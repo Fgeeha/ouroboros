@@ -279,6 +279,7 @@ def test_invalid_independent_snapshot_fence_cannot_be_cleared_by_project_recover
 def test_room_rebind_and_back_cannot_redirect_original_preparation(host, tmp_path, monkeypatch, frozen, back):  # noqa: F811
     task = accepted(host, tmp_path)
     task["_project_admission"]["frozen"] = frozen
+    prepared = copy.deepcopy(task)
     path, original = restore_unreadable(host)
     path.write_bytes(original)
     registry.update_project(host.root, "target", working_dir=str(tmp_path / "elsewhere"))
@@ -286,7 +287,38 @@ def test_room_rebind_and_back_cannot_redirect_original_preparation(host, tmp_pat
         registry.update_project(host.root, "target", working_dir=str(tmp_path / "prepared"))
     sent = worker(host, monkeypatch)
     workers.assign_tasks()
-    assert not sent and host.pending[0]["_terminalization_retry"]
+    workers.assign_tasks()
+    if frozen:
+        assert [row["id"] for row in sent] == [prepared["id"]]
+        for key in ("_project_admission", "workspace_root", "drive_root", "text"):
+            assert sent[0][key] == prepared[key]
+    else:
+        assert not sent and load_task_result(host.root, prepared["id"])["status"] == "failed"
+
+
+@pytest.mark.parametrize("dispatch", [None, "none", "possible"])
+@pytest.mark.parametrize("readable", [False, True])
+def test_held_deadline_keeps_custody_without_replay(host, tmp_path, monkeypatch, dispatch, readable):  # noqa: F811
+    accepted(host, tmp_path)
+    path, original = restore_unreadable(host)
+    if readable:
+        path.write_bytes(original)
+    [held] = host.pending
+    held["deadline_at"] = "2000-01-01T00:00:00Z"
+    if dispatch is None:
+        held.pop("admitted_dispatch", None)
+    else:
+        held["admitted_dispatch"] = dispatch
+    sent = worker(host, monkeypatch)
+    workers.assign_tasks()
+    assert held["_terminalization_retry"]["trigger"] == "deadline"
+    assert held["_terminalization_retry"]["reconcile_delegate_custody"] is True
+    assert not sent and not host.attempts
+    workers.assign_tasks()
+    assert not host.pending and not sent
+    stored = load_task_result(host.root, "held")
+    assert stored["status"] == "failed" and stored.get("admission_outcome") != "never_admitted"
+    assert "deadline" in stored["result"].lower()
 
 
 def test_unchanged_hold_does_not_rewrite_snapshot_but_changed_reason_does(host, tmp_path, monkeypatch):  # noqa: F811

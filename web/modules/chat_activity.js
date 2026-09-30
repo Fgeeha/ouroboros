@@ -1421,6 +1421,7 @@ export function renderLiveCardMeta(record, { agentModel = record?.agentModel || 
         ...[
             record.initiator === 'consciousness' ? 'Consciousness' : '',
             record.historicalUnavailable ? 'Outcome unavailable' : (record.historicalUnconfirmed ? 'Activity unconfirmed' : ''),
+            !record.finished && record.projectHoldDetail || '',
             record.historyRetentionProblem || '',
             modelExecutionLabel(record.modelExecution),
             Number.isInteger(record.toolCalls) ? `${record.toolCalls} tool ${record.toolCalls === 1 ? "call" : "calls"}` : '',

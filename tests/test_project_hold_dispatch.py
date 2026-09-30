@@ -89,6 +89,7 @@ def test_legacy_or_unknown_dispatch_does_not_backfill_on_restore(host, tmp_path,
         else:
             assert saved['admitted_dispatch'] == proof
     assert 'automatic recovery is not authorized' in host.pending[0]['_project_admission_restore_hold']['detail']
+    assert host.pending[0]['_project_admission_restore_hold']['reason'] == 'project_dispatch_unconfirmed'
 
 
 @pytest.mark.parametrize('basis', ['absent', None, ['malformed'], 'legacy', 'incomplete'])
@@ -160,10 +161,13 @@ def test_retry_owner_admits_but_unknown_handoff_cannot_auto_release(host, tmp_pa
 
 @pytest.mark.parametrize('change', ['chat_id', 'created_at', 'routing_incarnation',
                                   'routing_generation', 'working_dir'])
-def test_full_original_registered_tuple_is_required(host, tmp_path, monkeypatch, change):  # noqa: F811
+@pytest.mark.parametrize('frozen', [False, True])
+def test_hold_keeps_identity_and_frozen_prepared_resource(host, tmp_path, monkeypatch, change, frozen):  # noqa: F811
     import json
 
-    accepted(host, tmp_path)
+    task = accepted(host, tmp_path)
+    task['_project_admission']['frozen'] = frozen
+    prepared = copy.deepcopy(task)
     path, original = restore_unreadable(host)
     data = json.loads(original)
     row = data['projects'][0]
@@ -171,7 +175,12 @@ def test_full_original_registered_tuple_is_required(host, tmp_path, monkeypatch,
     path.write_text(json.dumps(data))
     sent = worker(host, monkeypatch)
     workers.assign_tasks()
-    assert not sent and host.pending[0]['_terminalization_retry']
+    if frozen and change in {'routing_generation', 'working_dir'}:
+        assert [row['id'] for row in sent] == ['held']
+        for key in ('_project_admission', 'workspace_root', 'drive_root', 'text'):
+            assert sent[0][key] == prepared[key]
+    else:
+        assert not sent and host.pending[0]['_terminalization_retry']
 
 
 def test_benign_activity_keeps_full_tuple_and_prepared_resource(host, tmp_path, monkeypatch):  # noqa: F811

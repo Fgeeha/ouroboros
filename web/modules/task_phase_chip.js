@@ -135,11 +135,14 @@ export function setInertCardPresentation(record, enabled) {
     setLiveCardTypingVisible(record, !enabled && !record.finished);
 }
 
-// `held` (census restore and live progress only) is the row's Project/scope hold
-// label, '' once the same id recovers; undefined leaves the recorded hold as is.
+// Census/queue reads carry the host's hold fact; {} clears it after recovery.
+// Undefined preserves the recorded fact across unrelated presentation writes.
 export function setHistoricalUnavailable(record, enabled, held) {
-    const holdChanged = Boolean(record) && held !== undefined && (record.projectHold || '') !== held;
-    if (holdChanged) record.projectHold = held;
+    const label = typeof held === 'string' ? held : held?.label || '';
+    const detail = held?.detail || '';
+    const holdChanged = Boolean(record) && held !== undefined
+        && ((record.projectHold || '') !== label || (record.projectHoldDetail || '') !== detail);
+    if (holdChanged) Object.assign(record, { projectHold: label, projectHoldDetail: detail });
     if (!record || (!holdChanged && Boolean(record.historicalUnavailable) === enabled && !record.historicalUnconfirmed)) return false;
     record.historicalUnavailable = enabled;
     record.historicalUnconfirmed = false;

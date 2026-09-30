@@ -524,3 +524,92 @@ def test_subagent_foreign_reservation_reason_never_becomes_acceptance_refusal():
     for reason in ("admission_reservation_owned", "admission_reservation_lost"):
         result = scheduled_admission_rejection({"_admission_blocked": reason}, project_id="target", root_task_id="root")
         assert result["reason_code"] == reason and result["persist_result"] is False
+
+
+def corrupt_neighbor(root, **fields):
+    path = registry._registry_path(root)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    row = next(row for row in data["projects"] if row["id"] == "other")
+    row.update(fields)
+    if "working_dir" not in fields:
+        row.pop("working_dir", None)
+    path.write_text(json.dumps(data), encoding="utf-8")
+    return row
+
+
+@pytest.mark.parametrize("operation", ["create", "rename", "folder", "bind", "visible_id",
+                                        "visible_chat", "delete", "delete_failure", "tombstone"])
+def test_registry_writers_preserve_unrelated_raw_rows(room, operation):
+    if operation in {"delete_failure", "tombstone"}:
+        registry.begin_project_deletion(room.root, "target")
+    raw = corrupt_neighbor(room.root, routing_generation="broken", lifecycle=["unknown"],
+                           visible_revision={"opaque": 7}, delete_error=["preserve"], extra={"x": None})
+    if operation == "create":
+        changed = registry.create_project(room.root, "fresh", name="Fresh")
+        assert changed["created"] is True
+    elif operation in {"rename", "folder"}:
+        changed = registry.update_project(room.root, "target", **{
+            "name" if operation == "rename" else "working_dir": "updated"})
+        assert changed["name" if operation == "rename" else "working_dir"] == "updated"
+    elif operation == "bind":
+        changed = registry.bind_task_to_project(room.root, "bound", "target", origin={"absent": "system"})
+        assert changed["project_id"] == "target"
+    elif operation.startswith("visible"):
+        changed = registry.increment_project_visible_revision(room.root, **(
+            {"project_id": "target"} if operation == "visible_id"
+            else {"chat_id": registry.project_admission_view(room.root, "target")["project"]["chat_id"]}))
+        assert changed["visible_revision"] == 1
+    else:
+        changed = {"delete": registry.begin_project_deletion,
+                   "delete_failure": lambda root, pid: registry.fail_project_deletion(root, pid, "pending"),
+                   "tombstone": registry.complete_project_deletion}[operation](room.root, "target")
+        assert changed["lifecycle"] == ("tombstoned" if operation == "tombstone" else "deleting")
+    rows = json.loads(registry._registry_path(room.root).read_text(encoding="utf-8"))["projects"]
+    assert next(row for row in rows if row["id"] == "other") == raw
+    assert "working_dir" not in next(row for row in rows if row["id"] == "other")
+
+
+@pytest.mark.parametrize("corruption", ["target", "duplicate_id", "duplicate_chat", "json"])
+def test_selected_writer_refuses_invalid_authority_without_changing_bytes(room, corruption):
+    path = registry._registry_path(room.root)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if corruption == "target":
+        data["projects"][0]["routing_generation"] = "unknown"
+    elif corruption == "duplicate_id":
+        data["projects"].append(dict(data["projects"][0]))
+    elif corruption == "duplicate_chat":
+        data["projects"][1]["chat_id"] = data["projects"][0]["chat_id"]
+    path.write_text("{torn" if corruption == "json" else json.dumps(data), encoding="utf-8")
+    before = path.read_bytes()
+    with pytest.raises(ValueError):
+        registry.update_project(room.root, "target", name="Must not land")
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("shape", ["existing_folder", "existing_empty", "new_room"])
+def test_real_promotion_provisions_healthy_room_beside_malformed_neighbor(host, tmp_path, monkeypatch, shape):  # noqa: F811
+    from ouroboros import subagent_worktrees
+    from supervisor import workers
+    from supervisor.events_project_routing import _handle_promote_chat_to_task
+
+    folder = tmp_path / "prepared-room"
+    folder.mkdir()
+    if shape != "new_room":
+        registry.create_project(host.root, "target", working_dir=str(folder) if shape == "existing_folder" else "")
+    registry.create_project(host.root, "other")
+    raw = corrupt_neighbor(host.root, routing_generation="unknown", visible_revision=[1], delete_error={"x": 2})
+    monkeypatch.setattr(subagent_worktrees, "provision_genesis_project", lambda **kw: SimpleNamespace(path=folder))
+    events = []
+    monkeypatch.setattr(workers, "get_event_q", lambda: SimpleNamespace(put=events.append))
+    outcome = _handle_promote_chat_to_task({
+        "task_id": "healthy-promotion", "routing_token": "healthy-token", "objective": "Synthetic work",
+        "project_id": "target", "chat_id": 1, "host_initiated": True,
+    }, host.ctx)
+    assert outcome["status"] == "scheduled", outcome
+    [queued] = host.pending
+    assert queued["id"] == "healthy-promotion" and queued["workspace_root"] == str(folder)
+    assert load_task_result(host.root, queued["id"])["status"] == "scheduled"
+    assert registry.project_binding_for_task(host.root, queued["id"])["project_id"] == "target"
+    rows = json.loads(registry._registry_path(host.root).read_text(encoding="utf-8"))["projects"]
+    assert next(row for row in rows if row["id"] == "other") == raw
+    assert not host.attempts

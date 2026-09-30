@@ -132,6 +132,46 @@ def test_ui_conversion_keeps_prepared_resource_through_recovery(host, tmp_path, 
     assert recovered["_project_admission"] == basis and not recovered.get("_project_admission_restore_hold")
 
 
+@pytest.mark.parametrize("stale", [False, True])
+def test_api_conversion_binding_overrides_old_result_scope_on_restore(host, tmp_path, monkeypatch, stale):  # noqa: F811
+    from starlette.requests import Request
+    from ouroboros.gateway.tasks import _create_task_from_body
+    from supervisor import queue, workers
+    from tests.test_project_hold_recovery import worker
+
+    folder = tmp_path / "api-folder"
+    folder.mkdir()
+    request = Request({"type": "http", "app": SimpleNamespace(state=SimpleNamespace(
+        drive_root=host.root, repo_dir=workers.REPO_DIR))})
+    response = _create_task_from_body(request, {
+        "task_id": "converted", "description": "Keep the original API work",
+        "workspace_root": str(folder), "memory_mode": "empty"})
+    assert response.status_code == 200, response.body
+    original = load_task_result(host.root, "converted")
+    assert original["project_id"].startswith("proj_")
+    response, answer = convert(host)
+    assert response.status_code == 200, answer
+    assert registry.project_binding_for_task(host.root, "converted")["project_id"] == "chosen"
+    assert load_task_result(host.root, "converted")["project_id"] == original["project_id"]
+    prepared = copy.deepcopy(host.pending[0])
+    assert queue.persist_queue_snapshot()
+    if stale:
+        snapshot = json.loads(queue.QUEUE_SNAPSHOT_PATH.read_text(encoding="utf-8"))
+        snapshot["ts"] = "2000-01-01T00:00:00Z"
+        queue.QUEUE_SNAPSHOT_PATH.write_text(json.dumps(snapshot), encoding="utf-8")
+    host.pending.clear()
+    assert queue.restore_pending_from_snapshot() == 1
+    assert bool(host.pending[0].get("_project_admission_restore_hold")) is stale
+    sent = worker(host, monkeypatch)
+    workers.assign_tasks()
+    workers.assign_tasks()
+    assert [row["id"] for row in sent] == ["converted"]
+    for key in ("project_id", "_project_admission", "workspace_root", "drive_root", "text"):
+        assert sent[0].get(key) == prepared.get(key)
+    assert load_task_result(host.root, "converted")["status"] == "running"
+    assert not host.attempts
+
+
 @pytest.mark.parametrize("scoped", [False, True])
 def test_in_task_conversion_uses_chosen_row_for_retry(host, tmp_path, scoped):  # noqa: F811
     from supervisor import queue

@@ -1,17 +1,11 @@
-"""Durable registry of owner projects (multi-project, v6.32.0).
+"""Durable owner Project registry in ``data/state/projects.json``.
 
-A project is a durable context the single agent works in: id + name +
-per-project memory (``data/projects/<id>/``) + chat thread (its own positive
-``chat_id``) + an OPTIONAL working folder (invisible auto-git under the
-durable projects root). File-less research projects are valid. Projects are
-NEVER age-pruned; the owner curates by archive/delete.
-
-State lives in ``data/state/projects.json`` via the canonical durable-JSON
-pattern (mirrors ``subagent_worktrees.py``). Deletion keeps a durable tombstone
-so chat history, bindings, memory and the owner folder remain addressable and a
-boot reconcile cannot resurrect the room. The registry is data-plane
-bookkeeping only — identity, constitution, and evolution stay unified in the
-one agent (BIBLE P1).
+Rooms have an id, name, memory under ``data/projects/<id>/``, a positive chat id
+and an optional working folder. File-less rooms are valid; only the owner
+archives/deletes them, never age pruning. Tombstones preserve history/data and
+prevent rediscovery while the registry survives. Recovery from store markers
+creates fresh execution incarnations; lost folders/tombstones are not recovered
+(PERSISTENCE.md). This bookkeeping does not split Ouroboros's identity (BIBLE P1).
 """
 
 from __future__ import annotations
@@ -35,10 +29,8 @@ _REGISTRY_NAME = "projects.json"
 # is lost authority, not a fresh install that never had a Project room.
 _REGISTRY_WITNESS_NAME = "projects.json.committed"
 _BINDINGS_NAME = "project_task_bindings.json"
-# v6.58.0 (slice 0): projects.json carries an opt-in _schema_version so future
-# additive fields (git provenance, trusted_at) migrate deliberately. Old rows read
-# as version 0; new fields must stay additive with safe-empty defaults because
-# reconcile_projects mints rows that will lack them.
+# Additive schema: unstamped rows are version 0; reconstructed rows may lack
+# optional provenance fields, whose defaults must remain compatible.
 _REGISTRY_SCHEMA_VERSION = 2
 # v6.73.0: project_task_bindings.json gains source_text / origin_absent fields.
 _BINDINGS_SCHEMA_VERSION = 1
@@ -106,18 +98,24 @@ def _bindings_path(drive_root: Any) -> pathlib.Path:
 
 # Keep the registry facade stable; execution reads have their own strict contract.
 from ouroboros.project_admission import (  # noqa: E402, F401
-    ProjectAdmissionError, _strict_admission_snapshot, display_registry_snapshot,
+    ProjectAdmissionError, _routing_row, _strict_admission_snapshot, display_registry_snapshot,
     project_admission_basis, project_admission_guard, project_admission_view,
     project_scope_admission, task_project_membership, validate_project_admission,
 )
 
 
-def _load(drive_root: Any, *, strict: bool = False) -> Dict[str, Any]:
-    # Writers reject malformed authority and a registry lost after its commit witness
-    # (only an install without a witness starts empty); display never normalizes it into active.
-    data = (_strict_admission_snapshot(drive_root, allow_missing=True)[0] if strict
+def _load(drive_root: Any, *, strict: bool = False,
+          project_id: Optional[str] = None) -> Dict[str, Any]:
+    # A writer validates global identity and its target, preserving every other
+    # raw row. None means a full strict reader; "" selects no row (append/census).
+    data = (_strict_admission_snapshot(drive_root, allow_missing=True,
+            identity_only=project_id is not None, preserve_raw=project_id is not None)[0] if strict
             else display_registry_snapshot(drive_root))
-    for row in data["projects"]:
+    for index, row in enumerate(data["projects"]):
+        if strict and project_id is not None:
+            if row["id"] != project_id:
+                continue
+            row = data["projects"][index] = _routing_row(row)
         try:
             row["visible_revision"] = max(0, int(row.get("visible_revision") or 0))
         except (TypeError, ValueError):
@@ -262,7 +260,7 @@ def bind_task_to_project(
     with _file_write_lock(_registry_path(drive_root)), \
             project_admission_guard(drive_root, admission_basis) if admission_basis is not None else nullcontext():
         project = next(
-            (row for row in _load(drive_root, strict=True)["projects"] if row.get("id") == pid),
+            (row for row in _load(drive_root, strict=True, project_id=pid)["projects"] if row.get("id") == pid),
             None,
         )
         if not isinstance(project, dict) or project.get("lifecycle") != PROJECT_ACTIVE:
@@ -922,7 +920,7 @@ def create_project(
         raise ValueError(f"unusable project id: {project_id!r}")
     with _file_write_lock(_registry_path(drive_root)), \
             project_admission_guard(drive_root, admission_basis) if admission_basis is not None else nullcontext():
-        data = _load(drive_root, strict=True)
+        data = _load(drive_root, strict=True, project_id=pid)
         for existing in data["projects"]:
             if existing.get("id") == pid:
                 if existing.get("lifecycle") != PROJECT_ACTIVE:
@@ -979,7 +977,7 @@ def update_project(
         if admission_basis is not None:
             with project_admission_guard(drive_root, admission_basis):
                 pass  # the writer lock keeps this comparison valid through _save
-        data = _load(drive_root, strict=True)
+        data = _load(drive_root, strict=True, project_id=pid)
         for entry in data["projects"]:
             if entry.get("id") != pid or entry.get("lifecycle") != PROJECT_ACTIVE:
                 continue
@@ -1002,7 +1000,7 @@ def begin_project_deletion(drive_root: Any, project_id: str) -> Optional[Dict[st
     if not pid:
         return None
     with _file_write_lock(_registry_path(drive_root)):
-        data = _load(drive_root, strict=True)
+        data = _load(drive_root, strict=True, project_id=pid)
         for entry in data["projects"]:
             if entry.get("id") != pid:
                 continue
@@ -1026,7 +1024,7 @@ def fail_project_deletion(
     if not pid:
         return None
     with _file_write_lock(_registry_path(drive_root)):
-        data = _load(drive_root, strict=True)
+        data = _load(drive_root, strict=True, project_id=pid)
         for entry in data["projects"]:
             if entry.get("id") == pid and entry.get("lifecycle") == PROJECT_DELETING:
                 entry["delete_error"] = str(error or "deletion did not quiesce")[:2000]
@@ -1041,7 +1039,7 @@ def complete_project_deletion(drive_root: Any, project_id: str) -> Optional[Dict
     if not pid:
         return None
     with _file_write_lock(_registry_path(drive_root)):
-        data = _load(drive_root, strict=True)
+        data = _load(drive_root, strict=True, project_id=pid)
         for entry in data["projects"]:
             if entry.get("id") != pid:
                 continue
@@ -1098,18 +1096,20 @@ def increment_project_visible_revision(
     if not pid and not cid:
         return None
     with _file_write_lock(_registry_path(drive_root)):
-        data = _load(drive_root, strict=True)
+        data = _load(drive_root, strict=True, project_id="")
         for entry in data["projects"]:
-            if entry.get("lifecycle") != PROJECT_ACTIVE:
-                continue
-            try:
-                matches_chat = cid and int(entry.get("chat_id") or 0) == cid
-            except (TypeError, ValueError):
-                matches_chat = False
+            matches_chat = cid and entry.get("chat_id", project_chat_id(entry["id"])) == cid
             if (pid and entry.get("id") == pid) or matches_chat:
-                entry["visible_revision"] = int(entry.get("visible_revision") or 0) + 1
+                selected = _routing_row(entry)
+                if selected["lifecycle"] != PROJECT_ACTIVE:
+                    continue
+                try:
+                    revision = max(0, int(entry.get("visible_revision") or 0))
+                except (TypeError, ValueError):
+                    revision = 0
+                entry["visible_revision"] = revision + 1
                 _save(drive_root, data)
-                return dict(entry)
+                return {**selected, **entry}
     return None
 
 
@@ -1151,7 +1151,12 @@ def reconcile_projects(drive_root: Any) -> int:
         projects_root = pathlib.Path(drive_root) / "projects"
         if projects_root.is_dir():
             with _file_write_lock(_registry_path(drive_root)):
-                data = _load(drive_root, strict=True)
+                try:
+                    data = _load(drive_root, strict=True, project_id="")
+                except FileNotFoundError:
+                    # Reconstruction owns absence, unlike admission. Recovered
+                    # rooms receive NEW incarnations and never authorize old work.
+                    data = {"projects": []}
                 known = {p.get("id") for p in data["projects"]}
                 # Keep the store-side marker current for every ACTIVE owner-originated
                 # row whose store already exists. Maintained HERE — by the same organ
@@ -1160,7 +1165,11 @@ def reconcile_projects(drive_root: Any) -> int:
                 # materializes, and reconcile-originated rows are deliberately
                 # excluded so a pre-guard ghost row can never mint recovery evidence
                 # for itself.
-                for row in data["projects"]:
+                for raw in data["projects"]:
+                    try:
+                        row = _routing_row(raw)
+                    except ValueError:
+                        continue  # retain unknown routing; do not maintain its marker
                     store = projects_root / str(row.get("id") or "")
                     if row.get("lifecycle") == PROJECT_TOMBSTONED:
                         # Convergence for deletion: a marker whose unlink failed at

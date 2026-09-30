@@ -32,11 +32,11 @@ def hold_unreadable_result(task: dict) -> bool:
 
     Restore and live assignment share this rule: the same row keeps its id,
     payload and resources; hold release rechecks its original receipt, scope and
-    no-dispatch evidence while Stop/terminal results stay independent. Exact
-    pauses and owner-wait handoffs keep their own authority.
+    no-dispatch or exact continuation evidence; Stop/terminal results stay
+    independent. Exact budget pauses keep their own hold authority.
     """
     pause = task.get("_budget_pause")
-    if (not task.get("_project_admission_restore_hold") and not task.get("_owner_wait_resume")
+    if (not task.get("_project_admission_restore_hold")
             and not (isinstance(pause, dict) and pause.get("exact_continuation") is True)
             and (task.get("project_id") or "_project_admission" in task)):
         task["_project_admission_restore_hold"] = {"reason": "project_routing_fence_lookup_failed",
@@ -48,6 +48,8 @@ def project_hold_fact(task: dict) -> dict:
     """Read-only waiting fact; no new task phase or owner-action claim."""
     hold = task.get("_project_admission_restore_hold")
     label = "Waiting for task scope verification" if host_unscoped(task) else "Waiting for Project verification"
+    if isinstance(hold, dict) and hold.get("reason") == "project_dispatch_unconfirmed":
+        label = "Waiting: previous run unconfirmed"
     return ({**hold, "label": label}
             if isinstance(hold, dict) and hold else {})
 
@@ -97,7 +99,7 @@ def _routing_row(raw: Any, *, identity_only: bool = False) -> dict:
 
 
 def _strict_admission_snapshot(drive_root: Any, *, allow_missing: bool = False,
-                               identity_only: bool = False) -> tuple[dict, bool]:
+                               identity_only: bool = False, preserve_raw: bool = False) -> tuple[dict, bool]:
     """Lockless committed authority. Only absent legacy fields receive defaults.
 
     ``allow_missing`` admits absence only while no commit witness exists: beside
@@ -107,20 +109,22 @@ def _strict_admission_snapshot(drive_root: Any, *, allow_missing: bool = False,
     as a first boot. ``identity_only`` checks every row's object, unique id and
     chat reservation, leaving routing fields to the reader that selects a room
     (``_routing_row``): a malformed unrelated room never blocks a healthy one.
-    Writers and the derived-folder census stay whole-registry strict.
+    Writers preserve raw neighbours and validate the selected row; the derived
+    folder census needs every room's routing. Raw rows are never normalized.
     """
     if allow_missing:
         from ouroboros.projects_registry import _registry_witness_path
 
         allow_missing = not _registry_witness_path(drive_root).exists()
     data, present = _registry_snapshot(drive_root, allow_missing=allow_missing)
-    rows, seen = [], set()
+    rows, seen, chats = [], set(), set()
     for raw in data["projects"]:
         row = _routing_row(raw, identity_only=identity_only)
-        if row["id"] in seen:
-            raise ValueError("Project registry contains a duplicate id")
+        if row["id"] in seen or row["chat_id"] in chats:
+            raise ValueError("Project registry contains a duplicate id or chat reservation")
         seen.add(row["id"])
-        rows.append(row)
+        chats.add(row["chat_id"])
+        rows.append(raw if preserve_raw else row)
     return {**data, "projects": rows}, present
 
 

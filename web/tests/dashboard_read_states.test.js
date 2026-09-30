@@ -159,7 +159,7 @@ test('Activity names known non-Project scope waits without implying a Project', 
     emptyActivity(routes);
     routes.set(queueUrl, response({ queue: { running: [], pending: [{ id: 'main', task: {
         title: 'Original work', _project_scope_none: true,
-        _project_admission_restore_hold: { detail: '<bindings unavailable>' },
+        project_admission_hold: { label: 'Waiting for task scope verification', detail: '<bindings unavailable>' },
     } }] } }));
     const activity = initActivity({ mount, ws });
     await activity.refresh();

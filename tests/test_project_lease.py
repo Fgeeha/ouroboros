@@ -273,9 +273,9 @@ def test_reconcile_recovers_a_marked_real_room_with_its_name(tmp_path, witnessed
     carries no binding when the owner created it by name). Once a reconcile tick has
     stamped the store's `.project.json`, losing the registry row is recoverable WITH
     the room's display name — better than the pre-guard behavior, which resurrected
-    it under the machine name. Beside its commit witness the lost registry is
-    unavailable authority instead: reconcile rebuilds nothing, and the marker waits
-    for the committed file to return."""
+    it under the machine name. Reconstruction creates a new execution incarnation;
+    neither a store marker nor the commit witness certifies the old assignment."""
+    from ouroboros import projects_registry as registry
     from ouroboros.project_facts import project_id_from_display_name
     from ouroboros.projects_registry import (
         _registry_witness_path, create_project, list_projects, reconcile_projects,
@@ -290,16 +290,10 @@ def test_reconcile_recovers_a_marked_real_room_with_its_name(tmp_path, witnessed
     assert (tmp_path / "projects" / pid / ".project.json").is_file()
 
     # Registry catastrophe: the rows are lost wholesale.
-    committed = (tmp_path / "state" / "projects.json").read_bytes()
+    prior = registry.project_admission_view(tmp_path, pid, frozen=True)
     (tmp_path / "state" / "projects.json").unlink()
-    if witnessed:
-        assert reconcile_projects(tmp_path) == 0
-        assert not (tmp_path / "state" / "projects.json").exists()
-        assert (tmp_path / "projects" / pid / ".project.json").is_file()
-        (tmp_path / "state" / "projects.json").write_bytes(committed)
-        assert [p["name"] for p in list_projects(tmp_path)] == ["динозавры"]
-        return
-    _registry_witness_path(tmp_path).unlink()  # a loss before any witness stamp
+    if not witnessed:
+        _registry_witness_path(tmp_path).unlink()  # a loss before any witness stamp
 
     assert reconcile_projects(tmp_path) == 1
     rows = list_projects(tmp_path)
@@ -307,6 +301,10 @@ def test_reconcile_recovers_a_marked_real_room_with_its_name(tmp_path, witnessed
     assert rows[0]["name"] == "динозавры"
     assert rows[0]["origin"] == "owner"
     assert rows[0]["created_at"] == born, "recovery restores provenance, not a fresh mint"
+    assert rows[0]["routing_incarnation"] != prior["project"]["routing_incarnation"]
+    with pytest.raises(registry.ProjectAdmissionError, match="changed"):
+        with registry.project_admission_guard(tmp_path, prior):
+            pytest.fail("Reconstruction must not authorize the old prepared work")
 
 
 def test_marker_maintenance_never_mkdirs_and_skips_reconcile_origin(tmp_path):

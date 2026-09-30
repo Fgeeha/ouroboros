@@ -548,7 +548,8 @@ def _create_task_from_body(request: Request, body: Any) -> JSONResponse:
     if workspace_root and task_type != "task":
         return json_error("external workspace tasks must use type='task'", 400)
     try:
-        chat_id = ingress_chat_id(body.get("chat_id"), drive_root, _task_project_id, source=body.get("source"))
+        chat_id = ingress_chat_id(body.get("chat_id"), drive_root, _task_project_id,
+                                  source=body.get("source"), project_basis=project_basis)
         depth = parse_task_depth(body.get("depth"), default=0)
     except ProjectThreadConflict as exc:
         return json_error(str(exc), 400)
@@ -1543,7 +1544,13 @@ def _render_attachment_lines(attachments: Any) -> str:
 def _queue_snapshot(drive_root: pathlib.Path) -> Dict[str, Any]:
     path = pathlib.Path(drive_root) / "state" / "queue_snapshot.json"
     try:
-        return read_json_dict(path) or {}
+        from ouroboros.project_admission import project_hold_fact
+        snapshot = read_json_dict(path) or {}
+        for row in [*snapshot.get("pending", []), *snapshot.get("running", [])]:
+            task = row.get("task")
+            if isinstance(task, dict):
+                task["project_admission_hold"] = project_hold_fact(task)
+        return snapshot
     except Exception:
         return {}
 

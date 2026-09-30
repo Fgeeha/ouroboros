@@ -72,6 +72,24 @@ test('a held card with retained progress waits statically; Stop, terminal and sa
     assert.equal(card.phaseEl.textContent, 'Working');
     assert.equal(card.inlineTypingEl.style.display, '');
     const chat = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
-    assert.match(chat, /restoreCardActivity\(liveCardRecords\.get\(k\), v\.project_admission_hold\?\.label\)/);
-    assert.match(chat, /function restoreCardActivity\(record, held = ''\) \{\n\s+if \(!setHistoricalUnavailable\(record, false, held\)\)/);
+    assert.match(chat, /restoreCardActivity\(liveCardRecords\.get\(k\), v\.project_admission_hold\)/);
+    assert.match(chat, /function restoreCardActivity\(record, held = \{\}\) \{\n\s+if \(!setHistoricalUnavailable\(record, false, held\)\)/);
+});
+
+
+test('nested wait keeps the host cause as text and clears it only on a recovery fact', () => {
+    const card = { isSubagent: true };
+    setHistoricalUnavailable(card, false, hold);
+    assert.equal(card.projectHoldDetail, hold.detail);
+    assert.equal(card.projectHold, hold.label);
+    setHistoricalUnavailable(card, false);
+    assert.equal(card.projectHoldDetail, hold.detail);
+    const unconfirmed = { label: 'Waiting for previous run verification', reason: 'project_dispatch_unconfirmed',
+        detail: 'The previous run cannot be confirmed; automatic recovery is not authorized.' };
+    setHistoricalUnavailable(card, false, unconfirmed);
+    assert.equal(desiredLiveCardPhase(card).text, unconfirmed.label);
+    assert.equal(card.projectHoldDetail, unconfirmed.detail);
+    setHistoricalUnavailable(card, false, {});
+    assert.equal(card.projectHoldDetail, '');
+    assert.equal(desiredLiveCardPhase(card).text, 'Working');
 });

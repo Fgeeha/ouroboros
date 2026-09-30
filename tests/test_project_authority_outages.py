@@ -20,12 +20,13 @@ from tests.test_swarm_host_admission import host  # noqa: F401
 pytestmark = pytest.mark.serial
 
 
-def test_legacy_registry_gains_its_commit_witness_before_a_loss_is_refused(tmp_path, monkeypatch):
+def test_registry_loss_blocks_admission_until_reconstruction_with_new_identity(tmp_path, monkeypatch):
     from ouroboros.project_admission import project_scope_admission
     from supervisor import state
 
     state.init(tmp_path)
     project = registry.create_project(tmp_path, "target")
+    original_basis = registry.project_admission_view(tmp_path, "target", frozen=True)
     (tmp_path / "projects" / "target").mkdir(parents=True)  # a store reconcile could rebuild from
     registry._registry_witness_path(tmp_path).unlink()  # committed by a build without the witness
     registry.reconcile_projects(tmp_path)
@@ -38,10 +39,15 @@ def test_legacy_registry_gains_its_commit_witness_before_a_loss_is_refused(tmp_p
     for write in writers:  # absence after a commit is unavailable authority, never zero rooms
         with pytest.raises(FileNotFoundError):
             write()
-    assert registry.reconcile_projects(tmp_path) == 0
-    assert not registry._registry_path(tmp_path).exists()
     direct, receipts = owner_turn(tmp_path, monkeypatch, project["chat_id"], "web")
     assert not direct and receipts[-1]["status"] == "project_unavailable"
+    assert registry.reconcile_projects(tmp_path) == 1
+    restored = project_scope_admission(tmp_path, project_id="target")
+    assert restored["project"]["chat_id"] == project["chat_id"]
+    assert restored["project"]["routing_incarnation"] != project["routing_incarnation"]
+    with pytest.raises(registry.ProjectAdmissionError, match="changed"):
+        with registry.project_admission_guard(tmp_path, original_basis):
+            pytest.fail("A reconstructed room cannot authorize the previous assignment")
 
 
 def test_never_committed_install_still_creates_and_reconciles_rooms(tmp_path):
