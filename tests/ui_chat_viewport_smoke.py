@@ -804,7 +804,7 @@ def run_chat_viewport_smoke(
                 page.route(
                     "**/api/tasks/vp-cancel-noop/cancel",
                     lambda route: route.fulfill(status=202, content_type="application/json", body=json.dumps({
-                        "task_id": "vp-cancel-noop", "cancel_state": "pending",
+                        "ok": True, "task_id": "vp-cancel-noop", "cancel_state": "pending",
                         "stop_policy": "finalize_then_cancel",
                     })),
                 )
