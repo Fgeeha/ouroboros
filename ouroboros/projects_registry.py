@@ -97,8 +97,9 @@ def _bindings_path(drive_root: Any) -> pathlib.Path:
 
 
 # Keep the registry facade stable; execution reads have their own strict contract.
+from ouroboros.project_admission import _routing_row  # noqa: E402
 from ouroboros.project_admission import (  # noqa: E402, F401
-    ProjectAdmissionError, _routing_row, _strict_admission_snapshot, display_registry_snapshot,
+    ProjectAdmissionError, _strict_admission_snapshot, display_registry_snapshot,
     project_admission_basis, project_admission_guard, project_admission_view,
     project_scope_admission, task_project_membership, validate_project_admission,
 )
@@ -556,7 +557,13 @@ def project_id_for_origin(drive_root: Any, origin_ref: Any, *, strict: bool = Fa
     if not candidates:
         return ""  # the common case: no binding names this message, so no registry read
     if not include_inactive:
-        active = {str(project.get("id") or "") for project in list_projects(drive_root, strict=strict)}
+        if strict:
+            ids = {row[2] for row in candidates}
+            projects = (_routing_row(row) for row in _load(drive_root, strict=True, project_id="")["projects"]
+                        if row["id"] in ids)
+        else:
+            projects = list_projects(drive_root)
+        active = {project["id"] for project in projects if project["lifecycle"] == PROJECT_ACTIVE}
         candidates = [row for row in candidates if row[2] in active]
     if not candidates:
         return ""
@@ -782,13 +789,8 @@ def registered_project_chat_ids(drive_root: Any) -> set:
 
 
 def get_project(drive_root: Any, project_id: str, *, strict: bool = False) -> Optional[Dict[str, Any]]:
-    pid = sanitize_project_id(project_id)
-    if not pid:
-        return None
-    for project in list_projects(drive_root, strict=strict):
-        if project.get("id") == pid:
-            return dict(project)
-    return None
+    project = get_reserved_project(drive_root, project_id, strict=strict)
+    return project if project and project.get("lifecycle") == PROJECT_ACTIVE else None
 
 
 def get_reserved_project(drive_root: Any, project_id: str, *, strict: bool = False) -> Optional[Dict[str, Any]]:
@@ -796,10 +798,9 @@ def get_reserved_project(drive_root: Any, project_id: str, *, strict: bool = Fal
     pid = sanitize_project_id(project_id)
     if not pid:
         return None
-    for project in list_reserved_projects(drive_root, strict=strict):
-        if project.get("id") == pid:
-            return dict(project)
-    return None
+    rows = (_load(drive_root, strict=True, project_id=pid)["projects"] if strict
+            else list_reserved_projects(drive_root))
+    return next((dict(project) for project in rows if project.get("id") == pid), None)
 
 
 

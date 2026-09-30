@@ -1027,6 +1027,10 @@ export function chatStatusCounts(activities, records, isWaiting = () => false) {
     }
     for (const record of records) {
         if (!isForegroundLiveCard(record)) continue;
+        if (record.projectHold) {
+            counts.projectWaitLabel ||= record.projectHold;
+            continue;
+        }
         if (activities.get(record.groupId)?.project_admission_hold) continue;
         if (record.modelWaiting) counts.waitingModelCount += 1;
         else if (!record.direct) counts.hasActiveLiveCard = true;

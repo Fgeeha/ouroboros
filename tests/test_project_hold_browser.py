@@ -53,7 +53,7 @@ def test_project_hold_reload_reconnect_and_automatic_same_id_recovery(
 
     def record(label, value):
         facts[label] = value
-        (evidence / "facts.json").write_text(json.dumps(facts, indent=2, default=str))
+        (evidence / "facts.json").write_text(json.dumps(facts, indent=2, default=str), encoding="utf-8")
 
     server["stop_server"]()
     host = _producers(monkeypatch, root, server["repo_dir"])
@@ -79,7 +79,7 @@ def test_project_hold_reload_reconnect_and_automatic_same_id_recovery(
     # The room's OWN routing authority is unreadable (the display lens still lists it); a
     # malformed unrelated room would not hold this work, so the neighbour stays healthy.
     next(row for row in data["projects"] if row["id"] == PROJECT)["routing_generation"] = "0"
-    path.write_text(json.dumps(data))
+    path.write_text(json.dumps(data), encoding="utf-8")
     host.pending.clear()
     queue.restore_pending_from_snapshot()
     assert [task["id"] for task in host.pending] == [TASK]

@@ -86,7 +86,7 @@ def test_first_restore_keeps_accepted_project_row_waiting_through_unreadable_res
     result = host.root / "task_results" / "held.json"
     original = result.read_bytes()
     assert queue.persist_queue_snapshot()
-    result.write_text("{torn")
+    result.write_text("{torn", encoding="utf-8")
     for _restart in range(2):  # the persisted hold survives a second restart during the fault
         host.pending.clear()
         assert queue.restore_pending_from_snapshot() == 2
@@ -136,7 +136,7 @@ def _uncertain_child(host, monkeypatch):  # noqa: F811
         stored = write(root, tid, *args, **kwargs)
         path = results.task_result_path(root, tid)
         committed.append(path.read_bytes())
-        path.write_text("{torn")  # committed, then unreadable before its readback
+        path.write_text("{torn", encoding="utf-8")  # committed, then unreadable before its readback
         return stored
 
     monkeypatch.setattr(task_admission, "write_task_result", write_then_tear)
@@ -164,7 +164,7 @@ def test_live_accepted_project_row_waits_through_its_first_unreadable_result(hos
         prepared = copy.deepcopy(accepted(host, tmp_path))
         result = host.root / "task_results" / "held.json"
         original = result.read_bytes()
-        result.write_text("{torn")
+        result.write_text("{torn", encoding="utf-8")
     else:
         prepared, original = _uncertain_child(host, monkeypatch)
         result = host.root / "task_results" / "held.json"
@@ -177,7 +177,7 @@ def test_live_accepted_project_row_waits_through_its_first_unreadable_result(hos
     if producer == "promotion":  # the census lists roots; a child's wait shows on its parent's tree
         census = {row["activity_id"]: row for row in _chat_activities_snapshot_safe(host.root, availability={})}
         assert census["held"]["project_admission_hold"]["label"] == "Waiting for Project verification"
-    snapshot = json.loads(queue.QUEUE_SNAPSHOT_PATH.read_text())
+    snapshot = json.loads(queue.QUEUE_SNAPSHOT_PATH.read_text(encoding="utf-8"))
     assert next(row for row in snapshot["pending"] if row["id"] == "held")["task"]["_project_admission_restore_hold"]
     queue.RUNNING.clear()
     workers.WORKERS[0].busy_task_id = None
@@ -238,7 +238,7 @@ def test_assisted_resolver_recovers_same_id_after_restore_scope_hold(pool, prior
         write_task_result(pool.root, RESOLVER, "scheduled", admitted_dispatch="possible")
     bindings = registry._bindings_path(pool.root)
     bindings.parent.mkdir(parents=True, exist_ok=True)
-    bindings.write_text("{torn")
+    bindings.write_text("{torn", encoding="utf-8")
     queue.PENDING.clear()
     queue.restore_pending_from_snapshot()
     assert update_merge.enqueue_assisted_resolution_task(tx) == RESOLVER  # boot recovery refreshes it
@@ -246,7 +246,7 @@ def test_assisted_resolver_recovers_same_id_after_restore_scope_hold(pool, prior
     assert held["id"] == RESOLVER and held["_project_admission_restore_hold"]
     workers.assign_tasks()
     assert not _drain(pool.slot)
-    bindings.write_text('{"bindings": {}}')
+    bindings.write_text('{"bindings": {}}', encoding="utf-8")
     workers.assign_tasks()
     workers.assign_tasks()
     assert _drain(pool.slot) == [RESOLVER] and not queue.PENDING
@@ -269,7 +269,7 @@ def test_resolver_boot_reenqueue_of_an_existing_id_fabricates_no_receipt(pool): 
 
 
 def _unadmitted(root):
-    rows = [json.loads(line) for line in (root / "logs" / "supervisor.jsonl").read_text().splitlines()]
+    rows = [json.loads(line) for line in (root / "logs" / "supervisor.jsonl").read_text(encoding="utf-8").splitlines()]
     return [row["reason"] for row in rows if row["type"] == "managed_update_assisted_resolver_unadmitted"]
 
 
@@ -283,11 +283,11 @@ def test_resolver_never_mints_a_receipt_over_an_unreadable_prior(pool, prior):  
     body = "{torn" if prior == "torn" else json.dumps({
         "task_id": RESOLVER if prior == "future" else "other", "status": "running",
         SCHEMA_VERSION_KEY: TASK_RESULT_SCHEMA_VERSION + (prior == "future")})
-    path.write_text(body)
+    path.write_text(body, encoding="utf-8")
     tx = {"task_id": RESOLVER, "phase": "assisted_resolution", "owner_chat_id": 1, "target_sha": "target"}
     update_merge.write_update_tx(tx)
     assert update_merge.enqueue_assisted_resolution_task(tx) == ""  # possibly sent before: no replay
-    assert not queue.PENDING and path.read_text() == body  # the unknown bytes keep their custody
+    assert not queue.PENDING and path.read_text(encoding="utf-8") == body  # the unknown bytes keep their custody
     assert tx["task_id"] == RESOLVER and _unadmitted(pool.root) == ["task_result_unreadable"]
 
 
@@ -300,7 +300,7 @@ def test_resolver_refused_by_its_admission_is_never_claimed_started(pool, prior)
     before = load_task_result(pool.root, RESOLVER)
     bindings = registry._bindings_path(pool.root)
     bindings.parent.mkdir(parents=True, exist_ok=True)
-    bindings.write_text("{torn")
+    bindings.write_text("{torn", encoding="utf-8")
     tx = {"task_id": RESOLVER, "phase": "assisted_resolution", "owner_chat_id": 1, "target_sha": "target",
           "resolver_submitted_id": ""}  # the apply's transaction: nothing submitted yet
     update_merge.write_update_tx(tx)
@@ -308,7 +308,7 @@ def test_resolver_refused_by_its_admission_is_never_claimed_started(pool, prior)
     assert not queue.PENDING and load_task_result(pool.root, RESOLVER) == before  # no receipt, no row
     assert _unadmitted(pool.root) == ["project_routing_fence_lookup_failed"]
     assert update_merge.read_update_tx()["resolver_submitted_id"] == ""  # a proven refusal submitted nothing
-    bindings.write_text('{"bindings": {}}')
+    bindings.write_text('{"bindings": {}}', encoding="utf-8")
     assert update_merge.enqueue_assisted_resolution_task(tx) == RESOLVER  # the next attempt admits it
     workers.assign_tasks()
     assert _drain(pool.slot) == [RESOLVER]
@@ -335,7 +335,7 @@ def test_resolver_whose_dispatch_evidence_is_lost_is_never_replayed(pool, loss, 
         queue.RUNNING.clear()  # the restart took it down with its worker
         pool.slot.busy_task_id = None
         if loss == "quarantined":  # a fail-soft reader moves the torn bytes aside, then reports absence
-            path.write_text("{torn")
+            path.write_text("{torn", encoding="utf-8")
             assert load_task_result(pool.root, RESOLVER) is None
             assert list((pool.root / "task_results" / "quarantine").glob(RESOLVER + "*.json"))
         else:
@@ -377,7 +377,7 @@ def _boot_recovery(pool, tmp_path, monkeypatch):  # noqa: F811
 
 
 def _supervisor_types(root):
-    return [json.loads(line)["type"] for line in (root / "logs" / "supervisor.jsonl").read_text().splitlines()]
+    return [json.loads(line)["type"] for line in (root / "logs" / "supervisor.jsonl").read_text(encoding="utf-8").splitlines()]
 
 
 @pytest.mark.parametrize("fault", ["bindings", "result"])
@@ -393,7 +393,7 @@ def test_boot_recovery_claims_no_resume_until_its_resolver_is_admitted(pool, tmp
         broken = results.task_result_path(pool.root, RESOLVER)
         write_task_result(pool.root, RESOLVER, "interrupted", admitted_dispatch="possible")
         original = broken.read_bytes()
-    broken.write_text("{torn")
+    broken.write_text("{torn", encoding="utf-8")
     assert update_merge.finalize_managed_update_on_boot(supervisor_ready=True) == {
         "finalized": False, "resumed": False, "resolution_attempts": 1}
     types = _supervisor_types(pool.root)
@@ -401,7 +401,7 @@ def test_boot_recovery_claims_no_resume_until_its_resolver_is_admitted(pool, tmp
     stored = update_merge.read_update_tx()
     assert stored["phase"] == "assisted_resolution" and stored["resolution_attempts"] == 1  # retried next boot
     assert update_merge._merge_head_sha() == stored["target_sha"]  # never rolled back
-    assert (repo / "a.txt").read_text() == "the resolver's precious resolution\n"
+    assert (repo / "a.txt").read_text(encoding="utf-8") == "the resolver's precious resolution\n"
     assert not queue.PENDING and not queue.RUNNING
     broken.write_bytes(original)
     assert update_merge.finalize_managed_update_on_boot(supervisor_ready=True) == {
@@ -445,7 +445,7 @@ def test_boot_recovery_resumes_a_resolver_restored_from_its_claimed_handoff_once
         write_task_result(pool.root, RESOLVER, "cancelled", cancel_origin={"source": "snapshot_restore",
                                                                            "reason": "server_shutdown"})
     elif veto == "torn":
-        path.write_text("{torn")
+        path.write_text("{torn", encoding="utf-8")
     elif veto == "bound":  # the unscoped resolver's assignment changed after its admission
         registry.create_project(pool.root, "room")
         registry.bind_task_to_project(pool.root, RESOLVER, "room", origin={"absent": "system"})
@@ -512,7 +512,7 @@ def test_assisted_apply_reports_started_only_for_an_admitted_resolver(pool, monk
     if bindings == "torn":
         path = registry._bindings_path(pool.root)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("{torn")
+        path.write_text("{torn", encoding="utf-8")
     plan = {"base_sha": base, "target_sha": "b" * 40, "local_snapshot": base, "kind": "conflicting",
             "code_conflict_paths": ["ouroboros/config.py"], "doc_conflict_paths": []}
     response = control._start_assisted_merge_fenced(
@@ -544,9 +544,9 @@ def _child_of(host, tmp_path, parent):  # noqa: F811
     write_task_result(host.root, "parent", "running" if parent == "interrupted" else "completed", chat_id=1)
     assert queue.persist_queue_snapshot()
     if parent == "interrupted":  # the parent was RUNNING when the server stopped
-        snap = json.loads(queue.QUEUE_SNAPSHOT_PATH.read_text())
+        snap = json.loads(queue.QUEUE_SNAPSHOT_PATH.read_text(encoding="utf-8"))
         snap["running"] = [{"id": "parent", "task": {"id": "parent", "chat_id": 1}}]
-        queue.QUEUE_SNAPSHOT_PATH.write_text(json.dumps(snap))
+        queue.QUEUE_SNAPSHOT_PATH.write_text(json.dumps(snap), encoding="utf-8")
     return host.root / "task_results" / "parent.json"
 
 
@@ -555,10 +555,10 @@ def test_held_project_child_never_starts_behind_an_interrupted_parent(host, tmp_
     parent_path = _child_of(host, tmp_path, parent)
     parent_bytes = parent_path.read_bytes()
     if parent == "unreadable":
-        parent_path.write_text("{torn")
+        parent_path.write_text("{torn", encoding="utf-8")
     result = host.root / "task_results" / "child.json"
     original = result.read_bytes()
-    result.write_text("{torn")  # the child's own receipt is unknown at restore
+    result.write_text("{torn", encoding="utf-8")  # the child's own receipt is unknown at restore
     host.pending.clear()
     queue.restore_pending_from_snapshot()
     [held] = host.pending
@@ -584,7 +584,7 @@ def test_readable_project_child_waits_for_its_unreadable_parent(host, tmp_path, 
     """Only the parent is unknown at restore: the child's receipt and the bindings are healthy."""
     parent_path = _child_of(host, tmp_path, "completed")
     parent_bytes = parent_path.read_bytes()
-    parent_path.write_text("{torn")
+    parent_path.write_text("{torn", encoding="utf-8")
     host.pending.clear()
     queue.restore_pending_from_snapshot()
     [held] = host.pending
@@ -612,7 +612,7 @@ def _fault_parent(host, path, fault):  # noqa: F811
     if fault == "missing":
         path.unlink()
     elif fault == "torn":
-        path.write_text("{torn")
+        path.write_text("{torn", encoding="utf-8")
     elif fault == "never_admitted":  # a refusal receipt cannot be the parent that spawned it
         path.unlink()
         write_task_result(host.root, "parent", "failed", chat_id=1, admission_outcome="never_admitted")
@@ -657,7 +657,7 @@ def test_healthy_child_waits_for_an_unknown_parent_inside_or_outside_the_snapsho
     if phase == "restore":
         _fault_parent(host, parent_path, fault)
     else:  # the child's own receipt is what is unknown at restore; its parent is healthy
-        child_path.write_text("{torn")
+        child_path.write_text("{torn", encoding="utf-8")
     host.pending.clear()
     queue.restore_pending_from_snapshot()
     sent = worker(host, monkeypatch)

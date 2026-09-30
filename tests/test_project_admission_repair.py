@@ -17,7 +17,7 @@ pytestmark = pytest.mark.serial
 
 
 def _drop_project(root):
-    data = json.loads(registry._registry_path(root).read_text())
+    data = json.loads(registry._registry_path(root).read_text(encoding="utf-8"))
     data["projects"] = [row for row in data["projects"] if row["id"] != "target"]
     registry._save(root, data)
 
@@ -30,7 +30,7 @@ def test_promotion_attachments_wait_for_exact_refusal_receipt(host, tmp_path, mo
 
     registry.create_project(host.root, "target")
     source = tmp_path / "input.txt"
-    source.write_text("must survive until custody is confirmed")
+    source.write_text("must survive until custody is confirmed", encoding="utf-8")
     captured = []
     real_stage = artifacts.stage_task_attachments
     def stage(*args, **kwargs):
@@ -68,7 +68,7 @@ def test_promotion_attachments_wait_for_exact_refusal_receipt(host, tmp_path, mo
         assert all(not path.exists() for path in captured)
     else:
         assert result["status"] == "unconfirmed"
-        assert all(path.read_text() == source.read_text() for path in captured)
+        assert all(path.read_text(encoding="utf-8") == source.read_text(encoding="utf-8") for path in captured)
         assert load_task_result(host.root, "promoted") is None
     if receipt == "foreign":
         assert queue.ADMISSION_RESERVATIONS["promoted"] == "foreign"
@@ -82,7 +82,7 @@ def test_api_preparation_cleanup_keeps_ownership_until_resources_settle(room, mo
     tid = "preparation"
     child = headless.prepare_task_drive(room.root, tid, "empty")
     artifact = headless.task_artifacts_dir(room.root, tid) / "keep.txt"
-    artifact.write_text("owned input")
+    artifact.write_text("owned input", encoding="utf-8")
     room.queue.reserve_task_admission(tid, "ours", drive_root=room.root)
     if occupant == "foreign_reservation":
         room.queue.ADMISSION_RESERVATIONS[tid] = "foreign"
@@ -91,7 +91,7 @@ def test_api_preparation_cleanup_keeps_ownership_until_resources_settle(room, mo
     elif occupant == "unreadable":
         path = room.root / "task_results" / f"{tid}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("{torn")
+        path.write_text("{torn", encoding="utf-8")
     elif occupant == "pending":
         room.pending.append(task(tid))
     original = headless.remove_subagent_task_drive
@@ -104,7 +104,7 @@ def test_api_preparation_cleanup_keeps_ownership_until_resources_settle(room, mo
         assert not child.exists() and not artifact.exists()
         assert tid not in room.queue.ADMISSION_RESERVATIONS
     else:
-        assert child.exists() and artifact.read_text() == "owned input"
+        assert child.exists() and artifact.read_text(encoding="utf-8") == "owned input"
         assert room.queue.ADMISSION_RESERVATIONS[tid] == ("foreign" if occupant == "foreign_reservation" else "ours")
 
 
@@ -120,7 +120,7 @@ def test_real_api_known_preparation_exception_cleans_only_its_attempt(room, tmp_
     request = Request({"type": "http", "app": SimpleNamespace(state=SimpleNamespace(
         drive_root=room.root, repo_dir=tmp_path / "repo"))})
     source = tmp_path / "input.txt"
-    source.write_text("input")
+    source.write_text("input", encoding="utf-8")
     child_paths = []
     original = api.prepare_task_drive
     def prepare(*args, **kwargs):
@@ -206,21 +206,28 @@ def test_legacy_malformed_binding_is_unknown_not_unregistered(room, bad_id):  # 
     ("routing_generation", 0.0), ("chat_id", False), ("chat_id", "4"),
     ("working_dir", None), ("routing_incarnation", ""), ("created_at", []),
 ])
-def test_strict_writers_cannot_launder_invalid_present_routing_fields(room, field, value):  # noqa: F811
+def test_selected_writers_preserve_invalid_neighbor_without_laundering_it(room, field, value):  # noqa: F811
     path = registry._registry_path(room.root)
-    data = json.loads(path.read_text())
+    data = json.loads(path.read_text(encoding="utf-8"))
     data["projects"][0][field] = value
-    path.write_text(json.dumps(data))
+    path.write_text(json.dumps(data), encoding="utf-8")
     before = path.read_bytes()
-    for write in (lambda: registry.update_project(room.root, "target", name="rename"),
-                  lambda: registry.create_project(room.root, "new")):
+    with pytest.raises(ValueError):  # the malformed selected target always refuses
+        registry.update_project(room.root, "target", name="rename")
+    assert path.read_bytes() == before
+    if field == "chat_id":  # ambiguous/invalid identity blocks every room
         with pytest.raises(ValueError):
-            write()
+            registry.create_project(room.root, "new")
+        registry.touch_project(room.root, "other")
+        registry.reconcile_projects(room.root)
         assert path.read_bytes() == before
-    registry.touch_project(room.root, "other")  # documented never-raises writer
-    assert path.read_bytes() == before
-    registry.reconcile_projects(room.root)
-    assert path.read_bytes() == before
+    else:
+        assert registry.create_project(room.root, "new")["created"] is True
+        registry.touch_project(room.root, "other")
+        registry.reconcile_projects(room.root)
+        after = json.loads(path.read_text(encoding="utf-8"))
+        assert next(row for row in after["projects"] if row["id"] == "target") == data["projects"][0]
+        assert {row["id"] for row in after["projects"]} == {"target", "other", "new"}
 
 
 @pytest.mark.parametrize("raw", [
@@ -232,23 +239,23 @@ def test_strict_writers_cannot_launder_invalid_present_routing_fields(room, fiel
 def test_duplicate_or_malformed_raw_authority_never_admits_or_rewrites(room, raw):  # noqa: F811
     basis = registry.project_admission_view(room.root, "target")
     path = registry._registry_path(room.root)
-    path.write_text(raw)
+    path.write_text(raw, encoding="utf-8")
     rejected = room.queue.enqueue_task(task(), project_admission=basis)
     assert rejected["_admission_blocked"] == "project_routing_fence_lookup_failed"
     with pytest.raises(ValueError):
         registry.create_project(room.root, "new")
-    assert path.read_text() == raw and not room.pending
+    assert path.read_text(encoding="utf-8") == raw and not room.pending
 
 
 def test_legacy_omitted_routing_fields_survive_writer_and_new_preparation(room, tmp_path, monkeypatch):  # noqa: F811
     from ouroboros import subagent_worktrees
 
     path = registry._registry_path(room.root)
-    data = json.loads(path.read_text())
+    data = json.loads(path.read_text(encoding="utf-8"))
     for row in data["projects"]:
         for field in ("lifecycle", "routing_generation", "chat_id", "working_dir", "routing_incarnation", "created_at"):
             row.pop(field, None)
-    path.write_text(json.dumps(data))
+    path.write_text(json.dumps(data), encoding="utf-8")
     registry.touch_project(room.root, "other")
     basis = registry.project_admission_view(room.root, "target")
     assert basis["project"]["lifecycle"] == "active" and basis["project"]["routing_generation"] == 0
@@ -324,7 +331,7 @@ def test_promote_post_stage_lookup_failure_cleans_attachment(host, tmp_path, mon
     from supervisor.events_project_routing import _handle_promote_chat_to_task
 
     source = tmp_path / "input.txt"
-    source.write_text("input")
+    source.write_text("input", encoding="utf-8")
     cleaned = []
     remove = artifacts.remove_staged_attachments
     def cleanup(manifest):
@@ -332,7 +339,7 @@ def test_promote_post_stage_lookup_failure_cleans_attachment(host, tmp_path, mon
         assert receipt["admission_outcome"] == "never_admitted"
         assert receipt["_admission_refusal_token"]
         cleaned.extend(Path(row["abs_path"]) for row in manifest)
-        assert cleaned and all(path.read_text() == "input" for path in cleaned)
+        assert cleaned and all(path.read_text(encoding="utf-8") == "input" for path in cleaned)
         remove(manifest)
     monkeypatch.setattr(artifacts, "remove_staged_attachments", cleanup)
     monkeypatch.setattr(registry, "project_admission_view", lambda *a, **k:
@@ -355,7 +362,7 @@ def test_promote_queue_failure_preserves_receipt_first_custody(host, tmp_path, m
 
     registry.create_project(host.root, "target")
     source = tmp_path / "input.txt"
-    source.write_text("input")
+    source.write_text("input", encoding="utf-8")
     captured = []
     real_enqueue = host.ctx.enqueue_task
     def enqueue(payload):
@@ -383,6 +390,6 @@ def test_promote_queue_failure_preserves_receipt_first_custody(host, tmp_path, m
         assert outcome["status"] == "unconfirmed"
         assert outcome["reason"] == "queue_snapshot_persist_failed"
         assert [row["id"] for row in host.pending] == ["promoted"]
-        assert staged.read_text() == "input"
+        assert staged.read_text(encoding="utf-8") == "input"
         assert receipt.get("admission_outcome") != "never_admitted"
         assert receipt.get("status") != "failed"

@@ -32,7 +32,7 @@ def restore_unreadable(host):  # noqa: F811
     path = registry._registry_path(host.root)
     original = path.read_bytes()
     assert queue.persist_queue_snapshot()
-    path.write_text("{torn")
+    path.write_text("{torn", encoding="utf-8")
     host.pending.clear()
     queue.restore_pending_from_snapshot()
     assert host.pending[0]["_project_admission_restore_hold"]
@@ -66,9 +66,9 @@ def test_same_id_recovers_once_with_original_resources_and_visible_wait(host, tm
     census = _chat_activities_snapshot_safe(host.root, availability=availability)
     assert next(row for row in census if row["activity_id"] == "held")["project_admission_hold"]
     for stamp in ("2000-01-01T00:00:00Z", "invalid", None):
-        snap = json.loads(queue.QUEUE_SNAPSHOT_PATH.read_text())
+        snap = json.loads(queue.QUEUE_SNAPSHOT_PATH.read_text(encoding="utf-8"))
         snap["ts"] = stamp
-        queue.QUEUE_SNAPSHOT_PATH.write_text(json.dumps(snap))
+        queue.QUEUE_SNAPSHOT_PATH.write_text(json.dumps(snap), encoding="utf-8")
         host.pending.clear()
         assert queue.restore_pending_from_snapshot() == 1
         assert host.pending[0]["_project_admission"] == prepared["_project_admission"]
@@ -111,7 +111,7 @@ def test_recovery_preserves_independent_guards(host, tmp_path, monkeypatch, guar
         write_task_result(host.root, "held", "running")
     elif guard in {"missing_result", "unreadable_result"}:
         result = host.root / "task_results/held.json"
-        result.unlink() if guard == "missing_result" else result.write_text("{torn")
+        result.unlink() if guard == "missing_result" else result.write_text("{torn", encoding="utf-8")
     elif guard == "started":
         write_task_result(host.root, "held", "scheduled", started_at="2026-01-01T00:00:00Z")
     elif guard == "deadline":
@@ -145,7 +145,7 @@ def test_real_authority_loss_never_redirects_and_failed_terminal_write_retains(h
     if change == "delete":
         registry.begin_project_deletion(host.root, "target")
     else:
-        path.write_text('{"projects": []}')
+        path.write_text('{"projects": []}', encoding="utf-8")
         if change == "incarnation":
             registry.create_project(host.root, "target", working_dir=str(tmp_path / "prepared"))
     sent = worker(host, monkeypatch)
@@ -204,7 +204,7 @@ def test_held_row_recovers_beside_a_room_with_malformed_routing(host, tmp_path, 
     path, original = restore_unreadable(host)
     data = json.loads(original)
     next(row for row in data["projects"] if row["id"] == "other")["routing_generation"] = "0"
-    path.write_text(json.dumps(data))
+    path.write_text(json.dumps(data), encoding="utf-8")
     sent = worker(host, monkeypatch)
     workers.assign_tasks()
     workers.assign_tasks()
@@ -229,9 +229,9 @@ def test_stop_during_project_hold_wins_recovery(host, tmp_path, monkeypatch):  #
 def test_first_restore_of_old_project_row_keeps_original_custody(host, tmp_path, monkeypatch, stamp):  # noqa: F811
     accepted(host, tmp_path)
     assert queue.persist_queue_snapshot()
-    snap = json.loads(queue.QUEUE_SNAPSHOT_PATH.read_text())
+    snap = json.loads(queue.QUEUE_SNAPSHOT_PATH.read_text(encoding="utf-8"))
     snap["ts"] = stamp
-    queue.QUEUE_SNAPSHOT_PATH.write_text(json.dumps(snap))
+    queue.QUEUE_SNAPSHOT_PATH.write_text(json.dumps(snap), encoding="utf-8")
     host.pending.clear()
     assert queue.restore_pending_from_snapshot() == 1
     assert host.pending[0]["_project_admission_restore_hold"]
@@ -263,9 +263,9 @@ def test_schedule_requires_its_positive_original_no_dispatch_receipt(host, tmp_p
 def test_invalid_independent_snapshot_fence_cannot_be_cleared_by_project_recovery(host, tmp_path, monkeypatch, field):  # noqa: F811
     accepted(host, tmp_path)
     path, original = restore_unreadable(host)
-    snap = json.loads(queue.QUEUE_SNAPSHOT_PATH.read_text())
+    snap = json.loads(queue.QUEUE_SNAPSHOT_PATH.read_text(encoding="utf-8"))
     snap[field] = ["invalid"]
-    queue.QUEUE_SNAPSHOT_PATH.write_text(json.dumps(snap))
+    queue.QUEUE_SNAPSHOT_PATH.write_text(json.dumps(snap), encoding="utf-8")
     host.pending.clear()
     queue.restore_pending_from_snapshot()
     path.write_bytes(original)
@@ -351,9 +351,9 @@ def test_replaced_binding_cannot_authorize_old_snapshot(host, tmp_path, monkeypa
     # Bindings are immutable through the production writer. Inject replacement
     # authority to prove an old snapshot cannot silently overrule it.
     binding_path = registry._bindings_path(host.root)
-    bindings = json.loads(binding_path.read_text())
+    bindings = json.loads(binding_path.read_text(encoding="utf-8"))
     bindings["bindings"]["held"]["project_id"] = "new-room"
-    binding_path.write_text(json.dumps(bindings))
+    binding_path.write_text(json.dumps(bindings), encoding="utf-8")
     sent = worker(host, monkeypatch)
     workers.assign_tasks()
     assert not sent and host.pending[0]["_terminalization_retry"]

@@ -83,7 +83,7 @@ def test_legacy_or_unknown_dispatch_does_not_backfill_on_restore(host, tmp_path,
         queue.restore_pending_from_snapshot()
         workers.assign_tasks()
         assert not sent and host.pending[0]['_project_admission_restore_hold']
-        saved = json.loads(queue.QUEUE_SNAPSHOT_PATH.read_text())['pending'][0]['task']
+        saved = json.loads(queue.QUEUE_SNAPSHOT_PATH.read_text(encoding="utf-8"))['pending'][0]['task']
         if proof == 'absent':
             assert 'admitted_dispatch' not in saved
         else:
@@ -172,7 +172,7 @@ def test_hold_keeps_identity_and_frozen_prepared_resource(host, tmp_path, monkey
     data = json.loads(original)
     row = data['projects'][0]
     row[change] = row.get(change, 0) + 1 if change in {'chat_id', 'routing_generation'} else 'changed'
-    path.write_text(json.dumps(data))
+    path.write_text(json.dumps(data), encoding="utf-8")
     sent = worker(host, monkeypatch)
     workers.assign_tasks()
     if frozen and change in {'routing_generation', 'working_dir'}:

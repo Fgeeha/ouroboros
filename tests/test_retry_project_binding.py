@@ -306,7 +306,7 @@ def test_legacy_retry_rejects_lost_known_room_before_enqueue(qenv, monkeypatch, 
     _bind_root(qenv.drive, identity, "known", ref=ref if evidence == "origin" else None)
     write_task_result(qenv.drive, old_id, STATUS_RUNNING, result="working")
     path = registry._registry_path(qenv.drive)
-    path.write_text('{torn' if failure == "unreadable" else '{"projects": []}')
+    path.write_text('{torn' if failure == "unreadable" else '{"projects": []}', encoding="utf-8")
     requeued, _attempt, reason, suppression = _retry(qenv, root, old_id, new_id)
     assert not requeued and not suppression and reason == "idle_timeout_retry_admission_blocked"
     assert not qenv.q.PENDING and project_binding_for_task(qenv.drive, new_id) is None

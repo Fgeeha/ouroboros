@@ -16,18 +16,18 @@ pytestmark = pytest.mark.serial
 
 def change_row(root, pid, **fields):
     path = registry._registry_path(root)
-    data = json.loads(path.read_text())
+    data = json.loads(path.read_text(encoding="utf-8"))
     for row in data["projects"]:
         if row["id"] == pid:
             row.update(fields)
-    path.write_text(json.dumps(data))
+    path.write_text(json.dumps(data), encoding="utf-8")
 
 
 def drop(root, pid):
     path = registry._registry_path(root)
-    data = json.loads(path.read_text())
+    data = json.loads(path.read_text(encoding="utf-8"))
     data["projects"] = [r for r in data["projects"] if r["id"] != pid]
-    path.write_text(json.dumps(data))
+    path.write_text(json.dumps(data), encoding="utf-8")
 
 
 @pytest.mark.parametrize("selected", [False, True])
@@ -48,9 +48,9 @@ def test_derived_admission_ignores_irrelevant_routing_edits(room, tmp_path, sele
         drop(room.root, "other")
     else:
         path = registry._registry_path(room.root)
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
         data["projects"].reverse()
-        path.write_text(json.dumps(data))
+        path.write_text(json.dumps(data), encoding="utf-8")
     admitted = room.queue.enqueue_task(task(project_id=basis["project_id"], workspace_root=str(folder)), project_admission=basis)
     assert room.pending == [admitted] and not admitted.get("_admission_blocked")
 
@@ -73,9 +73,9 @@ def test_relevant_claim_edits_are_not_laundered(room, tmp_path, change):  # noqa
             registry.update_project(room.root, "target", working_dir=str(folder))
     else:
         path = registry._registry_path(room.root)
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
         data["projects"].reverse()
-        path.write_text(json.dumps(data))
+        path.write_text(json.dumps(data), encoding="utf-8")
     refused = room.queue.enqueue_task(task(), project_admission=basis)
     assert refused["_admission_blocked"] == "project_routing_fence_changed" and not room.pending
 
@@ -92,7 +92,7 @@ def test_invalid_carried_basis_keeps_mixed_restore_and_raw_evidence(room, bad): 
     assert rows["broken"]["_project_admission"] == bad
     assert rows["broken"]["_project_admission_restore_hold"]["reason"] == "project_routing_fence_lookup_failed"
     assert not load_task_result(room.root, "broken")
-    snapshot = json.loads(room.queue.QUEUE_SNAPSHOT_PATH.read_text())
+    snapshot = json.loads(room.queue.QUEUE_SNAPSHOT_PATH.read_text(encoding="utf-8"))
     kept = {r["task"]["id"]: r["task"] for r in snapshot["pending"]}
     assert kept["broken"]["_project_admission"] == bad
     room.pending.clear()
@@ -116,7 +116,7 @@ def test_unreadable_restore_conserves_without_releasing_when_source_recovers(roo
     room.queue.persist_queue_snapshot()
     path = registry._registry_path(room.root)
     original = path.read_bytes()
-    path.write_text("{torn")
+    path.write_text("{torn", encoding="utf-8")
     room.pending.clear()
     room.queue.restore_pending_from_snapshot()
     assert {r["id"] for r in room.pending} == {"held", "main"}
@@ -139,16 +139,19 @@ def test_healthy_display_thread_and_source_identity_survive_malformed_neighbor(r
     registry.stamp_project_thread(room.root, frame)
     assert frame["project_thread"] is True  # Main exclusion used by live/history consumers
     assert registry.task_presentation_snapshot(room.root, "bound")["project_name"] == "Target"
-    # R4: the selected healthy room still admits; only the malformed room's own routing,
-    # every writer and the whole-registry derived-folder census refuse.
+    # Healthy named operations preserve unknown neighbours; target authority and
+    # the whole-registry derived-folder census remain strict.
     assert not room.queue.enqueue_task(task()).get("_admission_blocked")
     assert registry.project_scope_admission(room.root, project_id="target")["project"]["id"] == "target"
     assert room.queue.enqueue_task(task("other-work", project_id="other"))["_admission_blocked"] == (
         "project_routing_fence_lookup_failed")
     with pytest.raises(ValueError):
         registry.project_scope_admission(room.root, workspace_root=str(tmp_path))
-    with pytest.raises(ValueError):
-        registry.update_project(room.root, "target", name="Must not write")
+    raw = json.loads(registry._registry_path(room.root).read_text(encoding="utf-8"))
+    neighbor = next(row for row in raw["projects"] if row["id"] == "other")
+    assert registry.update_project(room.root, "target", name="Updated")["name"] == "Updated"
+    current = json.loads(registry._registry_path(room.root).read_text(encoding="utf-8"))
+    assert next(row for row in current["projects"] if row["id"] == "other") == neighbor
     assert [row["id"] for row in room.pending] == ["attempt"]
 
 
@@ -332,12 +335,12 @@ def test_project_provisioning_does_not_run_before_strict_authority_check(room, t
 
     folder = tmp_path / "owner-folder"
     folder.mkdir()
-    change_row(room.root, "other", routing_generation=[])
+    change_row(room.root, "target", routing_generation=[])
     calls = []
     monkeypatch.setattr("ouroboros.project_sources.attach_snapshot_init", lambda *a, **k: calls.append(True))
     class Request:
         app = SimpleNamespace(state=SimpleNamespace(drive_root=room.root, repo_dir=tmp_path / "repo"))
         async def json(self):
-            return {"id": "new", "name": "New", "path": str(folder), "init_git": True}
+            return {"id": "target", "name": "Target", "path": str(folder), "init_git": True}
     response = asyncio.run(projects.api_projects_create(Request()))
     assert response.status_code >= 400 and not calls and not (folder / ".git").exists()

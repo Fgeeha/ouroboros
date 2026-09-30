@@ -621,10 +621,18 @@ export function createChatInstance({
                 for (const record of children) {
                     if (record.finished || !record.root?.isConnected || record.lastLiveObservedAt > started) continue;
                     const task = tasks.get(record.groupId);
-                    if (task && 'project_admission_hold' in task) restoreCardActivity(record, task.project_admission_hold);
-                    else if (record.projectHold) observeMissingManagedTask(record.groupId);
+                    if (task && 'project_admission_hold' in task) {
+                        missingManagedTaskIds.delete(record.groupId);
+                        restoreCardActivity(record, task.project_admission_hold);
+                        record.projectHoldQueued = Boolean(record.projectHold);
+                    } else if (!task && record.projectHoldQueued) {
+                        record.projectHoldQueued = false;
+                        missingManagedTaskIds.add(record.groupId);
+                        void reconcileMissingManagedTask(record.groupId);
+                    }
                 }
             });
+            syncChatStatus();
         } catch { /* Keep the last fact; absence or a failed read proves no recovery. */ }
         finally { childHoldRead = false; }
     }
@@ -644,9 +652,8 @@ export function createChatInstance({
                 if (activity.required_question) chatDecision.appendActivityQuestion(activity.required_question, snapshotRequestedAt);
                 if (Number(activity.chat_id ?? 1) === chatId) modelWaits.observe(activity.activity_id, activity);
             }
-        } else {
-            syncChatStatus();
         }
+        syncChatStatus();
     }
 
     async function refreshHeaderControlState(force = false) {
@@ -1817,6 +1824,7 @@ export function createChatInstance({
             renderLiveCardTimeline(record);
         }
         cancelableTaskIds.delete(record.groupId);
+        missingManagedTaskIds.delete(record.groupId);
         syncCancelRunButton(record);
         modelWaits.finish(record.groupId);
         // A lost task_done is healed only by refetching; a block nobody sees
@@ -3263,20 +3271,13 @@ export function createChatInstance({
 
     let headerControlInterval = null;
     if (asPanel) {
-        // A panel has no global controls/budget to poll; seed the status from
-        // the live socket and the page's newest snapshot: the one-shot WS
-        // `open` already fired before a late panel existed.
+        // Late panels missed socket open; seed from the socket and latest snapshot.
         hostReady = supervisorReady(stateSnapshots.latest?.()) ?? hostReady;
         const seed = computeDerivedChatStatus({ supervisorStarting: !hostReady });
         if (ws.isConnected?.()) setStatus(seed.kind, seed.text);
-        // 1A a panel created AFTER the socket opened missed the `open`-driven
-        // refresh — hydrate in-flight turns once from the census (the
-        // per-instance closure filters to this panel's chat_id).
-        refreshHeaderControlState(true);
-    } else {
-        refreshHeaderControlState(true);
-        headerControlInterval = setInterval(refreshHeaderControlState, 3000);
-    }
+    } else headerControlInterval = setInterval(refreshHeaderControlState, 3000);
+    // Both Main and late panels hydrate once; each instance filters its chat.
+    refreshHeaderControlState(true);
 
     const typingEl = document.createElement('div');
     // Per-instance id (main stays 'typing-indicator'; panels get a unique id) so
@@ -3505,8 +3506,7 @@ export function createChatInstance({
 
     function revokeManagedTaskCancelAuthority(taskId) {
         cancelableTaskIds.delete(taskId);
-        const record = liveCardRecords.get(taskId);
-        if (record) syncCancelRunButton(record);
+        syncCancelRunButton(liveCardRecords.get(taskId));
     }
 
     async function reconcileMissingManagedTask(taskId, onDomWrite = withStableViewport) {
@@ -3545,6 +3545,7 @@ export function createChatInstance({
                     return changed;
                 }
                 if (cancelPending || (!vouched && !isTerminalTaskDetail(detail))) {
+                    if (currentRecord.isSubagent && detail?.status) missingManagedTaskIds.delete(taskId);
                     return Boolean(reconcileCancelCardFromDetail(currentRecord, taskId, detail) || changed);
                 }
                 if (vouched) return changed;
@@ -3560,7 +3561,7 @@ export function createChatInstance({
 
     function observeMissingManagedTask(taskId, onDomWrite = withStableViewport) {
         const id = taskKey(taskId);
-        if (!id || concludedDirectActivities.has(id)) return;
+        if (!id || concludedDirectActivities.has(id) || subagentChildParents.has(id) || liveCardRecords.get(id)?.isSubagent) return;
         missingManagedTaskIds.add(id);
         void reconcileMissingManagedTask(id, onDomWrite);
     }
@@ -3611,7 +3612,6 @@ export function createChatInstance({
         if (complete) for (const taskId of missingManagedTaskIds) {
             if (!activeDirectActivities.has(taskId)) void reconcileMissingManagedTask(taskId);
         }
-        syncChatStatus();
     }
 
     const isKnownProjectFrame = (msg) => {

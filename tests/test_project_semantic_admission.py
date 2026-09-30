@@ -89,7 +89,7 @@ def test_original_preparation_basis_rejects_semantic_changes(room, change):
         store = room.root / "projects" / "target"
         store.mkdir(parents=True)
         registry.reconcile_projects(room.root)
-        data = json.loads(registry._registry_path(room.root).read_text())
+        data = json.loads(registry._registry_path(room.root).read_text(encoding="utf-8"))
         data["projects"] = [row for row in data["projects"] if row["id"] != "target"]
         registry._save(room.root, data)
         if change == "reconstruct":
@@ -116,16 +116,16 @@ def test_raw_unavailable_authority_is_typed_and_never_normalized_active(room, mo
     elif corruption == "missing_file":
         path.unlink()
     elif corruption == "json":
-        path.write_text("{torn")
+        path.write_text("{torn", encoding="utf-8")
     else:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
         first = data["projects"][0]
         if corruption == "duplicate":
             data["projects"].append(dict(first))
         else:
             first[{"lifecycle": "lifecycle", "generation": "routing_generation", "folder": "working_dir"}[corruption]] = {
                 "lifecycle": "banana", "generation": -1, "folder": {"bad": "path"}}[corruption]
-        path.write_text(json.dumps(data))
+        path.write_text(json.dumps(data), encoding="utf-8")
     refused = room.queue.enqueue_task(task(), project_admission=basis)
     assert refused["_admission_blocked"] == "project_routing_fence_lookup_failed"
     assert refused["_project_lifecycle"] == "" and refused["_admission_detail"]
@@ -198,7 +198,7 @@ def test_mixed_restore_conserves_closed_project_task(room, monkeypatch, write_fa
     if write_failure:
         monkeypatch.setattr(task_admission, "write_task_result", lambda *a, **k: (_ for _ in ()).throw(OSError("synthetic write failure")))
     room.queue.restore_pending_from_snapshot()
-    snapshot = json.loads(room.queue.QUEUE_SNAPSHOT_PATH.read_text())
+    snapshot = json.loads(room.queue.QUEUE_SNAPSHOT_PATH.read_text(encoding="utf-8"))
     kept = {row["task"]["id"]: row["task"] for row in snapshot["pending"]}
     assert "main" in kept
     if write_failure:
@@ -463,7 +463,7 @@ def test_promotion_uses_original_folder_basis_and_cleans_refused_fork(host, tmp_
 
 def test_legacy_registered_binding_is_not_laundered_into_an_unregistered_scope(room):
     registry.bind_task_to_project(room.root, "legacy", "target", origin={"absent": "system"})
-    data = json.loads(registry._registry_path(room.root).read_text())
+    data = json.loads(registry._registry_path(room.root).read_text(encoding="utf-8"))
     data["projects"] = [row for row in data["projects"] if row["id"] != "target"]
     registry._save(room.root, data)
     refused = room.queue.enqueue_task(task("legacy"), restoring_snapshot=True)
@@ -472,7 +472,7 @@ def test_legacy_registered_binding_is_not_laundered_into_an_unregistered_scope(r
 
 
 def test_new_unregistered_api_scope_and_legacy_routing_omissions_remain_supported(room):
-    data = json.loads(registry._registry_path(room.root).read_text())
+    data = json.loads(registry._registry_path(room.root).read_text(encoding="utf-8"))
     for row in data["projects"]:
         for key in ("lifecycle", "routing_generation", "chat_id", "routing_incarnation"):
             row.pop(key, None)
@@ -613,3 +613,89 @@ def test_real_promotion_provisions_healthy_room_beside_malformed_neighbor(host, 
     rows = json.loads(registry._registry_path(host.root).read_text(encoding="utf-8"))["projects"]
     assert next(row for row in rows if row["id"] == "other") == raw
     assert not host.attempts
+
+
+@pytest.mark.parametrize("operation", ["create", "rename", "delete", "folder", "route"])
+def test_named_project_consumers_keep_healthy_neighbor_available(room, tmp_path, monkeypatch, operation):
+    import asyncio
+    from ouroboros.gateway import projects
+    from ouroboros.workspace_admission import room_chat_lens_dir
+    from ouroboros.tools.control_routing import _route_to_project
+    from tests.test_route_to_project import _ctx
+
+    folder = tmp_path / "target-folder"
+    folder.mkdir()
+    registry.update_project(room.root, "target", working_dir=str(folder))
+    raw = corrupt_neighbor(room.root, routing_generation="broken", visible_revision=[1])
+    calls = []
+    monkeypatch.setattr("supervisor.task_lifecycle.start_project_deletion", lambda *a: calls.append(a))
+    monkeypatch.setattr(projects, "_broadcast_projects_changed", lambda *a: None)
+
+    class Request:
+        app = SimpleNamespace(state=SimpleNamespace(drive_root=room.root, repo_dir=tmp_path / "repo"))
+        path_params = {"project_id": "target"}
+
+        async def json(self):
+            return {"id": "fresh-room", "name": "Updated"}
+
+    if operation == "folder":
+        assert room_chat_lens_dir(room.root, "target") == (str(folder), "")
+    elif operation == "route":
+        events = []
+        answer = _route_to_project(_ctx(room.root, events), "target", "Continue", predecessor_task_id="")
+        assert answer.startswith("⚠️ ROUTE_UNCONFIRMED:"), answer
+        assert len(events) == 1 and events[0]["project_id"] == "target"
+    else:
+        handler = {"create": projects.api_projects_create, "rename": projects.api_project_update,
+                   "delete": projects.api_project_delete}[operation]
+        response = asyncio.run(handler(Request()))
+        assert response.status_code == 200, response.body
+        if operation == "delete":
+            assert len(calls) == 1 and calls[0][1] == "target"
+            assert registry.get_reserved_project(room.root, "target", strict=True)["lifecycle"] == "deleting"
+        else:
+            pid = "fresh-room" if operation == "create" else "target"
+            assert registry.get_project(room.root, pid, strict=True)["name"] == "Updated"
+    rows = json.loads(registry._registry_path(room.root).read_text(encoding="utf-8"))["projects"]
+    assert next(row for row in rows if row["id"] == "other") == raw
+
+
+def test_conversion_adopts_origin_room_beside_malformed_neighbor(room, monkeypatch):
+    from tests.test_project_lease_ui_conversion import _convert, _origin_ref, _seed_origin_task, _live_queue, _OWNER_TEXT
+
+    ref = _origin_ref()
+    _seed_origin_task(room.root, "turn", ref)
+    registry.bind_task_to_project(room.root, "origin-root", "target", origin={"ref": ref, "text": _OWNER_TEXT})
+    raw = corrupt_neighbor(room.root, lifecycle=[], working_dir={"unavailable": True})
+    _live_queue(monkeypatch, room.root, {}, [])
+    assert registry.project_id_for_origin(room.root, ref, strict=True) == "target"
+    response = _convert(room.root, "turn")
+    body = json.loads(response.body)
+    assert response.status_code == 200 and body["adopted"] is True, body
+    assert body["project"]["id"] == "target"
+    assert registry.project_binding_for_task(room.root, "turn")["project_id"] == "target"
+    rows = json.loads(registry._registry_path(room.root).read_text(encoding="utf-8"))["projects"]
+    assert {row["id"] for row in rows} == {"target", "other"}
+    assert next(row for row in rows if row["id"] == "other") == raw
+
+
+@pytest.mark.parametrize("corruption", ["target", "identity", "json"])
+def test_named_strict_readers_preserve_refusal_for_relevant_unknown_authority(room, corruption):
+    from tests.test_project_lease_ui_conversion import _origin_ref, _OWNER_TEXT
+
+    ref = _origin_ref()
+    registry.bind_task_to_project(room.root, "bound", "target", origin={"ref": ref, "text": _OWNER_TEXT})
+    path = registry._registry_path(room.root)
+    rows = json.loads(path.read_text(encoding="utf-8"))
+    if corruption == "target":
+        rows["projects"][0]["routing_generation"] = "broken"
+    elif corruption == "identity":
+        rows["projects"][1]["chat_id"] = rows["projects"][0]["chat_id"]
+    path.write_text("{torn" if corruption == "json" else json.dumps(rows), encoding="utf-8")
+    before = path.read_bytes()
+    for read in (lambda: registry.get_project(room.root, "target", strict=True),
+                 lambda: registry.get_reserved_project(room.root, "target", strict=True),
+                 lambda: registry.project_id_for_origin(room.root, ref, strict=True)):
+        with pytest.raises(ValueError):
+            read()
+        assert path.read_bytes() == before

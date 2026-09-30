@@ -43,7 +43,7 @@ def test_known_none_recovers_same_id_after_bindings_outage(host, monkeypatch, pr
     assert queue.persist_queue_snapshot()
     path = registry._bindings_path(host.root)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("{torn")
+    path.write_text("{torn", encoding="utf-8")
     host.pending.clear()
     queue.restore_pending_from_snapshot()
     sent = worker(host, monkeypatch)
@@ -53,8 +53,8 @@ def test_known_none_recovers_same_id_after_bindings_outage(host, monkeypatch, pr
     assert queue.persist_queue_snapshot()
     host.pending.clear()
     queue.restore_pending_from_snapshot()
-    path.write_text('{"bindings": {}}')
-    registry._registry_path(host.root).write_text("{still torn")
+    path.write_text('{"bindings": {}}', encoding="utf-8")
+    registry._registry_path(host.root).write_text("{still torn", encoding="utf-8")
     workers.assign_tasks()
     workers.assign_tasks()
     assert [row["id"] for row in sent] == [original["id"]]
@@ -69,10 +69,10 @@ def test_unscoped_producers_preserve_absence_and_stale_restore_policy(host, prod
     assert "_project_admission" not in row
     assert "_project_admission" not in load_task_result(host.root, "main")
     assert queue.persist_queue_snapshot()
-    snap = json.loads(queue.QUEUE_SNAPSHOT_PATH.read_text())
+    snap = json.loads(queue.QUEUE_SNAPSHOT_PATH.read_text(encoding="utf-8"))
     assert "_project_admission" not in snap["pending"][0]["task"]
     snap["ts"] = "2000-01-01T00:00:00Z"
-    queue.QUEUE_SNAPSHOT_PATH.write_text(json.dumps(snap))
+    queue.QUEUE_SNAPSHOT_PATH.write_text(json.dumps(snap), encoding="utf-8")
     host.pending.clear()
     queue.restore_pending_from_snapshot()
     assert not host.pending
@@ -135,9 +135,9 @@ def test_old_main_snapshot_cannot_replay_after_handoff(host, monkeypatch):  # no
     queue.RUNNING.clear()
     workers.WORKERS[0].busy_task_id = None
     queue.QUEUE_SNAPSHOT_PATH.write_bytes(old)
-    registry._bindings_path(host.root).write_text("{torn")
+    registry._bindings_path(host.root).write_text("{torn", encoding="utf-8")
     queue.restore_pending_from_snapshot()
-    registry._bindings_path(host.root).write_text('{"bindings": {}}')
+    registry._bindings_path(host.root).write_text('{"bindings": {}}', encoding="utf-8")
     workers.assign_tasks()
     assert len(sent) == 1
 
@@ -151,7 +151,7 @@ def test_corrupt_registry_keeps_main_dialogue_available(tmp_path, monkeypatch, p
     chat_id = project["chat_id"] if project_room else 1
     direct, receipts = [], []
     ctx = _ctx(tmp_path, direct=lambda *_a, **_k: direct.append(True))
-    registry._registry_path(tmp_path).write_text("{torn")
+    registry._registry_path(tmp_path).write_text("{torn", encoding="utf-8")
     monkeypatch.setattr("ouroboros.server_owner_routing.threading", SimpleNamespace(Thread=_ImmediateThread))
     class Bridge:
         def get_updates(self, **_kwargs):
@@ -182,7 +182,7 @@ def test_main_steers_healthy_foreign_task_despite_corrupt_registry(host, monkeyp
     if project_room:
         issuer.current_chat_id = project["chat_id"]
         issuer.task_metadata["origin_message_ref"]["chat_id"] = project["chat_id"]
-    registry._registry_path(host.root).write_text("{torn")
+    registry._registry_path(host.root).write_text("{torn", encoding="utf-8")
     _steer_task(issuer, "t-target", "Continue original task")
     assert drain_owner_messages(host.root, "t-target") == ([] if project_room else ["Continue original task"])
 
@@ -192,7 +192,7 @@ def test_main_steers_healthy_foreign_task_despite_corrupt_registry(host, monkeyp
 def test_fresh_main_admission_distinguishes_irrelevant_registry_from_unknown_scope(host, producer, authority):  # noqa: F811
     registry.create_project(host.root, "neighbor")
     path = registry._registry_path(host.root) if authority == "registry" else registry._bindings_path(host.root)
-    path.write_text("{torn")
+    path.write_text("{torn", encoding="utf-8")
     if authority == "registry":
         row = admit_main(host, producer)
         assert row["_project_scope_none"] is True and row["admitted_dispatch"] == "none"
@@ -289,7 +289,9 @@ def test_unscoped_possible_handoff_never_replays_with_healthy_bindings(host, mon
     workers.assign_tasks()
     workers.assign_tasks()
     assert len(sent) == 1 and not host.attempts
-    assert project_hold_fact(host.pending[0])["label"] == "Waiting for task scope verification"
+    hold = project_hold_fact(host.pending[0])
+    assert hold["reason"] == "project_dispatch_unconfirmed"
+    assert hold["label"] == "Waiting: previous run unconfirmed"
 
 
 @pytest.mark.parametrize("producer", ["promotion", "api"])
@@ -339,7 +341,7 @@ def test_host_producer_row_recovers_once_after_bindings_fault(host, monkeypatch,
     assert queue.persist_queue_snapshot()
     path = registry._bindings_path(host.root)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("{torn")
+    path.write_text("{torn", encoding="utf-8")
     host.pending.clear()
     queue.restore_pending_from_snapshot()
     sent = worker(host, monkeypatch)
@@ -347,13 +349,13 @@ def test_host_producer_row_recovers_once_after_bindings_fault(host, monkeypatch,
     assert not sent and host.pending[0]["_project_admission_restore_hold"]
     assert host.pending[0]["_queue_seq"] > 0 and host.pending[0]["queued_at"]  # order survives the hold
     if veto == "unreadable":
-        (host.root / "task_results" / f"{tid}.json").write_text("{torn")
+        (host.root / "task_results" / f"{tid}.json").write_text("{torn", encoding="utf-8")
     elif veto == "possible":
         write_task_result(host.root, tid, "scheduled", admitted_dispatch="possible")
     elif veto == "legacy":
         for key in ("_project_scope_none", "admitted_dispatch"):
             host.pending[0].pop(key)
-    path.write_text('{"bindings": {}}')
+    path.write_text('{"bindings": {}}', encoding="utf-8")
     workers.assign_tasks()
     workers.assign_tasks()
     assert [task["id"] for task in sent] == ([] if veto else [tid]) and not host.attempts
@@ -400,7 +402,7 @@ def _registry_fault(root, fault):
     """After its first commit the registry becomes unreadable (torn) or absent (missing)."""
     path = registry._registry_path(root)
     if fault == "torn":
-        path.write_text("{torn")
+        path.write_text("{torn", encoding="utf-8")
     elif fault == "missing":
         path.unlink()
 

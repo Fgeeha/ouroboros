@@ -93,3 +93,92 @@ test('nested wait keeps the host cause as text and clears it only on a recovery 
     assert.equal(card.projectHoldDetail, '');
     assert.equal(desiredLiveCardPhase(card).text, 'Working');
 });
+
+test('held children do not claim room activity, while a real working sibling still does', () => {
+    const activities = computeHydratedDirectActivities(new Map(), [held], 7);
+    const root = { groupId: 'same-id', root: { isConnected: true }, projectHold: hold.label };
+    const child = { groupId: 'child', isSubagent: true, root: { isConnected: true }, projectHold: hold.label };
+    assert.equal(computeDerivedChatStatus(chatStatusCounts(activities, [root, child])).text, hold.label);
+    assert.equal(computeDerivedChatStatus(chatStatusCounts(new Map(), [child])).text, hold.label);
+    const sibling = { groupId: 'sibling', root: { isConnected: true } };
+    assert.equal(computeDerivedChatStatus(chatStatusCounts(activities, [root, child, sibling])).text, 'Working...');
+    child.projectHold = '';
+    assert.equal(computeDerivedChatStatus(chatStatusCounts(activities, [root, child])).text, 'Working...');
+});
+
+test('actual child queue hydration refreshes room status once and reconciles departure without polling reviews', async () => {
+    const { createChatInstance } = await import('../modules/chat.js');
+    const { installDom, restoreDom, walkCard } = await import('./chat_dom_fixture.js');
+    const settle = () => new Promise(resolve => setImmediate(resolve));
+    let queue = { pending: [{ id: 'child', task: { project_admission_hold: {} } }], running: [] };
+    let detailStatus = 'running';
+    const reads = [];
+    const { prior, mount } = installDom(async url => {
+        url = String(url);
+        if (url === '/api/tasks?queue_only=1') return { ok: true, json: async () => ({ queue }) };
+        if (url.startsWith('/api/tasks/')) {
+            reads.push(url);
+            return { ok: true, json: async () => ({ task_id: url.split('/').at(-1), status: detailStatus }) };
+        }
+        return { ok: true, json: async () => url.startsWith('/api/chat/history')
+            ? { messages: [] } : { active_direct_turns: [] } };
+    });
+    const handlers = new Map();
+    const ws = { on(type, fn) { handlers.set(type, fn); return () => handlers.delete(type); },
+        isConnected: () => true, send() {} };
+    let instance;
+    try {
+        instance = createChatInstance({ ws, state: { activePage: 'chat', projectChatIds: new Set(), unreadCount: 0 },
+            updateUnreadBadge() {}, stateSnapshots: { gate: async () => ({}), isCurrent: () => true, apply() {} },
+            chatId: 7, idPrefix: 'chat', mountEl: mount, asPanel: true });
+        await instance.refreshHistory({ revision: 1 });
+        const frame = (id, fields = {}) => handlers.get('chat')({ chat_id: 7, role: 'assistant', is_progress: true,
+            task_id: id, content: 'Inspecting sources', ts: '2026-09-30T10:00:00Z', ...fields });
+        frame('same-id');
+        const childFrame = id => frame(id, { delegation_role: 'subagent', subagent_event: 'scheduled',
+            subagent_task_id: id, parent_task_id: 'same-id', root_task_id: 'same-id', subagent_role: 'reader' });
+        childFrame('child');
+        const snapshot = () => instance.hydrateStateSnapshot({ active_chat_activities: [held],
+            active_chat_activities_complete: true, supervisor_ready: true });
+        const status = () => globalThis.document.byId.get('chat-status').textContent;
+        snapshot(); await settle();
+        assert.equal(status(), 'Working...', 'the child has not entered its hold yet');
+        queue.pending[0].task.project_admission_hold = hold;
+        snapshot();
+        assert.equal(status(), 'Working...', 'the snapshot finishes before its queue read');
+        await settle();
+        assert.equal(status(), hold.label, 'the async queue response refreshes the header without another snapshot');
+        const messages = globalThis.document.byId.get('chat-messages');
+        const child = walkCard(messages, 'child');
+        assert.equal(child.querySelector('[data-live-phase]').textContent, hold.label);
+        frame('working-sibling');
+        assert.equal(status(), 'Working...', 'independent working card keeps room activity');
+        handlers.get('log')({ chat_id: 7, data: { type: 'task_done', task_id: 'working-sibling', status: 'cancelled' } });
+
+        childFrame('review-child');
+        queue.running.push({ id: 'review-child', task: { project_admission_hold: {} } });
+        handlers.get('chat')({ chat_id: 7, role: 'system', system_type: 'skill_review', task_id: 'review-child',
+            review_group: { surface: 'skill', id: 'task:review-child:alpha', presentation_owner_task_id: 'review-child',
+                skill: 'alpha', status: 'clean', attempts: [{ job_id: 'job-child', skill: 'alpha', status: 'clean' }] } });
+        for (let pass = 0; pass < 3; pass++) { snapshot(); await settle(); }
+        assert.equal(reads.filter(url => url === '/api/tasks/review-child').length, 0,
+            'an ordinary child review never joins root-census absence reconciliation');
+
+        queue.pending = [];
+        snapshot(); await settle();
+        assert.equal(reads.filter(url => url === '/api/tasks/child').length, 1, 'held queue departure reads detail once');
+        for (let pass = 0; pass < 3; pass++) { snapshot(); await settle(); }
+        assert.equal(reads.filter(url => url === '/api/tasks/child').length, 1,
+            'a current nonterminal answer retires missing membership without inventing hold recovery');
+        assert.equal(child.querySelector('[data-live-phase]').textContent, hold.label);
+        queue.pending = [{ id: 'child', task: { project_admission_hold: hold } }];
+        snapshot(); await settle();
+        queue.pending = [];
+        detailStatus = 'cancelled';
+        snapshot(); await settle();
+        assert.equal(reads.filter(url => url === '/api/tasks/child').length, 2, 'a new queue departure is a new observation');
+        assert.equal(child.dataset.finished, '1', 'terminal detail heals a missing terminal frame');
+        for (let pass = 0; pass < 3; pass++) { snapshot(); await settle(); }
+        assert.equal(reads.filter(url => url === '/api/tasks/child').length, 2);
+    } finally { instance?.destroy(); restoreDom(prior); }
+});

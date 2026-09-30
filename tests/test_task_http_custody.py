@@ -135,7 +135,7 @@ def test_cancelled_create_settles_original_admission(tmp_path, monkeypatch, mode
         assert [item["id"] for item in pending] == ["custody"] and child.is_dir()
         assert row is None
         assert [reason for reason, _ in snapshots] == ["api_task_create"]
-        assert all(pathlib.Path(item["abs_path"]).read_text() == "complete input"
+        assert all(pathlib.Path(item["abs_path"]).read_text(encoding="utf-8") == "complete input"
                    for item in captured if item.get("status") == "staged")
         assert queue.reserve_task_admission("custody", "other", drive_root=data)["reason"] == "duplicate_task_id"
     else:

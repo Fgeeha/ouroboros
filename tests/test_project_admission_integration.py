@@ -50,7 +50,7 @@ def test_bare_promotion_checks_scope_before_drive_effects(host, tmp_path, monkey
     if authority != "missing":
         registry.create_project(host.root, "unrelated")
     if authority == "malformed":
-        path.write_text("{torn")
+        path.write_text("{torn", encoding="utf-8")
     if authority == "unreadable":
         original_open = type(path).open
         def denied(self, *args, **kwargs):
@@ -88,7 +88,7 @@ def test_explicit_promotion_cannot_write_into_replacement_incarnation(host, tmp_
     resolve = workspace_admission.resolve_room_workspace
     def replace(*args, **kwargs):
         resolved = resolve(*args, **kwargs)
-        registry._registry_path(host.root).write_text('{"projects": []}')
+        registry._registry_path(host.root).write_text('{"projects": []}', encoding="utf-8")
         registry.create_project(host.root, "target")
         return resolved
     monkeypatch.setattr(workspace_admission, "resolve_room_workspace", replace)
@@ -213,7 +213,7 @@ def test_conversion_rollback_restores_scope_and_exact_carrier(host, tmp_path, mo
     assert marked[0]["project_id"] == "chosen"
     assert marked[0]["_project_admission"]["project"]["id"] == "chosen"
     assert response.status_code >= 400 and prepared == before
-    saved = json.loads(queue.QUEUE_SNAPSHOT_PATH.read_text())["pending"][0]["task"]
+    saved = json.loads(queue.QUEUE_SNAPSHOT_PATH.read_text(encoding="utf-8"))["pending"][0]["task"]
     assert saved["project_id"] == before["project_id"]
     assert ("_project_admission" in saved) == ("_project_admission" in before)
     assert saved.get("_project_admission") == before.get("_project_admission")
@@ -233,19 +233,19 @@ def test_project_hold_survives_early_restore_pruning(host, tmp_path, timestamp, 
         prepared = queue.enqueue_task({"id": "held", "type": "task", "text": "Work",
                                       "project_id": "chosen", "chat_id": 1})
     assert queue.persist_queue_snapshot()
-    registry._registry_path(host.root).write_text("{torn")
+    registry._registry_path(host.root).write_text("{torn", encoding="utf-8")
     host.pending.clear()
     queue.restore_pending_from_snapshot()
     [held] = host.pending
     assert held["_project_admission_restore_hold"]
     if schedule:
-        (host.root / "task_results" / (prepared["id"] + ".json")).write_text("{torn")
-    snapshot = json.loads(queue.QUEUE_SNAPSHOT_PATH.read_text())
+        (host.root / "task_results" / (prepared["id"] + ".json")).write_text("{torn", encoding="utf-8")
+    snapshot = json.loads(queue.QUEUE_SNAPSHOT_PATH.read_text(encoding="utf-8"))
     if timestamp == "absent":
         snapshot.pop("ts", None)
     else:
         snapshot["ts"] = "2000-01-01T00:00:00Z" if timestamp == "old" else "invalid"
-    queue.QUEUE_SNAPSHOT_PATH.write_text(json.dumps(snapshot))
+    queue.QUEUE_SNAPSHOT_PATH.write_text(json.dumps(snapshot), encoding="utf-8")
     host.pending.clear()
     assert queue.restore_pending_from_snapshot() == 1
     [retained] = host.pending
@@ -254,7 +254,7 @@ def test_project_hold_survives_early_restore_pruning(host, tmp_path, timestamp, 
     assert retained["_project_admission_restore_hold"] == held["_project_admission_restore_hold"]
     assert not retained.get("_terminalization_retry")
     assert queue.persist_queue_snapshot(reason="startup")
-    assert json.loads(queue.QUEUE_SNAPSHOT_PATH.read_text())["pending"][0]["task"]["id"] == prepared["id"]
+    assert json.loads(queue.QUEUE_SNAPSHOT_PATH.read_text(encoding="utf-8"))["pending"][0]["task"]["id"] == prepared["id"]
 
 
 @pytest.mark.parametrize("present", [False, True])
@@ -267,7 +267,7 @@ def test_absent_and_historical_null_carriers_remain_distinct(host, present):  # 
         raw["_project_admission"] = None
     host.pending.append(raw)
     assert queue.persist_queue_snapshot()
-    saved = json.loads(queue.QUEUE_SNAPSHOT_PATH.read_text())["pending"][0]["task"]
+    saved = json.loads(queue.QUEUE_SNAPSHOT_PATH.read_text(encoding="utf-8"))["pending"][0]["task"]
     assert ("_project_admission" in saved) == present
     host.pending.clear()
     queue.restore_pending_from_snapshot()
@@ -300,9 +300,9 @@ def test_project_hold_keeps_terminal_and_cancel_authority_independent(host, tmp_
     row = admit(host, tmp_path)
     row["_project_admission_restore_hold"] = {"reason": "project_routing_fence_lookup_failed"}
     assert queue.persist_queue_snapshot()
-    snapshot = json.loads(queue.QUEUE_SNAPSHOT_PATH.read_text())
+    snapshot = json.loads(queue.QUEUE_SNAPSHOT_PATH.read_text(encoding="utf-8"))
     snapshot["ts"] = "2000-01-01T00:00:00Z"
-    queue.QUEUE_SNAPSHOT_PATH.write_text(json.dumps(snapshot))
+    queue.QUEUE_SNAPSHOT_PATH.write_text(json.dumps(snapshot), encoding="utf-8")
     if ending == "cancel_intent":
         request_cancel(host.root, row["id"], reason="owner stopped")
     else:
@@ -317,7 +317,7 @@ def test_historical_null_does_not_acquire_a_replacement_room_identity(host):  # 
 
     original = registry.create_project(host.root, "chosen")
     registry.bind_task_to_project(host.root, "legacy", "chosen", origin={"absent": "system"})
-    registry._registry_path(host.root).write_text('{"projects": []}')
+    registry._registry_path(host.root).write_text('{"projects": []}', encoding="utf-8")
     replacement = registry.create_project(host.root, "chosen")
     assert original["routing_incarnation"] != replacement["routing_incarnation"]
     host.pending.extend([
@@ -346,4 +346,4 @@ def test_main_promotion_preserves_absence_in_queue_snapshot_and_result(host):  #
     assert "_project_admission" not in result
     assert "_project_admission" not in host.pending[0]
     assert "_project_admission" not in load_task_result(host.root, "main")
-    assert "_project_admission" not in json.loads(queue.QUEUE_SNAPSHOT_PATH.read_text())["pending"][0]["task"]
+    assert "_project_admission" not in json.loads(queue.QUEUE_SNAPSHOT_PATH.read_text(encoding="utf-8"))["pending"][0]["task"]

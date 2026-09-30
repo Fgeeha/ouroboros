@@ -16,7 +16,9 @@ pytestmark = pytest.mark.serial
 
 
 @pytest.mark.parametrize("change", ["own_cas", "occupied", "rebind", "aba", "write_before", "write_after", "no_update"])
-def test_explicit_promotion_carries_only_confirmed_own_folder_basis(host, tmp_path, monkeypatch, change):  # noqa: F811
+@pytest.mark.parametrize("held", [False, True])
+def test_explicit_promotion_carries_only_confirmed_own_folder_basis(host, tmp_path, monkeypatch, change, held):  # noqa: F811
+    """Optional room-default publication cannot retarget an explicitly chosen resource."""
     from supervisor.events_project_routing import _handle_promote_chat_to_task
 
     explicit, other = tmp_path / "explicit", tmp_path / "other"
@@ -52,23 +54,53 @@ def test_explicit_promotion_carries_only_confirmed_own_folder_basis(host, tmp_pa
     prepared = copy.deepcopy(host.pending[0])
     assert prepared["workspace_root"] == str(explicit)
     assert prepared["_project_admission"]["frozen"] is True
-    path, committed = restore_unreadable(host)
-    path.write_bytes(committed)
+    # A refused or unconfirmed write cannot replace the captured room facts.
+    expected = (registry.project_admission_view(host.root, "target", frozen=True)
+                if change in {"own_cas", "occupied"} else original)
+    assert prepared["_project_admission"]["project"] == expected["project"]
+    if held:
+        path, committed = restore_unreadable(host)
+        path.write_bytes(committed)
     sent = worker(host, monkeypatch)
     workers.assign_tasks()
     workers.assign_tasks()
-    if change in {"rebind", "aba", "write_after"}:
-        assert not sent
-        assert prepared["_project_admission"]["project"] == original["project"]
-        assert load_task_result(host.root, "explicit")["status"] == "failed"
-    else:
-        assert [row["id"] for row in sent] == ["explicit"]
-        assert sent[0]["workspace_root"] == str(explicit)
-        assert sent[0]["drive_root"] == prepared["drive_root"]
-        assert sent[0]["_project_admission"] == prepared["_project_admission"]
-        expected = registry.project_admission_view(host.root, "target", frozen=True)
-        assert prepared["_project_admission"]["project"] == expected["project"]
+    assert [row["id"] for row in sent] == ["explicit"]
+    for key in ("id", "project_id", "chat_id", "workspace_root", "drive_root", "text", "_project_admission"):
+        assert sent[0][key] == prepared[key]
+    assert load_task_result(host.root, "explicit")["status"] == "running"
     assert not host.attempts
+
+
+@pytest.mark.parametrize("change", ["deletion", "incarnation"])
+def test_explicit_promotion_still_refuses_identity_loss_during_optional_folder_write(host, tmp_path, monkeypatch, change):  # noqa: F811
+    from supervisor.events_project_routing import _handle_promote_chat_to_task
+
+    explicit = tmp_path / "explicit"
+    explicit.mkdir()
+    original = registry.create_project(host.root, "target")
+    update = registry.update_project
+
+    def at_cas(*args, **kwargs):
+        if kwargs.get("only_if_empty") == ("working_dir",):
+            if change == "deletion":
+                registry.begin_project_deletion(host.root, "target")
+            else:
+                registry._registry_path(host.root).write_text('{"projects": []}', encoding="utf-8")
+                registry.create_project(host.root, "target")
+        return update(*args, **kwargs)
+
+    monkeypatch.setattr(registry, "update_project", at_cas)
+    answer = _handle_promote_chat_to_task({
+        "task_id": "explicit", "routing_token": "explicit-token", "objective": "Use the explicit folder",
+        "project_id": "target", "workspace_root": str(explicit), "chat_id": 1,
+    }, host.ctx)
+    assert answer["reason"] == ("project_routing_fence" if change == "deletion" else "project_routing_fence_changed")
+    assert not host.pending and not queue.ADMISSION_RESERVATIONS and not host.attempts
+    current = registry.get_reserved_project(host.root, "target")
+    assert current["working_dir"] == ""  # The failed optional write touched no replacement room.
+    if change == "incarnation":
+        assert current["routing_incarnation"] != original["routing_incarnation"]
+    assert load_task_result(host.root, "explicit")["admission_outcome"] == "never_admitted"
 
 
 @pytest.mark.parametrize("worker_count", [1, 3])
