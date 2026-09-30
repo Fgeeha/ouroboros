@@ -261,10 +261,16 @@ def skip_on_provider_environmental_error(
         print(f"[{provider_id}] HTTP {status} body: {safe_body[:500]}", file=sys.stderr)
     if classification.kind is ProviderFailureKind.INCONCLUSIVE:
         detail = safe_body[:200] if safe_body else safe_message[:200]
-        pytest.skip(
-            f"[{provider_id}] inconclusive provider alarm "
-            f"({classification.reason}): {detail}"
-        )
+        try:
+            pytest.skip(
+                f"[{provider_id}] inconclusive provider alarm "
+                f"({classification.reason}): {detail}"
+            )
+        except pytest.skip.Exception as skipped:
+            # Carry the existing decision across pytest's outcome wrapper.
+            skipped.provider_failure_classification = classification
+            skipped.provider_failure_exception_type = type(exc).__name__
+            raise
 
 
 def official_provider_integration_job():

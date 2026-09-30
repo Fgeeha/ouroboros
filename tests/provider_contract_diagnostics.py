@@ -145,10 +145,15 @@ class ProviderEvidence:
             self.errors.append({"stage": event, "error_type": type(exc).__name__})
 
     def error_facts(self, error):
-        from tests.provider_contract_ci import classify_provider_failure
-        classification = classify_provider_failure(self.canary.canary_id, error)
+        from tests.provider_contract_ci import ProviderFailureClassification, classify_provider_failure
+        classification = getattr(error, "provider_failure_classification", None)
+        preserved_classification = isinstance(classification, ProviderFailureClassification)
+        if not preserved_classification:
+            classification = classify_provider_failure(self.canary.canary_id, error)
         result = {"exception_type": type(error).__name__, "classification": classification.kind.value,
                   "reason": classification.reason, "status_code": classification.status_code}
+        if preserved_classification:
+            result["originating_exception_type"] = error.provider_failure_exception_type
         # Only host-authored typed violations, never arbitrary assertion/HTTP text.
         if isinstance(error, AssertionError) and error.args and isinstance(error.args[0], dict):
             for key in ("provider_contract_violation", "semantic_empty_provider_response"):
@@ -231,6 +236,8 @@ class ProviderEvidence:
                 basis="persisted_post_transform_public_projection")
         except Exception as exc:
             result["physical_request"] = _unavailable("physical_request_unavailable", exc)
+            self.errors.append({"stage": "physical_request", "attempt_id": attempt_id,
+                                "error_type": type(exc).__name__})
         try:
             manifest, payload, _ = read_call_payload(self.root, task_id=self.task_id,
                                                     call_id=f"physical_{attempt_id}_stream")
@@ -247,6 +254,8 @@ class ProviderEvidence:
         except Exception as exc:
             result["received_tool_fields"] = _unavailable("stream_projection_unavailable", exc)
             result.setdefault("partial_assembly", _unavailable("retained_stream_unavailable", exc))
+            self.errors.append({"stage": "stream_projection", "attempt_id": attempt_id,
+                                "error_type": type(exc).__name__})
         return result
 
     def finish(self, *, outcome, error=None):
@@ -285,6 +294,8 @@ class ProviderEvidence:
             failure = record["error"]
             record["classification"] = failure["reason"]
             record["violation"] = failure.get("provider_contract_violation", {}).get("violation")
+            if "semantic_empty_provider_response" in failure:
+                record["violation"] = "semantic_empty_provider_response"
         if outcome != "passed" or any(item["detail_retained"] for item in attempts):
             record["logical_expected"] = self.expected or _unavailable("canary_not_dispatched")
         if not attempts:

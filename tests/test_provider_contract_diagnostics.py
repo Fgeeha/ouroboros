@@ -119,6 +119,17 @@ def _physical(record, logical=0, physical=0):
     return record["attempts"][logical]["physical_attempts"][physical]
 
 
+def _summary(evidence, record):
+    from tests.ci_evidence import render_summary, write_json
+    outcome = record["outcome"]
+    write_json(evidence.directory / "results.json", {"reports": [{
+        "nodeid": evidence.nodeid, "phase": "call", "outcome": outcome,
+        "canary_id": evidence.canary.canary_id}], "session_exit_code": 1 if outcome == "failed" else 0})
+    return render_summary(evidence.directory,
+        producer_outcome="failure" if outcome == "failed" else "success",
+        artifact_outcome="success", artifact_url="https://github.com/example/artifact")
+
+
 @pytest.mark.parametrize("change,violation", [
     (lambda value: {"prompt": value["prompt"]}, "arguments_exact_keys"),
     (lambda value: {**value, "retry_of": "", "max_seconds": 0}, "arguments_exact_keys"),
@@ -176,6 +187,8 @@ def test_ordinary_success_retains_no_payloads(evidence):
     assert error is None and "logical_expected" not in record
     assert not record["attempts"][0]["detail_retained"]
     assert "physical_attempts" not in record["attempts"][0]
+    assert record["diagnostics_errors"] == []
+    assert "diagnostics_incomplete" not in _summary(evidence, record)
 
 
 def test_continuation_keeps_separate_request_and_nonstream_gap(evidence):
@@ -188,6 +201,8 @@ def test_continuation_keeps_separate_request_and_nonstream_gap(evidence):
     assert record["error"]["provider_contract_violation"]["violation"] == "continuation_marker"
     assert _physical(record, 1)["received_tool_fields"]["reason"] == "original_body_unavailable"
     assert record["logical_expected"]["value"]["final_marker"] == f"FULL_REGISTRY_CONTINUED_{NONCE}"
+    assert record["diagnostics_errors"] == []
+    assert "diagnostics_incomplete" not in _summary(evidence, record)
 
 
 def test_partial_stream_retains_assembly_without_unsafe_fragments_or_resend(evidence):
@@ -224,6 +239,8 @@ def test_secret_across_fragments_is_not_reconstructible(evidence, secret):
     assert secret not in encoded and a not in encoded and b not in encoded
     assert _physical(record)["received_tool_fields"]["reason"] == "tool_fields_require_redaction; fragments_omitted"
     assert "***" in encoded and "provider-contract-canary" in encoded
+    assert record["diagnostics_errors"] == []
+    assert "diagnostics_incomplete" not in _summary(evidence, record)
 
 
 def test_large_safe_payload_complete_and_projection_digest_matches(evidence):
@@ -309,18 +326,36 @@ def test_missing_credential_lifecycle_records_skip_without_dispatch(evidence, mo
     assert record["physical_evidence"]["reason"] == "canary_not_dispatched"
 
 
-def test_corrupt_recorded_blob_is_a_gap_and_does_not_replace_red(evidence, monkeypatch):
+@pytest.mark.parametrize("stage", ["physical_request", "stream_projection"])
+def test_corrupt_recorded_blob_is_a_gap_and_does_not_replace_red(evidence, monkeypatch, stage):
     from ouroboros import observability
+    client = PhysicalClient([_wire({"prompt": "wrong"})])
+    initial, error = _run(evidence, client)
+    attempt_id = initial["attempts"][0]["attempt_ids"][0]
+    if stage == "physical_request":
+        manifest, _payload, _ = observability.read_call_payload(
+            evidence.root, task_id=evidence.task_id, call_id=attempt_id)
+        target_ref = manifest["redacted_projection_ref"]
+    else:
+        _manifest, payload, _ = observability.read_call_payload(
+            evidence.root, task_id=evidence.task_id, call_id=f"physical_{attempt_id}_stream")
+        target_ref = payload["private_wire_ref"]
     original = observability.read_blob_ref
     def broken(root, ref, **kwargs):
-        if ref.get("kind") == "json":
+        if ref["sha256"] == target_ref["sha256"]:
             raise ValueError("private-corruption-message")
         return original(root, ref, **kwargs)
     monkeypatch.setattr(observability, "read_blob_ref", broken)
-    record, error = _run(evidence, PhysicalClient([_wire({"prompt": "wrong"})]))
-    assert isinstance(error, AssertionError)
-    assert _physical(record)["physical_request"]["status"] == "unavailable"
-    assert "private-corruption-message" not in json.dumps(record)
+    evidence.directory = evidence.directory / "corrupt"
+    path = evidence.finish(outcome="failed", error=error)
+    record = json.loads(path.read_text(encoding="utf-8"))
+    assert isinstance(error, AssertionError) and client.sends == 1
+    view = "physical_request" if stage == "physical_request" else "received_tool_fields"
+    assert _physical(record)[view]["status"] == "unavailable"
+    assert record["diagnostics_errors"] == [{"stage": stage, "attempt_id": attempt_id, "error_type": "ValueError"}]
+    summary = _summary(evidence, record)
+    assert "diagnostics_incomplete" in summary and "Producer step: **failure**" in summary
+    assert "private-corruption-message" not in json.dumps(record) + summary
 
 
 def test_observer_failure_changes_neither_send_count_nor_original_assertion(evidence):
@@ -364,3 +399,72 @@ def test_multiple_physical_ids_in_single_call_do_not_hide_earlier_attempt(eviden
     assert record["attempts"][0]["detail_retained"]
     first_args = _physical(record)["partial_assembly"]["value"]["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
     assert json.loads(first_args) == {"prompt": "first"}
+
+
+@pytest.mark.parametrize("status,reason,outcome", [
+    (429, "rate_limit_429", "skipped"),
+    (503, "provider_5xx", "skipped"),
+    (400, "provider_contract_or_unclassified", "failed"),
+])
+def test_integration_skip_context_and_summary_preserve_original_classification(
+    evidence, monkeypatch, status, reason, outcome,
+):
+    import httpx
+    from tests import test_provider_integration
+    error = httpx.HTTPStatusError("synthetic unavailable", request=httpx.Request("POST", "https://provider.invalid"),
+                                  response=httpx.Response(status, text="synthetic unavailable"))
+    calls = []
+    class Client:
+        def chat(self, **kwargs):
+            calls.append(kwargs)
+            raise error
+    monkeypatch.setenv(CANARY.credential_env, "public-test-key")
+    monkeypatch.setattr(test_provider_integration, "_get_llm_client", Client)
+    request = SimpleNamespace(config=SimpleNamespace(option=SimpleNamespace(ci_evidence_dir=str(evidence.directory))),
+                              node=SimpleNamespace(nodeid=evidence.nodeid))
+    expected_exception = pytest.skip.Exception if outcome == "skipped" else httpx.HTTPStatusError
+    with pytest.raises(expected_exception) as caught:
+        test_provider_integration.test_full_registry_provider_contract(CANARY, full_registry_canary_tools(), request)
+    if outcome == "failed":
+        assert caught.value is error
+    record = json.loads(next(evidence.directory.glob("provider-*.json")).read_text(encoding="utf-8"))
+    assert len(calls) == 1 and record["outcome"] == outcome
+    assert record["classification"] == reason and record["error"]["status_code"] == status
+    assert record["attempts"][0]["error"]["reason"] == reason
+    if outcome == "skipped":
+        assert record["error"]["classification"] == "inconclusive"
+        assert record["error"]["exception_type"] == "Skipped"
+        assert record["error"]["originating_exception_type"] == "HTTPStatusError"
+    else:
+        assert record["error"]["classification"] == "red"
+    summary = _summary(evidence, record)
+    assert f"| {CANARY.canary_id} | {outcome} | {reason} |" in summary
+
+
+def test_exhausted_semantic_empty_retry_keeps_specific_summary_cause(evidence):
+    from tests.provider_contract_ci import CANARY_EMPTY_RESPONSE_MAX_ATTEMPTS
+    empty = {"choices": [{"message": {"role": "assistant", "content": ""}, "finish_reason": "stop"}],
+             "usage": {"prompt_tokens": 20, "completion_tokens": 10, "cost": 0.01}}
+    client = PhysicalClient([empty] * CANARY_EMPTY_RESPONSE_MAX_ATTEMPTS)
+    record, error = _run(evidence, client)
+    assert isinstance(error, AssertionError) and client.sends == CANARY_EMPTY_RESPONSE_MAX_ATTEMPTS
+    assert record["outcome"] == "failed" and record["violation"] == "semantic_empty_provider_response"
+    assert all(attempt["status"] == "semantic_empty" for attempt in record["attempts"])
+    assert f"| {CANARY.canary_id} | failed | semantic_empty_provider_response |" in _summary(evidence, record)
+
+
+def test_actual_integration_success_remains_compact_and_unclassified(evidence, monkeypatch):
+    from tests import test_provider_integration
+    client = PhysicalClient([_wire(delegate_start_canary_arguments(NONCE))])
+    monkeypatch.setenv(CANARY.credential_env, "public-test-key")
+    monkeypatch.setattr(test_provider_integration, "_get_llm_client", lambda: client)
+    monkeypatch.setattr(test_provider_integration, "uuid", SimpleNamespace(uuid4=lambda: SimpleNamespace(hex=NONCE)))
+    request = SimpleNamespace(config=SimpleNamespace(option=SimpleNamespace(ci_evidence_dir=str(evidence.directory))),
+                              node=SimpleNamespace(nodeid=evidence.nodeid))
+    test_provider_integration.test_full_registry_provider_contract(CANARY, full_registry_canary_tools(), request)
+    record = json.loads(next(evidence.directory.glob("provider-*.json")).read_text(encoding="utf-8"))
+    assert client.sends == 1 and record["outcome"] == "passed"
+    assert record["error"] is None and "classification" not in record
+    assert record["diagnostics_errors"] == [] and not record["attempts"][0]["detail_retained"]
+    assert "logical_expected" not in record
+    assert "diagnostics_incomplete" not in _summary(evidence, record)

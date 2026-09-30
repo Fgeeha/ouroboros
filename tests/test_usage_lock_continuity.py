@@ -309,7 +309,7 @@ def _observe_async_accounting_wait(root, monkeypatch):
                 timer.cancel()
                 timer.join(3)
                 assert not timer.is_alive()
-            facts["watchdog_released"] = watchdog_fired.is_set()
+            facts["watchdog_fired"] = watchdog_fired.is_set()
         assert sent == [1]
         attempt_rows = rows(root)
         assert [row["state"] for row in attempt_rows] == ["reserved", "dispatched", "settled"]
@@ -320,13 +320,36 @@ def _observe_async_accounting_wait(root, monkeypatch):
 
 
 def _assert_loop_ran_during_contention(facts):
+    # A later watchdog expiry during settlement cannot undo observed progress.
     assert ("contention_thread" in facts and facts.get("callback_while_held")
-            and facts.get("sends_at_callback") == 0 and not facts["watchdog_released"]), (
+            and facts.get("sends_at_callback") == 0), (
         f"event loop did not run during accounting contention: {facts}")
 
 
 def test_async_wait_keeps_loop_responsive_and_context_claim(root, short_acquisitions, monkeypatch):
     _assert_loop_ran_during_contention(_observe_async_accounting_wait(root, monkeypatch))
+
+
+def test_async_wait_witness_accepts_watchdog_after_loop_release(root, short_acquisitions, monkeypatch):
+    callbacks = []
+    original_timer, original_account = threading.Timer, ua._account_response
+
+    def record_timer(interval, callback, *args, **kwargs):
+        callbacks.append(callback)
+        return original_timer(interval, callback, *args, **kwargs)
+
+    def account_after_watchdog(*args):
+        # Accounting follows release and send. Fire the real cleanup callback
+        # here to prove the ordering without another wall-clock sleep.
+        callback, = callbacks
+        callback()
+        return original_account(*args)
+
+    monkeypatch.setattr(threading, "Timer", record_timer)
+    monkeypatch.setattr(ua, "_account_response", account_after_watchdog)
+    facts = _observe_async_accounting_wait(root, monkeypatch)
+    assert facts["watchdog_fired"]
+    _assert_loop_ran_during_contention(facts)
 
 
 def test_async_wait_witness_rejects_inline_blocking(root, short_acquisitions, monkeypatch):
@@ -338,7 +361,7 @@ def test_async_wait_witness_rejects_inline_blocking(root, short_acquisitions, mo
     monkeypatch.setattr(_usage_wait, "presend_off_loop", inline)
     facts = _observe_async_accounting_wait(root, monkeypatch)
     assert facts["contention_thread"] == facts["loop_thread"]
-    assert facts["watchdog_released"]
+    assert facts["watchdog_fired"]
     with pytest.raises(AssertionError, match="event loop did not run during accounting contention"):
         _assert_loop_ran_during_contention(facts)
 
