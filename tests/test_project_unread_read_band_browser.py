@@ -354,11 +354,9 @@ def test_a_room_read_on_one_client_clears_the_dot_on_another_at_its_next_state_r
     with sync_playwright() as pw:
         browser = getattr(pw, engine).launch()
         try:
-            other, other_row = _client(browser, direct_server_with_data["url"], "shared-room", other_acks)
-            # Hold this client's shared-cursor responses until the reader has
-            # acknowledged. Existing background refreshes may otherwise win
-            # the race with the assertion below on a slower browser.
-            other.evaluate("""() => {
+            # Install before navigation so initial and background cursor reads
+            # both wait for the reader's ACK, regardless of browser speed.
+            hold_preferences = """() => {
                 const fetch = window.fetch.bind(window);
                 window.__holdPreferences = true;
                 window.__pendingPreferences = [];
@@ -370,7 +368,9 @@ def test_a_room_read_on_one_client_clears_the_dot_on_another_at_its_next_state_r
                     }
                     return fetch(input, init);
                 };
-            }""")
+            }"""
+            other, other_row = _client(browser, direct_server_with_data["url"], "shared-room", other_acks,
+                                       init=(hold_preferences,))
             reader, row = _client(browser, direct_server_with_data["url"], "shared-room", reader_acks)
             row.evaluate("el => el.click()")
             reader.locator(PANEL).locator(".chat-bubble").filter(has_text="Reply 3").wait_for(state="attached")
