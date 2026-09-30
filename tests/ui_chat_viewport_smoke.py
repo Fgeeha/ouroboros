@@ -171,7 +171,13 @@ def run_chat_viewport_smoke(
         )
 
     def begin_noop_read(page):
-        read_to_latest(page)
+        # This prepares duplicate-frame assertions, not wheel routing through
+        # whatever expanded card happens to occupy the viewport centre.
+        set_remaining(page, 300)
+        page.locator("#chat-scroll-bottom").click()
+        page.evaluate(_SETTLE_TWO_FRAMES)
+        state = jump_state(page)
+        assert state["remaining"] <= 1 and state["dotHidden"], state
         return set_remaining(page, 40)["scrollTop"]
 
     def assert_noop_read(page, before):
