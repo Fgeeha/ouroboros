@@ -355,6 +355,15 @@ def test_a_room_read_on_one_client_clears_the_dot_on_another_at_its_next_state_r
         browser = getattr(pw, engine).launch()
         try:
             other, other_row = _client(browser, direct_server_with_data["url"], "shared-room", other_acks)
+            held_reads = []
+            def hold_shared_cursor(route):
+                if route.request.method == "GET":
+                    held_reads.append(route)
+                else:
+                    route.continue_()
+            # The ordinary state poll may run while the reader acknowledges.
+            # Hold its cursor read so the before/after observation is ordered.
+            other.route("**/api/ui/preferences", hold_shared_cursor)
             reader, row = _client(browser, direct_server_with_data["url"], "shared-room", reader_acks)
             row.evaluate("el => el.click()")
             reader.locator(PANEL).locator(".chat-bubble").filter(has_text="Reply 3").wait_for(state="attached")
@@ -362,8 +371,12 @@ def test_a_room_read_on_one_client_clears_the_dot_on_another_at_its_next_state_r
             assert _wait_for(reader, lambda: [ack.get("project_seen_revision") for ack in reader_acks]
                              == [{"shared-room": revision}]), reader_acks
             row.locator(".nav-unread-dot").wait_for(state="detached")
-            assert other_row.locator(".nav-unread-dot").count() == 1, "the other client has not refreshed yet"
             _emit_ws_frame(other, {"type": "projects_changed"})
+            assert _wait_for(other, lambda: bool(held_reads)), "the other client requested the shared cursor"
+            assert other_row.locator(".nav-unread-dot").count() == 1, "the cursor response has not arrived yet"
+            for route in held_reads:
+                route.continue_()
+            other.unroute("**/api/ui/preferences", hold_shared_cursor)
             other_row.locator(".nav-unread-dot").wait_for(state="detached")
             other.screenshot(path=str(evidence / f"read-band-{engine}-other-client.png"))
             assert [ack for ack in other_acks if ack.get("project_seen_revision")] == [], \
