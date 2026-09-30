@@ -11,6 +11,7 @@ import logging
 import pathlib
 from typing import Any, Dict
 
+from ouroboros.contracts.chat_id_policy import HIDDEN_CHAT_ID
 from ouroboros.cost_projection import carry_cost_meta, with_cost_aliases
 from ouroboros.outcomes import (
     EXECUTION_DEGRADED,
@@ -30,7 +31,6 @@ from ouroboros.task_results import (
     write_task_result,
 )
 from ouroboros.utils import append_jsonl, truncate_for_log, utc_now_iso
-from ouroboros.contracts.chat_id_policy import HIDDEN_CHAT_ID
 from supervisor.message_bus import notification_chat_route, row_chat_identity
 
 
@@ -116,27 +116,14 @@ def _completed_lifecycle_display(
     return None
 
 
-def _authoritative_terminal_cost(
-    task_id: str, task: Dict[str, Any], result: Dict[str, Any], evt: Dict[str, Any], drive_root: pathlib.Path,
-    *, breakdown: Dict[str, Any] | None = None,
-) -> Dict[str, Any]:
-    """Project terminal cost; the optional breakdown belongs to drive_root only."""
-    from ouroboros.cost_projection import (
-        COST_SCOPE_ROOT_TREE, build_cost_presentation, honest_accounted_amount,
-    )
-    from supervisor.state import reconstruct_task_cost
-
-    authority_root = pathlib.Path(task.get("budget_drive_root") or drive_root)
-    if breakdown is not None and authority_root.resolve() != pathlib.Path(drive_root).resolve():
-        breakdown = None  # A split/copyback task keeps its canonical monetary authority.
-    projection = reconstruct_task_cost(task_id, fields=True, drive_root=authority_root,
-                                       **({"breakdown": breakdown} if breakdown is not None else {}))
+def _terminal_cost_lineage(task_id: str, task: dict, result: dict, evt: dict) -> dict:
+    """The result-derived scopes used by both projection and its equality memo."""
     from ouroboros.task_results import resolve_task_lineage
 
     metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
     root_id = str(result.get("root_task_id") or task.get("root_task_id") or evt.get("root_task_id") or "")
     parent_id = str(result.get("parent_task_id") or task.get("parent_task_id") or evt.get("parent_task_id") or "")
-    lineage = resolve_task_lineage(
+    return resolve_task_lineage(
         task_id,
         metadata=metadata,
         root_task_id=root_id,
@@ -157,6 +144,30 @@ def _authoritative_terminal_cost(
             or evt.get("timeout_retry_from")
         ),
     )
+
+
+def _authoritative_terminal_cost(
+    task_id: str, task: Dict[str, Any], result: Dict[str, Any], evt: Dict[str, Any], drive_root: pathlib.Path,
+    *, breakdown: Dict[str, Any] | None = None, canonical_only: bool = False,
+) -> Dict[str, Any]:
+    """Project terminal cost; canonical_only forbids import/read fallback from a probe."""
+    from ouroboros.cost_projection import (
+        COST_SCOPE_ROOT_TREE,
+        build_cost_presentation,
+        honest_accounted_amount,
+    )
+    from supervisor.state import reconstruct_task_cost
+
+    authority_root = pathlib.Path(task.get("budget_drive_root") or drive_root)
+    if (breakdown is not None or canonical_only) and authority_root.resolve() != pathlib.Path(drive_root).resolve():
+        if canonical_only:
+            raise ValueError("Cost probe lost canonical monetary authority")
+        breakdown = None  # A split/copyback task keeps its canonical monetary authority.
+    if canonical_only and breakdown is None:
+        raise ValueError("Cost probe requires a prefetched canonical breakdown")
+    projection = reconstruct_task_cost(task_id, fields=True, drive_root=authority_root,
+                                       **({"breakdown": breakdown} if breakdown is not None else {}))
+    lineage = _terminal_cost_lineage(task_id, task, result, evt)
     is_root = bool(lineage["is_root_task"])
     if is_root and projection.get("cost_accounting_status") == "available":
         try:
@@ -234,6 +245,33 @@ def _authoritative_terminal_cost(
     return with_cost_aliases(projection)
 
 
+def _terminal_cost_probe(
+    drive_root: pathlib.Path, task_id: str, current: dict, *,
+    breakdown: Dict[str, Any] | None = None, canonical_only: bool = False,
+) -> tuple[str, dict, tuple[bool, str] | None]:
+    """Classify the ordinary refresh's inputs, not permission to write.
+
+    Maintenance uses canonical_only with its indexed snapshot: foreign authority
+    is reported BEFORE accounting, which can import legacy rows on fallback.
+    """
+    from ouroboros.task_status import SETTLED_STATUSES
+
+    if current.get("status") not in SETTLED_STATUSES:
+        return "ineligible", {}, None
+    checkpoint = current.get("root_phase_checkpoint") or {}
+    if post_task_synthesis_is_open(checkpoint.get("post_task_synthesis")):
+        return "ineligible", {}, None
+    if canonical_only and pathlib.Path(current.get("budget_drive_root") or drive_root).resolve() != drive_root.resolve():
+        return "foreign", {}, None
+    fields = _authoritative_terminal_cost(
+        task_id, current, current, {}, drive_root, breakdown=breakdown, canonical_only=canonical_only)
+    lineage = _terminal_cost_lineage(task_id, current, current, {})
+    scopes = bool(lineage["is_root_task"]), str(lineage["root_task_id"])
+    if fields.get("cost_accounting_status") != "available":
+        return "unavailable", fields, scopes
+    return ("equal" if all(current.get(key) == value for key, value in fields.items()) else "differs"), fields, scopes
+
+
 def _refresh_terminal_task_cost(
     drive_root: pathlib.Path, task_id: str, *, breakdown: Dict[str, Any] | None = None,
 ) -> bool:
@@ -241,13 +279,8 @@ def _refresh_terminal_task_cost(
     from ouroboros.task_status import SETTLED_STATUSES
 
     current = load_task_result(drive_root, task_id, strict=True) or {}
-    if current.get("status") not in SETTLED_STATUSES:
-        return False
-    checkpoint = current.get("root_phase_checkpoint") or {}
-    if post_task_synthesis_is_open(checkpoint.get("post_task_synthesis")):
-        return False
-    fields = _authoritative_terminal_cost(task_id, current, current, {}, drive_root, breakdown=breakdown)
-    if fields.get("cost_accounting_status") != "available" or all(current.get(key) == value for key, value in fields.items()):
+    outcome, fields, _ = _terminal_cost_probe(pathlib.Path(drive_root), task_id, current, breakdown=breakdown)
+    if outcome != "differs":
         return False
 
     def project(latest, patch):
@@ -263,8 +296,8 @@ def _refresh_terminal_task_cost(
     event = {"type": "task_cost_finalized", "ts": utc_now_iso(), "task_id": task_id,
              "root_task_id": str(stored.get("root_task_id") or task_id), **carry_cost_meta(stored)}
     if append_jsonl(drive_root / "logs" / "events.jsonl", event):
-        from supervisor.message_bus import try_get_bridge
         from supervisor.log_addressing import address_handler_push
+        from supervisor.message_bus import try_get_bridge
 
         bridge = try_get_bridge()
         if bridge is not None:
