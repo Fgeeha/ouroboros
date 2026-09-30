@@ -486,14 +486,15 @@ The sentence is a hidden install-wide preference with no Settings control: the
 
 `default` shows the built-in "Ouroboros has awakened", `hidden` shows nothing, and
 `custom` shows `text` as plain text, never markup (nonblank, at most 500
-characters; the other modes keep `text` unused). The object has exactly these two
-keys. `POST /api/ui/preferences` with `{"welcome": {...}}` validates and merges it
-(a refused value answers 400 and writes nothing). A hand edit is best made while
-Ouroboros is stopped, because the UI rewrites the file whenever it saves another
-preference; a stored value the POST would refuse reads as `default` and the next
-write stores `default`. Main reads the preference when it opens and on every
-reconnect; nothing watches the file, so an open page keeps its greeting until it
-is reloaded or reconnects.
+characters; other modes retain but do not display valid text). The object has
+exactly these two keys. Prefer `POST /api/ui/preferences` with `{"welcome": {...}}`:
+it validates and merges the value (400 on refusal, without writing). For a hand
+edit, stop Ouroboros, back up the file, and preserve valid whole-document JSON
+and neighboring keys. An invalid welcome inside valid JSON falls back to
+`default` independently; the next save stores that default. Malformed JSON
+instead follows the existing whole-file fallback: all preferences read as
+defaults, and a later save may replace the unreadable contents. Main reads the
+preference when it opens and on every reconnect; there is no file watcher.
 
 ## 5. Card and section composition
 
