@@ -13,7 +13,7 @@ from ouroboros.contracts.chat_id_policy import is_a2a_chat_id
 from ouroboros.gateway import _helpers
 from ouroboros.gateway._helpers import _TAIL_WINDOW_START_BYTES
 from ouroboros.jsonl_tail import JsonlChainSnapshot
-from ouroboros.subagent_messages import is_task_card_message, subagent_message_meta
+from ouroboros.subagent_messages import CARD_ROW_PLACEMENTS, is_task_card_message, subagent_message_meta
 
 _SOURCES = ("chat", "progress")
 _READ_BYTES = 64 * 1024
@@ -23,6 +23,10 @@ _CHAIN_WITNESSES = 16
 # A projection that failed part-way: the rows after the failing one are missing
 # from the response, so neither its coverage nor its newest arrival is known.
 PROJECTION_FAILED = "projection_failed"
+# Stored kinds chat.js shows as a bubble of their own whoever sent them: it
+# renders them before a child's words are routed to its card, and their
+# producers (message_bus ``send_photo`` ...) count every one.
+_STANDALONE_KINDS = ("document", "links", "photo", "video", "quiz")
 
 
 def progress_quota_predicate(row_matches_thread, stored_chat_id):
@@ -344,17 +348,24 @@ def deferred_before(source, entries, candidates, messages, before):
                           and entry["history_position"]["source"] == source)])
 
 
+def _card_content(row, kind, child=lambda _row: False):
+    """Task-card content: a host placement, or a child's own words (``child``: by the
+    lineage its task result recovers). What a child delivers stands alone."""
+    return row.get("card_row") in CARD_ROW_PLACEMENTS or (
+        kind not in _STANDALONE_KINDS and (is_task_card_message(row) or child(row)))
+
+
 def _feed_message(row):
     """A standalone conversation row with a physical chat position.
 
-    Progress, a folded review, a task summary and task-card content (a host
-    placement or a child's own words) change a card, not the conversation; a
-    skill review is appended beside it and never counts as unread."""
+    Progress, a folded review, a task summary and task-card content change a
+    card, not the conversation; a skill review is appended beside it and never
+    counts as unread."""
     position = row.get("history_position")
+    kind = str(row.get("system_type") or "")  # the stored ``type``
     return (isinstance(position, dict) and position.get("source") == "chat"
             and not row.get("is_progress") and not isinstance(row.get("review_group"), dict)
-            and str(row.get("system_type") or "") not in ("task_summary", "skill_review")
-            and not is_task_card_message(row))
+            and kind not in ("task_summary", "skill_review") and not _card_content(row, kind))
 
 
 def _skipped_row_after(entries, after, upper):
@@ -374,11 +385,10 @@ def _stored_message(row_matches_thread, stored_chat_id, child):
         kind = str(entry.get("type") or "")
         return (str(entry.get("direction") or "").lower() in ("out", "system")
                 and kind not in ("routing_options", "quiz_answer", "task_summary", "skill_review")
-                and not is_task_card_message(entry) and not is_a2a_chat_id(entry.get("chat_id", 1))
-                and (str(entry.get("text") or "").strip() not in ("", "\u200b")
-                     or kind in ("document", "links", "photo", "video", "quiz"))
+                and not is_a2a_chat_id(entry.get("chat_id", 1))
+                and (str(entry.get("text") or "").strip() not in ("", "\u200b") or kind in _STANDALONE_KINDS)
                 and row_matches_thread(stored_chat_id(entry.get("chat_id"), 1), entry)
-                and not child(entry))  # last: it may read the row's task result
+                and not _card_content(entry, kind, child))  # last: it may read the row's task result
     return message
 
 
@@ -395,7 +405,8 @@ def latest_arrival(rows, page, data_dir, row_matches_thread, stored_chat_id, pro
     annotation rewrite them. A child's words are card content by their stored
     lineage or, on rows written before rows carried it, by the lineage their
     ``task_result`` recovers — the projection's own authority, which shows such a
-    row in the child's card. ``None``: its arrival is unknown — the chat source
+    row in the child's card; a photo, video, file, link card or question a child
+    delivers is shown alone and is a message. ``None``: its arrival is unknown — the chat source
     is unreadable, its projection failed part-way (``projected_gaps`` holds
     ``PROJECTION_FAILED``: any row after the fault may be the newest), a row
     after the newest readable one is unreadable, or the live chat ends in
@@ -412,8 +423,9 @@ def latest_arrival(rows, page, data_dir, row_matches_thread, stored_chat_id, pro
     says none lies at or after that offset, and the chain's cursors carry that
     fact (``quiet``: none at or after the cursor's ``before``). An older page of
     a quiet chain names its own newest message — then the newest below the
-    chain's frozen ``upper`` — or, holding none, passes the fact on; any other
-    older page names nothing.
+    chain's frozen ``upper`` — or, holding none, passes the fact on, and the one
+    that reaches the start of the chat without a gap proves the chat holds none
+    below that ``upper`` (``latest_absent``); any other older page names nothing.
     """
     quiet = page["quiet"]
     if page["replayed"] and page["recent"]:
@@ -428,16 +440,19 @@ def latest_arrival(rows, page, data_dir, row_matches_thread, stored_chat_id, pro
         return bool(task_id) and bool(subagent_message_meta(task_result(task_id), task_id=task_id))
 
     offset = lambda row: row["history_position"]["offset"]  # noqa: E731
+    words = lambda row: _card_content(row, str(row.get("system_type") or ""), child)  # noqa: E731
     feed = [row for row in rows if _feed_message(row)]
     spoken = sorted((row for row in feed if row.get("role") != "user" and (
         str(row.get("text") or "").strip() not in ("", "\u200b") or row.get("msg_type"))), key=offset)
-    latest = next((row for row in reversed(spoken) if not child(row)), None)
+    latest = next((row for row in reversed(spoken) if not words(row)), None)
     if entries is None or PROJECTION_FAILED in projected_gaps or "incomplete_live_line" in gaps or (
             gaps and _skipped_row_after(entries, offset(latest) if latest else start, end)):
         return {"latest_message": None}
     if not page["recent"]:
         page["quiet_below"] = latest is None
-        return {"latest_message": {"history_id": latest["history_id"], "out_of_order": True}} if latest else {}
+        if latest:
+            return {"latest_message": {"history_id": latest["history_id"], "out_of_order": True}}
+        return {"latest_absent": True} if start == 0 and not gaps else {}
     if latest is None and start > 0:
         message = _stored_message(row_matches_thread, stored_chat_id, child)
         try:
@@ -456,7 +471,7 @@ def latest_arrival(rows, page, data_dir, row_matches_thread, stored_chat_id, pro
         return {}
     ts = str(latest.get("ts") or "")
     return {"latest_message": {"history_id": latest["history_id"], "out_of_order": any(
-        offset(row) < offset(latest) and str(row.get("ts") or "") > ts and not child(row) for row in feed)}}
+        offset(row) < offset(latest) and str(row.get("ts") or "") > ts and not words(row) for row in feed)}}
 
 
 def replay_evidence_rows(messages, evidence):

@@ -111,7 +111,7 @@ Every `/api/files/*` operation resolves its requested path and refuses the opera
 | POST | `/api/projects/{project_id}/update` | `gateway.projects.api_project_update` |
 | POST | `/api/projects/{project_id}/delete` | `gateway.projects.api_project_delete` |
 | GET | `/api/fs/dirs` | `gateway.projects.api_fs_dirs` |
-| GET | `/api/chat/history` | `gateway.history.make_chat_history_endpoint` (a web owner row the durable ingress saved replays typed `ingress_accepted: true`; a legacy row carries nothing) |
+| GET | `/api/chat/history` | `gateway.history.make_chat_history_endpoint` (a web owner row the durable ingress saved replays typed `ingress_accepted: true`; a legacy row carries nothing; a room other than Main that an unreadable Project registry's readable rows omit reads `latest_message: null`) |
 | GET | `/api/logs/{name}` | `gateway.logs.api_logs_tail` |
 | POST | `/api/chat/upload` | `gateway.files.api_chat_upload` |
 | DELETE | `/api/chat/upload` | `gateway.files.api_chat_upload_delete` |

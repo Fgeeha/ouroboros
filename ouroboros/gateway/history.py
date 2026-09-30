@@ -137,8 +137,8 @@ def _stored_chat_id(value: Any, default: int = 1) -> int:
 def _project_history_context(
     data_dir: pathlib.Path,
     thread_id: int,
-) -> tuple[set[int], list[dict], Dict[str, Any], Dict[str, int]]:
-    """Load the read-only Project history lenses (synchronous).
+) -> tuple[set[int], list[dict], Dict[str, Any], Dict[str, int], bool]:
+    """Load the read-only Project history lenses (synchronous) and whether the registry classified every room.
 
     Runs inside the endpoint's single ``asyncio.to_thread`` assembly call
     (perf2 P3), so the loads stay off the event loop without per-load thread
@@ -146,12 +146,12 @@ def _project_history_context(
     (v6.90.x P2): `_bound_project_chat` previously re-read
     state/project_task_bindings.json for every uncached (task, parent, root)
     lineage key — up to three file reads per history row."""
-    try:
-        from ouroboros.projects_registry import reserved_project_chat_ids
+    from ouroboros.projects_registry import reserved_project_chat_ids
 
-        project_chat_ids = reserved_project_chat_ids(data_dir)
-    except Exception:
-        project_chat_ids = set()
+    try:
+        project_chat_ids, classified = reserved_project_chat_ids(data_dir, strict=True), True
+    except Exception:  # the rooms its readable rows name are still Projects; any other is unknown
+        project_chat_ids, classified = reserved_project_chat_ids(data_dir), False
     source_refs: list[dict] = []
     if thread_id in project_chat_ids:
         try:
@@ -172,7 +172,7 @@ def _project_history_context(
         bindings_by_task = all_task_bindings(data_dir)
     except Exception:
         bindings_by_task = {}
-    return project_chat_ids, source_refs, annotations, bindings_by_task
+    return project_chat_ids, source_refs, annotations, bindings_by_task, classified
 
 
 def _user_annotation(
@@ -1457,7 +1457,7 @@ def _assemble_history_response(
     Room lenses, source reads, projection, terminal truth and JSON encoding all
     stay off the event loop. Both selectors use the same row transformers.
     """
-    project_chat_ids, project_source_refs, chat_annotations, bindings_by_task = (
+    project_chat_ids, project_source_refs, chat_annotations, bindings_by_task, classified = (
         _project_history_context(data_dir, thread_id)
     )
     row_matches_thread = _make_thread_filter(
@@ -1495,7 +1495,8 @@ def _assemble_history_response(
         combined.append(lifecycle_row)
     result_cache: Dict[str, Dict[str, Any]] = {}  # every task result below is read once per request
     arrival = latest_arrival(combined, page, data_dir, row_matches_thread, _stored_chat_id, chat_gaps, lambda task_id: (
-        _load_terminal_result(data_dir, task_id, result_cache))) if thread_id in project_chat_ids else {}
+        _load_terminal_result(data_dir, task_id, result_cache))) if thread_id in project_chat_ids else (
+        {} if classified or thread_id == 1 else {"latest_message": None})  # an unclassified room may be a Project
     if recent:  # arrival is named above, before the tail and the annotation
         (messages, result_cache, human_rows_dropped, lineage_truncated, review_overlays_truncated, floor,
          anchored_children) = _apply_window_quotas(

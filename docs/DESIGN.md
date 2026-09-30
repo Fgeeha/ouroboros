@@ -422,16 +422,16 @@ their own meaning and are unaffected by it.
 - **Counts:** each new standalone message in the conversation — an ordinary or
   proactive reply, a question, a root task's final answer, a standalone System
   message (a root task's terminal incident included), a delivered photo, video,
-  file or link card.
+  file or link card. A question or a delivery is shown alone and counts whichever
+  task sends it, a child task included.
 - **Does not count:** anything that changes a task card rather than the
   conversation — narration and progress, lifecycle, incidents raised in a
   task's progress (they still toast), host rows placed in a card (custody, late
   review results, merge receipts, a child task's terminal incident), and a child
-  task's own messages and final: a child speaks to its parent, and only the
-  parent's own message reaches the room. Where a row is shown decides, never
-  its kind: an incident shown alone as a System message counts, one shown in a
-  card does not. A placed row is card content even where the page has not
-  loaded its card and shows it alone.
+  task's own words and final: a child speaks to its parent, and its card shows
+  them. Where a row is shown decides, never its kind: an incident shown alone as
+  a System message counts, one shown in a card does not. A placed row is card
+  content even where the page has not loaded its card and shows it alone.
 - **Read:** only once the newest message is painted in the visible room with
   the reader at it — on screen, clear of the header and composer, normally at
   the bottom of the conversation with nothing newer to load. Being at the bottom
@@ -443,11 +443,12 @@ their own meaning and are unaffected by it.
   is not reading the newer messages below it. The newest message is the one that
   arrived last: a late answer keeps the time it was written and takes that place
   in the conversation, so it is read only once it is itself on screen, clear of
-  the header and composer — above the loaded messages, after `Load older` shows
+  the header and composer — above the loaded messages, after `Load more history` shows
   it — and never while the room cannot tell which message arrived last, as
   while the newest line of the conversation is still being written. A
   message that later card rows and the owner's own messages pushed past the
-  newest page is read the same way.
+  newest page is read the same way; a room holding no standalone message at all
+  is read at the bottom once its start is reached (in a long room, by `Load more history`).
 - **Several clients** share one read cursor that only moves forward: a room read
   on one client stops showing the dot on the others at their next state
   refresh, and nothing read is shown unread again.

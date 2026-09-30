@@ -287,6 +287,37 @@ def test_main_names_nothing(room):
     assert "latest_message" not in json.loads(response.body)["window"]
 
 
+def test_a_room_read_while_the_project_registry_is_unreadable_names_no_arrival_and_main_reads_on(room):
+    """Unclassified, the room is read through Main's lens: its arrival is unknown, never absent
+    (which the bottom would decide). Main is known without the registry and reads as before."""
+    room.deliver("root answer", 5)
+    registry = room.root / "state" / "projects.json"
+    intact = registry.read_bytes()
+    registry.write_bytes(intact[: len(intact) // 2])
+    try:
+        assert room.read()["window"]["latest_message"] is None
+        main = asyncio.run(history.make_chat_history_endpoint(room.root)(SimpleNamespace(query_params={})))
+        assert main.status_code == 200 and "latest_message" not in json.loads(main.body)["window"]
+    finally:
+        registry.write_bytes(intact)
+    assert room.read()["window"]["latest_message"] == {"history_id": room.row_id("root answer"), "out_of_order": False}
+
+
+def test_one_malformed_registry_row_leaves_only_the_room_it_may_hold_unknown(room):
+    """A row the strict read refuses cannot unclassify the rooms the readable rows name."""
+    room.deliver("root answer", 5)
+    registry = room.root / "state" / "projects.json"
+    data = json.loads(registry.read_text(encoding="utf-8"))
+    registry.write_text(json.dumps({**data, "projects": [*data["projects"], {"chat_id": room.chat_id + 1}]}),
+                        encoding="utf-8")
+    recent = room.read()
+    assert "root answer" in texts(recent)
+    assert recent["window"]["latest_message"] == {"history_id": room.row_id("root answer"), "out_of_order": False}
+    other = asyncio.run(history.make_chat_history_endpoint(room.root)(
+        SimpleNamespace(query_params={"chat_id": str(room.chat_id + 1)})))
+    assert json.loads(other.body)["window"]["latest_message"] is None, "the malformed row's room is unknown"
+
+
 @pytest.fixture
 def narrow_recent(monkeypatch):
     """A recent read that stops as soon as its quota is met (a large chat's window)."""
@@ -364,6 +395,42 @@ def test_a_legacy_child_final_its_task_result_names_is_never_the_newest_message(
     assert recent["window"]["latest_message"] == {"history_id": room.row_id("root answer"), "out_of_order": False}
 
 
+def durable_child(room, task_id: str = "kid-1") -> None:
+    """The child's lineage as its task result persists it, recovered for every row the child wrote."""
+    from ouroboros.task_results import write_task_result
+
+    write_task_result(room.root, task_id, "running", delegation_role="subagent", parent_task_id="root-1",
+                      root_task_id="root-1", role="researcher")
+
+
+def test_a_photo_a_child_delivers_is_shown_alone_and_is_the_newest_arrival(room):
+    """A child's words are card content; what it delivers (a photo, a file, links, a question) is
+    its own bubble in the conversation, which the producer counts."""
+    durable_child(room)
+    room.deliver("root answer", 5)
+    room.deliver("child note", 6, task_id="kid-1")
+    before = room.revision()
+    assert room.host.bridge.send_photo(room.chat_id, b"\x89PNG\r\n\x1a\n", caption="child photo", task_id="kid-1")[0]
+    assert room.revision() == before + 1, "the producer counts the child's photo"
+    recent = room.read()
+    (photo,) = [row for row in recent["messages"] if row.get("system_type") == "photo"]
+    assert photo["delegation_role"] == "subagent", "its lineage is known, and it is still shown alone"
+    assert recent["window"]["latest_message"] == {"history_id": photo["history_id"], "out_of_order": False}, \
+        "the root answer on screen is not the photo that arrived after it"
+
+
+def test_a_question_a_child_asked_before_the_recent_selection_is_named_by_the_bounded_search(room, narrow_recent):
+    durable_child(room)
+    room.deliver("root answer", 5)
+    assert room.host.bridge.send_quiz(room.chat_id, "q-kid", "Ship it?", ["Yes", "No"],
+                                      assumption="I ship after review", task_id="kid-1")[0]
+    child_words(room, 6)
+    message_bus.log_chat("in", room.chat_id, 7, "owner asks", ts=ts(40))
+    recent = room.read(n_human="2")
+    assert "Ship it?" not in texts(recent), "the question lies before the recent selection"
+    assert recent["window"]["latest_message"] == {"history_id": room.row_id("Ship it?"), "out_of_order": True}
+
+
 def test_a_legacy_child_final_before_the_recent_selection_does_not_stand_in_for_the_root_answer(room, narrow_recent):
     room.deliver("root answer", 5)
     legacy_child_final(room, "legacy child final", 6)
@@ -423,6 +490,28 @@ def test_an_unreadable_row_interrupts_the_continued_search(room, narrow_recent, 
     assert any("root answer" in texts(page) for page in pages)
     assert not any(page["window"].get("latest_message") for page in pages), \
         "past an unreadable row the answer may not be the newest message"
+
+
+@pytest.mark.parametrize("torn", [False, True], ids=["clean", "unreadable"])
+def test_a_continued_search_reaching_the_clean_start_of_the_chat_proves_no_message_is_there(
+        room, narrow_recent, monkeypatch, torn):
+    """A room holding only a child's words and the owner's own messages (a revision once counted a
+    child's words): the older page that reaches the start of the chat with none says so, positively,
+    so the bottom decides. Past an unreadable row nothing is proven."""
+    if torn:
+        room.chat_log.parent.mkdir(parents=True, exist_ok=True)
+        with room.chat_log.open("ab") as stream:
+            stream.write(b'{"direction": "out", "text": "torn\n')
+    child_words(room, 8)
+    message_bus.log_chat("in", room.chat_id, 7, "owner asks", ts=ts(40))
+    monkeypatch.setattr(history_paging, "_PAGE_SCAN_ROWS", 3)
+    recent = room.read(n_human="2")
+    assert recent["window"]["latest_message"] is None and recent["window"]["latest_before"] > 0
+    pages = follow(room, recent["next_cursor"])
+    assert not any(page["window"].get("latest_message") for page in pages)
+    assert [page["window"].get("latest_absent", False) for page in pages] == [False] * (len(pages) - 1) + [not torn]
+    assert room.read(cursor=pages[-1]["page_cursor"])["window"].get("latest_absent", False) is not torn, \
+        "a restored page says it again"
 
 
 def test_a_search_that_found_the_newest_message_is_not_continued(room, narrow_recent, monkeypatch):

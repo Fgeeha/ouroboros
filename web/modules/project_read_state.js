@@ -29,16 +29,19 @@ export function createProjectReadReceipt({ read, isShown, isReadingLatest, onRea
     let readingLatest = false;
     let settledLatest;  // the newest message the previous settle named
     let recentRead = {};  // the newest admitted recent read: its window and coverage
-    let found = null;  // the newest message an older page of a quiet chain named
+    let found = null;  // what an older page of a quiet chain found: the newest message, or none
     // The recent read names the newest message (null: unknown). When its bounded
     // search ran out first, the older pages of its quiet chain carry it on
-    // (history_paging.latest_arrival); the message they name is still the newest
-    // while this read found none from its `latest_before` up to that chain's frozen
-    // upper, on one chain of byte coordinates. A newer arrival or a source gap breaks that.
+    // (history_paging.latest_arrival): the message they name, or the absence the
+    // one reaching the start of the chat proves, still holds while this read found
+    // none from its `latest_before` up to that chain's frozen upper, read through
+    // the same room view on one chain of byte coordinates. A newer arrival, a
+    // source gap or another membership breaks that.
     const newest = () => {
         const { window, coverage } = recentRead;
         return window?.latest_message === null && found && window.latest_before <= found.upper
-            && sameHistoryChain(coverage?.spans?.chat, found.span) ? found.message : window?.latest_message;
+            && coverage?.view === found.view && sameHistoryChain(coverage?.spans?.chat, found.span)
+            ? found.message : window?.latest_message;
     };
     // Scroll edges report arrivals only; a discrete change (the page or the
     // window shown again, another newest message) reports the current position once.
@@ -75,13 +78,20 @@ export function createProjectReadReceipt({ read, isShown, isReadingLatest, onRea
             return { painted, read: atLatest, revision: target };
         },
         note,
-        // Each admitted recent read, before its rows are drawn.
-        recent({ window, coverage }) { recentRead = { window, coverage }; },
+        // Each admitted recent read, before its rows are drawn. One that cannot
+        // name the newest message leaves no revision covered, so the next refresh
+        // reads again: a healed source names it without a new revision.
+        recent({ window, coverage }) {
+            recentRead = { window, coverage };
+            if (newest() === null) coveredRevision = 0;
+        },
         // An older page, once drawn, can show the newest message or, on a quiet
-        // chain, name it.
+        // chain, name it or prove there is none.
         page({ window, coverage }) {
-            if (window?.latest_message?.history_id && Number.isSafeInteger(coverage?.upper?.chat)) {
-                found = { message: window.latest_message, upper: coverage.upper.chat, span: coverage.spans?.chat };
+            const absent = window?.latest_absent === true;
+            if ((absent || window?.latest_message?.history_id) && Number.isSafeInteger(coverage?.upper?.chat)) {
+                found = { message: absent ? undefined : window.latest_message, upper: coverage.upper.chat,
+                    span: coverage.spans?.chat, view: coverage.view };
             }
             requestAnimationFrame(() => { settle(); note(); });
         },

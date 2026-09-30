@@ -672,6 +672,7 @@ _RECORD_HISTORY = """() => {
             response.clone().json().then(data => window.__historyReads.push({
                 older: url.searchParams.has('cursor'), named: 'latest_message' in (data.window || {}),
                 latest: data.window?.latest_message ?? null, before: data.window?.latest_before ?? null,
+                absent: data.window?.latest_absent === true,
                 upper: data.coverage?.upper?.chat ?? null,
                 texts: (data.messages || []).map(row => String(row.text || '').slice(0, 24)),
             }), () => {});
@@ -781,6 +782,153 @@ def test_a_newest_answer_past_the_bounded_search_is_read_once_older_pages_show_i
             assert _wait_for(page, lambda: seen() == [revision, newer]), acks
             page.evaluate(_SETTLE_RESTORE_FRAMES)
             page.screenshot(path=str(evidence / f"{name}-newer-read.png"))
+            row.locator(".nav-unread-dot").wait_for(state="detached")
+        finally:
+            browser.close()
+
+
+def _png(width=240, height=120):
+    """A real image, so the photo bubble has its ordinary size."""
+    import struct
+    import zlib
+
+    def chunk(kind, body):
+        return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body) & 0xFFFFFFFF)
+    raw = b"".join(b"\x00" + b"\x40\x80\xc0" * width for _ in range(height))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
+@pytest.mark.parametrize("engine", ["chromium", "webkit"])
+def test_a_photo_a_child_delivers_is_read_where_it_is_not_at_the_root_answer_above_it(direct_server_with_data, engine):
+    """A child's words are card content, but a photo it delivers is its own bubble and the message
+    that arrived last: the root answer the reader keeps on screen is not reading it."""
+    from urllib.parse import quote
+
+    from playwright.sync_api import sync_playwright
+
+    from ouroboros.artifacts import store_chat_media_bytes
+    from ouroboros.projects_registry import increment_project_visible_revision
+    from ouroboros.task_results import write_task_result
+
+    data = direct_server_with_data["data_dir"]
+    at = lambda minute: f"2026-09-28T10:{minute:02d}:00Z"  # noqa: E731
+    rows = [{"ts": at(minute), "direction": "out", "text": f"Reply {minute}"} for minute in range(3)]
+    rows.append({"ts": at(5), "direction": "out", "text": "Root answer\nwith its details", "task_id": "root-photo"})
+    # The owner's own follow-ups keep the bottom of the room below the fold while the answer is on screen.
+    rows += [{"ts": at(6 + index), "direction": "in",
+              "text": "\n".join(f"Owner follow-up {index}, line {line}" for line in range(8))} for index in range(6)]
+    chat_id, chat_log, first = _seed_room(data, "photo-room", "Photo room", rows)
+    write_task_result(data, "root-photo", "completed")
+    write_task_result(data, "kid-photo", "completed", delegation_role="subagent", parent_task_id="root-photo",
+                      root_task_id="root-photo", role="researcher")
+    stored = store_chat_media_bytes(data, "kid-photo", _png(), "image/png")
+    evidence = Path(os.environ.get("OUROBOROS_UI_EVIDENCE_DIR", data.parent))
+    evidence.mkdir(parents=True, exist_ok=True)
+    acks = []
+    seen = lambda: [ack["project_seen_revision"]["photo-room"] for ack in acks  # noqa: E731
+                    if "photo-room" in (ack.get("project_seen_revision") or {})]
+    with sync_playwright() as pw:
+        browser, page, row = _open_room(pw, engine, direct_server_with_data["url"], "photo-room", acks)
+        try:
+            messages = page.locator(PANEL)
+            messages.locator(".chat-bubble").filter(has_text="Owner follow-up 5").wait_for(state="attached")
+            page.evaluate(_SETTLE_RESTORE_FRAMES)
+            answer = messages.evaluate(_PLACE, ["Root answer", -160])
+            page.evaluate(_SETTLE_RESTORE_FRAMES)
+            assert answer["node"]["bottom"] <= answer["composer"]["top"], answer
+            assert _wait_for(page, lambda: seen() == [first]), ("the root answer on screen is read", acks)
+            row.locator(".nav-unread-dot").wait_for(state="detached")
+
+            # The child's photo arrives while the reader stays at the answer (message_bus.send_photo's row).
+            with chat_log.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps({
+                    "ts": at(30), "direction": "out", "chat_id": chat_id, "task_id": "kid-photo", "type": "photo",
+                    "text": "Child chart", "caption": "Child chart", "mime": "image/png",
+                    "download_url": f"/api/tasks/kid-photo/artifacts/{quote(stored['name'])}"}) + "\n")
+            second = increment_project_visible_revision(data, chat_id=chat_id)["visible_revision"]
+            _emit_ws_frame(page, {"type": "projects_changed"})
+            photo = messages.locator("figure.chat-gallery-item").filter(has_text="Child chart")
+            photo.wait_for(state="attached")
+            page.wait_for_function("() => [...document.querySelectorAll('#project-panel img.chat-photo')]"
+                                   ".every(img => img.complete && img.naturalWidth > 0)")
+            page.evaluate(_SETTLE_RESTORE_FRAMES)
+            page.wait_for_timeout(800)
+            held = messages.evaluate(_BOX_OF, "Root answer")
+            below = photo.evaluate("""n => ({top: n.getBoundingClientRect().top, card: Boolean(n.closest('.chat-live-card')),
+                feedBottom: n.closest('.chat-messages').getBoundingClientRect().bottom})""")
+            page.screenshot(path=str(evidence / f"read-band-{engine}-child-photo-below.png"))
+            assert not below["card"], ("the child's photo is shown alone, not in a card", below)
+            assert held["top"] >= held["feedTop"] and below["top"] >= below["feedBottom"], (held, below)
+            assert seen() == [first], ("the answer on screen is not the photo that arrived after it", acks)
+            assert row.locator(".nav-unread-dot").count() == 1
+
+            messages.evaluate(_AT_BOTTOM)
+            page.evaluate(_SETTLE_RESTORE_FRAMES)
+            read = _wait_for(page, lambda: seen() == [first, second])
+            page.screenshot(path=str(evidence / f"read-band-{engine}-child-photo-read.png"))
+            (evidence / f"read-band-{engine}-child-photo.json").write_text(
+                json.dumps({"answer": answer, "held": held, "below": below, "acks": acks}, indent=2), encoding="utf-8")
+            assert read, ("the photo on screen is read", acks)
+            row.locator(".nav-unread-dot").wait_for(state="detached")
+        finally:
+            browser.close()
+
+
+@pytest.mark.parametrize("engine", ["chromium", "webkit"])
+def test_a_long_room_with_no_standalone_message_is_read_at_the_bottom_once_older_pages_reach_its_start(
+        direct_server_with_data, engine):
+    """Only the owner's own notes (the room's revision once counted a child's words), more than the
+    recent read's bounded search covers: its arrival is unknown until the older pages reach the start
+    of the chat, whose page proves no standalone message is there. The bottom is then read."""
+    from playwright.sync_api import sync_playwright
+
+    data = direct_server_with_data["data_dir"]
+    at = lambda second: f"2026-09-28T10:{second // 60:02d}:{second % 60:02d}Z"  # noqa: E731
+    note = lambda index: {"ts": at(10 + index), "direction": "in",  # noqa: E731
+                          "text": f"Owner note {index}: " + "a long thought " * 270}
+    # Seeded as rotation leaves a room (see the bounded-search case above): 170 notes archived, 160 live.
+    chat_id, chat_log, revision = _seed_room(data, "quiet-room", "Quiet room", [note(i) for i in range(170, 330)])
+    archive = data / "archive" / "chat_20260928T101000.jsonl"
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    archive.write_text("".join(json.dumps({**note(i), "chat_id": chat_id}) + "\n" for i in range(170)),
+                       encoding="utf-8")
+    assert 512 * 1024 < archive.stat().st_size < 800_000 and chat_log.stat().st_size < 800_000
+    evidence = Path(os.environ.get("OUROBOROS_UI_EVIDENCE_DIR", data.parent))
+    evidence.mkdir(parents=True, exist_ok=True)
+    acks = []
+    seen = lambda: [ack["project_seen_revision"]["quiet-room"] for ack in acks  # noqa: E731
+                    if "quiet-room" in (ack.get("project_seen_revision") or {})]
+    with sync_playwright() as pw:
+        browser, page, row = _open_room(pw, engine, direct_server_with_data["url"], "quiet-room", acks,
+                                        (_RECORD_HISTORY,))
+        try:
+            messages = page.locator(PANEL)
+            messages.locator(".chat-bubble").filter(has_text="Owner note 329").wait_for(state="attached")
+            page.evaluate(_SETTLE_RESTORE_FRAMES)
+            page.wait_for_timeout(500)
+            assert seen() == [], "unknown: the bottom is not read"
+            (landing, *_) = page.evaluate("() => window.__historyReads")
+            assert not landing["older"] and landing["latest"] is None and 0 < landing["before"] < landing["upper"], \
+                ("the recent read's search ran out", landing)
+            assert _load_older_until(page, "Owner note 0:"), "the older pages reach the start of the chat"
+            older = [item for item in page.evaluate("() => window.__historyReads") if item["older"]]
+            assert not any(item["named"] for item in older), older
+            assert [item["absent"] for item in older] == [False] * (len(older) - 1) + [True], \
+                ("only the page reaching the start proves no standalone message is there", older)
+            page.locator("#project-panel-body .chat-scroll-bottom-btn").evaluate("node => node.click()")
+            messages.locator(".chat-bubble").filter(has_text="Owner note 329").wait_for(state="attached")
+            page.evaluate(_SETTLE_RESTORE_FRAMES)
+            messages.evaluate(_AT_BOTTOM)
+            page.evaluate(_SETTLE_RESTORE_FRAMES)
+            _emit_ws_frame(page, {"type": "projects_changed"})
+            read = _wait_for(page, lambda: seen() == [revision])
+            page.screenshot(path=str(evidence / f"read-band-{engine}-quiet-room.png"))
+            reads = [{key: value for key, value in item.items() if key != "texts"}
+                     for item in page.evaluate("() => window.__historyReads")]
+            (evidence / f"read-band-{engine}-quiet-room.json").write_text(
+                json.dumps({"acks": acks, "reads": reads}, indent=2), encoding="utf-8")
+            assert read, ("no standalone message: the bottom is read", acks, reads[-3:])
             row.locator(".nav-unread-dot").wait_for(state="detached")
         finally:
             browser.close()

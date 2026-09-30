@@ -558,6 +558,27 @@ test('a reconnect read naming a newest message already on screen retries without
     await until(() => arrivals === 1);
 });
 
+test('a covered revision whose newest message a later read cannot name is read again once the source heals', async (t) => {
+    let arrivals = 0;
+    const r = room(t, { onReadingLatest: () => { arrivals += 1; } });
+    placeAtTop(t, r, 'chat:9');
+    r.server.rows = [late(9), row(1), row(2)];
+    r.server.window = { complete: true, truncated_by: [], latest_message: { history_id: 'chat:9', out_of_order: true } };
+    const landed = await r.instance.refreshHistory({ revision: 3 });
+    assert.deepEqual([landed.painted, landed.read], [true, false], 'known, and off screen');
+    // A reconnect read meets a line still being written (the owner's own message: no new revision).
+    r.server.window = { complete: false, truncated_by: ['chat_incomplete_live_line'], latest_message: null };
+    const reads = r.reads.length;
+    r.reconnect();
+    await until(() => r.reads.length > reads);
+    r.readUp();
+    assert.equal(arrivals, 0, 'unknown: being at the late answer is not reading it');
+    r.server.window = { complete: true, truncated_by: [], latest_message: { history_id: 'chat:9', out_of_order: true } };
+    const healed = await r.instance.refreshHistory({ revision: 3 });
+    assert.equal(r.reads.length, reads + 2, 'the same revision is read again, not answered from the unknown read');
+    assert.deepEqual([healed.painted, healed.read], [true, true], 'the healed read names it, on screen');
+});
+
 test('the read receipt takes its edge again only when a read names another newest message', () => {
     let reading = true, arrivals = 0;
     const receipt = createProjectReadReceipt({ read: async () => true, isShown: () => true,
@@ -626,6 +647,8 @@ for (const [name, change] of [
         t.after(() => { ElementStub.prototype.getBoundingClientRect = rect; }); }],
     ['a source gap', (r) => { r.server.window = { complete: false, truncated_by: ['chat_malformed_jsonl'], latest_message: null }; }],
     ['another chain', (r) => { r.server.coverage = coverage(100, 20, 'c2'); }],
+    // Another task became the room's member: the same bytes, read through another lens.
+    ['another view on the same chain', (r) => { r.server.coverage = { ...coverage(100, 20), view: 'v2' }; }],
 ]) test(`the message an older page named is not read after ${name}`, async (t) => {
     const { r, arrivals } = searchedRoom(t);
     await r.instance.refreshHistory({ revision: 4 });
@@ -637,4 +660,21 @@ for (const [name, change] of [
     const after = await r.instance.refreshHistory({ revision: 5 });
     assert.ok(r.shown().includes('chat:9'), 'the named message is still on screen');
     assert.equal(Boolean(after.read), false, 'it is no longer known to be the newest message');
+});
+
+test('an older page that reaches the start of the chat with no message there lets the bottom decide', async (t) => {
+    const { r, arrivals } = searchedRoom(t);
+    // Only the owner's own notes and a child's words: an old revision counted the child's words.
+    r.server.older = [row(9), row(12)].map((item) => ({ ...item, role: 'user', text: `owner note ${item.history_position.offset}` }));
+    r.server.olderWindow = { latest_absent: true };
+    r.server.olderCoverage = coverage(100, 0);
+    assert.equal((await r.instance.refreshHistory({ revision: 4 })).painted, false, 'unknown until the start is reached');
+    r.readUp();
+    await until(() => r.shown().includes('chat:9'));
+    r.readLatest();
+    await until(() => arrivals() === 1);
+    const read = await r.instance.refreshHistory({ revision: 4 });
+    assert.deepEqual([read.painted, read.read], [true, true], 'no standalone message: the bottom is read');
+    r.server.coverage = { ...coverage(100, 20), view: 'v2' };
+    assert.equal((await r.instance.refreshHistory({ revision: 5 })).painted, false, 'bound to the view it was proven in');
 });
