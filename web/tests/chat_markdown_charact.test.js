@@ -49,9 +49,14 @@ test('legacy renderMarkdown pins GFM-style pipe-table shape and quirks', () => {
         '| one | two |',
         '| three | four |',
     ].join('\n');
+    // The separator's colons are the author's alignment, written as marked writes it.
     assert.equal(
         renderMarkdown(source),
-        '<div class="md-table-wrap"><table class="md-table"><thead><tr><th>First</th><th>Second</th></tr></thead><tbody><tr><td>one</td><td>two</td></tr><tr><td>three</td><td>four</td></tr></tbody></table></div>',
+        '<div class="md-table-wrap"><table class="md-table"><thead><tr><th align="left">First</th><th align="right">Second</th></tr></thead><tbody><tr><td align="left">one</td><td align="right">two</td></tr><tr><td align="left">three</td><td align="right">four</td></tr></tbody></table></div>',
+    );
+    assert.equal(
+        renderMarkdown('| a | b |\n| --- | :-: |\n| 1 | 2 |'),
+        '<div class="md-table-wrap"><table class="md-table"><thead><tr><th>a</th><th align="center">b</th></tr></thead><tbody><tr><td>1</td><td align="center">2</td></tr></tbody></table></div>',
     );
     assert.equal(renderMarkdown('| lone | row |'), '| lone | row |');
 });
@@ -59,7 +64,7 @@ test('legacy renderMarkdown pins GFM-style pipe-table shape and quirks', () => {
 test('legacy renderMarkdown routes links through safeExternalUrl', () => {
     assert.equal(
         renderMarkdown('[Web](https://example.com/docs) [Mail](mailto:owner@example.com) [Bad](javascript:alert(1))'),
-        '<a href="https://example.com/docs" target="_blank" rel="noopener noreferrer" class="md-link">Web</a> <a href="mailto:owner@example.com" target="_blank" rel="noopener noreferrer" class="md-link">Mail</a> <a href="#" target="_blank" rel="noopener noreferrer" class="md-link">Bad</a>)',
+        '<a href="https://example.com/docs" target="_blank" rel="noopener noreferrer" class="md-link">Web</a> <a href="mailto:owner@example.com" target="_blank" rel="noopener noreferrer" class="md-link">Mail</a> <a href="#" target="_blank" rel="noopener noreferrer" class="md-link">Bad</a>',
     );
 });
 
@@ -127,8 +132,8 @@ test('joinMarkdownHeadings follows the renderer heading rule and leaves other ma
     assert.equal(joinMarkdownHeadings('```sh\n# comment\nls\n```\nafter'), '```sh\n# comment\nls\n```\nafter');
     assert.equal(joinMarkdownHeadings('## Done —\nnext'), 'Done —\nnext');
     assert.equal(joinMarkdownHeadings('## Title\n```\ncode\n```'), 'Title\n```\ncode\n```');
-    // One fence grammar with the renderer: an indented opener is a fence; a non-word
-    // info string (`md-js`) is not a fence for either, so its `##` line is a heading.
+    // One fence grammar with the renderer: indented and punctuation-labelled
+    // openers keep the code literal in both views.
     assert.equal(joinMarkdownHeadings('   ```md\n## code\n```\nafter'), '   ```md\n## code\n```\nafter');
     // The renderer opens a fence on ANY line ending in ```<info>: a prefixed opener too,
     // and the fence closes on the next line that contains ```.
@@ -140,13 +145,12 @@ test('joinMarkdownHeadings follows the renderer heading rule and leaves other ma
     assert.match(renderMarkdown('```md\n## code\nmore'), /md-h2/);
     assert.equal(joinMarkdownHeadings('## Title\n```md\nmore'), 'Title —\n```md\nmore');
     assert.equal(joinMarkdownHeadings('## Title\n```md\nmore\n```'), 'Title\n```md\nmore\n```');
-    // Fence delimiters follow the renderer byte for byte: trailing blanks or a CR after
-    // the info string make it ordinary text (no fence) for both.
-    // (…so `## code` is a heading and the stray ``` under it is text it is followed by)
-    assert.equal(joinMarkdownHeadings('```md   \n## code\n```'), '```md\ncode —\n```');
-    assert.doesNotMatch(renderMarkdown('```md   \n## code\n```'), /<pre>/);
-    assert.equal(joinMarkdownHeadings('```md\r\n## code\r\n```'), '```md\ncode —\n```');
-    assert.doesNotMatch(renderMarkdown('```md\r\n## code\r\n```'), /<pre>/);
+    // Trailing blanks and CRLF are ordinary fence syntax; the plain preview
+    // normalizes line endings and trailing whitespace while preserving the code markers.
+    assert.equal(joinMarkdownHeadings('```md   \n## code\n```'), '```md\n## code\n```');
+    assert.match(renderMarkdown('```md   \n## code\n```'), /<pre>/);
+    assert.equal(joinMarkdownHeadings('```md\r\n## code\r\n```'), '```md\n## code\n```');
+    assert.match(renderMarkdown('```md\r\n## code\r\n```'), /<pre>/);
     // Linear on hostile brackets: 40k unmatched `[` inside one heading line.
     const brackets = Date.now(); joinMarkdownHeadings(`## ${'['.repeat(40000)}\nnext`);
     assert.ok(Date.now() - brackets < 500, 'link projection must stay linear');
@@ -156,10 +160,10 @@ test('joinMarkdownHeadings follows the renderer heading rule and leaves other ma
     // An entity-like literal is visible as typed on the raw path (9 characters).
     assert.equal(joinMarkdownHeadings(`## ${'q'.repeat(72)}&abcdefg;\nnext`), `${'q'.repeat(72)}&abcdefg;\nnext`);
     assert.equal(joinMarkdownHeadings(`## ${'q'.repeat(71)}&abcdefg;\nnext`), `${'q'.repeat(71)}&abcdefg; —\nnext`);
-    // (its `##` line is a heading; the stray closing ``` right after it is a fence line, so no separator)
-    assert.equal(joinMarkdownHeadings('```md-js\n## code\n```'), '```md-js\ncode —\n```'); // the trailing ``` has no closer: text
+    // A punctuation-labelled closed fence is code; an unclosed one remains prose.
+    assert.equal(joinMarkdownHeadings('```md-js\n## code\n```'), '```md-js\n## code\n```');
     assert.equal(joinMarkdownHeadings('```md-js\n## code\ntext'), '```md-js\ncode —\ntext');
-    assert.match(renderMarkdown('```md-js\n## code\n```'), /md-h2/);
+    assert.doesNotMatch(renderMarkdown('```md-js\n## code\n```'), /md-h2/);
     assert.doesNotMatch(renderMarkdown('   ```md\n## code\n```\nafter'), /md-h2/);
     // Stage-correct visibility: on the rendered path an unmatched `*` is a visible
     // character (80 x + `*` = 81 → prose); on the raw path a literal `<…>` or `&amp;`
