@@ -315,8 +315,8 @@ def delegate_start_canary_context():
 
     delegate_start takes subagent_id only for a direct fresh start, as an exact
     Agent-session actor id from Available subagents; asked for it with no roster,
-    a model may rightly omit an id it cannot find. The block mirrors the catalog
-    Main sees (heading and row facts); nothing is registered, started or executed.
+    the request leaves that premise unstated. This synthetic block borrows Main's
+    catalog heading and relevant row vocabulary; nothing is registered or started.
     """
     roster = {"rows": [{
         "subagent_id": CANARY_SUBAGENT_ID,

@@ -839,7 +839,7 @@ def test_canary_run_rejects_an_omitted_selector_as_red_not_weather():
     assert (evidence["extra_keys"], evidence["missing_keys"]) == ([], ["subagent_id"])
     assert skip_on_provider_environmental_error(canary.canary_id, caught.value) is None
     assert len(client.calls) == 1
-    # Asked for beside the roster that offers it, the omission is the model's, not the prompt's.
+    # An omitted selector remains a contract failure even with the matching roster.
     assert client.calls[0]["messages"][0]["content"].startswith(delegate_start_canary_context())
 
 
