@@ -354,6 +354,14 @@ class OuroborosAgent:
         atomic record instead of being minted by whichever surface writes next.
         """
         try:
+            from ouroboros.task_status import execution_owner_record
+
+            canonical = pathlib.Path(task.get("budget_drive_root") or getattr(self.env, "budget_drive_root", None)
+                                     or self.env.drive_root)
+            assigned_owner = task.get("_execution_owner") or {}
+            execution_kind = assigned_owner.get("kind") or (
+                "presence" if task.get("_presence_turn") else "direct" if task.get("_is_direct_chat") else "pooled")
+            execution_owner = execution_owner_record(canonical, task, execution_kind)
             started = getattr(self, "_task_started_ts", None)
             # A queue row's focus is a REPLAY (retry clone, owner-wait restart
             # handoff): it may be older than the focus the same task id already
@@ -372,6 +380,7 @@ class OuroborosAgent:
                 self.env.drive_root,
                 str(task.get("id") or ""),
                 STATUS_RUNNING,
+                execution_owner=execution_owner,
                 task_attempt=task.get("_attempt", 0),
                 **({"started_at": datetime.fromtimestamp(started, timezone.utc).isoformat()}
                    if isinstance(started, (int, float)) and started > 0 else {}),
@@ -430,8 +439,6 @@ class OuroborosAgent:
                 origin_message_text=task.get("origin_message_text"),
                 result="Task is running.",
             )
-            canonical = pathlib.Path(task.get("budget_drive_root") or getattr(self.env, "budget_drive_root", None)
-                                     or self.env.drive_root)
             if canonical.resolve() != self.env.drive_root.resolve() and running.get("status") == STATUS_RUNNING:
                 # Queue snapshots are transient. A split root or subagent must
                 # retain its real start, attempt and child location after the
@@ -440,6 +447,7 @@ class OuroborosAgent:
                 # existing writer refuses a late start over a terminal row.
                 write_task_result(
                     canonical, str(task.get("id") or ""), STATUS_RUNNING,
+                    execution_owner=execution_owner,
                     child_drive_root=str(self.env.drive_root), budget_drive_root=str(canonical),
                     _is_direct_chat=bool(task.get("_is_direct_chat")),
                     **{key: running[key] for key in ("started_at", "ts", "task_attempt", "acceptance_original_root_cap") if key in running},

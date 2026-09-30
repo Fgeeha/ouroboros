@@ -1387,12 +1387,12 @@ def test_wait_for_tasks_flags_unknown_ids_and_attaches_children_roster(tmp_path)
     assert real["status"] == STATUS_COMPLETED
     assert "unknown_task_id" not in real
 
-    # The repair surface: the ACTUAL direct children, compact v6.71.2 field set
-    # only — no result/trace envelope fields, absent accounting projects null.
+    # Actual children stay compact, with execution evidence and honest accounting.
     roster = payload["children_roster"]
     assert [row["task_id"] for row in roster] == ["realchild1"]
     assert set(roster[0]) == {"task_id", "status", "accounted_upper_bound_usd",
-                              "child_result_sha256", "outcome_axes"}
+                              "child_result_sha256", "outcome_axes", "execution_observation"}
+    assert roster[0]["execution_observation"]["state"] == "terminal"
     assert roster[0]["accounted_upper_bound_usd"] == 0.55
     # Nothing was capped away, and the projection SAYS so (BIBLE P1).
     assert payload["children_roster_omitted"] == 0
@@ -1429,8 +1429,8 @@ def test_children_roster_projection_discloses_the_capped_tail(tmp_path):
     assert projected["children_roster_omitted"] == total - 30  # …and is disclosed
     assert all(
         set(row) == {"task_id", "status", "accounted_upper_bound_usd",
-                     "child_result_sha256", "outcome_axes"}
-        for row in roster
+                     "child_result_sha256", "outcome_axes", "execution_observation"}
+        and row["execution_observation"]["state"] == "terminal" for row in roster
     )
 
 
@@ -3227,7 +3227,8 @@ def test_orphan_reconcile_never_terminalizes_a_live_direct_activity(tmp_path, mo
     _orphan_shaped_running_task(tmp_path, "direct-live", snapshot_ts="2027-01-15T08:00:00+00:00")
 
     registry = get_direct_activity_registry()
-    registry.register("direct-live", chat_id=1)
+    from types import SimpleNamespace
+    registry.register("direct-live", chat_id=1, actor=SimpleNamespace(env=SimpleNamespace(drive_root=tmp_path)))
     assert reconcile_orphaned_running_tasks(tmp_path) == 0
     assert load_effective_task_result(tmp_path, "direct-live")["status"] == STATUS_RUNNING
     assert load_task_result(tmp_path, "direct-live")["status"] == STATUS_RUNNING
