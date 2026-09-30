@@ -27,6 +27,19 @@ from tests.test_request_wire_recovery_phase2b import (
 
 evidence_root = _evidence_root
 
+
+@pytest.fixture(autouse=True)
+def isolated_effort_disclosure():
+    """Builder-only probes never leave a call's pending note for another test."""
+    from ouroboros.llm_capability_policy import _EFFORT_CLAMP_CVAR
+
+    token = _EFFORT_CLAMP_CVAR.set(None)
+    try:
+        yield
+    finally:
+        _EFFORT_CLAMP_CVAR.reset(token)
+
+
 ENUM_MESSAGE = ('reasoning.effort: Invalid option: expected one of '
                 '"none"|"minimal"|"low"|"medium"|"high"|"xhigh"|"max"')
 
