@@ -98,8 +98,10 @@ export function scheduleRowHtml(s) {
         pending_binding_unavailable: 'Fired task awaits verified work binding',
         followup_result_persistence_unavailable: 'Task record could not be saved',
     };
+    const pendingDetail = pendingDelete ? ` · deletion waits for ${relation === 'independent'
+        ? 'its accepted run to start' : 'its task to finish'}` : '';
     const statusLabel = pendingDelete ? 'deletion pending' : status;
-    const sub = `${timing}${next && !consumed && !pendingDelete ? ` · next ${next}` : ''} · ${esc(statusLabel)} · ${esc(relation)}${binding}${s.deadline_at ? ` · deadline ${scheduleInstantHtml(s.deadline_at, { includeYear: true })}` : ''}${hold.reason ? ` · ${esc(explanations[hold.reason] || hold.reason)}` : ''}${s.followup_wait ? ` · ${esc(explanations[s.followup_wait] || s.followup_wait)}` : ''}${s.completed_at ? ' · already fired' : ''}${managed && s.skill ? ` · ${esc(s.skill)}` : ''}${waiting}`;
+    const sub = `${timing}${next && !consumed && !pendingDelete ? ` · next ${next}` : ''} · ${esc(statusLabel)}${pendingDetail} · ${esc(relation)}${binding}${s.deadline_at ? ` · deadline ${scheduleInstantHtml(s.deadline_at, { includeYear: true })}` : ''}${hold.reason ? ` · ${esc(explanations[hold.reason] || hold.reason)}` : ''}${s.followup_wait ? ` · ${esc(explanations[s.followup_wait] || s.followup_wait)}` : ''}${s.completed_at ? ' · already fired' : ''}${managed && s.skill ? ` · ${esc(s.skill)}` : ''}${waiting}`;
     // The exact hold release stays available wherever a hold exists, including on a
     // deleted row whose accepted task still needs it; it never re-enables the row.
     const holdControl = !hold.hold_id ? ''
@@ -119,8 +121,7 @@ export function scheduleRowHtml(s) {
         ? `<button type="button" class="btn btn-xs btn-default" data-act="schedule-toggle" data-id="${id}" data-action="restore">Cancel deletion</button>` : '';
     const readinessHeld = managed && !enabled && !suppressed;
     const lifecycle = pendingDelete
-        ? `<span class="activity-tag">${relation === 'independent'
-            ? 'deletion waits for its accepted run to start' : 'deletion waits for its task to finish'}</span>${holdControl}${cancelDelete}`
+        ? `${holdControl}${cancelDelete}`
         : status === 'waiting'
             ? '<span class="activity-tag">waiting for existing control</span>'
             : hold.hold_id

@@ -40,6 +40,7 @@ export function desiredLiveCardPhase(record = {}, terminalPhase = 'done') {
     }
     // Owner Batch4: a paused task (owner Pause, budget pause, Restart hold) is
     // not working, and neither is one still settling its Pause.
+    if (record.parkedPhase === 'unknown') return { phase: 'unknown', text: 'Activity unconfirmed', className: 'chat-live-phase warn' };
     if (record.parkedPhase === 'budget_paused') return { phase: 'paused', text: 'Paused', className: 'chat-live-phase warn' };
     if (record.parkedPhase === 'budget_pausing') return {
         phase: 'working', text: 'Pausing…', className: 'chat-live-phase working waiting',
@@ -52,11 +53,11 @@ export function desiredLiveCardPhase(record = {}, terminalPhase = 'done') {
 
 /**
  * Keep an unfinished card's chip on its task's census phase (`/api/state`
- * `active_chat_activities`): `budget_paused` / `budget_pausing` park it, any
- * other phase releases it. true when the chip changed.
+ * `active_chat_activities`): paused/pausing/unknown park it until a positive
+ * phase releases it. true when the chip changed.
  */
 export function syncParkedPhase(record, phase = '') {
-    const parked = /^budget_paus(ed|ing)$/.test(String(phase || '')) ? String(phase) : '';
+    const parked = ['budget_paused', 'budget_pausing', 'unknown'].includes(String(phase || '')) ? String(phase) : '';
     if (!record || record.finished || (record.parkedPhase || '') === parked) return false;
     record.parkedPhase = parked;
     const desired = desiredLiveCardPhase(record);
@@ -136,7 +137,7 @@ export function setLiveCardPhaseSecondary(record, text = '') {
 // remains unfinished without pretending the paused role is doing computation.
 export function setLiveCardTypingVisible(record, visible) {
     if (!record?.inlineTypingEl) return false;
-    const display = visible && !record.modelWaiting && record.parkedPhase !== 'budget_paused' && !record.reviewAnchor
+    const display = visible && !record.modelWaiting && !['budget_paused', 'unknown'].includes(record.parkedPhase) && !record.reviewAnchor
         && !record.historicalUnavailable && !record.historicalUnconfirmed ? '' : 'none';
     if (record.inlineTypingEl.style.display === display) return false;
     record.inlineTypingEl.style.display = display;

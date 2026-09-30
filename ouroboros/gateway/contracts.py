@@ -1346,8 +1346,8 @@ class TaskHurryRequest(TypedDict):
 
 
 class OwnerHurryProjection(TypedDict, total=False):
-    """Task-detail owner_hurry, never a chat message. Effects map host rails to
-    status; same-ID requeues archive this shape with archived_at/archived_reason."""
+    """Task-detail owner_hurry, never chat: requested|applied|not_applied_before_terminal.
+    Effects map host rails; same-ID requeues retain archived_at/archived_reason."""
 
     attempt_key: int
     request_id: str
@@ -1582,6 +1582,8 @@ __all__ = [
     "TaskEventsRequest",
     "TaskCancelResponse",
     "TaskCancelRequest",
+    "TaskPauseRequest", "TaskPauseResponse",
+    "TaskContinueRequest", "TaskContinueResponse", "ContinuationOffer",
     "TaskHurryRequest",
     "TaskHurryResponse",
     "OwnerHurryProjection",

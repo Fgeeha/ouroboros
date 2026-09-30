@@ -1042,6 +1042,7 @@ export function computeDerivedChatStatus({
     queuedManagedCount = 0,
     pausingManagedCount = 0,
     pausedManagedCount = 0,
+    unknownActivityCount = 0,
     waitingModelCount = 0,
     pendingSubmissionsCount = 0,
     supervisorStarting = false,
@@ -1068,6 +1069,7 @@ export function computeDerivedChatStatus({
         return { kind: 'thinking', text: 'Queued...', showDots: true };
     }
     if (waitingModelCount > 0) return { kind: 'online', text: 'Waiting for access', showDots: false };
+    if (unknownActivityCount > 0) return { kind: 'online', text: 'Activity unconfirmed', showDots: false };
     if (pausedManagedCount > 0) {
         // Paused work is NOT running and will not start by itself: never dress
         // it up as Working or Queued. The census phase is shared by a budget
@@ -1083,10 +1085,11 @@ export function computeDerivedChatStatus({
 // a paused or pausing card (`task_phase_chip.syncParkedPhase`) is not working.
 export function chatStatusCounts(activities, records, isWaiting = () => false) {
     const counts = { activeDirectCount: 0, activeManagedCount: 0, queuedManagedCount: 0, pausingManagedCount: 0,
-        pausedManagedCount: 0, hasActiveLiveCard: false, waitingModelCount: 0 };
+        pausedManagedCount: 0, unknownActivityCount: 0, hasActiveLiveCard: false, waitingModelCount: 0 };
     for (const [id, entry] of activities) {
         if (isWaiting(id)) continue;
-        if (entry?.phase === 'budget_pausing') counts.pausingManagedCount += 1;
+        if (entry?.phase === 'unknown') counts.unknownActivityCount += 1;
+        else if (entry?.phase === 'budget_pausing') counts.pausingManagedCount += 1;
         else if (entry?.phase === 'budget_paused') counts.pausedManagedCount += 1;
         else if (String(entry?.kind || '') !== 'managed_task') counts.activeDirectCount += 1;
         else if (String(entry?.phase || '') === 'queued') counts.queuedManagedCount += 1;

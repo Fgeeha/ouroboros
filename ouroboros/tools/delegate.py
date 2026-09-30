@@ -45,7 +45,7 @@ from ouroboros.delegate_custody import RunCustody as _RunCustody
 from ouroboros.configured_subagents import SESSION_ACCESS_PROFILES, SESSION_ACCESS_LOWERING
 from ouroboros.tool_capabilities import tool_result_limit
 from ouroboros.tools.registry import ToolContext, ToolEntry
-from ouroboros.tools.tool_result import ToolResult
+from ouroboros.tools.tool_result import ToolResult, _replace_tool_result
 from ouroboros.subagent_work_order import (  # noqa: F401 - compatibility re-export
     assignment_instructions as _assignment_instructions,
 )
@@ -397,7 +397,8 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
     continuation_token, argument_refusal = _start_argument_refusal(
         ctx, text, selector_root, retry_of, bucket, skill_name, continue_from)
     if argument_refusal:
-        return argument_refusal
+        # This argument boundary precedes daemon access, provisioning and any start.
+        return _replace_tool_result(argument_refusal, meta_updates={"operation_outcome": "completed_no_effect"})
     seconds_basis = ""
     if not str(retry_of or "").strip():
         # Decided BEFORE the daemon is touched: a spent lifetime or a sub-second

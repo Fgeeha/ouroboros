@@ -1326,7 +1326,8 @@
 /**
  * @typedef {Object} TaskPauseRequest
  * @property {string} request_id
- *
+ */
+/**
  * @typedef {Object} TaskPauseResponse
  * @property {boolean=} ok
  * @property {string=} task_id
@@ -1336,14 +1337,15 @@
  * @property {boolean=} duplicate
  * @property {Array<string>=} members
  * @property {boolean=} snapshot_persisted
+ * @property {boolean=} latch_pending
  * @property {string=} error
  * @property {string=} reason_code
  */
-
 /**
  * @typedef {Object} TaskContinueRequest
  * @property {string} action_nonce
- *
+ */
+/**
  * @typedef {Object} TaskContinueResponse
  * @property {boolean=} ok
  * @property {string=} task_id
@@ -1362,7 +1364,6 @@
  * @property {'bound'|'admitted'=} state
  * @property {string=} action_nonce
  */
-
 /**
  * @typedef {Object} ContinuationOffer
  * @property {boolean=} eligible
@@ -1372,7 +1373,6 @@
  * @property {'bound'|'admitted'=} state
  * @property {string=} action_nonce
  */
-
 /**
  * Reuse stop_action_id (at most 200 characters) for this exact action; a later
  * Stop needs a new ID, distinct from server request_id. No ID means no exact retry.
@@ -1381,7 +1381,6 @@
  * @property {string=} stop_policy
  * @property {string=} stop_action_id
  */
-
 /**
  * @typedef {Object} TaskCancelResponse
  * @property {boolean} ok
@@ -1394,14 +1393,12 @@
  *   Effective durable "immediate" | "finalize_then_cancel"; a graceful request never softens a hard intent.
  * @property {string=} error
  */
-
 /**
  * POST /api/tasks/{task_id}/hurry: no chat message. Only client request_id is
  * accepted, stable across retries; every other body field is refused.
  * @typedef {Object} TaskHurryRequest
  * @property {string} request_id
  */
-
 /**
  * Task-detail owner_hurry; same-ID requeues archive this shape with archived_at/archived_reason.
  * @typedef {Object} OwnerHurryProjection

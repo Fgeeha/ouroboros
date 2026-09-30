@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ouroboros.tools.tool_result import ToolResult, _publish_tool_result, completed_local_read
+from ouroboros.tools.tool_result import ToolResult, _publish_tool_result, completed_local_read, publish_no_effect
 
 import copy
 import json
@@ -546,7 +546,7 @@ def _write_file(
 ) -> str:
     normalized, block = _access_or_block(ctx, root, "write")
     if block:
-        return block
+        return publish_no_effect(ctx, block, tool_name="write_file")
     try:
         if _resolved_binding is None and files:
             bindings: ResolvedResourceBinding | tuple[ResolvedResourceBinding, ...] = tuple(
@@ -718,7 +718,7 @@ def _edit_text(
     cyber = mode_has_unrestricted_agency(get_runtime_mode())
     normalized, block = _access_or_block(ctx, root, "edit")
     if block:
-        return block
+        return publish_no_effect(ctx, block, tool_name="edit_text")
     try:
         binding = _direct_resource_binding(
             ctx, _resolved_binding, root=normalized, operation="edit", path=path,
@@ -726,7 +726,7 @@ def _edit_text(
         )
     except Exception as exc:
         prefix = "SKILL_PAYLOAD_ARG_ERROR" if normalized == "skill_payload" else "EDIT_TEXT_ERROR"
-        return f"⚠️ {prefix}: {exc}"
+        return publish_no_effect(ctx, f"⚠️ {prefix}: {exc}", tool_name="edit_text")
     reason = block_reason_for_path(ctx, binding.target_path, "write", binding)
     protected_block = (
         f"⚠️ EDIT_TEXT_BLOCKED: protected artifact path blocked: {reason}" if reason else ""
@@ -792,15 +792,20 @@ def _edit_text(
             block_reason = artifact_store_path_block_reason(target, base_path=binding.base_path)
             if block_reason:
                 return f"⚠️ EDIT_TEXT_BLOCKED: artifact_store path blocked: {block_reason}"
-        text = target.read_text(encoding="utf-8")
+        try:
+            text = target.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return publish_no_effect(ctx, f"⚠️ EDIT_TEXT_ERROR: file not found: {_root_display_path(normalized, path)}", tool_name="edit_text")
+        except OSError as exc:
+            return publish_no_effect(ctx, f"⚠️ EDIT_TEXT_ERROR: {type(exc).__name__}: {exc}", tool_name="edit_text")
         new_text, match_error = _str_match_replace(
             text, old_str, new_str, _root_display_path(normalized, path), "EDIT_TEXT_ERROR"
         )
         if match_error:
-            return match_error
+            return publish_no_effect(ctx, match_error, tool_name="edit_text")
         # Exact replace and full overwrite share the intentional-shrink contract.
         if (shrink := _check_data_shrink_guard(target, new_text, force)):
-            return shrink
+            return publish_no_effect(ctx, shrink, tool_name="edit_text")
         constraint = normalize_task_constraint(getattr(ctx, "task_constraint", None))
         repair = selected_payload and constraint and constraint.has_selected_skill
         if repair:

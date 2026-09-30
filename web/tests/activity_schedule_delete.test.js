@@ -37,7 +37,8 @@ test('a deleted row still owing work stays in the standing list after reload', (
     assert.equal(isRetainedSchedule({ ...consumedPending, status: 'consumed', delete_requested_at: '' }), true);
     const html = scheduleRowHtml(consumedPending);
     assert.match(html, /deletion waits for its task to finish/);
-    assert.match(html, / · deletion pending · related/);
+    assert.match(html, / · deletion pending · deletion waits for its task to finish · related/);
+    assert.doesNotMatch(html.split('activity-row-actions')[1], /deletion waits/, 'wrapping detail stays with the description');
     assert.doesNotMatch(html, /data-act="schedule-toggle"/, 'a consumed one-shot cannot be rearmed');
     assert.match(html, /data-act="schedule-delete" data-id="fu-1"/);
     const independent = scheduleRowHtml({ ...consumedPending, relation: 'independent', trigger: { type: 'cron', expr: '0 9 * * *' },

@@ -624,6 +624,7 @@ def _execute_single_tool(
     drive_logs: pathlib.Path,
     task_id: str = "",
     invocation: Optional[Dict[str, Any]] = None,
+    *, host_refusal: Optional[ToolResult] = None,
 ) -> Dict[str, Any]:
     """
     Execute a single tool call and return all needed info.
@@ -704,7 +705,7 @@ def _execute_single_tool(
 
     tool_ok = True
     try:
-        tool_result = tools.execute_result(fn_name, args)
+        tool_result = host_refusal if host_refusal is not None else tools.execute_result(fn_name, args)
         result = tool_result.text
     except UsageAccountingError:
         raise
@@ -1105,10 +1106,17 @@ def _await_stateful_tool(tools: ToolRegistry, tc: Dict[str, Any], drive_logs: pa
     # reaches the tool body, the wrapper refuses instead of letting the
     # abandoned call build a session in the NEXT command's state.
     submit_generation = getattr(tool_ctx, "browser_state", None)
-    with execution_deadline_scope(monotonic_now() + timeout_sec):
-        from ouroboros.owner_pause import submit_tool
-        future = submit_tool(tool_ctx, fn_name, stateful_executor.submit,
-            _execute_browser_tool_bound, tools, tc, drive_logs, task_id, submit_generation, invocation)
+    from ouroboros.owner_pause import OwnerPauseRefused, submit_tool
+    try:
+        with execution_deadline_scope(monotonic_now() + timeout_sec):
+            future = submit_tool(tool_ctx, fn_name, stateful_executor.submit,
+                _execute_browser_tool_bound, tools, tc, drive_logs, task_id, submit_generation, invocation)
+    except OwnerPauseRefused as exc:
+        from ouroboros.tools.tool_result import launch_refusal_result
+
+        result = _execute_single_tool(tools, tc, drive_logs, task_id, invocation,
+                                      host_refusal=launch_refusal_result(str(exc)))
+        return _emit_finished(tools, live, result, started_at)
     # The registration PINS settlement ownership until this call's own
     # handling is over (result in time, or the late hold claimed below):
     # released in the finally, after either branch (#1196).

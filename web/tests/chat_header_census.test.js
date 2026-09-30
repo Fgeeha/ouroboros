@@ -142,6 +142,13 @@ test('a direct owner Pause agrees between the actual card and header, then Resum
         assert.equal(fx.typingHidden(), true);
         assert.equal(fx.card(id).querySelector('[data-live-phase]')?.textContent, 'Paused');
         assert.equal(fx.card(id).querySelector('[data-live-typing]')?.style.display, 'none');
+        fx.census([{ ...row, phase: 'unknown' }], false);
+        assert.equal(fx.status(), 'Activity unconfirmed');
+        assert.equal(fx.typingHidden(), true);
+        assert.equal(fx.card(id).querySelector('[data-live-phase]')?.textContent, 'Activity unconfirmed');
+        assert.equal(fx.card(id).querySelector('[data-live-typing]')?.style.display, 'none');
+        fx.census([{ ...row, phase: 'budget_paused' }], true);
+        assert.equal(fx.status(), 'Paused');
         fx.census([{ ...row, phase: 'thinking' }], true);
         assert.equal(fx.status(), 'Thinking...');
         assert.equal(fx.card(id).querySelector('[data-live-phase]')?.textContent, 'Working');

@@ -483,6 +483,8 @@ def resume_budget_paused_task(task_id: str, *, selected_by: str = "") -> Dict[st
             if isinstance(task.get("_budget_pause_resume"), dict):
                 return {"ok": False, "error": "resume_already_granted",
                         "grant_id": str(task["_budget_pause_resume"].get("grant_id") or "")}
+            if observation is None:
+                return {"ok": False, "error": "task_not_budget_paused"}
             pause = {**candidate_fence, "physical_calls": 0, "replay_safe": True}
         root_scope = str(pause.get("scope") or "") == "root"
         root_task_id = str(pause.get("root_task_id") or "").strip()

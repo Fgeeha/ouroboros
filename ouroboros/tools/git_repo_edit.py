@@ -13,6 +13,7 @@ from typing import Dict, List, Optional
 
 from ouroboros.tools.registry import ToolContext
 from ouroboros.tool_access import ResolvedResourceBinding, canonical_data_root
+from ouroboros.tools.tool_result import publish_no_effect
 
 
 def _git():
@@ -87,19 +88,19 @@ def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
     if files:
         for entry in files:
             if not isinstance(entry, dict):
-                return "⚠️ WRITE_ERROR: each item in files must be {path, content}."
+                return publish_no_effect(ctx, "⚠️ WRITE_ERROR: each item in files must be {path, content}.", tool_name="write_file")
             p = entry.get("path", "").strip()
             c = entry.get("content", "")
             if not p:
-                return "⚠️ WRITE_ERROR: every file entry must have a non-empty 'path'."
+                return publish_no_effect(ctx, "⚠️ WRITE_ERROR: every file entry must have a non-empty 'path'.", tool_name="write_file")
             write_list.append({"path": p, "content": c})
     elif path and content is not None:
         write_list.append({"path": path.strip(), "content": content})
     else:
-        return "⚠️ WRITE_ERROR: provide either (path + content) or files array."
+        return publish_no_effect(ctx, "⚠️ WRITE_ERROR: provide either (path + content) or files array.", tool_name="write_file")
 
     if not write_list:
-        return "⚠️ WRITE_ERROR: nothing to write."
+        return publish_no_effect(ctx, "⚠️ WRITE_ERROR: nothing to write.", tool_name="write_file")
 
     try:
         if _resolved_binding is None:
@@ -155,11 +156,11 @@ def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
             if force:
                 syntax_bypass_notes.append(f"{rel_path}: {syntax_err}")
                 continue
-            return (
+            return publish_no_effect(ctx, (
                 f"⚠️ WRITE_BLOCKED_SYNTAX: {syntax_err} for '{e['path']}'. "
                 "Nothing was written. Fix the content, or pass force=true for an "
                 "intentionally invalid file."
-            )
+            ), tool_name="write_file")
 
     written = []
     written_paths: List[str] = []
@@ -290,9 +291,9 @@ def _str_replace_editor(
 ) -> str:
     """Replace exactly one occurrence of old_str with new_str in a file."""
     if not path or not path.strip():
-        return "⚠️ STR_REPLACE_ERROR: path is required."
+        return publish_no_effect(ctx, "⚠️ STR_REPLACE_ERROR: path is required.", tool_name="edit_text")
     if not old_str:
-        return "⚠️ STR_REPLACE_ERROR: old_str is required (cannot be empty)."
+        return publish_no_effect(ctx, "⚠️ STR_REPLACE_ERROR: old_str is required (cannot be empty).", tool_name="edit_text")
 
     existing_tc = _git().normalize_task_constraint(getattr(ctx, "task_constraint", None))
     data_skill_target = None
@@ -368,18 +369,18 @@ def _str_replace_editor(
         )
 
     if not target.exists():
-        return f"⚠️ STR_REPLACE_ERROR: file not found: {path}"
+        return publish_no_effect(ctx, f"⚠️ STR_REPLACE_ERROR: file not found: {path}", tool_name="edit_text")
 
     try:
         content = target.read_text(encoding="utf-8")
     except Exception as e:
-        return f"⚠️ STR_REPLACE_ERROR: cannot read {path}: {e}"
+        return publish_no_effect(ctx, f"⚠️ STR_REPLACE_ERROR: cannot read {path}: {e}", tool_name="edit_text")
 
     # Shared exact-match single-replacement (deferral 4): identical count==0/count>1
     # feedback for the repo and data-plane editors.
     new_content, _match_err = _git()._str_match_replace(content, old_str, new_str, path, "STR_REPLACE_ERROR")
     if _match_err:
-        return _match_err
+        return publish_no_effect(ctx, _match_err, tool_name="edit_text")
     if data_skill_target is not None:
         # Deferral 5: a data-plane skill payload edited via the active_workspace route gets
         # the SAME shrink guard as the root=skill_payload editor — no silent >30% truncation
@@ -389,11 +390,11 @@ def _str_replace_editor(
 
         _shrink_block = _check_data_shrink_guard(target, new_content, force)
         if _shrink_block:
-            return _shrink_block
+            return publish_no_effect(ctx, _shrink_block, tool_name="edit_text")
     elif binding is not None:
         _shrink_block = _git()._check_shrink_guard(binding, new_content, force)
         if _shrink_block:
-            return _shrink_block
+            return publish_no_effect(ctx, _shrink_block, tool_name="edit_text")
     # X3 hash-bind: the ADMITTED repair task's payload edits CAS-check the
     # repair's own hash chain; drift outside the repair is a typed stale
     # terminalization, never a silent write over foreign changes.

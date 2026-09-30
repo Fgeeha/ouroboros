@@ -577,6 +577,11 @@ test('Batch4: the census phase parks and releases a live card chip', () => {
     assert.equal(record.phaseEl.textContent, 'Paused');
     assert.equal(record.inlineTypingEl.style.display, 'none', 'a paused card shows no typing activity');
     assert.equal(syncParkedPhase(record, 'budget_paused'), false, 'an unchanged phase writes nothing');
+    assert.equal(syncParkedPhase(record, 'unknown'), true);
+    assert.equal(record.phaseEl.textContent, 'Activity unconfirmed');
+    assert.equal(record.inlineTypingEl.style.display, 'none');
+    assert.equal(syncParkedPhase(record, 'budget_paused'), true);
+    assert.equal(record.phaseEl.textContent, 'Paused');
     assert.equal(syncParkedPhase(record, 'working'), true, 'Resume releases it');
     assert.equal(record.phaseEl.textContent, 'Working');
     assert.equal(record.inlineTypingEl.style.display, '');

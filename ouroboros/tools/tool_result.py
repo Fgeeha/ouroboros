@@ -645,6 +645,20 @@ def _restore_tool_result_sidecar(token: Token) -> None:
     _TOOL_RESULT_STATE.reset(token)
 
 
+def publish_no_effect(ctx: Any, result: str | ToolResult, *, tool_name: str = "") -> str:
+    """Publish a producer-proven refusal before this invocation's first effect.
+
+    Call only at the validation boundary, never on a generic error/timeout path.
+    Preserve existing typed classification and text; this settles no other custody.
+    """
+    prior = _published_tool_result(ctx, None)
+    typed = result if isinstance(result, ToolResult) else (
+        prior if isinstance(prior, ToolResult) and prior.text == result
+        else LegacyTextResultAdapter.from_text(tool_name, result))
+    return _publish_tool_result(ctx, _replace_tool_result(
+        typed, meta_updates={"operation_outcome": "completed_no_effect"}))
+
+
 def completed_local_read(handler):
     """Publish completion from a synchronous first-party reader's returned body.
 

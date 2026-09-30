@@ -26,7 +26,7 @@ records.
 
 from __future__ import annotations
 
-from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
+from ouroboros.tools.tool_result import ToolResult, _publish_tool_result, publish_no_effect
 
 import json
 import uuid
@@ -62,12 +62,12 @@ def _manage_schedules(
 
     operation = str(action or "list").strip().lower()
     if presence_caller_binding(ctx) is not None:  # a speaker, or work acting for its binding
-        return _publish_tool_result(ctx, ToolResult(
+        return publish_no_effect(ctx, ToolResult(
             status="blocked", code="RESOURCE_CONSTRAINT_BLOCKED",
             text="⚠️ RESOURCE_CONSTRAINT_BLOCKED: a Presence conversation cannot read or change owner schedules.",
         ))
     if operation != "list" and not _root_schedule_mutation_authorized(ctx):
-        return _publish_tool_result(ctx, ToolResult(
+        return publish_no_effect(ctx, ToolResult(
             status="blocked", code="RESOURCE_CONSTRAINT_BLOCKED",
             text=(
                 "⚠️ RESOURCE_CONSTRAINT_BLOCKED: a delegated task may only read schedules "
@@ -87,13 +87,13 @@ def _manage_schedules(
                               ensure_ascii=False, sort_keys=True,
                               separators=(",", ":"))
         if operation not in SCHEDULE_ACTIONS:
-            return json.dumps({"ok": False, "status": "invalid_action",
-                               "allowed": ["list", *sorted(SCHEDULE_ACTIONS)]}, sort_keys=True)
+            return publish_no_effect(ctx, json.dumps({"ok": False, "status": "invalid_action",
+                               "allowed": ["list", *sorted(SCHEDULE_ACTIONS)]}, sort_keys=True), tool_name="manage_schedules")
         # Preserve selectors verbatim. Refuse an identity that cannot fit in a
         # truthful receipt before changing anything, rather than cutting it.
         if len(json.dumps(str(schedule_id or ""), ensure_ascii=False)) > result_limit - 2_000:
-            return json.dumps({"ok": False, "changed": False, "status": "identity_too_large",
-                               "audit": "not_written", "detail": "Schedule identity exceeds the tool result limit; nothing changed."})
+            return publish_no_effect(ctx, json.dumps({"ok": False, "changed": False, "status": "identity_too_large",
+                               "audit": "not_written", "detail": "Schedule identity exceeds the tool result limit; nothing changed."}), tool_name="manage_schedules")
         outcome = mutate_scheduled_task(
             operation, schedule_id, reason=reason, actor="agent",
             task_id=str(getattr(ctx, "task_id", "") or ""), drive_root=root,
@@ -302,18 +302,18 @@ def _naive_instant(raw: str) -> bool:
 def _handle_schedule_followup(ctx: ToolContext, **params) -> str:
     if _is_delegated_subagent(ctx):
         return (
-            _publish_tool_result(ctx, ToolResult(status="blocked", code="ACCESS_BLOCKED", text=("ERROR: FOLLOWUP_SUBAGENT_REFUSED: a delegated subagent holds narrower-than-parent "
+            publish_no_effect(ctx, ToolResult(status="blocked", code="ACCESS_BLOCKED", text=("ERROR: FOLLOWUP_SUBAGENT_REFUSED: a delegated subagent holds narrower-than-parent "
             "authority and may not mint future root tasks. Report the wait instant to your "
             "parent instead; the parent (or the owner) decides whether to schedule a follow-up.")))
         )
     task_id = str(getattr(ctx, "task_id", "") or "").strip()
     if not task_id:
-        return _publish_tool_result(ctx, ToolResult(status="unavailable", code="CAPABILITY_UNAVAILABLE", text=("ERROR: FOLLOWUP_TASK_ID_REQUIRED: a durable follow-up must belong to a real task.")))
+        return publish_no_effect(ctx, ToolResult(status="unavailable", code="CAPABILITY_UNAVAILABLE", text=("ERROR: FOLLOWUP_TASK_ID_REQUIRED: a durable follow-up must belong to a real task.")))
     run_at_raw = str(params.get("run_at") or "").strip()
     cron = str(params.get("cron") or "").strip()
     if bool(run_at_raw) == bool(cron):
         return (
-            _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=("ERROR: FOLLOWUP_TRIGGER_REQUIRED: supply exactly one of run_at (one-shot) "
+            publish_no_effect(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=("ERROR: FOLLOWUP_TRIGGER_REQUIRED: supply exactly one of run_at (one-shot) "
             "or cron (recurring).")))
         )
     timezone = str(params.get("timezone") or "").strip()
@@ -324,7 +324,7 @@ def _handle_schedule_followup(ctx: ToolContext, **params) -> str:
             if _naive_instant(run_at_raw):
                 # A zone beside a run_at WITHOUT an offset asks for something: ignoring it would
                 # schedule the naive time as UTC, hours away from what was meant.
-                return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(
+                return publish_no_effect(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(
                     f"ERROR: FOLLOWUP_TIMEZONE_WITH_RUN_AT: run_at={run_at_raw!r} carries no UTC offset and "
                     f"timezone={timezone!r} applies only to recurring cron follow-ups. Put the offset into run_at "
                     "(example: 2026-08-19T12:20:00+03:00) and omit timezone. Nothing was scheduled.")))
@@ -334,7 +334,7 @@ def _handle_schedule_followup(ctx: ToolContext, **params) -> str:
             timezone = ""
         if instant is None:
             return (
-                _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(f"ERROR: FOLLOWUP_RUN_AT_INVALID: {run_at_raw!r} is not a parseable ISO 8601 "
+                publish_no_effect(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(f"ERROR: FOLLOWUP_RUN_AT_INVALID: {run_at_raw!r} is not a parseable ISO 8601 "
                 "instant. Example: 2026-08-19T12:20:00+03:00 (naive times read as UTC).")))
             )
         trigger = {"type": "once", "run_at": instant.isoformat()}
@@ -342,24 +342,24 @@ def _handle_schedule_followup(ctx: ToolContext, **params) -> str:
         from ouroboros.schedule_contract import cron_error, timezone_error
 
         if error := cron_error(cron):
-            return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(f"ERROR: FOLLOWUP_CRON_INVALID: {error}")))
+            return publish_no_effect(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(f"ERROR: FOLLOWUP_CRON_INVALID: {error}")))
         if error := timezone_error(timezone):
-            return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(f"ERROR: FOLLOWUP_TIMEZONE_INVALID: {error}")))
+            return publish_no_effect(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(f"ERROR: FOLLOWUP_TIMEZONE_INVALID: {error}")))
         trigger = {"type": "cron", "expr": cron}
     objective = str(params.get("objective") or "").strip()
     if not objective:
-        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=("ERROR: FOLLOWUP_OBJECTIVE_REQUIRED: write the future task's objective in plain language.")))
+        return publish_no_effect(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=("ERROR: FOLLOWUP_OBJECTIVE_REQUIRED: write the future task's objective in plain language.")))
     # Typed refusal, never a silent cut: the text rides VERBATIM into the future
     # task, so truncating it here would silently change what that task is.
     if len(objective) > _MAX_OBJECTIVE_CHARS:
         return (
-            _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(f"ERROR: FOLLOWUP_TEXT_TOO_LONG: objective is {len(objective)} chars; the limit is "
+            publish_no_effect(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(f"ERROR: FOLLOWUP_TEXT_TOO_LONG: objective is {len(objective)} chars; the limit is "
             f"{_MAX_OBJECTIVE_CHARS}. Shorten it — nothing was truncated and nothing was scheduled.")))
         )
     context = str(params.get("context") or "").strip()
     if len(context) > _MAX_CONTEXT_CHARS:
         return (
-            _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(f"ERROR: FOLLOWUP_TEXT_TOO_LONG: context is {len(context)} chars; the limit is "
+            publish_no_effect(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(f"ERROR: FOLLOWUP_TEXT_TOO_LONG: context is {len(context)} chars; the limit is "
             f"{_MAX_CONTEXT_CHARS}. Shorten it — nothing was truncated and nothing was scheduled.")))
         )
     from ouroboros.tool_access import canonical_data_root
@@ -368,14 +368,14 @@ def _handle_schedule_followup(ctx: ToolContext, **params) -> str:
     try:
         drive_root = canonical_data_root(ctx)
     except Exception as exc:
-        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ERROR", text=(f"ERROR: FOLLOWUP_DATA_ROOT_UNRESOLVED: {exc}")))
+        return publish_no_effect(ctx, ToolResult(status="error", code="TOOL_ERROR", text=(f"ERROR: FOLLOWUP_DATA_ROOT_UNRESOLVED: {exc}")))
     from supervisor.followup_policy import resolve_relation
     origin = {"task_id": task_id, "root_task_id": str(getattr(ctx, "root_task_id", "") or
               (getattr(ctx, "task_metadata", None) or {}).get("root_task_id") or task_id)}
     try:
         relation = resolve_relation(drive_root, origin, params.get("relation"), declared_by=task_id)
     except ValueError as exc:
-        return _publish_tool_result(ctx, ToolResult(status="unavailable", code="CAPABILITY_UNAVAILABLE",
+        return publish_no_effect(ctx, ToolResult(status="unavailable", code="CAPABILITY_UNAVAILABLE",
                                     text=f"FOLLOWUP_REFUSED: {exc}"))
     # The cap is read from the table this call is about to write, so the count
     # and the write share ONE transaction: two tasks registering at once would
