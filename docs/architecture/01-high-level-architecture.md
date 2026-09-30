@@ -226,7 +226,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── headless_status.py ← Artifact and task lifecycle vocabulary shared by the headless owners
       ├── workspace_patch_rules.py ← Pure patch-exclusion rules (env/cache sets, junk regex, lockfiles, credential-shaped names); the I/O checks + `untracked_capture_veto_reason` stay in headless
       ├── workspace_patch_capture.py ← Workspace patch capture: the patch artifact, its manifest, and its git plumbing
-      ├── workspace_copies.py ← Git-copy source/execution/baseline identity, own-body policy and legacy interpretation (§6 Delegated subagents)
+      ├── workspace_copies.py ← Git-copy source/baseline identity and own-body/legacy policy (§6 Delegated subagents)
       ├── coop_checkpoint.py   ← Quiescent checkpoint commits of cooperative trees, off the drain thread: only a MUTATIVE child's `write_root` qualifies (owner-attached folders never); credential-shaped files excluded + disclosed; a root mid merge/rebase/cherry-pick/revert is SKIPPED, because staging an interrupted operation consumes its MERGE_HEAD and commits a half-resolved tree (§5)
       ├── delegate_output.py ← Atomic full outputs delegated_runs/<run>.json (sha256/length), reader-bound delivered EOF coverage and delegate_run_output_consumed facts (§6 Terminal products and their reader)
       ├── delegate_activity.py ← Typed executor speech/problems/technical counts, source_handles/delegated_activity JSONL, emission-committed cursor and bounded terminal drain (§6 Delegated activity)
@@ -361,7 +361,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── deliverables_paths.py ← Lexical + case-folded deliverables path views
       ├── tool_capabilities.py ← SSOT for the core/parallel-safe/untruncated/stateful-browser tool sets and the cognitive-memory tool class every Presence ceiling carries
       ├── tool_access.py       ← ToolProfile × ResourceRoot × Operation matrix, affordance map, closed-enum `required_capabilities` check
-      ├── tool_access_types.py, tool_access_roots.py, tool_access_paths.py, tool_access_user_files.py, tool_access_reads.py ← Access matrix, physical roots and owner-location rules; inherited read bindings remain separate from action authority (§6 Resource roots and physical file identity)
+      ├── tool_access_types.py, tool_access_roots.py, tool_access_paths.py, tool_access_user_files.py, tool_access_reads.py ← Matrix and physical roots; inherited reads, separate action authority (§6 Resource roots and physical file identity)
       ├── tool_policy.py       ← Round-one tool visibility (the sets live in tool_capabilities)
       ├── browser_policy.py    ← The browser tool's target and control-request policy: task-granted concrete origins, metadata/private/reserved refusals, the three-valued Ouroboros control-service identity (`runtime_service_kind`: proven kind / unknown / none); `tools/browser.py` keeps the Playwright lifecycle (§6 MCP and browser-facing external tools)
       ├── skill_payload_binding.py ← Skill payload targeting: `.seed-origin` distinguishes native vs external; read/list/search only for read profiles; bounded manifestless skill_publish recovery
@@ -431,7 +431,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── tools/               ← Auto-discovered tool plugins (registry.py owns discovery; frozen module list for packaged builds)
       │   ├── registry.py      ← Tool registry SSOT: loads tool modules, exposes schemas, executes safely; owns the shell-guard/process-tool membership sets
       │   ├── core.py          ← File/data tools (read_file, write_file, list_files) + code search and digest helpers
-      │   ├── core_file_tools.py, core_secret_paths.py, core_artifacts.py ← Core-tool leaves: the read/list file tools with the shared resource-access helpers; the retained delegated action-profile and runtime-control helpers; the verbs that put something in front of a human (§6 Credential mutation and diagnostic redaction)
+      │   ├── core_file_tools.py, core_secret_paths.py, core_artifacts.py ← File reads/lists; delegated action/runtime helpers; human artifact delivery (§6 Credential mutation and diagnostic redaction)
       │   ├── shell.py         ← Process tools `run_command`/`run_script` (in-process `_active_subprocesses` tracking; §9)
       │   ├── shell_guards.py  ← Shared process-path inspection helpers and retained target extractors; process admission is owned by registry_guard_process (§6)
       │   ├── registry_core.py, registry_guards.py, registry_guard_process.py, tool_context.py ← The registry's leaves: the execution authority (load, schemas, safe dispatch); the host-owned pre-dispatch guards (capability/resource, managed-update and skill-payload constraints); process admission over the prepared target with post-execution observations (§6 Safety and runtime mode); and `ouroboros/tools/tool_context.py`, the concrete `ToolContext` + `BrowserState` (its protocol is `contracts/tool_context.py`)
