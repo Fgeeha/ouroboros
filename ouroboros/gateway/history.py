@@ -1165,6 +1165,7 @@ def _apply_window_quotas(
     combined: list,
     n_human: int,
     n_progress: int,
+    result_cache: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> tuple[list, Dict[str, Dict[str, Any]], bool, bool, bool, str, set]:
     """Quota slicing, origin fallback, and the lineage floor/cap (perf2 P3).
 
@@ -1306,7 +1307,7 @@ def _apply_window_quotas(
     # about the task's card — the client refuses role+task_id as a conclusion for
     # the same reason — so counting those would let a parent with no closable fact
     # re-anchor a finished swarm, the zombie the floor existed to prevent.
-    result_cache: Dict[str, Dict[str, Any]] = {}
+    result_cache = {} if result_cache is None else result_cache
     anchored_children: set = set()
     child_rows = [
         m for m in (*lineage_rows, *human_tail, *other_tail)
@@ -1492,15 +1493,13 @@ def _assemble_history_response(
     lifecycle_row = _active_lifecycle_row(row_matches_thread) if not cursor else None
     if lifecycle_row is not None:
         combined.append(lifecycle_row)
-    arrival = latest_arrival(combined, page, data_dir, row_matches_thread, _stored_chat_id,
-                             chat_gaps) if thread_id in project_chat_ids else {}  # before tail/annotation
-    if recent:
-        (
-            messages, result_cache, human_rows_dropped, lineage_truncated,
-            review_overlays_truncated, floor, anchored_children,
-        ) = _apply_window_quotas(
-            data_dir, thread_id, project_chat_ids, combined, n_human, n_progress
-        )
+    result_cache: Dict[str, Dict[str, Any]] = {}  # every task result below is read once per request
+    arrival = latest_arrival(combined, page, data_dir, row_matches_thread, _stored_chat_id, chat_gaps, lambda task_id: (
+        _load_terminal_result(data_dir, task_id, result_cache))) if thread_id in project_chat_ids else {}
+    if recent:  # arrival is named above, before the tail and the annotation
+        (messages, result_cache, human_rows_dropped, lineage_truncated, review_overlays_truncated, floor,
+         anchored_children) = _apply_window_quotas(
+            data_dir, thread_id, project_chat_ids, combined, n_human, n_progress, result_cache)
         for source in ("chat", "progress"):
             before[source] = deferred_before(source, selections[source][0], candidates, messages, before[source])
     else:
@@ -1508,7 +1507,7 @@ def _assemble_history_response(
         # floor would permanently remove children whose parent is on another
         # page; the keyed replay joins that topology without granting liveness.
         messages = sorted(combined, key=lambda row: row.get("ts", ""))
-        result_cache, floor, anchored_children = {}, "", set()
+        floor, anchored_children = "", set()
         human_rows_dropped = lineage_truncated = review_overlays_truncated = False
 
     # Annotate only emitted rows; an absent summary must not strand a card.

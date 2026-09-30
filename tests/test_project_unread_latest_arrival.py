@@ -342,3 +342,110 @@ def test_a_skill_review_after_a_late_answer_does_not_stand_in_for_it(room):
     assert room.revision() == 2
     assert room.read()["window"]["latest_message"] == {
         "history_id": room.row_id("late final"), "out_of_order": True}
+
+
+def legacy_child_final(room, text: str, minute: int, task_id: str = "kid-old") -> None:
+    """A child's final written before chat rows carried lineage: only its task result names the child."""
+    from ouroboros.task_results import write_task_result
+
+    write_task_result(room.root, task_id, "completed", delegation_role="subagent", parent_task_id="root-1",
+                      root_task_id="root-1", role="researcher")
+    append_jsonl(room.chat_log, {"ts": ts(minute), "direction": "out", "chat_id": room.chat_id,
+                                 "text": text, "task_id": task_id})
+
+
+def test_a_legacy_child_final_its_task_result_names_is_never_the_newest_message(room):
+    """History recovers the child's lineage from its task result and shows the final in the child's card."""
+    room.deliver("root answer", 5)
+    legacy_child_final(room, "legacy child final", 6)
+    recent = room.read()
+    (child,) = [row for row in recent["messages"] if row.get("text") == "legacy child final"]
+    assert child["delegation_role"] == "subagent" and child["parent_task_id"] == "root-1", "shown in the child's card"
+    assert recent["window"]["latest_message"] == {"history_id": room.row_id("root answer"), "out_of_order": False}
+
+
+def test_a_legacy_child_final_before_the_recent_selection_does_not_stand_in_for_the_root_answer(room, narrow_recent):
+    room.deliver("root answer", 5)
+    legacy_child_final(room, "legacy child final", 6)
+    child_words(room, 6)
+    message_bus.log_chat("in", room.chat_id, 7, "owner asks", ts=ts(40))
+    recent = room.read(n_human="2")
+    assert "legacy child final" not in texts(recent), "both lie before the recent selection"
+    assert recent["window"]["latest_message"] == {"history_id": room.row_id("root answer"), "out_of_order": True}
+
+
+def follow(room, cursor):
+    """Every older page from ``cursor`` down to the start of the chat."""
+    pages = []
+    while cursor:
+        pages.append(room.read(cursor=cursor))
+        cursor = pages[-1]["next_cursor"]
+    return pages
+
+
+def test_older_pages_carry_a_bounded_search_on_to_the_newest_message(room, narrow_recent, monkeypatch):
+    """The recent read's bound came first. Its older pages continue the search: the one holding the
+    newest standalone message names it, relative to the chain's frozen boundary; none other does."""
+    room.deliver("first answer", 1)
+    room.deliver("root answer", 5)
+    child_words(room, 8)
+    message_bus.log_chat("in", room.chat_id, 7, "owner asks", ts=ts(40))
+    monkeypatch.setattr(history_paging, "_PAGE_SCAN_ROWS", 3)
+    recent = room.read(n_human="2")
+    answer = room.row_id("root answer")
+    assert recent["window"]["latest_message"] is None, "unknown: the bound came before the answer"
+    assert int(answer.split(":")[1]) < recent["window"]["latest_before"] < room.chat_log.stat().st_size, \
+        "but searched: nothing newer lies at or after latest_before"
+    replay = room.read(cursor=recent["page_cursor"])
+    assert replay["window"]["latest_message"] is None and "latest_before" not in replay["window"]
+
+    pages = follow(room, recent["next_cursor"])
+    named = [page["window"].get("latest_message", "nothing") for page in pages]
+    holding = next(page for page in pages if page["window"].get("latest_message"))
+    assert [name for name in named if name != "nothing"] == [{"history_id": answer, "out_of_order": True}], \
+        ("the pages above it hold no standalone message, and the pages below it name nothing", named)
+    assert named[0] == "nothing" and named[-1] == "nothing", named
+    assert "root answer" in texts(holding) and holding["coverage"]["upper"] == recent["coverage"]["upper"]
+    assert room.read(cursor=holding["page_cursor"])["window"]["latest_message"] == {
+        "history_id": answer, "out_of_order": True}, "a restored page names it again"
+    assert "first answer" in texts(pages[-1])
+
+
+def test_an_unreadable_row_interrupts_the_continued_search(room, narrow_recent, monkeypatch):
+    room.deliver("root answer", 5)
+    with room.chat_log.open("ab") as stream:
+        stream.write(b'{"direction": "out", "text": "torn\n')
+    child_words(room, 8)
+    monkeypatch.setattr(history_paging, "_PAGE_SCAN_ROWS", 3)
+    recent = room.read(n_human="2")
+    assert recent["window"]["latest_message"] is None and recent["window"]["latest_before"] > 0
+    pages = follow(room, recent["next_cursor"])
+    assert any("root answer" in texts(page) for page in pages)
+    assert not any(page["window"].get("latest_message") for page in pages), \
+        "past an unreadable row the answer may not be the newest message"
+
+
+def test_a_search_that_found_the_newest_message_is_not_continued(room, narrow_recent, monkeypatch):
+    room.deliver("first answer", 1)
+    room.deliver("root answer", 5)
+    child_words(room, 6)
+    recent = room.read(n_human="2")
+    assert recent["window"]["latest_message"] == {"history_id": room.row_id("root answer"), "out_of_order": True}
+    assert "latest_before" not in recent["window"]
+    monkeypatch.setattr(history_paging, "_PAGE_SCAN_ROWS", 3)
+    assert not any("latest_message" in page["window"] for page in follow(room, recent["next_cursor"]))
+
+
+def test_a_cursor_carries_its_quiet_fact_as_a_boolean_and_older_cursors_still_read(room):
+    import base64
+
+    for minute in range(3):
+        room.deliver(f"reply {minute}", minute)
+    cursor = room.read(n_human="1")["next_cursor"]
+    state = json.loads(base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)))
+    encode = lambda value: base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip("=")  # noqa: E731
+    legacy = {key: value for key, value in state.items() if key != "quiet"}
+    assert texts(room.read(cursor=encode(legacy))) == texts(room.read(cursor=cursor)), "a saved older cursor reads on"
+    response = asyncio.run(history.make_chat_history_endpoint(room.root)(SimpleNamespace(query_params={
+        "chat_id": str(room.chat_id), "cursor": encode({**state, "quiet": "yes"})})))
+    assert response.status_code == 400

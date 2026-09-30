@@ -13,7 +13,7 @@ from ouroboros.contracts.chat_id_policy import is_a2a_chat_id
 from ouroboros.gateway import _helpers
 from ouroboros.gateway._helpers import _TAIL_WINDOW_START_BYTES
 from ouroboros.jsonl_tail import JsonlChainSnapshot
-from ouroboros.subagent_messages import is_task_card_message
+from ouroboros.subagent_messages import is_task_card_message, subagent_message_meta
 
 _SOURCES = ("chat", "progress")
 _READ_BYTES = 64 * 1024
@@ -77,6 +77,8 @@ def decode_cursor(value, thread_id, view):
             raise ValueError
         unfinished = cursor.setdefault("unfinished", [])
         if not isinstance(unfinished, list) or unfinished != sorted(set(unfinished) & set(_SOURCES)):
+            raise ValueError
+        if type(cursor.setdefault("quiet", False)) is not bool:  # see ``latest_arrival``
             raise ValueError
         if set(cursor["quotas"]) != {"human", "progress"} or any(
             type(value) is not int or value < 0 for value in cursor["quotas"].values()
@@ -272,6 +274,7 @@ def select_history_page(data_dir, thread_id, view, cursor, quotas, predicates, c
         before[source] = selections[source][1]
     return {"v": 1, "chat_id": thread_id, "view": view, "upper": upper, "unfinished": unfinished,
             "quotas": quotas, "recent": recent, "replayed": bool(continuation),
+            "quiet": bool(continuation and continuation["quiet"]),
             "selections": selections, "before": before, "page_ends": page_ends, "chains": chains}
 
 
@@ -303,8 +306,9 @@ def history_page_tokens(page):
     has_more = any(before.values())
     return {
         "has_more": has_more,
-        "next_cursor": encode_cursor({**state, "kind": "older", "before": before}) if has_more else None,
-        "page_cursor": encode_cursor({**state, "kind": "page", "before": page["page_ends"],
+        "next_cursor": encode_cursor({**state, "kind": "older", "before": before,
+                                      "quiet": page.get("quiet_below", False)}) if has_more else None,
+        "page_cursor": encode_cursor({**state, "kind": "page", "before": page["page_ends"], "quiet": page["quiet"],
                                       "lower": {source: value[1] for source, value in page["selections"].items()},
                                       "recent": page["recent"]}),
     }
@@ -364,7 +368,7 @@ def _skipped_row_after(entries, after, upper):
     return position != upper
 
 
-def _stored_message(row_matches_thread, stored_chat_id):
+def _stored_message(row_matches_thread, stored_chat_id, child):
     """A stored chat row the history projection turns into a standalone message."""
     def message(entry):
         kind = str(entry.get("type") or "")
@@ -373,11 +377,13 @@ def _stored_message(row_matches_thread, stored_chat_id):
                 and not is_task_card_message(entry) and not is_a2a_chat_id(entry.get("chat_id", 1))
                 and (str(entry.get("text") or "").strip() not in ("", "\u200b")
                      or kind in ("document", "links", "photo", "video", "quiz"))
-                and row_matches_thread(stored_chat_id(entry.get("chat_id"), 1), entry))
+                and row_matches_thread(stored_chat_id(entry.get("chat_id"), 1), entry)
+                and not child(entry))  # last: it may read the row's task result
     return message
 
 
-def latest_arrival(rows, page, data_dir, row_matches_thread, stored_chat_id, projected_gaps=frozenset()):
+def latest_arrival(rows, page, data_dir, row_matches_thread, stored_chat_id, projected_gaps=frozenset(),
+                   task_result=lambda _task_id: {}):
     """``window.latest_message`` of a recent Project read (DESIGN "Project unread dot").
 
     The window is ordered and tailed by event time, but a Project message counts
@@ -386,51 +392,71 @@ def latest_arrival(rows, page, data_dir, row_matches_thread, stored_chat_id, pro
     (``out_of_order``) or below the window's floor, where the first older page
     (``deferred_before``) shows it. Reading the room means reading the standalone
     message that arrived last, named from the persisted rows before the tail and
-    annotation rewrite them. ``None``: its arrival is unknown — the chat source
+    annotation rewrite them. A child's words are card content by their stored
+    lineage or, on rows written before rows carried it, by the lineage their
+    ``task_result`` recovers — the projection's own authority, which shows such a
+    row in the child's card. ``None``: its arrival is unknown — the chat source
     is unreadable, its projection failed part-way (``projected_gaps`` holds
     ``PROJECTION_FAILED``: any row after the fault may be the newest), a row
     after the newest readable one is unreadable, or the live chat ends in
     a line its writer has not finished (``incomplete_live_line``: this read froze
     before it, so it may be the newest message) — and on a replayed recent page,
-    which cannot see what arrived after its frozen boundary. Older pages name nothing.
+    which cannot see what arrived after its frozen boundary.
 
     Card rows, a child's words and the owner's own messages can fill the recent
     selection's quota. One bounded older read (``older``'s own byte and row bound)
     then names the newest stored message before it — ``out_of_order``, since this
     read cannot place it relative to the bottom — or proves the chat holds none
-    (absent); its bound or an unreadable row reached first leaves the arrival unknown.
+    (absent); an unreadable row reached first leaves the arrival unknown. Its
+    bound reached first leaves it unknown too, but searched: ``latest_before``
+    says none lies at or after that offset, and the chain's cursors carry that
+    fact (``quiet``: none at or after the cursor's ``before``). An older page of
+    a quiet chain names its own newest message — then the newest below the
+    chain's frozen ``upper`` — or, holding none, passes the fact on; any other
+    older page names nothing.
     """
-    if not page["recent"]:
+    quiet = page["quiet"]
+    if page["replayed"] and page["recent"]:
+        return {"latest_message": None}
+    if not (page["recent"] or quiet):
         return {}
-    if page["replayed"]:
-        return {"latest_message": None}
     entries, start, gaps = page["selections"]["chat"]
-    upper = page["upper"].get("chat", 0)
-    feed = [row for row in rows if _feed_message(row)]
-    spoken = [row for row in feed if row.get("role") != "user" and (
-        str(row.get("text") or "").strip() not in ("", "\u200b") or row.get("msg_type"))]
+    end = page["page_ends"].get("chat", 0)
+
+    def child(row):
+        task_id = str(row.get("task_id") or "")
+        return bool(task_id) and bool(subagent_message_meta(task_result(task_id), task_id=task_id))
+
     offset = lambda row: row["history_position"]["offset"]  # noqa: E731
-    latest = max(spoken, key=offset, default=None)
+    feed = [row for row in rows if _feed_message(row)]
+    spoken = sorted((row for row in feed if row.get("role") != "user" and (
+        str(row.get("text") or "").strip() not in ("", "\u200b") or row.get("msg_type"))), key=offset)
+    latest = next((row for row in reversed(spoken) if not child(row)), None)
     if entries is None or PROJECTION_FAILED in projected_gaps or "incomplete_live_line" in gaps or (
-            gaps and _skipped_row_after(entries, offset(latest) if latest else start, upper)):
+            gaps and _skipped_row_after(entries, offset(latest) if latest else start, end)):
         return {"latest_message": None}
+    if not page["recent"]:
+        page["quiet_below"] = latest is None
+        return {"latest_message": {"history_id": latest["history_id"], "out_of_order": True}} if latest else {}
     if latest is None and start > 0:
-        message = _stored_message(row_matches_thread, stored_chat_id)
+        message = _stored_message(row_matches_thread, stored_chat_id, child)
         try:
-            entries, before, gaps = HistorySource(data_dir / "logs" / "chat.jsonl", "chat", upper).older(
+            entries, before, gaps = HistorySource(data_dir / "logs" / "chat.jsonl", "chat", end).older(
                 start, 1, message)
         except OSError:
             return {"latest_message": None}
         found = next(filter(message, entries), None)  # ``older`` stops at the newest one
-        if (not found and before > 0) or (gaps and _skipped_row_after(
-                entries, offset(found) if found else before, start)):
+        if gaps and _skipped_row_after(entries, offset(found) if found else before, start):
             return {"latest_message": None}
+        if not found and before > 0:
+            page["quiet_below"] = True
+            return {"latest_message": None, "latest_before": before}
         return {"latest_message": {"history_id": found["history_id"], "out_of_order": True}} if found else {}
     if latest is None:
         return {}
     ts = str(latest.get("ts") or "")
     return {"latest_message": {"history_id": latest["history_id"], "out_of_order": any(
-        offset(row) < offset(latest) and str(row.get("ts") or "") > ts for row in feed)}}
+        offset(row) < offset(latest) and str(row.get("ts") or "") > ts and not child(row) for row in feed)}}
 
 
 def replay_evidence_rows(messages, evidence):

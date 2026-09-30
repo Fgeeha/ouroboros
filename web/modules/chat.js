@@ -417,7 +417,6 @@ export function createChatInstance({
     let inputHistorySeededFromServer = false; // set true only after a successful server-side recall seed
     let historySyncPromise = null;
     let lastHistorySyncSucceeded = false;
-    let recentLatestMessage; // newest recent read's window.latest_message
     // STICKY single-flight hydration promise.
     // Unlike historySyncPromise it survives success, so hydration triggers
     // (bootstrap IIFE, first non-reconnect socket open, refreshHistory without
@@ -2782,7 +2781,7 @@ export function createChatInstance({
                     updateMessagesPadding();
                     reading.followAfterLayout();
                 }
-                readReceipt.settle(recentLatestMessage);
+                readReceipt.settle();
                 return messages.length > 0;
             } catch (err) {
                 lastHistorySyncSucceeded = false;
@@ -2815,13 +2814,12 @@ export function createChatInstance({
                 if (historySyncPromise) await historySyncPromise;
                 await syncHistory({ includeUser: true });
             }
-            // null: the last arrival is unknown (an unreadable chat source too).
-            return lastHistorySyncSucceeded && recentLatestMessage !== null;
+            return lastHistorySyncSucceeded;
         },
         // A destroyed page reports hidden===false, hence the lifecycle flag.
         isShown: () => !destroyed && !page.hidden,
         // A place still being restored is not where the reader is.
-        isReadingLatest: () => !destroyed && !reading.pending && isInstanceVisible() && isAtNewestMessage(recentLatestMessage, {
+        isReadingLatest: latest => !destroyed && !reading.pending && isInstanceVisible() && isAtNewestMessage(latest, {
             delivered: id => retainedHistoryIds().has(id), nodes: historyNodes, viewport: messagesDiv, header: pageHeader, composer: inputArea,
             atBottom: () => isNearBottom() && !historyPager.getState().canNewer,
         }),
@@ -3285,7 +3283,7 @@ export function createChatInstance({
         historyControls.endRecent(data.reason_code ? new Error('Some saved history could not be loaded.') : null);
         recentCoverage = data.coverage ?? null;
         recentHasOrigins = messages.some(row => row.origin_projected);
-        recentLatestMessage = data.window?.latest_message;
+        readReceipt.recent(data);
         const ids = new Set(messages.flatMap(historyRowIds));
         for (const id of recentHistoryIds) if (data.window?.truncated_by?.includes(`${id.split(':')[0]}_source_unavailable`)) ids.add(id);
         recentHistoryIds = ids;
@@ -3371,9 +3369,9 @@ export function createChatInstance({
             const archived = descriptor.direction !== 'recent' && descriptor.direction !== 'latest';
             applyHistoryMessages(messages, { archived });
             if (admitted) withStableViewport(() => releaseHistoryIds(oldRecentIds));
-            // An older page drawn can show the newest arrival without a scroll.
-            if (admitted) readReceipt.settle(recentLatestMessage);
-            else if (archived) requestAnimationFrame(() => readReceipt.note());
+            // An older page drawn can show, or name, the newest arrival without a scroll.
+            if (admitted) readReceipt.settle();
+            else if (archived) readReceipt.page(descriptor);
         },
         releasePage: descriptor => {
             const ids = pageHistoryIds.get(descriptor.id) || [];

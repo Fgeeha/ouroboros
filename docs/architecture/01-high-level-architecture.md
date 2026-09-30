@@ -422,7 +422,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       │   ├── history.py       ← Shared Chat room/quiz/media/review/terminal projection + cost breakdown factories
       │   ├── history_contracts.py ← Descriptive paged Chat history response, re-exported by contracts.py
       │   ├── schedule_contracts.py ← Typed schedule list/upsert/lifecycle-action responses, re-exported by contracts.py
-      │   ├── history_paging.py ← Physical range selection over retained chat/progress JSONL chains, frozen room-bound page/continuation cursors and read gaps; no stored history copy
+      │   ├── history_paging.py ← Physical range selection over retained chat/progress JSONL chains, frozen room-bound page/continuation cursors, read gaps and a Project room's last arrival (`latest_arrival`); no stored history copy
       │   ├── cost_breakdown.py ← Ledger-derived dashboard buckets and root-task detail breakdown over the same physical-attempt authority
       │   ├── projects.py      ← GET/POST /api/projects, /from-task, /update, /delete
       │   └── _helpers.py      ← Shared request-root/coercion/JSON error envelope and `run_sync_to_completion`, the settled worker wait for request-owned blocking work

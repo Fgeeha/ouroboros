@@ -19,9 +19,10 @@ const late = (n) => ({ ...row(n), text: `late answer ${n}`, ts: '2026-09-28T11:0
 
 function room(t, { onReadingLatest, initialScrollState = null } = {}) {
     // `rows` is the durable state; a read answers with the state it STARTED on.
-    // `older`, when set, is the one older page behind the recent window;
-    // `pageFails` makes every page read (a saved place's too) fail.
-    const server = { rows: [], older: null, pageFails: false, window: { complete: true, truncated_by: [] }, gates: [] };
+    // `older`, when set, is the one older page behind the recent window (`olderWindow`
+    // and `olderCoverage` its facts); `pageFails` makes every page read (a saved place's too) fail.
+    const server = { rows: [], older: null, pageFails: false, window: { complete: true, truncated_by: [] }, gates: [],
+        coverage: undefined, olderWindow: {}, olderCoverage: undefined };
     const reads = [];
     const { prior, mount } = installDom(async (url) => {
         if (String(url).includes('cursor=') && server.pageFails) {
@@ -29,11 +30,13 @@ function room(t, { onReadingLatest, initialScrollState = null } = {}) {
         }
         if (String(url).includes('cursor=')) {
             return { ok: true, json: async () => ({ messages: [...server.older], page_cursor: 'page:older',
-                next_cursor: null, has_more: false, window: { complete: false, truncated_by: ['page'] } }) };
+                next_cursor: null, has_more: false, coverage: server.olderCoverage,
+                window: { complete: false, truncated_by: ['page'], ...server.olderWindow } }) };
         }
         if (String(url).startsWith('/api/chat/history')) {
             const data = { messages: [...server.rows], page_cursor: 'page:recent',
-                next_cursor: server.older ? 'older:1' : null, has_more: Boolean(server.older), window: server.window };
+                next_cursor: server.older ? 'older:1' : null, has_more: Boolean(server.older), window: server.window,
+                coverage: server.coverage };
             reads.push(data.messages.map((item) => item.history_id));
             const gate = server.gates.shift();
             if (gate) await gate;
@@ -505,6 +508,19 @@ test('the read band is the viewport less the header above and the composer below
     assert.equal(at(250, {}), true, 'a feed without chrome is its viewport');
 });
 
+// Chrome can cover the whole feed (a tall draft in a short window): nothing is
+// visible, even where the node overlaps the inverted band's two edges.
+test('a feed the header and composer cover entirely shows no message', () => {
+    const el = (top, bottom) => ({ isConnected: true, getClientRects: () => [{}],
+        getBoundingClientRect: () => ({ top, bottom }), closest: () => null });
+    const at = (node, viewport, chrome) => isAtNewestMessage({ history_id: 'chat:9', out_of_order: false }, {
+        delivered: () => true, nodes: () => [el(...node)], viewport: el(...viewport), atBottom: () => true, ...chrome });
+    assert.equal(at([40, 120], [80, 200], { composer: el(60, 300) }), false, 'the composer rises above the feed');
+    assert.equal(at([90, 110], [80, 200], { composer: el(100, 300) }), true, 'the strip it leaves is still read');
+    assert.equal(at([100, 140], [80, 200], { header: el(0, 120), composer: el(120, 300) }), false, 'no strip is left');
+    assert.equal(at([90, 160], [80, 200], { header: el(0, 150), composer: el(100, 300) }), false, 'they overlap');
+});
+
 // A read that names another newest message moves where the reader must be, so
 // the arrival edge is taken again then, not only when the reader scrolls.
 test('a refresh naming a new newest message takes the edge again, so reaching it retries', async (t) => {
@@ -546,16 +562,79 @@ test('the read receipt takes its edge again only when a read names another newes
     let reading = true, arrivals = 0;
     const receipt = createProjectReadReceipt({ read: async () => true, isShown: () => true,
         isReadingLatest: () => reading, onReadingLatest: () => { arrivals += 1; } });
-    receipt.settle(undefined);
+    const settle = (latest) => { receipt.recent({ window: { latest_message: latest } }); receipt.settle(); };
+    settle(undefined);
     assert.equal(arrivals, 0, 'the first read only records what it named');
-    receipt.settle(undefined);
+    settle(undefined);
     assert.equal(arrivals, 0, 'the same newest message is no change');
-    receipt.settle({ history_id: 'chat:9', out_of_order: true });
+    settle({ history_id: 'chat:9', out_of_order: true });
     assert.equal(arrivals, 1, 'another newest message, with the reader at it');
     reading = false;
-    receipt.settle(null);
+    settle(null);
     assert.equal(arrivals, 1);
     reading = true;
     receipt.note();
     assert.equal(arrivals, 2, 'the edge was taken again, so the next arrival reports');
+});
+
+// The recent read's bounded search can run out before the newest message (card rows
+// and the owner's own messages after it): unknown, but searched down to
+// `latest_before`. The older pages of its chain carry the search on; the one that
+// names the newest message makes it readable, on screen, while every later recent
+// read still finds nothing newer down to that chain's boundary.
+const span = (from, to, chain = 'c1') => ({ from, to, chain, gaps: [] });
+const coverage = (upper, from, chain = 'c1') => ({ v: 1, view: 'v', upper: { chat: upper, progress: 0 },
+    spans: { chat: span(from, upper, chain), progress: span(0, 0, 'empty') } });
+function searchedRoom(t) {
+    let arrivals = 0;
+    const r = room(t, { onReadingLatest: () => { arrivals += 1; } });
+    placeAtTop(t, r, 'chat:9');
+    r.server.rows = [row(20), row(21)].map((item) => ({ ...item, role: 'user', text: `owner note ${item.history_position.offset}` }));
+    r.server.older = [row(9), row(12)].map((item, index) => (index ? { ...item, role: 'user' } : late(9)));
+    r.server.window = { complete: false, truncated_by: ['quota'], latest_message: null, latest_before: 15 };
+    r.server.coverage = coverage(100, 20);
+    r.server.olderWindow = { latest_message: { history_id: 'chat:9', out_of_order: true } };
+    r.server.olderCoverage = coverage(100, 5);
+    return { r, arrivals: () => arrivals };
+}
+
+test('an older page that carries the search on to the newest message makes it readable on screen', async (t) => {
+    const { r, arrivals } = searchedRoom(t);
+    const landed = await r.instance.refreshHistory({ revision: 4 });
+    assert.deepEqual([landed.painted, Boolean(landed.read)], [false, false], 'unknown: nothing is read');
+    r.readUp();
+    await until(() => r.shown().includes('chat:9'));
+    await until(() => arrivals() === 1);
+    const reads = r.reads.length;
+    const read = await r.instance.refreshHistory({ revision: 4 });
+    assert.equal(r.reads.length, reads + 1, 'the uncovered revision is read again; that read still finds nothing newer');
+    assert.deepEqual([read.painted, read.read], [true, true], 'the named message on screen is read');
+    r.readLatest();
+    assert.equal((await r.instance.refreshHistory({ revision: 4 })).read, false, 'the bottom is not where it is');
+});
+
+for (const [name, change] of [
+    ['a newer arrival the next read searched past', (r) => { r.server.window = { ...r.server.window, latest_before: 140 };
+        r.server.coverage = coverage(160, 150); }],
+    ['a newer arrival the next read names', (r, t) => { r.server.window = { complete: true, truncated_by: [],
+        latest_message: { history_id: 'chat:30', out_of_order: false } };
+        // Named below the fold, where only it can be read.
+        const rect = ElementStub.prototype.getBoundingClientRect;
+        ElementStub.prototype.getBoundingClientRect = function () {
+            return this.dataset?.historyId === 'chat:30' ? r.box(100, 120) : rect.call(this);
+        };
+        t.after(() => { ElementStub.prototype.getBoundingClientRect = rect; }); }],
+    ['a source gap', (r) => { r.server.window = { complete: false, truncated_by: ['chat_malformed_jsonl'], latest_message: null }; }],
+    ['another chain', (r) => { r.server.coverage = coverage(100, 20, 'c2'); }],
+]) test(`the message an older page named is not read after ${name}`, async (t) => {
+    const { r, arrivals } = searchedRoom(t);
+    await r.instance.refreshHistory({ revision: 4 });
+    r.readUp();
+    await until(() => r.shown().includes('chat:9'));
+    await until(() => arrivals() === 1);
+    change(r, t);
+    r.server.rows = [...r.server.rows, { ...row(30), text: 'newer answer' }];
+    const after = await r.instance.refreshHistory({ revision: 5 });
+    assert.ok(r.shown().includes('chat:9'), 'the named message is still on screen');
+    assert.equal(Boolean(after.read), false, 'it is no longer known to be the newest message');
 });

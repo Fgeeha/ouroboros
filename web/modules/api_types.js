@@ -1559,13 +1559,15 @@ export const GATEWAY_CONTRACT_VERSION = '7.5.1';
  * @property {boolean} has_more Older bytes remain or a disclosed source gap prevents establishing EOF.
  * @property {string|null} next_cursor Opaque room-bound older continuation.
  * @property {string|null} page_cursor Replays a frozen page; null for an unavailable source boundary.
- * @property {{complete:boolean,truncated_by:Array<string>,latest_message?:({history_id:string,out_of_order:boolean}|null)}} window
+ * @property {{complete:boolean,truncated_by:Array<string>,latest_message?:({history_id:string,out_of_order:boolean}|null),latest_before?:number}} window
  *   Bounds/gaps of this response. A recent Project read also names the standalone message that
  *   arrived last (null: its arrival is unknown, as while the live chat's last line is
  *   unfinished, and on a replayed page, frozen before later arrivals), which must itself be
  *   on screen for the room's read receipt, in its ordinary place too;
  *   out_of_order: the bottom is not where it is (it sorts above earlier arrivals, or lies
- *   before the recent read).
+ *   before the recent read). latest_before: with null, its bounded search ran out first and
+ *   found none at or after this chat offset; the older pages of its chain carry the search on,
+ *   and the one holding the message names it here, the newest below its coverage.upper.
  * @property {{v:1,view:string,upper:Object,spans:Object}=} coverage Delivered physical byte spans, after deferrals.
  * @property {string} [next_before_ts] Legacy field retained for compatibility.
  * @property {string} [error]

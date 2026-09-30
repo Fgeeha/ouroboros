@@ -173,3 +173,29 @@ def test_empty_text_and_other_rooms_never_advance(room, tmp_path):
     assert room.deliver("root-1", "   ") == 0
     message_bus.send_with_budget(1, "a Main reply", task_id="root-1")
     assert room.revision() == 0
+
+
+def test_every_counted_message_is_stored_before_its_revision_advances(room, monkeypatch):
+    """A client that sees the new revision reads history begun after it, so the row the revision
+    counts must already be stored: otherwise that read could paint without it and be acknowledged."""
+    from ouroboros import projects_registry
+
+    chat_log = room.root / "logs" / "chat.jsonl"
+    advance = projects_registry.increment_project_visible_revision
+    stored = []
+
+    def observed(data_dir, **kwargs):
+        stored.append(len(chat_log.read_text(encoding="utf-8").splitlines()) if chat_log.exists() else 0)
+        return advance(data_dir, **kwargs)
+
+    monkeypatch.setattr(projects_registry, "increment_project_visible_revision", observed)
+    assert room.deliver("root-1", "the root's own answer") == 1
+    assert room.bridge.send_photo(room.chat_id, b"png", caption="shot", task_id="root-1")[0]
+    assert room.bridge.send_video(room.chat_id, b"mp4", caption="clip", task_id="root-1")[0]
+    assert room.bridge.send_document(room.chat_id, b"csv", filename="r.csv", task_id="root-1")[0]
+    assert room.bridge.send_links(room.chat_id, [{"label": "Docs", "url": "https://example.com"}],
+                                  title="Links", task_id="root-1")[0]
+    assert room.bridge.send_quiz(room.chat_id, quiz_id="q1", question="Merge now?",
+                                 options=[{"label": "Yes"}, {"label": "No"}], stake="release timing",
+                                 assumption="continuing with the merge", task_id="root-1") == (True, "ok")
+    assert stored == [1, 2, 3, 4, 5, 6], "each advance finds its own message already stored"

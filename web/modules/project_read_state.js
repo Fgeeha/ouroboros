@@ -6,17 +6,20 @@
 // near the bottom of the conversation. Opening or refreshing a room while its
 // reader is elsewhere is not reading; the chat instance reports each arrival at
 // the newest message (a scroll, a page shown again, an older page applied) so the
-// withheld acknowledgement is retried then, never by polling. This module owns
-// the paint generation, the highest covered revision and that arrival edge; the
-// chat instance owns reading history, and app.js alone posts the acknowledgement.
+// withheld acknowledgement is retried then, and app.js's existing state snapshots
+// offer it again — no timer of this module's own. This module owns the paint
+// generation, the highest covered revision, which message is the newest and that
+// arrival edge; the chat instance owns reading history, and app.js alone posts
+// the acknowledgement.
 
+import { sameHistoryChain } from './chat_history.js';
 import { historyNodeOnScreen } from './chat_history_replay.js';
 
 /**
  * @param {{
- *   read: (fresh: boolean) => Promise<boolean>,  // true when the recent source covered the read
+ *   read: (fresh: boolean) => Promise<boolean>,  // true when the recent read succeeded
  *   isShown: () => boolean,
- *   isReadingLatest: () => boolean,
+ *   isReadingLatest: (latest: undefined|null|object) => boolean,  // the reader is at `latest`
  *   onReadingLatest?: () => void,
  * }} facts
  */
@@ -24,45 +27,71 @@ export function createProjectReadReceipt({ read, isShown, isReadingLatest, onRea
     let generation = 0;
     let coveredRevision = 0;
     let readingLatest = false;
-    let settledLatest;  // the newest message the previous read named
+    let settledLatest;  // the newest message the previous settle named
+    let recentRead = {};  // the newest admitted recent read: its window and coverage
+    let found = null;  // the newest message an older page of a quiet chain named
+    // The recent read names the newest message (null: unknown). When its bounded
+    // search ran out first, the older pages of its quiet chain carry it on
+    // (history_paging.latest_arrival); the message they name is still the newest
+    // while this read found none from its `latest_before` up to that chain's frozen
+    // upper, on one chain of byte coordinates. A newer arrival or a source gap breaks that.
+    const newest = () => {
+        const { window, coverage } = recentRead;
+        return window?.latest_message === null && found && window.latest_before <= found.upper
+            && sameHistoryChain(coverage?.spans?.chat, found.span) ? found.message : window?.latest_message;
+    };
     // Scroll edges report arrivals only; a discrete change (the page or the
     // window shown again, another newest message) reports the current position once.
     const note = ({ discrete = false } = {}) => {
-        const latest = isReadingLatest();
+        const latest = isReadingLatest(newest());
         if (latest && (discrete || !readingLatest)) onReadingLatest();
         readingLatest = latest;
+    };
+    // Another newest message than the previous settle named moves where the
+    // reader must be: the edge is taken again without a scroll.
+    const settle = () => {
+        const identity = JSON.stringify(newest()) ?? '';
+        if (settledLatest !== undefined && identity !== settledLatest) note({ discrete: true });
+        settledLatest = identity;
     };
     return {
         cancel() { generation += 1; },
         // Only a revision newer than any covered one needs a fresh read; the
-        // receipt is still taken after this call's own paint either way.
+        // receipt is still taken after this call's own paint either way. A read
+        // that cannot name the newest message covers nothing, so the same revision
+        // is read again: a repaired source can name it without a new revision.
         async refresh({ revision = 0 } = {}) {
             const own = ++generation;
             const target = Math.max(0, Number(revision) || 0);
-            const covered = await read(target > coveredRevision);
+            const covered = await read(target > coveredRevision) && newest() !== null;
             if (covered && target > coveredRevision) coveredRevision = target;
             if (!covered || own !== generation || !isShown()) return { painted: false, revision: target };
             // Two frames cover layout followed by paint/composite.
             await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
             const painted = own === generation && isShown();
-            const atLatest = painted && isReadingLatest();
+            const atLatest = painted && isReadingLatest(newest());
             // A withheld read lowers the edge, so the next arrival retries it.
             if (painted && !atLatest) readingLatest = false;
             return { painted, read: atLatest, revision: target };
         },
         note,
-        // A read that names another newest message than the previous read moves
-        // where the reader must be: the edge is taken again without a scroll.
-        settle(latest) {
-            const identity = JSON.stringify(latest) ?? '';
-            if (settledLatest !== undefined && identity !== settledLatest) note({ discrete: true });
-            settledLatest = identity;
+        // Each admitted recent read, before its rows are drawn.
+        recent({ window, coverage }) { recentRead = { window, coverage }; },
+        // An older page, once drawn, can show the newest message or, on a quiet
+        // chain, name it.
+        page({ window, coverage }) {
+            if (window?.latest_message?.history_id && Number.isSafeInteger(coverage?.upper?.chat)) {
+                found = { message: window.latest_message, upper: coverage.upper.chat, span: coverage.spans?.chat };
+            }
+            requestAnimationFrame(() => { settle(); note(); });
         },
+        settle,
     };
 }
 
 // The feed the reader can see: its viewport less the chrome drawn over it, the
-// header above and the composer below. Eviction keeps the whole viewport.
+// header above and the composer below; chrome covering it all leaves an empty
+// band, where nothing is on screen. Eviction keeps the whole viewport.
 function readBand(viewport, header, composer) {
     let { top, bottom } = viewport.getBoundingClientRect();
     if (header?.getClientRects?.().length) top = Math.max(top, header.getBoundingClientRect().bottom);
@@ -80,9 +109,10 @@ function shownBy(node) {
 }
 
 /**
- * Whether the reader is at the room's newest message. `latest` is the newest
- * recent read's `window.latest_message`, the standalone message that ARRIVED
- * last: absent names nothing (the room holds no standalone message), so the
+ * Whether the reader is at the room's newest message. `latest` is the receipt's
+ * newest message (the recent read's `window.latest_message`, or where an older
+ * page carried its search on), the standalone message that ARRIVED last:
+ * absent names nothing (the room holds no standalone message), so the
  * bottom of the conversation decides; null (its arrival unknown) is never read.
  * A named message — in its ordinary place or not — must have reached the page
  * and must itself be on screen, clear of the header and composer drawn over the
@@ -99,5 +129,6 @@ export function isAtNewestMessage(latest, { delivered, nodes, viewport, header, 
     if (latest === undefined) return atBottom();
     if (!latest?.history_id || !delivered(latest.history_id)) return false;
     const band = readBand(viewport, header, composer);
-    return nodes(latest.history_id).some((node) => historyNodeOnScreen(shownBy(node), viewport, band));
+    return band.bottom > band.top
+        && nodes(latest.history_id).some((node) => historyNodeOnScreen(shownBy(node), viewport, band));
 }

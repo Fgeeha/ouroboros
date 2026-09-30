@@ -203,12 +203,13 @@ def _seed_room(data, project_id, name, rows):
     return chat_id, chat_log, increment_project_visible_revision(data, chat_id=chat_id)["visible_revision"]
 
 
-def _client(browser, url, project_id, acks):
+def _client(browser, url, project_id, acks, init=()):
     """One client showing the room's row unread; ``acks`` collects its read receipts."""
     page = browser.new_page(viewport={"width": 1187, "height": 734})
     page.on("request", lambda request: acks.append(json.loads(request.post_data or "{}"))
             if request.method == "POST" and request.url.endswith("/api/ui/preferences") else None)
-    page.add_init_script(f"({_CAPTURE_TEST_SOCKET})()")
+    for script in (_CAPTURE_TEST_SOCKET, *init):
+        page.add_init_script(f"({script})()")
     page.goto(url, wait_until="domcontentloaded")
     page.wait_for_function("() => window.__testSockets?.some(s => s.readyState === 1)")
     row = page.locator(f'.nav-project-row[data-project-id="{project_id}"]')
@@ -216,9 +217,9 @@ def _client(browser, url, project_id, acks):
     return page, row
 
 
-def _open_room(pw, engine, url, project_id, acks):
+def _open_room(pw, engine, url, project_id, acks, init=()):
     browser = getattr(pw, engine).launch()
-    page, row = _client(browser, url, project_id, acks)
+    page, row = _client(browser, url, project_id, acks, init)
     row.evaluate("el => el.click()")
     return browser, page, row
 
@@ -515,5 +516,271 @@ def test_a_failed_read_receipt_is_retried_at_the_next_state_refresh(direct_serve
             assert {json.dumps(seen) for seen, _ in attempts} == {json.dumps({"retry-room": revision})}, attempts
             assert attempts[-1][1] is False and cursors["retry-room"] == revision, (attempts, cursors)
             page.screenshot(path=str(evidence / f"read-band-{engine}-ack-retried.png"))
+        finally:
+            browser.close()
+
+
+# The question detail of a reveal from Main is held until the test releases it.
+_HOLD_QUESTION = """() => {
+    const original = window.fetch.bind(window);
+    window.fetch = async (input, init) => {
+        const url = new URL(typeof input === 'string' ? input : input.url, location.href);
+        if (window.__holdQuestion && url.pathname === '/api/tasks/held-task') {
+            await new Promise(resolve => { window.__releaseQuestion = resolve; });
+        }
+        return original(input, init);
+    };
+}"""
+_COMPOSER = "#project-panel .chat-input-area textarea"
+
+
+@pytest.mark.parametrize("retained", [True, False], ids=["retained", "rebuilt"])
+@pytest.mark.parametrize("engine", ["chromium", "webkit"])
+def test_an_ordinary_reopen_reads_its_room_while_an_old_question_reveal_is_held(direct_server_with_data, engine,
+                                                                              retained):
+    """A question reveal belongs to the showing that started it. Closed while its question detail is
+    held and reopened ordinarily, the room is read at its newest message at once, whether the reopen
+    reuses the instance its staged file kept or builds a new one; the old reveal, released later,
+    moves nothing and takes neither the draft nor the focus."""
+    from playwright.sync_api import sync_playwright
+
+    from ouroboros.projects_registry import bind_task_to_project, get_project, increment_project_visible_revision
+    from ouroboros.task_results import write_task_result
+
+    data = direct_server_with_data["data_dir"]
+    slug = "held-kept" if retained else "held-new"
+    chat_id, chat_log, revision = _seed_room(data, slug, "Held room", [
+        {"ts": f"2026-09-28T10:{minute:02d}:00Z", "direction": "out", "text": f"Reply {minute}"} for minute in range(4)])
+    project = get_project(data, slug)
+    bind_task_to_project(data, "held-task", project["id"], chat_id, origin={"absent": "system"})
+    write_task_result(data, "held-task", "running", project_id=project["id"], chat_id=chat_id, owner_quiz={"q-held": {
+        "quiz_id": "q-held", "question": QUESTION, "options": ["Yes", "No"], "state": "open",
+        "asked_at": "2026-09-28T10:02:30Z"}})
+    evidence = Path(os.environ.get("OUROBOROS_UI_EVIDENCE_DIR", data.parent))
+    evidence.mkdir(parents=True, exist_ok=True)
+    acks = []
+    seen = lambda: [ack["project_seen_revision"][slug] for ack in acks  # noqa: E731
+                    if slug in (ack.get("project_seen_revision") or {})]
+    ask = """project => window.dispatchEvent(new CustomEvent('ouro:open-project', {
+        detail: {project, task_id: 'held-task', quiz_id: 'q-held'}}))"""
+    with sync_playwright() as pw:
+        browser = getattr(pw, engine).launch()
+        try:
+            page = browser.new_page(viewport={"width": 1187, "height": 734})
+            page.add_init_script(f"({_HOLD_QUESTION})()")
+            page.on("request", lambda request: acks.append(json.loads(request.post_data or "{}"))
+                    if request.method == "POST" and request.url.endswith("/api/ui/preferences") else None)
+            page.add_init_script(f"({_CAPTURE_TEST_SOCKET})()")
+            page.goto(direct_server_with_data["url"], wait_until="domcontentloaded")
+            page.wait_for_function("() => window.__testSockets?.some(s => s.readyState === 1)")
+            row = page.locator(f'.nav-project-row[data-project-id="{slug}"]')
+            row.locator(".nav-unread-dot").wait_for(state="attached")
+            messages = page.locator(PANEL)
+            if retained:
+                row.evaluate("el => el.click()")
+                messages.locator(".chat-bubble").filter(has_text="Reply 3").wait_for(state="attached")
+                assert _wait_for(page, lambda: seen() == [revision]), acks
+                page.locator("#project-panel .chat-file-input-hidden").set_input_files(
+                    [{"name": "kept.txt", "mimeType": "text/plain", "buffer": b"kept"}])
+                page.locator("#project-panel .attach-name").filter(has_text="kept.txt").wait_for()
+                page.locator(_COMPOSER).fill(DRAFT)
+                page.locator("#project-panel-close").click()
+                assert page.locator('.chat-instance-panel[data-pending-work="1"]').count() == 1
+                with chat_log.open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps({"ts": "2026-09-28T10:30:00Z", "direction": "out", "chat_id": chat_id,
+                                             "text": "Reply while closed"}) + "\n")
+                revision = increment_project_visible_revision(data, chat_id=chat_id)["visible_revision"]
+                _emit_ws_frame(page, {"type": "projects_changed"})
+                row.locator(".nav-unread-dot").wait_for(state="attached")
+            before = seen()
+            page.evaluate("() => { window.__holdQuestion = true; }")
+            page.evaluate(ask, project)
+            page.wait_for_function("() => typeof window.__releaseQuestion === 'function'")
+            page.wait_for_timeout(500)
+            assert seen() == before, "landing on the question is not reading"
+            page.locator("#project-panel-close").click()
+            row.evaluate("el => el.click()")
+            if not retained:
+                page.locator(_COMPOSER).fill(DRAFT)
+            read = _wait_for(page, lambda: seen() == [*before, revision], attempts=50)
+            page.evaluate(_SETTLE_RESTORE_FRAMES)
+            page.screenshot(path=str(evidence / f"read-band-{engine}-reopen-{slug}.png"))
+            held = page.evaluate("() => typeof window.__releaseQuestion === 'function'")
+            assert read and held, ("the reopened room is read while the old reveal is still held", acks, held)
+            row.locator(".nav-unread-dot").wait_for(state="detached")
+
+            page.locator(_COMPOSER).focus()
+            page.evaluate("() => { window.__holdQuestion = false; window.__releaseQuestion(); }")
+            page.wait_for_timeout(500)
+            page.evaluate(_SETTLE_RESTORE_FRAMES)
+            page.screenshot(path=str(evidence / f"read-band-{engine}-released-{slug}.png"))
+            assert page.locator(_COMPOSER).input_value() == DRAFT, "the draft is kept"
+            assert page.evaluate("() => document.activeElement?.matches('.chat-input-area textarea')"), \
+                "the released reveal takes no focus"
+            assert messages.locator('[data-quiz-id="q-held"]').count() == 0, "nor reveals its question"
+            if retained:
+                assert page.locator("#project-panel .attach-name").filter(has_text="kept.txt").count() == 1
+            assert seen() == [*before, revision], ("the retired reveal decides nothing", acks)
+        finally:
+            browser.close()
+
+
+@pytest.mark.parametrize("engine", ["chromium", "webkit"])
+def test_a_legacy_child_final_after_the_root_answer_does_not_hold_the_room_unread(direct_server_with_data, engine):
+    """A child's final written before chat rows carried lineage is shown in the child's card by the
+    lineage its task result recovers; the root's answer before it is the newest message, and it is read."""
+    from playwright.sync_api import sync_playwright
+
+    from ouroboros.task_results import write_task_result
+
+    data = direct_server_with_data["data_dir"]
+    at = lambda minute: f"2026-09-28T10:{minute:02d}:00Z"  # noqa: E731
+    rows = [{"ts": at(minute), "direction": "out", "text": f"Reply {minute}"} for minute in range(3)]
+    rows += [{"ts": at(5), "direction": "out", "text": "Root answer", "task_id": "root-legacy"},
+             {"ts": at(6), "direction": "out", "text": "Legacy child final", "task_id": "kid-legacy"}]
+    _chat_id, _chat_log, revision = _seed_room(data, "legacy-room", "Legacy room", rows)
+    write_task_result(data, "root-legacy", "completed")
+    write_task_result(data, "kid-legacy", "completed", delegation_role="subagent", parent_task_id="root-legacy",
+                      root_task_id="root-legacy", role="researcher")
+    evidence = Path(os.environ.get("OUROBOROS_UI_EVIDENCE_DIR", data.parent))
+    evidence.mkdir(parents=True, exist_ok=True)
+    acks = []
+    seen = lambda: [ack["project_seen_revision"]["legacy-room"] for ack in acks  # noqa: E731
+                    if "legacy-room" in (ack.get("project_seen_revision") or {})]
+    with sync_playwright() as pw:
+        browser, page, row = _open_room(pw, engine, direct_server_with_data["url"], "legacy-room", acks)
+        try:
+            messages = page.locator(PANEL)
+            messages.locator(".chat-bubble").filter(has_text="Root answer").wait_for(state="attached")
+            page.evaluate(_SETTLE_RESTORE_FRAMES)
+            read = _wait_for(page, lambda: seen() == [revision], attempts=50)
+            page.screenshot(path=str(evidence / f"read-band-{engine}-legacy-child.png"))
+            assert read, ("the root's answer on screen is read", acks)
+            row.locator(".nav-unread-dot").wait_for(state="detached")
+        finally:
+            browser.close()
+
+
+# What each Project history read the page received says about the newest message.
+_RECORD_HISTORY = """() => {
+    const original = window.fetch.bind(window);
+    window.__historyReads = [];
+    window.fetch = async (input, init) => {
+        const response = await original(input, init);
+        const url = new URL(typeof input === 'string' ? input : input.url, location.href);
+        if (url.pathname === '/api/chat/history' && url.searchParams.get('chat_id')) {
+            response.clone().json().then(data => window.__historyReads.push({
+                older: url.searchParams.has('cursor'), named: 'latest_message' in (data.window || {}),
+                latest: data.window?.latest_message ?? null, before: data.window?.latest_before ?? null,
+                upper: data.coverage?.upper?.chat ?? null,
+                texts: (data.messages || []).map(row => String(row.text || '').slice(0, 24)),
+            }), () => {});
+        }
+        return response;
+    };
+}"""
+
+
+def _load_older_until(page, text):
+    messages = page.locator(PANEL)
+    button = page.locator(f"{PANEL} .chat-load-older button")
+    for _ in range(30):
+        if messages.locator(".chat-bubble").filter(has_text=text).count():
+            return True
+        button.evaluate("node => node.click()")
+        page.wait_for_function(f"() => !document.querySelector('{PANEL} .chat-load-older button')?.disabled")
+    return messages.locator(".chat-bubble").filter(has_text=text).count() > 0
+
+
+@pytest.mark.parametrize("interrupted", [False, True], ids=["continuous", "interrupted"])
+@pytest.mark.parametrize("engine", ["chromium", "webkit"])
+def test_a_newest_answer_past_the_bounded_search_is_read_once_older_pages_show_it(direct_server_with_data, engine,
+                                                                                interrupted):
+    """Long owner notes after the newest answer outrun the recent read's bounded search (its 512 KiB
+    byte bound), so its arrival is unknown. Loading older pages through them carries the search on to
+    the answer, which is then read on screen; an unreadable row between them leaves it unknown. A
+    newer answer is read only where it is."""
+    from playwright.sync_api import sync_playwright
+
+    from ouroboros.projects_registry import increment_project_visible_revision
+
+    data = direct_server_with_data["data_dir"]
+    at = lambda second: f"2026-09-28T10:{second // 60:02d}:{second % 60:02d}Z"  # noqa: E731
+    note = lambda index: {"ts": at(10 + index), "direction": "in",  # noqa: E731
+                          "text": f"Owner note {index}: " + "a long thought " * 270}
+    # The server rotates chat.jsonl past 800 KB and a recent read takes an archive segment whole, so the
+    # room is seeded as rotation leaves it: the answer and 170 notes archived, 160 newer notes live.
+    chat_id, chat_log, revision = _seed_room(data, "searched-room", "Searched room", [note(i) for i in range(170, 330)])
+    rows = [{"ts": at(second), "direction": "out", "text": f"Reply {second}"} for second in range(3)]
+    rows += [{"ts": at(5), "direction": "out", "text": f"{LATE}\nwith its details"}, *map(note, range(170))]
+    lines = [json.dumps({**row, "chat_id": chat_id}) + "\n" for row in rows]
+    if interrupted:
+        lines.insert(4, '{"direction": "out", "text": "torn\n')
+    archive = data / "archive" / "chat_20260928T101000.jsonl"
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    archive.write_text("".join(lines), encoding="utf-8")
+    assert 512 * 1024 < archive.stat().st_size < 800_000 and chat_log.stat().st_size < 800_000, \
+        "the archived notes outrun the search's 512 KiB bound, and neither file reaches the 800 KB rotation"
+    evidence = Path(os.environ.get("OUROBOROS_UI_EVIDENCE_DIR", data.parent))
+    evidence.mkdir(parents=True, exist_ok=True)
+    acks = []
+    seen = lambda: [ack["project_seen_revision"]["searched-room"] for ack in acks  # noqa: E731
+                    if "searched-room" in (ack.get("project_seen_revision") or {})]
+    name = f"read-band-{engine}-searched-{'interrupted' if interrupted else 'continuous'}"
+    with sync_playwright() as pw:
+        browser, page, row = _open_room(pw, engine, direct_server_with_data["url"], "searched-room", acks,
+                                        (_RECORD_HISTORY,))
+        try:
+            messages = page.locator(PANEL)
+            messages.locator(".chat-bubble").filter(has_text="Owner note 329").wait_for(state="attached")
+            page.evaluate(_SETTLE_RESTORE_FRAMES)
+            page.wait_for_timeout(500)
+            assert seen() == [], "unknown: the bottom is not read"
+            (landing, *_) = page.evaluate("() => window.__historyReads")
+            assert not landing["older"] and landing["latest"] is None and 0 < landing["before"] < landing["upper"], \
+                ("the recent read's search ran out above the answer", landing)
+            assert _load_older_until(page, LATE), "the older pages reach the answer"
+            older = [item for item in page.evaluate("() => window.__historyReads") if item["older"]]
+            assert [item["named"] for item in older] == [False] * (len(older) - 1) + [True], older
+            assert (older[-1]["latest"] is None) == interrupted and any(LATE in text for text in older[-1]["texts"]), \
+                ("only the quiet page holding the answer names it, unless a row after it is unreadable", older[-1])
+            page.evaluate(_SETTLE_RESTORE_FRAMES)
+            clear = messages.evaluate(_PLACE, [LATE, -160])
+            page.evaluate(_SETTLE_RESTORE_FRAMES)
+            assert clear["node"]["top"] >= clear["feed"]["top"] and clear["node"]["bottom"] <= clear["composer"]["top"], clear
+            _emit_ws_frame(page, {"type": "projects_changed"})
+            read = _wait_for(page, lambda: seen() == [revision], attempts=40 if interrupted else 100)
+            page.screenshot(path=str(evidence / f"{name}.png"))
+            reads = [{key: value for key, value in item.items() if key != "texts"}
+                     for item in page.evaluate("() => window.__historyReads")]
+            (evidence / f"{name}.json").write_text(json.dumps({"clear": clear, "acks": acks, "reads": reads}, indent=2),
+                                                   encoding="utf-8")
+            if interrupted:
+                assert not read and seen() == [], ("past an unreadable row the answer may not be the newest", acks)
+                assert row.locator(".nav-unread-dot").count() == 1
+                return
+            assert read, ("the answer on screen, reached through the older pages, is read", acks, clear)
+            recent = [item for item in reads if not item["older"]]
+            assert len(recent) > 1 and recent[-1]["latest"] is None and recent[-1]["before"] <= older[-1]["upper"], \
+                ("the uncovered revision was read again, and that read found nothing newer down to the chain", reads)
+            row.locator(".nav-unread-dot").wait_for(state="detached")
+
+            with chat_log.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps({"ts": at(2000), "direction": "out", "chat_id": chat_id,
+                                         "text": "Newer answer"}) + "\n")
+            newer = increment_project_visible_revision(data, chat_id=chat_id)["visible_revision"]
+            _emit_ws_frame(page, {"type": "projects_changed"})
+            row.locator(".nav-unread-dot").wait_for(state="attached")
+            messages.evaluate(_PLACE, [LATE, -160])
+            page.evaluate(_SETTLE_RESTORE_FRAMES)
+            page.wait_for_timeout(800)
+            page.screenshot(path=str(evidence / f"{name}-newer-unread.png"))
+            assert seen() == [revision], ("the older answer on screen does not read a newer one", acks)
+            page.locator("#project-panel-body .chat-scroll-bottom-btn").click()
+            messages.locator(".chat-bubble").filter(has_text="Newer answer").wait_for(state="attached")
+            assert _wait_for(page, lambda: seen() == [revision, newer]), acks
+            page.evaluate(_SETTLE_RESTORE_FRAMES)
+            page.screenshot(path=str(evidence / f"{name}-newer-read.png"))
+            row.locator(".nav-unread-dot").wait_for(state="detached")
         finally:
             browser.close()

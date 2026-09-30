@@ -59,9 +59,10 @@ for (const [name, mutate] of [
     ['hidden while the read was in flight', inst => { inst.page.hidden = true; }],
     ['destroyed (detached) while the read was in flight', inst => { inst.page.isConnected = false; }],
 ]) test(`a paint on a panel ${name} acknowledges nothing`, async () => {
+    // The receipt says read: only the panel's own lifecycle guard can refuse it.
     const h = harness({ refreshHistory: async ({ revision }) => {
         mutate(h.inst);
-        return { painted: true, revision };
+        return { painted: true, read: true, revision };
     } });
     await h.open();
     assert.deepEqual(h.acked, [], 'a revision nobody saw is never acknowledged');
@@ -329,4 +330,83 @@ for (const [name, options, refreshes] of [
     assert.deepEqual(h.posts, [], 'retrying the decision is not acknowledging');
     assert.equal(h.refreshes.length, refreshes, 'a shown room re-reads through the existing receipt; a hidden one does nothing');
     assert.equal(h.unread(), true);
+});
+
+// A question reveal belongs to the navigation that started it. Closing the room while
+// its detail read is held, then reopening it ordinarily, is a new navigation: the old
+// reveal neither blocks nor decides that showing's read, whether the reopen reuses a
+// hidden pending-work survivor (its draft and staged files) or builds a new instance.
+function navigationHarness({ pendingWork }) {
+    const acked = [], built = [], held = [];
+    const instance = () => {
+        const inst = {
+            page: { hidden: false, isConnected: true, dataset: {} }, generation: 0, draft: 'Yes, after the tag',
+            refreshes: 0, destroyed: false,
+            hasPendingWork: () => pendingWork, hasPaintedHistory: () => true, restoreScrollPosition() {},
+            getScrollState: () => null, cancelHistoryPaint() { this.generation += 1; },
+            destroy() { this.destroyed = true; this.page.isConnected = false; },
+            refreshHistory({ revision }) {
+                const own = ++this.refreshes && this.generation;
+                return Promise.resolve().then(() => (own === this.generation && !this.destroyed
+                    ? { painted: true, read: true, revision } : { painted: false, revision }));
+            },
+            // A reveal naming a question awaits its detail read until the test releases it.
+            revealQuestion: (taskId, quizId) => (taskId && quizId
+                ? new Promise((resolve) => held.push(resolve)) : Promise.resolve(false)),
+        };
+        built.push(inst);
+        return inst;
+    };
+    const project = { id: 'p1', name: 'P', chat_id: 9, lifecycle: 'active', visible_revision: 5 };
+    const context = vm.createContext({
+        navState: { activeProjectId: null, mobileDrawerOpen: false },
+        projectInstances: new Map(), projectPaintRequests: new Map(), projectReveals: new Map(),
+        projectScrollStash: new Map(), lastProjectRows: [project], state: { projectSeenRevision: {} },
+        projectPanelTitle: {}, projectPanelBody: {}, ctx: {},
+        showPage: async () => true, syncNavigationState() {}, createChatInstance: instance,
+        markProjectViewed: async (id, revision) => { acked.push([id, revision]); },
+        console: { error() {} },
+    });
+    vm.runInContext(`let projectNavigationGeneration = 0, projectPanelOpeningSince = 0;
+        ${['cancelProjectPaint', 'destroyProjectInstance', 'closeProjectPanel', 'openProjectPanel',
+        'freshProjectRow', 'revealProjectQuestion'].map(lift).join('\n')}\n${ackSource}
+        globalThis.api = { open: (options) => openProjectPanel(lastProjectRows[0], options), close: () => closeProjectPanel() };`,
+    context);
+    return { acked, built, held, project, context, api: context.api };
+}
+
+for (const pendingWork of [true, false]) {
+    test(`an ordinary reopen of a ${pendingWork ? 'retained pending-work' : 'rebuilt'} room decides its own read while an old question reveal is held`, async () => {
+        const h = navigationHarness({ pendingWork });
+        const revealed = h.api.open({ openOnly: true, taskId: 't1', quizId: 'q1' });
+        await flush();
+        assert.equal(h.held.length, 1, 'the question detail read is held');
+        assert.deepEqual(h.acked, [], 'landing on the question is not reading');
+        h.api.close();
+        await h.api.open();
+        const [first, reopened] = [h.built[0], h.built.at(-1)];
+        assert.equal(reopened === first, pendingWork, pendingWork ? 'the survivor is reused' : 'a new room is built');
+        assert.equal(first.destroyed, !pendingWork);
+        assert.deepEqual(h.acked, [['p1', 5]], 'the reader at the newest message has read, the reveal still held');
+        const refreshes = first.refreshes;
+        h.held[0](true);
+        await revealed;
+        await flush();
+        assert.deepEqual(h.acked, [['p1', 5]], 'the retired reveal decides nothing when it ends');
+        assert.equal(first.refreshes, refreshes, 'nor reads for an instance its navigation left');
+        assert.equal(h.context.projectReveals.size, 0);
+        assert.equal(reopened.draft, 'Yes, after the tag', 'the reopened room keeps its draft');
+    });
+}
+
+test('a question reveal still in progress keeps withholding the read of its own showing', async () => {
+    const h = navigationHarness({ pendingWork: false });
+    const revealed = h.api.open({ openOnly: true, taskId: 't1', quizId: 'q1' });
+    await flush();
+    const inst = h.built[0];
+    await h.context.acknowledgeProjectAfterPaint(h.project, inst);
+    assert.deepEqual(h.acked, [], 'an arrival or a poll during the reveal paints but decides nothing');
+    h.held[0](true);
+    await revealed;
+    assert.deepEqual(h.acked, [['p1', 5]], 'the reveal decides once it ends');
 });

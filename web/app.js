@@ -75,7 +75,8 @@ const navProjectsActivity = document.getElementById('nav-projects-activity');
 const navProjectsList = document.getElementById('nav-projects-list');
 const projectInstances = new Map();
 const projectPaintRequests = new Map();
-// Question reveals in progress (revealProjectQuestion): none of them is a read.
+// The question reveal the current showing is still making (revealProjectQuestion):
+// no read decides during it. A close or another showing retires it.
 const projectReveals = new Map();
 let knownProjectsJson = '';
 let lastProjectRows = [];
@@ -336,6 +337,7 @@ function destroyProjectInstance(pid) {
 let projectNavigationGeneration = 0;
 function closeProjectPanel({ sync = true } = {}) {
     projectNavigationGeneration += 1;
+    projectReveals.clear();
     const activeId = navState.activeProjectId;
     navState.activeProjectId = null;
     if (activeId) destroyProjectInstance(activeId);
@@ -355,6 +357,7 @@ async function openProjectPanel(project, { closeDrawer = true, openOnly = false,
         else if (taskId && quizId) await revealProjectQuestion(project, projectInstances.get(project.id), taskId, quizId);
         return;
     }
+    projectReveals.clear();
     // perf2 P4.2: signal chat.js that a panel open is in flight so Main's
     // deferred first hydration yields the CPU to this build/paint.
     projectPanelOpeningSince = Date.now();
@@ -423,18 +426,21 @@ function freshProjectRow(project) {
 // addressed question owns the viewport before either history or detail I/O (its
 // chat-owned generation yields to later navigation), its paint supersedes any
 // request in flight, and no acknowledgement decides until the reveal has ended,
-// when this one does (DESIGN "Project unread dot").
+// when this one does (DESIGN "Project unread dot") — unless a close or a later
+// showing retired it meanwhile: that navigation owns the room's read instead.
 async function revealProjectQuestion(project, inst, taskId, quizId) {
     const reveal = {};
+    let current = false;
     projectReveals.set(project.id, reveal);
     try {
         const revealed = inst?.revealQuestion?.(taskId, quizId);
         await acknowledgeProjectAfterPaint(project, inst, { forcePaint: true, paintOnly: true });
         await revealed;
     } finally {
-        if (projectReveals.get(project.id) === reveal) projectReveals.delete(project.id);
+        current = projectReveals.get(project.id) === reveal;
+        if (current) projectReveals.delete(project.id);
     }
-    await acknowledgeProjectAfterPaint(freshProjectRow(project), inst);
+    if (current) await acknowledgeProjectAfterPaint(freshProjectRow(project), inst);
 }
 
 // A Project can receive a new visible revision while its panel remains open.
