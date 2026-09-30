@@ -7,8 +7,8 @@ wait terminal:
 
 - a dispatched death on an inline Presence turn (the one caller that keeps the
   repeat rail) takes the repeat rail and never opens a wait episode;
-- the configured-route walk runs once BEFORE a wait episode opens and never inside
-  one, and a round record blocks it;
+- configured alternatives run before waiting and after paced failed redials;
+  an unresolved Presence repeat record blocks them throughout;
 - an episode exhausted on a round that still holds a repeat record ends on the
   record's source, worded as both the wait and the unresolved attempt — and that
   wording names the class the repeat was RELEASED with (it rides the round record,
@@ -138,8 +138,11 @@ def test_wait_episode_exhausted_on_a_round_holding_a_repeat_record_takes_the_unk
     else:
         _presence_turn(kwargs)
     result, usage, trace = run_llm_loop(**kwargs)
-    # One walk before the wait; a round record (an unresolved paid repeat) blocks even that one.
-    assert walks == ([] if with_record else ["transport_unavailable"])
+    # Each failed redial may revisit alternatives; an unresolved Presence repeat never may.
+    if with_record:
+        assert walks == []
+    else:
+        assert len(walks) > 1 and set(walks) == {"transport_unavailable"}
 
     assert (3 if with_record else 2) <= llm.calls <= len(script)  # the episode ended; the turn never recovered
     assert no_sleep == ([4.0] if with_record else [])  # one repeat backoff; released redials never re-arm it
@@ -251,7 +254,7 @@ def test_generic_terminal_names_the_class_the_repeat_was_released_with(tmp_path,
 
 def test_fallback_chain_fence_holds_inside_a_wait_episode_too(monkeypatch):
     """`fallback_chain_allowed` on the combined tree: the configured-route walk runs
-    BEFORE a wait episode opens (remote routes included) and never inside one; a round
+    before a wait episode opens and after paced redials (remote routes included); a round
     record — an unresolved paid repeat of this round — blocks it whatever the kind says;
     an unknown outcome walks only when it is eligible for a new generation."""
     monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
@@ -262,7 +265,7 @@ def test_fallback_chain_fence_holds_inside_a_wait_episode_too(monkeypatch):
     assert loop_transport.fallback_chain_allowed(routable, "transport_unavailable", None, {}) is True
     assert loop_transport.fallback_chain_allowed(routable, "provider_outcome_unknown", None, {}) is True
     for kind in ("transport_unavailable", "provider_outcome_unknown", "bad_request"):
-        assert loop_transport.fallback_chain_allowed(routable, kind, episode, {}) is False
+        assert loop_transport.fallback_chain_allowed(routable, kind, episode, {}) is True
         assert loop_transport.fallback_chain_allowed(routable, kind, None, {TRANSPORT_DEATHS_KEY: record}) is False
     rejoinable = {"_pending_transport_outcome": {"same_operation_recoverable": True}}
     assert loop_transport.fallback_chain_allowed(routable, "provider_outcome_unknown", None, rejoinable) is False

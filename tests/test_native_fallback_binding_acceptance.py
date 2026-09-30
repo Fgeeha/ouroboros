@@ -307,3 +307,79 @@ def test_primary_wait_honors_a_direct_api_access_refusal(main_call, monkeypatch,
     assert waits[0]["availability_observation"] == "unavailable" and waits[0]["auto_continue"] is False
     assert waits[0]["credential_harness"] == "" and waits[-1]["resolution"] == "cancelled"
     assert sent == ["openai"] and gateway.creates == []
+
+
+@pytest.mark.parametrize("primary_account,fallback_account", [("account-a", "account-b"), ("", "account-b"), ("account-a", "")])
+def test_transient_cooldown_keeps_other_native_account_available(main_call, monkeypatch, primary_account, fallback_account):
+    from ouroboros import loop_model_call
+
+    ctx, gateway, owner, _events, _decide, _observations = main_call
+    monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", MODEL)
+    monkeypatch.setenv("OUROBOROS_FALLBACK_COOLDOWN_ENABLED", "true")
+    monkeypatch.setenv(MODEL_ACCOUNTS_KEY, json.dumps({"main": primary_account, "fallback": ["decoy"]}))
+    owner.overrides["fallback:0"] = {"model_account_override": fallback_account}
+    inner = ctx.tools._ctx
+    inner.primary_route = {"model": MODEL, "use_local": False, "role": "main"}
+    ctx.accumulated_usage["_last_llm_error_kind"] = "provider_transient"
+    gateway.results = [_reply(ROUTE_B, {"role": "assistant", "content": "Other account answered."})]
+    gateway.dispatch = ["response_received"]
+    _bounded_creates(monkeypatch, gateway, 1)
+    fallback_cooldown.reset_for_tests()
+    try:
+        reply, *_ = loop_model_call._run_cross_model_fallback_chain(
+            llm=ctx.llm, ctx=inner, tools=ctx.tools, messages=ctx.messages, active_model=MODEL,
+            active_use_local=False, tool_schemas=[], active_effort="high", max_retries=1,
+            drive_logs=ctx.drive_logs, task_id=inner.task_id, round_idx=1, event_queue=ctx.event_queue,
+            accumulated_usage=ctx.accumulated_usage, task_type="task", emit_progress=lambda *_a, **_k: None,
+            context_fit_plan=ctx.context_fit_plan, active_context_mode="max")
+        assert reply["content"] == "Other account answered."
+        sent = gateway.uploads[0][0]["account"]
+        if fallback_account:
+            assert sent == {"mode": "pin", "profileId": fallback_account}
+        else:
+            assert sent["mode"] == "auto" and "profileId" not in sent
+        assert fallback_cooldown.is_cooling_down(MODEL, False, primary_account)
+        assert not fallback_cooldown.is_cooling_down(MODEL, False, fallback_account)
+        # Resource-refusal deferral must use the same account key as the actual walk.
+        assert loop_model_call._route_follows([(MODEL, "fallback:0", False, False)])
+        assert not loop_model_call._route_follows([(MODEL, "main", False, True)])
+    finally:
+        fallback_cooldown.reset_for_tests()
+
+
+@pytest.mark.parametrize("choice", ["return", "wait"])
+@pytest.mark.parametrize("primary_account", ["account-a", ""])
+def test_primary_choice_survives_shared_cold_continuation(main_call, monkeypatch, choice, primary_account):
+    from ouroboros import budget_pause, loop_model_call, owner_wait
+    from ouroboros.model_slots import route_binding
+
+    ctx, _gateway, owner, _events, _decide, _observations = main_call
+    monkeypatch.setenv(MODEL_ACCOUNTS_KEY, json.dumps({"main": "decoy", "fallback": ["account-b"]}))
+    owner.overrides["main"] = {"model_account_override": primary_account}
+    inner = ctx.tools._ctx
+    inner.model_wait_context = owner
+    inner.active_effort, inner.active_use_local = "high", False
+    inner.context_fit_plan = replace(ctx.context_fit_plan, model_role="fallback:0")
+    inner.primary_route = {"model": MODEL, "use_local": False, "role": "main"}
+    loop._reset_turn_state(inner)
+    assert "OK:" in _switch_model(inner, primary=choice)
+    inner._route_facts_pending = "dated refusal fact"
+    state = owner_wait.continuation_state(inner, ctx.messages, {}, {}, 1, [], set())
+    # JSON storage and a fresh turn can replace the initial role before restore.
+    state = json.loads(json.dumps(state))
+    loop._reset_turn_state(inner)
+    inner.primary_route = {"model": "decoy", "use_local": False, "role": "fallback:0"}
+    inner.budget_drive_root = inner.drive_root = ctx.drive_root
+    state["_pause_row"] = {"pause_id": "primary-pause", "state": budget_pause.STATE_RESUME_GRANTED,
+                           "rail": budget_pause.RAIL_GLOBAL_EXHAUSTED, "grant": {"grant_id": "owner-resume"}}
+    budget_pause.set_budget_pause(ctx.drive_root, inner.task_id, state["_pause_row"])
+    model, effort, local, mode, _round, restored_plan = budget_pause.resume_paused_loop(
+        ctx.tools, state, ctx.messages, {}, {}, set(), budget_remaining_usd=5.0)
+    assert budget_pause.budget_pause_row(ctx.drive_root, inner.task_id)["state"] == budget_pause.STATE_RESUMED
+    assert any("explicit owner Resume" in str(row.get("content")) for row in ctx.messages)
+    model, local, effort, plan, _mode = loop_model_call._apply_round_route_overrides(
+        inner, ctx.tools, ctx.messages, (model, local, effort), restored_plan, mode, "max", [])
+    assert plan.model_role == "main" and inner.route_wait_on_primary is (choice == "wait")
+    assert route_binding(model, local, plan.model_role, overrides=owner.overrides) == (MODEL, False, primary_account)
+    assert inner.primary_route == {"model": MODEL, "use_local": False, "role": "main"}
+    assert inner._route_facts_pending == "dated refusal fact" and effort == "high"

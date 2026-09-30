@@ -273,8 +273,15 @@ def test_wait_updates_preserve_reading_position_away_from_the_live_edge(waiting_
     page.reload()
     page.wait_for_selector('.chat-bubble.user')
     page.wait_for_selector('[data-wait-id="light-wait"]')
+    page.wait_for_selector('#chat-messages[data-history-hydrated="true"]')
     scroll = page.locator('#chat-messages')
-    scroll.evaluate('(el) => { el.style.overflowAnchor = "none"; el.scrollTop = 300; }')
+    scroll.evaluate('(el) => { el.style.overflowAnchor = "none"; }')
+    # A real upward gesture cancels the initial history-follow frames and
+    # establishes reading intent; assigning scrollTop alone does neither.
+    page.wait_for_function("() => document.querySelector('#chat-messages').scrollTop > 0")
+    scroll.hover()
+    page.mouse.wheel(0, 300 - scroll.evaluate('(el) => el.scrollTop'))
+    page.wait_for_function("() => Math.abs(document.querySelector('#chat-messages').scrollTop - 300) <= 1")
     assert scroll.evaluate('(el) => el.scrollHeight - el.clientHeight - el.scrollTop > 48')
     anchor = page.locator('.chat-bubble.user').nth(2)
     before = anchor.bounding_box()['y']

@@ -235,14 +235,14 @@ def _run_cross_model_fallback_chain(
     """
     from ouroboros import fallback_cooldown as _fcd
     from ouroboros.loop_transport import append_unknown_recovery_input
-    from ouroboros.model_slots import MODEL_ACCOUNTS_KEY, model_role_option, task_model_binding
+    from ouroboros.model_slots import MODEL_ACCOUNTS_KEY, model_role_option, task_model_binding, route_binding
     from ouroboros.model_wait import current_model_wait
     from ouroboros.loop_llm_call import _COOLDOWN_ERROR_KINDS as _cooldown_kinds
     from ouroboros.provider_models import provider_for_model
 
-    def _cooled(model: str, use_local: bool) -> None:
+    def _cooled(model: str, use_local: bool, role: str) -> None:
         if str(accumulated_usage.get("_last_llm_error_kind") or "") in _cooldown_kinds:
-            _fcd.mark_cooldown(model, use_local)
+            _fcd.mark_cooldown(*route_binding(model, use_local, role, overrides=waiter.overrides if waiter else None))
 
     def _disclose_unknown(target: List[Dict[str, Any]], route: str) -> None:
         # A NEW generation after an eligible unknown outcome names the unknown attempt it follows.
@@ -252,10 +252,10 @@ def _run_cross_model_fallback_chain(
                 lead=f"The previous attempt ended without a usable answer; the configured route {route} continues.",
                 continuation="configured_route")
 
-    _cooled(active_model, active_use_local)
+    waiter = current_model_wait()
+    _cooled(active_model, active_use_local, str(getattr(context_fit_plan, "model_role", "") or "main"))
     primary_context_usage = _snapshot_context_fit_usage(accumulated_usage)
     attempt_cap = _fcd.attempts_per_model()
-    waiter = current_model_wait()
     # The round's own outage or unknown outcome remains its wait if no route answers.
     entry_model, entry_kind = active_model, str(accumulated_usage.get("_last_llm_error_kind") or "")
     own_wait = entry_kind in _ROUND_WAIT_KINDS
@@ -280,7 +280,8 @@ def _run_cross_model_fallback_chain(
     # transport boundary. Every chain row uses the single global USE_LOCAL_FALLBACK
     # flag (the pre-existing chain contract); the primary keeps its own locality.
     for index, (fallback_model, fallback_role, fallback_use_local, is_primary) in enumerate(rows):
-        if _fcd.is_cooling_down(fallback_model, fallback_use_local):
+        if _fcd.is_cooling_down(*route_binding(fallback_model, fallback_use_local, fallback_role,
+                                             overrides=waiter.overrides if waiter else None)):
             continue
         deadline = _loop()._task_deadline_epoch(tools)
         if deadline and time.time() >= deadline:
@@ -402,7 +403,7 @@ def _run_cross_model_fallback_chain(
         _restore_context_fit_usage(accumulated_usage, primary_context_usage)
         if _walk_fenced(tools._ctx, accumulated_usage):
             break
-        _cooled(fallback_model, fallback_use_local)
+        _cooled(fallback_model, fallback_use_local, fallback_role)
         previous_model, previous_tag = fallback_model, ftag
     fenced = msg is None and _walk_fenced(tools._ctx, accumulated_usage)
     if deferred is None:
@@ -695,7 +696,13 @@ class _RoundModelCallContext:
 def _route_follows(candidates: List[Tuple[str, str, bool, bool]]) -> bool:
     from ouroboros import fallback_cooldown
 
-    return any(not fallback_cooldown.is_cooling_down(model, use_local) for model, _role, use_local, _primary in candidates)
+    from ouroboros.model_slots import route_binding
+    from ouroboros.model_wait import current_model_wait
+
+    waiter = current_model_wait()
+    return any(not fallback_cooldown.is_cooling_down(*route_binding(
+        model, use_local, role, overrides=waiter.overrides if waiter else None))
+        for model, role, use_local, _primary in candidates)
 
 
 def _fallback_route_follows(ctx: _RoundModelCallContext) -> bool:
