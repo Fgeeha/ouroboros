@@ -208,6 +208,8 @@ def _successor_task(q: Any, predecessor: str, result: Dict[str, Any], binding: D
     deadline_at = str(binding.get("deadline_at") or "")
     text = work_order_text(predecessor, verdict["cause"], sources, deadline_at=deadline_at)
     title = str(result.get("title") or result.get("suggested_name") or result.get("objective") or predecessor)[:80]
+    original = sources.get("original") or {}
+    origin_ref = original.get("origin_message_ref")
     task: Dict[str, Any] = {
         "id": binding["successor_task_id"], "type": "task", "chat_id": binding.get("chat_id"),
         "project_id": str(binding.get("project_id") or ""), "text": text, "objective": text,
@@ -217,6 +219,10 @@ def _successor_task(q: Any, predecessor: str, result: Dict[str, Any], binding: D
         **{key: binding[key] for key in ("workspace_root", "workspace_mode") if binding.get(key)},
         "metadata": {
             **({"project_id": binding["project_id"]} if binding.get("project_id") else {}),
+            # Keep verified owner-door provenance on its canonical carrier;
+            # the new objective below is still the host's continuation text.
+            **({"origin_message_ref": dict(origin_ref), "origin_message_text": original["content"]}
+               if isinstance(origin_ref, dict) and origin_ref else {}),
             # The objective is host-composed facts; the owner corpus is seeded
             # with the owner's exact words only (loop_messages seeding).
             "objective_author": {"kind": "continuation", "predecessor_task_id": predecessor},
