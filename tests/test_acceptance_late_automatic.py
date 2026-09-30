@@ -1,5 +1,6 @@
 """Actual terminal sender/outbox, preparation owner and registered explicit consumers."""
 import copy
+import hashlib
 import json
 import queue
 import threading
@@ -212,6 +213,7 @@ def test_overlapping_historical_collections_keep_the_queued_notice_room(late, tm
     """Both real collectors can observe pending before either publishes its result."""
     from ouroboros import acceptance_late, acceptance_settlement as settlement, review_dispatch
     from ouroboros.contracts.chat_id_policy import WEB_UI_CHAT_ID
+    from ouroboros.gateway.task_archive import serve_task_source
     from ouroboros.projects_registry import bind_task_to_project
     from supervisor.log_addressing import bound_project_chat_id
     from supervisor.terminal_delivery import pending_deliveries, terminal_answer_receipts
@@ -275,6 +277,11 @@ def test_overlapping_historical_collections_keep_the_queued_notice_room(late, tm
     notice, = pending_deliveries(f.root)
     assert notice['system_type'] == 'acceptance_late_settlement'
     assert notice['progress_meta']['late_evidence']['source_ref'] != p['applied_source_ref']
+    # The notice's record link still opens the exact record it was sent with (#1369).
+    sent = notice['progress_meta']['late_evidence']['source_ref']
+    served = serve_task_source(f.root, [], load_task_result(f.root, f.tid), f.tid, sent['path'].rsplit('/', 1)[1],
+                               sent['path'])
+    assert served.status_code == 200 and hashlib.sha256(served.body).hexdigest() == sent['sha256']
     assert notice['text'] == p['late_settlement']['note']
     receipt, = terminal_answer_receipts(f.root, f.tid)['delivered']
     assert p['late_settlement']['historical_delivery'] == {

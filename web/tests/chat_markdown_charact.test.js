@@ -49,9 +49,14 @@ test('legacy renderMarkdown pins GFM-style pipe-table shape and quirks', () => {
         '| one | two |',
         '| three | four |',
     ].join('\n');
+    // The separator's colons are the author's alignment, written as marked writes it.
     assert.equal(
         renderMarkdown(source),
-        '<div class="md-table-wrap"><table class="md-table"><thead><tr><th>First</th><th>Second</th></tr></thead><tbody><tr><td>one</td><td>two</td></tr><tr><td>three</td><td>four</td></tr></tbody></table></div>',
+        '<div class="md-table-wrap"><table class="md-table"><thead><tr><th align="left">First</th><th align="right">Second</th></tr></thead><tbody><tr><td align="left">one</td><td align="right">two</td></tr><tr><td align="left">three</td><td align="right">four</td></tr></tbody></table></div>',
+    );
+    assert.equal(
+        renderMarkdown('| a | b |\n| --- | :-: |\n| 1 | 2 |'),
+        '<div class="md-table-wrap"><table class="md-table"><thead><tr><th>a</th><th align="center">b</th></tr></thead><tbody><tr><td>1</td><td align="center">2</td></tr></tbody></table></div>',
     );
     assert.equal(renderMarkdown('| lone | row |'), '| lone | row |');
 });
@@ -59,7 +64,7 @@ test('legacy renderMarkdown pins GFM-style pipe-table shape and quirks', () => {
 test('legacy renderMarkdown routes links through safeExternalUrl', () => {
     assert.equal(
         renderMarkdown('[Web](https://example.com/docs) [Mail](mailto:owner@example.com) [Bad](javascript:alert(1))'),
-        '<a href="https://example.com/docs" target="_blank" rel="noopener noreferrer" class="md-link">Web</a> <a href="mailto:owner@example.com" target="_blank" rel="noopener noreferrer" class="md-link">Mail</a> <a href="#" target="_blank" rel="noopener noreferrer" class="md-link">Bad</a>)',
+        '<a href="https://example.com/docs" target="_blank" rel="noopener noreferrer" class="md-link">Web</a> <a href="mailto:owner@example.com" target="_blank" rel="noopener noreferrer" class="md-link">Mail</a> <a href="#" target="_blank" rel="noopener noreferrer" class="md-link">Bad</a>',
     );
 });
 
