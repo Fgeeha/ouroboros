@@ -256,33 +256,114 @@ def test_after_response_two_accounting_failures_return_exact_response_once(root,
     assert [row["state"] for row in rows(root)] == ["reserved", "dispatched"]
 
 
-def test_async_wait_keeps_loop_responsive_and_context_claim(root, short_acquisitions):
-    async def run():
-        ticks, sent = [], []
+def _observe_async_accounting_wait(root, monkeypatch):
+    facts = {}
 
-        async def heartbeat():
-            for _ in range(25):
-                ticks.append(1)
-                await asyncio.sleep(.01)
+    async def run():
+        loop, sent = asyncio.get_running_loop(), []
+        original = ua._locked
+        facts["loop_thread"] = threading.get_ident()
+        watchdog_fired = threading.Event()
+        response = {"usage": {}}
 
         async def send():
             sent.append(1)
-            return {"usage": {}}
+            return response
 
-        with owner(root), ua.physical_attempt_limit(1), held_lock(root) as release:
-            timer = threading.Timer(.18, release.set)
+        # Only the loop callback (or the cleanup watchdog) may release this hold.
+        with owner(root), ua.physical_attempt_limit(1), held_lock(root, timeout=None) as release:
+            def release_on_loop():
+                facts["callback_while_held"] = not release.is_set()
+                facts["sends_at_callback"] = len(sent)
+                release.set()
+
+            @contextlib.contextmanager
+            def observed_lock(*args, **kwargs):
+                stack = contextlib.ExitStack()
+                try:
+                    heartbeat = stack.enter_context(original(*args, **kwargs))
+                except ledger.UsageLockUnavailable as exc:
+                    if exc.reason == "contention" and "contention_thread" not in facts:
+                        facts["contention_thread"] = threading.get_ident()
+                        loop.call_soon_threadsafe(release_on_loop)
+                    raise
+                with stack:
+                    yield heartbeat
+
+            def release_if_stuck():
+                watchdog_fired.set()
+                release.set()
+
+            monkeypatch.setattr(ua, "_locked", observed_lock)
+            timer = threading.Timer(5, release_if_stuck)
             timer.start()
             try:
-                beat = asyncio.create_task(heartbeat())
-                await ua.execute_physical_attempt_async(request(root), send)
-                assert len(ticks) >= 10
+                # Await in this Task: its ContextVar owns the terminal capture.
+                assert await ua.execute_physical_attempt_async(request(root), send) is response
+                capture = ua.last_physical_attempt_capture()
+                assert capture.state == "settled"
                 assert ua._PHYSICAL_LIMIT.get().used == 1
-                assert ua.last_physical_attempt_capture().state == "settled"
-                await beat
+                assert ua._PHYSICAL_LIMIT.get().claimed_ids == {capture.attempt_id}
             finally:
-                timer.join(2)
+                release.set()
+                timer.cancel()
+                timer.join(3)
+                assert not timer.is_alive()
+            facts["watchdog_fired"] = watchdog_fired.is_set()
         assert sent == [1]
+        attempt_rows = rows(root)
+        assert [row["state"] for row in attempt_rows] == ["reserved", "dispatched", "settled"]
+        assert [row["attempt_id"] for row in attempt_rows] == [capture.attempt_id] * 3
+
     asyncio.run(run())
+    return facts
+
+
+def _assert_loop_ran_during_contention(facts):
+    # A later watchdog expiry during settlement cannot undo observed progress.
+    assert ("contention_thread" in facts and facts.get("callback_while_held")
+            and facts.get("sends_at_callback") == 0), (
+        f"event loop did not run during accounting contention: {facts}")
+
+
+def test_async_wait_keeps_loop_responsive_and_context_claim(root, short_acquisitions, monkeypatch):
+    _assert_loop_ran_during_contention(_observe_async_accounting_wait(root, monkeypatch))
+
+
+def test_async_wait_witness_accepts_watchdog_after_loop_release(root, short_acquisitions, monkeypatch):
+    callbacks = []
+    original_timer, original_account = threading.Timer, ua._account_response
+
+    def record_timer(interval, callback, *args, **kwargs):
+        callbacks.append(callback)
+        return original_timer(interval, callback, *args, **kwargs)
+
+    def account_after_watchdog(*args):
+        # Accounting follows release and send. Fire the real cleanup callback
+        # here to prove the ordering without another wall-clock sleep.
+        callback, = callbacks
+        callback()
+        return original_account(*args)
+
+    monkeypatch.setattr(threading, "Timer", record_timer)
+    monkeypatch.setattr(ua, "_account_response", account_after_watchdog)
+    facts = _observe_async_accounting_wait(root, monkeypatch)
+    assert facts["watchdog_fired"]
+    _assert_loop_ran_during_contention(facts)
+
+
+def test_async_wait_witness_rejects_inline_blocking(root, short_acquisitions, monkeypatch):
+    from ouroboros import _usage_wait
+
+    async def inline(function, *args, on_cancel=None, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(_usage_wait, "presend_off_loop", inline)
+    facts = _observe_async_accounting_wait(root, monkeypatch)
+    assert facts["contention_thread"] == facts["loop_thread"]
+    assert facts["watchdog_fired"]
+    with pytest.raises(AssertionError, match="event loop did not run during accounting contention"):
+        _assert_loop_ran_during_contention(facts)
 
 
 def test_async_cancellation_joins_reservation_committed_at_the_boundary(root, monkeypatch):
