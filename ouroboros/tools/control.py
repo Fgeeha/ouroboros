@@ -415,11 +415,20 @@ def get_tools() -> List[ToolEntry]:
             "name": "switch_model",
             "description": "Switch to a different LLM model or reasoning effort level. "
                            "Use when you need more power (complex code, deep reasoning) "
-                           "or want to save budget (simple tasks). Takes effect on next round.",
+                           "or want to save budget (simple tasks). Takes effect on next round. "
+                           "After the host moved this turn to a configured fallback, primary='return' "
+                           "or 'wait' goes back to the turn's primary route.",
             "parameters": {"type": "object", "properties": {
                 "model": {"type": "string", "description": "Model name (e.g. anthropic/claude-sonnet-4). Leave empty to keep current."},
                 "effort": {"type": "string", "enum": list(EFFORT_SCALE),
                            "description": "Reasoning effort level (adapted down per route when a model tops out lower). Leave empty to keep current."},
+                "primary": {"type": "string", "enum": ["return", "wait"],
+                            "description": ("Omit to keep the current route. Return to this turn's primary route: its model, role and account policy "
+                                            "(Auto stays Auto) plus the owner's wait-card choice; effort stays. 'return': "
+                                            "if the primary refuses, configured routes are tried again. 'wait': if it "
+                                            "refuses or is unreachable, wait for it where this turn may wait instead of "
+                                            "paid alternatives. The next real request tests it; no timer or probe does. "
+                                            "Not with model.")},
             }, "required": []},
         }, _switch_model),
         ToolEntry("get_task_result", {

@@ -63,11 +63,12 @@ from ouroboros.loop_transport import (
     continue_unknown_transport as _continue_unknown_transport,
     TransportWaitEpisode,  # noqa: F401 -- the loop module keeps its historical import surface for the L-B leaves
     end_episode_budget as _end_episode_budget,  # noqa: F401 -- the loop module keeps its historical import surface for the L-B leaves
-    fallback_chain_allowed as _fallback_chain_allowed,
+    PRIMARY_REFUSAL_KINDS,
+    fallback_chain_allowed as _fallback_chain_allowed,  # noqa: F401 -- resolved by loop_model_call._recover_failed_round at call time
     finalize_now_transport_terminal as _finalize_now_transport_terminal,  # noqa: F401 -- the loop module keeps its historical import surface for the L-B leaves
     last_assistant_text as _last_assistant_text,
     provider_terminal_fallback_text as _provider_terminal_fallback_text,
-    reconcile_transport_wait as _reconcile_transport_wait,
+    reconcile_transport_wait as _reconcile_transport_wait,  # noqa: F401 -- resolved by loop_model_call._recover_failed_round at call time
     task_deadline_epoch as _task_deadline_epoch,  # noqa: F401 -- the loop module keeps its historical import surface for the L-B leaves
     transport_wait_step as _transport_wait_step,
 )
@@ -200,16 +201,10 @@ def _provider_unavailable_result(
     # round record (a granted transport-death repeat, no usable response since) leaves an attempt
     # unresolved and outranks the wait terminal, which in turn outranks the overflow salvage.
     record = isinstance(ctx.accumulated_usage.get(TRANSPORT_DEATHS_KEY), dict)
-    # The UNKNOWN-OUTCOME predicate, spelled exactly as the two seams that already
-    # own it: `provider_no_call_source` (the no-resend decision) and
-    # `provider_terminal_fallback_text` (the owner sentence). The durable source
-    # asked only for the round record, so an episode whose attempt was interrupted
-    # in flight — no record, sticky kind `provider_outcome_unknown` — told the owner
-    # its outcome was unknown while stamping `transport_unavailable_no_resend` on the
-    # trace (#869). One question, one answer, on all three surfaces.
-    unknown_outcome = record or str(
+    # Pending custody outranks later failures; its unknown cost survives every wait.
+    unknown_outcome = record or bool(ctx.accumulated_usage.get("_pending_transport_outcome")) or str(
         ctx.accumulated_usage.get("_last_llm_error_kind") or "") == "provider_outcome_unknown"
-    is_transport_wait = wait_cause == "transport_unavailable"
+    is_transport_wait = wait_cause == "transport_unavailable" or wait_cause in PRIMARY_REFUSAL_KINDS
     is_context_overflow = (kind == "context_overflow" and not (record or is_transport_wait)
                            and not ctx.accumulated_usage.get("resource_refusal"))
     is_deadline_exhausted = kind == "deadline_exhausted" or str(ctx.accumulated_usage.get("_last_llm_error_kind") or "") == "deadline_exhausted"
@@ -223,7 +218,7 @@ def _provider_unavailable_result(
             usage["terminal_provider_notice"] = _provider_terminal_fallback_text(
                 usage, is_context_overflow=is_context_overflow, is_transport_wait=is_transport_wait,
                 waited_sec=waited_sec, interactive=interactive,
-                is_deadline_exhausted=is_deadline_exhausted, control_reason=control_reason,
+                is_deadline_exhausted=is_deadline_exhausted, control_reason=control_reason, wait_cause=wait_cause,
             )
         return text, usage, trace
 
@@ -243,7 +238,7 @@ def _provider_unavailable_result(
             is_transport_wait=is_transport_wait, waited_sec=waited_sec,
             interactive=interactive,
             is_deadline_exhausted=is_deadline_exhausted,
-            control_reason=control_reason,
+            control_reason=control_reason, wait_cause=wait_cause,
         )
     if is_context_overflow:
         text, usage, llm_trace = _forced_fallback_result(
@@ -261,7 +256,7 @@ def _provider_unavailable_result(
         ctx.accumulated_usage.update(execution_status=RESULT_INFRA_FAILED, reason_code="provider_unavailable")
         text, usage, llm_trace = _forced_fallback_result(
             ctx, llm_trace, fallback, reason_code="provider_unavailable",
-            source="provider_outcome_unknown_no_resend" if unknown_outcome else "transport_unavailable_no_resend",
+            source="provider_outcome_unknown_no_resend" if unknown_outcome else f"{wait_cause}_no_resend",
         )
         if usage.get("reason_code") == "provider_unavailable":
             usage["execution_status"] = RESULT_INFRA_FAILED
@@ -362,14 +357,19 @@ def _reset_turn_state(ctx: Any) -> None:
     ctx._delivery_candidate, ctx._delivery_candidate_revision, ctx._delivery_control_required = None, 0, False
     ctx._delivery_evidence_revision, ctx._delivery_evidence_fingerprint = 0, ""
     ctx.model_turn_state, ctx._authoring_handover, ctx._pending_model_wait_handover = ModelTurnState(), None, None
+    ctx.route_wait_on_primary, ctx.active_role_override, ctx._route_facts_pending = False, None, ""
 
 
 def _initial_round_route(ctx: Any, llm: LLMClient, initial_effort: str) -> tuple:
     """The route this turn opens on: model, effort, local flag and context modes.
 
     Unknown routes get one honest call; no synthetic short-window capacity, so a
-    fit plan is adopted only while it still answers the preferred mode.
+    fit plan is adopted only while it still answers the preferred mode. The same
+    binding is recorded as the turn's primary (task override or role slot, role,
+    locality) for configured-route recovery and ``switch_model(primary=...)``.
     """
+    from ouroboros.model_slots import task_model_binding
+
     task_model_override = str(getattr(ctx, "task_model_override", "") or "").strip()
     local_override = getattr(ctx, "task_use_local_override", None)
     preferred_mode = get_context_mode()
@@ -379,10 +379,12 @@ def _initial_round_route(ctx: Any, llm: LLMClient, initial_effort: str) -> tuple
         active_context_mode = str(getattr(context_fit_plan, "initial_mode", "") or preferred_mode)
     else:
         active_context_mode = preferred_mode
-    return (task_model_override or llm.default_model(), initial_effort,
-            (bool(local_override) if local_override is not None else
-             runtime_setting("USE_LOCAL_MAIN", "").lower() in ("true", "1")),
-            preferred_mode, active_context_mode, context_fit_plan)
+    model = task_model_override or llm.default_model()
+    use_local = (bool(local_override) if local_override is not None else
+                 runtime_setting("USE_LOCAL_MAIN", "").lower() in ("true", "1"))
+    ctx.primary_route = {"model": model, "use_local": use_local, "role": task_model_binding(
+        {"task_metadata": getattr(ctx, "task_metadata", {})}, context_fit_plan=context_fit_plan)[0]}
+    return model, initial_effort, use_local, preferred_mode, active_context_mode, context_fit_plan
 
 
 def run_llm_loop(
@@ -461,22 +463,10 @@ def run_llm_loop(
 
             ctx = tools._ctx
             if not pending_tool_budget:
-                _prev_active_route = (active_model, active_use_local)
-                active_model, active_use_local, active_effort = _apply_runtime_overrides(
-                    ctx, active_model, active_use_local, active_effort,
-                )
-                if (active_model, active_use_local) != _prev_active_route:
-                    context_fit_plan, active_context_mode = _rebind_context_fit_plan(
-                        context_fit_plan, tools, messages, model=active_model,
-                        use_local=active_use_local, preferred_mode=_preferred_context_mode,
-                        tool_schemas=tool_schemas,
-                    )
-                if active_model != _prev_active_route[0]:
-                    # Cross-FAMILY switch: discard provider-private reasoning
-                    # signatures before the new route sees them (same family is a no-op).
-                    _sanitized = LLMClient.sanitize_reasoning_on_model_switch(messages, _prev_active_route[0], active_model)
-                    if _sanitized is not messages:
-                        messages[:] = _sanitized
+                (active_model, active_use_local, active_effort, context_fit_plan,
+                 active_context_mode) = _apply_round_route_overrides(
+                    ctx, tools, messages, (active_model, active_use_local, active_effort), context_fit_plan,
+                    active_context_mode, _preferred_context_mode, tool_schemas)
             ctx.active_context_mode = active_context_mode
             ctx.active_model = active_model
             ctx.active_effort = active_effort
@@ -593,26 +583,12 @@ def run_llm_loop(
                     task_id=task_id, emit_progress=emit_progress, transport_episode=transport_wait):
                 transport_wait = None  # The leaf wake owns resumption, without a provider probe.
                 continue
-            transport_wait = _reconcile_transport_wait(
-                transport_wait, ctx, msg_present=msg is not None, error_kind=last_error_kind,
-                drive_logs=drive_logs, task_id=task_id, model=active_model, emit_progress=emit_progress)
-            if msg is None and _fallback_chain_allowed(ctx, last_error_kind, transport_wait, accumulated_usage):
-                _episode_before_chain = transport_wait is not None
-                (msg, active_model, active_use_local,
-                 context_fit_plan, active_context_mode) = _run_cross_model_fallback_chain(
-                    llm=llm, ctx=ctx, tools=tools, messages=messages, active_model=active_model,
-                    active_use_local=active_use_local, tool_schemas=tool_schemas, active_effort=active_effort,
-                    max_retries=max_retries, drive_logs=drive_logs, task_id=task_id, round_idx=round_idx,
-                    event_queue=event_queue, accumulated_usage=accumulated_usage, task_type=task_type,
-                    emit_progress=emit_progress, context_fit_plan=context_fit_plan,
-                    active_context_mode=active_context_mode)
-                # Post-chain reconcile with the FRESH kind: a MID-chain outage
-                # latches too (see reconcile_transport_wait's docstring).
-                transport_wait = _reconcile_transport_wait(
-                    transport_wait, ctx, msg_present=msg is not None,
-                    error_kind=str(accumulated_usage.get("_last_llm_error_kind") or ""),
-                    drive_logs=drive_logs, task_id=task_id, model=active_model,
-                    emit_progress=emit_progress, after_local_pass=_episode_before_chain)
+            limit_ctx.active_model, limit_ctx.active_use_local = active_model, active_use_local
+            # Configured routes before any wait; an active episode owns its own outcome.
+            (msg, active_model, active_use_local, context_fit_plan, active_context_mode,
+             transport_wait) = _recover_failed_round(
+                limit_ctx, tools, msg, transport_wait, context_fit_plan=context_fit_plan,
+                active_context_mode=active_context_mode, emit_progress=emit_progress)
             # A wait-card switch can change the route within this very call.
             # Delivery/finalization in the same round must use that applied route.
             limit_ctx.active_model = ctx.active_model = active_model
@@ -792,6 +768,8 @@ from ouroboros.loop_nudges import (  # noqa: E402, F401 -- intentional public re
 )
 from ouroboros.loop_model_call import (  # noqa: E402, F401 -- intentional public re-exports
     _adopt_fallback_route,
+    _apply_round_route_overrides,
+    _recover_failed_round,
     _snapshot_context_fit_usage,
     _restore_context_fit_usage,
     _run_cross_model_fallback_chain,
