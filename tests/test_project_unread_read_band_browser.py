@@ -355,6 +355,22 @@ def test_a_room_read_on_one_client_clears_the_dot_on_another_at_its_next_state_r
         browser = getattr(pw, engine).launch()
         try:
             other, other_row = _client(browser, direct_server_with_data["url"], "shared-room", other_acks)
+            # Hold this client's shared-cursor responses until the reader has
+            # acknowledged. Existing background refreshes may otherwise win
+            # the race with the assertion below on a slower browser.
+            other.evaluate("""() => {
+                const fetch = window.fetch.bind(window);
+                window.__holdPreferences = true;
+                window.__pendingPreferences = [];
+                window.fetch = async (input, init) => {
+                    const url = new URL(typeof input === 'string' ? input : input.url, location.href);
+                    if (url.pathname === '/api/ui/preferences' && (!init?.method || init.method === 'GET')
+                            && window.__holdPreferences) {
+                        await new Promise(resolve => window.__pendingPreferences.push(resolve));
+                    }
+                    return fetch(input, init);
+                };
+            }""")
             reader, row = _client(browser, direct_server_with_data["url"], "shared-room", reader_acks)
             row.evaluate("el => el.click()")
             reader.locator(PANEL).locator(".chat-bubble").filter(has_text="Reply 3").wait_for(state="attached")
@@ -364,6 +380,11 @@ def test_a_room_read_on_one_client_clears_the_dot_on_another_at_its_next_state_r
             row.locator(".nav-unread-dot").wait_for(state="detached")
             assert other_row.locator(".nav-unread-dot").count() == 1, "the other client has not refreshed yet"
             _emit_ws_frame(other, {"type": "projects_changed"})
+            other.wait_for_function("() => window.__pendingPreferences.length > 0")
+            other.evaluate("""() => {
+                window.__holdPreferences = false;
+                window.__pendingPreferences.splice(0).forEach(resolve => resolve());
+            }""")
             other_row.locator(".nav-unread-dot").wait_for(state="detached")
             other.screenshot(path=str(evidence / f"read-band-{engine}-other-client.png"))
             assert [ack for ack in other_acks if ack.get("project_seen_revision")] == [], \
