@@ -378,7 +378,9 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
         "_record_owner_directive",
     })),
     "ouroboros/loop_model_call.py": ("ouroboros/loop.py", "_loop", frozenset({
-        "_RoundModelCallContext", "_account_compaction_usage", "_call_round_model",
+        "_RoundModelCallContext", "_account_compaction_usage", "_append_or_merge_user_message",
+        "_apply_runtime_overrides", "_call_round_model", "_fallback_chain_allowed",
+        "_reconcile_transport_wait", "_run_cross_model_fallback_chain",
         "_context_overflow_retries", "_context_reclaim_materializations",
         "_context_reclaim_passes", "_dispatch_round_model", "_emit_checkpoint_event",
         "_measure_round_main_fit", "_rebind_context_fit_plan", "_run_main_reclaim",
