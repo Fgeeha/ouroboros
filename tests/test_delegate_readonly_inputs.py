@@ -46,7 +46,8 @@ def test_readonly_source_permissions_do_not_prevent_exact_session_input(tmp_path
             scope = pathlib.Path(request["scope"]["root"])
             manifest_text = (scope / "inputs.json").read_text(encoding="utf-8")
             manifest = json.loads(manifest_text)
-            assert str(secret_alias) in manifest_text and str(protected) not in manifest_text
+            sources = {row["source"] for row in manifest}
+            assert str(secret_alias) in sources and str(protected) not in sources
             [note] = [row for row in manifest if row["source"] == str(source)]
             delivered = (scope / note["local"]).read_bytes()
             assert delivered == source.read_bytes()
@@ -62,10 +63,11 @@ def test_readonly_source_permissions_do_not_prevent_exact_session_input(tmp_path
     registry = ToolRegistry(repo_dir=ctx.repo_dir, drive_root=ctx.drive_root)
     registry.set_context(ctx)
     try:
-        result = registry.execute("delegate_start", {
+        result = registry.execute_result("delegate_start", {
             "subagent_id": "payload-session", "access": "readonly", "prompt": "Read the parent notes.",
         })
-        assert json.loads(result).get("run_id") == "run-p1", result
+        assert result.status == "ok", result.text
+        assert json.loads(result.text).get("run_id") == "run-p1", result.text
         assert source.read_text(encoding="utf-8") == "Parent input with " + token
     finally:
         source.chmod(0o644)
