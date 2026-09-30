@@ -269,6 +269,7 @@ from ouroboros.context_runtime_facts import (  # noqa: E402,F401 — re-exported
     _queue_context_fact,
     _runtime_budget_info,
     task_execution_clock_fact,
+    task_schedule_fact,
 )
 
 
@@ -354,6 +355,7 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None, sc
             "budget_drive_root": task.get("budget_drive_root"),
             "deadline_at": task.get("deadline_at"),
             **task_execution_clock_fact(task, ctx),
+            **task_schedule_fact(task),
             "allowed_resources": task.get("allowed_resources"),
             "context": task.get("context"),
         },

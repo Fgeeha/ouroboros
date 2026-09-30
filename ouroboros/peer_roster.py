@@ -297,6 +297,35 @@ def host_listed_independent_root(drive_root: pathlib.Path, task_id: str) -> Opti
         return None
 
 
+def independent_message_target(
+    drive_root: pathlib.Path, task_id: str, effective: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Existing listed roots, or an exact source-bound inline Presence mailbox.
+
+    Presence stays outside the owner-addressable roster. Its retained RUNNING
+    record admits a peer write, not a claim that another process is alive or has
+    read it; the shared execution observation travels with the write receipt.
+    """
+    listed = host_listed_independent_root(drive_root, task_id)
+    if listed is not None:
+        return listed
+    from ouroboros.dialogue_provenance import presence_record_binding, presence_target_record
+
+    record = presence_target_record(drive_root, task_id) or {}
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    observation = effective.get("execution_observation") or {}
+    if (record.get("_is_direct_chat") is not True or record.get("source") != "presence"
+            or str(record.get("task_id") or "") != task_id
+            or str(effective.get("task_id") or "") != task_id
+            or str(record.get("status") or "") != "running"
+            or not presence_record_binding(record) or not metadata.get("presence_event_identity")
+            or not isinstance(observation, dict) or observation.get("kind") != "presence"
+            or observation.get("state") not in {"active", "unknown"}):
+        return None
+    return {"task_id": task_id, "target_kind": "inline_presence",
+            "execution_observation": dict(observation)}
+
+
 def _facts_fingerprint(row: Dict[str, Any]) -> str:
     """Recorded names, start, origin and waits: absolute values, so a heartbeat never churns them."""
     facts = {key: row[key] for key in ("suggested_name", "started_at", "origin", "waiting") if row.get(key)}

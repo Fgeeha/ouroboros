@@ -1,4 +1,4 @@
-"""Durable enqueue refusal, consumed before retry; absence never proves unrun."""
+"""Persistent claim recovery, receipt/dispatch barriers and frozen accepted work."""
 from __future__ import annotations
 
 import copy
@@ -24,51 +24,56 @@ def _capacity_refusal(q, monkeypatch):
     _row(q, intent={"kind": "system_repo"}, metadata={"initiator": "consciousness"})
     q.queue.check_scheduled_tasks()
     row = _rows(q)["s1"]
-    assert row["occurrence"]["admission"] == "refused" and not q.pending
+    assert row["occurrence"]["phase"] == "claimed" and not q.pending
+    assert row["hold"]["reason"] == "consciousness_task_limit"
     assert not load_task_result(q.root, row["occurrence"]["task_id"])
-    occurrence._FRESH_CLAIMS.clear()
     monkeypatch.setenv("OUROBOROS_CONSCIOUSNESS_MAX_TASKS", "1")
     return copy.deepcopy(row["occurrence"])
 
 
 @pytest.mark.parametrize("failure", ["false", "raise", "no_write"])
-def test_refusal_must_be_durably_consumed_before_enqueue(q, monkeypatch, failure):  # noqa: F811
+def test_failed_receipt_cannot_dispatch_and_recovers_same_claim(q, monkeypatch, failure):  # noqa: F811
+    import ouroboros.task_results as results
+
     held = _capacity_refusal(q, monkeypatch)
-    original = queue_schedules._write_scheduled_tasks
+    original = results.write_task_result
 
-    def fail_consumption(data, *args, **kwargs):
-        current = data["tasks"][0]["occurrence"]
-        if "admission" not in current:
-            if failure == "raise":
-                raise OSError("isolated refusal consumption failed")
-            return False if failure == "false" else None
-        return original(data, *args, **kwargs)
+    def fail_receipt(*args, **kwargs):
+        if failure == "raise":
+            raise OSError("isolated receipt failure")
+        return False if failure == "false" else None
 
-    monkeypatch.setattr(queue_schedules, "_write_scheduled_tasks", fail_consumption)
-    monkeypatch.setattr(q.queue, "enqueue_task", lambda *_a, **_k: pytest.fail("unconsumed witness admitted"))
+    monkeypatch.setattr(results, "write_task_result", fail_receipt)
     q.queue.check_scheduled_tasks()
     assert not q.pending and _rows(q)["s1"]["occurrence"] == held
+    assert _rows(q)["s1"]["hold"]["reason"] == "receipt_failed"
+    monkeypatch.setattr(results, "write_task_result", original)
+    for _ in range(2):
+        q.queue.check_scheduled_tasks()
+    assert [task["id"] for task in q.pending] == [held["task_id"]]
+    assert occurrence.record_dispatch_possible(q.pending[0])
 
 
-def test_crash_after_consumption_and_enqueue_without_receipt_stays_unknown(q, monkeypatch):  # noqa: F811
+def test_crash_after_enqueue_without_receipt_recovers_same_unstarted_claim(q, monkeypatch):  # noqa: F811
     held = _capacity_refusal(q, monkeypatch)
     original = occurrence._write_receipt
 
     def crash(*_args):
         assert [task["id"] for task in q.pending] == [held["task_id"]]
-        assert "admission" not in _rows(q)["s1"]["occurrence"]
+        assert occurrence.record_dispatch_possible(q.pending[0]) is False
+        assert occurrence.restore_allowed(q.pending[0]) is False
         raise RuntimeError("process lost before receipt")
 
     monkeypatch.setattr(occurrence, "_write_receipt", crash)
     with pytest.raises(RuntimeError, match="process lost"):
         q.queue.check_scheduled_tasks()
-    occurrence._FRESH_CLAIMS.clear()
     q.pending.clear()
     monkeypatch.setattr(occurrence, "_write_receipt", original)
     q.queue.check_scheduled_tasks()
-    assert not q.pending
-    assert _rows(q)["s1"]["hold"]["reason"] == "occurrence_evidence_missing"
-    assert _rows(q)["s1"]["occurrence"]["task_id"] == held["task_id"]
+    assert [task["id"] for task in q.pending] == [held["task_id"]]
+    assert _rows(q)["s1"]["occurrence"]["token"] == held["token"]
+    q.queue.check_scheduled_tasks()
+    assert len(q.pending) == 1
 
 
 @pytest.mark.parametrize("case", ["foreign", "unreadable", "dispatch_row", "accepted", "owner_hold"])
@@ -113,7 +118,6 @@ def test_receipt_loss_after_dispatch_cannot_replay_old_refusal(q, monkeypatch): 
     [task] = q.pending
     assert occurrence.record_dispatch_possible(task)
     q.pending.clear()
-    occurrence._FRESH_CLAIMS.clear()
     (q.root / f'task_results/{held["task_id"]}.json').unlink()
     for _ in range(2):
         q.queue.check_scheduled_tasks()
@@ -125,7 +129,6 @@ def test_accepted_republish_refusal_does_not_claim_never_admitted(q, monkeypatch
     held = _capacity_refusal(q, monkeypatch)
     q.queue.check_scheduled_tasks()
     q.pending.clear()
-    occurrence._FRESH_CLAIMS.clear()
     monkeypatch.setenv("OUROBOROS_CONSCIOUSNESS_MAX_TASKS", "0")
     q.queue.check_scheduled_tasks()
     current = _rows(q)["s1"]["occurrence"]
@@ -149,3 +152,144 @@ def test_stale_preparation_cannot_duplicate_or_replace_accepted_source(q, monkey
     q.queue.check_scheduled_tasks()
     [task] = q.pending
     assert task["id"] == held["task_id"] and task["text"] != "STALE PREPARATION"
+
+
+@pytest.mark.parametrize("source", ["followup", "owner_gateway"])
+@pytest.mark.parametrize("crash_point", ["prepare_hold", "before_receipt"])
+def test_fresh_process_recovers_and_physically_assigns_once(tmp_path, source, crash_point):
+    """A real interpreter exit loses every local object; only the protocol survives."""
+    import json
+    import os
+    import pathlib
+    import subprocess
+    import sys
+
+    program = r'''
+import json, pathlib, sys
+from types import SimpleNamespace
+from supervisor import queue, queue_schedules, schedule_occurrence as occurrence, state, workers
+from ouroboros import config
+from ouroboros.projects_registry import create_project
+from tests.test_schedule_occurrence import _rows
+from ouroboros.tools.followup import _handle_schedule_followup
+from ouroboros.tools.registry import ToolContext
+from tests.test_schedule_transition_repair import _api
+from tests.test_worker_crash_retry import _make_worker
+base, stage, source, crash_point = pathlib.Path(sys.argv[1]), *sys.argv[2:]
+root, repo, folder = base / "data", base / "repo", base / "folder"
+root.mkdir(exist_ok=True); repo.mkdir(exist_ok=True)
+state.init(root)
+workers.init(repo, root, 1)
+queue_schedules.resync_skill_schedules = lambda *_a: {}
+config.get_bg_wakeup_min_sec = lambda: 0
+q = SimpleNamespace(queue=queue, pending=workers.PENDING, root=root)
+assert not hasattr(queue, "REPO_DIR")
+if stage == "claim":
+    state.save_state({"owner_chat_id": 1})
+    folder.mkdir()
+    create_project(root, "proj", name="Room", working_dir=str(folder))
+    if source == "followup":
+        context = ToolContext(repo_dir=repo, drive_root=root, task_id="origin", project_id="proj")
+        context.is_direct_chat = True
+        context.chat_id = 42
+        answer = _handle_schedule_followup(context, run_at="2000-01-01T00:00:00+00:00", objective="continue")
+        assert answer.startswith("FOLLOWUP_SCHEDULED"), answer
+    else:
+        _api(q, {"id": "s1", "name": "owner schedule", "trigger": {"type": "once", "run_at": "2000-01-01T00:00:00+00:00"},
+                 "task": {"type": "task", "text": "continue", "project_id": "proj", "chat_id": 42}})
+    if crash_point == "prepare_hold":
+        folder.rmdir()
+        queue.check_scheduled_tasks()
+        assert next(iter(_rows(q).values()))["hold"]["reason"] == "workspace_unusable"
+    else:
+        def crash(*_a):
+            assert len(workers.PENDING) == 1
+            assert occurrence.record_dispatch_possible(workers.PENDING[0]) is False
+            assert occurrence.restore_allowed(workers.PENDING[0]) is False
+            raise RuntimeError("lost process before receipt")
+        occurrence._write_receipt = crash
+        try:
+            queue.check_scheduled_tasks()
+        except RuntimeError as exc:
+            assert str(exc) == "lost process before receipt"
+        else:
+            raise AssertionError("crash boundary not reached")
+    row = next(iter(_rows(q).values()))
+    print(json.dumps({"pid": __import__("os").getpid(), "occurrence": row["occurrence"]}))
+else:
+    folder.mkdir(exist_ok=True)
+    queue.check_scheduled_tasks()
+    queue.check_scheduled_tasks()
+    assert len(workers.PENDING) == 1
+    task = workers.PENDING[0]
+    assert task["workspace_root"] == str(folder.resolve())
+    worker = _make_worker(alive=True, busy_task_id=None, exitcode=None)
+    workers.WORKERS[0] = worker
+    state.budget_remaining = lambda *_a, **_k: 10.0
+    workers.assign_tasks()
+    assert worker.in_q.put.call_count == 1
+    sent = worker.in_q.put.call_args.args[0]
+    queue.check_scheduled_tasks()
+    workers.RUNNING.clear()
+    worker.busy_task_id = None
+    queue.check_scheduled_tasks()
+    workers.assign_tasks()
+    assert worker.in_q.put.call_count == 1
+    print(json.dumps({"pid": __import__("os").getpid(), "task_id": sent["id"],
+                      "occurrence": sent["metadata"]["schedule_occurrence"], "worker_sends": worker.in_q.put.call_count}))
+'''
+    results = []
+    for stage in ("claim", "restart"):
+        env = {**os.environ, "OUROBOROS_DATA_DIR": str(tmp_path / "data"),
+               "OUROBOROS_REPO_DIR": str(tmp_path / "repo")}
+        completed = subprocess.run(
+            [sys.executable, "-c", program, str(tmp_path), stage, source, crash_point],
+            cwd=pathlib.Path(__file__).resolve().parents[1], env=env,
+            capture_output=True, text=True, encoding="utf-8", timeout=45,
+        )
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        results.append(json.loads(completed.stdout.strip().splitlines()[-1]))
+    first, second = results
+    assert first["pid"] != second["pid"]
+    assert first["occurrence"]["task_id"] == second["task_id"]
+    for key in ("token", "due_at", "claimed_at"):
+        assert first["occurrence"][key] == second["occurrence"][key]
+    assert second["worker_sends"] == 1
+
+
+@pytest.mark.parametrize("state_kind", ["accepted", "missing", "unreadable", "foreign", "admitted_missing"])
+def test_worker_delete_reads_receipt_from_its_canonical_table_root(q, tmp_path, monkeypatch, state_kind):  # noqa: F811
+    import json
+    from types import SimpleNamespace
+    from ouroboros.tools.followup import _manage_schedules
+
+    canonical, child = tmp_path / "canonical", tmp_path / "child"
+    row = {"id": "s1", "enabled": True, "source": "task_followup", "task": {},
+           "trigger": {"type": "once", "run_at": "2000-01-01T00:00:00+00:00"},
+           "occurrence": {"phase": "admitted" if state_kind == "admitted_missing" else "claimed",
+                          "token": "same-token", "task_id": "same-task"}}
+    queue_schedules._write_scheduled_tasks({"tasks": [row]}, canonical)
+    if state_kind in {"accepted", "foreign"}:
+        write_task_result(canonical, "same-task", "scheduled", schedule_admission={
+            "schedule_id": "s1", "token": "same-token" if state_kind == "accepted" else "other",
+            "dispatch": "none", "task": {"id": "same-task", "text": "frozen"}})
+    elif state_kind == "unreadable":
+        path = canonical / "task_results" / "same-task.json"
+        path.parent.mkdir(parents=True)
+        path.write_text("{broken", encoding="utf-8")
+    # This other queue root has a receipt too. Neither its presence nor its
+    # absence can determine custody of the selected table's occurrence.
+    if state_kind == "missing":
+        write_task_result(q.root, "same-task", "scheduled", schedule_admission={
+            "token": "other-root", "dispatch": "none", "task": {"id": "same-task"}})
+    monkeypatch.setenv("OUROBOROS_IN_WORKER", "1")
+    ctx = SimpleNamespace(task_metadata={}, task_id="root", drive_root=child, budget_drive_root=canonical)
+    outcome = json.loads(_manage_schedules(ctx, action="delete", schedule_id="s1", reason="owner"))
+    assert outcome["ok"] and outcome["running_or_queued"] is None  # no snapshot required for custody
+    rows = queue_schedules.load_schedule_store(canonical)["tasks"]
+    if state_kind == "missing":
+        assert outcome["status"] == "deleted" and outcome["schedule"] is None and not rows
+    else:
+        assert outcome["status"] == "delete_deferred" and outcome["schedule"] is not None
+        assert len(rows) == 1 and rows[0]["delete_requested_at"] and not rows[0]["enabled"]
+        assert ("accepted run" in outcome["detail"]) is (state_kind == "accepted")

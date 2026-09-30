@@ -23,13 +23,13 @@ only. ``dispatch=possible`` is written BEFORE a worker receives the task
 replayed; existing orphan/custody recovery owns it. No exactly-once external
 effect is promised.
 
-A missing receipt is never proof that a restored claim is unrun. A live fresh
-claim or a durable ``admission=refused`` from the enqueue door proves no admission.
-The latter is consumed and read back under the locks BEFORE trying enqueue again;
-crashing after consumption without a receipt stays unknown. Dispatch possibility
-also lives monotonically on the occurrence row;
-receipt or snapshot loss cannot demote it. Deletion retains unresolved claims
-and accepted obligations in the same row until their disposition is established.
+A claimed occurrence with no result and no dispatch mark may prepare again once
+absent from the locked live queue: enqueue alone cannot reach a worker, and
+snapshot restore requires the matching receipt. The same token and task id
+survive restart; no process-local witness is needed. Unreadable or foreign
+results and admitted rows with missing receipts remain unknown. Dispatch
+possibility lives monotonically on the row and receipt. Deletion reads the
+receipt from the table's exact root and preserves accepted or unknown obligations.
 
 A recurring row that waited keeps ONE overdue occurrence (no catch-up burst) and,
 once admitted, moves to the next FUTURE cron point: a delayed run may land
@@ -43,6 +43,7 @@ import datetime
 import hashlib
 import json
 import logging
+import pathlib
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -54,7 +55,6 @@ log = logging.getLogger(__name__)
 OCCURRENCE_FIELDS = ("occurrence", "hold", "continuation_of", "delete_requested_at")
 _FINGERPRINT_FIELDS = ("task", "trigger", "timezone", "cron", "name", "description", "enabled", "manual_override")
 _SETTLED = "settled"
-_FRESH_CLAIMS: set[tuple[str, str]] = set()  # process-local positive no-admission evidence
 
 
 def _queue():
@@ -104,7 +104,6 @@ def claim(record: Dict[str, Any], due_at: str) -> Dict[str, Any]:
     record["occurrence"] = {"token": uuid.uuid4().hex[:16], "task_id": uuid.uuid4().hex[:8],
                             "due_at": str(due_at), "phase": "claimed", "claimed_at": utc_now_iso(),
                             "fingerprint": fingerprint(record)}
-    _FRESH_CLAIMS.add((str(_queue().DRIVE_ROOT), record["occurrence"]["token"]))
     return view(record)
 
 
@@ -125,20 +124,18 @@ def reconcile(record: Dict[str, Any]) -> tuple[str, Optional[Dict[str, Any]]]:
 
     ``live`` (T pending/running), ``settled`` (occurrence done: T possibly dispatched,
     running or terminal — existing custody owns it), ``prepare`` (claimed, never
-    received: prepare the SAME T again), ``reconsider`` (positively unadmitted,
+    dispatched: prepare the SAME T again), ``reconsider`` (unstarted,
     changed definition/control: evaluate the new due point), ``republish`` (accepted but not in flight
     and never dispatched: re-enqueue the frozen task), or ``hold`` (unknown or
-    missing evidence — never replayed on absence)."""
+    missing accepted evidence — never replayed on absence alone)."""
     occ = record["occurrence"]
     task_id, token = str(occ.get("task_id") or ""), str(occ.get("token") or "")
     if occ.get("dispatch") == "possible":
         return _SETTLED, None
     if _is_live(task_id):
         return "live", None
-    from ouroboros.task_results import load_task_result
-
     try:
-        result = load_task_result(_queue().DRIVE_ROOT, task_id, strict=True) or {}
+        result = _read_back(task_id)
     except Exception as exc:
         set_hold(record, "occurrence_result_unreadable", f"{type(exc).__name__}: {exc}")
         return "hold", None
@@ -154,30 +151,39 @@ def reconcile(record: Dict[str, Any]) -> tuple[str, Optional[Dict[str, Any]]]:
         if "_owner_hold" in result:
             task["_owner_hold"] = copy.deepcopy(result["_owner_hold"])
         return "republish", task
-    if (occ.get("phase") == "claimed" and not result
-            and (occ.get("admission") == "refused" or (str(_queue().DRIVE_ROOT), token) in _FRESH_CLAIMS)):
+    if _unstarted_claim(occ, result):
         if (not record.get("enabled", True) or
                 occ.get("fingerprint", fingerprint(record)) != fingerprint(record)):
-            return "reconsider", None  # positive non-admission: the NEW definition must be due
+            return "reconsider", None  # unstarted work: the NEW definition must be due
         return "prepare", None
     set_hold(record, "occurrence_evidence_missing",
-             f"admitted task {task_id} has no readable receipt; it is not replayed")
+             f"occurrence {token} (phase={occ.get('phase') or 'unknown'}) has no usable "
+             f"admission receipt for task {task_id}; execution history is unknown")
     return "hold", None
 
 
-def owed(record: Dict[str, Any]) -> Optional[bool]:
+def _unstarted_claim(occ: Dict[str, Any], result: Dict[str, Any]) -> bool:
+    """Under the table transaction, only a receipt-less claim can be re-prepared.
+
+    Admission holds this transaction through receipt/row writes; dispatch must
+    retain a matching receipt and mark before a worker receives the task.
+    """
+    return occ.get("phase") == "claimed" and not result and occ.get("dispatch") != "possible"
+
+
+def owed(record: Dict[str, Any], *, drive_root: Optional[pathlib.Path] = None) -> Optional[bool]:
     """Whether the row carries an ACCEPTED occurrence that is neither in flight nor
-    settled — work its deletion would silently drop. ``None``: its receipt is unreadable."""
+    settled — work its deletion would silently drop. ``None``: missing, unreadable
+    or conflicting evidence cannot establish that obligation."""
     occ = record.get("occurrence") if isinstance(record.get("occurrence"), dict) else None
     if occ is None or occ.get("dispatch") == "possible":
         return False
     try:
-        result = _read_back(str(occ.get("task_id") or ""))
+        result = _read_back(str(occ.get("task_id") or ""), drive_root=drive_root)
     except Exception:
         return None
-    if (not result and occ.get("phase") == "claimed" and (occ.get("admission") == "refused"
-            or (str(_queue().DRIVE_ROOT), str(occ.get("token") or "")) in _FRESH_CLAIMS)):
-        return False  # positive refusal or this process's still-unaccepted claim
+    if _unstarted_claim(occ, result):
+        return False
     admission = result.get("schedule_admission") if isinstance(result.get("schedule_admission"), dict) else {}
     if admission.get("token") != occ.get("token"):
         return None
@@ -188,11 +194,19 @@ def owed(record: Dict[str, Any]) -> Optional[bool]:
                     and isinstance(admission.get("task"), dict)) else None
 
 
+def discard_claim(record: Dict[str, Any], data: Dict[str, Any]) -> bool:
+    """Drop unaccepted work and finish any earlier deferred delete atomically."""
+    record.pop("occurrence", None)
+    record.pop("hold", None)
+    if record.get("delete_requested_at"):
+        data["tasks"] = [row for row in data.get("tasks") or [] if row is not record]
+        return True
+    return False
+
 
 def settle(record: Dict[str, Any]) -> None:
     """The occurrence is over (dispatched/ran/ended): the row may claim its next one."""
     occ = record.pop("occurrence", {}) or {}
-    _FRESH_CLAIMS.discard((str(_queue().DRIVE_ROOT), str(occ.get("token") or "")))
     record.pop("hold", None)
     record["last_task_id"] = str(occ.get("task_id") or record.get("last_task_id") or "")
     if occ.get("phase") == "claimed":  # a dispatched claim whose row never advanced
@@ -247,7 +261,10 @@ def prepare(claimed: Dict[str, Any]) -> Dict[str, Any]:
     task = _task_from_schedule(record, task_id=str(occ["task_id"]))
     if task.get("chat_id") is None:
         return {**claimed, "task": task, "hold": ("owner_chat_unknown", "the owner destination is not currently known")}
-    task["metadata"]["schedule_occurrence"] = {"schedule_id": claimed["schedule_id"], "token": occ["token"]}
+    task["metadata"]["schedule_occurrence"] = {
+        "schedule_id": claimed["schedule_id"], "token": occ["token"],
+        "due_at": str(occ.get("due_at") or ""), "claimed_at": str(occ.get("claimed_at") or ""),
+    }
     try:
         hold, basis = resolve_resource(task, record)
     except Exception as exc:
@@ -315,6 +332,7 @@ def resolve_resource(task: Dict[str, Any], record: Dict[str, Any]) -> tuple[Opti
     and owner/skill templates: unchanged. Returns ``(hold, binding_basis)``."""
     from ouroboros.dialogue_provenance import presence_metadata_binding
     from ouroboros.workspace_admission import resolve_room_workspace
+    from supervisor import workers
 
     template = record.get("task") if isinstance(record.get("task"), dict) else {}
     meta = task["metadata"]
@@ -340,11 +358,11 @@ def resolve_resource(task: Dict[str, Any], record: Dict[str, Any]) -> tuple[Opti
         basis = str(room.get("working_dir") or "").strip()
         if not basis or str(room.get("lifecycle") or "active") != "active":
             return None, ""  # folderless (task scratch as default cwd); a closed room meets the admission fence
-        root, error = resolve_room_workspace(drive_root=_queue().DRIVE_ROOT, system_repo_dir=_queue().REPO_DIR,
+        root, error = resolve_room_workspace(drive_root=_queue().DRIVE_ROOT, system_repo_dir=workers.REPO_DIR,
                                              project_id=project_id)
         return (("workspace_unusable", error), basis) if error else (_bind(task, root), basis)
     if kind == "explicit_resource":
-        root, error = resolve_room_workspace(drive_root=_queue().DRIVE_ROOT, system_repo_dir=_queue().REPO_DIR,
+        root, error = resolve_room_workspace(drive_root=_queue().DRIVE_ROOT, system_repo_dir=workers.REPO_DIR,
                                              project_id="", explicit_workspace=str(intent.get("root") or ""))
         return (("workspace_unusable", error), None) if error or not intent.get("root") else (_bind(task, root), None)
     return None, None  # explicit_none, system_repo, template: nothing to bind
@@ -394,7 +412,6 @@ def admit(prepared: List[Dict[str, Any]]) -> None:
             return
         rows = {str(row.get("id") or ""): row for row in data.get("tasks") or []}
         admitted: List[str] = []
-        retired_claims: list[tuple[str, str]] = []
         changed = False
         for item in prepared:
             record = rows.get(item["schedule_id"])
@@ -406,9 +423,7 @@ def admit(prepared: List[Dict[str, Any]]) -> None:
             changed = True
             verdict, stored = reconcile(record)  # CURRENT facts, not the off-lock prepare snapshot
             if verdict == "reconsider":
-                record.pop("occurrence", None)
-                record.pop("hold", None)
-                retired_claims.append((str(q.DRIVE_ROOT), str(current.get("token") or "")))
+                discard_claim(record, data)
                 continue
             if verdict not in {"prepare", "republish"}:
                 continue
@@ -416,46 +431,25 @@ def admit(prepared: List[Dict[str, Any]]) -> None:
                 continue  # accepted/held facts changed: prepare their frozen task on the next pass
             fresh_claim = verdict == "prepare"
             if fresh_claim and (not record.get("enabled", True) or fingerprint(record) != item["fingerprint"]):
-                record.pop("occurrence", None)  # disabled/edited/rebound during prepare: future only
+                discard_claim(record, data)  # disabled/edited during prepare: future only
                 continue
             if item.get("hold"):
                 set_hold(record, *item["hold"])
                 continue
-            if current.get("admission") == "refused":
-                # Refusal is a positive no-enqueue witness, not perpetual replay
-                # permission. Remove it durably before anything may be admitted.
-                current.pop("admission")
-                try:
-                    if _write_scheduled_tasks(data) is False:
-                        raise OSError("refusal consumption returned False")
-                    saved = load_schedule_store(q.DRIVE_ROOT)
-                    if not any(r.get("id") == item["schedule_id"] and r.get("occurrence") == current
-                               for r in saved.get("tasks") or []):
-                        raise OSError("refusal consumption readback mismatch")
-                except Exception:
-                    set_hold(record, "occurrence_transition_failed", "never-admitted witness could not be consumed")
-                    continue
-            claim_key = (str(q.DRIVE_ROOT), str(current["token"]))
-            _FRESH_CLAIMS.discard(claim_key)  # no live no-admission proof while enqueue may take effect
+            current.pop("admission", None)  # retire the legacy refusal witness
             outcome = q.enqueue_task(item["task"], consciousness_window=windows.get(item["schedule_id"]),
                                      project_admission=item.get("project_admission"),
                                      continuation=bool(record.get("continuation_of") or
                                                        (item.get("stored_task") or {}).get("_consciousness_continuation")))
             block = str(outcome.get("_admission_blocked") or "") if isinstance(outcome, dict) else ""
             if block:
-                if fresh_claim:
-                    current["admission"] = "refused"  # the locked enqueue door positively refused this attempt
-                    _FRESH_CLAIMS.add(claim_key)
-                _refused(record, block, outcome)
+                _refused(record, block, outcome, data)
                 continue
             item["task"] = outcome  # preserve host-stamped continuation and admission facts
             if not _write_receipt(item, record):
                 _unqueue([str(occ["task_id"])])
-                if fresh_claim:
-                    _FRESH_CLAIMS.add(claim_key)  # this process withdrew it under the dispatch lock
                 set_hold(record, "receipt_failed", "the admission receipt could not be written and verified")
                 continue
-            _FRESH_CLAIMS.discard((str(q.DRIVE_ROOT), str(occ["token"])))
             if current.get("phase") == "claimed":
                 _advance(record, current)
             current["phase"] = "admitted"
@@ -470,19 +464,18 @@ def admit(prepared: List[Dict[str, Any]]) -> None:
             _unqueue(admitted)  # the receipts stand; the rows' claims reconcile next pass
             log.error("Scheduled task store write failed after admission; admitted tasks withdrawn", exc_info=True)
             return
-        _FRESH_CLAIMS.difference_update(retired_claims)
         if admitted and q.persist_queue_snapshot(reason="scheduled_tasks") is not True:
             _unqueue(admitted)  # not durable in the queue: republished from their receipts next pass
             log.error("Queue snapshot failed after scheduled admission; %d task(s) withdrawn", len(admitted))
 
 
-def _refused(record: Dict[str, Any], block: str, outcome: Dict[str, Any]) -> None:
+def _refused(record: Dict[str, Any], block: str, outcome: Dict[str, Any], data: Dict[str, Any]) -> None:
     detail = str(outcome.get("_admission_detail") or outcome.get("_worker_pool_disabled_reason") or "")
     trigger = record.get("trigger") if isinstance(record.get("trigger"), dict) else {}
     if block == "project_routing_fence" and outcome.get("_project_lifecycle") == "tombstoned":
         message = f"Scheduled task was not queued: the project {outcome.get('_project_id') or ''} was deleted."
-        record.pop("occurrence", None)
-        record.pop("hold", None)
+        if discard_claim(record, data):
+            return
         record["last_error"] = message
         if str(trigger.get("type") or "cron") == "once":
             record.update(enabled=False, completed_at=utc_now_iso(), next_run_at="")
@@ -543,11 +536,11 @@ def _write_receipt(item: Dict[str, Any], record: Dict[str, Any]) -> bool:
             and got.get("token") == occ["token"] and got.get("dispatch") == "none")
 
 
-def _read_back(task_id: str) -> Dict[str, Any]:
+def _read_back(task_id: str, *, drive_root: Optional[pathlib.Path] = None) -> Dict[str, Any]:
     """The result as it now is ON DISK (strict: unreadable raises, absence is ``{}``)."""
     from ouroboros.task_results import load_task_result
 
-    return load_task_result(_queue().DRIVE_ROOT, task_id, strict=True) or {}
+    return load_task_result(drive_root if drive_root is not None else _queue().DRIVE_ROOT, task_id, strict=True) or {}
 
 
 def _unqueue(task_ids: List[str]) -> None:

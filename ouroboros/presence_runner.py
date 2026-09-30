@@ -336,13 +336,15 @@ class PresenceTurnGate:
 _GATES_LOCK = threading.Lock()
 _GATES: dict[tuple[str, int], PresenceTurnGate] = {}
 _LIVE_LOCK = threading.Lock()
-_LIVE_PRESENCE_TASKS: set[str] = set()
+_LIVE_PRESENCE_TASKS: set[tuple[str, str]] = set()
 
 
-def presence_turn_is_live(task_id: str) -> bool:
-    """Process-local liveness for the orphan reconciler; never an owner-addressable actor."""
+def presence_turn_is_live(task_id: str, *, drive_root: Path | None = None) -> bool:
+    """Root-scoped local liveness; never an owner-addressable actor."""
     with _LIVE_LOCK:
-        return str(task_id or "") in _LIVE_PRESENCE_TASKS
+        if drive_root is not None:
+            return (str(Path(drive_root).resolve()), str(task_id or "")) in _LIVE_PRESENCE_TASKS
+        return any(tid == str(task_id or "") for _root, tid in _LIVE_PRESENCE_TASKS)
 
 
 def _configured_gate(drive_root: Path | None = None) -> PresenceTurnGate:
@@ -1025,13 +1027,14 @@ def run_presence_turn(
     def _execute_live() -> PresenceTurnResult:
         nonlocal task_id
         task_id = _retry_target(Path(drive_root), task_id, identity, claim=True)
+        live_key = (str(Path(drive_root).resolve()), task_id)
         with _LIVE_LOCK:
-            _LIVE_PRESENCE_TASKS.add(task_id)
+            _LIVE_PRESENCE_TASKS.add(live_key)
         try:
             return _run_current()
         finally:
             with _LIVE_LOCK:
-                _LIVE_PRESENCE_TASKS.discard(task_id)
+                _LIVE_PRESENCE_TASKS.discard(live_key)
 
     def _run_current() -> PresenceTurnResult:
         # Both locks are held: no other execution of this conversation runs, so a running or
@@ -1108,9 +1111,11 @@ def run_presence_turn(
         # after a crash, absence of that row would otherwise authorize a second model/tool effect.
         # This existing task-result authority is published and read back BEFORE handle_task.
         from ouroboros.task_results import write_task_result
+        from ouroboros.task_status import execution_owner_record
 
         try:
             write_task_result(Path(drive_root), task_id, STATUS_RUNNING,
+                              execution_owner=execution_owner_record(drive_root, task, "presence"),
                               create_only=True, strict_existing_dict=True,
                               metadata=task["metadata"], chat_id=chat_id,
                               _is_direct_chat=True, source="presence", result="Task is running.")

@@ -114,13 +114,15 @@ def _mirror_assigned_running_status(task: Dict[str, Any]) -> None:
     in memory and the snapshot is a ghost a stale or absent snapshot leaves
     forever. Never raises: a task that runs without its mirror is better than an
     assignment tick that stops."""
-    if not str(task.get("drive_root") or ""):
-        return
     try:
         from ouroboros.task_results import STATUS_RUNNING, write_task_result
+        from ouroboros.task_status import execution_owner_record
 
+        task["_execution_owner"] = execution_owner_record(
+            task.get("budget_drive_root") or _pool().DRIVE_ROOT, task, "pooled")
         _is_subagent = str(task.get("delegation_role") or "") == "subagent"
         _mirror = {
+            "execution_owner": task["_execution_owner"], "task_attempt": int(task.get("_attempt") or 0),
             "root_task_id": task.get("root_task_id"),
             "session_id": task.get("session_id"),
             "actor_id": task.get("actor_id"),
@@ -174,7 +176,7 @@ def _mirror_assigned_running_status(task: Dict[str, Any]) -> None:
             _mirror["chat_id"] = task.get("chat_id")
             _mirror = {key: value for key, value in _mirror.items() if value is not None}
         write_task_result(
-            _pool().DRIVE_ROOT,
+            task.get("budget_drive_root") or _pool().DRIVE_ROOT,
             str(task.get("id") or ""),
             STATUS_RUNNING,
             **_mirror,
