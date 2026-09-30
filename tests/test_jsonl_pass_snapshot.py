@@ -41,7 +41,8 @@ def test_captured_consumer_horizon_survives_append_and_rotation(tmp_path, consum
     else:
         rows, _, gaps = source.replay(0, source.upper)
         assert [row["text"] for row in rows] == ["first"]
-        assert source.upper == len(first) and not gaps
+        # History discloses the line its writer had not finished when it froze.
+        assert source.upper == len(first) and gaps == {"incomplete_live_line"}
         fresh = HistorySource(path, "chat")
         rows, _, gaps = fresh.replay(source.upper, fresh.upper)
     assert [row["text"] for row in rows] == ["next", "new generation"]

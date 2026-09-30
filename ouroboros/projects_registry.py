@@ -674,7 +674,7 @@ def list_sidebar_projects(drive_root: Any) -> List[Dict[str, Any]]:
     ]
 
 
-def reserved_project_chat_ids(drive_root: Any) -> set:
+def reserved_project_chat_ids(drive_root: Any, *, strict: bool = False) -> set:
     """The set of chat_ids reserved by every Project lifecycle state.
 
     The TRUTH source for "is this chat a project thread" — a bare numeric range
@@ -685,16 +685,20 @@ def reserved_project_chat_ids(drive_root: Any) -> set:
     sees ALL threads in its unified memory. This classifier drives (a) the UI
     history/fan-out partition that organizes threads into panels, (b) message
     routing, and (c) the project TASK's FOCUSED passive context (build_recent_
-    sections shows the task its own thread).
+    sections shows the task its own thread). ``strict=True`` RAISES on an
+    unreadable registry instead of answering "no Projects".
     """
     out = set()
     try:
-        for project in list_reserved_projects(drive_root):
+        projects = list_reserved_projects(drive_root, strict=True) if strict else list_reserved_projects(drive_root)
+        for project in projects:
             try:
                 out.add(int(project.get("chat_id") or 0))
             except (TypeError, ValueError):
                 continue
     except Exception:
+        if strict:
+            raise
         log.debug("reserved_project_chat_ids failed", exc_info=True)
     out.discard(0)
     return out

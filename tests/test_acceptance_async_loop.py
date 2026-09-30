@@ -531,7 +531,9 @@ def test_a_panel_that_settles_after_the_loop_exited_is_attached_through_the_reme
     assert len(rows) == 1, [e.get("type") for e in events]
     assert rows[0]["task_id"] == f.ctx.task_id and rows[0]["chat_id"] == 1
     assert rows[0]["text"].startswith("On the delivered version of this answer, reviewers later passed it.")
-    assert "- acceptance-one: PASS" in rows[0]["text"]
+    # The owner row names the model, not the slot id, and says the verdict in words (#1369).
+    assert "- fixture/reviewer (requested): passed it — Independent review" in rows[0]["text"]
+    assert "acceptance-one" not in rows[0]["text"]
     stored = load_task_result(f.ctx.drive_root, f.ctx.task_id)
     assert stored["status"] == "completed"
     panel = stored["review_projection"]["panels"][-1]

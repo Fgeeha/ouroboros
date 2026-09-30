@@ -499,19 +499,51 @@ def review_source_reader(task_id: str, ref: Dict[str, Any]) -> Dict[str, Any]:
         "task_id": task_id, "review_source_sha256": str(ref.get("sha256") or "")}}
 
 
+def host_acceptance_source(drive_root: Any, task_id: str, digest: str) -> tuple:
+    """``(ref, bytes)`` of this physical author's own HOST acceptance record, named by digest.
+
+    The digest fixes the path (no caller path, no store search); the bytes must
+    hash to it and decode to a host-root task-acceptance run of this very task,
+    or this raises. The model's ``review_source_sha256`` reader and the owner's
+    record download (``gateway.task_archive.serve_task_source``) share it.
+    """
+    from ouroboros.artifacts import read_actor_source_bytes, task_artifact_dir_path
+    from ouroboros.source_retention import retained_task_roots
+
+    if len(digest) != 64 or digest.strip("0123456789abcdef"):
+        raise ValueError("review source digest is invalid")
+    path = f"source_handles/context_checkpoints/acceptance-{digest}.json"
+    # The selector addresses exact bytes, not their current placement. Only
+    # this author's known retained drives can supply a not-yet-canonical file.
+    roots = [drive_root, *retained_task_roots(drive_root, task_id)]
+    stored = next((candidate for root in roots
+                   if (candidate := task_artifact_dir_path(root, task_id, create=False) / path).exists()), None)
+    if stored is None:
+        raise FileNotFoundError(path)
+    ref = {"kind": "task_source", "root": "artifact_store", "path": path,
+           "size": stored.stat().st_size, "sha256": digest}
+    raw = read_actor_source_bytes(drive_root, task_id, ref)
+    run = json.loads(raw)
+    request = run.get("request") if isinstance(run, dict) else None
+    if (not isinstance(request, dict) or run.get("authority") != "host_root"
+            or request.get("surface") != "task_acceptance" or request.get("task_id") != task_id):
+        raise ValueError("review source identity verification failed")
+    return ref, raw
+
+
 def review_source_projection(drive_root: Any, task_id: str, digest: str,
                              start_char: Any = None, end_char: Any = None) -> Dict[str, Any]:
     """Read a physical author's exact acceptance source, including historical panels.
 
-    Only host acceptance panels and the canonical debt's exact pinned subject
-    qualify; no caller path, successor substitution or artifact-store search.
+    Only host acceptance panels (``host_acceptance_source``) and the canonical
+    debt's exact pinned subject qualify; no caller path, successor substitution
+    or artifact-store search.
     """
-    from ouroboros.artifacts import read_actor_source_bytes, task_artifact_dir_path, text_source_range_projection
+    from ouroboros.artifacts import read_actor_source_bytes, text_source_range_projection
 
     unavailable = {"schema": 1, "kind": "task_review_source", "status": "unavailable"}
     if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
         return {**unavailable, "reason": "source_ref_invalid"}
-    path = f"source_handles/context_checkpoints/acceptance-{digest}.json"
     try:
         from ouroboros.task_results import load_task_result
 
@@ -524,22 +556,7 @@ def review_source_projection(drive_root: Any, task_id: str, digest: str,
             ref = historical_ref
             raw = read_actor_source_bytes(drive_root, task_id, ref)
         else:
-            from ouroboros.source_retention import retained_task_roots
-
-            # The selector addresses exact bytes, not their current placement. Only
-            # this author's known retained drives can supply a not-yet-canonical file.
-            roots = [drive_root, *retained_task_roots(drive_root, task_id)]
-            stored = next((candidate for root in roots
-                           if (candidate := task_artifact_dir_path(root, task_id, create=False) / path).exists()), None)
-            if stored is None:
-                raise FileNotFoundError(path)
-            ref = {"kind": "task_source", "root": "artifact_store", "path": path,
-                   "size": stored.stat().st_size, "sha256": digest}
-            raw = read_actor_source_bytes(drive_root, task_id, ref)
-            panel = json.loads(raw)
-            request = panel.get("request") or {}
-            if panel.get("authority") != "host_root" or request.get("surface") != "task_acceptance" or request.get("task_id") != task_id:
-                raise ValueError("review source identity verification failed")
+            ref, raw = host_acceptance_source(drive_root, task_id, digest)
         projection, reason = text_source_range_projection(raw.decode("utf-8"), unavailable["kind"], start_char, end_char)
         return {**(projection or unavailable), "task_id": task_id, "source_ref": ref,
                 **({"reason": reason} if reason else {})}

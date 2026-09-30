@@ -222,10 +222,8 @@ class ChatOutbound(TypedDict):
     # v6.87.48: count of OPEN ledger rows — the disclosed cause of
     # ``cost_final: false``, which can hold with every dollar bucket at zero.
     non_final_rows: NotRequired[Optional[int]]
-    # C12: the ledger's own INTEGRITY marker. The cost authority has always
-    # produced it (`reconstruct_task_cost`), but no carry list named it, so an
-    # amount computed over a degraded ledger reached every surface looking exactly
-    # like one computed over a sound ledger.
+    # C12: the ledger's own INTEGRITY marker from the cost authority (`reconstruct_task_cost`), carried so an
+    # amount computed over a degraded ledger never reaches a surface looking like one over a sound ledger.
     ledger_integrity_degraded: NotRequired[Optional[bool]]
     # Closed shape owned by the cost producer; null means ledger unavailable.
     cost_presentation: NotRequired[Optional[CostPresentation]]
@@ -253,6 +251,7 @@ class ChatOutbound(TypedDict):
     card_row: NotRequired[Literal["timeline", "reviews"]]
     card_row_id: NotRequired[str]
     card_row_revision: NotRequired[int]  # canonical source order, independent of delivery timestamp
+    late_evidence: NotRequired[Dict[str, Any]]  # late review identity/revision + exact applied source; no transcript
     # Event-time human presentation; raw task/project ids remain machine keys.
     target_label: NotRequired[str]
     project_id: NotRequired[str]

@@ -163,12 +163,26 @@ def run_failure_cause(failure: Any) -> str:
     """What the engine REPORTED about a failed run (``failure.safeMessage``), whitespace-
     collapsed, secret-redacted and strictly bounded; "" when it reported nothing. An OPAQUE
     fact: stored and displayed, never parsed or branched on (BIBLE P5) — presence is the
-    only test a caller may make."""
+    only test a caller may make; a person's quote separates the host's own cut from the
+    engine's words through ``reported_cause_words``."""
     from ouroboros.utils import sanitize_tool_result_for_log, truncate_within_limit
 
     words = (failure if isinstance(failure, dict) else {}).get("safeMessage")
     return truncate_within_limit(
         sanitize_tool_result_for_log(" ".join(str(words or "").split())), REPORTED_CAUSE_CHARS)
+
+
+def reported_cause_words(cause: Any) -> tuple[str, bool]:
+    """``(words, shortened)`` of a stored ``run_failure_cause``: the engine's words
+    without the bound's own omission marker (``truncate_within_limit``), and whether
+    that bound cut them. The words were whitespace-collapsed before the bound, so a
+    newline can only open the host's marker; the engine's words are never read."""
+    text = str(cause or "")
+    words, marker, length = text.rpartition(
+        f"\n⚠️ OMISSION NOTE: truncated at {REPORTED_CAUSE_CHARS} chars; original length ")
+    if marker and "\n" not in words and length.isdigit() and int(length) > len(text) == REPORTED_CAUSE_CHARS:
+        return words, True
+    return text, False
 
 
 def run_failure_error(run_id: str, run_state: str, failure: Any) -> ClaudexorUnavailable:
