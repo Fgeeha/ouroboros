@@ -8,7 +8,8 @@ export function createChatReadingPosition({ initial, visible, alive, ready, feed
     let viewportAnchor = null, width = feed.clientWidth;
     let intent = initial && initial.stick === false ? { ...initial } : null;
     const saved = intent;
-    let approximate = false, dragging = '', claimed = null;
+    // dragging: 'held'/'released' feed scrollbar, or 'owed' to a downward gesture's animation.
+    let approximate = false, dragging = '', claimed = null, scrolls = 0;
     const state = {
         top: Math.max(0, Number(initial?.scrollTop) || 0),
         stick: initial ? initial.stick !== false : true,
@@ -24,7 +25,7 @@ export function createChatReadingPosition({ initial, visible, alive, ready, feed
             width = feed.clientWidth; viewportAnchor = anchors.capture();
         },
         reflow() {
-            if (dragging === 'released') dragging = ''; // a resize is no part of a released drag
+            if (dragging === 'released' || dragging === 'owed') dragging = ''; // a resize is no part of either
             if (intent) { state.position(); return; }
             if (!visible()) return;
             if (state.stick) feed.scrollTop = feed.scrollHeight;
@@ -32,10 +33,12 @@ export function createChatReadingPosition({ initial, visible, alive, ready, feed
             state.top = feed.scrollTop; state.remember(true); updateButton();
         },
         scroll() {
+            scrolls++;
             if (!visible()) return;
             if (!intent) {
-                // A feed scrollbar drag, and the scrolls it still owes after its
-                // release, follow exactly where it leaves the feed.
+                // A feed scrollbar drag, and the scrolls it (or a downward
+                // gesture) still owes after its release, follow exactly where
+                // it leaves the feed.
                 if (dragging) state.stick = feed.scrollHeight > feed.clientHeight && state.nearBottom();
                 state.top = feed.scrollTop;
                 state.remember();
@@ -87,7 +90,7 @@ export function createChatReadingPosition({ initial, visible, alive, ready, feed
             return () => token === generation;
         },
         bindGestures(navigate) {
-            let touchY = null, pressed = null, latched = null, wheelAt = -Infinity, boxScrolled = null;
+            let touchY = null, pressed = null, latched = null, wheelAt = -Infinity, boxScrolled = null, gestures = 0;
             const doc = feed.ownerDocument;
             // Keys scroll the focused control's scroller or, with nothing focused,
             // the one last pressed; neither sends keydown to the feed itself.
@@ -142,20 +145,26 @@ export function createChatReadingPosition({ initial, visible, alive, ready, feed
                 // end: turning back or reading away from the live edge.
                 const follow = state.stick, absorb = () => { state.stick = follow && direction > 0 && state.nearBottom(); };
                 if (nested) {
+                    // Box scrolling also ends an earlier feed gesture's queued frame and
+                    // the scrolls it still owes, though not a scrollbar drag still held.
+                    gestures++; if (dragging !== 'held') dragging = '';
                     if (intent || approximate || claimed === generation) state.cancel();
                     absorb();
                     return;
                 }
                 state.cancel(); state.stick = false;
-                const token = generation, since = event.timeStamp;
+                const token = generation, own = ++gestures, since = event.timeStamp;
                 requestAnimationFrame(() => {
-                    if (!alive() || !visible() || token !== generation) return;
+                    if (!alive() || !visible() || token !== generation || own !== gestures) return;
                     // A browser may move the box before it reports the gesture: when the
                     // box under it scrolled, the gesture was that box's after all.
                     for (let box = origin; boxScrolled?.at >= since - 50 && box && box !== feed; box = box.parentElement) {
                         if (box === boxScrolled.box) { latched = true; absorb(); return; }
                     }
                     state.stick = direction > 0 && feed.scrollHeight > feed.clientHeight && state.nearBottom();
+                    // A key, wheel or swipe the engine animates may still be moving the feed:
+                    // like a released drag, its own later scrolls decide until scrollend.
+                    if (direction > 0 && !state.stick) dragging = 'owed';
                     state.top = feed.scrollTop;
                     navigate(direction);
                 });
@@ -164,7 +173,17 @@ export function createChatReadingPosition({ initial, visible, alive, ready, feed
             for (const type of types) feed.addEventListener(type, gesture, { passive: true });
             const noteBoxScroll = event => { if (event.target && event.target !== feed) boxScrolled = { box: event.target, at: event.timeStamp }; };
             feed.addEventListener('scroll', noteBoxScroll, { passive: true, capture: true });
-            const settle = () => { if (dragging === 'released') dragging = ''; };
+            const settle = () => {
+                if (dragging === 'released') dragging = '';
+                if (dragging !== 'owed') return;
+                // WebKit also ends each step of an animated page scroll: the owed
+                // scrolls end only once a frame passes without another, and only
+                // this gesture's: a newer one's may not have begun to arrive.
+                const token = generation, seen = scrolls;
+                requestAnimationFrame(() => requestAnimationFrame(() => {
+                    if (dragging === 'owed' && token === generation && scrolls === seen) dragging = '';
+                }));
+            };
             feed.addEventListener('scrollend', settle, { passive: true });
             const pointer = ['pointerdown', 'pointerup', 'pointercancel'];
             doc.addEventListener('keydown', gesture, { passive: true });

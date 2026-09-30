@@ -6,7 +6,6 @@ existing resource authority, concrete origins and live service identity.
 from __future__ import annotations
 
 import ipaddress
-import pathlib
 import re
 import socket
 from typing import Any
@@ -58,7 +57,7 @@ def runtime_service_kind(url: str, ctx: Any = None) -> str:
     Identity is read from the actual binding and live process, never inferred
     from a port number or an ``/api/owner/...`` pathname alone.
     """
-    from ouroboros.tools.core_secret_paths import restricted_data_roots
+    from ouroboros.tools.core_secret_paths import runtime_data_roots
 
     origin = normalize_browser_origin(url)
     if not origin:
@@ -78,7 +77,7 @@ def runtime_service_kind(url: str, ctx: Any = None) -> str:
                    for address in resolved["addresses"])
 
     try:
-        for root in restricted_data_roots(ctx):
+        for root in runtime_data_roots(ctx):
             if identity := runtime_service_identity(root, parsed.port, host_matches):
                 return identity
         return ""
@@ -106,7 +105,7 @@ def browser_url_block_reason(
     if not restricted:
         return "BROWSER_METADATA_BLOCKED: link-local/cloud metadata target" if _is_metadata_blocked_browser_url(url) else ""
     if parsed.scheme == "file":
-        return "" if _file_url_under_workspace(parsed, ctx) else "BROWSER_LOCAL_READONLY_BLOCKED: file URL is outside the task workspace"
+        return ""  # Same local-file reach as the parent; network/action policy stays separate.
     origin = normalize_browser_origin(url)
     if not origin:
         return "BROWSER_LOCAL_READONLY_BLOCKED: expected a concrete HTTP(S) target"
@@ -162,26 +161,6 @@ def browser_request_block_reason(
     )) and runtime_service_kind(request.url, ctx):
         return "BROWSER_OWNER_CONTROL_BLOCKED: this operation belongs to the owner"
     return ""
-
-
-def _file_url_under_workspace(parsed: Any, ctx: Any) -> bool:
-    """True only when a file:// path resolves under the task's EXPLICIT workspace
-    root, so a subagent can view its own built app but not the data root/secrets."""
-    if ctx is None:
-        return False
-    ws = str(getattr(ctx, "workspace_root", "") or "").strip()
-    if not ws:
-        return False
-    try:
-        from urllib.request import url2pathname
-
-        path = pathlib.Path(url2pathname(parsed.path)).resolve(strict=False)
-        base = pathlib.Path(ws).resolve(strict=False)
-        path.relative_to(base)
-        return True
-    except (ValueError, OSError):
-        return False
-
 
 
 def _is_blocked_subagent_ip(ip: ipaddress._BaseAddress) -> bool:

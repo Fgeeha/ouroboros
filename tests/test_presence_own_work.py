@@ -639,8 +639,10 @@ def test_the_binding_authority_is_its_own_carrier_and_fails_closed():
 
 
 def _parent(root, metadata, *, task_id="presence-turn-1", ceiling=True):
+    repo = root / "repo"
+    repo.mkdir(parents=True, exist_ok=True)
     return types.SimpleNamespace(
-        task_depth=0, pending_events=[], drive_root=root, task_id=task_id, task_metadata=metadata,
+        repo_dir=repo, task_depth=0, pending_events=[], drive_root=root, task_id=task_id, task_metadata=metadata,
         task_contract={"capability_ceiling": presence_ceiling_payload(_ceiling())} if ceiling else {},
         current_chat_id=4242, is_direct_chat=ceiling, is_workspace_mode=lambda: False,
     )

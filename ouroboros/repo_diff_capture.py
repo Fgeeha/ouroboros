@@ -456,8 +456,8 @@ def repo_diff_projection(capture: Any, *, section_limits: Dict[str, int] | None 
         if name in _STRIPPED_SECTIONS:
             text = text.strip()
         text = _redact_diff_text(text) if name in _DIFF_SECTIONS else str(redact_projection(text).value)
-        # A private-key block inside a hunk is masked WHOLE with the existing
-        # egress pattern (secret_masking) before any presentation bound can cut it.
+        # Mask a whole private-key block in the diagnostic projection before
+        # any presentation bound can cut it; source file reads stay unchanged.
         text = _PEM_PRIVATE_KEY_RE.sub(_REDACTED, text)
         if name in limits:
             text = truncate_review_artifact(text, limit=limits[name])
