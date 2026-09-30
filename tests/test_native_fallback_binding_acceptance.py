@@ -268,7 +268,7 @@ def test_duplicate_model_slots_keep_their_distinct_native_accounts(main_call, mo
     assert [row["state"] for row in ledger(ctx.drive_root)].count("unresolved") == 2
 
 
-@pytest.mark.parametrize("status,reason", [(401, "auth"), (402, "quota"), (429, "unavailable"), (503, "unavailable"), (400, "")])
+@pytest.mark.parametrize("status,reason", [(401, "auth"), (402, "quota"), (400, "")])
 @pytest.mark.parametrize("wire", ["http", "sse"])
 def test_primary_wait_honors_a_direct_api_access_refusal(main_call, monkeypatch, status, reason, wire):
     """A declared wait must not be undone by a paid fallback merely because access uses an API key."""
@@ -401,3 +401,96 @@ def test_primary_choice_survives_shared_cold_continuation(main_call, monkeypatch
     assert route_binding(model, local, plan.model_role, overrides=owner.overrides) == (MODEL, False, primary_account)
     assert inner.primary_route == {"model": MODEL, "use_local": False, "role": "main"}
     assert inner._route_facts_pending == "dated refusal fact" and effort == "high"
+
+
+@pytest.mark.parametrize("wire", ["managed", "http", "sse"])
+@pytest.mark.parametrize("status", [429, 503, 529])
+@pytest.mark.parametrize("ending", ["answer", "stop", "deadline"])
+def test_primary_refusal_wait_paces_real_requests_without_catalog_recovery(
+        main_call, monkeypatch, wire, status, ending):
+    from datetime import datetime, timedelta, timezone
+    from ouroboros import loop_llm_call, owner_mailbox, usage_accounting as ua
+    from ouroboros.llm_attempt import _attempt_request, _candidate_before_dispatch
+    from supervisor.owner_stop import REASON_OWNER_STOPPED_DIRECT_TURN
+
+    ctx, gateway, owner, events, _decide, _observations = main_call
+    primary = MODEL if wire == "managed" else "openai::primary-test"
+    for key, value in {"OUROBOROS_CONTEXT_MODE": "max", "OUROBOROS_TASK_REVIEW_MODE": "off",
+                       "OUROBOROS_SAFETY_MODE": "off", "MCP_ENABLED": "false",
+                       "OUROBOROS_TRANSIENT_RETRY_MAX": "6", "OUROBOROS_MODEL_FALLBACKS": MODEL,
+                       "OPENAI_API_KEY": "fixture-key"}.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv(MODEL_ACCOUNTS_KEY, json.dumps({"main": "account-a", "fallback": ["account-b"]}))
+    ctx.context_fit_plan = replace(ctx.context_fit_plan, model=primary,
+        provider="claudexor" if wire == "managed" else "openai", model_route=ROUTE if wire == "managed" else {})
+    tools = _loop_tools(ctx, owner)
+    tools._ctx.task_model_override, tools._ctx.is_direct_chat = primary, True
+    tools._ctx.model_wait_context = owner
+    owner.worker_slot_held = False
+    wait_call = {"id": "wait-primary", "type": "function", "function": {
+        "name": "switch_model", "arguments": json.dumps({"primary": "wait"})}}
+    first = {"role": "assistant", "content": "", "tool_calls": [wait_call]}
+    final = {"role": "assistant", "content": "The primary answered."}
+    failures = 12
+    gateway.results = [_reply(ROUTE, first)] + [result(outcome="failed", problem={
+        "code": "provider_failed", "message": "Upstream refused", "retryable": True,
+        "context": {"httpStatus": status}}) for _ in range(failures)] + [_reply(ROUTE, final)]
+    gateway.dispatch = ["response_received"] * (failures + 2)
+    _bounded_creates(monkeypatch, gateway, failures + 2)
+    sent = []
+    if wire != "managed":
+        def send(target, messages, schemas, *args, **kwargs):
+            assert target["provider"] == "openai", "a chosen primary wait must not dispatch a fallback"
+            sent.append(target["provider"])
+            body = {"messages": deepcopy(messages), "tools": schemas or [], "model": "primary-test"}
+            request = _attempt_request(target, body)
+            def physical():
+                if len(sent) in (1, failures + 2):
+                    return (first if len(sent) == 1 else final), {"prompt_tokens": 1, "completion_tokens": 1, "cost": 0.01, "cost_final": True}
+                if wire == "sse":
+                    from ouroboros.llm_stream import ChatAccumulator
+                    ChatAccumulator().accept("message", json.dumps({"error": {"code": status, "message": "Temporary refusal"}}))
+                raise httpx.HTTPStatusError("Temporary refusal", request=httpx.Request("POST", "https://fixture.invalid"),
+                                           response=httpx.Response(status))
+            return ua.execute_physical_attempt(request, physical,
+                extractor=lambda value: (value[1], 0.01, True), before_dispatch=_candidate_before_dispatch(body, request))
+        monkeypatch.setattr(ctx.llm, "_chat_remote", send)
+    def no_probe(*_a, **_kw):
+        pytest.fail("an available catalog does not prove generation recovery")
+    monkeypatch.setattr(ctx.llm, "claudexor_model_catalog", no_probe)
+    monkeypatch.setattr(ctx.llm, "claudexor_model_sources", no_probe)
+    bursts, waits, notes = [], [], []
+    monkeypatch.setattr(loop_llm_call, "_sleep_within_deadline", lambda seconds, *_a, **_k: bursts.append(seconds) or True)
+    def pause(seconds, _wake):
+        waits.append(seconds)
+        if ending == "stop":
+            owner_mailbox.write_owner_message(ctx.drive_root, REASON_OWNER_STOPPED_DIRECT_TURN, "task-one",
+                msg_id="stop-primary-wait", kind=owner_mailbox.KIND_FINALIZE_NOW)
+        elif ending == "deadline":
+            tools._ctx.task_metadata["deadline_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        return ending != "answer"
+    monkeypatch.setattr(loop_transport, "interruptible_wait_sleep", pause)
+    text, usage, _trace = loop.run_llm_loop(
+        ctx.messages, tools, ctx.llm, ctx.drive_logs, lambda text, **_kw: notes.append(text), queue.Queue(),
+        task_id="task-one", drive_root=ctx.drive_root, event_queue=events)
+    attempts = len(gateway.creates) if wire == "managed" else len(sent)
+    assert attempts == (failures + 2 if ending == "answer" else 7)
+    assert waits == ([4.0, 8.0] if ending == "answer" else [4.0])
+    assert bursts == [4.0, 8.0, 16.0, 32.0, 60.0] * (2 if ending == "answer" else 1)
+    assert not owner.waits  # no immediate resource_available row/new paid call loop
+    if wire == "managed":
+        assert all(payload["account"] == {"mode": "pin", "profileId": "account-a"} for payload, _ in gateway.uploads)
+    rows = ledger(ctx.drive_root)
+    assert sum(row["state"] == "dispatched" for row in rows) == attempts
+    assert not any(row["state"] == "released" for row in rows)
+    assert any("primary provider temporarily refused" in note for note in notes)
+    assert not any("$0" in note or "connection restored" in note.lower() for note in notes)
+    if ending == "answer":
+        assert text == final["content"]
+    else:
+        notice = usage.get("terminal_provider_notice", text)
+        if ending == "stop":
+            assert "owner stopped this chat turn" in notice
+        else:
+            assert "No new summary request was sent" in notice
+        assert "provider connection was unavailable" not in notice and "$0" not in notice

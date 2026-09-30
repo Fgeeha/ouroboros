@@ -73,7 +73,7 @@ _FINAL_REDIAL_MARGIN_SEC = 3.0
 
 @dataclass
 class TransportWaitEpisode:
-    """Episode-local latch for one remote pre-dispatch transport outage.
+    """One remote outage or chosen wait for temporary primary-provider refusals.
 
     The latch — not the mutable ``_last_llm_error_kind`` projection — carries the
     terminal cause: later failures (a failed local fallback pass, the deadline
@@ -240,6 +240,15 @@ def continue_unknown_transport(episode: TransportWaitEpisode, *, llm: Any, tools
     return True
 
 
+PRIMARY_REFUSAL_KINDS = frozenset({"provider_transient", "rate_limit"})
+
+
+def primary_refusal_wait(ctx: Any, error_kind: str) -> bool:
+    """A declared primary wait keeps temporary refusals on ordinary paced recovery."""
+    return bool(getattr(ctx, "route_wait_on_primary", False) and error_kind in PRIMARY_REFUSAL_KINDS
+                and not inline_presence(ctx) and not getattr(ctx, "exact_model_route", False))
+
+
 def fallback_chain_allowed(
     ctx: Any, last_error_kind: str, episode: Optional[TransportWaitEpisode],
     accumulated_usage: Optional[Dict[str, Any]] = None,
@@ -258,6 +267,8 @@ def fallback_chain_allowed(
         # The round still holds an unresolved attempt (a granted transport-death
         # repeat with no usable response since): no paid candidate may dial over
         # it, whatever the last kind says.
+        return False
+    if primary_refusal_wait(ctx, last_error_kind):
         return False
     if getattr(ctx, "route_wait_on_primary", False) and (
             last_error_kind in ("transport_unavailable", "provider_outcome_unknown")
@@ -281,6 +292,8 @@ def reconcile_transport_wait(
 ) -> Optional[TransportWaitEpisode]:
     """Reconcile the episode latch with one dispatch outcome.
 
+    A declared primary wait also admits temporary provider refusals after ordinary retries,
+    without treating a ready account catalog as proof of generation recovery.
     Enters a new episode on a fresh ``transport_unavailable`` failure, or an
     eligible unknown outcome (``new_generation_after_unknown``), that the
     configured routes did not answer (durable ``entered`` event; the first owner
@@ -314,6 +327,12 @@ def reconcile_transport_wait(
     """
     pending = dict((getattr(ctx, "_accumulated_usage", {}) or {}).get("_pending_transport_outcome") or {})
     unknown_again = error_kind == "provider_outcome_unknown" and new_generation_after_unknown(ctx)
+    refused = not msg_present and primary_refusal_wait(ctx, error_kind)
+    if refused and episode is not None:
+        # Catalog readiness is not generation recovery. Keep the existing episode's
+        # pacing, elapsed bound and prior unknown custody; only a real answer ends it.
+        episode.wait_cause, episode.continuation_granted = error_kind, False
+        return episode
     if episode is not None and episode.continuation_granted:
         if (msg_present or error_kind not in ("provider_outcome_unknown", "transport_unavailable")
                 or (error_kind == "provider_outcome_unknown" and pending and not unknown_again)):
@@ -371,11 +390,11 @@ def reconcile_transport_wait(
         return episode
     if episode is None:
         unknown = unknown_again
-        if msg_present or (error_kind != "transport_unavailable" and not unknown):
+        if msg_present or (error_kind != "transport_unavailable" and not unknown and not refused):
             return None
         interactive = bool(getattr(ctx, "is_direct_chat", False))
         episode = TransportWaitEpisode(
-            wait_cause="provider_outcome_unknown" if unknown else "transport_unavailable",
+            wait_cause=error_kind,
             outcome_custody=dict((getattr(ctx, "_accumulated_usage", {}) or {}).get("_pending_transport_outcome") or {}),
             started_monotonic=time.monotonic(),
             interactive=interactive,
@@ -383,13 +402,15 @@ def reconcile_transport_wait(
         )
         emit_network_wait_event(
             drive_logs, task_id=task_id, phase="entered",
-            elapsed_sec=0.0, redials=0, model=model,
+            elapsed_sec=0.0, redials=0, model=model, detail=error_kind,
         )
         episode.last_note_monotonic = time.monotonic()
         # Interactive notes keep their existing wording; direct-turn Stop is
         # separately handled through its typed mailbox control.
         emit_progress(
-            ("🌐 Provider connection was lost after dispatch. The outcome and any unreported cost remain unknown. "
+            ("🌐 The primary provider temporarily refused the request. Waiting as chosen, then continuing "
+             "on the same primary with paced requests; prior attempt costs remain recorded." if refused else
+             "🌐 Provider connection was lost after dispatch. The outcome and any unreported cost remain unknown. "
              "Waiting for connectivity, then continuing from saved work with a new attempt; another charge is possible."
              if unknown else "🌐 Could not establish a provider connection — waiting and "
              "redialing automatically (failed attempts are $0).")
@@ -404,7 +425,9 @@ def reconcile_transport_wait(
             redials=episode.redials, model=model,
         )
         emit_progress(
-            f"🌐 Provider connection restored after {elapsed / 60.0:.1f} min — resuming.",
+            (f"🌐 Primary provider answered after {elapsed / 60.0:.1f} min — resuming."
+             if episode.wait_cause in PRIMARY_REFUSAL_KINDS else
+             f"🌐 Provider connection restored after {elapsed / 60.0:.1f} min — resuming."),
             incident=None,
         )
         return None
@@ -607,7 +630,8 @@ def transport_wait_step(
         )
         if episode.interactive:
             emit_progress(
-                "🌐 Stopped waiting for a provider connection after "
+                ("🌐 Stopped waiting for the primary provider after " if episode.wait_cause in PRIMARY_REFUSAL_KINDS
+                 else "🌐 Stopped waiting for a provider connection after ") +
                 f"{elapsed / 60.0:.1f} min — this turn ends as a provider outage.",
                 incident=None,
             )
@@ -644,7 +668,8 @@ def transport_wait_step(
     if time.monotonic() - episode.last_note_monotonic >= note_interval:
         episode.last_note_monotonic = time.monotonic()
         emit_progress(
-            f"🌐 Still waiting for a provider connection — {elapsed / 60.0:.0f} min "
+            ("🌐 Still waiting for the primary provider — " if episode.wait_cause in PRIMARY_REFUSAL_KINDS
+             else "🌐 Still waiting for a provider connection — ") + f"{elapsed / 60.0:.0f} min "
             f"elapsed, {episode.redials} redials; will resume automatically.",
             incident=None,  # a periodic note is never a toast; the episode always passes incident=
         )
@@ -680,12 +705,10 @@ def finalize_now_transport_terminal(
     """Route a finalize_now that lands during an active episode to the honest
     transport no-resend terminal.
 
-    Every finalize_now flavor (supervisor deadline, cost ceiling, owner stop)
-    normally dispatches one forced summarize call — but over a proven-dead
-    egress that paid path can only fail at $0 with identical salvage, so the
-    deterministic no-resend terminal wins. The episode's durable evidence is
-    closed with an ``ended`` row first; the caller passes a partial of its
-    ``_handle_provider_unavailable`` so terminal composition stays in loop.py.
+    Supervisor deadline, cost ceiling and owner stop send no forced summary
+    over a waited-out outage or chosen primary refusal wait. Preserve the actual
+    cause and prior attempt costs. Close the durable episode first; the caller's
+    ``_handle_provider_unavailable`` keeps terminal composition in loop.py.
     """
     emit_network_wait_event(
         drive_logs, task_id=task_id, phase="ended",
@@ -693,7 +716,7 @@ def finalize_now_transport_terminal(
         redials=episode.redials, model=model, detail="finalize_now",
     )
     return handle_provider_unavailable(
-        error_kind="transport_unavailable",
+        error_kind=episode.wait_cause,
         wait_cause=episode.wait_cause,
         waited_sec=episode.waited_sec,
         interactive=episode.interactive,
@@ -779,7 +802,7 @@ def provider_terminal_fallback_text(
     waited_sec: float,
     interactive: bool = False,
     is_deadline_exhausted: bool,
-    control_reason: str = "",
+    control_reason: str = "", wait_cause: str = "",
 ) -> str:
     """Owner-facing terminal text when provider death left nothing to salvage.
 
@@ -798,13 +821,19 @@ def provider_terminal_fallback_text(
     from supervisor.owner_stop import REASON_OWNER_STOPPED_DIRECT_TURN
 
     unknown = (isinstance(accumulated_usage.get(TRANSPORT_DEATHS_KEY), dict)
+               or bool(accumulated_usage.get("_pending_transport_outcome"))
                or accumulated_usage.get("_last_llm_error_kind") == "provider_outcome_unknown")
     if control_reason in {REASON_OWNER_REQUESTED_FINALIZATION, REASON_OWNER_STOPPED_DIRECT_TURN}:
         action = "Stop" if control_reason == REASON_OWNER_STOPPED_DIRECT_TURN else "Wrap up"
         waited = f" The wait ended after {waited_sec / 60.0:.1f} min;" if waited_sec else ""
-        return (f"⚠️ The owner requested {action} while the provider connection was unavailable."
+        subject = "the primary provider was refusing requests" if wait_cause in PRIMARY_REFUSAL_KINDS else "the provider connection was unavailable"
+        return (f"⚠️ The owner requested {action} while {subject}."
                 f"{waited} No new summary request was sent. Any files written so far are preserved."
                 + (provider_recovery_hint(accumulated_usage) if unknown else ""))
+    if wait_cause in PRIMARY_REFUSAL_KINDS and not unknown:
+        return ("⚠️ The primary provider kept refusing requests; its selected wait ended "
+                f"after {waited_sec / 60.0:.1f} min. No new summary request was sent. "
+                "Completed work and the original attempt-cost records are preserved.")
     if is_context_overflow:
         return (
             "⚠️ The context exceeded the selected model window; no further provider call was made. "

@@ -443,3 +443,24 @@ def test_a_readable_unknown_after_a_granted_continuation_ends_the_episode(tmp_pa
     readable = SimpleNamespace(task_id="t", _accumulated_usage={"_pending_transport_outcome": {
         "physical_attempt_id": "new", "outcome": "unknown", "same_operation_recoverable": True}})
     assert loop_transport.reconcile_transport_wait(granted(), readable, **kwargs) is None
+
+
+@pytest.mark.parametrize("kind", ["provider_transient", "rate_limit"])
+def test_chosen_primary_refusal_keeps_existing_episode_bounds_and_unknown_custody(tmp_path, kind):
+    ctx = SimpleNamespace(task_id="t", route_wait_on_primary=True, is_direct_chat=True, _accumulated_usage={})
+    assert not loop_transport.fallback_chain_allowed(ctx, kind, None, {})
+    episode = loop_transport.TransportWaitEpisode(wait_cause="provider_outcome_unknown", started_monotonic=12,
+        wait_iterations=3, redials=3, continuation_granted=True, outcome_custody={"physical_attempt_id": "old"})
+    kwargs = dict(drive_logs=tmp_path, task_id="t", model="primary", emit_progress=lambda *_a, **_kw: None)
+    resumed = loop_transport.reconcile_transport_wait(episode, ctx, msg_present=False, error_kind=kind, **kwargs)
+    assert resumed is episode and episode.wait_cause == kind and not episode.continuation_granted
+    assert (episode.started_monotonic, episode.wait_iterations, episode.redials) == (12, 3, 3)
+    assert episode.outcome_custody == {"physical_attempt_id": "old"}
+    assert loop_transport.reconcile_transport_wait(episode, ctx, msg_present=True, error_kind="", **kwargs) is None
+    ctx.route_wait_on_primary = False
+    assert loop_transport.fallback_chain_allowed(ctx, kind, None, {})
+    assert loop_transport.reconcile_transport_wait(None, ctx, msg_present=False, error_kind=kind, **kwargs) is None
+    ctx.route_wait_on_primary, ctx.current_task_type = True, "presence"
+    assert not loop_transport.primary_refusal_wait(ctx, kind)
+    ctx.current_task_type, ctx.exact_model_route = "task", True
+    assert not loop_transport.primary_refusal_wait(ctx, kind)

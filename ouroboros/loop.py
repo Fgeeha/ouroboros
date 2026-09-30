@@ -63,6 +63,7 @@ from ouroboros.loop_transport import (
     continue_unknown_transport as _continue_unknown_transport,
     TransportWaitEpisode,  # noqa: F401 -- the loop module keeps its historical import surface for the L-B leaves
     end_episode_budget as _end_episode_budget,  # noqa: F401 -- the loop module keeps its historical import surface for the L-B leaves
+    PRIMARY_REFUSAL_KINDS,
     fallback_chain_allowed as _fallback_chain_allowed,  # noqa: F401 -- resolved by loop_model_call._recover_failed_round at call time
     finalize_now_transport_terminal as _finalize_now_transport_terminal,  # noqa: F401 -- the loop module keeps its historical import surface for the L-B leaves
     last_assistant_text as _last_assistant_text,
@@ -200,16 +201,10 @@ def _provider_unavailable_result(
     # round record (a granted transport-death repeat, no usable response since) leaves an attempt
     # unresolved and outranks the wait terminal, which in turn outranks the overflow salvage.
     record = isinstance(ctx.accumulated_usage.get(TRANSPORT_DEATHS_KEY), dict)
-    # The UNKNOWN-OUTCOME predicate, spelled exactly as the two seams that already
-    # own it: `provider_no_call_source` (the no-resend decision) and
-    # `provider_terminal_fallback_text` (the owner sentence). The durable source
-    # asked only for the round record, so an episode whose attempt was interrupted
-    # in flight — no record, sticky kind `provider_outcome_unknown` — told the owner
-    # its outcome was unknown while stamping `transport_unavailable_no_resend` on the
-    # trace (#869). One question, one answer, on all three surfaces.
+    # Pending custody outranks later failures; its unknown cost survives every wait.
     unknown_outcome = record or bool(ctx.accumulated_usage.get("_pending_transport_outcome")) or str(
         ctx.accumulated_usage.get("_last_llm_error_kind") or "") == "provider_outcome_unknown"
-    is_transport_wait = wait_cause == "transport_unavailable"
+    is_transport_wait = wait_cause == "transport_unavailable" or wait_cause in PRIMARY_REFUSAL_KINDS
     is_context_overflow = (kind == "context_overflow" and not (record or is_transport_wait)
                            and not ctx.accumulated_usage.get("resource_refusal"))
     is_deadline_exhausted = kind == "deadline_exhausted" or str(ctx.accumulated_usage.get("_last_llm_error_kind") or "") == "deadline_exhausted"
@@ -223,7 +218,7 @@ def _provider_unavailable_result(
             usage["terminal_provider_notice"] = _provider_terminal_fallback_text(
                 usage, is_context_overflow=is_context_overflow, is_transport_wait=is_transport_wait,
                 waited_sec=waited_sec, interactive=interactive,
-                is_deadline_exhausted=is_deadline_exhausted, control_reason=control_reason,
+                is_deadline_exhausted=is_deadline_exhausted, control_reason=control_reason, wait_cause=wait_cause,
             )
         return text, usage, trace
 
@@ -243,7 +238,7 @@ def _provider_unavailable_result(
             is_transport_wait=is_transport_wait, waited_sec=waited_sec,
             interactive=interactive,
             is_deadline_exhausted=is_deadline_exhausted,
-            control_reason=control_reason,
+            control_reason=control_reason, wait_cause=wait_cause,
         )
     if is_context_overflow:
         text, usage, llm_trace = _forced_fallback_result(
@@ -261,7 +256,7 @@ def _provider_unavailable_result(
         ctx.accumulated_usage.update(execution_status=RESULT_INFRA_FAILED, reason_code="provider_unavailable")
         text, usage, llm_trace = _forced_fallback_result(
             ctx, llm_trace, fallback, reason_code="provider_unavailable",
-            source="provider_outcome_unknown_no_resend" if unknown_outcome else "transport_unavailable_no_resend",
+            source="provider_outcome_unknown_no_resend" if unknown_outcome else f"{wait_cause}_no_resend",
         )
         if usage.get("reason_code") == "provider_unavailable":
             usage["execution_status"] = RESULT_INFRA_FAILED
