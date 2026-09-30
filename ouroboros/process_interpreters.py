@@ -262,7 +262,9 @@ def _surface_for(
     if binding.root != "active_workspace":
         return binding.root or "unresolved"
     if constraint and constraint.mode == "acting_subagent" and constraint.surface == "self_worktree":
-        return "system_repo"
+        from ouroboros.workspace_copies import is_system_copy
+
+        return "system_repo" if is_system_copy(ctx) else "external_workspace"
     mode = str(getattr(ctx, "workspace_mode", "") or "").strip().lower()
     if mode in {"external", "external_workspace", "genesis"}:
         return "external_workspace"

@@ -226,8 +226,8 @@ def executor_blocked_outcome(
         # holder here), so the parent reads WHY, not only a reason code (#1241).
         + (f" {availability['detail']}" if availability.get("detail") else "")
         + " The task was NOT run on metered API tokens, because that spend is exactly "
-        "what the pin exists to prevent. Reschedule once the route recovers, or "
-        "explicitly select another Available subagent."
+        "what the pin exists to prevent. The recorded cause describes this failed start; "
+        "no replacement executor was selected."
     )
     return text, {
         "execution_status": "infra_failed",

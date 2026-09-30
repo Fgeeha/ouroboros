@@ -55,7 +55,9 @@ integration is safe. Excluded nested repositories remain outside the snapshot
 inventory and are disclosed as an untracked residual.
 
 A read-only child requests `mode: ask`, `access: readonly` under Claudexor's
-ordinary envelope. The host reads effective access back for both shapes;
+ordinary envelope. Its parent-selected starting folder is the session project
+root, not a read boundary; omitting it preserves inherited/folderless behavior.
+The host reads effective access back for both shapes;
 the delegated HOME/boundary checks below apply only to marker-carrying runs.
 
 ## 2a. Stable project identity and persistent registration

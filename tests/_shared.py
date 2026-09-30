@@ -44,6 +44,26 @@ def stop_socket_sharer() -> None:
     resource_sharer.stop(timeout=5)
 
 
+def wait_test_child_stop(pid: int, *, timeout_sec: float = 3.0) -> dict:
+    """Retain a fixture child's terminal observation before diagnostic reads.
+
+    A zombie can be reaped between two probes. Check that state first, and keep
+    the observed stop instead of asking again after the wait already succeeded.
+    A still-live or unreadable child exhausts the original bound, never passes.
+    """
+    import time
+    from ouroboros.platform_layer import pid_is_alive
+    from ouroboros.process_containment import pid_is_zombie
+
+    deadline = time.monotonic() + timeout_sec
+    while True:
+        stopped = pid_is_zombie(pid) or not pid_is_alive(pid)
+        verdict = {"child_stopped": stopped, "t_ns": time.monotonic_ns()}
+        if stopped or time.monotonic() >= deadline:
+            return verdict
+        time.sleep(.01)
+
+
 # Every function in the tree that persists a settings document, as (repo-relative POSIX
 # path, function name). Three route through `config.prepare_settings_for_persist`; the
 # context-pair migration and the Colab generator are exempt from it by design and carry

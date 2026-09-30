@@ -158,7 +158,8 @@
                   "description": "two parts",
                   "parameters": {
                     "type": "object"
-                  }
+                  },
+                  "strict": false
                 }
               },
               {
@@ -173,12 +174,13 @@
                         "type": "string"
                       }
                     }
-                  }
+                  },
+                  "strict": false
                 }
               }
             ]
           },
-          "value_sha256": "62f5abe098c360c7e3fde2a71518f98fdb88953d58f86f96f42edc5181b85660"
+          "value_sha256": "74b2caa648f8a1ebbeedb73cd6be0e4722cf2436ec3011c72cd52c72f5bbee74"
         },
         "sends": [],
         "unused_script_steps": 0
@@ -284,7 +286,8 @@
                   "description": "two parts",
                   "parameters": {
                     "type": "object"
-                  }
+                  },
+                  "strict": false
                 }
               },
               {
@@ -299,12 +302,13 @@
                         "type": "string"
                       }
                     }
-                  }
+                  },
+                  "strict": false
                 }
               }
             ]
           },
-          "value_sha256": "e4804aeb77658b2d38a8e81e603478dda0d5b1ca38d040998025a48803d03ee5"
+          "value_sha256": "47aeeafb94e9475dd0ab01125fae8c6832f544e6d7e63de287203fa1794efe15"
         },
         "sends": [],
         "unused_script_steps": 0
@@ -948,7 +952,8 @@
                   "description": "two parts",
                   "parameters": {
                     "type": "object"
-                  }
+                  },
+                  "strict": false
                 }
               },
               {
@@ -963,7 +968,8 @@
                         "type": "string"
                       }
                     }
-                  }
+                  },
+                  "strict": false
                 }
               },
               {
@@ -975,7 +981,7 @@
               }
             ]
           },
-          "value_sha256": "8ce93e0e8ce4b3478c4980a4b9844f4b02429571f5a97837514a6656bea470f1"
+          "value_sha256": "6d0792b8ff843846e03575a2f1e14633e0748ea0ebd84a3ca09848fce1fcac2d"
         },
         "sends": [],
         "unused_script_steps": 0
@@ -1585,6 +1591,19 @@
             "prompt_tokens_details": {
               "cached_tokens": 40
             },
+            "effort": {
+              "requested": "high",
+              "sent": {
+                "extra_body.reasoning": {
+                  "effort": "high",
+                  "exclude": false
+                }
+              },
+              "sent_state": "explicit",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            },
             "response_finish_reason": "stop",
             "cached_tokens": 40,
             "provider": "openrouter",
@@ -1594,12 +1613,17 @@
             "request_wire": {
               "requested_effort": "high",
               "applied_effort": "high",
+              "original_requested_effort": "high",
+              "requested_effort_source": "provider_projection",
+              "applied_effort_source": "sent_candidate",
+              "reported_effort": null,
+              "reported_effort_source": null,
               "requested_tool_dialect": "function",
               "applied_tool_dialect": "function",
               "reason_code": "requested_wire_form",
-              "source_profile_fingerprint": "760c6157eb99a45072ed50ff3f02dda60fc887c3534865f85fbad14fcca919d1",
-              "accepted_profile_fingerprint": "760c6157eb99a45072ed50ff3f02dda60fc887c3534865f85fbad14fcca919d1",
-              "candidate_sha256": "dfa3b4af80ed25e9ddc9fb9e71f7eb7b15b354522b071a86f2c8556d4644e644",
+              "source_profile_fingerprint": "5123c189414df91b972f8d20078a251c6b26563d52feb572364a70836d591302",
+              "accepted_profile_fingerprint": "5123c189414df91b972f8d20078a251c6b26563d52feb572364a70836d591302",
+              "candidate_sha256": "e430a01d4e8363513e703af1967143deed81b76fca8b96d197c471e98a745d51",
               "ladder_ordinal": 1,
               "applied_actions": [],
               "task_local": false,
@@ -1660,7 +1684,8 @@
                     "name": "apply_patch",
                     "parameters": {
                       "type": "object"
-                    }
+                    },
+                    "strict": false
                   },
                   "type": "function"
                 },
@@ -1679,13 +1704,14 @@
                         }
                       },
                       "type": "object"
-                    }
+                    },
+                    "strict": false
                   },
                   "type": "function"
                 }
               ]
             },
-            "payload_sha256": "dfa3b4af80ed25e9ddc9fb9e71f7eb7b15b354522b071a86f2c8556d4644e644"
+            "payload_sha256": "e430a01d4e8363513e703af1967143deed81b76fca8b96d197c471e98a745d51"
           }
         ],
         "physical_attempts": [
@@ -1693,8 +1719,8 @@
             "source": "llm.chat",
             "model": "anthropic/claude-sonnet-4.6",
             "provider": "openrouter",
-            "candidate_raw_sha256": "dfa3b4af80ed25e9ddc9fb9e71f7eb7b15b354522b071a86f2c8556d4644e644",
-            "candidate_raw_size_bytes": 707,
+            "candidate_raw_sha256": "e430a01d4e8363513e703af1967143deed81b76fca8b96d197c471e98a745d51",
+            "candidate_raw_size_bytes": 737,
             "candidate_measurement_kind": "canonical_json_v1",
             "states": [
               "reserved",
@@ -1768,6 +1794,19 @@
           "usage": {
             "prompt_tokens": 200,
             "completion_tokens": 10,
+            "effort": {
+              "requested": "medium",
+              "sent": {
+                "extra_body.reasoning": {
+                  "effort": "medium",
+                  "exclude": false
+                }
+              },
+              "sent_state": "explicit",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            },
             "response_finish_reason": "stop",
             "provider": "openrouter",
             "resolved_model": "x-ai/grok-4.5",
@@ -1777,6 +1816,11 @@
             "request_wire": {
               "requested_effort": "medium",
               "applied_effort": "medium",
+              "original_requested_effort": "medium",
+              "requested_effort_source": "provider_projection",
+              "applied_effort_source": "sent_candidate",
+              "reported_effort": null,
+              "reported_effort_source": null,
               "requested_tool_dialect": "none",
               "applied_tool_dialect": "none",
               "reason_code": "requested_wire_form",
@@ -1938,6 +1982,19 @@
           "usage": {
             "prompt_tokens": 200,
             "completion_tokens": 10,
+            "effort": {
+              "requested": "medium",
+              "sent": {
+                "extra_body.reasoning": {
+                  "effort": "medium",
+                  "exclude": false
+                }
+              },
+              "sent_state": "explicit",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            },
             "response_finish_reason": "stop",
             "cost": 0.0077,
             "provider": "openrouter",
@@ -1946,6 +2003,11 @@
             "request_wire": {
               "requested_effort": "medium",
               "applied_effort": "medium",
+              "original_requested_effort": "medium",
+              "requested_effort_source": "provider_projection",
+              "applied_effort_source": "sent_candidate",
+              "reported_effort": null,
+              "reported_effort_source": null,
               "requested_tool_dialect": "none",
               "applied_tool_dialect": "none",
               "reason_code": "requested_wire_form",
@@ -2097,6 +2159,19 @@
             "prompt_tokens_details": {
               "cached_tokens": 40
             },
+            "effort": {
+              "requested": "medium",
+              "sent": {
+                "extra_body.reasoning": {
+                  "effort": "medium",
+                  "exclude": false
+                }
+              },
+              "sent_state": "explicit",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            },
             "response_finish_reason": "stop",
             "cached_tokens": 40,
             "provider": "openrouter",
@@ -2105,6 +2180,11 @@
             "request_wire": {
               "requested_effort": "medium",
               "applied_effort": "medium",
+              "original_requested_effort": "medium",
+              "requested_effort_source": "provider_projection",
+              "applied_effort_source": "sent_candidate",
+              "reported_effort": null,
+              "reported_effort_source": null,
               "requested_tool_dialect": "none",
               "applied_tool_dialect": "none",
               "reason_code": "requested_wire_form",
@@ -2287,6 +2367,19 @@
             "prompt_tokens": 90,
             "completion_tokens": 12,
             "cost": 0.002,
+            "effort": {
+              "requested": "medium",
+              "sent": {
+                "extra_body.reasoning": {
+                  "effort": "medium",
+                  "exclude": false
+                }
+              },
+              "sent_state": "explicit",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            },
             "response_finish_reason": "tool_calls",
             "provider": "openrouter",
             "resolved_model": "x-ai/grok-4.5",
@@ -2294,12 +2387,17 @@
             "request_wire": {
               "requested_effort": "medium",
               "applied_effort": "medium",
+              "original_requested_effort": "medium",
+              "requested_effort_source": "provider_projection",
+              "applied_effort_source": "sent_candidate",
+              "reported_effort": null,
+              "reported_effort_source": null,
               "requested_tool_dialect": "function",
               "applied_tool_dialect": "function",
               "reason_code": "requested_wire_form",
-              "source_profile_fingerprint": "b3665fdf2866b600747bc031a414a4bb341b2d4663904da97f5ffebcbeabe844",
-              "accepted_profile_fingerprint": "b3665fdf2866b600747bc031a414a4bb341b2d4663904da97f5ffebcbeabe844",
-              "candidate_sha256": "41e784c12495bc22d0d006fb393905cbb6d9b82e05563fee57a175e3698a50f8",
+              "source_profile_fingerprint": "1efc6fdc0d589dce36f8cc63ac75ecd15e154c1c2fe05407b0e37fbabc3efce5",
+              "accepted_profile_fingerprint": "1efc6fdc0d589dce36f8cc63ac75ecd15e154c1c2fe05407b0e37fbabc3efce5",
+              "candidate_sha256": "18aa195e409cc792cf5212e3f6d3ba66df62579ee1b17d88f7f74390f2363466",
               "ladder_ordinal": 1,
               "applied_actions": [],
               "task_local": false,
@@ -2348,7 +2446,8 @@
                     "name": "apply_patch",
                     "parameters": {
                       "type": "object"
-                    }
+                    },
+                    "strict": false
                   },
                   "type": "function"
                 },
@@ -2363,13 +2462,14 @@
                         }
                       },
                       "type": "object"
-                    }
+                    },
+                    "strict": false
                   },
                   "type": "function"
                 }
               ]
             },
-            "payload_sha256": "41e784c12495bc22d0d006fb393905cbb6d9b82e05563fee57a175e3698a50f8"
+            "payload_sha256": "18aa195e409cc792cf5212e3f6d3ba66df62579ee1b17d88f7f74390f2363466"
           }
         ],
         "physical_attempts": [
@@ -2377,8 +2477,8 @@
             "source": "llm.chat",
             "model": "x-ai/grok-4.5",
             "provider": "openrouter",
-            "candidate_raw_sha256": "41e784c12495bc22d0d006fb393905cbb6d9b82e05563fee57a175e3698a50f8",
-            "candidate_raw_size_bytes": 536,
+            "candidate_raw_sha256": "18aa195e409cc792cf5212e3f6d3ba66df62579ee1b17d88f7f74390f2363466",
+            "candidate_raw_size_bytes": 566,
             "candidate_measurement_kind": "canonical_json_v1",
             "states": [
               "reserved",
@@ -2467,6 +2567,19 @@
             "server_tool_use": {
               "web_search_requests": 2
             },
+            "effort": {
+              "requested": "medium",
+              "sent": {
+                "extra_body.reasoning": {
+                  "effort": "medium",
+                  "exclude": false
+                }
+              },
+              "sent_state": "explicit",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            },
             "response_finish_reason": "stop",
             "web_search_sources": [
               {
@@ -2481,6 +2594,11 @@
             "request_wire": {
               "requested_effort": "medium",
               "applied_effort": "medium",
+              "original_requested_effort": "medium",
+              "requested_effort_source": "provider_projection",
+              "applied_effort_source": "sent_candidate",
+              "reported_effort": null,
+              "reported_effort_source": null,
               "requested_tool_dialect": "none",
               "applied_tool_dialect": "none",
               "reason_code": "requested_wire_form",
@@ -2596,6 +2714,19 @@
             "response_id": "gen-fixture-429"
           },
           "usage": {
+            "effort": {
+              "requested": "medium",
+              "sent": {
+                "extra_body.reasoning": {
+                  "effort": "medium",
+                  "exclude": false
+                }
+              },
+              "sent_state": "explicit",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            },
             "provider_error": {
               "code": 429,
               "type": null,
@@ -2609,6 +2740,11 @@
             "request_wire": {
               "requested_effort": "medium",
               "applied_effort": "medium",
+              "original_requested_effort": "medium",
+              "requested_effort_source": "provider_projection",
+              "applied_effort_source": "sent_candidate",
+              "reported_effort": null,
+              "reported_effort_source": null,
               "requested_tool_dialect": "none",
               "applied_tool_dialect": "none",
               "reason_code": "requested_wire_form",
@@ -2813,6 +2949,19 @@
             "prompt_tokens_details": {
               "cached_tokens": 40
             },
+            "effort": {
+              "requested": "medium",
+              "sent": {
+                "extra_body.reasoning": {
+                  "effort": "medium",
+                  "exclude": false
+                }
+              },
+              "sent_state": "explicit",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            },
             "response_finish_reason": "stop",
             "cached_tokens": 40,
             "provider": "openrouter",
@@ -2827,12 +2976,17 @@
             "request_wire": {
               "requested_effort": "medium",
               "applied_effort": "medium",
+              "original_requested_effort": "medium",
+              "requested_effort_source": "provider_projection",
+              "applied_effort_source": "sent_candidate",
+              "reported_effort": null,
+              "reported_effort_source": null,
               "requested_tool_dialect": "function",
               "applied_tool_dialect": "function",
               "reason_code": "requested_wire_form",
-              "source_profile_fingerprint": "760c6157eb99a45072ed50ff3f02dda60fc887c3534865f85fbad14fcca919d1",
-              "accepted_profile_fingerprint": "760c6157eb99a45072ed50ff3f02dda60fc887c3534865f85fbad14fcca919d1",
-              "candidate_sha256": "9451eeb0c00429e0c3b5e88d3ec0795aa56ed2818e36b1f238ff30669cd22b22",
+              "source_profile_fingerprint": "5123c189414df91b972f8d20078a251c6b26563d52feb572364a70836d591302",
+              "accepted_profile_fingerprint": "5123c189414df91b972f8d20078a251c6b26563d52feb572364a70836d591302",
+              "candidate_sha256": "a37d8eb2c30f67ed9d5185ce8da8bd78785e76aa72832ad4f71416d0aabc7743",
               "ladder_ordinal": 1,
               "applied_actions": [],
               "task_local": false,
@@ -2937,13 +3091,14 @@
                         }
                       },
                       "type": "object"
-                    }
+                    },
+                    "strict": false
                   },
                   "type": "function"
                 }
               ]
             },
-            "payload_sha256": "9451eeb0c00429e0c3b5e88d3ec0795aa56ed2818e36b1f238ff30669cd22b22"
+            "payload_sha256": "a37d8eb2c30f67ed9d5185ce8da8bd78785e76aa72832ad4f71416d0aabc7743"
           }
         ],
         "physical_attempts": [
@@ -2951,8 +3106,8 @@
             "source": "llm.chat",
             "model": "anthropic/claude-sonnet-4.6",
             "provider": "openrouter",
-            "candidate_raw_sha256": "9451eeb0c00429e0c3b5e88d3ec0795aa56ed2818e36b1f238ff30669cd22b22",
-            "candidate_raw_size_bytes": 870,
+            "candidate_raw_sha256": "a37d8eb2c30f67ed9d5185ce8da8bd78785e76aa72832ad4f71416d0aabc7743",
+            "candidate_raw_size_bytes": 885,
             "candidate_measurement_kind": "canonical_json_v1",
             "states": [
               "reserved",
@@ -2967,8 +3122,8 @@
       }
     },
     {
-      "id": "openrouter.dispatch.effort_clamp_disclosure",
-      "route": "a learned ceiling clamp rides THIS call's usage as reasoning_effort_clamped",
+      "id": "openrouter.dispatch.legacy_ceiling_does_not_clamp_xhigh",
+      "route": "requested xhigh reaches the transport unchanged despite a legacy learned ceiling, with exact sent-effort usage and no clamp disclosure",
       "spec": {
         "env": {
           "OPENROUTER_API_KEY": "or-fixture-key"
@@ -3037,6 +3192,19 @@
             "prompt_tokens_details": {
               "cached_tokens": 40
             },
+            "effort": {
+              "requested": "xhigh",
+              "sent": {
+                "extra_body.reasoning": {
+                  "effort": "xhigh",
+                  "exclude": false
+                }
+              },
+              "sent_state": "explicit",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            },
             "response_finish_reason": "stop",
             "cached_tokens": 40,
             "provider": "openrouter",
@@ -3045,6 +3213,11 @@
             "request_wire": {
               "requested_effort": "xhigh",
               "applied_effort": "xhigh",
+              "original_requested_effort": "xhigh",
+              "requested_effort_source": "provider_projection",
+              "applied_effort_source": "sent_candidate",
+              "reported_effort": null,
+              "reported_effort_source": null,
               "requested_tool_dialect": "none",
               "applied_tool_dialect": "none",
               "reason_code": "requested_wire_form",
@@ -3207,6 +3380,19 @@
             "prompt_tokens_details": {
               "cached_tokens": 40
             },
+            "effort": {
+              "requested": "medium",
+              "sent": {
+                "extra_body.reasoning": {
+                  "effort": "medium",
+                  "exclude": false
+                }
+              },
+              "sent_state": "explicit",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            },
             "response_finish_reason": "stop",
             "cached_tokens": 40,
             "provider": "openrouter",
@@ -3216,12 +3402,17 @@
             "request_wire": {
               "requested_effort": "medium",
               "applied_effort": "medium",
+              "original_requested_effort": "medium",
+              "requested_effort_source": "provider_projection",
+              "applied_effort_source": "sent_candidate",
+              "reported_effort": null,
+              "reported_effort_source": null,
               "requested_tool_dialect": "function",
               "applied_tool_dialect": "function",
               "reason_code": "requested_wire_form",
-              "source_profile_fingerprint": "760c6157eb99a45072ed50ff3f02dda60fc887c3534865f85fbad14fcca919d1",
-              "accepted_profile_fingerprint": "760c6157eb99a45072ed50ff3f02dda60fc887c3534865f85fbad14fcca919d1",
-              "candidate_sha256": "59c91042eda38434e8d30fa8df23731bb5d0d79cef37adef46d3c3b1178c7f0f",
+              "source_profile_fingerprint": "5123c189414df91b972f8d20078a251c6b26563d52feb572364a70836d591302",
+              "accepted_profile_fingerprint": "5123c189414df91b972f8d20078a251c6b26563d52feb572364a70836d591302",
+              "candidate_sha256": "466313bb0d49bcab44fc6dbe525dd551a4cb061e004e207a2ddbbf5115a9338a",
               "ladder_ordinal": 1,
               "applied_actions": [],
               "task_local": false,
@@ -3290,13 +3481,14 @@
                         }
                       },
                       "type": "object"
-                    }
+                    },
+                    "strict": false
                   },
                   "type": "function"
                 }
               ]
             },
-            "payload_sha256": "59c91042eda38434e8d30fa8df23731bb5d0d79cef37adef46d3c3b1178c7f0f"
+            "payload_sha256": "466313bb0d49bcab44fc6dbe525dd551a4cb061e004e207a2ddbbf5115a9338a"
           }
         ],
         "physical_attempts": [
@@ -3304,8 +3496,8 @@
             "source": "llm.chat",
             "model": "anthropic/claude-sonnet-4.6",
             "provider": "openrouter",
-            "candidate_raw_sha256": "59c91042eda38434e8d30fa8df23731bb5d0d79cef37adef46d3c3b1178c7f0f",
-            "candidate_raw_size_bytes": 571,
+            "candidate_raw_sha256": "466313bb0d49bcab44fc6dbe525dd551a4cb061e004e207a2ddbbf5115a9338a",
+            "candidate_raw_size_bytes": 586,
             "candidate_measurement_kind": "canonical_json_v1",
             "states": [
               "reserved",

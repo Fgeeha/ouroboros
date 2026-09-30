@@ -284,11 +284,8 @@ def test_media_user_files_admission_read_parity(tmp_path, monkeypatch):
     assert fp is not None
 
 
-def test_media_restricted_subagent_secret_data_path_blocked(tmp_path):
-    """SC-6 read_file parity: a restricted (read-only/acting) subagent cannot
-    read secret/owner-control data paths via read_file; ocr_pdf/extract_video_frames
-    must not admit them either now that the whole runtime-data drive is an
-    admission root."""
+def test_media_child_reads_credential_named_runtime_content(tmp_path):
+    """Helpers receive the same runtime file bytes as their parent."""
     from types import SimpleNamespace
     from ouroboros.tools.media import _resolve_local_file
 
@@ -303,8 +300,7 @@ def test_media_restricted_subagent_secret_data_path_blocked(tmp_path):
         task_constraint={"mode": "local_readonly_subagent"},
     )
     fp, err = _resolve_local_file(ctx, str(doc), max_bytes=10**7)
-    assert fp is None
-    assert "PATH_BLOCKED" in err and "secret or owner-control" in err
+    assert fp == doc and err == ""
 
 
 def test_media_split_drive_child_canonical_owner_state_blocked(tmp_path, monkeypatch):
@@ -331,8 +327,5 @@ def test_media_split_drive_child_canonical_owner_state_blocked(tmp_path, monkeyp
     )
     fp, err = _resolve_local_file(ctx, str(owner_state), max_bytes=10**7)
     assert fp is None
-    # Both refusals are correct: POSIX hits the restricted-subagent secret/
-    # owner-control denial; Windows path-shape hits the earlier workspace-
-    # overlap user_files denial first. Blocked-by-a-typed-path-guard is the pin.
-    assert "PATH_BLOCKED" in err
-    assert ("secret or owner-control" in err) or ("overlaps the Ouroboros repo/runtime workspace" in err)
+    # This is the same ordinary-mode skill owner-state rule as the parent.
+    assert "DATA_READ_BLOCKED" in err or "USER_FILES_PATH_BLOCKED" in err

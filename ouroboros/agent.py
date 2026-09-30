@@ -121,7 +121,7 @@ def _task_exception_terminal(env: Any, task: Dict[str, Any], exc: Exception, dri
         loop_outcome = derive_loop_outcome(text, usage, llm_trace)
         write_task_result(
             env.drive_root, str(task.get("id") or ""), STATUS_FAILED,
-            result=text, reason_code="task_exception", loop_outcome=loop_outcome,
+            _terminal_observed=True, result=text, reason_code="task_exception", loop_outcome=loop_outcome,
             outcome_axes=loop_outcome.get("outcome_axes") or infra_failed_axes(
                 "task_exception", review_trigger="agent_exception"),
             trace_summary=build_trace_summary(llm_trace),
@@ -346,7 +346,7 @@ class OuroborosAgent:
             return
 
     def _persist_running_record(self, task: Dict[str, Any]) -> None:
-        """Record actual start on the execution drive and bind split roots canonically.
+        """Record actual start on the execution drive and bind split tasks canonically.
 
         For a delegated child every derived field here was stamped onto ``task`` by
         `resolve_dispatch_axes` moments earlier, so model, effort, route, tool
@@ -354,6 +354,14 @@ class OuroborosAgent:
         atomic record instead of being minted by whichever surface writes next.
         """
         try:
+            from ouroboros.task_status import execution_owner_record
+
+            canonical = pathlib.Path(task.get("budget_drive_root") or getattr(self.env, "budget_drive_root", None)
+                                     or self.env.drive_root)
+            assigned_owner = task.get("_execution_owner") or {}
+            execution_kind = assigned_owner.get("kind") or (
+                "presence" if task.get("_presence_turn") else "direct" if task.get("_is_direct_chat") else "pooled")
+            execution_owner = execution_owner_record(canonical, task, execution_kind)
             started = getattr(self, "_task_started_ts", None)
             # A queue row's focus is a REPLAY (retry clone, owner-wait restart
             # handoff): it may be older than the focus the same task id already
@@ -372,6 +380,8 @@ class OuroborosAgent:
                 self.env.drive_root,
                 str(task.get("id") or ""),
                 STATUS_RUNNING,
+                execution_owner=execution_owner,
+                task_attempt=task.get("_attempt", 0),
                 **({"started_at": datetime.fromtimestamp(started, timezone.utc).isoformat()}
                    if isinstance(started, (int, float)) and started > 0 else {}),
                 **({"queued_at": task["queued_at"]} if task.get("queued_at") is not None else {}),
@@ -429,19 +439,18 @@ class OuroborosAgent:
                 origin_message_text=task.get("origin_message_text"),
                 result="Task is running.",
             )
-            canonical = pathlib.Path(task.get("budget_drive_root") or getattr(self.env, "budget_drive_root", None)
-                                     or self.env.drive_root)
-            if (str(task.get("delegation_role") or "") != "subagent"
-                    and canonical.resolve() != self.env.drive_root.resolve()
-                    and running.get("status") == STATUS_RUNNING):
-                # Queue snapshots are transient. A split root must retain its
-                # real start and child location after the worker/OS disappears.
-                # The existing writer refuses a late start over a terminal row.
+            if canonical.resolve() != self.env.drive_root.resolve() and running.get("status") == STATUS_RUNNING:
+                # Queue snapshots are transient. A split root or subagent must
+                # retain its real start, attempt and child location after the
+                # worker/OS disappears: copyback accepts the child's end time
+                # only for the attempt the canonical row already names. The
+                # existing writer refuses a late start over a terminal row.
                 write_task_result(
                     canonical, str(task.get("id") or ""), STATUS_RUNNING,
+                    execution_owner=execution_owner,
                     child_drive_root=str(self.env.drive_root), budget_drive_root=str(canonical),
                     _is_direct_chat=bool(task.get("_is_direct_chat")),
-                    **{key: running[key] for key in ("started_at", "ts", "acceptance_original_root_cap") if key in running},
+                    **{key: running[key] for key in ("started_at", "ts", "task_attempt", "acceptance_original_root_cap") if key in running},
                 )
         except Exception:
             log.warning("Failed to persist running task status", exc_info=True)
@@ -544,7 +553,7 @@ class OuroborosAgent:
         task_metadata = dict(task.get("metadata") or {}) if isinstance(task.get("metadata"), dict) else {}
         for key in (
             "parent_task_id", "root_task_id", "session_id", "actor_id", "delegation_role", "role",
-            "workspace_root", "workspace_mode", "memory_mode",
+            "workspace_root", "workspace_mode", "memory_mode", "parent_workspace", "workspace_copy",
             "drive_root", "child_drive_root", "budget_drive_root", "root_cost_ceiling_usd",
             "model_lane", "requested_model_lane", "effective_model_lane",
             "model", "use_local_model", "requested_executor",

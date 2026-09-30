@@ -1,9 +1,6 @@
-// Owner decision cards: the typed quiz card (question + option buttons +
-// stake + assumption) and the routing picker (#198) — one decision-card
-// family, one answer contract (POST /api/decisions). Optional questions let
-// the task keep working under an assumption; required questions wait for an
-// answer. Both read as a record after settlement. The routing picker
-// settles into the plain routing ack line once its dispatch is confirmed.
+// Typed quiz and routing picker (#198): one family, POST /api/decisions contract.
+// Optional questions let work continue under an assumption; required questions
+// wait. Both become records after settlement; confirmed routing becomes an ack.
 import { MAX_DECISION_COMMENT, MAX_QUIZ_OPTIONS } from './api_types.js';
 import { renderRoutingAnnotation, routingOptionLabel } from './chat_activity.js';
 import { nameProjectReference, projectReference } from './project_reference.js';
@@ -115,10 +112,14 @@ export function createChatDecision({
         return { ...source, ...observe(source) };
     }
 
-    async function revealQuestion(taskId, quizId, projectId, chatId, appendQuiz, isVisible, beforeReveal = () => {}) {
-        const navigation = ++questionNavigation;
-        const current = () => !disposed && isVisible() && navigation === questionNavigation;
+    async function revealQuestion(taskId, quizId, projectId, chatId, appendQuiz, isVisible, beginReveal = () => {}, didReveal = () => {}) {
+        const navigation = ++questionNavigation; // one naming no question still voids older reveals
+        let ownsPosition = () => true;
+        const current = () => !disposed && isVisible() && navigation === questionNavigation && ownsPosition();
         if (!projectId || !taskId || !quizId || !current()) return false;
+        // Navigation supersedes the room bookmark before I/O, even if the
+        // question is unavailable. A later wheel/latest intent can supersede us.
+        ownsPosition = beginReveal() || ownsPosition;
         let card = quizViews.get(questionKey(taskId, quizId));
         if (!card) {
             try {
@@ -133,11 +134,9 @@ export function createChatDecision({
             }
         }
         if (!current() || !card) return false;
-        // An explicit target supersedes any pending restoration of the room's
-        // earlier scroll position; the chat instance owns that restoration.
-        beforeReveal();
         card.scrollIntoView?.({ block: 'center', behavior: 'auto' });
         (card.querySelector('.chat-quiz-comment') || card.querySelector('.chat-quiz-question'))?.focus?.({ preventScroll: true });
+        didReveal();
         return true;
     }
 

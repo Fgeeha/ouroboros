@@ -165,8 +165,8 @@ canonical deliverables, `skill_payload` for reviewed skill payloads, and
 `user_files` for user-visible files under the owner's home (a bare filename
 lands in the visible Deliverables folder, not the home root).
 `subagent_projects` and `deliverables` are read-only (never written or a
-shell cwd); a read-only subagent reads `deliverables`, every subagent its
-parent's and root's task files.
+shell cwd). A helper reads what its parent reads; its starting folder is a
+focus, not a read boundary. Read-only helpers do not write or run commands.
 
 My cognitive memory has first-class tools — `update_identity`,
 `update_scratchpad`, `knowledge_write` — and I never reach for

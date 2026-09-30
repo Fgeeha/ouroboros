@@ -80,10 +80,8 @@ from ouroboros.tool_access_user_files import (  # noqa: F401 — re-exported mov
 )
 
 
-# Orchestrator READ-ONLY roots (subagent projects, the Deliverables container): only ever
-# {read,list,search}, never a shell cwd, read-only even for operator_control. A child never
-# reads `subagent_projects` (parallel candidates stay independent); it reads owner-visible
-# `deliverables` and, by the lineage rule below, its parent's and root's task files (T4=A).
+# Readable roots are shared by ordinary parents and children; write authority
+# remains profile-specific. Physical ancestor bindings are derived, never grants.
 
 def summarize_subagent_profile(profile: ToolProfile, *, effective_lane: str = "") -> str:
     """Compact, human-readable summary of a subagent's EFFECTIVE tool profile
@@ -92,8 +90,8 @@ def summarize_subagent_profile(profile: ToolProfile, *, effective_lane: str = ""
     at schedule time (and the child sees first line of its context) what the child
     CAN and CANNOT do. Prevents the wasted rounds where a prober child hit
     workspace_blocked on run_script because neither side knew shell was off.
-    The second line names what the child can READ (incl. its parent's and root's
-    task files, never a sibling's) and which roots stay invisible to it."""
+    The second line names shared readable roots; the context supplies their
+    physical bindings, including the parent's inherited folders and runtime."""
     matrix = _POLICY.get(_effective_policy_profile(profile), {})
     shell_roots = sorted(root for root, ops in matrix.items() if "shell" in ops)
     write_roots = sorted(root for root, ops in matrix.items() if ops & {"write", "edit"})
@@ -107,8 +105,7 @@ def summarize_subagent_profile(profile: ToolProfile, *, effective_lane: str = ""
     lane = str(effective_lane or "").strip()
     if lane:
         bits.append(f"model_lane={lane}")
-    lineage = (" (task_drive/artifact_store: its own, its parent's, its root task's and, when its"
-               " contract names one, its predecessor's files, never a sibling's)" if "task_drive" in read_roots else "")
+    lineage = " (including inherited parent folders and runtime data)"
     return (
         "child capabilities — " + " · ".join(bits)
         + f"\nreadable={', '.join(read_roots) or 'none'}{lineage}"
@@ -324,11 +321,10 @@ def filesystem_affordance_map(ctx: Any, *, runtime_mode: str = "") -> dict[str, 
     plan inside the same envelope that the dispatcher later enforces.
     """
 
+    from ouroboros.tool_access_reads import inherited_read_roots
     profile = active_tool_profile(ctx)
     policy = _POLICY.get(_effective_policy_profile(profile), {})
-    # H2 (capinv-447): a root is writable iff a MUTATING operation is granted on
-    # it. Grouping "vcs" as write-like claimed writable roots for the read-only
-    # child profile (status/diff-only vcs), contradicting summarize_subagent_profile.
+    # Read-only VCS does not make a root writable.
     writable_roots = sorted(root for root, ops in policy.items() if ops & _WRITE_LIKE_OPS)
     readonly_roots = sorted(
         root for root, ops in policy.items()
@@ -358,6 +354,7 @@ def filesystem_affordance_map(ctx: Any, *, runtime_mode: str = "") -> dict[str, 
             continue
     result = {
         "profile": profile,
+        "inherited_read_bindings": [{"root": label, "path": str(base)} for label, base in inherited_read_roots(ctx)],
         "writable_roots": writable_roots,
         "readonly_roots": readonly_roots,
         "searchable_roots": sorted(root for root, ops in policy.items() if "search" in ops),
@@ -411,7 +408,11 @@ def profile_readable_root_paths(ctx: Any, *, operation: Operation = "read") -> l
             out.append((root, pathlib.Path(resource_root_path(ctx, root)).resolve(strict=False)))
         except Exception:
             continue
-    return out
+    if operation in _READ_OPS:
+        from ouroboros.tool_access_reads import inherited_read_roots
+        out.extend((label, base) for label, base in inherited_read_roots(ctx)
+                   if operation in policy.get(label, set()))
+    return list(dict.fromkeys(out))
 
 
 def shell_cwd_block_message(ctx: Any, cwd: str = "", *, operation: Operation = "shell", error: Exception | None = None) -> str:
@@ -677,10 +678,10 @@ def _resolve_target_in_selected_base(
                 path_text = candidate.relative_to(resolved_base).as_posix()
             except ValueError:
                 if operation in _READ_OPS:
-                    # Cross-prefix READS: the lineage rule (own id on every drive, the
-                    # parent's and the root's task files), then the ORPHAN capture rule,
-                    # which the custody authority alone answers.
-                    if lineage_read_base(ctx, root, candidate) is not None:
+                    # READ aliases preserve inherited physical roots and orphan custody.
+                    from ouroboros.tool_access_reads import inherited_read_base
+                    if (lineage_read_base(ctx, root, candidate) is not None
+                            or inherited_read_base(ctx, root, candidate) is not None):
                         return candidate
                     if root == "artifact_store":
                         from ouroboros.delegate_shared import orphan_capture_read_target
@@ -852,10 +853,8 @@ def build_resolved_resource_binding(
         path=path,
         operation=operation,
     )
-    # The physical base follows the container holding the target: an absolute
-    # user_files target may land in the configured Deliverables container outside the
-    # home (else an exact Presence path-prefix check calls a valid deliverable outside
-    # the binding), and a lineage READ lands in the parent's or root's task root.
+    # The physical base follows the containing root; retain the selected default
+    # separately so policy sees the same exact file even across inherited roots.
     logical_base_path = None
     container = None
     if normalized == "user_files":
@@ -866,7 +865,9 @@ def build_resolved_resource_binding(
         except (OSError, TypeError, ValueError, RuntimeError):
             pass
     elif operation in _READ_OPS and not path_is_relative_to(target, base):
-        container = lineage_read_base(ctx, normalized, target)
+        from ouroboros.tool_access_reads import inherited_read_base
+        container = (lineage_read_base(ctx, normalized, target)
+                     or inherited_read_base(ctx, normalized, target))
     if container is not None:
         logical_base_path = pathlib.Path(base).resolve(strict=False)
         base = container

@@ -117,9 +117,15 @@ def project_replica_task_result_fields(
     review snapshots retain the newest host publication of each panel.
     ``updated_at`` is monotonic metadata only; it never selects field authority.
     """
-    overlay = dict(replica_fields)
+    from ouroboros.terminal_time import preserve_terminal_attempt, replica_terminal_time
+    from ouroboros.task_results import _TRULY_TERMINAL_STATUSES
     from ouroboros.acceptance_history import preserve_acceptance_history
+
+    overlay = preserve_terminal_attempt(canonical_fields, replica_fields)
     overlay = preserve_acceptance_history(canonical_fields, overlay)
+    if (canonical_fields.get("status") in _TRULY_TERMINAL_STATUSES
+            or replica_fields.get("status") in _TRULY_TERMINAL_STATUSES):
+        overlay["terminal_time"] = replica_terminal_time(canonical_fields, replica_fields)
     # The receiving drive's first accepted terminal transition owns provenance,
     # including its absence on historical rows; replicas cannot originate it.
     overlay.pop("canonical_terminal_projection_origin", None)
