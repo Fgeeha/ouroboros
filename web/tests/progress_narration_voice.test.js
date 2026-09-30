@@ -90,8 +90,23 @@ test('host notes are rows the card shows, never its title', () => {
         f.emit({ content: 'Task acceptance review: PASS (clean acceptance).', narration: false });
         assert.ok(f.card(), 'the notes are content: the block exists');
         assert.equal(f.rows().length, 2, 'both notes are visible rows');
-        assert.equal(f.title(), 'Working...', 'the running placeholder, not the last host note');
+        assert.equal(f.title(), '', 'no title: neither the last host note nor a placeholder repeating the chip (#1369)');
     } finally { f.close(); }
+});
+
+test('only the host placeholder left: authored words that say Working keep the title (#1369)', () => {
+    const f = fixture();
+    try {
+        f.census(direct());
+        f.emit({ content: 'Working…', narration: true });
+        assert.equal(f.title(), 'Working…', 'the model narrated these words; they are its own');
+    } finally { f.close(); }
+    const g = fixture();
+    try {
+        g.census(direct());
+        g.emit({ content: NOTE, narration: false, suggested_name: 'Working...' });
+        assert.equal(g.title(), 'Working...', 'a coined name is the author\'s, whatever it says');
+    } finally { g.close(); }
 });
 
 test('a host-notes-only turn keeps its coined name and an empty activity line', () => {

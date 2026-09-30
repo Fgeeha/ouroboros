@@ -457,7 +457,9 @@ test('nonterminal diagnostics stay visible facts but never promote the task', ()
     assert.deepEqual({ phase: success.phase, headline: success.headline }, { phase: 'done', headline: 'Done' });
     assert.match(chatSource, /const shouldPromote = Boolean\(summary\.promote\) \|\| record\.finished;/);
     assert.match(chatSource, /record\.updates > 1 \? record\.titleEl\.textContent : ''/);
-    assert.match(chatSource, /\|\| 'Working\.\.\.'/);
+    // #1369: the status chip already says Working; no title or headline fallback repeats it.
+    assert.doesNotMatch(chatSource, /\|\| 'Working\.\.\.'/);
+    assert.doesNotMatch(logEventsSource, /headline = 'Working\.\.\.'|\|\| 'Working\.\.\.'/);
     assert.doesNotMatch(chatSource, /record\.lastHumanHeadline \|\| headline/);
 });
 

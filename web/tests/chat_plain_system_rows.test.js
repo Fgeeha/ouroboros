@@ -662,11 +662,14 @@ test('render arm order and enhancement guard are pinned in source', () => {
     );
 });
 
-test('chat bubble heading clamp is scoped in style.css', () => {
-    // Inside chat bubbles every markdown heading is a subsection label at body
-    // size (DESIGN.md §2); the global md-h1 page-size rule stays for non-chat
-    // surfaces, and the live-card timeline carries its own inline clamp.
+test('chat bubble heading ladder is scoped in style.css', () => {
+    // Only a full rich answer (`.message.ui-rich-content`) follows the reading
+    // ladder (DESIGN.md §1, §5); compact Markdown in a bubble (a Skill Review
+    // report) keeps every heading a body-size semibold label; the global md-h1
+    // page-size rule stays for non-chat surfaces, and the live-card timeline
+    // carries its own inline clamp.
     assert.match(styleSource, /\.chat-bubble \.message \.md-h1,\n\.chat-bubble \.message \.md-h2,\n\.chat-bubble \.message \.md-h3 \{\n\s+font-size: var\(--type-body\);\n\s+font-weight: 600;\n\}/);
+    assert.match(styleSource, /\n\.chat-bubble \.message:where\(\.ui-rich-content\) :is\(\.md-h1, \.md-h2\) \{ font-size: var\(--md-heading-major\); \}\n\.chat-bubble \.message:where\(\.ui-rich-content\) \.md-h3 \{ font-size: var\(--md-heading-minor\); \}\n/);
     // The timeline label follows its row's size: collapsed rows are meta size,
     // an expanded row is body size (DESIGN.md §5, "summary outranks details").
     // Unambiguous block scan (indent, then a non-space start): the `(\s+[^\n]+\n)*`
@@ -678,7 +681,7 @@ test('chat bubble heading clamp is scoped in style.css', () => {
     assert.match(styleSource, decl('\\.chat-live-line-title', 'font-size: var\\(--type-meta\\);'));
     assert.match(styleSource, decl('\\.chat-live-line\\[data-expanded="1"\\] \\.chat-live-line-body', 'font-size: var\\(--type-body\\);'));
     assert.match(styleSource, decl('\\.chat-live-activity', 'font-size: var\\(--type-body\\);'));
-    // The rich bubble renderer demotes h4-h6 to the smallest label so the clamp reaches them.
+    // The rich bubble renderer gives h4-h6 the smallest label class, as the compact one demotes them.
     const richSource = readFileSync(new URL('../modules/chat_markdown.js', import.meta.url), 'utf8');
     assert.match(richSource, /querySelectorAll\('h1, h2, h3, h4, h5, h6'\)[\s\S]{0,160}Math\.min\(Number\(heading\.tagName\.slice\(1\)\), 3\)/);
 });

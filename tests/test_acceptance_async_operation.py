@@ -324,7 +324,10 @@ def test_a_panel_that_settles_after_the_task_ended_is_attached_and_announced_onc
     # supersession is not delivery proof: with no send receipt the version is unknown.
     assert event["text"].startswith("On the reviewed version of this answer (whether it was the delivered one "
                                     "is unknown), reviewers later passed it.")
-    assert "- a: PASS — model/a says PASS" in event["text"]
+    # The owner row names the reviewer by model and says the verdict in words;
+    # the slot id and the token stay in the typed evidence (#1369).
+    assert "- model/a (requested): passed it — model/a says PASS" in event["text"]
+    assert "- a: PASS" not in event["text"]
     assert event["delivery_id"] == "acceptance-late:acceptance-subject-one"
     assert {key: event["progress_meta"][key] for key in ("card_row", "card_row_id")} == {
         "card_row": "reviews", "card_row_id": "acceptance-late:acceptance-subject-one"}
@@ -372,15 +375,20 @@ def test_the_late_row_never_reports_a_reviewer_whose_outcome_is_unknown_as_answe
     wave = {"slots": {"a": "ok", "b": "ok", "c": ""},
             "verdicts": {"a": {"verdict": "PASS"}, "b": {"verdict": "DEGRADED"}}}
     incident = {"aggregate_signal": "DEGRADED", "actors": [
-        {"operation_state": "settled", "parsed": {"verdict": "PASS"}},
-        {"operation_state": "settled", "parsed": {"verdict": "DEGRADED"}},
-        {"operation_state": "custody_lost", "late_result_pending": True}]}
+        {"slot_id": "a", "operation_state": "settled", "parsed": {"verdict": "PASS"}},
+        {"slot_id": "b", "operation_state": "settled", "parsed": {"verdict": "DEGRADED"}},
+        {"slot_id": "c", "operation_state": "custody_lost", "late_result_pending": True}]}
     text = _late_settlement_text(incident, wave)
     unknown_version = "On the reviewed version of this answer (whether it was the delivered one is unknown), "
     assert text.startswith(unknown_version + "reviewers later returned no settled verdict — 1 reviewer's outcome "
                            "is still unknown.")
     assert "no quorum" not in text
-    assert "- a: PASS" in text and "- c: pending" in text
+    # Owner wording (#1369): a settled PASS, a reviewer's own DEGRADED and an
+    # unanswered seat read as words; with no roster identity the reviewer is unknown.
+    assert "- unknown reviewer (seat 1): passed it" in text
+    assert "- unknown reviewer (seat 2): inconclusive" in text
+    assert "- unknown reviewer (seat 3): still awaited" in text
+    assert "PASS" not in text.split("\n", 1)[1] and "DEGRADED" not in text and "pending" not in text
     assert "— 2 reviewers' outcomes are still unknown." in _late_settlement_text(
         {**incident, "actors": [incident["actors"][2], {"operation_state": "pending_dispatch"}]}, wave)
     answered = {**incident, "actors": incident["actors"][:2]}
@@ -444,8 +452,9 @@ def test_a_terminal_task_gets_one_row_at_completion_not_at_quorum(tmp_path, monk
         with settled:
             settled.wait_for(lambda: count["n"] >= 2, timeout=10)
     rows = [e for e in events if e.get("system_type") == "acceptance_late_settlement"]
-    assert len(rows) == 1 and "- a: PASS" in rows[0]["text"] and "- b: PASS" in rows[0]["text"]
-    assert "pending" not in rows[0]["text"] and _mailbox_rows(tmp_path, "late-two") == []
+    assert len(rows) == 1
+    assert "- model/a (requested): passed it" in rows[0]["text"] and "- model/b (requested): passed it" in rows[0]["text"]
+    assert "still awaited" not in rows[0]["text"] and _mailbox_rows(tmp_path, "late-two") == []
 
 
 def test_two_late_panels_of_one_task_each_announce_their_own_row(tmp_path, monkeypatch):

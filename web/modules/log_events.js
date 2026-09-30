@@ -1102,7 +1102,7 @@ export function summarizeLogEvent(evt) {
 
 function chatView({
     phase = 'working',
-    headline = 'Working...',
+    headline = '',  // no placeholder: a frame naming nothing has none; the chip says Working (#1369)
     body = '',
     fullBody = '',
     fullHeadline = '',
@@ -1349,7 +1349,8 @@ function summarizeChatLiveEventView(evt) {
         const narration = evt.narration === true || evt.narration === undefined;
         return chatView({
             phase: lifecycleTerminal ? (/failed\b/i.test(progressText.full) ? 'lifecycle_error' : 'done') : 'working',
-            headline: progressText.preview || 'Working...',
+            // An empty note is no narration: a placeholder would become the card title as if said (#1369).
+            headline: progressText.preview || '',
             fullHeadline: progressText.full || '',
             activityPreview: progressText.preview || '',
             visible: Boolean(progressText.preview),

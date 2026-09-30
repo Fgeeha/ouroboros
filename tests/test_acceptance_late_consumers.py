@@ -208,7 +208,12 @@ def test_delayed_quorum_callback_keeps_one_final_historical_notice(
     for notice in [*notices, owed]:  # The real consumer also sees an outbox replay.
         chat._handle_send_message(notice, sender)
     assert len(sends) == 1 and sends[0][0] == 7, sends
-    assert 'pending' not in sends[0][1] and f'- 2: {last_verdict}' in sends[0][1], {
+    # The owner row says each outcome in words (DESIGN §4), one seat per roster slot in
+    # roster order, so the final notice reads slot 2's own verdict at seat 3.
+    words = {'PASS': 'passed it', 'FAIL': 'rejected it'}[last_verdict]
+    seats = [line.split(' — ')[0] for line in sends[0][1].split('\n')[1:]]
+    assert seats == [f'- openai/gpt-4.1-nano (requested) (seat {seat}): {outcome}'
+                     for seat, outcome in ((1, 'passed it'), (2, 'passed it'), (3, words))], {
         'notices': len(notices), 'sent': sends, 'retained': panel['late_settlement']['note']}
     assert len(notices) == 1, notices
     assert sends[0][1] == owed['text'] == panel['late_settlement']['note'] == source['late_settlement']['note']

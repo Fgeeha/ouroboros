@@ -85,11 +85,11 @@ Every `/api/files/*` operation resolves its requested path and refuses the opera
 | GET | `/api/tasks/{task_id}` | `gateway.tasks.api_task_get` |
 | GET | `/api/tasks/{task_id}/events` | `gateway.tasks.api_task_events` (legacy integer rank) |
 | POST | `/api/tasks/{task_id}/events` | `gateway.tasks.api_task_events` (read-only v2 cursor) |
-| GET | `/api/tasks/{task_id}/artifacts/{name}` | `gateway.tasks.api_task_artifact` via task_archive and task-owned stores: bare name = top-level file, `?relpath=` = nested file, `?archive=<dir>` = ZIP described by artifact_archives. Recorded digests bind files and ZIP members: drift is 409 artifact_identity_changed with digest, failed capture 404 artifact_unverified; x-ouroboros-artifact-identity says verified/unmeasured. Delegated JSONL `?source=` requires source_handles/delegated_activity content-addressed name, matching basename, confined descent and digest. Ordinary file/chat-media/ZIP and delegated JSONL reads return 503 where confined opens are unsupported, including Windows (issue #1297); result-published review sources retain read_task_result_source_bytes. |
+| GET | `/api/tasks/{task_id}/artifacts/{name}` | `gateway.tasks.api_task_artifact` via task_archive/task stores: bare name=top-level file, `?relpath=`=nested file, `?archive=<dir>`=ZIP (artifact_archives). Digests bind files/ZIP members: drift=409 artifact_identity_changed (digest), failed capture=404 artifact_unverified; x-ouroboros-artifact-identity=verified/unmeasured. Delegated JSONL `?source=` requires source_handles/delegated_activity content-addressed name, basename, confined descent and digest. File/chat-media/ZIP/delegated JSONL reads return 503 when confined opens are unsupported (Windows, #1297); result-published review sources retain read_task_result_source_bytes; a replaced host `acceptance-<sha256>.json` record resolves by host_acceptance_source membership. |
 | POST | `/api/tasks/{task_id}/cancel` | `gateway.tasks.api_task_cancel` |
 | POST | `/api/tasks/{task_id}/hurry` | `gateway.tasks.api_task_hurry` |
-| POST | `/api/tasks/{task_id}/pause` | `gateway.task_pause.api_task_pause`: text-free `{request_id}`; `state` requested=Pausing, paused=settled, released=resumed replay; 202 `latch_pending`=retry same ID (§6) |
-| POST | `/api/tasks/{task_id}/continue` | `gateway.task_continue.api_task_continue`: `TaskContinueRequest` `{action_nonce}` / `TaskContinueResponse`. Detail/history `ContinuationOffer`: bound carries retry nonce; admitted confirms successor (§6) |
+| POST | `/api/tasks/{task_id}/pause` | `gateway.task_pause.api_task_pause`: `{request_id}`, text-free; state requested/paused/released = pausing/settled/resumed replay; 202 `latch_pending` retries ID (§6) |
+| POST | `/api/tasks/{task_id}/continue` | `gateway.task_continue.api_task_continue`: `{action_nonce}` → `TaskContinueResponse`; `ContinuationOffer` in detail/history: bound=retry nonce, admitted=successor (§6) |
 | POST | `/api/tasks/{task_id}/resume` | `gateway.tasks.api_task_resume` |
 | POST | `/api/decisions` | `gateway.tasks.api_decision_answer` |
 | GET | `/api/schedules` | `gateway.schedules.api_schedules_list` |
@@ -113,7 +113,7 @@ Every `/api/files/*` operation resolves its requested path and refuses the opera
 | POST | `/api/projects/{project_id}/update` | `gateway.projects.api_project_update` |
 | POST | `/api/projects/{project_id}/delete` | `gateway.projects.api_project_delete` |
 | GET | `/api/fs/dirs` | `gateway.projects.api_fs_dirs` |
-| GET | `/api/chat/history` | `gateway.history.make_chat_history_endpoint` (a web owner row the durable ingress saved replays typed `ingress_accepted: true`; a legacy row carries nothing) |
+| GET | `/api/chat/history` | `gateway.history.make_chat_history_endpoint` (saved web ingress: `ingress_accepted: true`; legacy rows omit it. Registry failures leave unclassified non-Main rooms at `latest_message: null`) |
 | GET | `/api/logs/{name}` | `gateway.logs.api_logs_tail` |
 | POST | `/api/chat/upload` | `gateway.files.api_chat_upload` |
 | DELETE | `/api/chat/upload` | `gateway.files.api_chat_upload_delete` |

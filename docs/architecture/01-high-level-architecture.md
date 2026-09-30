@@ -23,7 +23,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
   │   ├── modules/project_handoff.js ← Main-only transfer anchors: every converted card stays visible, at most one receipt row per `handoff_id` folds under the first visible card, shadows restored on eviction, phase from the existing census/task detail; `receiptNotice` words the typed receipt (§3 Project handoff receipts)
   │   ├── modules/project_reference.js ← the one control that points at a Project, and the only raiser of `ouro:open-project` (DESIGN "References and actions")
   │   ├── modules/project_activity.js ← pure `active_chat_activities` census projection for Project navigation dots; complete supervisor-ready snapshots clear absences, while partial/unavailable/disconnected reads retain explicitly unknown rows (§3 Liveness census and the chat header)
-  │   ├── modules/project_work_pointer.js ← Project-room pointer to an already loaded root card; no execution or history authority (§3 Project rooms)
+  │   ├── modules/project_work_pointer.js, project_read_state.js ← Pointer to a loaded root card, no execution or history authority; a room's read receipt (§3 Project rooms)
   │   ├── modules/model_wait.js ← Model-wait views and owner actions inside existing chat cards, through the shared decision ingress (§6 Quota and auth waits)
   │   ├── modules/task_checkpoints.js, cancel_presentation.js ← Typed task checkpoints and recorded cancellation-cause text shared by Chat and Logs (§3)
   │   ├── modules/dashboard.js, logs.js, costs.js, files.js ← Dashboard tab host; Logs (backfill plus live-stream duplicate guard); Costs (an open zero is never shown as free); Files browser over `/api/files/*` (§3 Dashboard, Files)
@@ -406,8 +406,8 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       │   ├── task_archive.py  ← Confined single-file and directory-ZIP reads of a task's own stores; a typed 503 without directory-relative opens
       │   ├── task_events.py   ← Task-event SSE endpoint: legacy GET ranks plus read-only POST v2 physical-chain cursors (§3 History reads and the SSE v2 transport)
       │   ├── task_hurry.py    ← POST hurry ingress: exact one-field `{request_id}` body — extra fields refused, because hurry carries no text by design and a smuggled field must not become a side channel; queue-owned admission initializes only an absent pooled lifecycle (`write_task_result(create_only=True)`), direct turns excluded (semantics: owner_hurry.py)
-      │   ├── task_pause.py    ← POST owner Pause ingress: `{request_id}` like hurry; answers only after the root's durable fence landed (semantics: owner_pause.py, §6 Owner Pause)
-      │   ├── task_continue.py ← POST owner Continue ingress: `{action_nonce}`; one nonce always answers one admission (semantics: owner_continue.py, §6 Owner Continue)
+      │   ├── task_pause.py    ← POST owner Pause: `{request_id}`; answers after the durable root fence (owner_pause.py, §6 Owner Pause)
+      │   ├── task_continue.py ← POST owner Continue: `{action_nonce}`; one nonce answers one admission (owner_continue.py, §6 Owner Continue)
       │   ├── task_decision.py ← ONE `POST /api/decisions` ingress with family-parsed ids (`quiz:` here, `routing:` → routing_decision.py, `interaction:` reserved); writes `KIND_QUIZ_ANSWER`, broadcasts `quiz_state` (lifecycle: owner_quiz.py; ABI: §11.1)
       │   ├── task_model_wait.py ← Shared model-wait decision effects over the existing mailbox, with live-owner/revision checks and optional role persistence
       │   ├── routing_decision.py ← Validates a click against the durable `needs_manual_target` row, recovers the original text, dispatches the existing `steer_task`/`promote_chat_to_task`, confirms through routing_wait receipts
@@ -435,7 +435,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       │   ├── history.py       ← Shared Chat room/quiz/media/review/terminal projection + cost breakdown factories
       │   ├── history_contracts.py ← Descriptive paged Chat history response, re-exported by contracts.py
       │   ├── schedule_contracts.py ← Typed schedule list/upsert/lifecycle-action responses, re-exported by contracts.py
-      │   ├── history_paging.py ← Physical range selection over retained chat/progress JSONL chains, frozen room-bound page/continuation cursors and read gaps; no stored history copy
+      │   ├── history_paging.py ← Physical range selection over retained chat/progress JSONL chains, frozen room-bound page/continuation cursors, read gaps and a Project room's `latest_arrival`; no stored history copy
       │   ├── cost_breakdown.py ← Ledger-derived dashboard buckets and root-task detail breakdown over the same physical-attempt authority
       │   ├── projects.py      ← GET/POST /api/projects, /from-task, /update, /delete
       │   └── _helpers.py      ← Shared request-root/coercion/JSON error envelope and `run_sync_to_completion`, the settled worker wait for request-owned blocking work

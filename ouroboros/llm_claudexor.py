@@ -130,7 +130,7 @@ class ClaudexorModelError(RuntimeError):
             for key, label in fields
             if isinstance(value := context.get(key), str) and value.strip()
         ]
-        # Details lead so the existing terminal preview can name the refusal.
+        # Details lead so a shortened Logs preview still names the refusal.
         return sanitize_tool_result_for_log("; ".join([", ".join(details), str(self)]) if details else str(self))
 
 

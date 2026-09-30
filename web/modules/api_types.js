@@ -1,5 +1,4 @@
 /** Dependency-free JSDoc mirror of `ouroboros.gateway.contracts`. */
-
 /**
  * @typedef {Object} CostPresentation
  * @property {'own'|'root_tree'} scope
@@ -9,7 +8,6 @@
  * @property {boolean} accounting_open
  * @property {boolean} has_rows
  */
-
 /**
  * @typedef {Object} StateResponse
  * @property {number} uptime
@@ -45,7 +43,6 @@
  * @property {boolean=} active_chat_activities_complete
  * @property {ActiveChatActivity[]=} active_chat_activities  // combined snapshot: direct/ephemeral turns + root managed queue tasks
  */
-
 /**
  * Background Consciousness alarm-clock snapshot (server._describe_bg_consciousness_state over
  * consciousness.status_snapshot). A wake-up is an ordinary Main turn; its liveness is the direct-activity census, never a flag here.
@@ -69,7 +66,6 @@
  * @property {number} unknown_unmetered  // window rows without a price: spent_24h_usd is then a floor ("at least")
  * @property {boolean} integrity_degraded  // the ledger was quarantined/repaired; the numbers are best-effort
  */
-
 /**
  * @typedef {Object} ActiveDirectTurn
  * @property {Object.<string,Object>=} model_waits
@@ -82,7 +78,6 @@
  * @property {string} phase
  * @property {number} started_at
  */
-
 /**
  * @typedef {Object} ActiveChatActivity
  * @property {Object=} required_question  // read-only pointer to the current required Project quiz
@@ -97,7 +92,6 @@
  * @property {string} phase  // managed: queued | budget_pausing | budget_paused | working | finalizing | unknown (unreadable Pause authority); direct: thinking or unknown; parked direct turns retain ID/kind and use managed phases
  * @property {number} started_at
  */
-
 /**
  * @typedef {Object} EvolutionDataResponse
  * @property {Object[]} points
@@ -105,7 +99,6 @@
  * @property {string} generated_at
  * @property {boolean} cached
  */
-
 /**
  * @typedef {Object} HealthResponse
  * @property {"ok"} status
@@ -113,32 +106,27 @@
  * @property {string} runtime_version
  * @property {string} app_version
  */
-
 /**
  * @typedef {Object} OpenAICompatibleModelsResponse
  * @property {string[]} models
  * @property {string=} error
  */
-
 /**
  * @typedef {Object} ProviderTestRequest
  * @property {string} provider_id
  * @property {Object<string, string>=} overrides
  */
-
 /**
  * @typedef {Object} ProviderTestResponse
  * @property {boolean} ok
  * @property {string=} error
  */
-
 /**
  * @typedef {Object} AvailableSubagentRoute
  * @property {'api_model'|'agent_session'} kind
  * @property {string} target_id
  * @property {string=} credential_profile_id
  */
-
 /**
  * @typedef {Object} AvailableSubagentItem
  * @property {string} subagent_id
@@ -474,6 +462,9 @@
  *   ordinary row.
  * @property {string=} card_row_id  // the row's stable identity across live delivery, outbox replay and history
  * @property {number=} card_row_revision  // canonical source order, independent of delivery timestamp
+ * @property {Object=} late_evidence
+ *   Late-review identity, reviewed revision and exact applied source_ref served by
+ *   taskSourceDownloadUrl; not an original reviewer transcript or a copy of the row.
  * @property {string=} target_label
  * @property {string=} project_id
  * @property {string=} project_name
@@ -1585,7 +1576,17 @@ export const GATEWAY_CONTRACT_VERSION = '7.5.1';
  * @property {boolean} has_more Older bytes remain or a disclosed source gap prevents establishing EOF.
  * @property {string|null} next_cursor Opaque room-bound older continuation.
  * @property {string|null} page_cursor Replays a frozen page; null for an unavailable source boundary.
- * @property {{complete:boolean,truncated_by:Array<string>}} window Bounds/gaps of this response.
+ * @property {{complete:boolean,truncated_by:Array<string>,latest_message?:({history_id:string,out_of_order:boolean}|null),latest_before?:number,latest_absent?:true}} window
+ *   Bounds/gaps of this response. A recent Project read also names the standalone message that
+ *   arrived last (null: its arrival is unknown, as while the live chat's last line is
+ *   unfinished, and on a replayed page, frozen before later arrivals), which must itself be
+ *   on screen for the room's read receipt, in its ordinary place too;
+ *   out_of_order: the bottom is not where it is (it sorts above earlier arrivals, or lies
+ *   before the recent read). latest_before: with null, its bounded search ran out first and
+ *   found none at or after this chat offset; the older pages of its chain carry the search on,
+ *   and the one holding the message names it here, the newest below its coverage.upper;
+ *   latest_absent: the one reaching the chat's start without a gap holds none, so none exists
+ *   below that upper. A room an unreadable Project registry's readable rows omit is null (not Main).
  * @property {{v:1,view:string,upper:Object,spans:Object}=} coverage Delivered physical byte spans, after deferrals.
  * @property {string} [next_before_ts] Legacy field retained for compatibility.
  * @property {string} [error]

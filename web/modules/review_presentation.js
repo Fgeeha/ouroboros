@@ -63,7 +63,7 @@ export function setReviewAnchor(record, enabled, writePhase) {
     } else {
         writePhase(record, 'working');
         if (!record.suggestedName && !record.lastHumanHeadline) {
-            record.titleEl.textContent = 'Working...';
+            record.titleEl.textContent = '';  // the chip says Working; the title waits for a name (#1369)
         }
         record.inlineTypingEl.style.display = '';
     }
@@ -880,11 +880,11 @@ export function taskAcceptanceGroupFromTaskDetail(detail, ownerTaskId = '') {
         const verdict = text(panel?.aggregate_signal || 'UNKNOWN');
         const roster = (Array.isArray(panel?.actors) ? panel.actors : []).filter((actor) => actor && typeof actor === 'object');
         const awaited = roster.some(actorAwaiting);
-        // An awaited panel is activity only while its own task still runs to collect it;
-        // afterwards an unanswered slot is a recorded gap, not a degraded verdict.
+        // An awaited panel is activity only while its own task still runs to collect it; afterwards an unanswered
+        // slot is a recorded gap. A settled panel without a verdict says so in words; DEGRADED stays in its detail.
         const live = awaited && text(detail?.status).toLowerCase() === 'running' && !panel?.superseded && index === panels.length - 1;
         const held = { FAIL: 'FAIL', PASS: live ? 'PASS so far' : 'PASS' }[verdict.toUpperCase()] || (live ? 'in progress' : 'no verdict');
-        const [progress, heldTone] = awaited ? heldProgress(held, roster, (actor) => text(actor.transport_status) === 'success') : ['', ''];
+        const [progress, heldTone] = awaited || verdict.toUpperCase() === 'DEGRADED' ? heldProgress(held, roster, (actor) => text(actor.transport_status) === 'success') : ['', ''];
         // The host composed this sentence; the card prints it verbatim and
         // leads the detail with it, because the renderer shows detailText over
         // summary. The panel's own verdict and identity are untouched.

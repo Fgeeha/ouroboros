@@ -3,11 +3,12 @@
 // in-flight direct/ephemeral turn status reducer and snapshot hydration.
 import { executorIdentityMarkup, joinMetaParts } from './harness_presentation.js';
 import { resultFilesItemHtml } from './result_files.js';
+import { taskSourceDownloadUrl } from './api_client.js';
 import { compactModel, formatLogDuration, modelExecutionLabel } from './log_events.js';
 import { createSystemMessageActions } from './ui_helpers.js';
 import { projectReference } from './project_reference.js';
 import { delegatedActivityBodyHtml, delegatedHeadline, delegatedLineView } from './delegated_activity.js';
-import { joinMarkdownHeadings } from './utils.js';
+import { joinMarkdownHeadings, MARKDOWN_FENCED_CODE } from './utils.js';
 import { REUSABLE_TASK_IDS } from './task_control_menu.js';
 import { apiFetch } from './api_client.js';
 import {
@@ -73,6 +74,37 @@ export function isLiveLineExpandable(item) {
     );
 }
 
+// A late-review row links its exact applied review record through the task artifact
+// route (#1369) — an absent or unsupported `late_evidence.source_ref` offers no link
+// rather than a guessed one. The card's timeline and a card-less System row share it.
+export function cardRowEvidenceRef(msg) {
+    const evidence = msg?.late_evidence && typeof msg.late_evidence === 'object'
+        ? taskSourceDownloadUrl(String(msg.task_id || '').trim(), msg.late_evidence.source_ref) : '';
+    return evidence ? { href: evidence, label: 'Download the review record' } : null;
+}
+
+// The stored record link as one download anchor, or nothing. A value restored from
+// the session snapshot is held to the task artifact route it was minted on. It wears
+// the chat link ink (`md-link`), as the result-file downloads beside it do.
+export function evidenceLinkHtml(evidenceRef) {
+    const href = typeof evidenceRef?.href === 'string' && evidenceRef.href.startsWith('/api/tasks/') ? evidenceRef.href : '';
+    return href
+        ? `<p class="chat-live-line-evidence"><a class="md-link" href="${escapeHtmlAttr(href)}" download data-live-line-evidence>${escapeHtml(evidenceRef.label || 'Download the review record')}</a></p>`
+        : '';
+}
+
+// A host-placed card row (timeline or Reviews) as its timeline summary: the first line
+// heads, `card_row_id` is the row's stable identity, and a late-review row carries its
+// record link (`cardRowEvidenceRef`).
+export function cardRowSummary(msg, phase, rawTs = '') {
+    const lines = String(msg.text ?? msg.content ?? '').split('\n');
+    const rowId = String(msg.card_row_id || '').trim() || `${String(msg.system_type || '').trim()}|${rawTs}`;
+    return {
+        phase, headline: lines[0].trim(), body: lines.slice(1).join('\n').trim(), dedupeKey: `cardrow|${rowId}`,
+        cardRowRevision: msg.card_row_revision, evidenceRef: cardRowEvidenceRef(msg),
+    };
+}
+
 export function buildTimelineItemHtml(item, record) {
     if (item.resultArtifacts) return resultFilesItemHtml(item);
     // A delegated observation renders its per-seq projection; one wholly shown by
@@ -89,6 +121,8 @@ export function buildTimelineItemHtml(item, record) {
     const displayBody = expanded ? (item.fetchedFull || item.fullBody || item.body) : item.body;
     const showingFetched = expanded && Boolean(item.fetchedFull);
     const loadingFull = expanded && Boolean(item.truncated && item.fullRef && !item.fetchedFull);
+    // A late-review row offers its exact applied review record (`cardRowSummary`).
+    const evidenceHtml = evidenceLinkHtml(item.evidenceRef);
     const isProgressLine = item.phase === 'working' || item.phase === 'thinking';
     const bodyId = `chat-live-line-body-${String(record.groupId || 'task').replace(/[^A-Za-z0-9_-]/g, '-')}-${String(item.lineKey || '').replace(/[^A-Za-z0-9_-]/g, '-')}`;
     const headContent = `
@@ -120,7 +154,7 @@ export function buildTimelineItemHtml(item, record) {
         >
             ${headHtml}
             ${delegated ? `<div class="chat-live-line-body chat-delegated-activity" id="${escapeHtmlAttr(bodyId)}">${delegatedActivityBodyHtml(delegated, { expanded })}</div>`
-        : displayBody ? `<div class="chat-live-line-body${showingFetched ? ' chat-live-line-body-full' : ''}" id="${escapeHtmlAttr(bodyId)}">${renderMarkdown(displayBody, { inlineHeadingBreaks: true })}${loadingFull ? '<div class="chat-live-line-loading">Loading full output…</div>' : ''}</div>` : ''}
+        : displayBody || evidenceHtml ? `<div class="chat-live-line-body${showingFetched ? ' chat-live-line-body-full' : ''}" id="${escapeHtmlAttr(bodyId)}">${displayBody ? renderMarkdown(displayBody, { inlineHeadingBreaks: true }) : ''}${evidenceHtml}${loadingFull ? '<div class="chat-live-line-loading">Loading full output…</div>' : ''}</div>` : ''}
         </div>
     `;
 }
@@ -827,7 +861,7 @@ export const COLLAPSED_ACTIVITY_MAX = 240;
 export function plainActivityText(text = '') {
     const source = String(text || '');
     const plain = joinMarkdownHeadings(source)
-        .replace(/```\w*\n([\s\S]*?)```/g, '$1')
+        .replace(MARKDOWN_FENCED_CODE, '$1')
         .replace(/(``|`)(.+?)\1/g, '$2')
         .replace(/\*\*(.+?)\*\*/g, '$1')
         .replace(/\*(.+?)\*/g, '$1')

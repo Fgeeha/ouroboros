@@ -54,7 +54,7 @@ from ouroboros.config import (
     get_task_idle_timeout_sec,
 )
 from ouroboros.deadline_utils import parse_deadline_ts
-from ouroboros.loop_llm_call import TRANSPORT_DEATHS_KEY, _TRANSIENT_BACKOFF_CAP_SEC
+from ouroboros.loop_llm_call import TRANSPORT_DEATHS_KEY, _TRANSIENT_BACKOFF_CAP_SEC, _exception_body
 from ouroboros.llm_probe import upstream_transport_reachable
 from ouroboros.owner_mailbox import OwnerMailboxPeek
 from ouroboros.utils import append_jsonl, utc_now_iso
@@ -835,13 +835,127 @@ def provider_terminal_fallback_text(
 
 
 
-def provider_failure_hint(accumulated_usage: Dict[str, Any]) -> str:
+# The host's own words for a failure class when the provider left no readable
+# sentence (#1369). The typed kind stays on the record and in the llm_api_error
+# event; a person reads the class, never the exception repr.
+_FAILURE_KIND_WORDS = {
+    "auth_error": "an authentication or authorization refusal",
+    "quota_exhausted": "a quota or billing refusal",
+    "subscription_window_exhausted": "a spent subscription window",
+    "rate_limit": "a rate limit",
+    "bad_request": "a rejected request",
+    "request_too_large": "a request the provider found too large",
+    "context_overflow": "a context overflow",
+    "transport_unavailable": "no connection to the provider",
+    "provider_outcome_unknown": "an attempt with no known outcome",
+    "provider_transient": "a temporary provider failure",
+    "provider_incomplete_response": "an incomplete response",
+    "llm_empty_response": "an empty response",
+    "provider_body_error": "an error in the provider's response",
+    "provider_error": "a provider error",
+    "model_substituted": "an answer from a model other than the requested one",
+    "deadline_exhausted": "the owner deadline running out before dispatch",
+}
+# Logs hold the host's record, not necessarily the provider's whole sentence: a
+# stream error frame's text reaches the durable event only as a bounded excerpt.
+_DIAGNOSTIC_POINTER = "The task's Logs keep the host's record of this failure."
+# The owner's quote of a provider sentence passes the SSOT display bound; past it
+# the quote is shortened in words beside the Logs pointer, never silently cut.
+_OWNER_QUOTE_LIMIT = 600
+
+
+def owner_provider_message(failure: Any) -> str:
+    """The provider's OWN sentence about a failed call, whole, or "" when there is none.
+
+    ``failure`` is the raised exception — a structured error body's ``message``,
+    a stream error's provider message — or an empty response's body-error dict
+    (its ``message``). A Python exception repr is never one of those: it stays in
+    the durable ``llm_api_error`` event and ``_last_llm_error`` for diagnostics
+    (#1369). Nor is a Claudexor engine error's text: its ``display_message`` joins
+    host-side diagnostics (stage, cause, engine code, the engine's own message)
+    and its provider body stays private, so only its typed provider fields speak
+    (``owner_provider_fields``). The owner's row bounds it (``provider_failure_hint``).
+    """
+    from ouroboros.llm_claudexor import ClaudexorModelError
     from ouroboros.utils import sanitize_tool_result_for_log
 
-    detail = " ".join(sanitize_tool_result_for_log(str(accumulated_usage.get("_last_llm_error") or "")).split()).strip()
-    if not detail:
+    if isinstance(failure, ClaudexorModelError):
         return ""
-    return f" Last provider error: {detail}"
+    if isinstance(failure, dict):
+        authored = (failure.get("message"),)
+    else:
+        body = _exception_body(failure)
+        nested = body.get("error") if isinstance(body.get("error"), dict) else {}
+        authored = (nested.get("message"), body.get("message"), getattr(failure, "provider_message", None))
+    text = next((value for value in authored if isinstance(value, str) and value.strip()), "")
+    return sanitize_tool_result_for_log(" ".join(text.split())) if text else ""
+
+
+def owner_provider_fields(failure: Any) -> Dict[str, str]:
+    """The typed fields a provider itself returned through the Claudexor engine —
+    its error ``code`` and the refused ``parameter`` — or {}. An unknown outcome
+    exposes none, as in ``ClaudexorModelError.display_message``."""
+    from ouroboros.llm_claudexor import ClaudexorModelError
+    from ouroboros.utils import sanitize_tool_result_for_log
+
+    if not isinstance(failure, ClaudexorModelError) or failure.code == "model_outcome_unknown":
+        return {}
+    context = failure.problem.get("context")
+    context = context if isinstance(context, dict) else {}
+    return {label: " ".join(sanitize_tool_result_for_log(value).split())
+            for key, label in (("vendorCode", "code"), ("parameter", "parameter"))
+            if isinstance(value := context.get(key), str) and value.strip()}
+
+
+def stamp_owner_provider_message(accumulated_usage: Dict[str, Any], failure: Any) -> None:
+    """Replace ``_last_llm_provider_message`` with ``failure``'s own sentence and
+    ``_last_llm_provider_fields`` with its typed provider fields, or clear them.
+    ``_last_llm_provider_message_cut`` marks a sentence its producer already cut
+    (an empty response's body error keeps only a bounded ``message``).
+
+    Stamped by the call owner (``loop_llm_call``) at each failed call, so an
+    earlier round's sentence never speaks for this one.
+    """
+    cut = isinstance(failure, dict) and failure.get("message_truncated") is True
+    for key, value in (("_last_llm_provider_message", owner_provider_message(failure)),
+                       ("_last_llm_provider_message_cut", cut),
+                       ("_last_llm_provider_fields", owner_provider_fields(failure))):
+        accumulated_usage.pop(key, None)
+        if value:
+            accumulated_usage[key] = value
+
+
+def provider_failure_hint(accumulated_usage: Dict[str, Any]) -> str:
+    """The provider's own sentence (a long one shortened in words, with the Logs
+    pointer), or the host's classification with that pointer.
+
+    Quotes only ``_last_llm_provider_message`` — text a provider positively
+    authored (``stamp_owner_provider_message``); typed provider fields without a
+    sentence are named as the provider's beside the host's classification. The
+    exception repr in ``_last_llm_error`` and an engine's composed display text
+    are never appended: they belong to Logs and task details.
+    """
+    from ouroboros.utils import sanitize_tool_result_for_log, truncate_review_artifact
+
+    message = " ".join(sanitize_tool_result_for_log(
+        str(accumulated_usage.get("_last_llm_provider_message") or "")).split()).strip()
+    cut = accumulated_usage.get("_last_llm_provider_message_cut") is True
+    if message and not cut and truncate_review_artifact(message, limit=_OWNER_QUOTE_LIMIT) == message:
+        return f" The provider said: \"{message}\""
+    if message:  # its producer or the SSOT cut it (the SSOT's anti-waste floor lets a small overflow through whole)
+        return f" The provider said: \"{message[:_OWNER_QUOTE_LIMIT].rstrip()}…\" (shortened). {_DIAGNOSTIC_POINTER}"
+    kind = str(accumulated_usage.get("_last_llm_error_kind") or "").strip()
+    if not kind and not str(accumulated_usage.get("_last_llm_error") or "").strip():
+        return ""
+    words = _FAILURE_KIND_WORDS.get(kind, "a provider failure")
+    fields = accumulated_usage.get("_last_llm_provider_fields")
+    fields = fields if isinstance(fields, dict) else {}
+    named = [f'{label} "{fields[key]}"' for key, label in (("code", "error code"), ("parameter", "parameter"))
+             if isinstance(fields.get(key), str) and fields[key].strip()]
+    if named:  # the provider's own typed fields; its body, if any, stays private
+        return (f" The provider reported {' and '.join(named)} but no sentence the host can quote; "
+                f"the host classified the failure as {words}. {_DIAGNOSTIC_POINTER}")
+    return f" The provider gave no readable message; the host classified the failure as {words}. {_DIAGNOSTIC_POINTER}"
 
 
 # What the host KNOWS it did. It asks again and names no account; which account
