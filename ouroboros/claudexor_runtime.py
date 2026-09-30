@@ -1097,12 +1097,12 @@ class ClaudexorRuntimeManager:
             )
             had_old = root.exists()
             if had_old:
-                os.replace(root, displaced)
+                replace_atomic(root, displaced)
             try:
-                os.replace(staging, root)
+                replace_atomic(staging, root)
             except Exception:
                 if had_old and displaced.exists() and not root.exists():
-                    os.replace(displaced, root)
+                    replace_atomic(displaced, root)
                 raise
             if displaced.exists():
                 shutil.rmtree(displaced, ignore_errors=True)

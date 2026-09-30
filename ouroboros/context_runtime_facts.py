@@ -22,6 +22,21 @@ from ouroboros.config import runtime_setting
 log = logging.getLogger(__name__)
 
 
+def task_schedule_fact(task: Dict[str, Any]) -> Dict[str, Any]:
+    """The admitted occurrence's original clock, even after its row advances.
+
+    Lateness is for the mind to judge. A missing legacy date stays unknown;
+    the schedule's next firing point cannot supply this occurrence's due time.
+    """
+    metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    occurrence = metadata.get("schedule_occurrence")
+    if not isinstance(occurrence, dict):
+        return {}
+    return {"schedule_occurrence": {
+        key: occurrence.get(key) for key in ("schedule_id", "due_at", "claimed_at")
+    }}
+
+
 def task_execution_clock_fact(task: Dict[str, Any], ctx: Any) -> Dict[str, Any]:
     """Current finite execution-ceiling estimate, not a calendar deadline.
 

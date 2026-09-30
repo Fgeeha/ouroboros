@@ -247,6 +247,35 @@ def test_schedule_room_preparation_detects_aba_during_workspace_validation(room,
     assert _rows(room)["s1"]["hold"]["reason"] == "project_routing_fence_changed"
 
 
+def test_schedule_room_folder_uses_the_carried_basis_and_repo_owner(room, tmp_path, monkeypatch):
+    """The folder comes from the same read admission fences, validated against the worker repo."""
+    from ouroboros import projects_registry, workspace_admission
+    from supervisor import workers
+
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    registry.update_project(room.root, "target", working_dir=str(folder))
+    _row(room, project_id="target", intent={"kind": "room_default", "project_id": "target"})
+    views, repos = [], []
+    original_view, original_validate = projects_registry.project_admission_view, workspace_admission.validate_workspace_root
+    def view(*args, **kwargs):
+        views.append(args)
+        if len(views) > 1:  # a second preparation read would observe a replaced registry
+            raise OSError("registry replaced after the basis was captured")
+        return original_view(*args, **kwargs)
+    def validate(requested, **kwargs):
+        repos.append(kwargs["system_repo_dir"])
+        return original_validate(requested, **kwargs)
+    monkeypatch.setattr(projects_registry, "project_admission_view", view)
+    monkeypatch.setattr(workspace_admission, "validate_workspace_root", validate)
+    room.queue.check_scheduled_tasks()
+    [queued] = room.pending
+    assert "hold" not in _rows(room)["s1"] and len(views) == 1 and repos == [workers.REPO_DIR]
+    assert queued["workspace_root"] == str(folder.resolve())
+    assert queued["_project_admission"]["project"]["working_dir"] == str(folder)
+    assert load_task_result(room.root, queued["id"])["schedule_admission"]["dispatch"] == "none"
+
+
 @pytest.mark.parametrize("change", ["benign", "delete"])
 def test_real_api_settles_only_its_refused_attempt(room, monkeypatch, tmp_path, change):
     from ouroboros.gateway import tasks as api

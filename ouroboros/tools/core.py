@@ -5,6 +5,7 @@ from __future__ import annotations
 from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
 
 import copy
+import json
 import logging
 import os
 import pathlib
@@ -1118,19 +1119,15 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
 def _forward_to_worker(
     ctx: ToolContext, task_id: str, message: str, relayed_from_task_id: str = "",
 ) -> str:
-    """Write a task-tree message into a running or queued task's mailbox: one writer for a
-    descendant (an ancestor's or relayed sibling's message), for the caller's
-    own parent or sibling (a peer contribution, never authority), and for any
-    active independent root the host lists (a message from an independent task,
-    owner 6C). Never owner text; WRITTEN, not read -- the recipient drains it
-    later, from its recorded drive or the canonical root, never the sender's.
-    The receipt follows ``owner_mailbox.mail_write_receipt`` (TZ-1 V10): queued (the
-    recipient has not started) or delivered to a live drain; never "read"."""
+    """Write task context to the recipient's mailbox, never owner text.
+    Descendants receive ancestor/relayed context; parent/sibling contributions
+    retain their relation. Listed roots and inline Presence receive independent
+    task context. Receipts prove persistence, not a read, in the recipient's drive."""
     from ouroboros.owner_mailbox import (
         PROVENANCE_INDEPENDENT_TASK, PROVENANCE_PEER_TASK, TASK_MESSAGE_MAX_CHARS, write_task_message,
     )
     from ouroboros.peer_roster import (
-        durable_descendant_of, host_listed_independent_root, peer_contribution_admission,
+        durable_descendant_of, independent_message_target, peer_contribution_admission,
     )
     from ouroboros.task_results import STATUS_RUNNING, STATUS_SCHEDULED, validate_task_id
     from ouroboros.task_status import FINAL_STATUSES, load_effective_task_result
@@ -1188,12 +1185,12 @@ def _forward_to_worker(
         if relation:
             provenance = PROVENANCE_PEER_TASK
         else:
-            listed_root = host_listed_independent_root(status_drive_root, tid)
+            listed_root = independent_message_target(status_drive_root, tid, data)
             if listed_root is None:
                 return (f"⚠️ TASK_FORBIDDEN: task {tid} is neither a descendant, the parent nor a sibling "
-                        "of the current task, nor an active independent root the host lists.")
+                        "of the current task, nor an active independent root the host lists or an inline Presence mailbox.")
             if relayed_from:
-                return f"⚠️ TASK_FORBIDDEN: a relayed message reaches only your own descendants; task {tid} is an independent root."
+                return f"⚠️ TASK_FORBIDDEN: a relayed message reaches only your own descendants; task {tid} is an independent recipient."
             provenance = PROVENANCE_INDEPENDENT_TASK
     if relayed_from:
         try:
@@ -1238,6 +1235,12 @@ def _forward_to_worker(
         return (f"Message forwarded to task {tid}: written to its mailbox ({MAIL_RETAINED_UNREAD}); task {tid}'s "
                 "own drain has already ended, so no checkpoint will read it: its result keeps it as unread mail. "
                 "Files cannot be attached to messages between tasks.")
+    if listed_root is not None and listed_root.get("target_kind") == "inline_presence":
+        observation = json.dumps(listed_root["execution_observation"], ensure_ascii=False, sort_keys=True)
+        return (f"Message forwarded to task {tid}: written to its mailbox as a message from this task "
+                "(independent_task, never owner text). This proves persistence, not that its model read it; "
+                "if the turn continues, its checkpoint can read it. "
+                f"execution_observation={observation}. Files cannot be attached to messages between tasks.")
     if receipt == MAIL_QUEUED:
         as_from = (f" as a message from a peer task (your {relation}; never owner text or an ancestor's steering)"
                    if provenance == PROVENANCE_PEER_TASK else " as a message from this task (never owner text)"
@@ -1424,8 +1427,9 @@ def get_tools() -> List[ToolEntry]:
                 "or descendant of yours (delivered as the ancestor's message), your own parent "
                 "or a sibling (delivered as a message from a peer task naming the relation — "
                 "a contribution it weighs, never steering; relay is refused there), or any active "
-                "independent root the host lists (delivered as a message from an independent "
-                "task). It is never labelled owner dialogue, files cannot be attached, the body "
+                "independent root the host lists or a source-bound inline Presence turn (a message "
+                "from an independent task). Presence observation gaps are disclosed; a write never "
+                "proves a read. It is never labelled owner dialogue, files cannot be attached, the body "
                 "is limited to 8000 chars (longer is refused, never truncated), and the "
                 "result says written, not read: a running task drains it at its next checkpoint, a queued "
                 "one when it starts, and a task that ends without reading it keeps it as unread mail in its "
