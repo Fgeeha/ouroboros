@@ -18,6 +18,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
   │   ├── modules/chat_decision.js, question_presentation.js, chat_render_batch.js, task_phase_chip.js, lifecycle_card.js ← Chat helpers: the typed decision (quiz) cards, one form for a Project question in its room and in its Main mirror, with one pure lifecycle projection shared by both (its Python twin: `project_dialogue.QUESTION_STATUS`); keyed timeline items, DOM patches, history-control presentation and reading anchors; pure desired-phase chip projection where terminal truth wins; skill lifecycle card state with best-effort polling
   │   ├── modules/chat_history.js, chat_history_replay.js, chat_reading_position.js ← Bounded per-chat pages with exact return handles; source-keyed replay without live-task authority; one reading intent (§3 Timeline ownership and ordering)
   │   ├── modules/delegated_activity.js ← Run/seq-based activity projection, Unicode fragment cuts, explicit preview gaps and retained-source links (§3 Child cards and executor presentation)
+  │   ├── modules/welcome_preference.js ← Main's host-owned empty state; copy from the hidden `welcome` preference (DESIGN "Chat authorship and System rows")
   │   ├── modules/project_answer.js ← Main's Project lifecycle rows: the fold of a mirrored final answer and the Project reference under every row (§3 Main rows)
   │   ├── modules/project_handoff.js ← Main-only transfer anchors: every converted card stays visible, at most one receipt row per `handoff_id` folds under the first visible card, shadows restored on eviction, phase from the existing census/task detail; `receiptNotice` words the typed receipt (§3 Project handoff receipts)
   │   ├── modules/project_reference.js ← the one control that points at a Project, and the only raiser of `ouro:open-project` (DESIGN "References and actions")
@@ -408,7 +409,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       │   ├── update_progress.py ← Process-local stages owned by the synchronous update executor; status projection and WS invalidation, never recovery authority
       │   ├── schedules.py     ← Cron schedule HTTP surface
       │   ├── files.py         ← File Browser + chat upload
-      │   ├── ui_preferences.py ← `state/ui_preferences.json`: widget order, per-card start-mode overrides (`widget_start_mode`, values from `extension_ui_validation.WIDGET_START_MODES`), nested subagent expansion
+      │   ├── ui_preferences.py ← `state/ui_preferences.json`: widget order, per-card start-mode overrides (`widget_start_mode`, values from `extension_ui_validation.WIDGET_START_MODES`), nested subagent expansion, empty-Main `welcome` copy
       │   ├── models.py        ← Model catalog + provider probes + local-model lifecycle
       │   ├── extensions.py    ← extensions/skills HTTP surface (GET /api/extensions, GET /api/extensions/<skill>/manifest, GET /api/extensions/<skill>/module/<entry:path> — reviewed module sources served from the live loader registration, ALL /api/extensions/<skill>/<rest:path>, POST /api/skills/<skill>/toggle, POST /api/skills/<skill>/delete, POST /api/skills/<skill>/review, POST /api/skills/<skill>/grants)
       │   ├── extension_receipts.py ← Process-qualified extension index/toggle/reconcile receipt projection
@@ -661,7 +662,7 @@ Bundled resources use the CLI / Headless Boundary lookup order rather than assum
 │   │   ├── update_letter.json     ← the last update letter (key = base/target/channel/ref, state, text, `last_good`); kept after apply and projected against the live HEAD (update_letter.py)
 │   │   ├── projects.json          ← Project registry: immutable id/chat identity, working folder, lifecycle/routing fence, revision; tombstones are durable and never age-pruned
 │   │   ├── project_task_bindings.json ← schema v1 root↔Project bindings with REQUIRED typed origin; one-way enrichment; tombstoning never removes a binding
-│   │   ├── ui_preferences.json    ← owner-local layout preferences + monotonic project_seen_revision ACKs
+│   │   ├── ui_preferences.json    ← owner-local layout/`welcome` prefs + monotonic project_seen_revision ACKs
 │   │   ├── cancel_intents.json    ← compact locked projection of ACTIVE cancel intents; the forensic trail is typed cancel_intent rows in logs/supervisor.jsonl, never read back (cancel_intents.py)
 │   │   ├── terminal_deliveries.json ← delivery-id dedupe, emitted-byte receipts, pending outbox (terminal_delivery.py)
 │   │   ├── extension_companions.json ← runtime snapshot of live companion processes

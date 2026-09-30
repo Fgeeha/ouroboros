@@ -463,6 +463,39 @@ renderer regardless of `markdown`; ordinary System text is escaped unless
 Voice does not confer task finality. The existing untyped terminal-host-notice
 contract remains a documented exception, not a pattern for new notices.
 
+Main's empty-chat greeting speaks in neither voice: it is host copy in a quiet
+`.chat-empty-welcome` placeholder (a `Welcome` label over one sentence), never a
+bubble, a history row or a model reply (`web/modules/welcome_preference.js`). It
+appears only after a successful recent history read whose own window reports
+complete coverage, over a feed with no message or task card (the typing indicator
+and the ephemeral reconnect notice are chrome, by the same rule that gives an empty
+feed its history loading state). Every later read withdraws it while in flight, so
+that loading state, then any failure, shows instead; only a complete answer brings
+it back, and it leaves with the first message or task card. Project rooms never
+show it.
+
+The sentence is a hidden install-wide preference with no Settings control: the
+`welcome` key of `state/ui_preferences.json` under the data root
+(`~/Ouroboros/data` by default). Change only that key and keep the file's others:
+
+```json
+"welcome": {"mode": "default", "text": ""}
+"welcome": {"mode": "hidden", "text": ""}
+"welcome": {"mode": "custom", "text": "Good morning."}
+```
+
+`default` shows the built-in "Ouroboros has awakened", `hidden` shows nothing, and
+`custom` shows `text` as plain text, never markup (nonblank, at most 500
+characters; other modes retain but do not display valid text). The object has
+exactly these two keys. Prefer `POST /api/ui/preferences` with `{"welcome": {...}}`:
+it validates and merges the value (400 on refusal, without writing). For a hand
+edit, stop Ouroboros, back up the file, and preserve valid whole-document JSON
+and neighboring keys. An invalid welcome inside valid JSON falls back to
+`default` independently; the next save stores that default. Malformed JSON
+instead follows the existing whole-file fallback: all preferences read as
+defaults, and a later save may replace the unreadable contents. Main reads the
+preference when it opens and on every reconnect; there is no file watcher.
+
 ## 5. Card and section composition
 
 - A panel is one `.ui-card`-family surface: `--ui-card-border`,

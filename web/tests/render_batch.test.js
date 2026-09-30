@@ -7,6 +7,7 @@ import {
     createHistoryResyncScheduler,
     createLiveCardBound,
     createTimelineAnchors,
+    feedIsEmpty,
 } from '../modules/chat_render_batch.js';
 import { ElementStub } from './chat_dom_fixture.js';
 
@@ -62,6 +63,30 @@ test('history chrome shares one control and derives completeness from physical c
     assert.equal(messages.querySelector('.chat-load-older')
         .querySelector('.chat-load-older-note').textContent, 'Beginning of saved history');
     assert.equal(controls.olderButton.hidden, true);
+});
+
+test('the empty-Main greeting and the reconnect notice are chrome: a read over them still shows its loading and failure', () => {
+    const doc = { byId: new Map(), createElement: (tag) => new ElementStub(tag, doc) };
+    const messages = new ElementStub('div', doc);
+    messages.isConnected = true;
+    const controls = createHistoryControls(messages);
+    const node = (className) => { const element = doc.createElement('div'); element.className = className; return element; };
+    messages.appendChild(node('chat-bubble assistant typing-bubble'));
+    messages.appendChild(node('chat-empty-welcome'));
+    const notice = node('chat-bubble system');
+    notice.dataset.ephemeral = '1';
+    messages.appendChild(notice);
+    assert.equal(feedIsEmpty(messages), true);
+    assert.equal(controls.beginRecent(), true);
+    controls.render({ initialized: true });
+    assert.equal(messages.querySelector('.chat-load-older').querySelector('.chat-load-older-note').textContent,
+        'Loading saved history…');
+    controls.endRecent(new Error('offline'));
+    assert.equal(controls.recentFailed(), true);
+    controls.endRecent();
+    messages.appendChild(node('chat-bubble assistant'));
+    assert.equal(feedIsEmpty(messages), false);
+    assert.equal(controls.beginRecent(), false, 'a painted transcript gets no loading chrome');
 });
 
 // ─────────────── sticky hydration / replay contracts ──────────────────────
