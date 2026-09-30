@@ -347,12 +347,12 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── server_runtime.py    ← Startup/onboarding wiring + WS liveness
       ├── server_web.py        ← `NoCacheStaticFiles`, web-dir resolver and fixed-source `read_author_kit_assets(repo_dir)` for optional author-owned routes; no endpoint or cache
       ├── server_process.py, server_liveness.py, server_maintenance.py, server_restart.py, server_owner_routing.py, server_routing_context.py ← Server leaves the composition root calls: the facts one server process shares with every leaf, including applied startup settings; wedge detection for the supervisor generation; the upkeep a generation owes the drive; restart operations (shutdown, the checkout-first manual Restart, the planned restart's engine-pin daemon stop; §9); where one owner message goes; the bounded facts one owner turn may address
-      ├── terminal_cost_reconciliation.py ← Maintenance usage recovery, then cost projection behind a no-write EQUAL memo (§6)
+      ├── terminal_cost_reconciliation.py ← Usage recovery/projection (§6)
       ├── task_continuation.py ← Durable review continuation state
       ├── task_results.py      ← Durable task results `task_results/<id>.json`; the locked `task_acceptance_review_accounting` claim (minted at first physical reviewer dispatch; a claim without a recoverable terminal host run is UNKNOWN, never permission to re-dispatch); the read-only root review-capacity projection is WALLET and cancellation only (`root_task_id`, `cap_cycles`, `claimed_cycles`, `remaining_cycles`, `binding_seen`, `dedupe`, `state`, `reason`), no time axis (§6 Task acceptance)
       ├── task_result_schema.py ← Task-result schema admission: the `_schema_version` stamp, the classifier, and the quarantine an unstamped, future, malformed or retired-key row lands in
       ├── task_status.py       ← Effective-status SSOT, lineage, bounded waits; worker-side `task_has_live_queue_ownership` (§10 invariant 14); the DESTRUCTIVE orphan predicate fails open toward liveness — an in-process direct actor or a missing/stale queue snapshot can never prove a task dead
-      ├── git_shell_policy.py  ← Structural git argv classifiers for the shell guards
+      ├── git_shell_policy.py  ← Shell Git argv checks
       ├── protected_artifacts.py ← Execute-only black-box policy for protected artifacts
       ├── shell_parse.py       ← Shared command/argv normalization and POSIX wrapper grammar; observed targets, not semantic permission judgments (§6 Safety and runtime mode)
       ├── argv_budget.py       ← Argv admission counts encoded bytes of argv PLUS environment (ARG_MAX charges both; per-arg `MAX_ARG_STRLEN`, Windows unit limit); asked by skill_exec before exec
