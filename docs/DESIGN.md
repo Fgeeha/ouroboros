@@ -426,7 +426,7 @@ their own meaning and are unaffected by it.
   task sends it, a child task included.
 - **Does not count:** anything that changes a task card rather than the
   conversation — narration and progress, lifecycle, incidents raised in a
-  task's progress (they still toast), host rows placed in a card (custody, late
+  task's progress (root worker failures included; they still toast), host rows placed in a card (custody, late
   review results, merge receipts, a child task's terminal incident), and a child
   task's own words and final: a child speaks to its parent, and its card shows
   them. Where a row is shown decides, never its kind: an incident shown alone as
@@ -446,9 +446,12 @@ their own meaning and are unaffected by it.
   the header and composer — above the loaded messages, after `Load more history` shows
   it — and never while the room cannot tell which message arrived last, as
   while the newest line of the conversation is still being written. A
-  message that later card rows and the owner's own messages pushed past the
-  newest page is read the same way; a room holding no standalone message at all
-  is read at the bottom once its start is reached (in a long room, by `Load more history`).
+  damaged persisted row can leave this unknown until the history is repaired or
+  a newer standalone message arrives; while the unread room is open, existing
+  state refreshes recheck the source. A message that later card rows and the
+  owner's own messages pushed past the newest page is read the same way. A room
+  holding no standalone message is read at the bottom once the history reader
+  reaches its clean start, through the bounded search or `Load more history`.
 - **Several clients** share one read cursor that only moves forward: a room read
   on one client stops showing the dot on the others at their next state
   refresh, and nothing read is shown unread again.

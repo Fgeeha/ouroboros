@@ -395,6 +395,34 @@ def test_a_legacy_child_final_its_task_result_names_is_never_the_newest_message(
     assert recent["window"]["latest_message"] == {"history_id": room.row_id("root answer"), "out_of_order": False}
 
 
+@pytest.mark.parametrize("old_result", [False, True], ids=["missing-result", "pre-upgrade-result"])
+def test_a_legacy_child_final_uses_the_progress_lineage_the_client_reads(room, old_result):
+    """A pre-upgrade result may be quarantined; the page still knows the child's parent."""
+    room.deliver("root answer", 5)
+    lineage = {"delegation_role": "subagent", "parent_task_id": "root-1",
+               "root_task_id": "root-1", "subagent_task_id": "kid-old"}
+    append_jsonl(room.chat_log, {"ts": ts(6), "direction": "out", "chat_id": room.chat_id,
+                                 "text": "legacy child final", "task_id": "kid-old"})
+    append_jsonl(room.root / "logs" / "progress.jsonl", {
+        "ts": ts(4), "chat_id": room.chat_id, "task_id": "root-1", "content": "Child scheduled",
+        "subagent_event": "scheduled", **lineage})
+    if old_result:
+        path = room.root / "task_results" / "kid-old.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"id": "kid-old", "status": "completed", **lineage}), encoding="utf-8")
+    recent = room.read()
+    assert any(row.get("subagent_task_id") == "kid-old" for row in recent["messages"])
+    assert recent["window"]["latest_message"] == {"history_id": room.row_id("root answer"), "out_of_order": False}
+    if old_result:
+        assert not path.exists(), "the unstamped result was quarantined, not used as current lineage"
+    # The scheduling row's task_id names the parent, and a delivery from that
+    # same child still stands alone. Neither may be mistaken for child speech.
+    assert room.host.bridge.send_photo(room.chat_id, b"\x89PNG\r\n\x1a\n", caption="child photo", task_id="kid-old")[0]
+    recent = room.read()
+    photo = next(row for row in recent["messages"] if row.get("system_type") == "photo")
+    assert recent["window"]["latest_message"] == {"history_id": photo["history_id"], "out_of_order": False}
+
+
 def durable_child(room, task_id: str = "kid-1") -> None:
     """The child's lineage as its task result persists it, recovered for every row the child wrote."""
     from ouroboros.task_results import write_task_result

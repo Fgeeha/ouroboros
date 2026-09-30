@@ -626,12 +626,15 @@ def test_an_ordinary_reopen_reads_its_room_while_an_old_question_reveal_is_held(
 
 
 @pytest.mark.parametrize("engine", ["chromium", "webkit"])
-def test_a_legacy_child_final_after_the_root_answer_does_not_hold_the_room_unread(direct_server_with_data, engine):
+@pytest.mark.parametrize("lineage_source", ["result", "progress", "pre-upgrade-result"])
+def test_a_legacy_child_final_after_the_root_answer_does_not_hold_the_room_unread(
+        direct_server_with_data, engine, lineage_source):
     """A child's final written before chat rows carried lineage is shown in the child's card by the
-    lineage its task result recovers; the root's answer before it is the newest message, and it is read."""
+    result or progress lineage; the root's answer before it is the newest message, and it is read."""
     from playwright.sync_api import sync_playwright
 
     from ouroboros.task_results import write_task_result
+    from ouroboros.utils import append_jsonl
 
     data = direct_server_with_data["data_dir"]
     at = lambda minute: f"2026-09-28T10:{minute:02d}:00Z"  # noqa: E731
@@ -640,8 +643,17 @@ def test_a_legacy_child_final_after_the_root_answer_does_not_hold_the_room_unrea
              {"ts": at(6), "direction": "out", "text": "Legacy child final", "task_id": "kid-legacy"}]
     _chat_id, _chat_log, revision = _seed_room(data, "legacy-room", "Legacy room", rows)
     write_task_result(data, "root-legacy", "completed")
-    write_task_result(data, "kid-legacy", "completed", delegation_role="subagent", parent_task_id="root-legacy",
-                      root_task_id="root-legacy", role="researcher")
+    lineage = {"delegation_role": "subagent", "parent_task_id": "root-legacy",
+               "root_task_id": "root-legacy", "subagent_task_id": "kid-legacy", "subagent_role": "researcher"}
+    if lineage_source == "result":
+        write_task_result(data, "kid-legacy", "completed", **lineage)
+    else:
+        append_jsonl(data / "logs" / "progress.jsonl", {
+            "ts": at(4), "chat_id": _chat_id, "task_id": "root-legacy", "content": "Child scheduled",
+            "subagent_event": "scheduled", **lineage})
+        if lineage_source == "pre-upgrade-result":
+            (data / "task_results" / "kid-legacy.json").write_text(
+                json.dumps({"id": "kid-legacy", "status": "completed", **lineage}), encoding="utf-8")
     evidence = Path(os.environ.get("OUROBOROS_UI_EVIDENCE_DIR", data.parent))
     evidence.mkdir(parents=True, exist_ok=True)
     acks = []
@@ -654,8 +666,10 @@ def test_a_legacy_child_final_after_the_root_answer_does_not_hold_the_room_unrea
             messages.locator(".chat-bubble").filter(has_text="Root answer").wait_for(state="attached")
             page.evaluate(_SETTLE_RESTORE_FRAMES)
             read = _wait_for(page, lambda: seen() == [revision], attempts=50)
-            page.screenshot(path=str(evidence / f"read-band-{engine}-legacy-child.png"))
+            page.screenshot(path=str(evidence / f"read-band-{engine}-legacy-child-{lineage_source}.png"))
             assert read, ("the root's answer on screen is read", acks)
+            assert messages.locator(".chat-bubble").filter(has_text="Legacy child final").count() == 0
+            assert messages.locator(".chat-live-card").filter(has_text="Legacy child final").count() > 0
             row.locator(".nav-unread-dot").wait_for(state="detached")
         finally:
             browser.close()

@@ -404,7 +404,7 @@ def latest_arrival(rows, page, data_dir, row_matches_thread, stored_chat_id, pro
     message that arrived last, named from the persisted rows before the tail and
     annotation rewrite them. A child's words are card content by their stored
     lineage or, on rows written before rows carried it, by the lineage their
-    ``task_result`` recovers — the projection's own authority, which shows such a
+    ``task_result`` or this page's progress recovers — the projection's own authority, which shows such a
     row in the child's card; a photo, video, file, link card or question a child
     delivers is shown alone and is a message. ``None``: its arrival is unknown — the chat source
     is unreadable, its projection failed part-way (``projected_gaps`` holds
@@ -434,10 +434,14 @@ def latest_arrival(rows, page, data_dir, row_matches_thread, stored_chat_id, pro
         return {}
     entries, start, gaps = page["selections"]["chat"]
     end = page["page_ends"].get("chat", 0)
+    # The client learns these facts before placing any row. A scheduling row's
+    # task_id may name the parent; the shared projection names the actual child.
+    known_children = {meta["subagent_task_id"] for row in rows if (meta := subagent_message_meta(row))}
 
     def child(row):
         task_id = str(row.get("task_id") or "")
-        return bool(task_id) and bool(subagent_message_meta(task_result(task_id), task_id=task_id))
+        return bool(task_id) and (task_id in known_children
+                                 or bool(subagent_message_meta(task_result(task_id), task_id=task_id)))
 
     offset = lambda row: row["history_position"]["offset"]  # noqa: E731
     words = lambda row: _card_content(row, str(row.get("system_type") or ""), child)  # noqa: E731
