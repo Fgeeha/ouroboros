@@ -16,6 +16,17 @@ def _parent_ctx(tmp_path, task_id: str = "parent1") -> SimpleNamespace:
     )
 
 
+def _typed_code(text: str) -> str:
+    """The code the one classifier assigns to a refusal sentence (owner item I23).
+
+    The plain-string producers below never publish a typed result, so the
+    identifier table is what decides whether a refused disposition is recorded as
+    an argument error or as a success."""
+    from ouroboros.tools.tool_result import LegacyTextResultAdapter
+
+    return LegacyTextResultAdapter.from_text("tree_note", text).code
+
+
 def _payload(child_id: str, disposition: str, result_sha256: str) -> dict:
     return {
         "type": "child_result_disposition",
@@ -145,7 +156,10 @@ def test_changed_child_result_reopens_and_old_hash_is_stale(tmp_path):
 
 
 def test_artifact_change_reopens_exact_hash_disposition(tmp_path):
-    from ouroboros.artifacts import task_artifact_dir_path
+    """Reads hash no files (TZ-1 A): the recorded artifact identity is what the
+    exact-hash disposition covers, so a published byte change reopens it while an
+    unrecorded file mutation leaves the pure read unchanged."""
+    from ouroboros.artifacts import artifact_record, task_artifact_dir_path
     from ouroboros.task_results import write_task_result
     from ouroboros.task_status import load_effective_task_result
     from ouroboros.tools.join_ledger import (
@@ -155,6 +169,10 @@ def test_artifact_change_reopens_exact_hash_disposition(tmp_path):
     from ouroboros.tools.task_tree import _tree_note
 
     child_id = "artifact-child"
+    artifact_dir = task_artifact_dir_path(tmp_path, child_id)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    artifact_path = artifact_dir / "report.md"
+    artifact_path.write_text("version one\n", encoding="utf-8")
     write_task_result(
         tmp_path,
         child_id,
@@ -163,11 +181,8 @@ def test_artifact_change_reopens_exact_hash_disposition(tmp_path):
         root_task_id="parent1",
         delegation_role="subagent",
         result="artifact-backed result",
+        artifacts=[artifact_record(artifact_path)],
     )
-    artifact_dir = task_artifact_dir_path(tmp_path, child_id)
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    artifact_path = artifact_dir / "report.md"
-    artifact_path.write_text("version one\n", encoding="utf-8")
     shown_hash = _child_result_sha256(load_effective_task_result(tmp_path, child_id))
     assert _tree_note(
         _parent_ctx(tmp_path),
@@ -180,6 +195,8 @@ def test_artifact_change_reopens_exact_hash_disposition(tmp_path):
     ) == "integrated"
 
     artifact_path.write_text("version two\n", encoding="utf-8")
+    assert _child_result_sha256(load_effective_task_result(tmp_path, child_id)) == shown_hash
+    write_task_result(tmp_path, child_id, "completed", artifacts=[artifact_record(artifact_path)])
     changed = load_effective_task_result(tmp_path, child_id)
     assert _child_result_sha256(changed) != shown_hash
     assert _current_child_result_disposition(changed) == ""
@@ -236,6 +253,7 @@ def test_malformed_disposition_names_every_violation_in_one_reply(tmp_path):
     result = _tree_note(_parent_ctx(tmp_path), "decision", "x" * 501, payload=bad)
 
     assert result.count("CHILD_RESULT_DISPOSITION_INVALID") == 1
+    assert _typed_code(result) == "TOOL_ARG_ERROR"
     for fragment in (
         "unknown key(s) supports_claims",
         "disposition must be one of",
@@ -281,6 +299,7 @@ def test_ledger_append_renders_the_same_aggregated_violations(tmp_path):
     )
 
     assert out.startswith("⚠️ CHILD_RESULT_DISPOSITION_INVALID:")
+    assert _typed_code(out) == "TOOL_ARG_ERROR"
     for fragment in (
         "unknown key(s) supports_claims",
         "disposition must be one of",
@@ -394,6 +413,8 @@ def test_batch_disposition_rejects_invalid_entries_individually(tmp_path):
     assert "[stranger9] ⚠️ CHILD_RESULT_LINEAGE_FORBIDDEN" in result
     assert "disposition must be one of" in result
     assert "[entry 4] ⚠️ CHILD_RESULT_DISPOSITION_INVALID: entry must be a JSON object." in result
+    # A partial batch stays a warning: the recorded entries are real work.
+    assert _typed_code(result) == "LEGACY_WARNING"
     rows = tree_ledger_rows("parent1", data_root=tmp_path)
     assert [row["payload"]["child_task_id"] for row in rows] == ["child1"]
 
@@ -413,6 +434,7 @@ def test_batch_disposition_envelope_is_validated_atomically(tmp_path):
         result = _tree_note(_parent_ctx(tmp_path), "decision", "why", payload=payload)
         assert "CHILD_RESULT_DISPOSITION_INVALID" in result
         assert "atomic no-op" in result
+        assert _typed_code(result) == "TOOL_ARG_ERROR"
     wrong_kind = _tree_note(
         _parent_ctx(tmp_path),
         "note",
@@ -635,7 +657,7 @@ def test_cancellation_wins_and_late_scratch_result_is_deleted(tmp_path):
         trace_summary="late trace",
     )
 
-    assert remove_subagent_task_drive(tmp_path, child_id) is True
+    assert remove_subagent_task_drive(tmp_path, child_id, live=lambda _task: False) is True
     assert not scratch.parent.exists()
     raw = load_task_result(tmp_path, child_id) or {}
     assert raw["status"] == STATUS_CANCELLED

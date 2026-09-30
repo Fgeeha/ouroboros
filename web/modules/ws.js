@@ -6,6 +6,11 @@ import { apiFetch } from './api_client.js';
 // fuse for a browser runtime whose WebSocket stack froze.
 export const RECOVERY_HEALTHY_PROBE_LIMIT = 4;
 
+// Pause before the post-open state read is repeated after a non-answer; it grows
+// 1.5x per attempt up to the cap, the same curve the recovery probe uses.
+const POST_OPEN_RETRY_MS = 2000;
+const POST_OPEN_RETRY_MAX_MS = 30000;
+
 /**
  * SSOT for the served-SHA reload decision, shared by the post-open state
  * refresh and the socket-down recovery probe.
@@ -48,6 +53,7 @@ export class WS {
         this._lastMessageAt = 0;
         this._reconnectTimer = null;
         this._uiRecoveryTimer = null;
+        this._postOpenRetryTimer = null;
         this._uiRecoveryProbeInFlight = false;
         // Disconnect-episode generation: bumped on every successful open so a
         // probe armed during an earlier disconnect episode can recognize that
@@ -75,6 +81,13 @@ export class WS {
         if (this._uiRecoveryTimer) {
             clearTimeout(this._uiRecoveryTimer);
             this._uiRecoveryTimer = null;
+        }
+    }
+
+    _clearPostOpenRetryTimer() {
+        if (this._postOpenRetryTimer) {
+            clearTimeout(this._postOpenRetryTimer);
+            this._postOpenRetryTimer = null;
         }
     }
 
@@ -220,14 +233,30 @@ export class WS {
         this.reconnectDelay = Math.min(Math.round(this.reconnectDelay * 1.5), this.maxDelay);
     }
 
-    _refreshStateAfterOpen(previouslyConnected) {
+    _refreshStateAfterOpen(previouslyConnected, delay = POST_OPEN_RETRY_MS) {
         // Capture the socket this refresh belongs to: if the connection cycles
         // while the fetch is in flight, the NEWER open's refresh owns the SHA
         // decision — a stale response must not overwrite _lastSha or reload
         // (mirror of the recovery probe's OPEN bail).
         const socket = this.ws;
+        this._clearPostOpenRetryTimer();
+        // A non-OK answer or a failed request is no answer, not a "keep": a
+        // server seconds into its life can answer 500, and an open that gave
+        // up there kept the old JS/CSS until the next disconnect. The read
+        // repeats with a growing pause until the server answers or this socket
+        // is gone; a non-answer itself still never reloads.
+        const retry = () => {
+            if (this.ws !== socket) return;
+            this._postOpenRetryTimer = setTimeout(() => {
+                this._postOpenRetryTimer = null;
+                if (this.ws !== socket) return;
+                this._refreshStateAfterOpen(previouslyConnected,
+                    Math.min(Math.round(delay * 1.5), POST_OPEN_RETRY_MAX_MS));
+            }, delay);
+        };
         apiFetch('/api/state', { cache: 'no-store' }).then(async (resp) => {
-            if (!resp.ok) return;
+            if (this.ws !== socket) return;
+            if (!resp.ok) { retry(); return; }
             let servedSha;
             try {
                 servedSha = (await resp.json())?.sha;
@@ -235,7 +264,7 @@ export class WS {
             if (this.ws !== socket) return;
             const decision = this._applyShaDecision(servedSha, previouslyConnected, true);
             if (decision !== 'keep') this._reloadForShaDecision(decision);
-        }).catch(() => {});
+        }, retry).catch(() => {});
     }
 
     _flushPendingMessages() {
@@ -272,7 +301,8 @@ export class WS {
         const handleDisconnect = () => {
             if (disconnected) return;
             disconnected = true;
-            if (this.ws === socket) this.ws = null;
+            // A newer socket owns its own retry; an older socket's late close leaves it alone.
+            if (this.ws === socket) { this.ws = null; this._clearPostOpenRetryTimer(); }
             this._clearWatchdogTimer();
             this.emit('close');
             this._scheduleReconnect();

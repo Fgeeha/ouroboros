@@ -27,6 +27,7 @@ def boot_state(tmp_path, monkeypatch):
     state.init(tmp_path)
     (tmp_path / "state").mkdir(parents=True, exist_ok=True)
     (tmp_path / "locks").mkdir(parents=True, exist_ok=True)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     cfg._RETIREMENT_NOTICE_SEEN.clear()
     yield tmp_path
     cfg._RETIREMENT_NOTICE_SEEN.clear()
@@ -213,4 +214,4 @@ def test_the_supervisor_boot_calls_the_notice_after_the_queue_restore():
     source = (pathlib.Path(__file__).resolve().parents[1] / "server.py").read_text(encoding="utf-8")
     body = source.split("def _run_supervisor(settings: dict) -> None:", 1)[1]
     assert "_startup_retired_settings_notice(settings)" in body.split("\ndef ", 1)[0]
-    assert body.index("restore_pending_from_snapshot()") < body.index("_startup_retired_settings_notice(settings)")
+    assert body.index("restore_pending_from_snapshot(") < body.index("_startup_retired_settings_notice(settings)")

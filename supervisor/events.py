@@ -155,6 +155,7 @@ def _handle_main_llm_call_state(evt: Dict[str, Any], ctx: Any) -> None:
 # so this facade stays the single import surface for callers and tests.
 from supervisor.events_budget import (  # noqa: E402, F401 -- intentional public re-exports
     _handle_budget_pause,
+    _handle_budget_resume_child,
     _handle_budget_root_fence,
     _handle_llm_usage,
     _set_root_budget_pause_locked,
@@ -190,6 +191,7 @@ from supervisor.events_project_routing import (  # noqa: E402, F401 -- intention
     _handle_project_digest,
     _handle_promote_chat_to_task,
     _handle_routing_manual_target,
+    _notify_host_initiated_refusal,
     _persist_promote_rejection,
     _prepare_promote_source_off_loop,
     _publish_routing_ack,
@@ -205,13 +207,8 @@ from supervisor.events_runtime_controls import (  # noqa: E402, F401 -- intentio
 )
 from supervisor.events_schedule_task import (  # noqa: E402, F401 -- intentional public re-exports
     VALID_SUBAGENT_MEMORY_MODES,
-    _PARENT_CONTEXT_END,
-    _PARENT_CONTEXT_MARKER,
     _cleanup_rejected_worktree,
-    _extract_task_description_and_context,
-    _find_duplicate_task,
     _handle_schedule_task,
-    _format_task_for_dedup,
     _reject_schedule_task,
 )
 from supervisor.events_subagent_admission import (  # noqa: E402, F401 -- intentional public re-exports
@@ -247,6 +244,7 @@ from supervisor.events_worker_reports import (  # noqa: E402, F401 -- intentiona
     _handle_log_event,
     _handle_skill_lifecycle,
     _handle_task_dispatch_resolved,
+    _handle_task_focus_updated,
     _handle_task_heartbeat,
     _handle_task_metrics,
 )
@@ -265,8 +263,10 @@ EVENT_HANDLERS = {
     "main_llm_call_state": _handle_main_llm_call_state,
     "budget_pause": _handle_budget_pause,
     "budget_root_fence": _handle_budget_root_fence,
+    "budget_resume_child": _handle_budget_resume_child,
     "task_heartbeat": _handle_task_heartbeat,
     "task_dispatch_resolved": _handle_task_dispatch_resolved,
+    "task_focus_updated": _handle_task_focus_updated,
     "typing_start": _handle_typing_start,
     "send_message": _handle_send_message,
     "task_done": _handle_task_done,

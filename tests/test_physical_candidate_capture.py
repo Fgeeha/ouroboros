@@ -238,15 +238,13 @@ def test_local_candidate_is_measured_after_existing_local_transform(data_root, m
     monkeypatch.setattr(
         local_model,
         "get_manager",
-        lambda: SimpleNamespace(get_context_length=lambda: 8192),
+
+        lambda: SimpleNamespace(serving_context_evidence=lambda: {"context_window": 8192, "confirmed": True}, measure_prepared_input=lambda payload: {"supported": False}),
     )
     monkeypatch.setattr(
         client,
         "_prepare_messages_for_local_context",
-        lambda messages, ctx_len, max_tokens: [{
-            "role": "system",
-            "content": [{"type": "text", "text": "post-local-compactor"}],
-        }],
+        lambda messages, ctx_len, max_tokens: [{"role": "system", "content": "post-local-compactor"}],
     )
     tools = [{
         "type": "function",
@@ -270,9 +268,75 @@ def test_local_candidate_is_measured_after_existing_local_transform(data_root, m
     }]
     assert sent["max_tokens"] == 2048
     final = _rows(data_root)[-1]
+
     raw = _canonical_candidate_bytes(sent)
     assert final["candidate_raw_sha256"] == hashlib.sha256(raw).hexdigest()
     assert final["candidate_raw_size_bytes"] == len(raw)
+
+
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("timeout", [33.0, None, 0.0, -1.0])
+@pytest.mark.parametrize("measurement_supported", [False, True], ids=["estimated", "measured"])
+def test_local_transport_timeout_is_separate_from_physical_candidate(
+    data_root, monkeypatch, asynchronous, timeout, measurement_supported,
+):
+    from importlib import import_module
+
+    import httpx
+    from openai import OpenAI
+
+    from ouroboros.local_model_server import input_fingerprint
+    from ouroboros.observability import read_blob_ref
+
+    client = LLMClient(api_key="unused")
+    sent, transport_timeouts, measured = [], [], []
+
+    def handle(request):
+        sent.append(json.loads(request.content))
+        transport_timeouts.append(request.extensions["timeout"])
+        return httpx.Response(200, json=_Response(text="local").model_dump())
+
+    def measure(payload):
+        measured.append(copy.deepcopy(payload))
+        return {
+            "supported": measurement_supported, "input_is_exact": measurement_supported,
+            "input_tokens": 8, "context_window": 8192, "process_id": 123,
+            "native_input_sha256": input_fingerprint(payload),
+            "output_limit_enforced": True, "reasoning_included_in_limit": True,
+        }
+
+    monkeypatch.setattr(import_module("ouroboros.local_model"), "get_manager", lambda: SimpleNamespace(
+        serving_context_evidence=lambda: {"context_window": 8192, "confirmed": True, "process_id": 123},
+        measure_prepared_input=measure,
+    ))
+    messages = [{"role": "user", "content": "hello", "_context_capsule": {"generation": 2}}]
+    original = copy.deepcopy(messages)
+    kwargs = dict(messages=messages, model="local", use_local=True, max_tokens=512, timeout=timeout)
+    with OpenAI(
+        base_url="http://127.0.0.1:8799/v1", api_key="local", max_retries=0, timeout=91.0,
+        http_client=httpx.Client(transport=httpx.MockTransport(handle)),
+    ) as transport, ua.usage_scope(_scope(data_root)), ua.physical_attempt_limit(1):
+        monkeypatch.setattr(client, "_get_local_client", lambda: transport)
+        message, usage = asyncio.run(client.chat_async(**kwargs)) if asynchronous else client.chat(**kwargs)
+
+    assert message["content"] == "local" and len(sent) == 1
+    # Assert the SDK's actual HTTP timeout, including its unchanged default
+    # when the caller supplies no positive override, independently of kwargs.
+    expected_timeout = timeout if timeout is not None and timeout > 0 else 91.0
+    assert transport_timeouts == [dict.fromkeys(("connect", "read", "write", "pool"), expected_timeout)]
+    physical = sent[0]
+    assert measured == [physical] and "timeout" not in measured[0]
+    assert not _has_capsule(physical) and messages == original
+    raw = _canonical_candidate_bytes(physical)
+    rows = _rows(data_root)
+    assert [row["state"] for row in rows] == ["reserved", "dispatched", "settled"]
+    assert all(row["candidate_raw_sha256"] == hashlib.sha256(raw).hexdigest() for row in rows)
+    assert all(row["candidate_raw_size_bytes"] == len(raw) for row in rows)
+    assert rows[0]["reservation_upper_bound_usd"] == rows[-1]["cost_usd"] == 0.0
+    assert usage["cost"] == 0.0 and usage["cost_final"] is True
+    assert usage["ledger_attempt_ids"] == [rows[-1]["attempt_id"]]
+    manifest = _manifest(rows[-1]["candidate_manifest_ref"])
+    assert read_blob_ref(data_root, manifest["full_payload_ref"]) == physical
 
 
 def test_local_read_timeout_after_dispatch_is_not_retried(data_root, monkeypatch):
@@ -297,7 +361,8 @@ def test_local_read_timeout_after_dispatch_is_not_retried(data_root, monkeypatch
     monkeypatch.setattr(
         local_model,
         "get_manager",
-        lambda: SimpleNamespace(get_context_length=lambda: 8192),
+
+        lambda: SimpleNamespace(serving_context_evidence=lambda: {"context_window": 8192, "confirmed": True}, measure_prepared_input=lambda payload: {"supported": False}),
     )
     with ua.usage_scope(_scope(data_root, "task-local-timeout")), ua.bind_physical_attempt_context(
         _physical_context("route-local-timeout")

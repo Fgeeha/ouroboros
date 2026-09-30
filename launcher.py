@@ -1,4 +1,4 @@
-"""Immutable desktop launcher: bootstrap repo, manage server.py, and host UI."""
+"""Immutable launcher: bootstrap repo, manage server.py, and optionally host UI."""
 
 from __future__ import annotations
 
@@ -32,6 +32,7 @@ os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
 from ouroboros.config import (
     AGENT_SERVER_PORT,
     DATA_DIR,
+    LAUNCHER_STOP_GRACE_SEC,
     PANIC_EXIT_CODE,
     PORT_FILE,
     REPO_DIR,
@@ -53,6 +54,9 @@ from ouroboros.launcher_bootstrap import (
     check_git as _check_git,
     install_deps as _install_deps_impl,
     embedded_python_env,
+    update_external_host,
+    parse_launch_options,
+    automatic_launch_allowed,
     sync_existing_repo_from_bundle as _sync_existing_repo_from_bundle_impl,
 )
 from ouroboros.launcher_onboarding import (
@@ -92,15 +96,13 @@ from ouroboros.platform_layer import (
     subprocess_new_group_kwargs,
     terminate_job,
     terminate_process_group_id,
-    terminate_process_tree,
+    request_native_attention,
 )
 from ouroboros.utils import atomic_write_json, utc_now_iso
 
 MAX_CRASH_RESTARTS = 5
 CRASH_WINDOW_SEC = 120
-# One bounded, visible retry when a restart's dependency install fails (XG-7B.3):
-# long enough to ride out a transient index/network hiccup, short enough not to
-# stall an offline restart whose requirements are already satisfied.
+# One bounded visible retry when dependency installation fails.
 _DEPS_RETRY_DELAY_SEC = 5
 _CREATE_SUSPENDED = getattr(subprocess, "CREATE_SUSPENDED", 0x4) if IS_WINDOWS else 0
 _CREATE_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if IS_WINDOWS else 0
@@ -182,7 +184,7 @@ EMBEDDED_PYTHON = _find_embedded_python()
 def _bundle_dir() -> pathlib.Path:
     if getattr(sys, "frozen", False):
         return pathlib.Path(sys._MEIPASS)
-    return pathlib.Path(__file__).parent
+    return _external_seed_bundle or pathlib.Path(__file__).parent
 
 
 def _bootstrap_context() -> BootstrapContext:
@@ -192,7 +194,7 @@ def _bootstrap_context() -> BootstrapContext:
         data_dir=DATA_DIR,
         settings_path=SETTINGS_PATH,
         embedded_python=EMBEDDED_PYTHON,
-        app_version=APP_VERSION,
+        app_version=(_external_seed_bundle / "VERSION").read_text().strip() if _external_seed_bundle else APP_VERSION,
         hidden_run=_hidden_run,
         # Launcher is owner-process boundary; first-launch migration may set runtime mode.
         save_settings=lambda settings: save_settings(settings, allow_elevation=True),
@@ -229,6 +231,11 @@ _webview_window = None
 # probe never runs there, so every `if _headless:` branch is dead code on
 # those platforms and their behavior is unchanged.
 _headless = False
+_external_ui = False
+_external_host_update: Optional[pathlib.Path] = None
+_external_host_result: dict = {}
+_external_seed_bundle: Optional[pathlib.Path] = None
+_launch_argv: list[str] = []
 
 
 def _server_process_identity_matches(record: dict) -> bool:
@@ -259,12 +266,14 @@ def _server_process_identity_matches(record: dict) -> bool:
     return expected_server in command or ("server.py" in command and expected_repo in command)
 
 
-def _write_server_process_record(proc: subprocess.Popen, *, port: int, server_py: pathlib.Path) -> None:
+def _write_server_process_record(proc: subprocess.Popen, *, port: int, server_py: pathlib.Path,
+                                 server_host_source: str) -> None:
     try:
         record = {
             "pid": int(proc.pid),
             "pgid": process_group_id(proc.pid),
             "server_path": str(server_py.resolve()),
+            "server_host_source": server_host_source,
             "repo_dir": str(REPO_DIR.resolve()),
             "requested_port": int(port),
             "port": int(port),
@@ -293,6 +302,16 @@ def _update_server_process_record_port(pid: int, actual_port: int) -> None:
         log.debug("Failed to update server process record port", exc_info=True)
 
 
+def _retained_shared_daemon_pids() -> set[int]:
+    """Read this installation's shared daemon custody; never start or adopt it."""
+    from ouroboros.claudexor_daemon import CUSTODY_PURPOSE
+    from ouroboros.process_custody import live_daemon_root_pids
+
+    return live_daemon_root_pids(
+        DATA_DIR, purposes={CUSTODY_PURPOSE}, retained_purposes={CUSTODY_PURPOSE}, strict=True,
+    )
+
+
 def _cleanup_recorded_server_process(reason: str = "preflight") -> None:
     try:
         record_path = _server_process_record_path()
@@ -308,13 +327,14 @@ def _cleanup_recorded_server_process(reason: str = "preflight") -> None:
             return
         pid = int(record.get("pid") or 0)
         pgid = int(record.get("pgid") or 0)
+        retained = _retained_shared_daemon_pids()
         log.info("Cleaning recorded server process pid=%d pgid=%d (%s)", pid, pgid, reason)
         if not IS_WINDOWS and pgid > 0 and pgid != current_process_group_id():
-            terminate_process_group_id(pgid)
+            terminate_process_group_id(pgid, exclude_pids=retained)
             time.sleep(0.5)
-            kill_process_group_id(pgid)
+            kill_process_group_id(pgid, exclude_pids=retained)
         if pid_is_alive(pid):
-            kill_pid_tree(pid)
+            kill_pid_tree(pid, exclude_pids=retained)
         record_path.unlink(missing_ok=True)
     except Exception:
         log.warning("Failed to clean recorded server process (%s)", reason, exc_info=True)
@@ -329,6 +349,7 @@ def _cleanup_recorded_server_group_for_pid(pid: int, reason: str = "agent_exit")
         if not isinstance(record, dict) or int(record.get("pid") or 0) != int(pid):
             return
         pgid = int(record.get("pgid") or 0)
+        retained = _retained_shared_daemon_pids()
         live_pgid = process_group_id(int(pid)) if pid_is_alive(int(pid)) else 0
         if not IS_WINDOWS and live_pgid > 0 and pgid > 0 and pgid != live_pgid:
             log.info(
@@ -341,11 +362,11 @@ def _cleanup_recorded_server_group_for_pid(pid: int, reason: str = "agent_exit")
             pgid = 0
         if not IS_WINDOWS and pgid > 0 and pgid != current_process_group_id():
             log.info("Cleaning server process group pgid=%d after pid=%d exit (%s)", pgid, pid, reason)
-            terminate_process_group_id(pgid)
+            terminate_process_group_id(pgid, exclude_pids=retained)
             time.sleep(0.2)
-            kill_process_group_id(pgid)
+            kill_process_group_id(pgid, exclude_pids=retained)
         if pid_is_alive(int(pid)):
-            kill_pid_tree(int(pid))
+            kill_pid_tree(int(pid), exclude_pids=retained)
         record_path.unlink(missing_ok=True)
     except Exception:
         log.warning("Failed to clean recorded server process group (%s)", reason, exc_info=True)
@@ -366,6 +387,7 @@ def start_agent(port: int = AGENT_SERVER_PORT) -> subprocess.Popen:
     # export exclusion closed — setdefault lets the settings value stand in
     # only when the environment says nothing.
     saved_host = str(settings.get("OUROBOROS_SERVER_HOST") or "").strip()
+    host_source = "environment" if str(env.get("OUROBOROS_SERVER_HOST") or "").strip() else "settings"
     if saved_host:
         env.setdefault("OUROBOROS_SERVER_HOST", saved_host)
     env["OUROBOROS_SERVER_PORT"] = str(port)
@@ -373,8 +395,8 @@ def start_agent(port: int = AGENT_SERVER_PORT) -> subprocess.Popen:
     env["OUROBOROS_REPO_DIR"] = str(REPO_DIR)
     env["OUROBOROS_APP_VERSION"] = str(APP_VERSION)
     env["OUROBOROS_MANAGED_BY_LAUNCHER"] = "1"
-    # Owner Surface Fact: the launcher is the only actor that knows HOW this
-    # server will be presented. `_headless` is decided in main() before the
+    env["OUROBOROS_MANAGED_REPO_DIR"] = str(REPO_DIR.resolve())
+    # Owner Surface Fact: the launcher alone knows presentation; `_headless` is decided in main() before the
     # lifecycle loop ever calls start_agent(), and every managed restart funnels
     # back through here, so the export is re-stamped fresh each time. Absence of
     # the var (source mode, Docker, Colab, CLI server) truthfully means "web".
@@ -382,7 +404,16 @@ def start_agent(port: int = AGENT_SERVER_PORT) -> subprocess.Popen:
     # erase an injected value). Known bounded lie: a SIGKILLed launcher can
     # orphan the server with a stale "desktop_window" until the next launcher
     # start reaps it — the same envelope OUROBOROS_MANAGED_BY_LAUNCHER accepts.
-    env["OUROBOROS_PRESENTATION"] = "browser_fallback" if _headless else "desktop_window"
+    env["OUROBOROS_PRESENTATION"] = (
+        str(os.environ.get("OUROBOROS_PRESENTATION") or "web")
+        if _external_ui else "browser_fallback" if _headless else "desktop_window"
+    )
+    if _external_host_update is not None:
+        env["OUROBOROS_EXTERNAL_HOST_UPDATE"] = str(_external_host_update)
+        env["OUROBOROS_EXTERNAL_HOST_RESULT"] = json.dumps(_external_host_result)
+    else:
+        env.pop("OUROBOROS_EXTERNAL_HOST_UPDATE", None)
+        env.pop("OUROBOROS_EXTERNAL_HOST_RESULT", None)
     # The server runs out of the managed repo, not the bundle: without this the
     # bundled payloads (node, ripgrep) are invisible to it (platform_layer.
     # bundled_resource_bases).
@@ -410,7 +441,7 @@ def start_agent(port: int = AGENT_SERVER_PORT) -> subprocess.Popen:
     _agent_proc = proc
 
     if IS_WINDOWS:
-        job = create_kill_on_close_job()
+        job = create_kill_on_close_job(allow_breakaway=True)
         if job is None:
             log.error(
                 "Failed to create Windows Job Object; refusing to run without process-tree ownership."
@@ -436,7 +467,7 @@ def start_agent(port: int = AGENT_SERVER_PORT) -> subprocess.Popen:
             return proc
         log.info("Agent pid %d assigned to Windows Job Object", proc.pid)
 
-    _write_server_process_record(proc, port=port, server_py=server_py)
+    _write_server_process_record(proc, port=port, server_py=server_py, server_host_source=host_source)
 
     def _stream_output() -> None:
         # Size-capped copy (CPL4-C5): same bound as the server.log stdlib
@@ -502,16 +533,18 @@ def stop_agent() -> None:
 
     log.info("Stopping agent (pid=%s)...", proc.pid)
     try:
-        if IS_WINDOWS:
-            proc.terminate()
-        else:
-            terminate_process_tree(proc)
-        proc.wait(timeout=10)
+        # Graceful phase signals only the server: it owns its Manager and workers (#1142).
+        proc.terminate()
+        proc.wait(timeout=LAUNCHER_STOP_GRACE_SEC)
     except subprocess.TimeoutExpired:
         if IS_WINDOWS and job is not None:
             terminate_job(job)
         else:
-            kill_process_tree(proc)
+            try:
+                kill_process_tree(proc, exclude_pids=_retained_shared_daemon_pids())
+            except Exception:
+                log.warning("Shared daemon custody unavailable; stopping only the captured server", exc_info=True)
+                proc.kill()
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
@@ -589,7 +622,9 @@ def _reap_same_install_strays(reason: str) -> list[int]:
     panic or window-close path — Emergency Stop tears down what it owns and adds no new killing.
     """
     try:
-        return _reap_same_install_strays_impl(REPO_DIR, DATA_DIR, reason)
+        return _reap_same_install_strays_impl(
+            REPO_DIR, DATA_DIR, reason, retained_descendant_roots=_retained_shared_daemon_pids(),
+        )
     except Exception:
         # A sweep that cannot run must not stop the launcher booting.
         log.warning("Same-install stray sweep failed (%s)", reason, exc_info=True)
@@ -632,10 +667,12 @@ def _wait_for_server(port: int, timeout: float = 30.0, abort_event=None) -> bool
     return False
 
 
-def _poll_port_file(timeout: float = 30.0) -> int:
+def _poll_port_file(timeout: float = 30.0, abort_event=None) -> int:
     """Poll until the port file is freshly written."""
     deadline = time.time() + timeout
     while time.time() < deadline:
+        if abort_event is not None and abort_event.is_set():
+            break
         try:
             if PORT_FILE.exists():
                 age = time.time() - PORT_FILE.stat().st_mtime
@@ -686,7 +723,7 @@ def _kill_orphaned_children(port: int, reason: str = "window_close") -> None:
 
 def agent_lifecycle_loop(port: int = AGENT_SERVER_PORT) -> None:
     """Start/monitor agent; restart on code 42 or bounded crashes."""
-    global _agent_proc, _agent_job
+    global _agent_proc, _agent_job, _external_host_result
     crash_times: list[float] = []
 
     while not _shutdown_event.is_set():
@@ -707,11 +744,17 @@ def agent_lifecycle_loop(port: int = AGENT_SERVER_PORT) -> None:
         except OSError:
             pass
 
+        _external_host_result = update_external_host(_external_host_update, EMBEDDED_PYTHON, log, _shutdown_event)
+        if _shutdown_event.is_set():
+            break  # Native preparation has reaped its owned processes before returning.
         proc = start_agent(port)
+        if _shutdown_event.is_set():
+            stop_agent()
+            break
 
-        actual_port = _poll_port_file(timeout=30)
+        actual_port = _poll_port_file(timeout=30, abort_event=_shutdown_event)
         _update_server_process_record_port(proc.pid, actual_port)
-        if not _wait_for_server(actual_port, timeout=45):
+        if not _wait_for_server(actual_port, timeout=45, abort_event=_shutdown_event):
             log.warning("Agent server did not become responsive within 45s (port %d)", actual_port)
 
         proc.wait()
@@ -783,6 +826,9 @@ def agent_lifecycle_loop(port: int = AGENT_SERVER_PORT) -> None:
                         "import them — see the pip output above for the cause.",
                         MAX_CRASH_RESTARTS, CRASH_WINDOW_SEC,
                     )
+            if _external_seed_bundle is not None:
+                release_pid_lock()
+                os.execv(EMBEDDED_PYTHON, [EMBEDDED_PYTHON, str(REPO_DIR / "launcher.py"), *_launch_argv])
             # No port sweep here: _pre_generation_cleanup owns it next iteration.
             continue
 
@@ -813,13 +859,24 @@ def _request_agent_restart() -> None:
     stop_agent()
 
 
-def _await_server_ready(port: int, abort_event=None) -> tuple[bool, int]:
+def _await_server_ready(port: int, abort_event=None, lifecycle_thread=None) -> tuple[bool, int]:
     """Wait for managed-server health; resolve the AUTHORITATIVE bound port.
 
     The server may rebind on conflict and publish the real port in
     ``data/state/server_port``; every later consumer (UI URL, onboarding window,
     teardown sweep) must use that value, not the requested one.
     """
+    if _external_host_update is not None and lifecycle_thread is not None:
+        # Native preparation has its own bounded operation before server.py exists.
+        # Do not spend the HTTP readiness window waiting for a compiler. On shutdown
+        # the hook observes the event and reaps before this thread can finish.
+        while lifecycle_thread.is_alive():
+            with _agent_lock:
+                if _agent_proc is not None:
+                    break
+            lifecycle_thread.join(timeout=0.1)
+        else:
+            return False, _read_port_file()
     ready = _wait_for_server(port, timeout=15, abort_event=abort_event)
     actual_port = _read_port_file()
     if actual_port != port:
@@ -834,8 +891,15 @@ def _load_settings() -> dict:
 
 
 def _save_settings(settings: dict) -> None:
-    # Owner-process boundary: first-run/env/provider saves may elevate runtime mode.
-    save_settings(settings, allow_elevation=True)
+    # The desktop launcher is the owner-controlled writer.  The generic
+    # config.save_settings ratchet deliberately makes allow_elevation inert
+    # after boot, which is correct for agent-reachable callers but also made a
+    # confirmed Cyber Pro selection fall back to Advanced.  Reuse the existing
+    # owner writer so the confirmation is honored while its document lock,
+    # persistence normalization and other owner-only checks remain in force.
+    from ouroboros.gateway.owner_settings import _owner_write_settings
+
+    _owner_write_settings(settings)
 
 
 def _request_runtime_mode_change(mode: str, confirm_fn) -> dict:
@@ -1003,18 +1067,15 @@ def _headless_signal_handler(signum, frame) -> None:
 
 def _open_browser_detached(url: str, outcome: Optional[list] = None) -> threading.Thread:
     """Open the default browser without ever blocking the caller.
-
     `webbrowser.open` waits for the child on a stdlib-resolved console
     browser (w3m/lynx or an unrecognized $BROWSER), which would stall the
     keep-alive loop for that browser's lifetime; the URL is already printed,
     so the open is best-effort and rides a daemon thread. Returns the thread
     so a short-lived caller (the already-running notice) can bound-join it
     before process exit would kill the daemon thread under the opener.
-
     An ``outcome`` list, when given, receives exactly one entry — True/False
     from ``webbrowser.open`` or the raised exception — so a bounded-join
     caller (the desktop bridge) can report failure honestly.
-
     DELIBERATE (owner-approved): the opened browser is the USER'S own
     application, intentionally outside process custody and launcher teardown —
     the Emergency-Stop invariant governs the AGENT'S tree, and killing the
@@ -1035,6 +1096,23 @@ def _open_browser_detached(url: str, outcome: Optional[list] = None) -> threadin
     return thread
 
 
+def _open_external_url(url: str) -> dict:
+    """Shared external-link handoff for both desktop window bridges."""
+    try:
+        raw = str(url or "")
+        if not raw.lower().startswith(("http://", "https://", "mailto:")):
+            return {"ok": False, "error": "Only absolute http://, https:// or mailto: links can be opened."}
+        outcome: list = []
+        # Settled failure is reported; a slow browser stays detached.
+        _open_browser_detached(raw, outcome).join(timeout=3.0)
+        if outcome and outcome[0] is not True:
+            return {"ok": False, "error": f"The default browser could not be opened: {outcome[0] or 'no handler found'}"}
+        return {"ok": True}
+    except Exception as exc:
+        log.warning("Desktop external-URL open failed: %s", exc, exc_info=True)
+        return {"ok": False, "error": str(exc)}
+
+
 def _run_headless_main(url: str, port: int, lifecycle_thread: threading.Thread) -> None:
     """Browser-mode replacement for the main webview window (Linux headless).
 
@@ -1050,13 +1128,16 @@ def _run_headless_main(url: str, port: int, lifecycle_thread: threading.Thread) 
         # A signal can land between main()'s startup check and this entry:
         # no URL announcement / browser launch mid-shutdown — straight to
         # teardown (the keep-alive loop returns immediately).
-        log.info("Headless browser mode: serving the UI at %s", url)
-        print(
-            f"Ouroboros is running at {url}. No GUI backend (GTK/QT) — "
-            "opening in your default browser. Press Ctrl-C to stop.",
-            flush=True,
-        )
-        _open_browser_detached(url)
+        log.info("Headless mode: serving the UI at %s", url)
+        if _external_ui:
+            print(f"Ouroboros is running at {url}. UI is owned by the host.", flush=True)
+        else:
+            print(
+                f"Ouroboros is running at {url}. No GUI backend (GTK/QT) — "
+                "opening in your default browser. Press Ctrl-C to stop.",
+                flush=True,
+            )
+            _open_browser_detached(url)
     # Handlers were installed in main() BEFORE the lifecycle thread started;
     # the browser open above rides a daemon thread because stdlib can resolve
     # a console browser (GenericBrowser) that blocks for its whole lifetime.
@@ -1069,6 +1150,8 @@ def _run_headless_main(url: str, port: int, lifecycle_thread: threading.Thread) 
             break
     requested_shutdown = _shutdown_event.is_set()
     stop_agent()
+    if _external_host_update is not None:
+        lifecycle_thread.join()  # The hook observes shutdown and owns its bounded reap.
     _kill_orphaned_children(port, reason="headless_shutdown" if requested_shutdown else "crash_fuse")
     # NO explicit release_pid_lock(): sys.exit runs the atexit-registered
     # release, and a second release would unconditionally unlink a lock a
@@ -1076,8 +1159,16 @@ def _run_headless_main(url: str, port: int, lifecycle_thread: threading.Thread) 
     sys.exit(0 if requested_shutdown else 1)
 
 
-def main():
-    if IS_WINDOWS:
+def main(argv=()):
+    global _headless, _external_ui, _external_host_update, _external_seed_bundle, _launch_argv
+    options = parse_launch_options(argv)
+    _launch_argv = list(argv)
+    _external_ui = options.no_ui
+    _external_host_update = options.host_update.resolve() if options.host_update is not None else None
+    _external_seed_bundle = options.seed_bundle.resolve() if options.seed_bundle is not None else None
+    if _external_ui:
+        _headless = True
+    if IS_WINDOWS and not _external_ui:
         ok, reason = _prepare_windows_webview_runtime()
         if not ok:
             log.error("Windows UI runtime initialization failed: %s", reason)
@@ -1089,7 +1180,8 @@ def main():
             )
             return
 
-    _detect_headless()
+    if not _external_ui:
+        _detect_headless()
 
     if not _headless:
         import webview
@@ -1121,7 +1213,8 @@ def main():
             # default browser at it. Bounded join: the open rides a daemon
             # thread (see _open_browser_detached), and returning immediately
             # would end the process under the opener before it fires.
-            _open_browser_detached(existing_url).join(timeout=5.0)
+            if not _external_ui:
+                _open_browser_detached(existing_url).join(timeout=5.0)
             return
         webview.create_window(
             "Ouroboros",
@@ -1130,12 +1223,15 @@ def main():
             width=420,
             height=200,
         )
-        webview.start()
+        webview.start(private_mode=False)
         return
 
     import atexit
 
     atexit.register(release_pid_lock)
+
+    if not automatic_launch_allowed(options.launch_intent, DATA_DIR, log):
+        return
 
     if not check_git():
         log.warning("Git not found.")
@@ -1214,7 +1310,7 @@ def main():
             width=520,
             height=300,
         )
-        webview.start(func=_git_page, args=[git_window])
+        webview.start(func=_git_page, args=[git_window], private_mode=False)
         if not check_git():
             sys.exit(1)
 
@@ -1254,13 +1350,14 @@ def main():
     lifecycle_thread = threading.Thread(target=agent_lifecycle_loop, args=(port,), daemon=True)
     lifecycle_thread.start()
 
-    server_ready, actual_port = _await_server_ready(port, _abort)
+    server_ready, actual_port = _await_server_ready(port, _abort, lifecycle_thread)
 
     if server_ready and onboarding_required and not _shutdown_event.is_set():
         # The gateway is live and, with no provider configured, runs WITHOUT a
         # supervisor — the supported state that lets the wizard reach /api/*.
         onboarding = _present_first_run_onboarding(
-            onboarding_settings, actual_port, headless=_headless
+            onboarding_settings, actual_port, headless=_headless,
+            open_external_url=_open_external_url,
         )
         if not onboarding["saved"]:
             log.info(
@@ -1272,7 +1369,7 @@ def main():
             # runtime-mode baseline). The launcher owns the process, so it
             # recycles it instead of leaving the owner with a restart nag.
             _request_agent_restart()
-            server_ready, actual_port = _await_server_ready(port, _abort)
+            server_ready, actual_port = _await_server_ready(port, _abort, lifecycle_thread)
 
     if _headless and _shutdown_event.is_set():
         # Shutdown during startup: same teardown the keep-alive loop performs
@@ -1315,7 +1412,7 @@ def main():
             width=520,
             height=260,
         )
-        webview.start()
+        webview.start(private_mode=False)
         return
 
     def _resolve_bridge_file_url(raw_url: str) -> str:
@@ -1363,6 +1460,29 @@ def main():
                 log.warning("Runtime mode native confirmation failed: %s", exc, exc_info=True)
                 return {"ok": False, "error": f"Native confirmation failed: {exc}"}
 
+        def confirm_runtime_mode_change(self, mode: str) -> dict:
+            """Confirm a mode change without writing it.
+
+            The SPA persists the selected mode through the owner HTTP endpoint.
+            Keeping this bridge side-effect free lets older shells fall back to
+            the same in-app confirmation instead of normalizing newer modes
+            such as Cyber Pro through their stale local enum.
+            """
+            try:
+                mode_text = str(mode or "").strip().lower()
+                if mode_text not in {"light", "advanced", "pro", "cyber_pro"}:
+                    return {"confirmed": False, "error": "Unknown runtime mode."}
+                settings = _load_settings()
+                current = normalize_runtime_mode(settings.get("OUROBOROS_RUNTIME_MODE"))
+                message = (
+                    f"Change Ouroboros runtime mode from {current} to {mode_text}?\n\n"
+                    "The new mode is saved through the owner endpoint and takes effect after restart."
+                )
+                return {"confirmed": bool(self._native_confirm("Confirm Runtime Mode Change", message))}
+            except Exception as exc:
+                log.warning("Runtime mode native confirmation failed: %s", exc, exc_info=True)
+                return {"confirmed": False, "error": f"Native confirmation failed: {exc}"}
+
         def request_auto_grant_reviewed_skills_change(self, enabled: bool) -> dict:
             try:
                 return _request_auto_grant_reviewed_skills_change(bool(enabled), self._native_confirm)
@@ -1390,19 +1510,9 @@ def main():
                 return {"ok": False, "error": str(exc)}
 
         def open_external_url(self, url: str) -> dict:
-            try:
-                raw = str(url or "")
-                if not raw.lower().startswith(("http://", "https://", "mailto:")):
-                    return {"ok": False, "error": "Only absolute http://, https:// or mailto: links can be opened."}
-                outcome: list = []
-                # Bounded join: settled failure reported honestly; still-running stays detached.
-                _open_browser_detached(raw, outcome).join(timeout=3.0)
-                if outcome and outcome[0] is not True:
-                    return {"ok": False, "error": f"The default browser could not be opened: {outcome[0] or 'no handler found'}"}
-                return {"ok": True}
-            except Exception as exc:
-                log.warning("Desktop external-URL open failed: %s", exc, exc_info=True)
-                return {"ok": False, "error": str(exc)}
+            return _open_external_url(url)
+        def request_attention(self, sound: bool = True) -> dict:
+            return request_native_attention(_webview_window.show if _webview_window else None, sound=bool(sound))
 
         def save_bytes_to_downloads(self, filename: str, b64: str) -> dict:
             try:
@@ -1464,9 +1574,9 @@ def main():
         os._exit(0)
 
     window.events.closing += _on_closing
-    _webview_window = window
+    _webview_window = window  # Persist cookies and website data (ouroboros.theme); rebuild/limits: ARCHITECTURE §3.
 
-    webview.start(debug=False)
+    webview.start(debug=False, private_mode=False)
 
 
 if __name__ == "__main__":
@@ -1486,4 +1596,4 @@ if __name__ == "__main__":
         except Exception:
             pass
 
-    main()
+    main(sys.argv[1:])

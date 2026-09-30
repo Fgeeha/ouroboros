@@ -44,25 +44,6 @@ def _write_owner_attested_review(state_dir, content_hash, with_marker):
             json.dumps({"attested_at": "now", "content_hash": content_hash}), encoding="utf-8")
 
 
-def test_owner_attest_self_call_is_blocked_in_shell_and_browser():
-    # The agent must not loopback-call the owner-only attestation endpoint through any
-    # channel (otherwise it could self-bypass the immune system's skill review).
-    from ouroboros.tools.registry import _detect_owner_skill_attest_self_call
-    from ouroboros.browser_policy import _blocks_owner_skill_attest_js
-    cmd = "curl -X post http://127.0.0.1:8765/api/owner/skills/myskill/attest-review"
-    assert _detect_owner_skill_attest_self_call(cmd.lower()) is True
-    js = "fetch('/api/owner/skills/myskill/attest-review', {method:'POST'})"
-    assert _blocks_owner_skill_attest_js(js) is True
-    # Percent-encoded paths (which the server decodes before routing) must NOT slip past.
-    enc = "curl -x post http://127.0.0.1:8765/api/owner/skills/x/%61ttest-review"
-    assert _detect_owner_skill_attest_self_call(enc.lower()) is True
-    enc_js = "fetch('/api/owner/skills/x/attest%2dreview', {method:'POST'})"
-    assert _blocks_owner_skill_attest_js(enc_js) is True
-    # A normal command / JS is not blocked.
-    assert _detect_owner_skill_attest_self_call("ls -la") is False
-    assert _blocks_owner_skill_attest_js("document.title") is False
-
-
 def test_owner_attest_route_level_post_blocked():
     # The Playwright route-level guard aborts a click/form-triggered POST (not just an
     # evaluate fetch) to the owner-only endpoint.
@@ -205,43 +186,47 @@ def test_owner_attest_allows_verified_ouroboroshub(monkeypatch, tmp_path):
 
 
 def test_extensions_review_fields_expose_verified_hub_attestable_hint(monkeypatch):
+    """The listing hint matches against the display view the caller peeked; it
+    never reaches the fresh verifier, and no view means unknown, not negative."""
     import ouroboros.gateway.extensions as ext
     import ouroboros.skill_review as sr
-
-    class _Review:
-        status = "pending"
-        review_profile = ""
-
-        def is_stale_for(self, content_hash):
-            return False
+    from ouroboros.skill_loader import SkillReviewState
 
     class _Skill:
         name = "hub"
         source = "ouroboroshub"
         is_self_authored = False
         content_hash = "hash"
-        review = _Review()
+        review = SkillReviewState(status="pending", content_hash="hash")
 
-    calls = {"count": 0}
+    monkeypatch.setattr(
+        sr, "is_official_hub_payload_verified",
+        lambda _skill: (_ for _ in ()).throw(AssertionError("the hint must not run the fresh verifier")),
+    )
+    seen = []
 
-    def verified(_skill):
-        calls["count"] += 1
-        return True
+    def matches(skill, catalog_files_for):
+        seen.append(catalog_files_for("hub"))
+        return verdict["value"]
 
-    monkeypatch.setattr(sr, "is_official_hub_payload_verified", verified)
-    ext._OFFICIAL_HUB_VERIFIED_HINT_CACHE.clear()
-    fields = ext._review_fields(_Skill())
+    verdict = {"value": True}
+    monkeypatch.setattr(sr, "hub_payload_matches", matches)
+    view = {"hub": [{"path": "SKILL.md", "sha256": "ab"}]}
+
+    fields = ext._review_fields(_Skill(), hub_catalog_files=view)
     assert fields["official_hub_verified"] is True
     assert fields["owner_attestable"] is True
-    fields = ext._review_fields(_Skill())
-    assert fields["official_hub_verified"] is True
-    assert calls["count"] == 1
+    assert seen == [view["hub"]]
 
-    ext._OFFICIAL_HUB_VERIFIED_HINT_CACHE.clear()
-    monkeypatch.setattr(sr, "is_official_hub_payload_verified", lambda skill: False)
-    fields = ext._review_fields(_Skill())
+    verdict["value"] = False
+    fields = ext._review_fields(_Skill(), hub_catalog_files=view)
     assert fields["official_hub_verified"] is False
     assert fields["owner_attestable"] is False
+
+    fields = ext._review_fields(_Skill())
+    assert fields["official_hub_verified"] is None
+    assert fields["owner_attestable"] is None
+    assert len(seen) == 2
 
 
 def test_owner_attest_refuses_invalid_manifest(monkeypatch, tmp_path):

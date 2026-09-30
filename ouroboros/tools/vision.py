@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import pathlib
-import os
 from typing import Any, Dict, List, Optional, Tuple
 
 from ouroboros.config import (
@@ -18,6 +17,7 @@ from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
 from ouroboros.model_wait import current_model_wait, model_waitable
 from ouroboros.utils import emit_cognitive_operation_event
 from ouroboros.observability import new_call_id
+from ouroboros.config import runtime_setting
 
 log = logging.getLogger(__name__)
 
@@ -161,7 +161,8 @@ _VLM_MAX_IMAGE_SIDE = 1600
 
 
 @model_waitable(client_parameter="client")
-def _vision_query_with_timeout(client: Any, *, model_role: str = "vision", **kwargs: Any) -> tuple[str, dict]:
+def _vision_query_with_timeout(client: Any, *, model_role: str = "vision",
+                               processing_preference: Optional[str] = None, **kwargs: Any) -> tuple[str, dict]:
     """Wait around one image call while keeping inference in a tracked child."""
     from ouroboros.provider_models import provider_for_model
     from ouroboros.deadline_utils import dispatch_window_remaining_sec
@@ -179,16 +180,16 @@ def _vision_query_with_timeout(client: Any, *, model_role: str = "vision", **kwa
         raise TimeoutError("VLM task execution window exhausted before child dispatch")
     child_timeout = operation_timeout + NESTED_SETTLEMENT_MARGIN_SEC
     return run_vision_child(child_timeout=child_timeout, subscription=subscription,
-                            model_role=model_role, **kwargs)
+                            model_role=model_role, processing_preference=processing_preference, **kwargs)
 
 
 def _vision_execution_window() -> float:
-    from ouroboros.config import get_task_abs_ceiling_sec
+    from ouroboros.config import get_task_abs_ceiling_sec, operation_window_sec
 
     context = current_model_wait()
     remaining = context.execution_window_remaining() if context else None
-    # An owner without an absolute clock still bounds this individual image.
-    return float(get_task_abs_ceiling_sec()) if remaining is None else remaining
+    # An owner (or task) without an absolute clock still bounds this individual image.
+    return operation_window_sec(get_task_abs_ceiling_sec()) if remaining is None else remaining
 
 
 def _vision_tool_timeout(ctx: Any, tool_args: dict | None) -> float:
@@ -214,16 +215,6 @@ def _path_is_under(path: "pathlib.Path", root: "pathlib.Path") -> bool:
         return True
     except ValueError:
         return False
-
-
-def _detect_image_mime_for_vlm(raw: bytes) -> str:
-    """Return MIME type string or empty string if not a recognised image."""
-    for magic, mime in _IMAGE_MAGIC:
-        if raw[:len(magic)] == magic:
-            return mime
-    if raw[:4] == _IMAGE_WEBP_MAGIC[0] and raw[8:12] == _IMAGE_WEBP_MAGIC[1]:
-        return "image/webp"
-    return ""
 
 
 def _downscale_image_for_vlm(raw: bytes, mime: str) -> Tuple[bytes, str]:
@@ -352,7 +343,7 @@ def _vision_capable_slot_candidates(client: Any, ctx: Any = None) -> List[str]:
         out.append(str(client.default_model() or "").strip())
     except Exception:
         pass
-    out.append(str(os.environ.get("OUROBOROS_MODEL", "") or "").strip())
+    out.append(str(runtime_setting("OUROBOROS_MODEL", "") or "").strip())
     # Fallbacks is a comma chain -> add each link as its own candidate (via the shared
     # SSOT parser, which also honors the legacy singular env), not the raw comma-string
     # (which would never match a vision-capable model id).
@@ -475,8 +466,7 @@ def _read_file_parity_block(ctx: Any, fp: "pathlib.Path") -> str:
     (SC-6). Deriving admission roots from ``profile_readable_root_paths``
     admitted the user_files home, the WHOLE runtime-data drive, and system_repo
     — roots where read_file enforces per-path rules BEYOND root membership: the
-    user_files secret/runtime confinement, the restricted-subagent
-    secret/owner-control denials, and the project-store guard. Root admission
+    user_files runtime confinement, skill owner state and the project-store guard. Root admission
     alone would let an image/PDF/video path in where read_file refuses it. ONE
     helper shared by vision (view_image / vlm_query) and media (ocr_pdf /
     extract_video_frames) so the two consumers cannot drift. Empty = no
@@ -487,69 +477,9 @@ def _read_file_parity_block(ctx: Any, fp: "pathlib.Path") -> str:
         return block
     if ctx is None:
         return ""
-    import pathlib as _pl
-    restricted = False
-    try:
-        from ouroboros.tools.core import is_restricted_subagent_profile
-        restricted = bool(is_restricted_subagent_profile(ctx))
-    except Exception:
-        restricted = False
-    # Read admission and every restricted file/shell consumer share the same
-    # child/canonical/configured roots; a fork cannot hide parent owner state.
-    from ouroboros.tools.core_secret_paths import restricted_data_roots
+    from ouroboros.tools.core_file_tools import _runtime_data_read_block
 
-    fp_resolved = _pl.Path(fp).resolve(strict=False)
-    data_roots = restricted_data_roots(ctx)
-
-    for data_root in data_roots:
-        try:
-            rel = fp_resolved.relative_to(data_root).as_posix()
-        except Exception:
-            rel = ""
-        if not rel:
-            continue
-        try:
-            from ouroboros.project_facts import project_store_access_block
-            reason = project_store_access_block(rel)
-            if reason:
-                return str(reason)
-        except Exception:
-            pass
-        if restricted:
-            try:
-                from ouroboros.tools.core import (
-                    _is_skill_owner_state_target,
-                    _is_subagent_secret_data_path,
-                    is_skill_owner_state_alias,
-                )
-                if (
-                    _is_subagent_secret_data_path(rel)
-                    or _is_skill_owner_state_target(fp, data_root)
-                    or is_skill_owner_state_alias(fp, data_root)
-                ):
-                    return "⚠️ PATH_BLOCKED: this subagent cannot access secret or owner-control data files."
-            except Exception:
-                pass
-    if restricted:
-        try:
-            from ouroboros.tools.core import _is_subagent_secret_repo_target
-            from ouroboros.tools.registry import active_repo_dir_for
-            repo_roots = []
-            try:
-                repo_roots.append(_pl.Path(active_repo_dir_for(ctx)).expanduser().resolve(strict=False))
-            except Exception:
-                pass
-            try:
-                from ouroboros.tool_access import resource_root_path
-                repo_roots.append(_pl.Path(resource_root_path(ctx, "system_repo")).expanduser().resolve(strict=False))
-            except Exception:
-                pass
-            for repo_root in repo_roots:
-                if _path_is_under(fp, repo_root) and _is_subagent_secret_repo_target(fp, repo_root, ctx=ctx):
-                    return "⚠️ PATH_BLOCKED: this subagent cannot access repo secret or control paths."
-        except Exception:
-            pass
-    return ""
+    return _runtime_data_read_block(ctx, fp)
 
 
 def _load_local_image_payload(ctx: ToolContext, file_path: str) -> Tuple[Optional[Dict[str, str]], str]:
@@ -592,8 +522,10 @@ def _load_local_image_payload(ctx: ToolContext, file_path: str) -> Tuple[Optiona
         raw = fp.read_bytes()
     except Exception as e:
         return None, _refuse(ctx, f"⚠️ Failed to read image file: {e}")
-    # Fail closed: only recognized image bytes may be used.
-    mime = _detect_image_mime_for_vlm(raw)
+    # Fail closed: only recognized image bytes (by magic number) may be used.
+    mime = next((kind for magic, kind in _IMAGE_MAGIC if raw[:len(magic)] == magic), "")
+    if not mime and raw[:4] == _IMAGE_WEBP_MAGIC[0] and raw[8:12] == _IMAGE_WEBP_MAGIC[1]:
+        mime = "image/webp"
     if not mime:
         return None, _refuse(ctx, (
             "⚠️ File does not appear to be a supported image (PNG/JPEG/GIF/WEBP). "

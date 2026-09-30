@@ -1,16 +1,13 @@
 """In-process read acceleration for the usage ledger, beside the substrate.
 
-Extracted from ``usage_accounting.py`` at the perf2 P1 render-cache round for
-the same reason ``_usage_rows.py`` exists: the accounting module sits at the
-hard module-size gate and this layer is a self-contained seam. It carries the
-ledger's two in-process caches — the validated-rows memo + render cache for
-display projections, and the in-lock warm read cache the monetary write paths
-use (razzant/ouroboros#129) — and it deliberately lives beside, not inside,
-``usage_ledger.py``: the substrate stays cache-ignorant. In every case the
-full ``_read_records_locked`` replay remains the authority and the sole owner
-of quarantine; a cache can only ever change the COST of a read, never its
-result, because ``_read_new_records_locked`` re-stats the file under the held
-lock and refuses to resume on any doubt.
+The display memo/render cache permits explicitly stale presentation. The
+separate existing writer view is generation-bound and strict: complete records,
+last attempt rows, validation state/late-receipt rights and reversible exact cash
+by root advance together under the monetary lock. Ordinary cold/replaced views
+prepare outside the lock and reconcile their suffix after identity/CAS proof.
+Only exceptional corruption repair uses the authoritative locked full replay.
+Strict readers share that preparation; display memos capture its row references.
+Public full-record/resume readers retain detached snapshots; writers borrow private state.
 
 ``usage_accounting`` re-binds every name here, and the implementation resolves
 the substrate (``_locked``, ``_read_records_locked``, ...) through the
@@ -21,14 +18,23 @@ exactly as when the code was inline.
 from __future__ import annotations
 
 import collections
+import contextlib
+import heapq
+import os
 import copy
 import logging
 import pathlib
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Tuple
 
-from ouroboros.usage_ledger import QUARANTINE_REL, LedgerResumeState
+from ouroboros.runtime_limits import (
+    USAGE_DISPLAY_LOCK_TIMEOUT_SEC,
+    USAGE_DISPLAY_REVALIDATE_AFTER_SEC,
+)
+from ouroboros.usage_ledger import QUARANTINE_REL, LedgerResumeState, UsageLockUnavailable, is_abandoned_settlement
+from ouroboros._usage_money import monetary_scope_key, ZERO_CASH, cash_contribution, change_cash, render_cash, exceeds_limit
 
 log = logging.getLogger(__name__)
 
@@ -42,105 +48,104 @@ def _ua():
 
 @dataclass
 class _LedgerRowsMemo:
-    """In-process cache of one drive root's per-attempt FINAL rows.
+    """One captured writer generation and its outside-lock display renders.
 
-    Holds only the ``_final_rows`` dict (one row per attempt, first-occurrence
-    order) plus the resume fingerprint — O(final rows), not O(ledger rows);
-    superseded transition rows are not retained.
-
-    ``renders`` is the fingerprint-keyed cache of finished display renders
-    (``usage_projection``/``usage_breakdown`` bodies) computed over these rows:
-    valid exactly while the rows are, so it is cleared on refold and on every
-    non-empty advance, never by TTL. ``generation`` increments on those same
-    two events and guards the clear-then-publish race (see ``_render_cached``).
+    Rows are private immutable-by-ownership references: writers replace rows,
+    never edit them. The tuple and scalar resume fingerprint detach this capture
+    from the writer's mutable indexes. Public consumers receive deep copies.
     """
 
     resume: LedgerResumeState
-    final_rows: Dict[str, Dict[str, Any]]
+    final_rows: tuple
+    source: object
     generation: int = 0
     renders: Dict[Tuple[Any, ...], Dict[str, Any]] = field(default_factory=dict)
 
 
-# Read-side memo per RESOLVED drive root. Populated and advanced only under the
-# cross-process ledger lock; the module lock guards the dict itself. Write paths
-# (reserve/_transition/settle/import) never touch it — they read through their
-# own in-lock cache below (full ordered records, which seq assignment and
-# whole-history append validation need; this memo keeps only final rows), and
-# the stat + seq-continuity check on the next read is what makes a stale memo
-# impossible to serve, so correctness never depends on any writer remembering
-# to invalidate.
+# Only presentation snapshots/renders live here, never a second replay cache.
 _ROWS_MEMO: Dict[str, _LedgerRowsMemo] = {}
 _ROWS_MEMO_LOCK = threading.Lock()
+_STALE_BACKOFF: Dict[str, float] = {}
 
 
-def _memoized_final_rows(
-    root: pathlib.Path,
-) -> Tuple[list, bool, "_LedgerRowsMemo", int]:
-    """Validated final rows for display projections, resumed incrementally.
+def _stale_memo_rows(key: str):
+    with _ROWS_MEMO_LOCK:
+        memo = _ROWS_MEMO.get(key)
+        if memo is None:
+            return None
+        return memo.final_rows, memo.resume.st_ino != -2, memo, memo.generation
 
-    Cold (or whenever the resume fingerprint is rejected — file replacement,
-    size shrink, same-size rewrite, seq discontinuity, a non-row-aligned tail,
-    structural corruption) this is one full ``_read_records_locked`` replay,
-    which owns quarantine. Warm, it parses only the bytes appended since the
-    previous read. Locks and substrate reads resolve through the
-    ``usage_accounting`` namespace at call time (tests monkeypatch those
-    names). Returned row dicts are shared read-only snapshots; row ORDER
-    matches a from-scratch ``_final_rows`` exactly (first-occurrence order,
-    updates in place), so aggregation over them is bit-identical to a fresh
-    replay.
 
-    Returns ``(rows, cacheable, memo, generation)`` — the render-cache
-    transport: ``cacheable`` is False for the deliberately NON-RESUMABLE
-    crash-tail fingerprint (``st_ino == -2``), whose every read stays a full
-    replay, so caching a render of it would hide exactly the reads that must
-    keep re-checking the torn tail. ``memo``/``generation`` let
-    ``_render_cached`` publish a render computed OUTSIDE the lock only if the
-    rows have not moved since.
+def _memoized_final_rows(root: pathlib.Path, *, allow_stale: bool = False):
+    """Capture strict rows from the ONE prepared source used by writers.
+
+    Cold/replaced history parses outside the money lock; inside it we validate
+    the generation, reconcile only the suffix and capture row references.
+    Rendering/folding happens after release. Internal rows are read-only;
+    ``read_usage_records`` is the detached public snapshot seam.
+
+    Display-only ``allow_stale`` retains the short acquisition/backoff and last
+    validated snapshot. A cold contended read stays unavailable, never zero.
+    Strict reads and admission never use the stale snapshot. Platform refusal
+    is not contention and must propagate even when a snapshot exists.
     """
     ua = _ua()
     key = str(pathlib.Path(root).resolve(strict=False))
-    with ua._locked(root):
+    if allow_stale:
         with _ROWS_MEMO_LOCK:
-            memo = _ROWS_MEMO.get(key)
-        advanced = ua._read_new_records_locked(root, memo.resume) if memo is not None else None
-        if advanced is None:
-            records = ua._read_records_locked(root)
-            memo = _LedgerRowsMemo(
-                resume=ua._ledger_resume_state(root, records),
-                final_rows=ua._final_rows(records),
-                generation=(memo.generation + 1) if memo is not None else 0,
-            )
-        else:
-            new_records, new_resume = advanced
-            if new_records:
-                for row in new_records:
-                    memo.final_rows[str(row["attempt_id"])] = row
-                # The generation bump and the renders clear MUST happen under
-                # _ROWS_MEMO_LOCK: the publisher in _render_cached checks the
-                # generation and writes under that lock only (it never holds
-                # the ledger lock), so without it the check-then-publish pair
-                # could interleave with this clear — a stale render published
-                # right after the clear would then serve pre-append data to
-                # every warm reader until the next append. Lock order stays
-                # "ledger lock → memo lock" (same as above/below); the
-                # publisher takes the memo lock alone, so no deadlock. The
-                # refold branch needs no such section: it swaps in a NEW memo
-                # object and the publisher's `is memo` identity check already
-                # rejects publications against a replaced object.
-                with _ROWS_MEMO_LOCK:
-                    memo.generation += 1
-                    memo.renders.clear()
-            memo.resume = new_resume
+            backing_off = time.monotonic() < _STALE_BACKOFF.get(key, 0.0)
+        stale = _stale_memo_rows(key) if backing_off else None
+        if stale is not None:
+            return stale
+    acquisition = (lambda path: ua._locked(path, timeout_sec=USAGE_DISPLAY_LOCK_TIMEOUT_SEC)) if allow_stale else None
+    try:
+        with _writer_locked(root, acquisition=acquisition) as view:
+            resume = view.resume
+            # Identity distinguishes rebuilt views even if their stat fingerprint
+            # matches. Never retain resume.states/late_receipt_ids: they mutate.
+            source = (view.identity, resume.st_ino, resume.st_dev, resume.size,
+                      resume.st_mtime_ns, resume.row_count)
+            with _ROWS_MEMO_LOCK:
+                memo = _ROWS_MEMO.get(key)
+                if memo is None or memo.source != source or resume.st_ino == -2:
+                    memo = _LedgerRowsMemo(
+                        LedgerResumeState(*source[1:]), tuple(view.finals.values()),
+                        source, (memo.generation + 1) if memo else 0,
+                    )
+                    _ROWS_MEMO[key] = memo
+                _STALE_BACKOFF.pop(key, None)
+                return memo.final_rows, resume.st_ino != -2, memo, memo.generation
+    except UsageLockUnavailable as exc:
+        if not allow_stale or exc.reason != "contention":
+            raise
         with _ROWS_MEMO_LOCK:
-            _ROWS_MEMO[key] = memo
-        cacheable = memo.resume.st_ino != -2
-        return list(memo.final_rows.values()), cacheable, memo, memo.generation
+            _STALE_BACKOFF[key] = time.monotonic() + USAGE_DISPLAY_REVALIDATE_AFTER_SEC
+        stale = _stale_memo_rows(key)
+        if stale is None:
+            raise
+        return stale
+
+
+def read_usage_records(root: pathlib.Path, *, final_only: bool = False) -> list:
+    """Detached strict snapshot for audit/custody consumers and full readers.
+
+    Row references are captured under lock; deep copy runs after release. All
+    nested fields belong to this caller, and later appends/replacements cannot
+    change its snapshot. Import/compaction that already own the lock retain the
+    compatible locked reader below; do not recursively acquire the lock here.
+    """
+    root = _ua()._drive_root(root)
+    with _writer_locked(root) as view:
+        rows = list(view.finals.values()) if final_only else list(view.records)
+    return copy.deepcopy(rows)
 
 
 def _render_cached(
     root: pathlib.Path,
     cache_key: Tuple[Any, ...],
     render: Callable[[list, bool], Dict[str, Any]],
+    *,
+    allow_stale: bool = False,
 ) -> Dict[str, Any]:
     """Serve one display render through the memo's fingerprint-keyed cache.
 
@@ -155,41 +160,115 @@ def _render_cached(
     between read and publish means the render is returned to this caller but
     never cached. Both directions hand out deep copies: the cached object is
     shared between requests, and callers (``_with_limit``/``_with_integrity``,
-    gateway handlers) mutate nested buckets in place."""
-    rows, cacheable, memo, generation = _memoized_final_rows(root)
+    gateway handlers) mutate nested buckets in place. ``allow_stale`` forwards
+    the display-reader contract of ``_memoized_final_rows`` unchanged."""
+    rows, cacheable, memo, generation = _memoized_final_rows(root, allow_stale=allow_stale)
     integrity_degraded = (root / QUARANTINE_REL).is_file()
     full_key = (*cache_key, integrity_degraded)
     if cacheable:
         with _ROWS_MEMO_LOCK:
-            if memo.generation == generation:
-                cached = memo.renders.get(full_key)
-                if cached is not None:
-                    return copy.deepcopy(cached)
+            cached = memo.renders.get(full_key) if memo.generation == generation else None
+        if cached is not None:
+            return copy.deepcopy(cached)
     result = render(rows, integrity_degraded)
     if cacheable:
         key = str(pathlib.Path(root).resolve(strict=False))
+        # Copy before taking the memo lock: a strict reader takes it while
+        # holding money, so a rich render copy must not indirectly hold money.
+        frozen = copy.deepcopy(result)
         with _ROWS_MEMO_LOCK:
             if _ROWS_MEMO.get(key) is memo and memo.generation == generation:
-                memo.renders[full_key] = copy.deepcopy(result)
-    return result
+                memo.renders[full_key] = frozen
+    return copy.deepcopy(result)
 
 
-# razzant/ouroboros#129: the in-lock write paths (reserve/settle/_transition/
-# release/legacy-import) each did a full parse+validate of the whole ledger
-# under the 45s monetary flock, and the file grows unboundedly. This is their
-# per-process warm cache of the last validated read per drive root: the next
-# in-lock read parses only the bytes appended since. It is distinct from
-# ``_ROWS_MEMO`` because writers need the FULL ordered records list (seq
-# assignment + whole-history append validation), not just final rows. Rows are
-# shared read-only snapshots, same as the memo's.
-_LEDGER_READ_CACHE: "collections.OrderedDict[str, Tuple[LedgerResumeState, list]]" = (
-    collections.OrderedDict()
-)
+@dataclass(eq=False)
+class _LedgerWriterView:
+    """One private, generation-bound validated view, borrowed only under lock.
+
+    Records/finals are retained for full-record consumers; cash is derived only
+    from those final rows. No display snapshot can install this view. Public
+    readers receive a list snapshot and never receive its mutable resume state.
+    """
+
+    resume: LedgerResumeState
+    records: list
+    identity: object = field(default_factory=object)
+    finals: dict = field(default_factory=dict)
+    cash: tuple = ZERO_CASH
+    roots: dict = field(default_factory=dict)
+    fold_times: list = field(default_factory=list)
+
+    def fold(self, rows: list) -> None:
+        from ouroboros.usage_compaction import fold_eligible_at
+
+        for row in rows:
+            identity = str(row["attempt_id"])
+            previous = self.finals.get(identity)
+            old = cash_contribution(previous) if previous else ZERO_CASH
+            new = cash_contribution(row)
+            self.cash = change_cash(self.cash, old, new)
+            if previous:
+                root = monetary_scope_key(previous)
+                self.roots[root] = change_cash(self.roots[root], old)
+            root = monetary_scope_key(row)
+            self.roots[root] = change_cash(self.roots.get(root, ZERO_CASH), new=new)
+            self.finals[identity] = row
+            eligible = fold_eligible_at(row)
+            if eligible is not None:
+                heapq.heappush(self.fold_times, (eligible, int(row["seq"]), identity))
+
+    def has_foldable_attempt(self) -> bool:
+        from ouroboros.usage_compaction import _fold_clock
+
+        while self.fold_times:
+            eligible, sequence, identity = self.fold_times[0]
+            if self.finals[identity]["seq"] == sequence:
+                return eligible <= _fold_clock()
+            heapq.heappop(self.fold_times)  # superseded late receipt, once per update
+        return False
+
+    def summary(self, root_task_id: str | None = None) -> dict:
+        return render_cash(self.cash if root_task_id is None else self.roots.get(root_task_id, ZERO_CASH))
+
+    def exceeds_limit(self, limit, bound=None, *, root_task_id=None, dispatch=False):
+        total = self.cash if root_task_id is None else self.roots.get(root_task_id, ZERO_CASH)
+        return exceeds_limit(total, limit, bound, dispatch=dispatch)
+
+    def append(self, root: pathlib.Path, rows: list) -> list:
+        ua = _ua()
+        key = str(root.resolve(strict=False))
+        try:
+            appended = ua._append_rows_locked(root, self.records, rows, resume=self.resume)
+            # Publication follows durable append/fsync. Any uncertainty invalidates
+            # the whole view, including partially advanced arithmetic.
+            self.fold(appended)
+            self.records.extend(appended)
+            for row in appended:
+                identity = str(row["attempt_id"])
+                self.resume.states[identity] = str(row["state"])
+                if str(row.get("kind") or "attempt") == "attempt" and (
+                    row["state"] == "unresolved" or is_abandoned_settlement(row)
+                ):
+                    self.resume.late_receipt_ids.add(identity)
+                else:
+                    self.resume.late_receipt_ids.discard(identity)
+            stat = (root / ua.LEDGER_REL).stat()
+            self.resume = LedgerResumeState(stat.st_ino, stat.st_dev, stat.st_size, stat.st_mtime_ns,
+                                            len(self.records), self.resume.states, self.resume.late_receipt_ids)
+            return appended
+        except BaseException:
+            with _LEDGER_READ_CACHE_LOCK:
+                _LEDGER_READ_CACHE.pop(key, None)
+            raise
+
+
+_LEDGER_READ_CACHE: collections.OrderedDict[str, _LedgerWriterView] = collections.OrderedDict()
 _LEDGER_READ_CACHE_LOCK = threading.Lock()
 _LEDGER_READ_CACHE_MAX_ROOTS = 8
 
 
-def _ledger_cache_put(key: str, value: "Tuple[LedgerResumeState, list]") -> None:
+def _ledger_cache_put(key: str, value: _LedgerWriterView) -> None:
     with _LEDGER_READ_CACHE_LOCK:
         _LEDGER_READ_CACHE[key] = value
         _LEDGER_READ_CACHE.move_to_end(key)
@@ -197,30 +276,153 @@ def _ledger_cache_put(key: str, value: "Tuple[LedgerResumeState, list]") -> None
             _LEDGER_READ_CACHE.popitem(last=False)
 
 
-def _read_records_locked_cached(root: pathlib.Path) -> list:
-    """``_read_records_locked`` with an incremental warm path. Call under the
-    held ledger lock (same contract as ``_read_records_locked``)."""
+def _seed_writer(records: list, resume: LedgerResumeState) -> _LedgerWriterView:
+    view = _LedgerWriterView(resume, records)
+    view.fold(records)
+    return view
+
+
+_PREPARATION_CHANGED = object()
+
+
+def _prepare_writer(root: pathlib.Path):
+    """Read/validate a captured newline-aligned extent without the money lock.
+
+    A preparation is unpublished and has no quarantine authority. Atomic
+    replacement/shrink/same-size rewrite is proved again under lock. History
+    is append-only within one inode; any other rewrite must atomically replace
+    the file, or a same-inode rewrite that grows it can go undetected.
+    """
+    from ouroboros.usage_ledger import _decode_record
+
     ua = _ua()
-    key = str(pathlib.Path(root).resolve(strict=False))  # one slot per physical root
-    with _LEDGER_READ_CACHE_LOCK:
-        cached = _LEDGER_READ_CACHE.get(key)
-    if cached is not None:
-        resume, rows = cached
-        try:
-            delta = ua._read_new_records_locked(root, resume)
-        except Exception:  # noqa: BLE001 — any doubt = fall back to the full read
-            delta = None
-        if delta is not None:
-            new_rows, new_resume = delta
-            merged = rows if not new_rows else [*rows, *new_rows]
-            _ledger_cache_put(key, (new_resume, merged))
-            return list(merged)
-    records = ua._read_records_locked(root)
     try:
-        resume = ua._ledger_resume_state(root, records)
-        _ledger_cache_put(key, (resume, list(records)))
-    except Exception:  # noqa: BLE001 — caching is best-effort; correctness is the full read
-        log.debug("ledger read-cache seed failed for %s", key, exc_info=True)
+        with open(root / ua.LEDGER_REL, "rb") as handle:
+            stat = os.fstat(handle.fileno())
+            records = []
+            consumed = 0
+            while consumed < stat.st_size:
+                chunk = handle.readline(stat.st_size - consumed)
+                if not chunk.endswith(b"\n"):
+                    break
+                consumed += len(chunk)
+                for line in chunk.splitlines(keepends=True):
+                    row = _decode_record(line)
+                    if row is not None:
+                        records.append(row)
+            after = os.fstat(handle.fileno())
+            if after.st_size < stat.st_size or (after.st_size == stat.st_size
+                                               and after.st_mtime_ns != stat.st_mtime_ns):
+                return _PREPARATION_CHANGED
+        states, late_ids = {}, set()
+        ua._validate_records(records, states=states, late_receipt_ids=late_ids)
+        resume = LedgerResumeState(stat.st_ino, stat.st_dev, consumed, stat.st_mtime_ns,
+                                   len(records), states, late_ids)
+        return _seed_writer(records, resume)
+    except FileNotFoundError:
+        return _seed_writer([], LedgerResumeState(-1, -1, 0, -1, 0))
+    except (OSError, ValueError, ua.UsageLedgerCorrupt):
+        # Only the locked full reader may judge and quarantine a damaged tail.
+        return None
+
+
+def _writer_generation(root: pathlib.Path) -> tuple:
+    try:
+        stat = (root / _ua().LEDGER_REL).stat()
+    except FileNotFoundError:
+        return (-1, -1, 0, -1)
+    return stat.st_ino, stat.st_dev, stat.st_size, stat.st_mtime_ns
+
+
+def _writer_generation_matches(root: pathlib.Path, view: _LedgerWriterView) -> bool:
+    inode, device, size, mtime = _writer_generation(root)
+    resume = view.resume
+    return ((inode, device) == (resume.st_ino, resume.st_dev)
+            and size >= resume.size and (size != resume.size or mtime == resume.st_mtime_ns))
+
+
+def _advance_writer(root: pathlib.Path, view: _LedgerWriterView) -> bool:
+    ua = _ua()
+    delta = ua._read_new_records_locked(root, view.resume, private=True)
+    if delta is None:
+        return False
+    rows, resume = delta
+    view.fold(rows)
+    view.records.extend(rows)
+    view.resume = resume
+    return True
+
+
+@contextlib.contextmanager
+def _writer_locked(root: pathlib.Path, *, before_read=None, acquisition=None):
+    """Prepare outside, prove and reconcile inside, then lend one private view.
+
+    Replacement (including a compaction in this acquisition) releases the lock
+    and prepares again. The cache object is a CAS token: an older preparation
+    never overwrites a newer installed view. The transaction body is yielded
+    once and is NEVER retried, even when append or fsync fails.
+    """
+    ua = _ua()
+    key = str(root.resolve(strict=False))
+    while True:
+        with _LEDGER_READ_CACHE_LOCK:
+            expected = _LEDGER_READ_CACHE.get(key)
+        prepared = None
+        needs_preparation = expected is None or not _writer_generation_matches(root, expected)
+        if needs_preparation:
+            prepared = _prepare_writer(root)
+            if prepared is _PREPARATION_CHANGED:
+                continue
+        with (acquisition(root) if acquisition else ua._locked(root)) as heartbeat:
+            with _LEDGER_READ_CACHE_LOCK:
+                view = _LEDGER_READ_CACHE.get(key)
+            try:
+                if view is not None and _writer_generation_matches(root, view):
+                    if not _advance_writer(root, view):
+                        # Only an invalid suffix requires locked quarantine.
+                        records = ua._read_records_locked(root)
+                        view = _seed_writer(records, ua._ledger_resume_state(root, records))
+                elif view is expected and prepared is not None and _writer_generation_matches(root, prepared):
+                    if not _advance_writer(root, prepared):
+                        records = ua._read_records_locked(root)
+                        prepared = _seed_writer(records, ua._ledger_resume_state(root, records))
+                    view = prepared
+                elif view is expected and needs_preparation and prepared is None:
+                    records = ua._read_records_locked(root)
+                    view = _seed_writer(records, ua._ledger_resume_state(root, records))
+                else:
+                    continue
+                _ledger_cache_put(key, view)
+                if before_read:
+                    generation = _writer_generation(root)
+                    before_read(heartbeat, view)
+                    if _writer_generation(root) != generation:
+                        continue  # committed maintenance: reprepare outside lock
+                yield view
+                return
+            except BaseException:
+                with _LEDGER_READ_CACHE_LOCK:
+                    _LEDGER_READ_CACHE.pop(key, None)
+                raise
+
+
+def _read_records_locked_cached(root: pathlib.Path) -> list:
+    """Compatible detached full-record snapshot for already-locked imports.
+
+    These callers already hold the lock. Monetary hot paths instead borrow
+    ``_writer_locked`` so neither cold preparation nor list copies run there.
+    """
+    ua = _ua()
+    key = str(root.resolve(strict=False))
+    with _LEDGER_READ_CACHE_LOCK:
+        view = _LEDGER_READ_CACHE.get(key)
+    try:
+        if view is None or not _advance_writer(root, view):
+            records = ua._read_records_locked(root)
+            view = _seed_writer(records, ua._ledger_resume_state(root, records))
+        _ledger_cache_put(key, view)
+        return copy.deepcopy(view.records)
+    except BaseException:
         with _LEDGER_READ_CACHE_LOCK:
             _LEDGER_READ_CACHE.pop(key, None)
-    return records
+        raise

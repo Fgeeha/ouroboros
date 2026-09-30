@@ -931,6 +931,46 @@
    "is_error": true,
    "status": "error"
   },
+  "ident:FOCUS_PROJECTION_UNAVAILABLE:named": {
+   "is_error": true,
+   "status": "error"
+  },
+  "ident:FOCUS_PROJECTION_UNAVAILABLE:plain": {
+   "is_error": true,
+   "status": "error"
+  },
+  "ident:FOCUS_SOURCE_UNRESOLVED:named": {
+   "is_error": false,
+   "status": "ok"
+  },
+  "ident:FOCUS_SOURCE_UNRESOLVED:plain": {
+   "is_error": false,
+   "status": "ok"
+  },
+  "ident:FOCUS_SOURCE_UNRETAINED:named": {
+   "is_error": false,
+   "status": "ok"
+  },
+  "ident:FOCUS_SOURCE_UNRETAINED:plain": {
+   "is_error": false,
+   "status": "ok"
+  },
+  "ident:FOCUS_STALE:named": {
+   "is_error": false,
+   "status": "ok"
+  },
+  "ident:FOCUS_STALE:plain": {
+   "is_error": false,
+   "status": "ok"
+  },
+  "ident:FOCUS_TASK_NOT_LIVE:named": {
+   "is_error": false,
+   "status": "ok"
+  },
+  "ident:FOCUS_TASK_NOT_LIVE:plain": {
+   "is_error": false,
+   "status": "ok"
+  },
   "ident:GH_ERROR:named": {
    "is_error": true,
    "status": "error"
@@ -1394,6 +1434,14 @@
   "ident:LIST_FILES_ERROR:plain": {
    "is_error": true,
    "status": "error"
+  },
+  "ident:LIST_FILES_NOT_FOUND:named": {
+   "is_error": false,
+   "status": "ok"
+  },
+  "ident:LIST_FILES_NOT_FOUND:plain": {
+   "is_error": false,
+   "status": "ok"
   },
   "ident:LOCAL_READONLY_SUBAGENT_BLOCKED:named": {
    "is_error": true,
@@ -2651,6 +2699,14 @@
    "is_error": true,
    "status": "error"
   },
+  "ident:TOOL_FORBIDDEN:named": {
+   "is_error": true,
+   "status": "error"
+  },
+  "ident:TOOL_FORBIDDEN:plain": {
+   "is_error": true,
+   "status": "error"
+  },
   "ident:TOOL_INTERNAL_ERROR:named": {
    "is_error": true,
    "status": "error"
@@ -2907,6 +2963,10 @@
    "is_error": true,
    "status": "git_via_shell_blocked"
   },
+  "native:LEGACY_BLOCKED:CHILD_RESULT_STALE": {
+   "is_error": false,
+   "status": "ok"
+  },
   "native:LEGACY_BLOCKED:REPO_LIST_BLOCKED": {
    "is_error": true,
    "status": "blocked"
@@ -2914,6 +2974,14 @@
   "native:LEGACY_BLOCKED:REPO_READ_BLOCKED": {
    "is_error": true,
    "status": "blocked"
+  },
+  "native:LEGACY_BLOCKED:TASK_CANCEL_PENDING": {
+   "is_error": false,
+   "status": "ok"
+  },
+  "native:LEGACY_BLOCKED:TASK_NOT_ACTIVE": {
+   "is_error": false,
+   "status": "ok"
   },
   "native:LEGACY_TOOL_ERROR:LIST_FILES_ERROR": {
    "is_error": true,
@@ -2923,7 +2991,19 @@
    "is_error": true,
    "status": "error"
   },
+  "native:LEGACY_UNAVAILABLE:CHILD_RESULT_STALE": {
+   "is_error": false,
+   "status": "ok"
+  },
+  "native:LEGACY_UNAVAILABLE:TASK_NOT_FOUND": {
+   "is_error": false,
+   "status": "ok"
+  },
   "native:LEGACY_WARNING:DATA_NOT_YET_CREATED": {
+   "is_error": false,
+   "status": "ok"
+  },
+  "native:LEGACY_WARNING:LIST_FILES_NOT_FOUND": {
    "is_error": false,
    "status": "ok"
   },
@@ -2971,6 +3051,14 @@
    "is_error": true,
    "status": "blocked"
   },
+  "native:TOOL_ARG_ERROR:CHILD_RESULT_DISPOSITION_INVALID": {
+   "is_error": false,
+   "status": "ok"
+  },
+  "native:TOOL_ARG_ERROR:ERROR": {
+   "is_error": false,
+   "status": "ok"
+  },
   "native:TOOL_ARG_ERROR:GH_TARGET_INVALID": {
    "is_error": false,
    "status": "ok"
@@ -2979,9 +3067,17 @@
    "is_error": false,
    "status": "ok"
   },
+  "native:TOOL_ARG_ERROR:REJECTED": {
+   "is_error": false,
+   "status": "ok"
+  },
   "native:TOOL_ARG_ERROR:TOOL_ARG_ERROR": {
    "is_error": true,
    "status": "error"
+  },
+  "native:TOOL_ERROR:TASK_MESSAGE_UNWRITTEN": {
+   "is_error": false,
+   "status": "ok"
   },
   "native:USER_FILES_PATH_BLOCKED:USER_FILES_PATH_BLOCKED": {
    "is_error": true,
@@ -3080,6 +3176,10 @@
    "status": "ok"
   },
   "shape:git_error_untyped_text": {
+   "is_error": false,
+   "status": "ok"
+  },
+  "shape:list_files_not_found": {
    "is_error": false,
    "status": "ok"
   },
@@ -3234,6 +3334,10 @@
   "shape:unknown_tool_extension_down": {
    "is_error": false,
    "status": "ok"
+  },
+  "shape:safety_violation": {
+   "is_error": true,
+   "status": "safety_violation"
   }
  }
 }

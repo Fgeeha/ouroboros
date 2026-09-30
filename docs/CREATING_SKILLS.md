@@ -36,8 +36,9 @@ and official-hub payloads are freshly rechecked against the live catalog before
 attestation is persisted. Only the tri-model LLM phase is skipped; the verdict
 is marked `owner-attested` (distinct from an LLM-clean badge) and does not
 confer publication readiness. Choosing Publish may still start the ordinary
-managed publication task, but Ouroboros must complete a fresh full skill review
-before any outbound GitHub effect. Native, ClawHub, and unverified
+managed publication task, but attestation alone authorizes no outbound GitHub
+effect. Publication needs fresh critic authority or a later actual independent-review
+outcome acknowledged through qualified Advisory author finish (see Publishing). Native, ClawHub, and unverified
 OuroborosHub payloads are never attestable. The agent cannot self-attest (the
 marker is owner-state).
 
@@ -183,7 +184,10 @@ flowchart LR
     triad -- PASS --> deps
     deps --> enable[owner toggles enabled=true]
     enable --> execute[skill_exec / dispatch]
-    review -- FAIL/PREFLIGHT --> repair[Repair → re-review]
+    review -- feedback --> reaction[Author reaction]
+    reaction -- next permitted panel --> review
+    reaction -- Advisory finish + current preflight --> deps
+    review -- PREFLIGHT failure --> repair[Repair]
     repair --> review
 ```
 
@@ -193,13 +197,20 @@ flowchart LR
 - **Review** runs three reviewer models in parallel against the
   Skill Review Checklist (see [`docs/CHECKLISTS.md`](CHECKLISTS.md)).
   The review pack hashes every runtime-reachable file in the skill
-  directory; any later edit invalidates the executable verdict. `.self_authored.json`
+  directory; any later edit stales that critic verdict. `.self_authored.json`
   is provenance only; self-authored skills use the same tri-model review,
   grant, enable, and extension reload flow as other executable skills.
 - **Isolated deps** (pip / npm / uv / node) install into
   `data/skills/<bucket>/<name>/.ouroboros_env/`. Status is recorded
   in `data/state/skills/<name>/deps.json`.
-- **Enable** flips `enabled.json` after a fresh executable review + grants + deps. The
+  In-process extension scopes are non-reentrant: no-dependency handlers of
+  DIFFERENT skills share a read lease and overlap, the handlers of ONE skill
+  run one at a time (your callbacks stay sequential, as under the old
+  exclusive lock), and a dependency-bearing handler owns an exclusive lease
+  through import, handler waits and cleanup. The async form polls
+  cooperatively, so it never blocks the ASGI loop; nested scopes and
+  unwrapped child work remain unsupported rather than inheriting a lease.
+- **Enable** flips `enabled.json` after current executable-review authority + grants + deps. The
   Skills UI surfaces a toggle; agents can also call `toggle_skill`.
   A self-authored skill's first enablement can follow
   `OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS`; otherwise enabling requires the owner
@@ -592,7 +603,7 @@ Skills UI.
 ## Grants for protected keys and host permissions
 
 Some settings keys are protected: `OPENROUTER_API_KEY`,
-`OPENAI_API_KEY`, `OPENAI_COMPATIBLE_API_KEY`, `ANTHROPIC_API_KEY`, `MINIMAX_API_KEY`, `DEEPSEEK_API_KEY`,
+`OPENAI_API_KEY`, `OPENAI_COMPATIBLE_API_KEY`, `ANTHROPIC_API_KEY`, `MINIMAX_API_KEY`, `DEEPSEEK_API_KEY`, `ZAI_API_KEY`,
 `CLOUDRU_FOUNDATION_MODELS_API_KEY`, `GIGACHAT_CREDENTIALS`, `GIGACHAT_PASSWORD`, `TELEGRAM_BOT_TOKEN`,
 `GITHUB_TOKEN`, `OUROBOROS_NETWORK_PASSWORD`. These keys are NEVER
 forwarded to a skill by default, even when listed in
@@ -610,13 +621,14 @@ follow the setting below; an explicitly authorized task toggle remains separate.
 
 `OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS` is enabled by default as of v6.10.0; the
 owner may disable it in Settings → Behavior → Skills (desktop asks for native
-confirmation and web uses the owner endpoint). When enabled, a fresh executable
-review grants only the manifest-declared keys and host permissions for the
+confirmation and web uses the owner endpoint). When enabled, current executable
+review authority grants only the manifest-declared keys and host permissions for the
 current content hash. Under
 blocking enforcement, blocker reviews are not executable and do not auto-grant;
 under advisory enforcement, blocker findings may auto-grant only because that
-mode makes the review executable. Editing the skill still invalidates those
-grants.
+mode makes the review executable. Qualified current Advisory author acceptance
+uses the same gate even when the original critic state stays pending. Editing the
+skill still invalidates those grants.
 
 Official OuroborosHub skills have one extra review profile. If the installed
 payload, live catalog file list, and `.ouroboroshub.json` hashes all match
@@ -696,11 +708,16 @@ A transport extension declares `permissions: [presence]`, obtains its ordinary
 content-hash-bound skill token, and sends:
 
 - `POST /presence/turn` with exactly `binding_id`, `event`, and optional
-  `staged_files`. The event carries the provider/account/conversation/thread,
+  `staged_files` and negotiated `delivery_reporting_version`. The event carries the provider/account/conversation/thread,
   stable source-event and conversation ids, structured actor/conversation/message
   facts, and text. Files must already be under that transport skill's state root.
 - `GET /presence/work/{work_ref}?binding_id=...` to poll only late work created
   by the same owner binding.
+
+The nested fact maps may include optional provider evidence such as the agent's
+own account identity, explicit mention occurrences and the thread-root author.
+Keep unknowns and source meanings intact: neither a mention nor root authorship
+establishes the current addressee or an obligation to answer.
 
 The owner-created binding fixes the authenticated transport skill, behavior
 skill, origin scope, and exact proactive destination. The origin is either one
@@ -717,11 +734,99 @@ ceiling and reply context rather than widening authority.
 
 Transport custody preserves provider arrival order before Host admission; the
 host serializes one conversation and enforces the installation-wide active-turn
-limit across processes. A current Presence turn may cancel only its own
-binding-and-conversation-correlated `work_ref`. Owner chat or Background
-Consciousness may initiate an existing binding, but the resulting cycle must use
-an explicitly selected transport tool and finish `tool_delivered` to claim that
-an external message was sent.
+limit across processes. By default, the host-provided own-work readers, messaging
+and cancellation reach only independent work started from the same nonempty binding,
+across its conversations. A profile that explicitly selects global `recent_tasks` or
+`get_task_result` retains those readers' global scope, including other bindings and
+owner work; binding-scoped steering and cancellation do not widen with those reads.
+Owner chat or Background Consciousness may initiate an existing binding, but
+its cycle must use an explicitly selected transport tool and finish
+`tool_delivered` to claim an external message was sent.
+
+A turn's source identity is its binding, source event ID, provider/account,
+conversation/thread, actor ID and text. Keep those facts stable on retry;
+`staged_files` paths and delivery-reporting negotiation may change. A collision
+returns HTTP 409 `presence_event_identity_conflict` with `disposition: rejected`,
+not another room's answer. HTTP 409 `presence_attempt_outcome_unknown` and
+`presence_resources_unavailable` carry `disposition: retry` and no external
+text: retain the original event in the transport. A refusal may carry a
+previously admitted child's `work_ref`; poll it through `/presence/work`,
+not as a completed reply to the original event. A failed durable start is
+also retryable; no agent effect began unless its start was recorded. A quota
+refusal after a terminal task does not itself prove safe regeneration on the
+same ID; if prior effects remain unproven the conversation may need explicit
+owner recovery. Never treat these refusals as `completed/silent` or resend a
+confirmed provider effect merely because a Host receipt failed.
+
+#### Reporting actual Presence delivery
+
+Use the current event's exact conversation/thread for a reply; the binding's
+origin is an admission filter and its destination is the separate default for
+initiated contact. Selected transport tools may still address other intended
+conversations. The host projection names these roles under `communication`.
+A first or intermediate reply uses an explicit transport-tool call after choosing
+to contribute or undertake work for that conversation; observation alone owes no
+acknowledgement. Incoming content is framed as observed conversation, separately
+from an initiated cycle or an inherited work order. Assistant narration is only Working activity;
+`queued` does not establish delivery, and an early acknowledgement does not
+replace the substantive final result.
+
+After the current tool batch, `presence_finish` with nonblank reply text or a
+silent/tool-delivered outcome enters normal completion checks without an extra
+model round. If a check requests more work, continue and finish again. An omitted
+message/deferred body retains the later model-answer path. Native inline turns
+return their persisted result before optional post-task cognition; transport
+outbox custody still owns actual delivery.
+If a parent fails after work was scheduled, its handoff remains deferred with
+the work reference and any current model-authored reply. Host diagnostics and
+status notices stay in the owner task; an empty deferred body sends nothing but
+still requires polling. Cached and late results preserve that empty body rather
+than substituting the task diagnostic. This does not turn failure into success.
+Ordinary implicit replies and genuine authored best-effort answers remain valid.
+A forced final separates the task record from the reply: only a `presence_finish`
+declared in that answer is spoken, so an undeclared record sends nothing new.
+
+`GET /identity` advertises `presence_delivery_version: 1` on supporting hosts.
+Only then request `delivery_reporting_version: 1` alongside `binding_id` and
+`event` on `/presence/turn`. Persist the response's echoed mode with the Host
+reference and automatic outbox rows, including deferred `/presence/work` results.
+A cached legacy turn may echo zero even if a newer request asked for one.
+Missing capability or mode means the legacy protocol; sending still works,
+but its automatic history row records authored text without delivery proof.
+Migrated automatic outbox rows retain mode zero and are not imported again.
+
+With reporting enabled, persist the physical provider receipt before reporting
+it through `POST /presence/delivery` under the same skill token and `presence`
+permission. The JSON fields are `schema_version: 1`, the existing outbox
+`delivery_id`, string `part_id`, `state` (`delivered`, `accepted`, `failed`, or
+`uncertain`), `provider`, `account_id`, actual `conversation_id` and `thread_id`,
+exact `text`, `format`, provider facts in `message`, and
+`origin: {kind: "tool" | "automatic", task_id?, source_event_id?}`. The producer
+sets kind explicitly. A tool handler may use its supported first `ctx` argument
+to retain compact task provenance; never serialize the full context or secrets.
+The Host establishes source identity, and a task reference grants no authority.
+
+Report physical parts separately. Preserve resolved DM IDs, actual chunk or
+fallback text, captions and provider message IDs in the receipt snapshot.
+For email, `accepted` means SMTP acceptance; include actual accepted/refused
+recipients and Message-ID/References, without claiming inbox arrival or reading.
+Only confirmed sent/accepted content becomes outgoing speech; failure and
+uncertainty are typed System facts. Do not report queued text as delivered.
+
+An unreadable or malformed retained chat chain makes receipt-index rebuilding
+return HTTP 503. Provider sending continues; durable receipts remain pending
+for reporting. Restore the retained history's readability before retrying the
+reports, without resending provider messages or treating missing history as empty.
+
+Keep report acknowledgement and backoff in the existing outbox. A Host failure
+must never put an already delivered provider message back into its send queue
+or hold later provider messages behind a failed report. Retrying the same
+immutable report returns `duplicate: true`; changed facts for the same identity
+return HTTP409. Successful response shape is
+`{ok: true, recorded: true, duplicate: false}`. The existing shared autobiography
+is the only canonical history; no separate memory or reporting scheduler is
+needed. Expose unsupported reporting or pending report failures through ordinary
+transport status and receipts.
 
 ## Notifying the owner when work completes
 
@@ -825,6 +930,15 @@ def register(api):
     # configuration writes and markdown/json for explanatory diagnostics.
     # Rich widget-only components (media, stream, map, kanban, module JS)
     # belong on the Widgets page, not Settings.
+    # Hydration: before rendering a form/action the host issues GET on the
+    # component's own route. Answer 2xx with a JSON object
+    # {field_name: current_value} (strings) to pre-fill those fields; omit a
+    # field to show its declared default/first option, and never return a
+    # secret. 404/405 means "no current values", so the form renders from
+    # defaults; a failed read makes the host disable Save and tell the owner
+    # to reload. Password fields are never pre-filled, so treat an empty
+    # password on save as "unchanged". Reference: skills/telegram/plugin.py,
+    # GET+POST settings/save.
     api.register_settings_section(
         "config",
         title="Search settings",
@@ -876,6 +990,7 @@ ui_tab:
     kind: module
     entry: widget.js
     start: manual                   # auto | manual | retain — see "Launch policy" below
+    appearance: host                # host | independent | fixed (author intent)
 ```
 
 The manifest declaration is checked during preflight and review; it does not
@@ -886,6 +1001,7 @@ register the same surface in `plugin.py`:
 def register(api):
     api.register_ui_tab("editor", "Editor", render={
         "kind": "module", "entry": "widget.js", "start": "manual",
+        "appearance": "host",
     })
 ```
 
@@ -962,6 +1078,27 @@ are the one exception — "What the frame may do" below). The bridge exposes:
   `api.send_ws_message(type, data)` — `type` is the short name you passed; the
   host strips its own namespace prefix. The first listener subscribes the frame,
   the last unsubscribe stops delivery, and other skills' events never reach it.
+
+- **`OuroborosWidget.onTheme(callback)`** is an optional resolved-palette
+  subscription for module widgets. The callback receives `light` or `dark`
+  through the nonce-bound parent bridge; `onTheme` returns an unsubscribe function.
+  The module applies the value itself, commonly with
+  `document.documentElement.dataset.theme = theme`; the host never injects CSS,
+  changes the child DOM or forces a remount. The first callback receives the
+  resolved value embedded in the frame's initial document, later changes arrive
+  on authenticated bridge messages derived from the host's `ouro:theme-changed`
+  event, and disposal releases the parent subscription. The first listener
+  normally sees the injected bootstrap value immediately, then the parent
+  confirms the current value asynchronously; after a prior unsubscribe, the
+  next listener waits for that confirmation instead of using stale bootstrap.
+  Route
+  iframes have no bridge. A module declaration may record
+  `render.appearance: host | independent | fixed` for author/reviewer intent:
+  `host` opts into the resolved bridge, `independent` leaves palette choice to
+  the author, and `fixed` names an intentionally stable visual world;
+  the declaration does not gate legacy modules or prove that the source repaints.
+  `appearance` is valid only inside a `kind: module` render; adding it to an
+  iframe or declarative render is a registration error rather than a theme claim.
 
 - **`OuroborosWidget.download(name, source)`** saves an existing `Blob`, a
   `data:` URL, or a URL under this skill's extension route prefix. It resolves
@@ -1338,6 +1475,11 @@ the authoritative SSOT — read it there once and consult it whenever you author
 or repair a skill instead of reading a paraphrase here. Review verdicts are
 `clean`, `warnings`, `blockers`, or `pending`; execution is decided by
 `review_gate.executable_review`.
+Advisory explicit author finish can accept unchanged or corrected bytes after
+feedback, or a returned terminal partial/unavailable review reference, with current
+deterministic preflight. It buys no second critic and retains the original hash,
+status and findings; pending work without feedback is not unavailable. Blocking
+requires fresh reviewer approval. See ARCHITECTURE §13 for the shared runtime gate.
 
 ## Reference skills
 
@@ -1373,8 +1515,9 @@ The preflight returns one of five states:
 
 - `ready` — the current snapshot is locally publication-ready; the managed task
   repeats the authoritative checks before any public effect.
-- `warnings` — only non-blocking redacted findings remain, and continuing
-  requires explicit confirmation.
+- `warnings` — redacted scanner warnings or qualified Advisory author acceptance
+  remain disclosed; original critic findings retain their actual severity.
+  Continuing requires explicit confirmation.
 - `needs_attention` — the content, version, or full review still needs work, but
   the ordinary managed publication task may start so Ouroboros can repair and
   re-review it.
@@ -1398,7 +1541,8 @@ Only literal Betterleaks `high` confidence blocks an outbound publication call.
 `medium`, `low`, missing, and unknown confidence remain redacted warnings. For
 an intentional provider-shaped fixture, Ouroboros may add Betterleaks's
 exact-line `betterleaks:allow` annotation. That byte edit makes the hash-bound
-skill review stale, so a fresh full `skill_review` is mandatory before retrying.
+critic review stale, so the current bytes need fresh critic authority or qualified
+Advisory author finish before retrying; scanner approval alone supplies neither.
 The audit pass records the suppressed exact line as an audited false positive.
 Remove or rotate a real credential instead of allowing it.
 
@@ -1415,15 +1559,33 @@ A successful publication also writes a durable local receipt to
 `data/state/skills/<name>/ouroboroshub.json` (`published` section: slug,
 version, content hash, repository, PR number/url, timestamp). The receipt is
 best-effort: a write failure is disclosed as `publication_recorded: false` in
-the tool result and never cancels the real PR. The Skills UI reads it for the
-"Submitted PR #N" badge and the adopt confirmation copy; it survives
-uninstall and adopt, and a republish overwrites it.
+the tool result and never cancels the real PR. Both Skills views show it as
+quiet submission history — the submitted version (not the current local one),
+the PR link and whether the local files now differ from the submitted copy —
+in the card's details on My skills and under **Submission history** on the
+OuroborosHub card. It is history, not a status: it never claims that the PR
+merged or that the served Hub copy is yours, and it never gates an action. When
+the catalog lists the name, a local copy offers **Use Hub version** whichever
+way the versions differ. The receipt survives uninstall (including the startup
+cleanup of uninstalled state), adopt and reinstall; a republish overwrites it,
+and an explicit **Delete** of a local skill removes it with the rest of that
+skill's state.
 
-If a submission is no longer being pursued, **Clear local submission** on its
-OuroborosHub card removes that local waiting state. The action preserves the
-installed files, review and grants, and does not close or change the GitHub PR.
-It clears the receipt shown on the card; if another publication replaced it,
-refresh the card first. Returning to My skills refreshes the submission badge.
+**Clear local submission** in that history deliberately forgets the local
+receipt. Nothing else needs it: the installed files, review and grants stay,
+the GitHub PR is not closed or changed, and Install, Use Hub version and Update
+never wait for it. It clears the receipt shown on the card; if another
+publication replaced it, refresh the card first.
+
+**Use Hub version** and **Update** (on the OuroborosHub card or the My skills
+menu) both confirm before anything changes: the local files, including any
+local edits, are replaced with the copy the Hub serves when the action runs —
+the version shown is the last one seen, not a pinned package. The skill's saved
+data, enablement and review history stay; the new files are reviewed again and
+may need access granted again. Cancelling sends nothing. Grants are bound to
+the content hash, so with auto-grant off an enabled extension whose new files
+need a granted key cannot reload: the replacement fails and rolls back to the
+previous copy, and a failed restore is reported.
 
 For a catalog update, the tool result and PR body name both the current catalog
 version and the proposed version. Versions are opaque strings: an older-looking

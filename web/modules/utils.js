@@ -38,6 +38,50 @@ export function safeExternalHrefAttr(value) {
     return '';
 }
 
+/**
+ * ` · since HH:MM` in the viewer's own 24-hour clock, for an instant the host
+ * actually recorded. A wait that began on an earlier local day carries that day
+ * too, so `since 23:50` can never be misread as tonight. A missing or
+ * unparseable value yields '': a moment is never invented or inferred.
+ */
+export function sinceLocalTime(value, now = Date.now()) {
+    const at = new Date(Date.parse(String(value ?? '').trim()));
+    if (Number.isNaN(at.getTime())) return '';
+    const clock = at.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+    if (at.toDateString() === new Date(now).toDateString()) return ` · since ${clock}`;
+    return ` · since ${at.toLocaleDateString([], { month: 'short', day: 'numeric' })} ${clock}`;
+}
+
+const absoluteTime = (value, zone = false) => {
+    const date = value ? new Date(value) : null;
+    return date && !Number.isNaN(date.getTime()) ? date.toLocaleString(undefined, {
+        year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+        ...(zone ? { timeZoneName: 'short' } : {}),
+    }) : '';
+};
+// The instant's own minute: local clock text repeats across a DST fallback hour.
+const minuteOf = value => Math.floor(new Date(value).getTime() / 60000);
+
+/** A task's host-observed end and the time its notification was added are two
+ * facts (#1347); an unknown end says so rather than borrowing the second. Two
+ * different minutes that read alike locally carry their zone names. */
+export function terminalTimeNote(terminalTime, addedAt) {
+    const known = terminalTime?.source === 'executor_terminal' && absoluteTime(terminalTime.occurred_at);
+    const zone = Boolean(known) && known === absoluteTime(addedAt) && minuteOf(terminalTime.occurred_at) !== minuteOf(addedAt);
+    const occurred = known ? absoluteTime(terminalTime.occurred_at, zone) : '';
+    return `${occurred ? `Task ended ${occurred}` : 'Task end time not recorded'} · Notification added ${absoluteTime(addedAt, zone)}`;
+}
+
+/** A saved end row may be published long after its task ended. Its line keeps the
+ * row's own time and adds the note when the end falls in another minute or is
+ * unknown; live frames and rows saved before the host fact existed stay as they were. */
+export function savedTerminalRowNote(row) {
+    const fact = row?.system_type === 'task_summary' ? row.terminal_time : null;
+    if (!fact || typeof fact !== 'object' || !absoluteTime(row.ts)) return '';
+    const known = fact.source === 'executor_terminal' && absoluteTime(fact.occurred_at);
+    return known && minuteOf(fact.occurred_at) === minuteOf(row.ts) ? '' : terminalTimeNote(fact, row.ts);
+}
+
 /** Bound untrusted text with a visible marker before it reaches DOM surfaces. */
 export function boundedText(value, maxLen = 1200) {
     const text = String(value ?? '');
@@ -153,8 +197,9 @@ export function renderHubCard(item, {
     const lifecycleHint = lifecycle?.hint
         ? `<div class="marketplace-card-state-hint">${escapeHtmlAttr(lifecycle.hint)}</div>`
         : '';
+    // The local copy's own version only; the catalog version is the title's fact.
     const status = installed
-        ? `<span class="skills-status-chip skills-status-ok">Installed v${escapeHtmlAttr(installed.version || item.latest_version || '')}</span>`
+        ? `<span class="skills-status-chip skills-status-ok">Installed${installed.version ? ` v${escapeHtmlAttr(installed.version)}` : ''}</span>`
         : '';
     return `
         <article class="${working ? 'marketplace-card is-working' : 'marketplace-card'}" data-slug="${escapeHtmlAttr(slug)}">
@@ -181,6 +226,24 @@ export function renderHubCard(item, {
             </div>
         </article>
     `;
+}
+
+/**
+ * One quiet line of OuroborosHub submission history (the hub_sync
+ * `submission` facts), shared by the installed card's details and the hub
+ * card's disclosure. It states what this installation submitted — never
+ * ownership, a merge or an open pull request — and an unsafe receipt URL
+ * stays plain text without hiding the other facts.
+ */
+export function renderSubmissionHistory(submission) {
+    if (!submission || typeof submission !== 'object') return '';
+    const parts = [submission.version ? `Submitted v${escapeHtmlAttr(submission.version)}` : 'Submitted'];
+    const pr = submission.pr_number !== null ? `PR #${escapeHtmlAttr(String(submission.pr_number))}` : 'Pull request';
+    const href = safeExternalHrefAttr(submission.pr_url);
+    if (href) parts.push(`<a href="${href}" target="_blank" rel="noopener noreferrer">${pr}</a>`);
+    else if (submission.pr_number !== null) parts.push(pr);
+    if (submission.local_differs) parts.push('Local files differ from the submitted copy');
+    return parts.join(' · ');
 }
 
 /**
@@ -283,6 +346,16 @@ export function formatUsd2(value) {
     if (value === null || value === undefined || value === '') return '—';
     const num = Number(value);
     return Number.isFinite(num) ? `$${num.toFixed(2)}` : '—';
+}
+
+export function allowanceLabel(spent, daily, unknownUnmetered = 0, integrityDegraded = false) {
+    // The consciousness allowance line: an absent number stays absent (never $0.00), a
+    // window with unmetered rows prints as a floor ("≥"), a quarantined ledger says so.
+    if (spent === null || spent === undefined || daily === null || daily === undefined) return '';
+    if (!Number.isFinite(Number(spent)) || !Number.isFinite(Number(daily))) return '';
+    const floor = Number(unknownUnmetered) > 0 ? '≥ ' : '';
+    const degraded = integrityDegraded ? ' (ledger integrity degraded)' : '';
+    return `${floor}${formatUsd2(spent)} / ${formatUsd2(daily)}${degraded}`;
 }
 
 export function formatUsd4(value) {
@@ -389,8 +462,9 @@ function isMarkdownHeading(text, { rendered = false } = {}) {
     return visibleHeadingText(text, rendered).length <= MARKDOWN_HEADING_MAX_CHARS;
 }
 
-function headingOrProse(cls, text) {
-    return isMarkdownHeading(text, { rendered: true }) ? `<strong class="${cls}">${text}</strong>` : text;
+function headingOrProse(cls, text, breakAfter = false) {
+    return isMarkdownHeading(text, { rendered: true })
+        ? `<strong class="${cls}">${text}</strong>${breakAfter ? '<br>' : ''}` : text;
 }
 
 // The renderer's fence grammar (`/```(\w*)\n([\s\S]*?)```/`), line by line on the
@@ -439,7 +513,38 @@ export function joinMarkdownHeadings(text) {
     }).join('\n');
 }
 
-export function renderMarkdown(text) {
+/**
+ * One plain-text projection of RECORDED free text before it joins a host cause
+ * cancellation clause. The Python twin is
+ * `ouroboros.utils.strip_markdown` followed by a whitespace split/join, and the
+ * two strip the SAME marker inventory so one stored cause reads the same in the
+ * browser card and in the host's durable chat row. Line-anchored patterns
+ * (headings, bullets) only match while the newlines are still there, so
+ * stripping precedes flattening — exactly the order the Python docstring names.
+ * The common fixture pins Markdown, empty provenance and sentence punctuation
+ * through both consumers. `max` of 0 keeps the whole text; any other value
+ * bounds it by Unicode characters with an ellipsis.
+ */
+export function plainCauseText(value, max = 160) {
+    const plain = String(value || '')
+        .replace(/```[^\n]*\n([\s\S]*?)```/g, '$1')
+        .replace(/`([^`]+)`/g, '$1')
+        .replace(/\*\*\*(.+?)\*\*\*/g, '$1')
+        .replace(/\*\*(.+?)\*\*/g, '$1')
+        .replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g, '$1')
+        .replace(/(?<![\p{L}\p{N}_])_(.+?)_(?![\p{L}\p{N}_])/gu, '$1')
+        .replace(/~~(.+?)~~/g, '$1')
+        .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+        .replace(/^#{1,6}\s+/gm, '')
+        .replace(/^[*-]\s+/gm, '• ')
+        .replace(/\*\*|__|~~|`/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+    const chars = Array.from(plain);
+    return max > 0 && chars.length > max ? `${chars.slice(0, max - 1).join('').trimEnd()}…` : plain;
+}
+
+export function renderMarkdown(text, { inlineHeadingBreaks = false } = {}) {
     let html = escapeHtmlText(text);
     html = html.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>');
     // One pass for both span forms: a double-backtick span may contain backticks.
@@ -450,9 +555,14 @@ export function renderMarkdown(text) {
     // Header order matters: deeper levels first. Levels 4+ have no own size. A
     // marker in front of a whole paragraph is not a heading: past the length
     // cap the marker is dropped and the line stays prose.
-    html = html.replace(/^#{3,6} (.+)$/gm, (_, text) => headingOrProse('md-h3', text));
-    html = html.replace(/^## (.+)$/gm, (_, text) => headingOrProse('md-h2', text));
-    html = html.replace(/^# (.+)$/gm, (_, text) => headingOrProse('md-h1', text));
+    // Timeline labels stay inline, but their following paragraph needs a real
+    // copyable break when its surface collapses source whitespace.
+    const heading = (cls) => (match, content, offset, source) => headingOrProse(
+        cls, content, inlineHeadingBreaks && ['\r', '\n'].includes(source[offset + match.length]),
+    );
+    html = html.replace(/^#{3,6} (.+)$/gm, heading('md-h3'));
+    html = html.replace(/^## (.+)$/gm, heading('md-h2'));
+    html = html.replace(/^# (.+)$/gm, heading('md-h1'));
     html = html.replace(/^- (.+)$/gm, '<span class="md-li">\u2022 $1</span>');
     html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, function(_, text, url) {
         const safe = safeExternalUrl(decodeHtmlEntities(url));
@@ -540,15 +650,18 @@ export function initMatrixRain() {
     function syncMotion() {
         if (timer !== null) clearInterval(timer);
         timer = null;
+        if (document.documentElement.dataset.theme === 'light') return;
         if (motion.matches) draw();
         else timer = setInterval(draw, 66);
     }
     motion.addEventListener('change', syncMotion);
+    window.addEventListener('ouro:theme-changed', syncMotion);
     syncMotion();
     return () => {
         if (timer !== null) clearInterval(timer);
         timer = null;
         motion.removeEventListener('change', syncMotion);
+        window.removeEventListener('ouro:theme-changed', syncMotion);
         window.removeEventListener('resize', resize);
         canvas.remove();
     };

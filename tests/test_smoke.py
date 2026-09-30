@@ -102,18 +102,20 @@ EXPECTED_TOOLS = [
     "run_ci_tests",
     "preflight_review", "review_status",
     "compact_context", "set_tool_timeout", "request_restart",
-    "promote_to_stable", "schedule_subagent", "schedule_followup",
+    "promote_to_stable", "schedule_subagent", "schedule_followup", "manage_schedules",
     "configure_presence", "initiate_presence",
     "integrate_subagent_patch", "compare_subagent_patches",
     # C1: the explicit acceptance seam for a delegated run's captured patch —
     # a first-class tool, so the registry contract must name it.
-    "integrate_delegated_patch", "cancel_task",
+    "integrate_delegated_patch", "cancel_task", "resume_child_task",
     "peek_task", "discard_child_result", "override_delegation_constraint",
     "request_deep_self_review", "chat_history", "update_scratchpad",
     "send_user_message", "update_identity", "toggle_evolution",
-    "toggle_consciousness", "switch_model", "get_task_result",
-    "wait_task", "wait_tasks", "tree_note", "tree_read",
+    "toggle_consciousness",
+    "set_next_wakeup", "switch_model", "get_task_result",
+    "wait_task", "wait_tasks", "await_messages", "tree_note", "tree_read",
     "delegate_start", "delegate_wait", "delegate_cancel", "delegate_answer",
+    "delegate_message",
     "read_file", "list_files", "write_file", "edit_text",
     "apply_patch", "edit_batch",
     "send_photo", "send_video", "send_file", "send_links", "search_code", "query_code", "escalate",
@@ -123,7 +125,7 @@ EXPECTED_TOOLS = [
     "vcs_pull_ff", "vcs_restore", "vcs_revert",
     "fetch_pr_ref", "create_integration_branch", "cherry_pick_pr_commits",
     "stage_adaptations", "stage_pr_merge", "vcs_rollback",
-    "list_github_prs", "get_github_pr", "comment_on_pr",
+    "list_github_prs", "get_github_pr", "comment_on_pr", "pr_merge",
     "list_github_issues", "get_github_issue", "comment_on_issue",
     "close_github_issue", "create_github_issue",
     "codebase_health", "knowledge_read", "knowledge_write", "knowledge_list",
@@ -131,7 +133,8 @@ EXPECTED_TOOLS = [
     "promote_chat_to_task", "route_to_project", "list_projects", "steer_task",
     "ensure_project_scope", "schedule_followup",
     "memory_map", "memory_update_registry",
-    "plan_task", "recent_tasks", "task_acceptance_review", "verify_and_record", "web_search",
+    "plan_task", "recent_tasks", "live_roots", "update_focus",
+    "task_acceptance_review", "verify_and_record", "web_search",
     "start_service", "service_status", "service_logs", "stop_service",
     "run_command", "run_script",
     "list_skills", "skill_review", "skill_exec", "toggle_skill", "skill_owner_action",
@@ -602,11 +605,11 @@ class TestPrePushGate:
     def test_pre_push_tests_timeout_is_sufficient(self):
         """The pre-push/post-commit pytest budget must be >= 180s.
 
-        Since v6.88.0 this is the TOTAL budget across BOTH preflight passes
-        (parallel ``not serial``, then ``serial``, which gets the remainder).
-        The full suite measures ~180s two-pass against ~470-510s for the old
-        single serial pass, so a shorter cap produces false TESTS_FAILED on
-        every successful commit. The budget is owned by ``run_hermetic_pytest``
+        Since v6.88.0 this is the TOTAL budget across the node test lane AND
+        both preflight passes (parallel ``not serial``, then ``serial``, which
+        gets the remainder) — not a per-pass one. A full suite takes MINUTES,
+        and one loaded-host run measured 1077s, so a cap sized for an idle host
+        reports a healthy suite as a timeout. The budget is owned by ``run_hermetic_pytest``
         (default + ``OUROBOROS_PREFLIGHT_TIMEOUT_SEC`` env) so callers do not
         re-pin a stale literal — this guard anchors on that single source of truth.
         """
@@ -616,9 +619,9 @@ class TestPrePushGate:
         )
 
         assert _DEFAULT_PREFLIGHT_TIMEOUT_SEC >= 180, (
-            f"preflight default timeout is {_DEFAULT_PREFLIGHT_TIMEOUT_SEC}s — must be "
-            ">= 180s; the full suite takes ~2 minutes and a shorter cap reports "
-            "spurious TESTS_FAILED on successful commits."
+            f"preflight default timeout is {_DEFAULT_PREFLIGHT_TIMEOUT_SEC}s — 180s is a "
+            "FLOOR against a caller re-pinning a tiny literal, never a claim about how "
+            "long the suite takes; the real budget must cover a whole loaded-host run."
         )
         # The env override is honoured so operators can raise it on slow hosts.
         import os as _os

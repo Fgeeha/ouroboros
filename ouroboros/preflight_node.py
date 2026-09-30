@@ -102,17 +102,18 @@ def run_node_tests(
     the candidate). Otherwise a small result dict whose ``error`` key carries
     the bounded typed diagnosis — ``None`` on green. The caller runs this as
     the FIRST consumer of the shared preflight budget, before any pytest pass.
+    ``reap_error`` is the container's reason when a process the lane spawned
+    was not proven gone (empty otherwise): the caller then keeps the tree.
     """
     # Lazy sibling import: preflight_runner imports this module at its top, so
     # the shared helpers must be reached at call time, not import time.
     from ouroboros import preflight_runner as pr
-    from ouroboros.platform_layer import kill_processes_referencing
     from ouroboros.process_containment import ProcessContainer
 
     files = candidate_node_tests(worktree)
     if not files:
         return None
-    result = {"files": len(files), "node": None, "returncode": None, "error": None}
+    result = {"files": len(files), "node": None, "returncode": None, "error": None, "reap_error": ""}
     node = resolve_node()
     if not node:
         result["error"] = pr._diagnosis(
@@ -200,11 +201,9 @@ def run_node_tests(
             pass
         container.reap()
         container.close()
-        # Sweep so a node-lane escapee cannot touch the pytest passes that
-        # follow — the same between-pass hygiene the pytest loop applies.
-        kill_processes_referencing(str(temp_root))
     elapsed = time.monotonic() - started
     result["returncode"] = returncode
+    result["reap_error"] = reap_error
     if reap_error:
         result["error"] = pr._diagnosis(
             "⚠️ PRE_PUSH_TEST_ERROR: PREFLIGHT_CONTAINMENT_FAILED (hard block): "

@@ -15,6 +15,7 @@ import json
 import logging
 import pathlib
 import subprocess
+from contextlib import ExitStack
 from typing import Any, Dict, List
 
 from ouroboros.contracts.task_constraint import normalize_task_constraint
@@ -78,7 +79,7 @@ def _capture_failed_refusal(rid: str, cap_status: str, note: str) -> str:
 
 
 def _capture_at_disposition(
-    drive: Any, entry: Any, rid: str, manifest_path: pathlib.Path,
+    drive: Any, entry: Any, rid: str, manifest_path: pathlib.Path, decision: str = "apply",
 ) -> str:
     """Capture-on-demand (C1-R2) for a run that settled without terminal proof.
 
@@ -99,6 +100,20 @@ def _capture_at_disposition(
     """
     if entry.patch_captured and _manifest_capture_status(manifest_path) in _READY_CAPTURE_STATUSES:
         return ""
+    if str(decision or "").lower() == "reject":
+        try:
+            saved = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError):
+            saved = {}
+        if (isinstance(saved, dict) and saved.get("status") == "failed"
+                and saved.get("authority_drift_source_status") == ARTIFACT_STATUS_READY_NO_CHANGES
+                and isinstance(saved.get("authority_drift"), dict)
+                and (saved.get("authority_drift", {}).get("paths")
+                     or saved.get("authority_drift", {}).get("error"))):
+            # The private snapshot is known to contain no child changes. A
+            # reject only discards that empty result, so it remains safe and
+            # prevents a neighboring edit from wedging custody forever.
+            return ""
     from ouroboros.tools.delegate_integration import capture_terminal_patch_for_drive
 
     try:
@@ -127,11 +142,14 @@ def _delegated_disposition_refusal(status: str, entry: Any, rid: str,
     if status != custody.OWNED or entry is None:
         return (
             f"⚠️ INTEGRATE_DELEGATED_NOT_OWNED: run {rid!r} is {status} to this task. "
-            "Only the task that started a delegated run may integrate its patch while that task "
-            "is LIVE; once the owner is terminal, a live TOP-LEVEL task whose active root (Git lane) "
-            "or fresh payload binding (payload lane) is the run's recorded target may dispose the orphan."
+            "The starter or its host-confirmed retry successor may dispose a completed result; "
+            "retry authority does not include live control; once the owner is terminal, a live "
+            "TOP-LEVEL task whose active root (Git lane) "
+            "or fresh payload binding (payload lane) is the run's recorded target — or contains it as "
+            "a host-minted project tree — may dispose the orphan."
         )
-    if not entry.execution_root:
+    from ouroboros.delegate_directory import is_directory_run
+    if not entry.execution_root and not is_directory_run(entry):
         return (
             f"⚠️ INTEGRATE_DELEGATED_NOT_ISOLATED: run {rid} recorded no execution "
             "snapshot (read-only, or a pre-isolation run). There is no captured patch "
@@ -275,7 +293,8 @@ def _drift_refusal(
 
 def _locked_apply(
     ctx: ToolContext, target: pathlib.Path, patch_path: pathlib.Path,
-    ordered_touched: List[str], baseline_sha: str,
+    ordered_touched: List[str], baseline_sha: str, *, file_changes=None, file_baseline=None,
+    admission_check=None, three_way: bool = False,
 ) -> Dict[str, Any]:
     """Apply one captured patch under the repo git lock — mechanics only.
 
@@ -286,11 +305,14 @@ def _locked_apply(
     the one caller so every exit stays visible in one place.
     """
     from ouroboros.tools.git import _acquire_git_lock, _release_git_lock
+    from ouroboros.workspace_file_outputs import prepare_file_outputs
 
     result: Dict[str, Any] = {
         "proc": None, "drifted": [], "drift_error": "",
         "staging_failure": "", "reverted": False, "lock_error": "",
     }
+    prepared = None
+    temporary = ExitStack()
     try:
         _git_lock = _acquire_git_lock(ctx)
     except Exception as exc:
@@ -301,28 +323,46 @@ def _locked_apply(
         # target that moved since the snapshot can still take the patch — at a
         # shifted position, silently. Under the same lock that serializes the
         # mutation, every touched path is compared against the run's baseline commit
-        # first; ANY difference is the typed conflict the nanny owns, and nothing is
-        # applied.
+        # first. Dirty-source copies refuse drift; proven clean task copies
+        # retain Git three-way synthesis and its explicit conflicts.
         try:
             result["drifted"], result["drift_error"] = _si()._baseline_drifted_paths(
-                target, baseline_sha, ordered_touched)
+                target, baseline_sha, [path for path in ordered_touched if path not in (file_baseline or {})])
         except Exception as exc:
             result["drifted"], result["drift_error"] = [], f"{type(exc).__name__}: {exc}"
-        if result["drift_error"] or result["drifted"]:
+        if result["drift_error"] or (result["drifted"] and not three_way):
             return result
-        # WORKING-TREE apply, not --3way/--index: the baseline deliberately
-        # snapshots the target's DIRTY state (that is the whole point of C1), so the
-        # patch's preimage is the live working tree — while `--3way` implies index
-        # binding and refuses any file whose worktree differs from the index, i.e.
-        # refuses the normal shared-tree state. Touched paths are then staged
-        # explicitly so the result matches integrate_subagent_patch's staged contract.
+        if three_way:
+            result["drifted"] = []  # Git's 3-way merge reconciles clean-base contributions.
+        if file_changes:
+            try:
+                prepared = temporary.enter_context(prepare_file_outputs(
+                    file_changes, target, baseline_sha=baseline_sha, file_baseline=file_baseline))
+            except Exception as exc:
+                result["drift_error"] = f"file results could not be prepared: {type(exc).__name__}: {exc}"
+                return result
+        if admission_check and (refusal := admission_check()):
+            result["admission_refusal"] = refusal
+            return result
+        # Dirty-source snapshots use working-tree apply: --3way implies index
+        # binding and would reject the source's pre-existing unstaged changes.
+        # A task copy recorded from clean HEAD/index instead keeps three-way
+        # synthesis. Both paths stage touched results and never commit.
+        has_patch = patch_path.is_file() and patch_path.stat().st_size > 0
         proc = subprocess.run(
-            ["git", "apply", str(patch_path)],
+            ["git", "apply", *(["--3way", "--index"] if three_way else []), str(patch_path)],
             cwd=str(target), capture_output=True, text=True,
-        )
+        ) if has_patch else subprocess.CompletedProcess([], 0, "", "")
         result["proc"] = proc
+        if proc.returncode != 0:
+            return result
+        if prepared:
+            try:
+                prepared.apply()
+            except Exception as exc:
+                result["staging_failure"] = f"file result apply failed: {type(exc).__name__}: {exc}"
         stageable = _si()._stageable_paths(target, ordered_touched) if proc.returncode == 0 else []
-        if proc.returncode != 0 or not stageable:
+        if not stageable and not result["staging_failure"]:
             return result
         # NUL-delimited stdin pathspecs: byte-safe and immune to argv limits for a
         # patch touching thousands of files.
@@ -331,15 +371,26 @@ def _locked_apply(
             cwd=str(target), capture_output=True,
             input=b"\0".join(
                 p.encode("utf-8", errors="surrogateescape") for p in stageable) + b"\0",
-        )
-        if add.returncode == 0:
+        ) if not result["staging_failure"] else None
+        if add is not None and add.returncode == 0:
             return result
         # The APPLY SUCCEEDED — the tree is already mutated. Reporting this as a
         # conflict ("the tree moved") invited a retry over changed content and let a
         # later reject record "not applied" over real changes. Try to put the tree
         # back cleanly; whatever the outcome, the caller says exactly what is true.
-        result["staging_failure"] = (add.stderr or add.stdout or b"").decode(
-            "utf-8", errors="replace").strip()
+        if add is not None:
+            result["staging_failure"] = (add.stderr or add.stdout or b"").decode(
+                "utf-8", errors="replace").strip()
+        files_reverted = True
+        if prepared:
+            try:
+                prepared.rollback()
+            except Exception as exc:
+                files_reverted = False
+                result["staging_failure"] += f"; file rollback: {type(exc).__name__}: {exc}"
+        if not has_patch:
+            result["reverted"] = files_reverted
+            return result
         check = subprocess.run(
             ["git", "apply", "--check", "--reverse", str(patch_path)],
             cwd=str(target), capture_output=True, text=True,
@@ -348,9 +399,10 @@ def _locked_apply(
             result["reverted"] = subprocess.run(
                 ["git", "apply", "--reverse", str(patch_path)],
                 cwd=str(target), capture_output=True, text=True,
-            ).returncode == 0
+            ).returncode == 0 and files_reverted
         return result
     finally:
+        temporary.close()
         _release_git_lock(_git_lock)
 
 
@@ -360,6 +412,65 @@ def _integrate_delegated_patch(
     decision: str = "apply",
     reason: str = "",
     acknowledge_ambiguous: bool = False,
+    paths: List[str] | None = None,
+) -> str:
+    """Serialize a captured run's disposition across owners and retry successors.
+
+    The canonical capture address keeps every caller on the same lock even with
+    separate task drives. Admission is repeated inside it; a stale custody object
+    must never authorize a second materialization or an obsolete starter.
+    """
+    from ouroboros import delegate_custody as custody
+    from ouroboros.delegate_shared import orphan_disposition_status
+    from ouroboros.platform_layer import acquire_exclusive_file_lock, release_exclusive_file_lock
+
+    rid = str(run_id or "").strip()
+    if not rid:
+        return "⚠️ TOOL_ARG_ERROR (integrate_delegated_patch): run_id is required."
+    decision = str(decision or "apply").strip().lower()
+    if decision not in {"apply", "reject"}:
+        return "⚠️ TOOL_ARG_ERROR (integrate_delegated_patch): decision must be 'apply' or 'reject'."
+    drive = custody.custody_root(ctx)
+    status, entry, _ = orphan_disposition_status(ctx, drive, rid)
+    if status != custody.OWNED or entry is None:
+        return _delegated_disposition_refusal(status, entry, rid, acknowledge_ambiguous)
+    lock_path = custody.delegated_capture_dir(
+        drive, entry.task_id, entry.snapshot_id or rid) / "disposition.lock"
+    try:
+        lock_fd = acquire_exclusive_file_lock(lock_path, timeout_sec=20.0, owner_aware_stale=True)
+    except Exception as exc:
+        return f"⚠️ INTEGRATE_LOCK_TIMEOUT: could not lock the captured result: {type(exc).__name__}: {exc}."
+    if lock_fd is None:
+        return "⚠️ INTEGRATE_LOCK_TIMEOUT: another disposition holds this captured result; retry after it completes."
+    try:
+        result = _integrate_delegated_patch_locked(ctx, rid, decision, reason, acknowledge_ambiguous, paths)
+        from ouroboros.delegate_terminal import refresh_disposed_reconciliation
+
+        try:
+            refresh_disposed_reconciliation(drive, rid, reader_task_id=str(getattr(ctx, "task_id", "") or ""))
+        except Exception:
+            log.warning("Disposed custody disclosure refresh failed for run %s", rid, exc_info=True)
+        return result
+    finally:
+        release_exclusive_file_lock(lock_path, lock_fd)
+
+
+def _current_disposition_refusal(ctx: ToolContext, rid: str) -> str:
+    """Revalidate authority after capture/preparation, allowing this call's intent."""
+    from ouroboros import delegate_custody as custody
+    from ouroboros.delegate_shared import orphan_disposition_status
+
+    status, entry, _ = orphan_disposition_status(ctx, custody.custody_root(ctx), rid)
+    return _delegated_disposition_refusal(status, entry, rid, acknowledge_ambiguous=True)
+
+
+def _integrate_delegated_patch_locked(
+    ctx: ToolContext,
+    run_id: str = "",
+    decision: str = "apply",
+    reason: str = "",
+    acknowledge_ambiguous: bool = False,
+    paths: List[str] | None = None,
 ) -> str:
     """The C1 explicit acceptance seam: apply or reject ONE delegated run's captured patch.
 
@@ -380,12 +491,7 @@ def _integrate_delegated_patch(
     from ouroboros import delegate_custody as custody, delegate_source_coverage
     from ouroboros.delegate_shared import orphan_disposition_status
 
-    rid = str(run_id or "").strip()
-    if not rid:
-        return "⚠️ TOOL_ARG_ERROR (integrate_delegated_patch): run_id is required."
-    decision = str(decision or "apply").strip().lower()
-    if decision not in {"apply", "reject"}:
-        return "⚠️ TOOL_ARG_ERROR (integrate_delegated_patch): decision must be 'apply' or 'reject'."
+    rid = run_id
     drive = custody.custody_root(ctx)
     status, entry, orphan_of = orphan_disposition_status(ctx, drive, rid)
     orphan_note = f"(orphan of terminal task {orphan_of}) " if orphan_of else ""
@@ -395,15 +501,35 @@ def _integrate_delegated_patch(
     if decision == "apply" and entry is not None:
         if refusal := delegate_source_coverage.source_apply_refusal(entry, rid):
             return refusal
+    from ouroboros.delegate_directory import is_directory_run, integrate_directory_result
+    if is_directory_run(entry):
+        from ouroboros.claudexor_daemon import read_owned_gateway
+        try:
+            with read_owned_gateway() as gateway:
+                return integrate_directory_result(ctx, entry, decision, reason, gateway,
+                                                  acknowledge_ambiguous=acknowledge_ambiguous,
+                                                  paths=paths, orphan=bool(orphan_of),
+                                                  admission_check=lambda: _current_disposition_refusal(ctx, rid))
+        except Exception as exc:
+            return f"⚠️ INTEGRATE_DELEGATED_APPLY_UNCONFIRMED: {type(exc).__name__}: {exc}. Retain this run; no replacement was started."
+    # Directory selections have their own semantics. On whole-capture paths,
+    # an explicitly empty list asks for no filter, exactly as omission does.
+    empty_paths = type(paths) is list and not paths
+    if paths is not None and not empty_paths:
+        return ("⚠️ TOOL_ARG_ERROR (integrate_delegated_patch): nonempty paths selects engine "
+                "directory results only. Omit paths or use [] for the complete Git/skill capture.")
+    selection_note = "\npaths=[] selects the complete captured result, as when paths is omitted." if empty_paths else ""
     if entry.patch_apply_pending and acknowledge_ambiguous:
         _resolve_acknowledged_intent(drive, entry)
     snapshot_key = entry.snapshot_id or entry.run_id
     cap_dir = custody.delegated_capture_dir(drive, entry.task_id, snapshot_key)
     manifest_path = cap_dir / "workspace_patch.json"
     patch_path = cap_dir / "workspace.patch"
-    capture_refusal = _si()._capture_at_disposition(drive, entry, rid, manifest_path)
+    capture_refusal = _si()._capture_at_disposition(drive, entry, rid, manifest_path, decision)
     if capture_refusal:
         return capture_refusal
+    if refusal := _current_disposition_refusal(ctx, rid):
+        return refusal
     manifest: Dict[str, Any] = {}
     if manifest_path.exists():
         try:
@@ -419,9 +545,31 @@ def _integrate_delegated_patch(
 
         return integrate_payload_patch(
             ctx, drive=drive, entry=entry, rid=rid, decision=decision,
-            reason=reason, cap_dir=cap_dir, manifest=manifest, patch_path=patch_path) + (f"\n{orphan_note.rstrip()}" if orphan_note else "")
+            reason=reason, cap_dir=cap_dir, manifest=manifest, patch_path=patch_path) + (f"\n{orphan_note.rstrip()}" if orphan_note else "") + selection_note
+    return _integrate_git_capture(ctx, entry, decision, reason, manifest, cap_dir, orphan_of) + selection_note
+
+
+def _integrate_git_capture(ctx, entry, decision, reason, manifest, cap_dir, orphan_of):
+    """Apply/dispose a Git capture after common run ownership and source admission.
+
+    File postimages and the diagnostic patch share one target, lock and disposition.
+    Payload and engine-directory products have their own materialization owners.
+    """
+    from ouroboros import delegate_custody as custody
+    from ouroboros.delegate_shared import orphan_apply_target_ok
+
+    drive, rid = custody.custody_root(ctx), entry.run_id
+    snapshot_key = entry.snapshot_id or rid
+    patch_path = cap_dir / "workspace.patch"
+    orphan_note = f"(orphan of terminal task {orphan_of}) " if orphan_of else ""
     touched = [str(p) for p in (manifest.get("tracked_changed") or [])]
     touched += [str(p) for p in (manifest.get("untracked_included") or [])]
+    from ouroboros.workspace_file_outputs import file_output_changes
+    try:
+        file_changes = file_output_changes(manifest, cap_dir)
+    except Exception as exc:
+        return _capture_failed_refusal(rid, str(manifest.get("status") or ""), str(exc))
+    touched = sorted(set(touched) | {row["path"] for row in file_changes})
 
     def _dispose(disposition: str, cleanup: bool) -> tuple[bool, str]:
         return _dispose_delegated(
@@ -433,8 +581,17 @@ def _integrate_delegated_patch(
 
     capture_status = str(manifest.get("status") or "")
     if decision == "reject":
-        # A reject RELEASES the snapshot (the child's only copy): ready-only.
-        if capture_status not in _READY_CAPTURE_STATUSES:
+        drifted_no_change = (
+            capture_status == "failed"
+            and manifest.get("authority_drift_source_status") == ARTIFACT_STATUS_READY_NO_CHANGES
+            and isinstance(manifest.get("authority_drift"), dict)
+            and (manifest["authority_drift"].get("paths")
+                 or manifest["authority_drift"].get("error"))
+        )
+        # A reject releases a ready capture. It may also release a failed
+        # no-change capture whose only private fact is the durable authority
+        # drift record: there are no child bytes to discard in that shape.
+        if capture_status not in _READY_CAPTURE_STATUSES and not drifted_no_change:
             return _capture_failed_refusal(
                 rid, capture_status, "a reject would release the snapshot over it")
         verdict_path = _si()._write_verdict(
@@ -457,8 +614,8 @@ def _integrate_delegated_patch(
             if not recorded:
                 return _unwritten_disposition("applied", applied=False)
             return (
-                f"OK: delegated run {rid} changed NOTHING in its execution snapshot; "
-                f"there is no patch to apply and the snapshot is released."
+                f"OK: delegated run {rid} has no captured file changes to apply; "
+                f"its answer and external effects remain separate evidence. The snapshot is released."
                 f"{format_patch_exclusions(manifest)}{note}"
             )
         return (
@@ -467,10 +624,10 @@ def _integrate_delegated_patch(
             "ended, delegate_wait it once more to capture; a failed capture keeps the "
             "snapshot for direct inspection."
         )
-    if not patch_path.exists():
+    if not patch_path.exists() and not file_changes:
         return f"⚠️ INTEGRATE_PATCH_MISSING: captured patch not found at {patch_path}."
     expected_digest = str(manifest.get("sha256") or "")
-    if expected_digest:
+    if expected_digest and patch_path.exists():
         actual_digest = _si()._sha256_file(patch_path)
         if actual_digest != expected_digest:
             return (
@@ -485,16 +642,22 @@ def _integrate_delegated_patch(
     except Exception as exc:
         return f"⚠️ INTEGRATE_TARGET_ERROR: could not resolve active repo: {type(exc).__name__}: {exc}."
     target = pathlib.Path(str(entry.target_root or "")).resolve(strict=False)
-    if not str(entry.target_root or "").strip() or target != active_root:
+    # Owner decision B7=A: an ORPHAN may also apply into a target NESTED inside the
+    # caller's active root under the projects root; an OWN run keeps exact equality.
+    target_ok = orphan_apply_target_ok(target, active_root) if orphan_of else target == active_root
+    if not str(entry.target_root or "").strip() or not target_ok:
         return (
             "⚠️ INTEGRATE_DELEGATED_TARGET_MISMATCH: the run's recorded authority target "
             f"({entry.target_root or '(none)'}) is not this task's active root ({active_root}). "
-            "Refusing to apply across trees."
+            "Refusing to apply across trees. A terminal owner's orphan may also target a host-minted "
+            "project tree NESTED inside that root (both under the subagent-projects root); this one is not."
         )
     if not (target / ".git").exists():
         return f"⚠️ INTEGRATE_TARGET_NOT_GIT: target {target} is not a git working tree."
 
-    patch_touched, parse_error = _si()._patch_touched_paths(patch_path, target)
+    patch_touched, parse_error = (_si()._patch_touched_paths(patch_path, target)
+                                  if patch_path.exists() else (set(), ""))
+    patch_touched.update(row["path"] for row in file_changes)
     if parse_error:
         return (
             f"⚠️ INTEGRATE_PATCH_UNREADABLE: cannot parse run {rid}'s captured patch "
@@ -539,7 +702,17 @@ def _integrate_delegated_patch(
             "tree state unaccountable. Refusing to mutate; fix the drive/event "
             "log and retry. Nothing was changed."
         )
-    outcome = _si()._locked_apply(ctx, target, patch_path, ordered_touched, entry.baseline_sha)
+    file_options = {}
+    if file_changes:
+        from ouroboros.subagent_worktrees import find_execution_snapshot
+        snapshot = find_execution_snapshot(entry.snapshot_id) or {}
+        file_options = {"file_changes": file_changes, "file_baseline": snapshot.get("file_baseline") or {}}
+    outcome = _si()._locked_apply(
+        ctx, target, patch_path, ordered_touched, entry.baseline_sha,
+        admission_check=lambda: _current_disposition_refusal(ctx, rid), **file_options)
+    if outcome.get("admission_refusal"):
+        custody.record_patch_apply_resolved(drive, entry, reason="authority_changed")
+        return outcome["admission_refusal"]
     if outcome.get("lock_error"):
         custody.record_patch_apply_resolved(drive, entry, reason="lock_error")
         return (
@@ -576,8 +749,8 @@ def _integrate_delegated_patch(
         )
         if reverted:
             return (
-                f"⚠️ INTEGRATE_APPLIED_UNSTAGED: run {rid}'s patch applied cleanly into "
-                f"{target} but STAGING it failed ({staging_failure[:300]}), so the apply "
+                f"⚠️ INTEGRATE_APPLIED_UNSTAGED: applying or staging run {rid}'s results in "
+                f"{target} failed ({staging_failure[:300]}), so the apply "
                 "was reversed — your tree is back to its pre-apply state and NOTHING is "
                 "left half-applied. The snapshot and the patch are preserved; fix the "
                 f"index problem, then call this tool again. Verdict: {verdict_path or '(unwritten)'}."
@@ -589,8 +762,8 @@ def _integrate_delegated_patch(
             "outcome yourself before any further integration attempt."
         )
         return (
-            f"⚠️ INTEGRATE_APPLIED_UNSTAGED: run {rid}'s patch IS APPLIED in {target} "
-            f"({len(touched)} file(s)) but could NOT be staged ({staging_failure[:300]}), "
+            f"⚠️ INTEGRATE_APPLIED_UNSTAGED: run {rid}'s result transfer in {target} "
+            f"({len(touched)} file(s)) is incomplete ({staging_failure[:300]}), "
             "and the apply could not be cleanly reversed. Do NOT retry this call — the "
             "changes are already in your working tree and a second apply would double "
             "them. Inspect with vcs_diff, stage what you accept yourself, and note that "

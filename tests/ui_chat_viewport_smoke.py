@@ -16,6 +16,54 @@ _CAPTURE_TEST_SOCKET = """() => {
         }
     };
 }"""
+# One page-wide /api/state read is in flight at a time (chat_activity.js
+# createStateSnapshotSequencer.gate): a forced refresh that lands behind an
+# in-flight read starts only after that read settles, so the socket-open census
+# can still be reading after the socket reports OPEN. A frame emitted on the test
+# socket exists nowhere on the server; a complete census whose request started
+# after that frame concludes its card by absence, exactly as it would a task the
+# queue really lost. Tests that emit such frames wait for the reads to land first.
+_OBSERVE_STATE_READS = """() => {
+    window.__stateReadsInFlight = 0;
+    window.__stateReadsSettled = 0;
+    const nativeFetch = window.fetch.bind(window);
+    const settle = () => { window.__stateReadsInFlight -= 1; window.__stateReadsSettled += 1; };
+    window.fetch = (input, init) => {
+        const raw = typeof input === 'string' ? input : input?.url || '';
+        if (new URL(raw, location.href).pathname !== '/api/state') return nativeFetch(input, init);
+        window.__stateReadsInFlight += 1;
+        return nativeFetch(input, init).then((response) => {
+            if (!response.ok) { settle(); return response; }
+            // A reader applies right after resp.json() resolves, and the gate
+            // starts the coalesced follow-up in that same microtask turn, so
+            // counting the read as settled here never exposes a false quiet gap.
+            const nativeJson = response.json.bind(response);
+            response.json = () => nativeJson().finally(settle);
+            return response;
+        }, (error) => { settle(); throw error; });
+    };
+}"""
+_STATE_READS_QUIESCENT = "() => window.__stateReadsInFlight === 0 && window.__stateReadsSettled > 0"
+
+
+def _wait_state_reads_quiescent(page, timeout=30_000):
+    """No /api/state read in flight, at least one landed; needs _OBSERVE_STATE_READS."""
+    page.wait_for_function(_STATE_READS_QUIESCENT, timeout=timeout)
+
+
+_TEST_SOCKET_OPEN = "() => window.__testSockets?.some(socket => socket.readyState === WebSocket.OPEN)"
+
+
+def _wait_socket_open_quiescent(page, timeout=30_000):
+    """A test socket is OPEN and the socket-open census has landed (both init scripts).
+
+    A frame emitted on the test socket before that census settles is concluded
+    by absence when the census applies, exactly like a task the queue lost.
+    """
+    page.wait_for_function(_TEST_SOCKET_OPEN, timeout=timeout)
+    _wait_state_reads_quiescent(page, timeout)
+
+
 _SETTLE_TWO_FRAMES = "() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))"
 _SETTLE_RESTORE_FRAMES = """() => new Promise(resolve => {
     let remaining = 14;
@@ -88,6 +136,20 @@ def run_chat_viewport_smoke(
         page.evaluate(_SETTLE_TWO_FRAMES)
         return result
 
+    def read_to_latest(page):
+        # Follow is reading intent: the reader's own wheel reaches the live edge.
+        # A scripted scroll (set_remaining) moves the view but decides nothing.
+        box = page.locator("#chat-messages").bounding_box()
+        page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+        page.mouse.wheel(0, jump_state(page)["remaining"] + 200)
+        page.wait_for_function(
+            """() => {
+                const messages = document.querySelector('#chat-messages');
+                return messages.scrollHeight - messages.scrollTop - messages.clientHeight <= 1;
+            }"""
+        )
+        page.evaluate(_SETTLE_TWO_FRAMES)
+
     def jump_state(page):
         return page.evaluate(
             """() => {
@@ -109,7 +171,7 @@ def run_chat_viewport_smoke(
         )
 
     def begin_noop_read(page):
-        set_remaining(page, 0)
+        read_to_latest(page)
         return set_remaining(page, 40)["scrollTop"]
 
     def assert_noop_read(page, before):
@@ -124,6 +186,14 @@ def run_chat_viewport_smoke(
 
     def hold_first_route(routes):
         return lambda route: routes.append(route) if not routes else route.fallback()
+
+    def incomplete_activity_census(route):
+        # These WS-only tasks do not exist on the fixture server. Its empty
+        # roster cannot disprove them; reconciliation cases opt in below.
+        response = route.fetch()
+        payload = response.json()
+        payload["active_chat_activities_complete"] = False
+        route.fulfill(response=response, json=payload)
 
     def visible_card_anchor(page):
         return page.evaluate(
@@ -152,6 +222,7 @@ def run_chat_viewport_smoke(
             page = browser.new_page(viewport={"width": 1280, "height": 760})
             try:
                 page.add_init_script(f"({_CAPTURE_TEST_SOCKET})()")
+                page.route("**/api/state", incomplete_activity_census)
                 page.goto(url, wait_until="domcontentloaded", timeout=30_000)
                 page.add_style_tag(
                     content="#chat-messages, #chat-messages * { overflow-anchor: none !important; }"
@@ -163,10 +234,7 @@ def run_chat_viewport_smoke(
                     "() => window.__testSockets?.some(socket => socket.readyState === WebSocket.OPEN)",
                     timeout=30_000,
                 )
-                page.wait_for_function(
-                    "() => document.querySelector('#chat-messages')?.innerText.includes('Ouroboros has awakened')",
-                    timeout=30_000,
-                )
+                page.wait_for_selector('#chat-messages[data-history-hydrated="true"]', timeout=30_000)
                 # Threshold assertions start after the page-show restore lease;
                 # WebKit otherwise applies its final scheduled pin mid-scenario.
                 page.evaluate(_SETTLE_RESTORE_FRAMES)
@@ -214,7 +282,9 @@ def run_chat_viewport_smoke(
                 assert state["visible"] and state["dotHidden"], state
                 assert state["label"] == state["title"] == "Scroll to latest message", state
 
-                # The visible pre-mutation distance is the only live-follow truth.
+                # A following reader follows only from within the 48px zone:
+                # the visible pre-mutation distance decides.
+                read_to_latest(page)
                 for case, target in enumerate((0, 40)):
                     assert abs(set_remaining(page, target)["remaining"] - target) <= 2
                     _emit_ws_frame(page, {
@@ -255,9 +325,9 @@ def run_chat_viewport_smoke(
                     set_remaining(page, 0)
                     assert jump_state(page)["dotHidden"]
 
-                # `_savedStick` is deliberately stale here: scroll and delivery
+                # Follow intent is deliberately stale here: scroll and delivery
                 # happen in one JS turn, before a native scroll event can repair it.
-                set_remaining(page, 0)
+                read_to_latest(page)
                 stale = page.evaluate(
                     """frame => {
                         const messages = document.querySelector('#chat-messages');
@@ -306,7 +376,7 @@ def run_chat_viewport_smoke(
                 assert state["remaining"] <= 6 and state["dotHidden"], state
                 assert button.evaluate("node => document.activeElement === node")
 
-                # A duplicate is a no-op. Transient work is visible activity
+                # A duplicate is a no-op. Ordinary direct work is visible activity
                 # under #691 and keeps the reader's history position.
                 duplicate = {
                     "type": "chat", "role": "user", "chat_id": 1,
@@ -322,28 +392,33 @@ def run_chat_viewport_smoke(
                 _emit_ws_frame(page, duplicate)
                 state = jump_state(page)
                 assert state["remaining"] > 48 and state["dotHidden"], state
-                before_transient = state["scrollTop"]
+                before_direct = state["scrollTop"]
                 _emit_ws_frame(page, {
                     "type": "chat", "role": "assistant", "is_progress": True,
-                    "ephemeral_decision": True, "chat_id": 1,
-                    "task_id": "vp-transient-decision", "content": "Transient work",
+                    "chat_id": 1,
+                    "task_id": "vp-direct-work", "content": "Ordinary direct work",
                     "ts": "2026-08-03T10:02:23+00:00",
                 })
-                transient = page.locator('[data-task-id="vp-transient-decision"]')
-                assert transient.count() == 1
+                direct = page.locator('[data-task-id="vp-direct-work"]')
+                assert direct.count() == 1
                 state = jump_state(page)
                 assert not state["dotHidden"] and state["dotCount"] == 1, state
-                assert abs(state["scrollTop"] - before_transient) <= 6, state
+                assert abs(state["scrollTop"] - before_direct) <= 6, state
                 _emit_ws_frame(page, {
                     "type": "chat", "role": "assistant", "is_progress": True, "chat_id": 1,
-                    "task_id": "vp-transient-decision", "content": "More transient work",
+                    "task_id": "vp-direct-work", "content": "More ordinary direct work",
                 })
-                assert transient.count() == 1 and not jump_state(page)["dotHidden"]
+                assert direct.count() == 1 and not jump_state(page)["dotHidden"]
 
                 # Browser visibility is a lifecycle seam. A hidden pinned
                 # reader re-follows; a hidden history reader keeps its saved
                 # numeric position and receives the coalesced activity bit.
-                set_remaining(page, 0)
+                # Following is the reader's intent, set by ↓ or their own
+                # gesture; a scripted scroll event alone decides neither.
+                button.click()
+                page.evaluate(_SETTLE_TWO_FRAMES)
+                state = jump_state(page)
+                assert state["remaining"] <= 6 and state["dotHidden"], state
                 page.evaluate(
                     """() => {
                         window.__testDocumentHidden = true;
@@ -369,7 +444,16 @@ def run_chat_viewport_smoke(
                 state = jump_state(page)
                 assert state["remaining"] <= 6 and state["dotHidden"], state
 
-                set_remaining(page, 300)
+                box = page.locator("#chat-messages").bounding_box()
+                page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+                page.mouse.wheel(0, -300)
+                page.wait_for_function(
+                    """() => {
+                        const messages = document.querySelector('#chat-messages');
+                        return messages.scrollHeight - messages.scrollTop - messages.clientHeight >= 298;
+                    }"""
+                )
+                page.evaluate(_SETTLE_TWO_FRAMES)
                 hidden_top = page.locator("#chat-messages").evaluate("node => node.scrollTop")
                 page.evaluate(
                     """() => {
@@ -552,6 +636,24 @@ def run_chat_viewport_smoke(
                     "ts": "2026-08-03T10:04:00+00:00",
                 }
                 _emit_ws_frame(page, late_child_frame)
+                # Observe this mount's real height change before testing the
+                # viewport; elapsed animation frames alone do not establish it.
+                # A missing or zero-height child still fails.
+                try:
+                    page.wait_for_function("""minimum => {
+                        const parent = document.querySelector('.chat-live-card[data-task-id="vp-parent"]');
+                        const child = parent?.querySelector(':scope > .chat-subagents > [data-task-id="vp-late-child"]');
+                        return child && child.getBoundingClientRect().height > 0
+                            && parent.getBoundingClientRect().height > minimum;
+                    }""", arg=parent_before_mount + 30, timeout=10_000)
+                except PlaywrightError as exc:
+                    geometry = parent.evaluate("""(card, before) => {
+                        const child = card.querySelector('[data-task-id="vp-late-child"]');
+                        return {before, after: card.getBoundingClientRect().height,
+                            expanded: card.dataset.expanded, childHeight: child?.getBoundingClientRect().height,
+                            childParent: child?.parentElement?.dataset.subagentsFor};
+                    }""", parent_before_mount)
+                    raise AssertionError(f"Late child did not grow its parent: {geometry}") from exc
                 assert parent.evaluate("card => card.getBoundingClientRect().height") > parent_before_mount + 30
                 assert abs(card_top(page, anchor_id) - anchor_before) <= 6
                 parent.evaluate("""card => { window.__subagentNoopMutations = []; window.__subagentNoopObserver = new MutationObserver(records => window.__subagentNoopMutations.push(...records)); window.__subagentNoopObserver.observe(card, {attributes: true, attributeOldValue: true, childList: true, characterData: true, subtree: true}); }""")
@@ -658,7 +760,8 @@ def run_chat_viewport_smoke(
                     lambda route: route.fulfill(
                         status=200,
                         content_type="application/json",
-                        body=json.dumps({"active_chat_activities": [{
+                        body=json.dumps({"active_chat_activities_complete": True, "supervisor_ready": True,
+                                         "active_chat_activities": [{
                             "activity_id": task_id, "task_id": task_id, "chat_id": 1,
                             "kind": "managed_task", "phase": "working",
                         } for task_id in cancel_active_ids]}),
@@ -716,6 +819,7 @@ def run_chat_viewport_smoke(
                 page.evaluate(_SETTLE_TWO_FRAMES)
                 assert_noop_read(page, noop_top)
                 page.unroute("**/api/state")
+                page.route("**/api/state", incomplete_activity_census)
 
                 # A production-shaped review reference hydrates asynchronously;
                 # both the fetch result and its review DOM reconcile stay anchored.
@@ -933,7 +1037,8 @@ def run_chat_viewport_smoke(
                     lambda route: route.fulfill(
                         status=200,
                         content_type="application/json",
-                        body=json.dumps({"active_chat_activities": [{
+                        body=json.dumps({"active_chat_activities_complete": True, "supervisor_ready": True,
+                                         "active_chat_activities": [{
                             "activity_id": task_id, "task_id": task_id, "chat_id": 1,
                             "kind": "managed_task", "phase": "working",
                         } for task_id in active_ids]}),
@@ -997,8 +1102,8 @@ def run_chat_viewport_smoke(
                 set_remaining(page, 300)
                 healing_anchor = visible_card_anchor(page)
                 _emit_ws_frame(page, {
-                    "type": "chat", "role": "assistant", "is_progress": True, "ephemeral_decision": True,
-                    "chat_id": 1, "task_id": "vp-threshold-freeze-0", "content": "Late decision marker",
+                    "type": "chat", "role": "assistant", "is_progress": True,
+                    "chat_id": 1, "task_id": "vp-threshold-freeze-0", "content": "Late ordinary work",
                 })
                 assert abs(card_top(page, healing_anchor["id"]) - healing_anchor["top"]) <= 6
                 assert page.locator('[data-task-id="vp-threshold-freeze-0"]').count() == 1 and not jump_state(page)["dotHidden"]

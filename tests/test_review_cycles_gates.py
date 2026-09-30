@@ -403,7 +403,9 @@ def test_skill_review_contract_fingerprint_preserves_legacy_and_tracks_rows(monk
 
     monkeypatch.setenv("OUROBOROS_EFFORT_REVIEW", "high")
     legacy = skill_review_contract_fingerprint(["m1", "m2"], required_items=("a",))
-    assert legacy == "eb35c9d2d6daaf1afdece2baec2107aff2b8107c80ab2788597a8c55545a215a"
+    # The author-finality contract is part of the skill-review prompt contract;
+    # its deliberate wording change invalidates the old fingerprint.
+    assert legacy == "b0d298d70bf93185b2b88f647af3ab28233e18db517c13398d7b323c786dd16b"
     legacy_delivery = {
         "legacy_skill_fingerprint": True,
         "models": ["m1", "m2"], "routes": ["api_chat", "api_chat"],
@@ -673,6 +675,39 @@ def test_skill_review_cycles_refusal_emits_typed_event(tmp_path, monkeypatch):
         ctx, "demo", drive_root=pathlib.Path(tmp_path), group_id=group,
         models=["m1"], content_hash="h2", contract_fingerprint="cf-1",
     ) is None
+
+
+@pytest.mark.parametrize("enforcement,mode,author_finish", [
+    ("advisory", "advanced", True), ("blocking", "advanced", False),
+    ("advisory", "cyber_pro", True), ("blocking", "cyber_pro", True),
+])
+def test_skill_review_cycles_refusal_names_the_author_finish_where_it_is_legal(
+    tmp_path, monkeypatch, enforcement, mode, author_finish,
+):
+    from ouroboros.skill_review_cycles import skill_review_cycles_refusal
+
+    monkeypatch.setenv(KEY, "1")
+    monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", enforcement)
+    monkeypatch.setattr("ouroboros.config.get_runtime_mode", lambda: mode)
+    group = "task:root-7:demo"
+    _write_history(tmp_path, "demo", [
+        {"ts": "t1", "status": "blockers", "content_hash": "h1", "paid": True,
+         "group_id": group, "root_task_id": "root-7", "job_id": "j1"},
+    ])
+    outcome = skill_review_cycles_refusal(
+        types.SimpleNamespace(task_id="t-77", event_queue=None), "demo",
+        drive_root=tmp_path, group_id=group, models=["m1"],
+        content_hash="h2", contract_fingerprint="cf-1",
+    )
+    assert outcome.status == "pending" and outcome.paid is False
+    assert "REVIEW_CYCLES_EXHAUSTED" in outcome.error
+    assert "finalize and disclose" in outcome.error
+    assert "ask the owner" in outcome.error and "fresh task" in outcome.error
+    assert ("author_disposition" in outcome.error) == author_finish
+    assert ("author_rationale" in outcome.error) == author_finish
+    if author_finish:
+        assert "Ordinary Advisory requires prior reviewer feedback" in outcome.error
+        assert "passing current preflight" in outcome.error
 
 
 def test_terminal_history_payload_carries_cycle_facts():

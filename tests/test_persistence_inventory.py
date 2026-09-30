@@ -396,10 +396,22 @@ class _PathResolver:
     def _locals(self, scope: ast.AST, consts: dict[str, str],
                 nodes: list[ast.AST]) -> dict[str, str]:
         local: dict[str, str] = {}
+        created_dirs = {node.func.value.id for node in nodes
+                        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                        and node.func.attr == "mkdir" and isinstance(node.func.value, ast.Name)}
         for node in nodes:
             if isinstance(node, ast.Assign) and len(node.targets) == 1 \
                     and isinstance(node.targets[0], ast.Name):
-                rel, ok = self.resolve(node.value, consts, local)
+                value = node.value
+                if (node.targets[0].id in created_dirs and isinstance(value, ast.Call)
+                        and isinstance(value.func, ast.Attribute) and value.func.attr == "resolve"
+                        and isinstance(value.func.value, ast.BinOp) and isinstance(value.func.value.op, ast.Div)
+                        and self._segment(value.func.value.right, consts) in TOP_LEVEL):
+                    # A constructor creates this resolved directory. Its declared
+                    # store prefix survives canonicalization; an arbitrary locator
+                    # reader's resolve() is not a declaration of another store.
+                    value = value.func.value
+                rel, ok = self.resolve(value, consts, local)
                 if ok and _is_named(rel):
                     local[node.targets[0].id] = rel
             elif isinstance(node, ast.For) and isinstance(node.target, ast.Name) \
@@ -503,7 +515,17 @@ class _PathResolver:
 
 @functools.lru_cache(maxsize=4)
 def scan_data_paths(root: pathlib.Path = REPO) -> frozenset[str]:
-    return frozenset(_PathResolver(root).paths())
+    paths = set(_PathResolver(root).paths())
+    # The linked-knowledge owner derives the project shelf from a validated
+    # project id, then appends its history beside that shelf.  Keep these
+    # canonical dynamic siblings visible to the inventory audit even though
+    # the AST resolver cannot expand the address object's validated prefix.
+    if (root / "ouroboros" / "knowledge.py").exists():
+        paths.update({
+            "projects/*/knowledge/*.md",
+            "projects/*/knowledge_history.jsonl",
+        })
+    return frozenset(paths)
 
 
 # The pinned scan-population size. Moving it is deliberate: a new distinct
@@ -532,7 +554,40 @@ def scan_data_paths(root: pathlib.Path = REPO) -> frozenset[str]:
 # root-task projection with its gaps ledger (``state/skill_review_root_tasks*``)
 # and the per-project retirement locks (``state/delegate_project_retirements/``)
 # — while the retired acceptance api-fallback record left the population.
-EXPECTED_SCAN_PATHS = 286  # Combined Artifact, Skills and Host path owners.
+# 290 -> 291: the supervisor's off-lock projection of live direct-chat roots
+# (``state/direct_roots.json``, ``supervisor/direct_roots.py``) is the one new
+# durable plane of the structural-health train; it has its own row in section 2.
+# 291 -> 290: the Background Consciousness redesign retired the observation inbox
+# and its startup fold; the archive segments ``archive/consciousness_observations_<ts>``
+# left the population and the one-time ``archive/consciousness_observations.jsonl``
+# move target (``ouroboros/consciousness.py``) took their place.
+# 290 -> 291: the retained focus source (``task_results/artifacts/*/source_handles/
+# context_checkpoints``, ``ouroboros/task_finalization.py``'s digest glob) is the
+# one new durable plane of cross-focus awareness; it has its own row in section 2.
+# 291 -> 292: the streamed bytes blob's temp name under observability/blobs (the existing
+# ``observability/{calls,blobs,salvaged}/**`` row covers it).
+# 292 -> 293: the Presence previous-turn pointer (``state/presence_turn_gate/last-<sha256>.json``),
+# one rebuildable projection per conversation written by presence_runner at the end of an executed
+# turn; it has its own row in section 2.
+# 293 -> 295: the disposable test-environment caches (``cache/pip``, ``cache/uv``; test root only).
+# 295 -> 294: TZ-3 removed the destructive memory journal rewrite and its
+# ``.compact.tmp`` sibling path; PERSISTENCE.md keeps the journals, now
+# read-only observed and never age-digested.
+# 294 -> 296 (upstream 7.5.0): the merged extra-CA bundle is content-addressed under
+# ``state/extra-ca-bundle/`` (the directory and its ``*.pem`` members, so a changed
+# owner PEM rotates every cache); one section-2 row covers both.
+# 296 -> 297 (Presence resilience): Presence recovery inspects the retained quarantine
+# members (``task_results/quarantine/*``) before deciding whether an event ever started.
+# 297 -> 296 (TZ-3 PR-1): the ``knowledge_journal.jsonl`` size-telemetry writer is
+# removed (its only reader was this inventory); ``knowledge_history.jsonl`` keeps the
+# complete captures, now host-stamped.
+# 296 -> 300 (TZ-1 child-drive custody): ``task_results/<id>.custody.lock`` (the per-task
+# custody lock) and the settlement's ``state/custody_staging`` / ``state/custody_trash``
+# entries; one PERSISTENCE.md row covers all three.
+# 300 -> 303: state-initialization witness plus named review source and review_inputs.
+# 303 -> 305: immutable retention names exact text-CAS manifest versions and the
+# existing blob copy destination; both stay under the documented observability store.
+EXPECTED_SCAN_PATHS = 307
 
 # Scanned paths that must always be present — guards the scanner itself
 # against a silent regression that would shrink coverage while keeping counts
@@ -883,3 +938,21 @@ def test_no_parameter_rooted_spelling_lands_at_the_data_ROOT():
         if path.split("/")[0] in {"uninstalled.json", "__extension_imports"}
     )
     assert not misrooted, f"parameter-rooted spellings left at the data root: {misrooted}"
+
+
+def test_resolved_observability_root_matches_real_writer_outputs(tmp_path):
+    """Canonical root spelling must not turn blobs/calls into data-root stores."""
+    from ouroboros import observability
+
+    root = tmp_path / "data"
+    call = observability.persist_call(root, task_id="inventory", call_id="call",
+                                      call_type="llm_response", payload={"answer": "retained"})
+    manifest = observability.read_call_manifest_ref(root, call["manifest_ref"], task_id="inventory")
+    assert observability.read_blob_ref(root, manifest["full_payload_ref"]) == {"answer": "retained"}
+    paths = scan_data_paths()
+    for ref in (call["manifest_ref"], manifest["full_payload_ref"]):
+        relative = pathlib.Path(ref["path"]).relative_to(root.resolve()).as_posix()
+        assert relative.startswith("observability/")
+        assert any(fnmatch.fnmatchcase(relative, path) for path in paths)
+    assert {"observability/blobs/*.*.gz", "observability/calls/*/*.json"} <= paths
+    assert not any(path.startswith(("blobs/", "calls/")) for path in paths)

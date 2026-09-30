@@ -370,7 +370,7 @@ def checkout_and_reset(branch: str, reason: str = "unspecified",
         fetch_remote = "origin"
 
     if fetch_remote:
-        rc, _, err = _go().git_capture(["git", "fetch", fetch_remote])
+        rc, _, err = _go()._git_network_bounded(["fetch", fetch_remote])
         if rc != 0:
             msg = f"git fetch {fetch_remote} failed: {err or 'unknown error'}"
             _go().append_jsonl(
@@ -453,13 +453,11 @@ def checkout_and_reset(branch: str, reason: str = "unspecified",
     # Checkout may not update mtimes; remove stale bytecode.
     for p in _go().REPO_DIR.rglob("__pycache__"):
         shutil.rmtree(p, ignore_errors=True)
-    st = _go().load_state()
-    st["current_branch"] = branch
-    st["current_sha"] = subprocess.run(
+    st = {"current_branch": branch, "current_sha": subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=str(_go().REPO_DIR),
         capture_output=True, text=True, check=True,
-    ).stdout.strip()
-    _go().save_state(st)
+    ).stdout.strip()}
+    _record_checkout_facts(st)
     if update_intent_target and st["current_sha"] != update_intent_target:
         return False, f"Update intent checkout landed on {st['current_sha']} but expected {update_intent_target}"
     if pin_bundle_sha:
@@ -473,6 +471,18 @@ def sync_runtime_dependencies(reason: str) -> Tuple[bool, str]:
     if getattr(sys, 'frozen', False):
         log.info("Skipping pip install in frozen (PyInstaller) mode — deps are bundled.")
         return True, "frozen:bundled"
+
+    # The one dependency-install chokepoint every caller reaches — bootstrap,
+    # managed update pre-restart and the reset fallbacks all route here — so the
+    # test boundary belongs on THIS line, not on one caller's local-dev branch.
+    # A verification run must never mutate the interpreter it is verifying (the
+    # operator's, or a fixture's dependency-only venv): the marker is set by
+    # tests/conftest.py and re-injected into every scrubbed child environment
+    # (ouroboros/test_environment.py), so a server started by a test inherits it.
+    # Production sets no such marker and keeps its install policy unchanged.
+    if os.environ.get("OUROBOROS_PYTEST_ACTIVE") == "1":
+        log.info("Skipping dependency sync under an active test boundary (%s).", reason)
+        return True, "pytest:suppressed"
 
     from ouroboros.platform_layer import pip_install_target_args
 
@@ -615,3 +625,13 @@ def safe_restart(
         return True, f"OK: fell back to {_go().BRANCH_STABLE}"
 
     return False, "Both branches failed import (dev and stable)"
+
+
+def _record_checkout_facts(facts: dict) -> None:
+    """Field-update the checkout projection (#1307): never a stale whole-state write."""
+    from supervisor.state import StateUnavailable
+
+    try:
+        _go().update_state(lambda live: live.update(facts))
+    except StateUnavailable:
+        log.warning("Checkout facts not recorded in state: runtime state unavailable", exc_info=True)

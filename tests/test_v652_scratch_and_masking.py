@@ -1,12 +1,13 @@
 """v6.52.2 — ephemeral `scratch=[...]` (Fix #1) + verify_and_record exit-masking sensor (Fix #2).
 
 Both are GENERAL, leak-free, advisory-only. Additive: with no scratch / no masking, behavior is
-unchanged. Includes the false-completion adversarial coverage DEVELOPMENT.md §651 mandates for the
+unchanged. Includes the false-completion adversarial coverage DEVELOPMENT.md "Loop / State-Machine Changes" mandates for the
 loop nudge (one-shot, fires only on a masked unreconciled PASS, suppressed by a later clean pass,
 ordered after the red nudge, advisory).
 """
 from __future__ import annotations
 
+import errno
 import json
 import pathlib
 import shutil
@@ -211,6 +212,33 @@ def test_run_script_success_keeps_payload_alongside_undeclared_nudge(tmp_path, m
     assert published.meta["exit_code"] == 0
 
 
+def test_output_audit_skips_unstatable_candidate_and_keeps_real_output(tmp_path, monkeypatch):
+    """Pin pre-3.14 pathlib stat errors without depending on the host filesystem."""
+    from ouroboros.tools.shell_audit import _mentioned_user_file_outputs_without_declaration
+
+    registry, _repo, _data, desktop = _reg(tmp_path, monkeypatch)
+    invalid = (desktop / "unstatable").resolve()
+    target = desktop / "real output.txt"
+    target.write_text("real output", encoding="utf-8")
+    original_is_dir = pathlib.Path.is_dir
+    rejected = []
+
+    def is_dir(path):
+        if path == invalid:
+            rejected.append(path)
+            raise OSError(errno.ENAMETOOLONG, "File name too long", str(path))
+        return original_is_dir(path)
+
+    monkeypatch.setattr(pathlib.Path, "is_dir", is_dir)
+    body = f"open({invalid.as_posix()!r}, 'w'); open({target.as_posix()!r}, 'w')"
+    mentioned = _mentioned_user_file_outputs_without_declaration(
+        registry._ctx, [sys.executable, "-c", body], None, cwd=desktop,
+    )
+    assert rejected
+    assert str(target.resolve()) in mentioned
+    assert str(invalid) not in mentioned
+
+
 def test_undeclared_output_audit_detects_clobber_redirect(tmp_path, monkeypatch):
     from ouroboros.tools.shell_audit import _mentioned_user_file_outputs_without_declaration
 
@@ -374,7 +402,7 @@ def test_headless_excludes_declared_scratch_from_workspace_patch(tmp_path):
 def test_check_has_exit_masking_detection():
     from ouroboros.tools.verify import _check_has_exit_masking
 
-    assert _check_has_exit_masking(["sh", "-c", "node t.js -f 2>&1 | tail -5"])[0] is True
+    assert _check_has_exit_masking(["sh", "-c", "(node t.js -f 2>&1 | tail -5)"])[0] is True
     assert _check_has_exit_masking(["bash", "-c", "make test || true"])[0] is True
     assert _check_has_exit_masking(["sh", "-c", "run.sh 2>/dev/null"])[0] is False
     assert _check_has_exit_masking(["sh", "-c", "make test ; true"])[0] is True
@@ -513,3 +541,24 @@ def test_masked_verification_nudge_one_shot_advisory_and_ordering(tmp_path):
     )
     assert fired is True
     assert any("RED" in m.get("content", "") for m in msgs2)
+
+
+@pytest.mark.parametrize("head", ["sh", "bash", "zsh", "dash", "ash"])
+@pytest.mark.parametrize("absolute", [False, True])
+def test_subshell_masking_uses_typed_shell_grammar(head, absolute):
+    from ouroboros.tools.verify import check_exit_masking
+
+    executable = "/bin/" + head if absolute else head
+    for command, reason in [
+        ("make test|tail", "pipeline_tail"),
+        ("make test||true", "|| true"),
+        ("make test; true", "; true"),
+        ("make test; exit 0", "exit 0"),
+        ("make test|'tail'", "pipeline_tail"),
+    ]:
+        expected = check_exit_masking([executable, "-c", command])
+        assert expected == (True, [reason])
+        assert check_exit_masking([executable, "-c", "(" + command + ")"]) == expected
+    assert check_exit_masking([executable, "-c", "(false)|(tail)"]) == (True, ["pipeline_tail"])
+    for literal in ["echo '|' tail", "echo '||' true", "echo ';' true", "echo '(' false '|tail)'", r"echo \(false\|tail\)"]:
+        assert check_exit_masking([executable, "-c", literal]) == (False, [])

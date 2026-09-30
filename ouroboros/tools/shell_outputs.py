@@ -61,6 +61,12 @@ def _protected_output_source_reason(
 ) -> str:
     """Return a block reason for protected/control-plane output sources."""
 
+    from ouroboros.config import get_runtime_mode
+    from ouroboros.runtime_mode_policy import mode_has_unrestricted_agency
+
+    if mode_has_unrestricted_agency(get_runtime_mode()):
+        return ""
+
     try:
         from ouroboros.protected_artifacts import block_reason_for_path
 
@@ -361,6 +367,22 @@ def _scan_directory_output_members(
     return sorted(members, key=lambda item: item.as_posix()), dir_size, "", skipped
 
 
+def _record_skipped_members(ctx: ToolContext, output: str, members: List[str]) -> None:
+    """The COMPLETE skip list as one durable row in the task's ``events.jsonl`` (the rendered
+    note is bounded); a context without a log root falls back to the process log."""
+    from ouroboros.utils import append_jsonl, utc_now_iso
+
+    row = {"ts": utc_now_iso(), "type": "directory_output_members_skipped",
+           "task_id": str(getattr(ctx, "task_id", "") or ""), "output": str(output),
+           "count": len(members), "members": list(members)}
+    try:
+        if not append_jsonl(ctx.drive_logs() / "events.jsonl", row):
+            raise OSError("events.jsonl append refused")
+    except Exception:
+        log.info("task %s: directory output %s: full export skip list (%d): %s",
+                 row["task_id"] or "?", output, len(members), "; ".join(members))
+
+
 def _register_process_outputs(
     ctx: ToolContext,
     outputs: List[str] | None,
@@ -439,16 +461,12 @@ def _register_process_outputs(
                 # the task log so the omission stays resolvable (#447 P1).
                 shown = "; ".join(skipped_members[:5])
                 more = (
-                    f" (+{len(skipped_members) - 5} more; full list in server.log,"
-                    f" task {getattr(ctx, 'task_id', '') or '?'})"
+                    f" (+{len(skipped_members) - 5} more; full list: directory_output_members_skipped"
+                    f" in the task's events.jsonl)"
                     if len(skipped_members) > 5 else ""
                 )
                 if len(skipped_members) > 5:
-                    log.info(
-                        "task %s: directory output %s: full export skip list (%d): %s",
-                        getattr(ctx, "task_id", "") or "?",
-                        text, len(skipped_members), "; ".join(skipped_members),
-                    )
+                    _record_skipped_members(ctx, text, skipped_members)
                 notes.append(
                     f"skipped {len(skipped_members)} member(s) of directory output {text}: {shown}{more}"
                 )
@@ -492,18 +510,6 @@ def _register_process_outputs(
     else:
         prefix = "ARTIFACT_OUTPUT_NOTE"
     return "\n\n" + prefix + ":\n" + "\n".join(f"- {note}" for note in notes), failed, registered
-
-
-_SENSITIVE_OUTPUT_NAMES = frozenset({".env", ".env.local", "credentials.json", "secrets.json", "token.json"})
-
-
-_SENSITIVE_OUTPUT_SUFFIXES = (".key", ".pem", ".p12", ".pfx")
-
-
-_SENSITIVE_OUTPUT_MARKERS = ("api_key", "apikey", "access_token", "bearer_token", "credential", "password", "refresh_token", "secret")
-
-
-_SENSITIVE_OUTPUT_COMPONENT_NAMES = _SENSITIVE_OUTPUT_NAMES | frozenset({"secret", "secrets", "credential", "credentials", "token", "tokens"})
 
 
 def _sensitive_output_component_reason(parts: tuple[str, ...]) -> str:

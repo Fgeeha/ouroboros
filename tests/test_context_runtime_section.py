@@ -1,8 +1,7 @@
 """The runtime section and the user content the context builder emits.
 
 Split verbatim out of ``tests/test_context.py`` by theme. This module owns the
-force-plan notice that must not rewrite the user's text, the ephemeral force plan that
-only routes, the light-mode rule and filesystem affordances the runtime section states,
+force-plan notice that must not rewrite the user's text, the light-mode rule and filesystem affordances the runtime section states,
 the workspace rules that preserve system review/commit authority, the host routing
 manifest and manual contract, the improvement backlog digest, and the runtime_env
 block.
@@ -46,6 +45,11 @@ def test_force_plan_metadata_adds_structured_notice_without_rewriting_user_text(
     assert content.startswith("[SWARM_INITIATIVE]")
     assert "Source: swarm." in content
     assert f"Resolved review enforcement: {enforcement}." in content
+    # The obligation is constitutional (BIBLE P3) and the gate is structural
+    # (owner_hurry.force_plan_decision); the ORDER of asking, exploring and
+    # planning belongs to the mind (BIBLE P5/P13), never to a prompt choreography.
+    assert "First call plan_task" not in content
+    assert "whether to ask, explore or plan first is your judgment" in content
     assert "Under blocking" in content
     assert "non-mutating preparation" in content
     assert "begin implementation only after review closes" in content
@@ -61,17 +65,19 @@ def test_force_plan_metadata_adds_structured_notice_without_rewriting_user_text(
     assert content.rstrip().endswith("Fix the marketplace retry flow.")
 
 
-def test_ephemeral_force_plan_is_routing_only_and_transfers_work():
+@pytest.mark.parametrize("obsolete_marker", [False, True])
+def test_managed_force_plan_has_only_the_initiative_context(obsolete_marker):
+    text = "  Investigate the alternatives.\nAsk about the actual constraints.\n"
     content = build_user_content({
-        "text": "Fix the marketplace retry flow.",
-        "_ephemeral_turn": True,
+        "text": text, "id": "managed-root", "root_task_id": "managed-root",
+        "_ephemeral_turn": obsolete_marker,
         "metadata": {"force_plan": True, "force_plan_source": "swarm"},
     })
+    assert content.startswith("[SWARM_INITIATIVE]")
+    assert content.count("[SWARM_INITIATIVE]") == 1
+    assert "SWARM_ROUTING_INTENT" not in content
+    assert content.endswith(text)
 
-    assert content.startswith("[SWARM_ROUTING_INTENT]")
-    assert "exactly one NEW managed root" in content
-    assert "do not execute it" in content
-    assert content.rstrip().endswith("Fix the marketplace retry flow.")
 
 
 def test_runtime_section_includes_light_runtime_mode_rule(tmp_path, monkeypatch):
@@ -88,6 +94,38 @@ def test_runtime_section_includes_light_runtime_mode_rule(tmp_path, monkeypatch)
     assert "runtime_data/uploads" in payload["runtime_mode_rule"]
 
 
+@pytest.mark.parametrize("trigger", ["once", "cron"])
+def test_runtime_keeps_the_admitted_occurrences_due_time_after_schedule_advances(tmp_path, trigger):
+    env = _make_health_env(tmp_path)
+    due = "2026-09-29T00:30:00+00:00"
+    claimed = "2026-09-30T03:00:00+00:00"
+    (tmp_path / "state" / "scheduled_tasks.json").write_text(json.dumps({"tasks": [{
+        "id": "follow-up", "enabled": trigger == "cron", "name": "Review results",
+        "trigger": {"type": trigger, "run_at": due, "expr": "30 0 * * *"},
+        "next_run_at": "2026-10-01T00:30:00+00:00",
+    }]}), encoding="utf-8")
+    task = {"id": "late-run", "type": "task", "metadata": {"schedule_occurrence": {
+        "schedule_id": "follow-up", "token": "occurrence-token", "due_at": due, "claimed_at": claimed,
+    }}}
+    runtime = json.loads(build_runtime_section(env, task).split("\n\n", 1)[1])
+    assert runtime["task"]["schedule_occurrence"] == {
+        "schedule_id": "follow-up", "due_at": due, "claimed_at": claimed,
+    }
+    if trigger == "once":
+        assert "scheduled_tasks" not in runtime  # consumed one-shot no longer appears in the digest
+    else:
+        assert runtime["scheduled_tasks"]["active"][0]["next_run_at"] != due
+
+
+def test_runtime_does_not_invent_a_due_time_for_legacy_or_ordinary_work(tmp_path):
+    env = _make_health_env(tmp_path)
+    task = {"id": "legacy", "metadata": {"schedule_occurrence": {"schedule_id": "old", "token": "t"}}}
+    legacy = json.loads(build_runtime_section(env, task).split("\n\n", 1)[1])
+    assert legacy["task"]["schedule_occurrence"] == {"schedule_id": "old", "due_at": None, "claimed_at": None}
+    ordinary = json.loads(build_runtime_section(env, {"id": "ordinary"}).split("\n\n", 1)[1])
+    assert "schedule_occurrence" not in ordinary["task"]
+
+
 def test_runtime_section_includes_filesystem_affordances_with_ctx(tmp_path, monkeypatch):
     from ouroboros.tools.registry import ToolContext
 
@@ -101,7 +139,7 @@ def test_runtime_section_includes_filesystem_affordances_with_ctx(tmp_path, monk
 
     assert fs["profile"] == "self_modification"
     assert "runtime_data" in fs["searchable_roots"]
-    assert "task_drive" not in fs["searchable_roots"]
+    assert "task_drive" in fs["searchable_roots"]  # read⇒search closure (TZ-1 E)
     assert "task_drive" in fs["allowed_shell_cwd_roots"]
     assert "status" in fs["git_readonly_subcommands"]
     assert "active_workspace" in fs["light_gated_roots"]
@@ -215,6 +253,46 @@ def test_runtime_section_exposes_host_routing_manifest_and_manual_contract(tmp_p
     assert payload["current_chat"]["addressable_root_tasks"][0]["task_id"] == "pending-1"
     assert payload["main_routing_manifest"]["projects"][0]["project_id"] == "racer"
     assert payload["routing_contract"]["on_uncertain_or_invalid_target"] == "needs_manual_target"
+
+
+def test_runtime_section_offers_the_rooms_own_continuation_hint(tmp_path, monkeypatch):
+    """A project room's routing manifest has to REACH the decision turn.
+
+    While only the pointer row travelled, a room saw exactly ONE continuation
+    candidate; when a child had stamped that pointer the room could not name its
+    own interrupted root at all and promoted again, minting a duplicate root.
+    """
+    env = _make_health_env(tmp_path)
+    monkeypatch.setattr("ouroboros.config.get_runtime_mode", lambda: "advanced")
+    room = {
+        "final_results": [{"task_id": "racer-old", "status": "completed"}],
+        "active_roots": [{"task_id": "racer-live", "status": "running",
+                          "cancel_state": "pending"}],
+        "omissions": {"final_results": 3, "children": 2, "active_roots": 0},
+    }
+    task = {
+        "id": "decision-room",
+        "type": "task",
+        "metadata": {
+            "current_chat": {
+                "chat_id": 7,
+                "running_tasks": [],
+                "addressable_root_tasks": [{"task_id": "racer-live", "status": "running"}],
+            },
+            "project_routing_manifest": room,
+            "project_last_task_result": {"task_id": "racer-old", "status": "completed"},
+        },
+    }
+
+    payload = json.loads(build_runtime_section(env, task).split("\n\n", 1)[1])
+    assert payload["project_routing_manifest"] == room
+    assert payload["project_last_task_result"]["task_id"] == "racer-old"
+
+    # The quiet direction: a lane with nothing to offer states no empty hint.
+    task["metadata"]["project_routing_manifest"] = {}
+    quiet = json.loads(build_runtime_section(env, task).split("\n\n", 1)[1])
+    assert "project_routing_manifest" not in quiet
+    assert quiet["project_last_task_result"]["task_id"] == "racer-old"
 
 
 def test_improvement_backlog_digest_is_actor_scoped(tmp_path):
@@ -446,7 +524,8 @@ def test_delegation_fact_carries_historical_rows_and_profile_evidence(tmp_path, 
     assert last["applied_model"] == "claude-opus-5"
     assert last["requested_profile"] == "requested-delegate-profile"
     assert last["applied_profile"] == "applied-delegate-profile"
-    assert last["selected_subagent_id"] == "builder"
+    # Named from the record's own facts (no typed identity here: its route target).
+    assert last["selected_subagent_id"] == "claudexor=opus-5"
     assert last["observed"] == "last observed at 2026-08-18T02:00:00+00:00"
     assert "historical" not in rows["triad_1"]["observed"]
     # The prompt-visible note teaches the semantics ONCE: rows are history, live
@@ -500,3 +579,40 @@ def test_delegation_fact_failure_never_drops_capability_digest(tmp_path, monkeyp
     # The surrounding digest survives intact.
     assert "allow_mutative_subagents" in capabilities
     assert "write_surfaces" in capabilities
+
+
+def test_runtime_names_its_capture_instant_and_how_this_run_learns_the_time(tmp_path):
+    """#1320: the runtime block is captured once; it says so instead of calling itself "now"."""
+    env = _make_health_env(tmp_path)
+    main = json.loads(build_runtime_section(env, {"id": "t1", "type": "task"}, captured_at="2027-01-15T12:00:00+00:00")
+                      .split("\n\n", 1)[1])
+    assert "utc_now" not in main and main["context_captured_at"] == "2027-01-15T12:00:00+00:00"
+    assert "not the current time" in main["clock_note"] and "host clock line" in main["clock_note"]
+    child = json.loads(build_runtime_section(env, {"id": "t2", "type": "task", "delegation_role": "subagent"})
+                       .split("\n\n", 1)[1])
+    assert "does not advance during this run" in child["clock_note"] and child["context_captured_at"]
+
+
+def test_captured_recent_and_drive_sections_carry_one_capture_label(tmp_path, monkeypatch):
+    """Recent*/Drive state are labelled with the core's single capture instant, below their headings,
+    and are not refreshed: two projections of one core carry byte-identical labels."""
+    from ouroboros import context as context_module
+    from ouroboros.context import build_llm_messages
+    from tests.test_cache_optimization import _make_env_and_memory
+
+    monkeypatch.setattr(context_module, "utc_now_iso", lambda: "2027-01-15T12:00:00+00:00")
+    env, memory = _make_env_and_memory(tmp_path)
+    logs = memory.drive_root / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    (logs / "chat.jsonl").write_text(json.dumps({
+        "ts": "2027-01-15T11:00:00+00:00", "direction": "in", "chat_id": 1, "text": "hello"}) + "\n",
+        encoding="utf-8")
+    messages, _info = build_llm_messages(env=env, memory=memory, task={
+        "id": "t-labels", "type": "task", "text": "hi", "_is_direct_chat": True, "chat_id": 1, "metadata": {}})
+    dynamic = messages[0]["content"][2]["text"]
+    label = "_Snapshot captured at 2027-01-15T12:00:00+00:00 when this context was built; not refreshed during this run._"
+    assert "## Drive state\n" + label in dynamic and "## Recent chat coverage\n" + label in dynamic
+    assert '"context_captured_at": "2027-01-15T12:00:00+00:00"' in dynamic
+    headings = [line for line in dynamic.splitlines() if line.startswith(("## Recent ", "## Drive state"))]
+    assert headings and all(dynamic.split(heading + "\n", 1)[1].startswith(label) for heading in headings)
+    assert "## Runtime context\n" + label not in dynamic  # labels are for the captured snapshots only

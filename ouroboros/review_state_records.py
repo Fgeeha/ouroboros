@@ -248,7 +248,8 @@ class AdvisoryRunRecord:
     snapshot_summary: str = ""
     raw_result: str = ""
     # Typed cause for status="preflight_blocked" rows: "syntax" (a staged .py
-    # failed compile) or "release_metadata" (deterministic release preflight).
+    # failed compile), "release_metadata" (defect); status="error" also carries
+    # "release_metadata_unavailable" when the required source could not be read.
     # "" = unknown/legacy — guidance must then point at raw_result instead of
     # asserting a specific problem class (H4, capinv-447).
     reason_kind: str = ""
@@ -341,6 +342,9 @@ class CommitAttemptRecord:
     # free text) were compacted because the preserved accounting row fell
     # outside the newest-50 ledger window (see _strip_attempt_heavy_payload).
     raw_stripped: bool = False
+    # Optional canonical author-finish stance for an advisory commit. Raw
+    # reviewer evidence remains in the same attempt row beside this record.
+    author_disposition: Dict[str, Any] = field(default_factory=dict)
 
 
 def _attempt_identity_tuple(attempt: CommitAttemptRecord) -> tuple[str, str, str, str]:
@@ -419,6 +423,7 @@ def _merge_attempt(existing: CommitAttemptRecord, incoming: CommitAttemptRecord)
         triad_models=list(incoming.triad_models or existing.triad_models),
         triad_raw_results=list(getattr(incoming, "triad_raw_results", None) or getattr(existing, "triad_raw_results", None) or []),
         scope_raw_result=dict(getattr(incoming, "scope_raw_result", None) or getattr(existing, "scope_raw_result", None) or {}),
+        author_disposition=dict(incoming.author_disposition or existing.author_disposition),
         # Once an attempt physically dispatched a paid triad/scope wave the fact is
         # durable: a later terminal update on the same row must never launder it.
         paid=bool(getattr(incoming, "paid", False) or getattr(existing, "paid", False)),

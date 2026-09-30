@@ -1,42 +1,30 @@
-"""Durable terminal-answer delivery seam (Poltergeist phase A2, owner 5=A).
+"""Durable terminal-answer delivery, shared by completion, cancellation and reap.
 
-The incident: a cancelled root's finished final report was salvaged to disk but
-never reached chat, because final-answer delivery existed only on the natural
-finalization path. This module is the ONE shared seam for terminal delivery:
+``register_delivery`` atomically dedupes every delivery-id-bearing send through
+``state/terminal_deliveries.json``; the owed outbox replays across restart.
+Registration follows the send, so a crash between them can duplicate delivery:
+external transports remain at-least-once, prioritizing no lost answer.
 
-- ``register_delivery`` is the DURABLE logical dedupe every terminal delivery
-  goes through (``state/terminal_deliveries.json``, bounded, atomic). The
-  supervisor's ``send_message`` handler consults it for every ``delivery_id``-
-  bearing event, so the natural completion path (worker-buffered final answer),
-  the cancel path, and the reap path share one at-most-once-per-restart-free
-  registry instead of a process-local deque that forgets on restart. External
-  transports remain at-least-once; the residual is disclosed here rather than
-  papered over: a delivery can still double across a crash BETWEEN send and
-  registration ("never lost" outranks "never doubled").
-- ``deliver_unreviewed_salvage`` builds and enqueues the one chat message for a
-  cancelled / non-retry-reaped task: a loud UNREVIEWED banner, an honest bounded
-  preview (exact omitted count), a durable full-copy receipt (path + size +
-  sha256), and — for a subtree cascade — a compact children digest. Routed by
-  task lineage chat, never blindly to ``owner_chat_id``. Zero paid rounds.
-
-Outcome routing stays with the callers: ``completed`` keeps the existing
-review-aware final delivery (``task_finalization.deliver_final_message_live``,
-same ``delivery_id`` vocabulary, now deduped durably by this registry);
-``cancelled``/non-retry reap deliver here; a retryable reap delivers nothing.
+Completed tasks keep review-aware delivery via ``task_finalization``. Cancelled
+or non-retry-reaped tasks use ``deliver_unreviewed_salvage``: an UNREVIEWED
+banner, bounded preview with exact omitted count, full-copy path/size/hash and
+optional subtree digest, routed by task lineage. Retryable reap sends nothing.
+These delivery paths buy no model rounds; outcome routing stays with callers.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import pathlib
+import re
 from typing import Any, Dict, List, Optional
 
 from ouroboros.utils import update_json_locked, utc_now_iso
 from ouroboros.task_finalization import (
-    HOST_AUTHORED_TERMINAL_ORIGINS,
-    TERMINAL_ORIGIN_HOST_SALVAGE,
-    TERMINAL_ORIGIN_MODEL_FINAL,
+    HOST_AUTHORED_TERMINAL_ORIGINS, TERMINAL_ORIGIN_HOST_SALVAGE, TERMINAL_ORIGIN_MODEL_FINAL,
+    artifact_store_roots, rescued_files_fact, rescued_files_sentence,
 )
 
 log = logging.getLogger(__name__)
@@ -69,22 +57,16 @@ _HOST_SALVAGE_RECEIPT = (
 
 
 def cleanup_settled_owner_mailbox(
-    drive_root: Any, task_id: str, task: Optional[Dict[str, Any]] = None,
+    drive_root: Any, task_id: str, task: Optional[Dict[str, Any]] = None, *, carry_inputs: bool = True, stop: Any = None,
 ) -> None:
-    """Keep model-wait choices until the canonical post-task phase settles."""
-    from ouroboros.owner_mailbox import cleanup_task_mailbox
-    from ouroboros.post_task_checkpoint import post_task_synthesis_is_open
+    """Release the execution mailbox once its canonical obligations settle and the canonical row holds its unread rows with their input closure; ``carry_inputs=False`` (the loop thread) leaves inputs to an off-loop owner, whose generation ``stop()`` fences the cleanup."""
+    from ouroboros.owner_mailbox import cleanup_task_mailbox, settled_mailbox_cleanup_allowed
     from ouroboros.task_results import load_task_result
-    from ouroboros.task_status import SETTLED_STATUSES
     from supervisor.queue import _task_drive_for_task
 
     durable = load_task_result(pathlib.Path(drive_root), str(task_id)) or {}
-    pending = (durable.get("child_ref_promotion") or {}).get("pending_refs", [])
-    if any(isinstance(ref, dict) and ref.get("kind") == "task_attachment" for ref in pending):
-        return  # Accepted inputs still need this mailbox as their retry source.
-    post_status = (durable.get("root_phase_checkpoint") or {}).get("post_task_synthesis")
-    if str(durable.get("status") or "") in SETTLED_STATUSES and not post_task_synthesis_is_open(post_status):
-        cleanup_task_mailbox(_task_drive_for_task(task or durable, str(task_id)), str(task_id))
+    if settled_mailbox_cleanup_allowed(durable):
+        cleanup_task_mailbox(_task_drive_for_task(task or durable, str(task_id)), str(task_id), canonical_root=drive_root, carry_inputs=carry_inputs, stop=stop)
 
 
 def _registry_path(drive_root: Any) -> pathlib.Path:
@@ -93,18 +75,107 @@ def _registry_path(drive_root: Any) -> pathlib.Path:
     return root / "terminal_deliveries.json"
 
 
-def delivery_id_for(task_id: str, text: str) -> str:
-    """The shared delivery identity: ``final:<tid>:<sha256[:16]>`` — the same
-    vocabulary ``deliver_final_message_live`` mints for the natural path.
+# A terminal ANSWER's identity; custody-notice and other suffixed rows are not answers.
+_TERMINAL_ANSWER_ID = re.compile(r"final:(?P<task>[^:]+):[0-9a-f]{16}")
 
-    GR7-4: callers digest the STABLE part of the message (task id + settled
-    status framing + core answer), never the mutable unreconciled-runs
-    disclosure note — the note rides the TEXT only. A watchdog replay rebuilds
-    the note from the CURRENT audit (the list shrinks as runs reconcile); a
-    note-bearing digest minted a fresh id per replay, and each became a second
-    owed message for the same terminal answer (mirror of the cascade's GR4-2
-    intent-derived identity: identity from the durable task/answer, not from
-    mutable content)."""
+
+def _mapping_rows(current: Dict[str, Any], key: str, *, strict: bool = False) -> Dict[str, Any]:
+    """Read a registry mapping; strict mutations preserve malformed forensic bytes.
+
+    Both pending rows and emitted receipts use this contract. Missing/None is
+    empty; other non-objects raise on strict reads, never silently vanish
+    when a mutator rewrites the whole registry.
+    """
+    value = current.get(key)
+    if isinstance(value, dict):
+        return dict(value)
+    if strict and value is not None:
+        raise ValueError(f"terminal-delivery registry '{key}' is malformed (not an object)")
+    return {}
+
+
+def _registry_document(current: Dict[str, Any], rows: List[str], pending: Dict[str, Any],
+                       receipts: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """The whole registry a mutator writes: every mutator keeps the receipts it did not touch."""
+    receipts = _mapping_rows(current, "receipts", strict=True) if receipts is None else receipts
+    document = {"schema_version": _SCHEMA_VERSION, "delivered": rows[-_REGISTRY_CAP:], "pending": pending}
+    if receipts:
+        document["receipts"] = dict(list(receipts.items())[-_REGISTRY_CAP:])
+    return document
+
+
+def _capture_emitted_answer(drive_root: Any, delivery_id: str, emitted: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Retain the terminal text, routed chat and identity after the send returned.
+
+    The immutable source binds exact text; failed capture dedupes only, proving no bytes."""
+    match = _TERMINAL_ANSWER_ID.fullmatch(delivery_id)
+    task_id = str(emitted.get("task_id") or "")
+    text = emitted.get("text")
+    if match is None or match.group("task") != task_id or not isinstance(text, str):
+        return None
+    try:
+        from ouroboros.artifacts import store_actor_source_bytes
+
+        record = {"delivery_id": delivery_id, "task_id": task_id, "chat_id": int(emitted["chat_id"]),
+                  "text": text, "sent_at": utc_now_iso(), "basis": "send_handler_returned",
+                  **{key: str(emitted.get(key) or "") for key in ("format", "role", "system_type", "terminal_origin")}}
+        if isinstance(emitted.get("routing"), dict):
+            record["routing"] = dict(emitted["routing"])
+        ref = store_actor_source_bytes(
+            pathlib.Path(drive_root), task_id, category="context_checkpoints", source_id="terminal-delivery",
+            data=json.dumps(record, ensure_ascii=False, sort_keys=True).encode("utf-8"), extension="json")
+    except Exception:
+        log.warning("terminal answer %s: emitted bytes could not be retained; no receipt", delivery_id, exc_info=True)
+        return None
+    return {"task_id": task_id, "chat_id": record["chat_id"], "sent_at": record["sent_at"],
+            "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(), "text_chars": len(text),
+            "basis": record["basis"], "source_ref": ref}
+
+
+def terminal_answer_receipts(drive_root: Any, task_id: str) -> Dict[str, Any]:
+    """What the host can PROVE it emitted as one task's terminal answer.
+
+    ``delivered`` lists exact text digests, routed chats and retained sources
+    captured after sends. Owed rows and ids without receipts prove no bytes.
+    Both remain listed; state is delivered (at least one receipt), owed or
+    unknown, never inferred from the task result or an id digest.
+    """
+    fact: Dict[str, Any] = {"source": "terminal_delivery_registry", "state": "unknown", "delivered": [],
+                            "unverified_delivery_ids": [], "owed_delivery_ids": []}
+    try:
+        from ouroboros.utils import read_json_dict
+
+        path = pathlib.Path(drive_root) / "state" / "terminal_deliveries.json"
+        data = read_json_dict(path) if path.is_file() else {}
+        if data is None:
+            raise ValueError("registry file is malformed or is not an object")
+        receipts, pending = _mapping_rows(data, "receipts", strict=True), _mapping_rows(data, "pending", strict=True)
+        delivered = _delivered_rows(data, strict=True)
+    except Exception:
+        log.debug("terminal-delivery registry unreadable for %s", task_id, exc_info=True)
+        fact["registry"] = "unreadable"
+        return fact
+
+    def answer(did: str) -> bool:
+        match = _TERMINAL_ANSWER_ID.fullmatch(did)
+        return match is not None and match.group("task") == str(task_id)
+
+    for did in (item for item in delivered if answer(item)):
+        receipt = receipts.get(did)
+        if isinstance(receipt, dict) and receipt.get("text_sha256") and isinstance(receipt.get("source_ref"), dict):
+            fact["delivered"].append({"delivery_id": did, **receipt})
+        else:
+            fact["unverified_delivery_ids"].append(did)
+    fact["owed_delivery_ids"] = sorted(did for did in pending if answer(str(did)) and did not in delivered)
+    fact["state"] = "delivered" if fact["delivered"] else "owed" if fact["owed_delivery_ids"] else "unknown"
+    return fact
+
+
+def delivery_id_for(task_id: str, text: str) -> str:
+    """Stable terminal identity: ``final:<tid>:<sha256[:16]>``.
+
+    Callers hash task/status framing and core answer, excluding mutable custody
+    disclosures. Replay can refresh those notes without owing a second answer."""
     digest = hashlib.sha256(str(text or "").encode("utf-8")).hexdigest()[:16]
     return f"final:{task_id}:{digest}"
 
@@ -127,35 +198,11 @@ def already_delivered(drive_root: Any, delivery_id: str) -> bool:
         return False
 
 
-def _pending_rows(current: Dict[str, Any], *, strict: bool = False) -> Dict[str, Any]:
-    """The owed-outbox rows; ``strict`` refuses a malformed nested value.
-
-    GR5-6: the three MUTATORS pass ``strict=True`` — a present-but-non-dict
-    ``pending`` under a valid top-level dict used to be coerced to ``{}`` and
-    the next mutation overwrote EVERY owed row silently, the exact loss the
-    top-level ``strict_existing_dict`` check refuses. The raise is the same
-    typed ``ValueError`` that check uses, so the callers' existing
-    corrupt-registry handling (refuse + disclose, no overwrite) applies.
-    Read paths stay fail-soft (they disclose separately)."""
-    pending = current.get("pending")
-    if isinstance(pending, dict):
-        return dict(pending)
-    if strict and pending is not None:
-        raise ValueError(
-            "terminal-delivery registry 'pending' is malformed (not an object)"
-        )
-    return {}
-
-
 def _delivered_rows(current: Dict[str, Any], *, strict: bool = False) -> List[str]:
-    """The delivered-id list; ``strict`` refuses a malformed container or entry.
+    """Read delivered ids; strict reads reject malformed containers or entries.
 
-    GR6-3 row strictness: the mutators rewrite the whole file, so a
-    present-but-non-list ``delivered`` — or a non-string ENTRY inside a valid
-    list — used to be silently coerced and overwritten on the next write,
-    destroying the dedupe evidence with no corruption event. Strict raises the
-    same typed ``ValueError`` the container checks use (refuse + disclose, no
-    overwrite — the malformed bytes stay on disk); reads stay fail-soft."""
+    Mutators refuse corruption without overwriting the file. Fail-soft readers
+    keep only a valid list; corruption disclosure belongs to their caller."""
     delivered = current.get("delivered")
     if isinstance(delivered, list):
         if strict and any(not isinstance(item, str) for item in delivered):
@@ -170,27 +217,24 @@ def _delivered_rows(current: Dict[str, Any], *, strict: bool = False) -> List[st
     return []
 
 
-def register_delivery(drive_root: Any, delivery_id: str) -> bool:
-    """Durably register one delivery id AFTER a successful send.
+def register_delivery(drive_root: Any, delivery_id: str, *, emitted: Optional[Dict[str, Any]] = None) -> bool:
+    """Register an id AFTER a successful send and clear its owed row atomically.
 
-    Returns whether the id was newly registered. Registration only after the
-    send preserves the "never lost" ordering: a send that raised keeps its id
-    unregistered, so a buffered second copy is still delivered. The registry is
-    a bounded newest-last list — old ids age out, which is safe because a
-    delivery id binds a terminal answer to its content hash and terminal answers
-    stop being re-sent long before the cap turns over.
-
-    The same write CLEARS the pending-outbox row: "delivered" and "still owed"
-    are one transaction, so a replay can never re-send an answer that landed.
-    """
+    Return whether the id is new. A send that raises remains owed; old ids age
+    out of the bounded newest-last registry after their replay lifetime.
+    ``emitted`` contains the handler's exact text, routed chat and task; its
+    first retained receipt supplies ``terminal_answer_receipts``. Registration
+    failure is disclosed and returns True so the live send still counts."""
     did = str(delivery_id or "").strip()
     if not did:
         return True
     fresh = {"value": False}
+    receipt = _capture_emitted_answer(drive_root, did, emitted) if isinstance(emitted, dict) else None
 
     def _mutate(current: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         rows: List[str] = _delivered_rows(current, strict=True)
-        pending = _pending_rows(current, strict=True)
+        pending = _mapping_rows(current, "pending", strict=True)
+        receipts = _mapping_rows(current, "receipts", strict=True)
         target = pending.get(did)
         if target is not None and not isinstance(target, dict):
             # GR6-3: a malformed owed ROW is corruption — clearing it as part
@@ -199,19 +243,18 @@ def register_delivery(drive_root: Any, delivery_id: str) -> bool:
                 f"terminal-delivery registry pending row for {did} is malformed"
             )
         had_pending = pending.pop(did, None) is not None
+        new_receipt = receipt is not None and did not in receipts
+        if new_receipt:
+            receipts[did] = receipt
         if did in rows:
-            if not had_pending:
+            if not had_pending and not new_receipt:
                 return None
-            return {"schema_version": _SCHEMA_VERSION, "delivered": rows[-_REGISTRY_CAP:],
-                    "pending": pending}
-        rows.append(did)
-        fresh["value"] = True
-        return {"schema_version": _SCHEMA_VERSION, "delivered": rows[-_REGISTRY_CAP:],
-                "pending": pending}
+        else:
+            rows.append(did)
+            fresh["value"] = True
+        return _registry_document(current, rows, pending, receipts)
 
     try:
-        # GR3-9 strict read: a malformed registry must refuse the mutation
-        # loudly, never collapse to {} and overwrite every owed answer.
         update_json_locked(_registry_path(drive_root), _mutate, strict_existing_dict=True)
     except ValueError:
         _log_registry_corrupt(drive_root, did, op="register_delivery")
@@ -223,12 +266,9 @@ def register_delivery(drive_root: Any, delivery_id: str) -> bool:
 
 
 def _log_registry_corrupt(drive_root: Any, delivery_id: str, *, op: str) -> None:
-    """Typed fail-closed disclosure for a corrupt delivery registry (GR3-9).
+    """Disclose a refused corrupt-registry mutation as a durable typed event.
 
-    The mutation was REFUSED (no overwrite — the malformed file keeps whatever
-    forensic value it has); the gap is made visible through a durable typed
-    event, because a silent {}-collapse was exactly the loss mode this closes.
-    """
+    The original malformed file stays untouched for diagnosis."""
     log.error(
         "terminal-delivery registry is corrupt; %s refused for %s (no overwrite)",
         op, delivery_id,
@@ -246,26 +286,13 @@ def _log_registry_corrupt(drive_root: Any, delivery_id: str, *, op: str) -> None
 
 
 def register_pending_delivery(drive_root: Any, event: Dict[str, Any]) -> bool:
-    """Record a terminal send as OWED, before it is enqueued.
+    """Record a terminal send as owed BEFORE enqueue, for boot/tick replay.
 
-    The incident class in its purest form: the answer was salvaged to disk and
-    the send was handed to an in-memory queue — a crash between the settle and
-    the send lost the owner's answer forever, because the delivered registry only
-    remembers what ALREADY went out. This row is the other half: written first,
-    cleared by ``register_delivery`` after a confirmed send, and replayed by
-    ``replay_pending_deliveries`` on boot and on the supervisor tick.
-
-    Deliberately NOT a general send queue (owner scope): it holds only terminal
-    answers going through this seam, bounded to ``_PENDING_CAP`` newest rows.
-
-    Return semantics (GR3-4 — callers now BRANCH on this): ``True`` means the
-    answer is durably tracked — newly owed, already owed, or already in the
-    delivered registry. ``False`` means a REAL durability gap: the event
-    carries no ``delivery_id``, or the registry write failed (a typed
-    ``terminal_delivery_unregistered`` event is emitted so the gap is
-    visible). Cancel paths leave the intent open on ``False``; the normal
-    completion path still enqueues the live send and relies on the typed event.
-    """
+    ``register_delivery`` clears it only after a confirmed send. The outbox
+    retains the newest ``_PENDING_CAP`` rows and discloses every eviction.
+    True means newly owed, already owed or delivered; False means a missing id
+    or a disclosed write failure. Cancel callers leave the intent open on
+    False; ordinary completion still tries the live send."""
     did = str(event.get("delivery_id") or "").strip()
     if not did:
         return False
@@ -276,13 +303,10 @@ def register_pending_delivery(drive_root: Any, event: Dict[str, Any]) -> bool:
         rows: List[str] = _delivered_rows(current, strict=True)
         if did in rows:
             return None  # already delivered: nothing is owed
-        pending = _pending_rows(current, strict=True)
+        pending = _mapping_rows(current, "pending", strict=True)
         if did in pending:
             if not isinstance(pending.get(did), dict):
-                # GR6-3: the probe shape — a malformed row for THIS id would
-                # be reported as "already durably owed" while the replay read
-                # can never deliver it. Refuse loudly instead (typed
-                # corruption event + unregistered disclosure, no overwrite).
+                # A malformed row cannot count as durably owed: replay cannot send it.
                 raise ValueError(
                     f"terminal-delivery registry pending row for {did} is malformed"
                 )
@@ -292,17 +316,12 @@ def register_pending_delivery(drive_root: Any, event: Dict[str, Any]) -> bool:
         if len(pending) > _PENDING_CAP:
             for stale in list(pending)[: len(pending) - _PENDING_CAP]:
                 row = pending.pop(stale, None)
-                # GR2-6: eviction is a LOST OWED ANSWER, never a silent pop —
-                # the row is disclosed below through the same exhaustion seam
-                # (full-text preservation + typed event + owner notice).
+                # Every eviction is disclosed through the exhaustion seam below.
                 if isinstance(row, dict):
                     evicted.append({**row, "delivery_id": str(stale)})
-        return {"schema_version": _SCHEMA_VERSION, "delivered": rows[-_REGISTRY_CAP:],
-                "pending": pending}
+        return _registry_document(current, rows, pending)
 
     try:
-        # GR3-9 strict read: a malformed registry refuses the mutation loudly
-        # instead of collapsing to {} and overwriting every owed answer.
         update_json_locked(_registry_path(drive_root), _mutate, strict_existing_dict=True)
     except ValueError:
         _log_registry_corrupt(drive_root, did, op="register_pending_delivery")
@@ -339,16 +358,11 @@ def _log_unregistered_delivery(drive_root: Any, event: Dict[str, Any], did: str)
 def pending_deliveries(
     drive_root: Any, *, disclose_corruption: bool = False,
 ) -> List[Dict[str, Any]]:
-    """Terminal sends registered as owed and not yet confirmed delivered.
+    """Read owed sends, excluding delivered ids, with disclosed corruption.
 
-    GR5-6 read semantics: an ABSENT registry is an ordinary empty outbox; an
-    UNREADABLE/MALFORMED one (file or nested ``pending``) is a real gap — it
-    is disclosed with a typed ``log.error`` (and, for the watchdog's replay
-    read via ``disclose_corruption=True``, the existing typed corruption
-    event) before the read still returns ``[]``. Fail-soft read, but the
-    owner can see the replay lane is degraded instead of silently owing
-    nothing.
-    """
+    An absent registry is empty. Unreadable/malformed data logs an error and
+    returns []; malformed individual rows are skipped with their bytes intact.
+    ``disclose_corruption`` also emits the durable corruption event for replay."""
     path = pathlib.Path(drive_root) / "state" / "terminal_deliveries.json"
     if not path.is_file():
         return []
@@ -358,7 +372,7 @@ def pending_deliveries(
         data = read_json_dict(path)
         if data is None:
             raise ValueError("registry file is malformed or is not an object")
-        pending = _pending_rows(data, strict=True)
+        pending = _mapping_rows(data, "pending", strict=True)
     except Exception as exc:
         log.error(
             "terminal-delivery registry is unreadable/malformed (%s); the owed "
@@ -373,11 +387,7 @@ def pending_deliveries(
     malformed: List[str] = []
     for did, row in pending.items():
         if not isinstance(row, dict):
-            # GR6-3 row strictness on the enforcement read: a malformed owed
-            # row used to vanish from replay silently — an answer the file
-            # still claims is owed. Quarantined (skipped here, bytes kept on
-            # disk — the strict mutators refuse to rewrite it) and disclosed
-            # loudly below.
+            # Quarantine and disclose; strict mutations preserve these bytes on disk.
             malformed.append(str(did))
             continue
         if str(did) in delivered_ids:
@@ -397,22 +407,15 @@ def pending_deliveries(
 
 
 def _bump_replay_attempts(drive_root: Any, ids: List[str]) -> List[str]:
-    """Count one replay per id and DROP the ones that exhausted their attempts.
+    """Count replays and return ids still eligible; disclose exhausted rows.
 
-    Returns the ids that may still be replayed. The cap is what keeps a durable
-    outbox from becoming a retry storm: a chat that is permanently unreachable
-    would otherwise have its answer re-enqueued on every supervisor tick forever.
-    Each bump also stamps ``last_replay_at`` — ``_replay_due`` spaces attempts
-    with exponential backoff from it, so the cap covers a realistic outage
-    window instead of burning on consecutive ticks. An exhausted row is dropped
-    LOUDLY (AR2-7): the full message text is preserved on disk and the owner is
-    told through a typed durable event plus a chat notice — never a silent drop.
-    """
+    Each bump stamps ``last_replay_at`` for exponential backoff. Exhaustion
+    preserves the message and emits a durable event plus a live notice."""
     live: List[str] = []
     exhausted: List[Dict[str, Any]] = []
 
     def _mutate(current: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        pending = _pending_rows(current, strict=True)
+        pending = _mapping_rows(current, "pending", strict=True)
         changed = False
         for did in ids:
             row = pending.get(did)
@@ -430,11 +433,9 @@ def _bump_replay_attempts(drive_root: Any, ids: List[str]) -> List[str]:
         if not changed:
             return None
         rows = _delivered_rows(current, strict=True)
-        return {"schema_version": _SCHEMA_VERSION, "delivered": rows[-_REGISTRY_CAP:],
-                "pending": pending}
+        return _registry_document(current, rows, pending)
 
     try:
-        # GR3-9 strict read: never rebuild a malformed registry from {}.
         update_json_locked(_registry_path(drive_root), _mutate, strict_existing_dict=True)
     except ValueError:
         _log_registry_corrupt(drive_root, ",".join(ids), op="bump_replay_attempts")
@@ -450,18 +451,13 @@ def _bump_replay_attempts(drive_root: Any, ids: List[str]) -> List[str]:
 def _disclose_exhausted_delivery(
     drive_root: Any, row: Dict[str, Any], *, reason: str = "replay_exhausted",
 ) -> None:
-    """Owner-visible disclosure for an outbox row that is dropped undelivered.
+    """Disclose an outbox row dropped without a confirmed send.
 
-    Two callers, one seam: a row that exhausted its bounded replays
-    (``reason="replay_exhausted"``, AR2-7) and a row evicted past
-    ``_PENDING_CAP`` by newer registrations (``reason="outbox_capacity"``,
-    GR2-6). Either way the undelivered answer must not vanish into a
-    log.error: the FULL message text is preserved durably, a typed
-    ``terminal_delivery_exhausted`` event lands in ``logs/events.jsonl`` (the
-    guaranteed half — it works even when chat itself is what is failing), and
-    a chat notice through the ordinary supervisor notification path names the
-    task, the preserved copy, and why delivery gave up. Every step fail-soft.
-    """
+    Replay exhaustion and capacity eviction share this seam. Preserve THIS row's
+    full message (a receipt may hold only an excerpt), emit ``terminal_delivery_exhausted`` even
+    if chat fails, and say sending was not confirmed. Only a cancel receipt
+    proving this delivery reached this destination suppresses the notice;
+    a bare delivery id proves no destination. Every step is fail-soft."""
     did = str(row.get("delivery_id") or "")
     tid = str(row.get("task_id") or "")
     text = str(row.get("text") or "")
@@ -474,17 +470,9 @@ def _disclose_exhausted_delivery(
         chat_id = int(row.get("chat_id") or 0)
     except (TypeError, ValueError):
         chat_id = 0
-    if capacity:
-        log.error(
-            "Terminal answer %s (task %s) was evicted from the pending outbox "
-            "(capacity %d exceeded) before its send confirmed; disclosing",
-            did, tid, _PENDING_CAP,
-        )
-    else:
-        log.error(
-            "Terminal answer %s (task %s) could not be delivered after %d replays; giving up",
-            did, tid, _PENDING_MAX_REPLAYS,
-        )
+    detail = ("pending outbox over capacity; oldest owed row evicted" if capacity
+              else "send never confirmed; replay cap reached")
+    log.error("Terminal message %s (task %s) dropped with no confirmed send (%s); disclosing", did, tid, detail)
     preserved = ""
     try:
         from ouroboros.observability import preserve_salvaged_output
@@ -495,6 +483,13 @@ def _disclose_exhausted_delivery(
             )
     except Exception:
         log.debug("exhausted-delivery preservation failed for %s", did, exc_info=True)
+    try:  # positive evidence only: the cancel receipt stamped THIS delivery at THIS chat
+        from ouroboros.task_results import load_task_result
+
+        receipt = (load_task_result(pathlib.Path(drive_root), tid) or {}).get("cancel_receipt") if tid and did and chat_id != 0 else None
+        reached = isinstance(receipt, dict) and receipt.get("delivery_id") == did and receipt.get("delivered_chat_id") == chat_id
+    except Exception:
+        reached = False
     try:
         from ouroboros.utils import append_jsonl
 
@@ -504,33 +499,31 @@ def _disclose_exhausted_delivery(
                 "ts": utc_now_iso(), "type": "terminal_delivery_exhausted",
                 "task_id": tid, "delivery_id": did, "chat_id": chat_id,
                 "reason": reason,
-                "attempts": attempts, "preserved_path": preserved,
-                "detail": (
-                    "pending outbox over capacity; oldest owed row evicted"
-                    if capacity else "send never confirmed; replay cap reached"
-                ),
+                "attempts": attempts, "preserved_path": preserved, "detail": detail,
+                **({"owner_notice": "not_sent_same_delivery_recorded_at_this_chat"} if reached else {}),
             },
         )
     except Exception:
         log.debug("exhausted-delivery event append failed for %s", did, exc_info=True)
-    if not chat_id:
+    # A live notice needs a reader; the hidden partition (0) has none.
+    if chat_id == 0 or reached:
         return
     try:
         from supervisor.message_bus import send_with_budget
 
         copy_note = (
-            f"The full text is preserved at {preserved}." if preserved
-            else "No durable copy could be preserved."
+            f"A copy of this message is saved at {preserved}." if preserved
+            else "No copy of this message could be saved."
         )
         cause = (
-            f"its pending-outbox slot was evicted by newer owed answers (capacity {_PENDING_CAP})"
+            f"its pending-outbox slot was taken by newer owed messages (capacity {_PENDING_CAP})"
             if capacity else
-            f"the send never confirmed after {_PENDING_MAX_REPLAYS} replay attempts (chat "
+            f"no send was confirmed after {_PENDING_MAX_REPLAYS} replay attempts (chat "
             "transport failing or the supervisor kept crashing mid-send)"
         )
         send_with_budget(
             chat_id,
-            f"⚠️ A terminal answer for task {tid} could not be delivered: {cause}. {copy_note}",
+            f"⚠️ Sending a message for task {tid} was not confirmed: {cause}. {copy_note}",
             role="system",
             system_type="terminal_incident",
         )
@@ -649,10 +642,10 @@ def salvage_cancelled_output(
 def unreconciled_runs_note(unreconciled_runs: Optional[List[str]]) -> str:
     """GR6-5a: the ONE outcome-independent disclosure line for open delegated runs.
 
-    Appended to the owner's terminal message whenever the list is non-empty,
-    REGARDLESS of the outcome (completed, failed, cancelled, reaped): a task
-    whose teardown left delegated runs open must never read as cleanly
-    finished, and only the cancelled wording used to carry the warning.
+    Carried on the owner's custody row (never inside the model's answer)
+    whenever the list is non-empty, REGARDLESS of the outcome (completed,
+    failed, cancelled, reaped): a task whose teardown left delegated runs open
+    must never read as cleanly finished.
     Returns "" for an empty list.
     """
     runs = [str(rid) for rid in (unreconciled_runs or []) if str(rid)]
@@ -677,14 +670,14 @@ def build_completed_result_event(
     losing both the watchdog trigger and the answer. Returns None when there
     is nothing deliverable (no text / no lineage chat).
 
-    ``unreconciled_runs`` (GR6-5a): a completed answer whose teardown left
-    delegated runs open carries the outcome-independent disclosure line — the
-    completed wording used to omit it entirely. GR7-4: the note rides the TEXT
-    but never the delivery id — the id digests the CORE answer only, so a
-    replay whose rebuilt note shrank (runs reconciled meanwhile) dedups to the
-    same owed message instead of minting a second one. This also makes the id
-    byte-equal to the natural path's ``final:<tid>:<digest>`` for the same
-    stored answer.
+    ``unreconciled_runs``: a completed answer whose teardown left delegated
+    runs open carries the outcome-independent disclosure line on its CUSTODY
+    row, never inside the assistant answer — host words never speak as the
+    model's (issue #1006). The note stays out of the delivery id too: the id
+    digests the CORE answer only, so a replay whose rebuilt note shrank (runs
+    reconciled meanwhile) dedups to the same owed message instead of minting a
+    second one. This also makes the id byte-equal to the natural path's
+    ``final:<tid>:<digest>`` for the same stored answer.
     """
     tid = str(task_id or "").strip()
     core_text = str((stored or {}).get("result") or "")
@@ -692,16 +685,22 @@ def build_completed_result_event(
     chat_id = lineage_chat_id(pathlib.Path(drive_root), task_row, tid)
     if not tid or not core_text or not chat_id:
         return None
+    from ouroboros.task_finalization import terminal_custody_notice_text
+
+    runs = [str(rid) for rid in (unreconciled_runs or []) if str(rid)]
+    custody = terminal_custody_notice_text(stored or {})
+    note = unreconciled_runs_note(runs).lstrip("\n")
+    if note and any(run not in custody for run in runs):
+        custody = "\n\n".join(part for part in (note, custody) if part)
     event = {
         "type": "send_message",
         "chat_id": chat_id,
         "task_id": tid,
-        "text": core_text + unreconciled_runs_note(unreconciled_runs),
-        # The natural final answer is rendered as markdown; a re-delivered
-        # copy that drops the format renders as a different message.
+        "text": core_text,
+        # A re-delivered copy that drops markdown renders as a different message.
         "format": "markdown",
         "delivery_id": delivery_id_for(tid, core_text),
-        **({"terminal_host_notice": stored["terminal_host_notice"]} if (stored or {}).get("terminal_host_notice") else {}),
+        **({"terminal_custody_notice": custody} if custody else {}),
     }
     return project_terminal_result_event(
         pathlib.Path(drive_root), task_row, tid,
@@ -724,7 +723,8 @@ def project_terminal_result_event(
     """Project one terminal event from producer-stamped origin.
 
     ``host_salvage`` becomes one short keyed plain System receipt (inherited
-    ``format``/``log_text`` dropped; the full bytes stay in task details).
+    ``format``/``log_text`` dropped; the full bytes stay in task details); a
+    subagent's receipt also names its card placement, a root's does not.
     ``host_notice`` is a text the host wrote alone, so it keeps its OWN words
     and inherited markdown and becomes a System row WITHOUT a system_type,
     which is what lets a replayed card conclude on it. ``model_final`` and a
@@ -753,6 +753,15 @@ def project_terminal_result_event(
         if salvage:
             event.pop("log_text", None)
             event.pop("format", None)
+            # A child's receipt is a row of that child's card. The row id derives
+            # from the delivery id, so the live send, the owed outbox row and
+            # its replay all name one row.
+            from ouroboros.subagent_messages import subagent_message_meta
+
+            meta = event.get("progress_meta") if isinstance(event.get("progress_meta"), dict) else {}
+            if subagent_message_meta(task) or subagent_message_meta(meta):
+                event["progress_meta"] = {**meta, "card_row": "timeline",
+                                          "card_row_id": event["delivery_id"] + ":terminal_incident"}
         return event
     if origin == TERMINAL_ORIGIN_MODEL_FINAL:
         event["terminal_origin"] = TERMINAL_ORIGIN_MODEL_FINAL
@@ -761,20 +770,38 @@ def project_terminal_result_event(
     return event
 
 
-def enqueue_terminal_delivery(
+ENQUEUE_QUEUED = "queued"
+ENQUEUE_ALREADY_DELIVERED = "already_delivered"
+ENQUEUE_QUEUED_UNREGISTERED = "queued_unregistered"
+ENQUEUE_UNAVAILABLE = "unavailable"
+ENQUEUE_OUTCOMES = (
+    ENQUEUE_QUEUED, ENQUEUE_ALREADY_DELIVERED, ENQUEUE_QUEUED_UNREGISTERED, ENQUEUE_UNAVAILABLE,
+)
+
+
+def enqueue_terminal_delivery_outcome(
     drive_root: Any, event: Dict[str, Any], *, event_queue: Any = None,
-) -> bool:
-    """Dedupe, register as owed (idempotent), and enqueue one built event.
+) -> str:
+    """Dedupe, register as owed (idempotent), enqueue; answer one typed word.
 
     The enqueue half of the seam: safe to call after the same event was already
     registered by the owed-before-settle ordering — registration is keyed by
-    ``delivery_id`` and no-ops on a repeat.
+    ``delivery_id`` and no-ops on a repeat. Four facts a caller may branch on:
+    ``queued`` (owed row written, live send queued), ``already_delivered``
+    (this id already went out — nothing is owed, nothing failed),
+    ``queued_unregistered`` (the live send is queued but the owed row could not
+    be written: a crash before the send loses it — the ``register`` seam already
+    emitted its typed event), ``unavailable`` (no event, or the queue refused).
+    A boolean collapsed the first two with the last two; a receipt consumer read
+    an idempotent repeat as a failure and a lost owed row as durable.
     """
     did = str((event or {}).get("delivery_id") or "")
     tid = str((event or {}).get("task_id") or "")
-    if not event or already_delivered(pathlib.Path(drive_root), did):
-        return False
-    register_pending_delivery(pathlib.Path(drive_root), event)
+    if not event:
+        return ENQUEUE_UNAVAILABLE
+    if already_delivered(pathlib.Path(drive_root), did):
+        return ENQUEUE_ALREADY_DELIVERED
+    registered = register_pending_delivery(pathlib.Path(drive_root), event)
     try:
         if event_queue is None:
             from supervisor import workers
@@ -783,8 +810,18 @@ def enqueue_terminal_delivery(
         event_queue.put(dict(event))
     except Exception:
         log.warning("terminal-delivery enqueue failed for %s", tid, exc_info=True)
-        return False
-    return True
+        return ENQUEUE_UNAVAILABLE
+    return ENQUEUE_QUEUED if registered else ENQUEUE_QUEUED_UNREGISTERED
+
+
+def enqueue_terminal_delivery(
+    drive_root: Any, event: Dict[str, Any], *, event_queue: Any = None,
+) -> bool:
+    """Boolean projection of ``enqueue_terminal_delivery_outcome``: was a live
+    send queued? (An already-delivered id and a refused queue both read False —
+    callers that must tell those apart use the typed outcome.)"""
+    outcome = enqueue_terminal_delivery_outcome(drive_root, event, event_queue=event_queue)
+    return outcome in (ENQUEUE_QUEUED, ENQUEUE_QUEUED_UNREGISTERED)
 
 
 def deliver_completed_result(
@@ -798,9 +835,9 @@ def deliver_completed_result(
     confirmed, so the completed answer goes out through this seam: owed BEFORE
     enqueued, deduped by the same ``final:<tid>:<digest>`` identity the natural
     path mints — a copy the worker already delivered is suppressed durably.
-    Returns whether a send was enqueued. ``unreconciled_runs`` rides the text
-    (GR6-5a) and must match what the owed registration was built with, or the
-    two halves mint different delivery ids.
+    Returns whether a send was enqueued. ``unreconciled_runs`` rides the custody
+    row, never the answer text or the delivery id, so the owed registration and
+    the publish half mint the same ids.
     """
     event = build_completed_result_event(
         pathlib.Path(drive_root), task, task_id, stored,
@@ -840,8 +877,8 @@ def deliver_miss_lane_outcome(
         return True
     try:
         if status == "completed":
-            # GR6-5a: the completed answer carries the outcome-independent
-            # unreconciled-runs line — only the cancelled wording used to.
+            # The completed answer's custody row carries the outcome-independent
+            # unreconciled-runs line; the answer text stays the model's.
             event = build_completed_result_event(
                 pathlib.Path(drive_root), row, task_id, row,
                 unreconciled_runs=list(unreconciled_runs or []),
@@ -1227,7 +1264,7 @@ def _stop_episode_delivery_id(drive_root: Any, task_id: str) -> str:
         prefix = f"cancel:{tid}:"
         owed = [
             (str(row.get("registered_at") or ""), did)
-            for did, row in _pending_rows(data).items()
+            for did, row in _mapping_rows(data, "pending").items()
             if isinstance(row, dict) and did.startswith(prefix)
         ]
         if owed:
@@ -1243,6 +1280,7 @@ def _persist_cancel_receipt(
     preserved_path: str, preview_omitted: int,
     children: Optional[List[Dict[str, Any]]] = None,
     unreconciled_runs: Optional[List[str]] = None,
+    reason_code: str = "", files_rescued: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Q5=A: the technical stop facts live in the task DETAILS panel.
 
@@ -1254,6 +1292,7 @@ def _persist_cancel_receipt(
     digest for a cascade root. Never creates the result file (a later full
     write would clobber a block-only row) and never clobbers previously
     persisted non-empty facts with an emptier rebuild. Fail-soft.
+    ``files_rescued`` (TZ-2 C2) is the typed stat-only store count the receipt text speaks.
     """
     tid = str(task_id or "")
     try:
@@ -1271,7 +1310,10 @@ def _persist_cancel_receipt(
                 else {"path": "", "preserved": False}
             ),
             "ts": utc_now_iso(),
+            **({"files_rescued": dict(files_rescued)} if files_rescued else {}),
         }
+        if str(reason_code or ""):
+            block["reason_code"] = str(reason_code)  # TZ-2 C1: the typed rail beside its sentence
         rows = [
             {"task_id": str(c.get("task_id") or ""),
              "outcome": str(c.get("outcome") or ""),
@@ -1287,18 +1329,29 @@ def _persist_cancel_receipt(
             block["unreconciled_runs"] = runs
         try:
             from ouroboros.cancel_intents import active_intent
+            from ouroboros.task_results import load_task_result
 
-            reason = str((active_intent(pathlib.Path(drive_root), tid) or {}).get("reason") or "")
-            if reason:
-                block["stop_reason"] = reason
+            # The cause outlives the intent: once custody settles, `cancel_origin`
+            # on the stored result is where the same scalars live, and a receipt
+            # rebuilt after the settle must name the stop the owner actually made.
+            cause = active_intent(pathlib.Path(drive_root), tid) or {}
+            if not cause:
+                stored = load_task_result(pathlib.Path(drive_root), tid) or {}
+                origin = stored.get("cancel_origin")
+                cause = origin if isinstance(origin, dict) else {}
+            for key, field in (("reason", "stop_reason"), ("requested_at", "stop_requested_at")):
+                if cause.get(key):
+                    block[field] = str(cause[key])
         except Exception:
-            log.debug("cancel-receipt intent reason read failed for %s", tid, exc_info=True)
+            log.debug("cancel-receipt stop cause read failed for %s", tid, exc_info=True)
 
         def _mutate(current: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             if not isinstance(current, dict) or not current:
                 return None  # no durable row yet — never mint a block-only file
             merged = dict(current.get("cancel_receipt") or {}) if isinstance(
                 current.get("cancel_receipt"), dict) else {}
+            if block["delivery_id"] != merged.get("delivery_id"):
+                merged.pop("delivered_chat_id", None)
             for key, value in block.items():
                 if (
                     key == "salvage"
@@ -1320,6 +1373,30 @@ def _persist_cancel_receipt(
         log.debug("cancel-receipt persistence failed for %s", tid, exc_info=True)
 
 
+def record_cancel_receipt_delivery(
+    drive_root: Any, task_id: str, delivery_id: str, chat_id: int,
+) -> None:
+    """Record the actual sent destination on the matching existing receipt.
+
+    This write is separate from delivery registration. A failed write leaves
+    destination evidence unknown; it never authorizes suppressing an excerpt.
+    """
+    try:
+        from ouroboros.task_results import task_result_path
+
+        def _mutate(current: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            receipt = current.get("cancel_receipt")
+            if (str(current.get("task_id") or "") != task_id
+                    or not isinstance(receipt, dict)
+                    or not delivery_id or receipt.get("delivery_id") != delivery_id):
+                return None
+            return {**current, "cancel_receipt": {**receipt, "delivered_chat_id": chat_id}}
+
+        update_json_locked(task_result_path(pathlib.Path(drive_root), task_id), _mutate)
+    except Exception:
+        log.debug("cancel-receipt delivery evidence failed for %s", task_id, exc_info=True)
+
+
 def build_unreviewed_salvage_event(
     drive_root: Any,
     task: Optional[Dict[str, Any]],
@@ -1332,6 +1409,7 @@ def build_unreviewed_salvage_event(
     unreconciled_runs: Optional[List[str]] = None,
     settled_status: str = "",
     delivery_id: str = "",
+    reason_code: str = "",
 ) -> Optional[Dict[str, Any]]:
     """Build (without sending) the one salvage/terminal chat message.
 
@@ -1364,12 +1442,19 @@ def build_unreviewed_salvage_event(
     "answer"), and the technical facts (path/sha256/bytes/children digest)
     live in the durable ``cancel_receipt`` block on the task result — the
     details panel — not in chat.
+    ``reason_code`` (TZ-2 C1): the TYPED rail; with an empty ``outcome`` the owner
+    sentence comes from TASK_CAUSE_PHRASES here, and the code rides the receipt, not the prose.
+    TZ-2 C2: text and receipt state the files rescued (positive/zero/unknown, stat-only walk, no hashes).
     """
     from ouroboros.task_results import STATUS_COMPLETED
 
     tid = str(task_id or "").strip()
     if not tid:
         return None
+    code = str(reason_code or "").strip()
+    if code and not str(outcome or "").strip():
+        from ouroboros.project_dialogue import TASK_CAUSE_PHRASES
+        outcome = f"stopped by the supervisor. {TASK_CAUSE_PHRASES.get(code, code)}"
     task_row = task if isinstance(task, dict) else {}
     chat_id = lineage_chat_id(pathlib.Path(drive_root), task_row, tid)
     if not chat_id:
@@ -1384,21 +1469,19 @@ def build_unreviewed_salvage_event(
     if str(settled_status or "").strip().lower() == STATUS_COMPLETED:
         # Completion-wins (owner 4=A): the kept result is the real answer, not a
         # salvage — but it still bypassed the normal delivery path, so say so.
-        lines = [
-            f"✅ Task {tid} {outcome_text}. Its completed result is preserved below."
-            + descendants,
-        ]
+        lines = [f"✅ Task {tid} {outcome_text}. Its completed result is preserved below." + descendants]
     else:
         lines = [
             f"⚠️ Task {tid} was {outcome_text}. Below is the last persisted "
             "intermediate model message, preserved WITHOUT review (salvaged "
             "best-effort; NOT a final answer)." + descendants,
         ]
-    if preview:
-        lines += ["", preview, "", _preview_note_line(preserved_path, omitted)]
-    else:
-        lines += ["", "(no salvageable agent output was found for this task)"]
-    disclosure_lines: List[str] = []
+    lines += ["", preview, "", _preview_note_line(preserved_path, omitted)] if preview else [
+        "", "(no salvageable agent output was found for this task)"]
+    # TZ-2 C2: "no salvageable text" never implies "no files": the stat-only store count
+    # rides the mutable disclosure (never the content-derived identity), hashes not computed.
+    rescued = rescued_files_fact(tid, artifact_store_roots(drive_root, tid, task=task_row))
+    disclosure_lines: List[str] = ["", rescued_files_sentence(rescued)]
     if unreconciled_runs:
         # GR3-7: an audit-failure marker means run state is UNKNOWN — a
         # different honest sentence than "these named runs stayed open".
@@ -1440,9 +1523,9 @@ def build_unreviewed_salvage_event(
         settled_status=str(settled_status or ""), outcome=outcome_text,
         delivery_id=did, preserved_path=str(preserved_path or ""),
         preview_omitted=omitted, children=children,
-        unreconciled_runs=unreconciled_runs,
+        unreconciled_runs=unreconciled_runs, reason_code=code, files_rescued=rescued,
     )
-    return {
+    event = {
         "type": "send_message",
         "chat_id": chat_id,
         "task_id": tid,
@@ -1456,6 +1539,9 @@ def build_unreviewed_salvage_event(
         "delivery_id": did,
         "ts": utc_now_iso(),
     }
+    if code:
+        event["reason_code"] = code
+    return event
 
 
 def deliver_unreviewed_salvage(
@@ -1470,6 +1556,7 @@ def deliver_unreviewed_salvage(
     unreconciled_runs: Optional[List[str]] = None,
     settled_status: str = "",
     delivery_id: str = "",
+    reason_code: str = "",
     event_queue: Any = None,
 ) -> bool:
     """Enqueue ONE unreviewed-salvage chat message for a cancelled/reaped task.
@@ -1487,7 +1574,7 @@ def deliver_unreviewed_salvage(
         pathlib.Path(drive_root), task, task_id,
         outcome=outcome, salvaged_text=salvaged_text, preserved_path=preserved_path,
         children=children, unreconciled_runs=unreconciled_runs,
-        settled_status=settled_status, delivery_id=delivery_id,
+        settled_status=settled_status, delivery_id=delivery_id, reason_code=reason_code,
     )
     if event is None:
         # GR3-1c: a terminal outcome with NO resolvable lineage chat records a

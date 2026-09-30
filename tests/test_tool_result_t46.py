@@ -410,7 +410,7 @@ def test_plan_handler_wrapper_preserves_native_meta_for_all_projection_paths(
                     ],
                 },
             },
-            "PLAN_REVIEW_DISPOSITION_MIXED_ENVELOPE",
+            "PLAN_RESOURCE_FORM_REQUIRED",
         ),
         (
             {"review_disposition": {"review_fingerprint": "", "items": []}},
@@ -432,6 +432,7 @@ def test_plan_task_argument_refusals_are_typed_at_the_registry_boundary(
     from ouroboros.tools import plan_review
 
     registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
+    registry._ctx.task_id = "t46"  # answers beside an envelope are validated against the task's state
     monkeypatch.setattr(safety, "check_safety", lambda *_args, **_kwargs: (True, ""))
     monkeypatch.setattr(
         plan_review,
@@ -615,6 +616,7 @@ def test_review_cycle_publishes_only_structural_critical_finding_rejection(
     from ouroboros.tools import git as git_facade
     from ouroboros.tools import git_review_cycle as git_tools
 
+    monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "blocking")
     sentinel = object()
     ctx = SimpleNamespace(
         repo_dir=tmp_path,

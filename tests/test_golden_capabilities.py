@@ -31,6 +31,12 @@ def _posix(rendered: str) -> str:
 
 
 AWS_SECRET_LINE = "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n"
+GITHUB_TOKEN_LINE = "token = ghp_abcdefghijklmnopqrstuvwxyz123456\n"
+PEM_BLOCK = (
+    "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+    "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gt\n"
+    "-----END OPENSSH PRIVATE KEY-----\n"
+)
 
 
 @pytest.fixture()
@@ -68,28 +74,27 @@ def repo_ctx(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Incident X1/В23 — the ROOT principal reads/lists/searches its owner's home;
-# credential-shaped NAMES stopped being a read-authorization input (bytes are
-# masked at egress instead of the file being refused at ingress).
-# ---------------------------------------------------------------------------
+# File names and content do not infer read authority.
 
-def test_root_reads_credential_named_user_file_masked_not_refused(user_files_ctx):
-    ctx, _home = user_files_ctx
+def test_root_reads_credential_named_user_file_unchanged(user_files_ctx):
+    ctx, home = user_files_ctx
+    source = "[default]\n" + AWS_SECRET_LINE + GITHUB_TOKEN_LINE + PEM_BLOCK
+    (home / ".aws" / "credentials").write_text(source, encoding="utf-8")
     out = _read_file(ctx, ".aws/credentials", root="user_files")
-    assert not out.startswith("⚠️"), out[:200]          # the read itself succeeds
-    assert "[default]" in out                            # non-secret content survives
-    assert "wJalrXUtnFEMI" not in out                    # raw key bytes never egress
-    assert "SECRET_BYTES_MASKED" in out                  # disclosure, not silence
+    assert source in out and "SECRET_BYTES_MASKED" not in out
 
 
 def test_root_lists_and_searches_credential_named_user_files(user_files_ctx):
-    ctx, _home = user_files_ctx
+    ctx, home = user_files_ctx
+    (home / ".aws" / "credentials").write_text(
+        "[default]\n" + AWS_SECRET_LINE + GITHUB_TOKEN_LINE, encoding="utf-8")
     listing = _list_files(ctx, path=".aws", root="user_files")
-    assert ".aws/credentials" in _posix(listing)         # the name is not hidden
-    found = _code_search(ctx, "aws_secret_access_key", root="user_files", path=".aws")
-    assert ".aws/credentials" in _posix(found)           # search reaches the file
-    assert "wJalrXUtnFEMI" not in found                  # match lines are masked
-    assert "SECRET_BYTES_MASKED" in found
+    assert ".aws/credentials" in _posix(listing)
+    found = _code_search(ctx, "token", root="user_files", path=".aws")
+    assert ".aws/credentials" in _posix(found)
+    assert GITHUB_TOKEN_LINE.strip() in found and "SECRET_BYTES_MASKED" not in found
+    raw = _code_search(ctx, "aws_secret_access_key", root="user_files", path=".aws")
+    assert "wJalrXUtnFEMI" in raw
 
 
 @pytest.mark.parametrize("operation", ["read", "list", "search"])
@@ -151,9 +156,10 @@ def test_skill_owner_state_inspection_read_passes(tmp_path, cmd):
 # members; one rejected sibling no longer voids the whole declaration.
 # ---------------------------------------------------------------------------
 
-def test_partial_attachment_set_stages_the_valid_member(tmp_path):
+def test_partial_attachment_set_stages_the_valid_member(tmp_path, monkeypatch):
     from ouroboros.artifacts import stage_task_attachments
 
+    monkeypatch.setattr(pathlib.Path, "home", classmethod(lambda cls: tmp_path))
     aws = tmp_path / ".aws"
     aws.mkdir()
     (aws / "credentials").write_text("[default]\n", encoding="utf-8")

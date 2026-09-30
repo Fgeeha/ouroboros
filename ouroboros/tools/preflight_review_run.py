@@ -401,7 +401,7 @@ def _checkpoint_advisory_execution(ctx, repo_dir, commit_message, paths, options
         ) from exc
 
 
-def _run_advisory_delegated(prompt: str, repo_dir: pathlib.Path, ctx: ToolContext, *, execution=None, checkpoint=None):
+def _run_advisory_delegated(prompt: str, repo_dir: pathlib.Path, ctx: ToolContext, *, execution=None, checkpoint=None, task_evidence=None):
     """The advisory as a delegated agent session on the SHARED executor seam.
 
     One substrate executor (``AgentSessionReviewExecutor``) owns the session:
@@ -430,8 +430,12 @@ def _run_advisory_delegated(prompt: str, repo_dir: pathlib.Path, ctx: ToolContex
         str(_task_metadata.get("deadline_at") or "")
         if isinstance(_task_metadata, dict) else ""
     )
+    from ouroboros.review_evidence import commit_review_evidence_refs
+    evidence = task_evidence or {}
     request = ReviewRequest(
         surface="advisory_review",
+        evidence={"task_execution": evidence} if evidence else {},
+        evidence_refs=commit_review_evidence_refs(evidence),
         goal="Advisory pre-review of the live worktree.",
         task_id=str(getattr(ctx, "task_id", "") or ""),
         session_root=str(repo_dir),
@@ -504,6 +508,26 @@ def _note_meta_error(ctx: ToolContext, meta: dict, err_msg: str) -> None:
         pass
 
 
+def _prepare_advisory_task_evidence(ctx, repo_dir, options, execution, delegated_route):
+    """Bind the original readable view before either advisory delivery sends.
+
+    Pending custody selects its recorded canonical source. Only hosted sessions
+    materialize that source inside the project; native reads keep the data root.
+    """
+    from ouroboros.review_evidence import materialize_commit_review_session_view, restore_commit_review_evidence
+
+    evidence = dict(options.get("task_evidence") or {})
+    if execution.get("pending_invocation_id"):
+        evidence = restore_commit_review_evidence(ctx, execution["evidence_source_ref"]) if execution.get("evidence_source_ref") else {}
+    if delegated_route and evidence:
+        evidence = materialize_commit_review_session_view(evidence, repo_dir)
+    if options.get("owns_task_evidence") is False:
+        ctx._commit_review_evidence = evidence
+    if evidence.get("source_ref"):
+        execution["evidence_source_ref"] = evidence["source_ref"]
+    return evidence
+
+
 def _run_claude_advisory(
     repo_dir: pathlib.Path,
     commit_message: str,
@@ -558,7 +582,14 @@ def _run_claude_advisory(
         _note_meta_error(ctx, {"execution": execution}, message)
         return [], message, "", 0
 
+    from ouroboros.review_evidence import commit_review_evidence_section
     resuming = bool(execution.get("pending_invocation_id"))
+    governance_facts: dict = {}  # the delivered tiers, filled in by the builder
+    try:
+        task_evidence = _prepare_advisory_task_evidence(ctx, repo_dir, options, execution, delegated_route)
+    except (OSError, ValueError, TypeError) as exc:
+        return assembly_failure(f"⚠️ ADVISORY_ERROR: frozen task evidence is unavailable: {type(exc).__name__}")
+    task_evidence_section = commit_review_evidence_section(task_evidence, delivery="session" if delegated_route else "native")
     if resuming:
         from ouroboros.delegate_custody import custody_root, invocation_record
 
@@ -584,12 +615,12 @@ def _run_claude_advisory(
                 changed_files_text = _car()._get_changed_file_list(repo_dir, paths=context_paths)
                 if changed_files_text.startswith("⚠️ ADVISORY_ERROR:"):
                     return assembly_failure(changed_files_text)
-                resolved_paths, touched_pack, omitted_paths = _car().build_advisory_changed_context(
-                    repo_dir,
-                    changed_files_text=changed_files_text,
-                    paths=context_paths,
-                    exclude_paths={"docs/ARCHITECTURE.md"},
-                )
+                # A retrieving reviewer receives the touched-path MANIFEST, so
+                # this is a path scope only: the bodies stay in its own tree.
+                from ouroboros.tools.review_file_pack import parse_changed_paths_from_porcelain
+
+                resolved_paths = (list(context_paths) if context_paths is not None
+                                  else parse_changed_paths_from_porcelain(changed_files_text))
                 preflight_err = _car()._syntax_preflight_staged_py_files(repo_dir, resolved_paths)
                 if preflight_err:
                     log.warning("Advisory skipped — syntax preflight blocked: %s", preflight_err.splitlines()[0])
@@ -597,7 +628,7 @@ def _run_claude_advisory(
             else:
                 diff_text = "(not included; this advisory review is scoped to the supplied payload pack)"
                 changed_files_text = "(not included; this advisory review is scoped to the supplied payload pack)"
-                resolved_paths, touched_pack, omitted_paths = [], "", []
+                resolved_paths = []
                 managed_subject_diff = False
 
             prompt = _car()._build_advisory_prompt(
@@ -610,21 +641,27 @@ def _run_claude_advisory(
                 prompt_context={
                     "diff": diff_text,
                     "changed_files": changed_files_text,
-                    "touched_pack": touched_pack,
-                    "omitted_paths": omitted_paths,
                     "review_surface": review_surface,
                     "review_rebuttal": str(options.get("review_rebuttal") or ""),
                     "expected_items": expected_items,
+                    "task_evidence_section": task_evidence_section,
+                    # Both deliveries RETRIEVE, so no body is inlined: touched
+                    # files arrive as their manifest and governance arrives
+                    # tiered against THIS row's window (hence the route here).
+                    "reviewer_model": model,
+                    "reviewer_use_local": getattr(_slot, "use_local", None),
+                    "governance_facts": governance_facts,
                 },
-                # Both deliveries RETRIEVE governance docs via mandatory-read
-                # pointers (the session with its own tools, the native episode with
-                # host inspection tools): the inlined multi-hundred-KB governance
-                # pack died with the Claude-SDK transport.
-                governance_by_retrieval=True,
             )
         except Exception as exc:
             return assembly_failure(f"⚠️ ADVISORY_ERROR: failed to build advisory prompt: {exc}")
 
+    if not resuming and task_evidence_section:
+        oversized = (len(prompt) > _ADVISORY_PROMPT_MAX_CHARS or
+                     (not delegated_route and _car()._api_window_skip_warning(model, prompt, managed_subject_diff, slot=_slot)))
+        if oversized:
+            prompt = prompt.replace(task_evidence_section, commit_review_evidence_section(
+                task_evidence, delivery="session" if delegated_route else "native", compact=True), 1)
     prompt_chars = len(prompt)
     diag = _car()._get_runtime_diagnostics(model, prompt_chars, resolved_paths)
     size_skip = None if resuming else _car()._predispatch_size_skip(
@@ -641,32 +678,27 @@ def _run_claude_advisory(
 
     try:
         if delegated_route:
-            # 5.8: only the transport changes — the delegated session runs the
-            # SAME advisory prompt in the same repo root and rehydrates the same
-            # result structure. The SDK budget kill is replaced by the runner's
-            # nanny-enforced time cap; cost settles through delegate_custody.
+            # Same prompt/root/result contract; session timing and cost belong
+            # to the nanny and delegate_custody, not the retired SDK budget.
             scope_effort = ""  # the session route carries its own effort
             custody_args = ({"execution": execution, "checkpoint": checkpoint}
                             if options.get("snapshot_hash") else {})
-            result, model = _car()._run_advisory_delegated(prompt, repo_dir, ctx, **custody_args)
+            result, model = _car()._run_advisory_delegated(prompt, repo_dir, ctx, **custody_args,
+                **({"task_evidence": task_evidence} if task_evidence else {}))
         else:
-            # The native inspection episode (the retired Claude-SDK
-            # transport's successor): same prompt, same repo root, same result
-            # structure. The SDK budget kill is replaced by the episode's
-            # transcript bound derived from THIS reviewer's own window
-            # (``review_native_episode.review_native_transcript_bound``) — no
-            # round cap; every provider call rides the ordinary usage ledger
-            # under category=advisory_review.
+            # Same prompt/root/result contract; native inspection has no round
+            # cap, only its reviewer-window transcript bound. Each provider call
+            # rides the ordinary advisory_review usage ledger.
             scope_effort = _slot.effort or "low"
             if _car().owner_deadline_exhausted_for_context(ctx, reserve_sec=_car().get_finalization_grace_sec()):
                 raise TimeoutError("owner deadline leaves no dispatch window for advisory review")
-            # The documents the pointer form requires read IN FULL, measured
-            # from the files at prompt-build time: the episode's bound is
-            # lifted to hold them when the reviewer's window allows, else the
-            # prompt and the episode facts carry the typed shortfall code.
+            # The reading this brief requires IN FULL: the touched bodies its
+            # manifest names (the activated rules are already inline). The
+            # episode declares it and types a reading across working views.
             result, model = _car()._run_advisory_native(
                 prompt, repo_dir, ctx, _slot, model,
-                mandatory_read_corpus_chars=_car()._mandatory_read_corpus_chars(repo_dir, review_surface),
+                mandatory_read_corpus_chars=_car()._mandatory_read_corpus_chars(repo_dir, resolved_paths),
+                **({"task_evidence": task_evidence} if task_evidence else {}),
             )
 
         usage = dict(getattr(result, "usage", {}) or {})
@@ -693,6 +725,8 @@ def _run_claude_advisory(
             "review_surface": review_surface,
             "effort": scope_effort,
             "status": "completed" if getattr(result, "success", False) else "error",
+            # Disclosure (BIBLE P1): what governance this brief delivered.
+            "governance_manifest": list(governance_facts.get("governance_manifest") or []),
         }
         try:
             setattr(ctx, "_last_claude_advisory_meta", dict(meta))
@@ -719,6 +753,8 @@ def _run_claude_advisory(
             return [], err_msg + "\n\nReviewer output:\n" + raw_received, model, prompt_chars
 
         raw_text = str(result.result_text or "")
+        event_facts = {key: meta[key] for key in (
+            "model", "session_id", "prompt_chars", "cost_usd", "review_surface")}
 
         if raw_text.strip() in {"", "(no output)"}:
             err_msg = _car()._format_advisory_error(
@@ -730,12 +766,8 @@ def _run_claude_advisory(
             )
             _car().emit_review_event(ctx, {
                 "type": "advisory_suspect_result",
-                "model": model,
-                "session_id": meta.get("session_id", ""),
-                "prompt_chars": prompt_chars,
-                "cost_usd": float(result.cost_usd or 0),
+                **event_facts,
                 "reason": "advisory result had empty output",
-                "review_surface": review_surface,
             })
             execution.update(failure_phase="format", failure_code="empty_response", source_text=original)
             _note_meta_error(ctx, meta, err_msg)
@@ -759,12 +791,8 @@ def _run_claude_advisory(
             )
             _car().emit_review_event(ctx, {
                 "type": "advisory_suspect_result",
-                "model": model,
-                "session_id": meta.get("session_id", ""),
-                "prompt_chars": prompt_chars,
-                "cost_usd": float(result.cost_usd or 0),
+                **event_facts,
                 "reason": contract_error,
-                "review_surface": review_surface,
             })
             execution.update(failure_phase="format", failure_code="checklist_contract", source_text=original)
             _note_meta_error(ctx, meta, err_msg)
@@ -773,12 +801,8 @@ def _run_claude_advisory(
         if contract_warning:
             _car().emit_review_event(ctx, {
                 "type": "advisory_contract_warning",
-                "model": model,
-                "session_id": meta.get("session_id", ""),
-                "prompt_chars": prompt_chars,
-                "cost_usd": float(result.cost_usd or 0),
+                **event_facts,
                 "warning": contract_warning,
-                "review_surface": review_surface,
             })
             try:
                 meta["status"] = "completed_with_contract_warning"

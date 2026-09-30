@@ -225,10 +225,10 @@ def test_invalid_new_plan_attempts_do_not_reuse_old_green(tmp_path):
     ctx.system_repo_dir = tmp_path
     ctx.emit_progress_fn = lambda _message: None
     cases = [
-        ({"plan": "", "goal": "G", "spec": {"in_scope": ["x"]}}, "plan: required non-empty prose"),
-        ({"plan": "P", "goal": "", "spec": {"in_scope": ["x"]}}, "goal: required non-empty string"),
+        ({"plan": "", "goal": "G", "spec": {"in_scope": ["x"], "affected_paths": []}}, "plan: required non-empty prose"),
+        ({"plan": "P", "goal": "", "spec": {"in_scope": ["x"], "affected_paths": []}}, "goal: required non-empty string"),
         ({"plan": "P", "goal": "G", "spec": "not-an-object"}, "spec: must be an object"),
-        ({"plan": "P", "goal": "G", "spec": {"bogus": 1}}, "unknown fields: bogus"),
+        ({"plan": "P", "goal": "G", "spec": {"bogus": 1, "affected_paths": []}}, "unknown fields: bogus"),
     ]
     for params, error_text in cases:
         record_plan_review_attempt(tmp_path, "root1", fingerprint=old_fingerprint)
@@ -355,7 +355,7 @@ def test_malformed_reviewer_slots_block_plan_review_before_any_dispatch(tmp_path
         patch.object(pr, "_run_plan_review_slots",
                      side_effect=AssertionError("no reviewer dispatch")),
     ):
-        result = pr._handle_plan_task(ctx, plan="P", goal="G", spec={"in_scope": ["x"]})
+        result = pr._handle_plan_task(ctx, plan="P", goal="G", spec={"in_scope": ["x"], "affected_paths": []})
 
     assert "Invalid reviewer-slot configuration blocks plan review" in result
     assert "not valid JSON" in result
@@ -368,19 +368,78 @@ def test_malformed_reviewer_slots_block_plan_review_before_any_dispatch(tmp_path
     assert load_plan_review_state(tmp_path, "plan-slot-config")["current_attempt"]["status"] == "unavailable"
 
 
-def test_corrupt_parent_task_result_fails_closed_without_overwrite(tmp_path):
+@pytest.mark.parametrize("payload", ["{broken", "[]", "null"])
+def test_corrupt_parent_task_result_fails_closed_without_overwrite(tmp_path, payload):
     from ouroboros.task_results import load_plan_review_state, record_plan_review_wave
 
     result_path = tmp_path / "task_results" / "parent-corrupt.json"
     result_path.parent.mkdir(parents=True, exist_ok=True)
-    result_path.write_text("{broken", encoding="utf-8")
+    result_path.write_text(payload, encoding="utf-8")
 
     with pytest.raises(ValueError, match="PLAN_REVIEW_STATE_INVALID"):
         load_plan_review_state(tmp_path, "parent-corrupt")
     with pytest.raises(ValueError, match="PLAN_REVIEW_STATE_INVALID"):
         record_plan_review_wave(tmp_path, "parent-corrupt", _wave("f" * 64))
 
-    assert result_path.read_text(encoding="utf-8") == "{broken"
+    assert result_path.read_text(encoding="utf-8") == payload
+
+
+def test_plan_state_read_waits_for_writer_without_rewriting_snapshot(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+    from ouroboros import platform_layer, task_results as tr, utils
+    from ouroboros.tools import plan_review_artifacts
+
+    tr._update_plan_review_state(tmp_path, "plan", lambda state: state)
+    path = tr.task_result_path(tmp_path, "plan", create=False)
+    writing, release, reader_waiting = (threading.Event() for _ in range(3))
+    acquire = platform_layer.acquire_exclusive_file_lock
+    write = utils.atomic_write_json
+    resolve = plan_review_artifacts.authority_state
+    snapshots = []
+
+    def observed_acquire(*args, **kwargs):
+        if threading.current_thread().name.startswith("plan-reader"):
+            reader_waiting.set()
+        return acquire(*args, **kwargs)
+
+    def observed_write(target, value, **kwargs):
+        write(target, value, **kwargs)
+        snapshots.append((path.read_bytes(), path.stat().st_mtime_ns))
+
+    def resolve_after_unlock(*args):
+        assert not path.with_name(path.name + ".lock").exists()
+        return resolve(*args)
+
+    def held_update(state):
+        writing.set()
+        assert release.wait(5), "test did not release the state writer"
+        return {**state, "cycles_paid": 1}
+
+    monkeypatch.setattr(platform_layer, "acquire_exclusive_file_lock", observed_acquire)
+    monkeypatch.setattr(utils, "atomic_write_json", observed_write)
+    monkeypatch.setattr(plan_review_artifacts, "authority_state", resolve_after_unlock)
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="plan-writer") as writers, \
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="plan-reader") as readers:
+        writer = writers.submit(tr._update_plan_review_state, tmp_path, "plan", held_update)
+        try:
+            assert writing.wait(3)
+            reader = readers.submit(tr.load_plan_review_state, tmp_path, "plan")
+            assert reader_waiting.wait(2), "state reader bypassed the active writer's lock"
+            assert not reader.done()
+        finally:
+            release.set()
+        writer.result(timeout=3)
+        assert reader.result(timeout=3)["cycles_paid"] == 1
+    assert snapshots == [(path.read_bytes(), path.stat().st_mtime_ns)]
+
+
+def test_missing_plan_state_read_does_not_create_a_store(tmp_path):
+    from ouroboros.task_results import load_plan_review_state
+
+    state = load_plan_review_state(tmp_path, "absent")
+    assert state["waves"] == [] and state["cycles_paid"] == 0
+    assert not (tmp_path / "task_results").exists()
 
 
 def _deadline_ctx(tmp_path, *, seconds_left: int):
@@ -410,7 +469,7 @@ def test_expired_explicit_deadline_skips_before_any_reviewer(monkeypatch, tmp_pa
     monkeypatch.setattr(pr, "_plan_review_slots",
                         lambda: (_ for _ in ()).throw(AssertionError("expired deadline must skip")))
     out = asyncio.run(pr._run_plan_review_async(
-        ctx, pr._PlanRequest(goal="G", plan="P", spec={"in_scope": ["x"]}),
+        ctx, pr._PlanRequest(goal="G", plan="P", spec={"in_scope": ["x"], "affected_paths": []}),
     ))
 
     assert out.startswith("PLAN_TASK_SKIPPED_DEADLINE: the task deadline has expired")
@@ -437,7 +496,7 @@ def test_expired_deadline_replays_a_recorded_wave_but_never_pays(monkeypatch, tm
     monkeypatch.setattr(pr, "_plan_review_slots",
                         lambda: (_ for _ in ()).throw(AssertionError("no panel under a dead deadline")))
     out = asyncio.run(pr._run_plan_review_async(
-        ctx, pr._PlanRequest(goal="G", plan="P", spec={"in_scope": ["x"]}),
+        ctx, pr._PlanRequest(goal="G", plan="P", spec={"in_scope": ["x"], "affected_paths": []}),
     ))
     assert out.startswith("PLAN_TASK_SKIPPED_DEADLINE:")
     attempt = load_plan_review_state(tmp_path, ctx.task_id)["current_attempt"]
@@ -467,21 +526,21 @@ class TestPlanReviewInputValidation(unittest.TestCase):
         self.ctx.emit_progress_fn = lambda _m: None
 
     def test_missing_plan_returns_error(self):
-        result = self.handler(self.ctx, plan="", goal="some goal", spec={"in_scope": ["x"]})
+        result = self.handler(self.ctx, plan="", goal="some goal", spec={"in_scope": ["x"], "affected_paths": []})
         self.assertIn("ERROR: PLAN_SPEC_INVALID", result)
         self.assertIn("plan", result.lower())
 
     def test_missing_goal_returns_error(self):
-        result = self.handler(self.ctx, plan="some plan", goal="", spec={"in_scope": ["x"]})
+        result = self.handler(self.ctx, plan="some plan", goal="", spec={"in_scope": ["x"], "affected_paths": []})
         self.assertIn("ERROR: PLAN_SPEC_INVALID", result)
         self.assertIn("goal", result.lower())
 
     def test_whitespace_plan_returns_error(self):
-        result = self.handler(self.ctx, plan="   ", goal="some goal", spec={"in_scope": ["x"]})
+        result = self.handler(self.ctx, plan="   ", goal="some goal", spec={"in_scope": ["x"], "affected_paths": []})
         self.assertIn("ERROR", result)
 
     def test_whitespace_goal_returns_error(self):
-        result = self.handler(self.ctx, plan="some plan", goal="   ", spec={"in_scope": ["x"]})
+        result = self.handler(self.ctx, plan="some plan", goal="   ", spec={"in_scope": ["x"], "affected_paths": []})
         self.assertIn("ERROR", result)
 
     def test_missing_spec_is_a_typed_refusal(self):
@@ -508,12 +567,14 @@ class TestPlanReviewToolRegistration(unittest.TestCase):
         from ouroboros.tools.plan_review import get_tools
         tool = next(t for t in get_tools() if t.name == "plan_task")
         params = tool.schema["parameters"]["properties"]
-        self.assertEqual(set(params), {"plan", "goal", "spec", "review_disposition"})
+        self.assertEqual(set(params), {"plan", "goal", "spec", "reviewer_effort", "review_disposition"})
         spec = params["spec"]["properties"]
         self.assertEqual(set(spec), {
             "in_scope", "non_goals", "acceptance_claims", "invariants", "decisions",
-            "deferred", "affected_resources", "evidence",
+            "deferred", "affected_paths", "affected_resources", "evidence",
         })
+        # The ONE list the host resolves as file paths, and the one a submitted spec must carry.
+        self.assertEqual(params["spec"]["required"], ["affected_paths"])
         disposition = params["review_disposition"]
         self.assertEqual(disposition["required"], ["review_fingerprint", "items"])
         decision = disposition["properties"]["items"]["items"]["properties"]["decision"]
@@ -572,6 +633,9 @@ class TestPlanReviewToolRegistration(unittest.TestCase):
         self.assertNotIn("skip", lower)
         for word in ("research", "deliverable", "action in the world"):
             self.assertIn(word, lower)
+        # The description states where the open review lives; it promises no host bubble.
+        self.assertNotIn("the host discloses", desc)
+        self.assertIn("your own answer states it", desc)
 
     def test_plan_task_contract_has_no_swarm_knobs(self):
         from ouroboros.config import RETIRED_SETTING_KEYS, SETTINGS_DEFAULTS
@@ -609,7 +673,9 @@ class TestPlanReviewDispositionEnvelope(unittest.TestCase):
             run.assert_not_called()
             self.assertFalse((root / "task_results" / "parent.json").exists())
 
-    def test_mixed_disposition_and_plan_envelope_is_rejected_without_mutation(self):
+    def test_answer_beside_an_envelope_naming_no_wave_is_refused_without_mutation(self):
+        """The valid envelope is prepared read-only, then the answers are bound to their wave:
+        none holds this fingerprint, so the call is refused before any review or write."""
         import tempfile
         import ouroboros.tools.plan_review as pr
         from ouroboros.tools.registry import ToolContext
@@ -618,18 +684,14 @@ class TestPlanReviewDispositionEnvelope(unittest.TestCase):
             root = pathlib.Path(raw)
             ctx = ToolContext(repo_dir=root, drive_root=root)
             ctx.task_id = "parent"
-            disposition = {
-                "review_fingerprint": "f" * 64,
-                "items": [{"finding_id": "slot_1:f1", "decision": "reject", "rationale": "one"}],
-            }
+            disposition = {"review_fingerprint": "f" * 64,
+                           "items": [{"finding_id": "slot_1:f1", "decision": "reject", "rationale": "one"}]}
             with patch.object(pr, "_record_raw_plan_request_with_reference") as record, patch.object(
                 pr, "_run_plan_review_async",
             ) as run:
-                out = pr._handle_plan_task(
-                    ctx, plan="P changed", goal="G", spec={"in_scope": ["a"]},
-                    review_disposition=disposition,
-                )
-            self.assertIn("PLAN_REVIEW_DISPOSITION_MIXED_ENVELOPE", out)
+                out = pr._handle_plan_task(ctx, plan="P changed", goal="G", spec={"in_scope": ["a"], "affected_paths": []},
+                                           review_disposition=disposition)
+            self.assertIn("PLAN_REVIEW_DISPOSITION_UNBINDABLE", out)
             record.assert_not_called()
             run.assert_not_called()
             self.assertFalse((root / "task_results" / "parent.json").exists())
@@ -659,34 +721,32 @@ class TestPlanReviewDispositionEnvelope(unittest.TestCase):
                 apply_.assert_called_once_with(ctx, disposition)
                 run.assert_not_called()
 
-    def test_meaningful_or_invalid_padding_beside_a_disposition_is_still_mixed(self):
+    def test_meaningful_or_invalid_padding_beside_a_disposition_is_refused_by_the_envelope_form(self):
         """Only schema-equivalent emptiness is ignored: a non-empty list, an unknown spec
-        key or a wrong type is meaning (or an error) and keeps the typed refusal — a
-        vacuity rule must never discard an invalid value to make a call pass."""
+        key or a wrong type is an envelope, validated FIRST — its typed form refusal comes
+        before the answers are touched; a vacuity rule never discards an invalid value."""
+        import tempfile
         import ouroboros.tools.plan_review as pr
         from ouroboros.tools.registry import ToolContext
 
-        ctx = ToolContext(repo_dir=pathlib.Path("."), drive_root=pathlib.Path("."))
-        ctx.task_id = "parent"
-        disposition = {"review_fingerprint": "f" * 64, "items": []}
-        for padding in (
-            {"spec": {"in_scope": [""]}},
-            {"spec": {"unknown": ""}},
-            {"goal": []},
-            {"plan": "P changed"},
-        ):
-            with self.subTest(padding=padding):
-                with patch.object(pr, "_apply_disposition") as apply_, patch.object(
+        with tempfile.TemporaryDirectory() as raw:
+            root = pathlib.Path(raw)
+            ctx = ToolContext(repo_dir=root, drive_root=root)
+            ctx.task_id = "parent"
+            disposition = {"review_fingerprint": "f" * 64, "items": []}
+            for padding in ({"spec": {"in_scope": [""]}}, {"spec": {"unknown": ""}}, {"goal": []}, {"plan": "P changed"}):
+                with self.subTest(padding=padding), patch.object(pr, "_apply_disposition") as apply_, patch.object(
                     pr, "_run_plan_review_async",
                 ) as run:
                     out = pr._handle_plan_task(ctx, review_disposition=disposition, **padding)
-                self.assertIn("PLAN_REVIEW_DISPOSITION_MIXED_ENVELOPE", out)
-                apply_.assert_not_called()
-                run.assert_not_called()
+                    self.assertTrue("PLAN_SPEC_INVALID" in out or "PLAN_RESOURCE_FORM_REQUIRED" in out, out)
+                    apply_.assert_not_called()
+                    run.assert_not_called()
+            self.assertFalse((root / "task_results" / "parent.json").exists())
 
     def test_disposition_with_an_empty_item_beside_a_plan_is_not_vacuous(self):
-        """``items=[{}]`` says something malformed, not nothing: beside a plan it is a
-        mixed envelope (refused typed), never silently promoted into review mode."""
+        """``items=[{}]`` says something malformed, not nothing: beside a plan it is an answer
+        with an envelope whose (malformed) form is refused typed, never plain review mode."""
         import ouroboros.tools.plan_review as pr
         from ouroboros.tools.registry import ToolContext
 
@@ -697,7 +757,7 @@ class TestPlanReviewDispositionEnvelope(unittest.TestCase):
                 ctx, plan="P", goal="G", spec={},
                 review_disposition={"review_fingerprint": "", "items": [{}]},
             )
-        self.assertIn("PLAN_REVIEW_DISPOSITION_MIXED_ENVELOPE", out)
+        self.assertIn("PLAN_RESOURCE_FORM_REQUIRED", out)
         run.assert_not_called()
 
     def test_state_lookup_failure_is_error_not_absence(self):
@@ -749,6 +809,34 @@ class TestPlanReviewDispositionEnvelope(unittest.TestCase):
             )
         self.assertEqual(out, "reviewed")
         run.assert_called_once()
+
+    def test_default_filled_author_disposition_beside_a_plan_is_ignored(self):
+        """Seen live: a model that fills every schema key sent
+        {"author_disposition": {"disposition": "accepted", "rationale": ""},
+         "items": [], "review_fingerprint": ""} with its FIRST plan and looped on
+        MIXED_ENVELOPE. No fingerprint names no wave, so it carries nothing."""
+        import ouroboros.tools.plan_review as pr
+        from ouroboros.tools.registry import ToolContext
+
+        ctx = ToolContext(repo_dir=pathlib.Path("."), drive_root=pathlib.Path("."))
+        ctx.task_id = "parent"
+        filler = {"author_disposition": {"disposition": "accepted", "rationale": ""},
+                  "items": [], "review_fingerprint": ""}
+        with patch.object(pr, "_run_plan_review_async", return_value="reviewed") as run:
+            out = pr._handle_plan_task(ctx, plan="P", goal="G", spec={}, review_disposition=filler)
+        self.assertEqual(out, "reviewed")
+        run.assert_called_once()
+        # A rationale is a statement; with it the disposition is real: beside a valid plan it is
+        # bound to its wave first, and an empty fingerprint names none.
+        import tempfile
+
+        spoken = {**filler, "author_disposition": {"disposition": "rejected", "rationale": "no"}}
+        with tempfile.TemporaryDirectory() as raw, patch.object(pr, "_run_plan_review_async") as run:
+            ctx = ToolContext(repo_dir=pathlib.Path(raw), drive_root=pathlib.Path(raw))
+            ctx.task_id = "parent"
+            out = pr._handle_plan_task(ctx, plan="P", goal="G", spec={"affected_paths": []}, review_disposition=spoken)
+        self.assertIn("review_fingerprint is required", out)
+        run.assert_not_called()
 
     def test_duplicate_plan_calls_use_existing_sequential_tool_lane(self):
         from ouroboros.loop_tool_execution import tool_calls_can_run_parallel
@@ -828,7 +916,7 @@ class TestPlanRowTypedFacts(unittest.TestCase):
         self.assertEqual(plan_row_typed_facts(row), {
             "failure_code": "subscription_window_exhausted",
             "reset_at": "2030-01-01T00:00:00Z", "http_status": 429,
-            "transport_status": "provider_transport_error",
+            "transport_status": "provider_transport_error", "reported_cause": "",
             "capability_delta": [{"reason": "reduced"}],
         })
 

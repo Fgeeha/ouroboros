@@ -161,8 +161,8 @@ def test_markerless_native_is_user_managed_in_every_runtime_mode(
     )
     assert "BLOCKED" in sidecar_write
     assert "BLOCKED" in sidecar_edit
-    assert "SAFETY_VIOLATION" in sidecar_shell
-    assert "SAFETY_VIOLATION" in existing_sidecar_shell
+    assert "SKILL_PAYLOAD_BLOCKED" in sidecar_shell
+    assert "SKILL_PAYLOAD_BLOCKED" in existing_sidecar_shell
     assert not (user_payload / ".seed-origin").exists()
     assert "real" in (user_payload / ".clawhub.json").read_text(encoding="utf-8")
 
@@ -307,7 +307,7 @@ def test_presence_bucket_ceiling_cannot_be_bypassed_by_native_read_overlay(tmp_p
         TaskConstraint(mode="acting_subagent", surface="external_workspace", write_root="/tmp/acting-native"),
     ],
 )
-def test_repair_and_acting_profiles_cannot_select_native_payload(
+def test_native_payload_reads_follow_parent_while_repair_constraint_stays(
     constraint,
     tmp_path,
 ):
@@ -325,15 +325,17 @@ def test_repair_and_acting_profiles_cannot_select_native_payload(
         )
     ctx = ToolContext(repo_dir=repo, drive_root=data, task_constraint=constraint)
 
-    with pytest.raises(ValueError):
-        build_resolved_resource_binding(
-            ctx,
-            root="skill_payload",
-            operation="read",
-            path="SKILL.md",
-            bucket="native",
-            skill_name="seeded-native",
-        )
+    arguments = dict(root="skill_payload", operation="read", path="SKILL.md",
+                     bucket="native", skill_name="seeded-native")
+    if constraint.mode == "acting_subagent":
+        binding = build_resolved_resource_binding(ctx, **arguments)
+        assert binding.target_path == data / "skills" / "native" / "seeded-native" / "SKILL.md"
+        with pytest.raises(ValueError):
+            build_resolved_resource_binding(ctx, **{**arguments, "operation": "write"})
+    else:
+        with pytest.raises(ValueError):
+            build_resolved_resource_binding(ctx, **arguments)
+
 
 
 @pytest.mark.parametrize("mode", ["advanced", "pro"])

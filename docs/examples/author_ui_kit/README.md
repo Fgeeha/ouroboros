@@ -31,3 +31,21 @@ currently installed styling; retained frames keep their mounted snapshot until
 they are opened again. There is no theme polling or forced remount. A failed kit
 request displays `Controls unavailable` in the application, leaving other widgets
 unaffected. The example's Preview changes local status only and performs no write.
+
+## Appearance boundary
+
+Settings → Appearance controls the host document only. Module and route iframes
+have independent roots: CSS variables and `ouroboros.theme` do not propagate.
+The kit delivers a stylesheet snapshot, not the host's current choice; without
+an author-set `data-theme="light"` it uses that stylesheet's default palette.
+Modules may opt into the host's resolved palette with
+`OuroborosWidget.onTheme(theme => { document.documentElement.dataset.theme = theme; })`.
+Keep the returned unsubscribe in the module disposer. The bridge delivers
+`light` or `dark` without applying styles or forcing a remount; route iframes
+have no bridge. Fetching the kit again alone does not synchronize appearance.
+
+Authors may set their own root's `data-theme`, track their document's media
+query, or keep a fixed palette. Native `Canvas`/`CanvasText` colours follow the
+document's supported `color-scheme`, not necessarily the host's pinned choice or
+the OS. Declare that scheme deliberately if following the OS. The example keeps
+its own native-colour surface readable before kit loading and on kit failure.

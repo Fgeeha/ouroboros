@@ -1,8 +1,9 @@
 """The runtime section's FACT builders: what the host can honestly say it knows.
 
-Extracted whole from ``context.py`` at its module ceiling (v7 leaf) so the four
+Extracted whole from ``context.py`` at its module ceiling (v7 leaf) so the
 facts the runtime section renders keep one home: the project room a task sits in,
-the budget rails it runs under, the toolset a promoted task materialized, and the
+the budget rails it runs under, how the run learns the time (its capture instant
+labels the Recent/Drive snapshots), and the
 configured delegation route with its honestly-labeled historical observations.
 Each returns a plain projection and reads no context state, so nothing here can
 change what the section MEANS — only what it reports. ``context`` re-exports every
@@ -12,13 +13,126 @@ name, so historical imports and monkeypatch targets keep working unchanged.
 from __future__ import annotations
 
 import logging
-import os
 import pathlib
 from typing import Any, Dict, List, Optional
 
 from ouroboros.task_pacing import in_task_cost_ceiling_disclosure as _in_task_cost_ceiling
+from ouroboros.config import runtime_setting
 
 log = logging.getLogger(__name__)
+
+
+def task_schedule_fact(task: Dict[str, Any]) -> Dict[str, Any]:
+    """The admitted occurrence's original clock, even after its row advances.
+
+    Lateness is for the mind to judge. A missing legacy date stays unknown;
+    the schedule's next firing point cannot supply this occurrence's due time.
+    """
+    metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    occurrence = metadata.get("schedule_occurrence")
+    if not isinstance(occurrence, dict):
+        return {}
+    return {"schedule_occurrence": {
+        key: occurrence.get(key) for key in ("schedule_id", "due_at", "claimed_at")
+    }}
+
+
+def task_execution_clock_fact(task: Dict[str, Any], ctx: Any) -> Dict[str, Any]:
+    """Current finite execution-ceiling estimate, not a calendar deadline.
+
+    Quota/budget pauses can move the estimate after this context is assembled;
+    an unknown start or unlimited ceiling yields null instead of a false date.
+    """
+    import datetime
+    import math
+    import time
+    from ouroboros.config import get_task_abs_ceiling_sec
+    from ouroboros.deadline_utils import parse_deadline_ts
+    from ouroboros.model_wait import current_model_wait, execution_elapsed_seconds
+
+    raw = getattr(ctx, "task_started_at", None) or task.get("started_at")
+    try:
+        start = float(raw)
+    except (TypeError, ValueError):
+        parsed = parse_deadline_ts(raw)
+        start = parsed.timestamp() if parsed is not None else 0.0
+    ceiling = get_task_abs_ceiling_sec()
+    started = datetime.datetime.fromtimestamp(start, datetime.timezone.utc).isoformat() if start > 0 and math.isfinite(start) else None
+    projected = None
+    if started and ceiling is not None:
+        now = time.time()
+        owner = current_model_wait()
+        elapsed = (owner.executed_seconds() if owner is not None and owner.task_id == str(task.get("id") or "")
+                   else execution_elapsed_seconds({**task, "started_at": start}, now))
+        projected = datetime.datetime.fromtimestamp(now + max(0.0, ceiling - elapsed),
+                                                    datetime.timezone.utc).isoformat()
+    return {"started_at": started, "absolute_ceiling_at": projected,
+            "absolute_ceiling_at_basis": "current estimate; quota or budget pauses may move it" if projected else "not_set"}
+
+
+def _context_clock_note(task: Dict[str, Any]) -> str:
+    """How this run learns the time: Main gets a clock line per request (``send_clock``)."""
+    from ouroboros.send_clock import main_clock_policy
+
+    meta = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    if task.get("delegation_role") and "delegation_role" not in meta:
+        meta = {**meta, "delegation_role": task.get("delegation_role")}
+    if main_clock_policy(meta, task_type=str(task.get("type") or "")) is None:
+        return ("context_captured_at is when this context was built; it does not advance "
+                "during this run.")
+    return ("context_captured_at is when this context was built, not the current time. "
+            "Each of your model requests ends with a host clock line sampled for that request.")
+
+
+def snapshot_labelled(section: str, captured_at: str) -> str:
+    """Label a captured Recent/Drive section with its capture time, below its heading.
+
+    These sections are rendered once per run and stay byte-stable in the cached
+    prefix; the label says so instead of refreshing them every round.
+    """
+    heading, sep, body = str(section or "").partition("\n")
+    if not heading.startswith(("## Recent ", "## Drive state")) or not captured_at:
+        return section
+    label = (f"_Snapshot captured at {captured_at} when this context was built; "
+             "not refreshed during this run._")
+    return heading + "\n" + label + ((sep + body) if body else "")
+
+
+def _queue_context_fact(task: Dict[str, Any]) -> Dict[str, Any]:
+    """One dated canonical-queue view, frozen with the task's ContextCore."""
+    from ouroboros.config import DATA_DIR, get_max_active_subagents_per_root, get_max_workers
+    from ouroboros.task_status import _load_queue_snapshot, queue_snapshot_observation
+
+    root = pathlib.Path(task.get("budget_drive_root") or DATA_DIR)
+    snapshot = _load_queue_snapshot(root)
+    fact = {**queue_snapshot_observation(snapshot), "source_root": str(root),
+            "max_workers": int(get_max_workers()),
+            "max_active_subagents_per_root": int(get_max_active_subagents_per_root())}
+    if snapshot.get("_snapshot_missing") or snapshot.get("_snapshot_invalid"):
+        return {**fact, "note": "Queue observation unavailable; current capacity is unknown."}
+    for key in ("running", "pending"):
+        rows = snapshot.get(key)
+        fact[key + "_count"] = sum(isinstance(row, dict) for row in rows) if isinstance(rows, list) else None
+    fact["reaping_count"] = snapshot.get("reaping_count")
+    fact["worker_total"] = snapshot.get("worker_total")
+    assignable = snapshot.get("assignable_idle_workers")
+    if assignable is not None:
+        fact["free_worker_slots"] = max(0, int(assignable))
+        fact["free_worker_slots_basis"] = "recorded_assignable_idle_workers"
+    elif fact["running_count"] is not None:
+        fact["free_worker_slots"] = max(0, fact["max_workers"] - fact["running_count"]
+                                          - int(fact["reaping_count"] or 0))
+        fact["free_worker_slots_basis"] = "legacy_estimate_from_configured_limit"
+    else:
+        fact["free_worker_slots"] = None
+        fact["free_worker_slots_basis"] = "unknown"
+    fact["note"] = (
+        "Last recorded queue counts at ts; freshness and age were measured when this context "
+        "was built and do not refresh during the task. Stale or unknown observations do not "
+        "establish current load. Legacy free-slot estimates are not measured capacity. "
+        "Scheduling owns admission; these observations reserve no slots."
+    )
+    return fact
 
 
 def _project_room_fact(task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -94,7 +208,7 @@ def _runtime_budget_info(env: Any, task: Dict[str, Any], ctx: Any = None) -> Dic
         log.error("Budget authority unavailable for runtime context", exc_info=True)
         budget_info = {"status": "unavailable"}
     try:
-        root_cap = float(os.environ.get("OUROBOROS_PER_TASK_COST_USD", "0") or 0)
+        root_cap = float(runtime_setting("OUROBOROS_PER_TASK_COST_USD", "0") or 0)
     except (TypeError, ValueError):
         root_cap = 0.0
     if root_cap > 0:
@@ -109,52 +223,6 @@ def _runtime_budget_info(env: Any, task: Dict[str, Any], ctx: Any = None) -> Dic
     return budget_info
 
 
-def _promoted_task_toolset(env: Any) -> Dict[str, Any]:
-    """The LIVE built-in toolset available to an ordinary promoted task.
-
-    Workspace focus changes the default target, not the top-level principal's
-    tool names. The projection therefore asks the real registry once and keeps
-    credential omissions typed instead of maintaining a second static catalog.
-    Dynamic extension/MCP availability remains task-time state.
-    """
-    from types import SimpleNamespace
-
-    from ouroboros.tools.registry import ToolRegistry, _builtin_tool_availability
-
-    registry = ToolRegistry(pathlib.Path(env.repo_dir), pathlib.Path(getattr(env, "drive_root", ".")))
-
-    probe = SimpleNamespace(
-        task_id="promote_toolset_probe",
-        task_metadata={},
-        task_contract={},
-        task_constraint=None,
-        is_workspace_mode=lambda: False,
-        is_ephemeral_turn=False,
-    )
-    registry.set_context(probe)
-    top_level_tools = set(registry.available_tools())
-    # Typed omissions: registered built-ins that live availability removes right
-    # now (credential gates). Named with their reason so the router can tell
-    # "does not exist" from "exists but currently unavailable".
-    unavailable = {}
-    for name in registry._entries:
-        available, reason, detail = _builtin_tool_availability(name, probe)
-        if not available:
-            unavailable[name] = f"{reason}: {detail}" if detail else reason
-    return {
-        "top_level_tools": sorted(top_level_tools),
-        **({"unavailable_builtin_tools": dict(sorted(unavailable.items()))} if unavailable else {}),
-        "rule": (
-            "LIVE built-in tool availability, evaluated by the real tool "
-            "registry at promote time. Project focus changes the default root, "
-            "not this ordinary top-level toolset. unavailable_builtin_tools "
-            "exist but are currently unusable (e.g. missing credentials) — do "
-            "not demand them. Dynamic extension/MCP tools are NOT listed (their "
-            "availability is unknowable at promote time). If an objective/"
-            "expected_output demands specific BUILT-IN tools, demand only names "
-            "listed here."
-        ),
-    }
 
 
 def _delegation_capability_fact() -> Optional[Dict[str, Any]]:
@@ -170,6 +238,7 @@ def _delegation_capability_fact() -> Optional[Dict[str, Any]]:
     """
     try:
         from ouroboros.reviewer_slot_config import reviewer_slot_last_executions
+        from ouroboros.subagent_history import recorded_handle
         from ouroboros.subagents import subagent_last_delegation
 
         def _observed_label(ts: Any) -> str:
@@ -224,9 +293,20 @@ def _delegation_capability_fact() -> Optional[Dict[str, Any]]:
                 last_fact["requested_profile"] = str(last["requested_profile"])
             if last.get("applied_profile"):
                 last_fact["applied_profile"] = str(last["applied_profile"])
+            # Model-facing actor names are handles computed from each record's
+            # OWN facts; the stored key stays in the durable receipt file.
             if last.get("selected_subagent_id"):
-                last_fact["selected_subagent_id"] = str(last["selected_subagent_id"])
+                last_fact["selected_subagent_id"] = recorded_handle(last)
+            for key in ("outcome", "failure_code", "reset_at", "occurred_at", "observed_at"):
+                if key in last:
+                    last_fact[key] = last[key]
             delegation["subagent_last_delegation"] = last_fact
+            rows = last.get("latest_by_subagent")
+            if isinstance(rows, dict) and rows:
+                delegation["subagents_last_executions"] = [
+                    {**row, "selected_subagent_id": recorded_handle(row)}
+                    for row in rows.values() if isinstance(row, dict)
+                ]
         if len(delegation) == 1:
             return None
         return delegation

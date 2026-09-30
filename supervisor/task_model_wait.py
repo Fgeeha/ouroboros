@@ -30,6 +30,7 @@ def handle_task_model_wait(event: dict, ctx: Any) -> None:
     payload = copy.deepcopy(event)
     row = {key: value for key, value in payload.items()
            if key not in {"type", "ts", "task_id", "quota_clock", "is_progress"}}
+    operation_event = False
     with _queue_lock:
         meta = ctx.RUNNING.get(task_id)
         if isinstance(meta, dict):
@@ -53,22 +54,27 @@ def handle_task_model_wait(event: dict, ctx: Any) -> None:
             from supervisor.workers import direct_chat_turn
 
             if direct_chat_turn(task_id) is None:
-                from supervisor.active_activity import get_direct_activity_registry
+                from ouroboros.post_task_checkpoint import post_task_model_wait
 
-                consciousness = getattr(ctx, "consciousness", None)
-                owner = get_direct_activity_registry().ephemeral_model_wait(ctx.DRIVE_ROOT, task_id)
-                if owner is None and consciousness and task_id == "bg-consciousness":
-                    owner = consciousness.live_model_wait()
-                if owner is None:
-                    from ouroboros.post_task_checkpoint import post_task_model_wait
-                    owner = post_task_model_wait(ctx.DRIVE_ROOT, task_id)
-                if owner is None or payload.get("model_wait_owner_id", "") != owner.owner_id:
+                owner = post_task_model_wait(ctx.DRIVE_ROOT, task_id)
+                if owner is not None and payload.get("model_wait_owner_id", "") == owner.owner_id:
+                    with owner.lock:
+                        current = owner.waits.get(wait_id) or {}
+                        if owner.closed or attempt != owner.attempt or current.get("revision") != revision:
+                            return
+                    payload["chat_id"] = owner.task.get("chat_id")
+                elif isinstance(payload.get("review_operation"), dict):
+                    operation_event = True
+                else:
                     return
-                with owner.lock:
-                    current = owner.waits.get(wait_id) or {}
-                    if owner.closed or attempt != owner.attempt or current.get("revision") != revision:
-                        return
-                payload["chat_id"] = consciousness._owner_chat_id_fn() if task_id == "bg-consciousness" else owner.task.get("chat_id")
+    if operation_event:
+        # The author ended; its paid review operation may still be live. Proven
+        # off the queue lock: it reads the canonical row and the controller process.
+        from ouroboros.review_operation import review_operation_event_admitted
+
+        if not review_operation_event_admitted(ctx.DRIVE_ROOT, payload):
+            return
+        payload["chat_id"] = payload["review_operation"].get("chat_id")
     address_ctx_event(ctx, payload)
     ctx.append_jsonl(ctx.DRIVE_ROOT / "logs" / "progress.jsonl", payload)
     ctx.bridge.push_log(payload)

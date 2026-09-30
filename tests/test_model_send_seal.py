@@ -1,6 +1,6 @@
-"""CPL-5 pins: the ``model-visible ⟺ logged`` invariant at the model_send seam.
+"""Pins the ``model-visible ⟺ logged`` invariant at the model_send seam.
 
-Design contract: ``docs/v7next/DESIGN_MODEL_VISIBLE_LOGGED.md`` (F15-narrowed).
+Design contract: ``docs/MODEL_SEND_OBSERVABILITY.md``.
 Forward — every physical attempt seals its exact send copy before dispatch and
 the seam reconstructs that durable record and byte-compares it ON THE CALL;
 a mismatch is a typed durable fact, never a second dispatch gate. Exclusions
@@ -25,7 +25,10 @@ from ouroboros.llm import LLMClient, _canonical_candidate_bytes
 
 @pytest.fixture
 def data_root(tmp_path, monkeypatch):
+    from tests.fixtures_usage_compaction import age_fixture_clock
+
     root = tmp_path / "data"
+    age_fixture_clock(monkeypatch)  # the fold horizon: fresh rows must still fold here
     monkeypatch.setenv("OUROBOROS_DATA_DIR", str(root))
     monkeypatch.setenv("OUROBOROS_SETTINGS_PATH", str(root / "settings.json"))
     monkeypatch.setenv("TOTAL_BUDGET", "100")
@@ -417,6 +420,51 @@ def test_sweep_flags_a_synthetic_orphan_seal(data_root):
     assert list((data_root / "observability" / "calls" / "task-orphan").glob("*.json"))
 
 
+def test_a_compacted_attempt_is_recorded_history_not_an_orphan_seal(data_root):
+    """Compaction folds a terminal attempt out of the LIVE replay and into an
+    archive segment, on purpose. Asking the live file alone would make every
+    folded attempt a durable orphan_seal fact on the monetary/dispatch
+    invariant, at every startup, for history that is perfectly well recorded
+    (``docs/USAGE_COMPACTION.md`` §10: the verdict consults the
+    union)."""
+    from ouroboros import usage_compaction as uc
+
+    attempt_ids = [_dispatch(data_root, "task-folded-%d" % index)["attempt_id"] for index in range(2)]
+    assert seal_mod.reconcile_model_send_seals(data_root)["orphan_seals"] == 0
+
+    with ua._locked(data_root) as heartbeat:
+        receipt = uc.compact_usage_ledger_locked(data_root, heartbeat=heartbeat)
+    assert receipt is not None and receipt["folded_attempt_count"] == len(attempt_ids)
+    live_ids = {str(row.get("attempt_id")) for row in _rows(data_root)}
+    assert not live_ids & set(attempt_ids), "the fold must remove them from the live replay"
+    assert all(uc.usage_attempt_recorded(data_root, attempt_id) for attempt_id in attempt_ids)
+
+    report = seal_mod.reconcile_model_send_seals(data_root)
+    assert report["seals"] == len(attempt_ids)
+    assert report["orphan_seals"] == 0 and report["facts_written"] == 0
+    assert _violation_files(data_root) == []
+    assert _violation_events(data_root) == []
+
+
+def test_an_unreadable_archive_is_unknown_not_an_orphan_accusation(data_root):
+    """The join's own typed corruption is the sweep's existing UNKNOWN case: a
+    tampered or unreadable segment means the history question has no answer,
+    and no answer may become a durable accusation."""
+    from ouroboros import usage_compaction as uc
+
+    _dispatch(data_root, "task-archive-unknown")
+    with ua._locked(data_root) as heartbeat:
+        assert uc.compact_usage_ledger_locked(data_root, heartbeat=heartbeat) is not None
+    [segment] = (data_root / "archive" / "usage_ledger").glob("*.jsonl")
+    segment.write_text("not a ledger\n", encoding="utf-8")
+    uc._SEGMENT_CACHE.clear()
+    uc._CHAIN_UNION_CACHE.clear()
+
+    report = seal_mod.reconcile_model_send_seals(data_root)
+    assert report["orphan_seals"] == 0 and report["facts_written"] == 0
+    assert _violation_files(data_root) == []
+
+
 def test_sweep_flags_a_dispatched_attempt_whose_seal_vanished(data_root):
     final = _dispatch(data_root, "task-sweep-unlogged")
     pathlib.Path(final["candidate_manifest_ref"]["path"]).unlink()
@@ -505,6 +553,7 @@ def test_sweep_skips_every_conclusion_on_an_unreadable_ledger(data_root):
     (data_root / ua.LEDGER_REL).write_text("not-json\n{}\n", encoding="utf-8")
     report = seal_mod.reconcile_model_send_seals(data_root)
     assert report == {
+        "status": "unknown", "manifests_checked": 0,
         "seals": 0, "sealed_attempts": 0,
         "orphan_seals": 0, "unlogged_attempts": 0,
         "facts_written": 0, "truncated": False,
@@ -522,4 +571,6 @@ def test_sweep_rides_the_startup_family(data_root, monkeypatch):
     )
     # Neighbour sweep steps degrade fail-soft on this synthetic root.
     maintenance._startup_custody_sweep()
-    assert calls == [data_root]
+    # Historical reconciliation moved out of the synchronous custody sweep;
+    # the supervisor launches its session child after readiness.
+    assert calls == []

@@ -13,7 +13,10 @@ import pathlib
 import time
 from typing import Any, Dict
 
+from ouroboros.model_wait import budget_paused_seconds
+from supervisor.events_budget import budget_fence_selected, budget_hold_fact
 from supervisor.queue import _queue_lock
+from supervisor.schedule_occurrence import record_dispatch_possible
 
 
 def _pool():
@@ -31,6 +34,20 @@ def _pool():
 
 
 log = logging.getLogger(__name__)
+
+
+def _direct_actor_still_registered(task_id: str) -> bool:
+    """Whether the in-process direct actor that paused ``task_id`` still holds its
+    registry entry. A parked direct turn releases the entry as its last act; a
+    grant dispatched before that would put a pooled worker beside a live actor
+    under the SAME id (#1196). Unreadable registry state fences (never admits)."""
+    try:
+        from supervisor.active_activity import get_direct_activity_registry
+
+        return get_direct_activity_registry().get(str(task_id or "")) is not None
+    except Exception:
+        log.debug("Direct activity registry unreadable during assignment", exc_info=True)
+        return True
 
 
 def _evolution_assignment_error(task: Dict[str, Any]) -> str:
@@ -89,6 +106,89 @@ def _cancel_unauthorized_evolution(task: Dict[str, Any], reason: str) -> bool:
     return True
 
 
+def _mirror_assigned_running_status(task: Dict[str, Any]) -> None:
+    """Write the durable RUNNING mirror one step before the worker dispatches.
+
+    Assignment is the first host-visible execution fact, and it is one for a ROOT
+    too: both orphan healers key on the STORED status, so a root that exists only
+    in memory and the snapshot is a ghost a stale or absent snapshot leaves
+    forever. Never raises: a task that runs without its mirror is better than an
+    assignment tick that stops."""
+    try:
+        from ouroboros.task_results import STATUS_RUNNING, write_task_result
+        from ouroboros.task_status import execution_owner_record
+
+        task["_execution_owner"] = execution_owner_record(
+            task.get("budget_drive_root") or _pool().DRIVE_ROOT, task, "pooled")
+        if not str(task.get("drive_root") or ""):
+            return  # no fork mirror: the actual native start publishes RUNNING
+        _is_subagent = str(task.get("delegation_role") or "") == "subagent"
+        _mirror = {
+            "execution_owner": task["_execution_owner"], "task_attempt": int(task.get("_attempt") or 0),
+            "root_task_id": task.get("root_task_id"),
+            "session_id": task.get("session_id"),
+            "actor_id": task.get("actor_id"),
+            "project_id": task.get("project_id"),
+            "role": task.get("role"),
+            "description": task.get("description"),
+            "objective": task.get("objective") or task.get("description"),
+        }
+        if _is_subagent:
+            from ouroboros.tools.control_delegation import stamp_task_assignment_depth
+            from ouroboros.config import get_max_subagent_depth
+
+            # Stamp the worker payload and canonical result from one
+            # projection; the achieved depth is a delegation fact.
+            _depth_fields = stamp_task_assignment_depth(
+                task, max_depth=get_max_subagent_depth(),
+            )
+            _mirror.update(
+                parent_task_id=task.get("parent_task_id"),
+                delegation_role=task.get("delegation_role"),
+                expected_output=task.get("expected_output"),
+                constraints=task.get("constraints"),
+                context=task.get("context"),
+                memory_mode=task.get("memory_mode"),
+                drive_root=task.get("drive_root"),
+                child_drive_root=task.get("child_drive_root") or task.get("drive_root"),
+                budget_drive_root=task.get("budget_drive_root"),
+                task_constraint=task.get("task_constraint"),
+                **_depth_fields,
+                # INTENT ONLY. This mirror is written at ASSIGNMENT, one
+                # step before the worker dispatches and resolves the
+                # child; naming `effective_model_lane`/`model` here wrote
+                # whatever the record happened to hold, which on a retry
+                # is the PREVIOUS attempt's resolution and on a fresh
+                # child is nothing at all.
+                model_lane=task.get("model_lane"),
+                requested_model_lane=task.get("requested_model_lane"),
+                parent_model_lane=task.get("parent_model_lane"),
+                requested_executor=task.get("requested_executor"),
+                task_group_id=task.get("task_group_id"),
+                task_group=task.get("task_group"),
+                subagent_envelope=task.get("subagent_envelope"),
+                configured_subagent=task.get("configured_subagent"),
+                parent_cognitive_route=task.get("parent_cognitive_route"),
+                metadata=task.get("metadata") if isinstance(task.get("metadata"), dict) else {},
+            )
+        else:
+            # A root carries neither the delegation identity nor a child
+            # drive. Writing None for what it lacks would ERASE what
+            # admission recorded, because this write MERGES.
+            _mirror["chat_id"] = task.get("chat_id")
+            _mirror = {key: value for key, value in _mirror.items() if value is not None}
+        write_task_result(
+            task.get("budget_drive_root") or _pool().DRIVE_ROOT,
+            str(task.get("id") or ""),
+            STATUS_RUNNING,
+            **_mirror,
+            result=("Subagent assigned to a worker." if _is_subagent
+                    else "Assigned to a worker."),
+        )
+    except Exception:
+        log.debug("Failed to mirror the running assigned status", exc_info=True)
+
+
 def assign_tasks() -> None:
     from supervisor import queue
     from supervisor.state import budget_remaining, EVOLUTION_BUDGET_RESERVE
@@ -118,8 +218,11 @@ def assign_tasks() -> None:
                 "Invalid-depth rows deferred until terminal custody is available; continuing assignment for other tasks: %s",
                 ", ".join(unresolved_invalid_ids),
             )
-        try:
-            remaining = budget_remaining(st, strict=True)
+        try:  # every loop tick: ride the snapshot; a refusal re-reads exactly, reserve_attempt is the gate
+            evolution_queued = any(str(row.get("type") or "") == "evolution" for row in _pool().PENDING)
+            remaining = budget_remaining(  # this tick refuses at zero AND, for evolution, at its reserve
+                st, strict=True, allow_stale=True,
+                refuse_below=EVOLUTION_BUDGET_RESERVE if evolution_queued else 0.0)
         except Exception:
             log.error("Task assignment blocked: monetary authority unavailable")
             return
@@ -130,8 +233,19 @@ def assign_tasks() -> None:
                     continue
                 if isinstance(task.get("_budget_pause"), dict):
                     continue
+                if budget_hold_fact(task) is not None:
+                    continue  # Held, not paused: no second pause row over the hold.
                 if task.get("_owner_wait_resume"):
                     continue  # Restore the checkpoint; the loop still owns its budget stop.
+                if isinstance(task.get("_budget_pause_resume"), dict):
+                    # Money vanished between the grant and this dispatch: the
+                    # single-use grant returns to its exact pause, never to a
+                    # pre-dispatch replay or a terminal.
+                    from supervisor.queue_transitions import revoke_exact_budget_resume
+
+                    revoke_exact_budget_resume(task, "budget_exhausted_before_dispatch")
+                    queue.persist_queue_snapshot(reason="budget_exact_resume_revoked")
+                    continue
                 task_id = str(task.get("id") or "")
                 cost_fields = _pool().reconstruct_task_cost(
                     task_id, fields=True,
@@ -207,7 +321,7 @@ def assign_tasks() -> None:
                         int(st["owner_chat_id"]),
                         "🚫 Model budget reached. Queued tasks are paused before dispatch; "
                         "raising the limit does not resume them automatically.",
-                    )
+                        role="system", system_type="budget_notice")
                 queue.persist_queue_snapshot(reason="budget_paused_before_dispatch")
             if not any(task.get("_owner_wait_resume") for task in _pool().PENDING):
                 return
@@ -229,7 +343,7 @@ def assign_tasks() -> None:
                 except Exception:
                     log.debug("Failed to cancel light-mode evolution task %s", tid, exc_info=True)
             if st.get("owner_chat_id"):
-                _pool().send_with_budget(int(st["owner_chat_id"]), evo_block)
+                _pool().send_with_budget(int(st["owner_chat_id"]), evo_block, role="system", system_type="evolution_notice")
             queue.persist_queue_snapshot(reason="evolution_blocked_light")
 
         from ouroboros.project_lease import candidate_is_leasable, running_project_ids
@@ -246,6 +360,8 @@ def assign_tasks() -> None:
                 # and project-leased candidates)
                 chosen_idx = None
                 for i, candidate in enumerate(_pool().PENDING):
+                    if candidate.get("_owner_hold"):
+                        continue
                     if remaining <= 0 and not candidate.get("_owner_wait_resume"):
                         continue
                     if _pool()._invalid_depth_deferred(candidate, unresolved_invalid_id_set):
@@ -254,8 +370,52 @@ def assign_tasks() -> None:
                         continue
                     if isinstance(candidate.get("_budget_pause"), dict):
                         continue
+                    if budget_hold_fact(candidate) is not None:
+                        # A durable budget hold (#1196): a sibling whose paused
+                        # root's fence was lifted without an explicit selection,
+                        # an unrestorable continuation, or a grant whose
+                        # revocation could not be written. Never assignable
+                        # until the selection is recorded on the row.
+                        continue
+                    if (candidate.get("_is_direct_chat")
+                            and _direct_actor_still_registered(str(candidate.get("id") or ""))):
+                        # The direct actor that parked this id has not released
+                        # its registry entry yet: no second live actor for one id.
+                        continue
                     root_task_id = str(candidate.get("root_task_id") or "").strip()
-                    if root_task_id in queue.BUDGET_ROOT_FENCES and not candidate.get("_owner_wait_resume"):
+                    from supervisor.events_budget import budget_resume_dispatch_allowed
+
+                    if not budget_resume_dispatch_allowed(queue, candidate):
+                        if isinstance(candidate.get("_budget_pause_resume"), dict):
+                            from supervisor.budget_resume import revoke_exact_budget_resume
+
+                            revoke_exact_budget_resume(candidate, "root_resume_generation_stale")
+                        else:
+                            # A zero-dispatch selection whose root grant or fence is
+                            # no longer live returns to an UNSELECTED hold (#1196, Q9):
+                            # the row keeps its hold identity, drops the dead grant
+                            # binding, and the next selection records the live one.
+                            from supervisor.events_budget import (
+                                BUDGET_HOLD_KEY, HOLD_ROOT_FENCE_LIFTED, hold_budget_row,
+                            )
+
+                            stale = candidate.get(BUDGET_HOLD_KEY) or {}
+                            hold_budget_row(
+                                candidate, reason=str(stale.get("reason") or HOLD_ROOT_FENCE_LIFTED),
+                                detail="root_resume_generation_stale",
+                                extra={**{key: stale[key] for key in ("root_task_id", "fence_id")
+                                          if key in stale},
+                                       "stale_root_grant_id": str(stale.get("root_grant_id") or "")},
+                                result_root=pathlib.Path(candidate.get("budget_drive_root") or _pool().DRIVE_ROOT))
+                        queue.persist_queue_snapshot(reason="stale_child_resume_held")
+                        continue
+                    if (root_task_id in queue.BUDGET_ROOT_FENCES
+                            and not candidate.get("_owner_wait_resume")
+                            and not candidate.get("_budget_pause_resume")
+                            # One member explicitly selected against THIS fence
+                            # is admitted; the latch stays up for the rest (Q9).
+                            and not budget_fence_selected(
+                                candidate, queue.BUDGET_ROOT_FENCES.get(root_task_id))):
                         continue
                     if str(candidate.get("type") or "") == "evolution" and remaining < EVOLUTION_BUDGET_RESERVE:
                         continue
@@ -297,69 +457,26 @@ def assign_tasks() -> None:
                     else:
                         _pool().PENDING.insert(chosen_idx, task)
                     continue
-                if str(task.get("delegation_role") or "") == "subagent" and str(task.get("drive_root") or ""):
-                    try:
-                        from ouroboros.task_results import STATUS_RUNNING, write_task_result
-                        from ouroboros.tools.control_delegation import stamp_task_assignment_depth
-                        from ouroboros.config import get_max_subagent_depth
-
-                        # Assignment is the first host-visible execution fact. Stamp
-                        # the worker payload and canonical result from one projection.
-                        _depth_fields = stamp_task_assignment_depth(
-                            task, max_depth=get_max_subagent_depth(),
-                        )
-                        write_task_result(
-                            _pool().DRIVE_ROOT,
-                            str(task.get("id") or ""),
-                            STATUS_RUNNING,
-                            parent_task_id=task.get("parent_task_id"),
-                            root_task_id=task.get("root_task_id"),
-                            session_id=task.get("session_id"),
-                            actor_id=task.get("actor_id"),
-                            delegation_role=task.get("delegation_role"),
-                            project_id=task.get("project_id"),
-                            role=task.get("role"),
-                            description=task.get("description"),
-                            objective=task.get("objective") or task.get("description"),
-                            expected_output=task.get("expected_output"),
-                            constraints=task.get("constraints"),
-                            context=task.get("context"),
-                            memory_mode=task.get("memory_mode"),
-                            drive_root=task.get("drive_root"),
-                            child_drive_root=task.get("child_drive_root") or task.get("drive_root"),
-                            budget_drive_root=task.get("budget_drive_root"),
-                            task_constraint=task.get("task_constraint"),
-                            **_depth_fields,
-                            # INTENT ONLY. This mirror is written at ASSIGNMENT, one
-                            # step before the worker dispatches and resolves the
-                            # child; naming `effective_model_lane`/`model` here wrote
-                            # whatever the record happened to hold, which on a retry
-                            # is the PREVIOUS attempt's resolution and on a fresh
-                            # child is nothing at all.
-                            model_lane=task.get("model_lane"),
-                            requested_model_lane=task.get("requested_model_lane"),
-                            parent_model_lane=task.get("parent_model_lane"),
-                            requested_executor=task.get("requested_executor"),
-                            task_group_id=task.get("task_group_id"),
-                            task_group=task.get("task_group"),
-                            subagent_envelope=task.get("subagent_envelope"),
-                            configured_subagent=task.get("configured_subagent"),
-                            parent_cognitive_route=task.get("parent_cognitive_route"),
-                            metadata=task.get("metadata") if isinstance(task.get("metadata"), dict) else {},
-                            result="Subagent assigned to a worker.",
-                        )
-                    except Exception:
-                        log.debug("Failed to mirror running subagent status", exc_info=True)
+                if not record_dispatch_possible(task):  # its receipt must first say it MAY run (#1315)
+                    _pool().PENDING.insert(chosen_idx, task)
+                    continue
+                _mirror_assigned_running_status(task)
                 w.busy_task_id = task["id"]
                 w.in_q.put(task)
                 now_ts = time.time()
-                resume = task.get("_owner_wait_resume") or {}
+                resume = task.get("_owner_wait_resume") or task.get("_budget_pause_resume") or {}
                 _pool().RUNNING[task["id"]] = {
                     "task": dict(task), "worker_id": w.wid,
                     "started_at": float(resume.get("started_at") or now_ts), "last_heartbeat_at": now_ts,
                     "last_progress_at": now_ts,
                     **({"model_wait_quota_clock": dict(resume["model_wait_quota_clock"])}
                        if resume.get("model_wait_quota_clock") else {}),
+                    # Separate paused-interval carrier (#1196): the original
+                    # started_at is untouched; lifetime rails subtract this. ONE
+                    # reader for either handoff: a budget grant names it
+                    # ``paused_duration_sec``, an owner-wait restart ``budget_paused_sec``.
+                    **({"budget_paused_sec": budget_paused_seconds(resume)}
+                       if budget_paused_seconds(resume) > 0 else {}),
                     "soft_sent": False, "attempt": int(task.get("_attempt") or 1),
                 }
                 task_type = str(task.get("type") or "")
@@ -370,5 +487,5 @@ def assign_tasks() -> None:
                         _pool().send_with_budget(
                             int(st["owner_chat_id"]),
                             f"{emoji} {task_type.capitalize()} task {task['id']} started.",
-                        )
+                            role="system", system_type="task_started")
                 queue.persist_queue_snapshot(reason="assign_task")

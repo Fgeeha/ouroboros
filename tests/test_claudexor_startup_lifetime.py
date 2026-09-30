@@ -243,7 +243,9 @@ def test_peer_stop_works_before_readiness_and_reaps_the_owned_child(startup, mon
     if action == "panic":
         from tests.test_server_control_panic_daemon import _run_panic
         with monkeypatch.context() as patch:
-            assert _run_panic(patch, startup.root, daemon_stop=stop)
+            # Panic no longer invokes the legacy cooperative worker callback;
+            # the real owned daemon + its child must be gone below.
+            _run_panic(patch, startup.root, daemon_stop=stop)
     else:
         assert stop() is True
     assert time.monotonic() - started < 5
@@ -383,7 +385,7 @@ def test_crashed_startup_reports_current_pid_build_and_log_interval(startup):
     elected = _read_json(startup.home / "elected.json")
     assert failed.value.code == "daemon_spawn_failed"
     text = str(failed.value)
-    assert f"spawn_pid={elected['pid']}" in text and "exit_code=7" in text
+    assert f"spawn_pid={elected['pid']}" in text and "poll=7" in text
     assert "version=9.9.9" in text and "build_sha=" + "c" * 40 in text
     assert f"startup log interval={len(old)}.." in text
     assert "old runtime" not in text and str(startup.home / "daemon.log") in text

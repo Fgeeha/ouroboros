@@ -18,7 +18,8 @@ import threading
 from pathlib import Path
 from typing import Any, Dict
 
-from ouroboros.tool_policy import swarm_router_turn
+from ouroboros.runtime_limits import get_promote_confirm_wait_sec
+from ouroboros.tool_capabilities import ROUTING_VERBS
 from ouroboros.tools.registry import ToolContext
 from ouroboros.utils import append_jsonl, utc_now_iso
 
@@ -33,7 +34,7 @@ log = logging.getLogger(__name__)
 _SCHEDULE_EMIT_LOCK = threading.Lock()
 
 
-_PROMOTE_CONFIRM_TIMEOUT_SEC = 15.0
+_PROMOTE_CONFIRM_TIMEOUT_SEC = get_promote_confirm_wait_sec()
 
 
 _PROMOTE_CONFIRM_POLL_SEC = 0.05
@@ -43,7 +44,7 @@ def _emit_control_event(ctx: ToolContext, evt: Dict[str, Any]) -> str:
     """Emit a control event live when possible, preserving legacy fallback."""
     def _mark_typed_routing_action() -> None:
         event_type = str(evt.get("type") or "")
-        if event_type not in {"promote_chat_to_task", "routing_manual_target", "steer_task"}:
+        if not any(event_type in events for events in ROUTING_VERBS.values()):
             return
         # Keep a turn-local fact on the existing ToolContext so finalization can
         # expose the typed action on task_done. The supervisor receipt remains the
@@ -90,6 +91,9 @@ def _emit_control_event(ctx: ToolContext, evt: Dict[str, Any]) -> str:
                     "ts": utc_now_iso(),
                     "type": "promote_chat_to_task_emitted",
                     "task_id": str(evt.get("task_id") or ""),
+                    # The owner message this root came from: without it the durable
+                    # ingress row cannot be joined to the message that caused it.
+                    "client_message_id": str(evt.get("client_message_id") or ""),
                     "routing_token": str(evt.get("routing_token") or ""),
                     "transport_mode": mode,
                     "sender_pid": os.getpid(),
@@ -176,6 +180,59 @@ def _wait_for_routing_annotation(
     )
 
 
+def _record_promotion_admission_stub(ctx: ToolContext, evt: Dict[str, Any], mode: str) -> None:
+    """Make the EMITTED promote durably readable before the wait can time out.
+
+    An admission the supervisor has not confirmed yet left NOTHING to read, so
+    ``get_task_result`` answered "unknown or not yet registered" - which reads as
+    "your promote never happened" and invites the second promote that mints a
+    duplicate root (#1160). The stub is the negative side only: ``emitted`` is not
+    a scheduled status, positive scheduling authority stays with the supervisor's
+    own receipt, and ``create_only`` initializes ABSENCE alone, so a supervisor
+    that already answered keeps its row byte-for-byte. A Presence promote's stub
+    carries the event's host provenance as the would-be root, exactly as the
+    admission writes it, so its own binding can read the pending reconciliation.
+    """
+    from ouroboros.dialogue_provenance import presence_root_carrier
+    from ouroboros.routing_wait import PROMOTION_ADMISSION_EMITTED
+    from ouroboros.task_results import STATUS_REQUESTED, write_task_result
+
+    task_id = str(evt.get("task_id") or "")
+    carrier = presence_root_carrier(evt, task_contract=evt.get("task_contract"))
+    try:
+        write_task_result(
+            _routing_status_root(ctx), task_id, STATUS_REQUESTED,
+            create_only=True, strict_existing_dict=True,
+            project_id=str(evt.get("project_id") or ""),
+            description=str(evt.get("objective") or ""),
+            promotion_admission={
+                "status": PROMOTION_ADMISSION_EMITTED,
+                "routing_token": str(evt.get("routing_token") or ""),
+                "emitted_at": utc_now_iso(),
+                "transport_mode": mode,
+            },
+            **({"metadata": carrier, "source": "presence_promote",
+                "delegation_role": "root", "root_task_id": task_id} if carrier else {}),
+        )
+    except Exception as exc:
+        # The promote itself proceeds; what is lost is the reconciliation read, so
+        # the failure is loud and durable rather than a DEBUG line (BIBLE P1).
+        log.warning("Failed to record the emitted promote admission for %s", task_id, exc_info=True)
+        try:
+            append_jsonl(
+                _routing_status_root(ctx) / "logs" / "supervisor.jsonl",
+                {
+                    "ts": utc_now_iso(),
+                    "type": "promote_admission_stub_failed",
+                    "task_id": task_id,
+                    "routing_token": str(evt.get("routing_token") or ""),
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+            )
+        except Exception:
+            log.debug("Failed to record the admission-stub failure", exc_info=True)
+
+
 def _emit_and_wait_for_routing(
     ctx: ToolContext,
     evt: Dict[str, Any],
@@ -190,23 +247,14 @@ def _emit_and_wait_for_routing(
         }
     timeout = _PROMOTE_CONFIRM_TIMEOUT_SEC if mode == "live" else 0.0
     if str(evt.get("type") or "") == "promote_chat_to_task":
-        try:
-            return mode, _wait_for_promotion_admission(
-                ctx,
-                str(evt.get("task_id") or ""),
-                str(evt.get("routing_token") or ""),
-                client_message_id=str(evt.get("client_message_id") or ""),
-                timeout_sec=timeout,
-            )
-        except Exception as exc:
-            if not swarm_router_turn(ctx):
-                raise
-            log.warning("Routing admission receipt failed after event emission", exc_info=True)
-            return mode, {
-                "status": "unconfirmed",
-                "reason": "admission_confirmation_failed",
-                "detail": type(exc).__name__,
-            }
+        _record_promotion_admission_stub(ctx, evt, mode)
+        return mode, _wait_for_promotion_admission(
+            ctx,
+            str(evt.get("task_id") or ""),
+            str(evt.get("routing_token") or ""),
+            client_message_id=str(evt.get("client_message_id") or ""),
+            timeout_sec=timeout,
+        )
     return mode, _wait_for_routing_annotation(
         ctx,
         str(evt.get("client_message_id") or ""),

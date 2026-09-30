@@ -11,7 +11,11 @@ from ouroboros.gateway.routing_decision import (
     handle_routing_decision,
     parse_routing_decision_id,
 )
-from ouroboros.project_dialogue import append_chat_annotation, chat_annotation_receipt
+from ouroboros.project_dialogue import (
+    append_chat_annotation,
+    build_owner_message_ref,
+    chat_annotation_receipt,
+)
 
 OPTIONS = [
     {"action": "steer_task", "task_id": "t-live", "label": "Fix CI"},
@@ -150,6 +154,9 @@ def test_promote_click_confirms_from_the_admission_record(tmp_path, monkeypatch)
 
     def _supervisor_schedules(evt):
         assert evt["task_id"] == derived_task_id
+        # The owner's click issued this promote: the handler's publication
+        # boundary owns any refusal notice (no model turn narrates it).
+        assert evt["host_initiated"] is True and evt["routed_from_main"] is True
 
         def _mut(current):
             from ouroboros.contracts.schema_versions import SCHEMA_VERSION_KEY
@@ -262,8 +269,10 @@ def test_route_to_project_candidates_reorder_is_host_validated(tmp_path, monkeyp
         {"action": "new_task_in_project", "project_id": "p1", "label": "New in P1"},
     ]
     ctx = types.SimpleNamespace(
-        current_chat_id=1, drive_root=tmp_path,
+        current_chat_id=1, drive_root=tmp_path, is_direct_chat=True,
         task_metadata={"client_message_id": "cm-1",
+                       "origin_message_ref": build_owner_message_ref(
+                           chat_id=1, client_message_id="cm-1", ts="2026-09-24T00:00:00+00:00", text="route me"),
                        "routing_contract": {"manual_options": manual}},
     )
     text = control._route_to_project(
@@ -327,6 +336,9 @@ def test_rejected_dispatch_reopens_the_original_card(tmp_path, monkeypatch):
     status, body = handle_routing_decision(
         tmp_path, request_id="r1", decision_id="routing:cm-1:tok-1", option_index=0)
     assert (status, body["state"]) == (409, "open")
+    # R5/R16: the toast shows the host's sentence for the refused act, not the code.
+    assert body["reason"] == "target_closed"
+    assert body["cause"] == "Not delivered: that task has already finished"
     reopened = chat_annotation_receipt(tmp_path, "cm-1", "tok-1")
     assert reopened["status"] == "needs_manual_target"
     assert [row["action"] for row in reopened["options"]] == [
@@ -470,3 +482,154 @@ def test_compare_and_append_refuses_under_the_lock(tmp_path):
         tmp_path, "cm-1", action="route_decision", status="needs_manual_target",
         routing_token="tok-1",
     )
+
+
+# --- the deciding turn is SHOWN an existing receipt (disclosure, never a gate) ---
+
+def _decision_ctx(tmp_path):
+    import types
+
+    return types.SimpleNamespace(
+        DRIVE_ROOT=tmp_path,
+        PENDING=[],
+        RUNNING={},
+        load_state=lambda: {"owner_id": 1, "owner_chat_id": 1},
+        update_state=lambda fn: fn({"owner_id": 1, "owner_chat_id": 1}),
+    )
+
+
+def test_a_turn_nobody_typed_is_given_the_same_main_lane_facts(tmp_path):
+    """P3c: a consciousness wake-up has no owner message, so nothing used to build its
+    Main manifest and every predecessor it named was refused as not addressable. The
+    same facts now come through ONE seam over the owner path, never a second copy that
+    could drift; only what an owner MESSAGE carries is absent."""
+    from ouroboros.projects_registry import create_project
+    from ouroboros.server_routing_context import _decision_turn_metadata, main_lane_routing_metadata
+
+    create_project(tmp_path, "racer", name="Racer")
+    ctx = _decision_ctx(tmp_path)
+
+    owner = _decision_turn_metadata(ctx, 1, "cm-owner", {})
+    wake = main_lane_routing_metadata(ctx, 1)
+
+    assert wake["main_routing_manifest"] == owner["main_routing_manifest"]
+    assert [row["project_id"] for row in wake["main_routing_manifest"]["projects"]] == ["racer"]
+    assert wake["routing_contract"]["source_lane"] == "main"
+    assert "client_message_id" not in wake
+
+
+def test_decision_turn_is_shown_the_existing_receipt_for_the_same_message(tmp_path):
+    """I7 (owner decision B5=A): one owner message became task c405c824 and was then
+    steered into three more live roots, each paying a review wave, because the
+    deciding turn was never told a receipt already existed. It is a FACT on the
+    contract the turn already receives; the choice stays with the model."""
+    from ouroboros.server_routing_context import _decision_turn_metadata
+
+    append_chat_annotation(
+        tmp_path, "cm-dup", action="promote_chat_to_task", target="c405c824",
+        target_label="MLConf deck", status="dispatched", routing_token="tok-dup",
+    )
+
+    metadata = _decision_turn_metadata(_decision_ctx(tmp_path), 1, "cm-dup", {})
+    receipt = metadata["routing_contract"]["message_routing_receipt"]
+
+    assert receipt["action"] == "promote_chat_to_task"
+    assert receipt["target"] == "c405c824"
+    assert receipt["target_label"] == "MLConf deck"
+    assert receipt["status"] == "dispatched"
+    assert receipt["ts"]
+    # Disclosure only: the model keeps every action it had.
+    assert "promote_chat_to_task" in metadata["routing_contract"]["valid_actions"]
+
+
+def test_decision_turn_without_a_receipt_carries_no_such_key(tmp_path):
+    from ouroboros.server_routing_context import _decision_turn_metadata
+
+    metadata = _decision_turn_metadata(_decision_ctx(tmp_path), 1, "cm-fresh", {})
+
+    assert "message_routing_receipt" not in metadata["routing_contract"]
+
+
+def test_unreadable_annotations_do_not_break_the_decision_turn(tmp_path):
+    from ouroboros.server_routing_context import _decision_turn_metadata
+
+    (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "logs" / "chat_annotations.jsonl").write_text("{ torn", encoding="utf-8")
+
+    metadata = _decision_turn_metadata(_decision_ctx(tmp_path), 1, "cm-dup", {})
+
+    assert "message_routing_receipt" not in metadata["routing_contract"]
+    assert metadata["routing_contract"]["llm_first"] is True
+
+
+def test_decision_turn_reads_every_recorded_act_on_the_same_message_as_facts(tmp_path):
+    """The latest receipt alone hid an earlier act on the same owner message (a promote,
+    then a steer relaying it): each act keeps its own receipt, listed oldest first, and
+    the contract says these are facts, not a ban."""
+    from ouroboros.server_routing_context import _decision_turn_metadata
+
+    append_chat_annotation(tmp_path, "cm-fan", action="promote_chat_to_task", target="root-a",
+                           target_label="Deck", status="dispatched", routing_token="tok-1")
+    append_chat_annotation(tmp_path, "cm-fan", action="steer_task", target="root-b",
+                           target_label="Build", status="delivered", routing_token="tok-2")
+    append_chat_annotation(tmp_path, "cm-other", action="steer_task", target="root-c",
+                           target_label="Else", status="delivered", routing_token="tok-3")
+
+    contract = _decision_turn_metadata(_decision_ctx(tmp_path), 1, "cm-fan", {})["routing_contract"]
+
+    assert contract["message_routing_receipt"]["target"] == "root-b"  # the latest act, as before
+    assert [(act["action"], act["target"], act["status"]) for act in contract["message_routing_acts"]] == [
+        ("promote_chat_to_task", "root-a", "dispatched"), ("steer_task", "root-b", "delivered")]
+    assert "not a ban" in contract["message_routing_acts_note"]
+    assert set(contract["valid_actions"]) >= {"promote_chat_to_task", "steer_task"}
+    single = _decision_turn_metadata(_decision_ctx(tmp_path), 1, "cm-other", {})["routing_contract"]
+    assert "message_routing_acts" not in single and single["message_routing_receipt"]["target"] == "root-c"
+
+
+def _boundary(tmp_path, metadata, messages, *, delivery=None):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(tools=SimpleNamespace(_ctx=SimpleNamespace(
+        task_metadata=metadata, last_owner_delivery=delivery)), messages=messages, drive_root=tmp_path)
+
+
+def test_routing_acts_taken_during_the_turn_reach_its_next_model_boundary_as_append_only_facts(tmp_path):
+    """The decision metadata is captured once, at start; an act recorded since — the turn's own
+    steer, a status the rail later wrote — is read from the same receipts at the next boundary
+    and appended once, never rewritten, never phrased as a ban. Acts with no link to the
+    message are named as not listed, not inferred."""
+    from ouroboros.loop_model_call import ROUTING_RECEIPTS_HEADER, _append_routing_receipts
+    from ouroboros.server_routing_context import _decision_turn_metadata
+
+    append_chat_annotation(tmp_path, "cm-1", action="promote_chat_to_task", target="root-a",
+                           target_label="Deck", status="dispatched", routing_token="tok-1")
+    metadata = _decision_turn_metadata(_decision_ctx(tmp_path), 1, "cm-1", {})
+    messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "owner text"}]
+    ctx = _boundary(tmp_path, metadata, messages)
+    assert _append_routing_receipts(ctx) is False  # the startup receipt already said exactly this
+    append_chat_annotation(tmp_path, "cm-1", action="steer_task", target="root-b", target_label="Build",
+                           status="delivered", routing_token="tok-2")
+    append_chat_annotation(tmp_path, "agent-steer:tok-9", action="steer_task", target="root-c",
+                           status="delivered", routing_token="tok-9")
+    before = [dict(message) for message in messages]
+    assert _append_routing_receipts(ctx) is True
+    assert messages[:2] == before and len(messages) == 3
+    note = messages[-1]["content"]
+    assert note.startswith(ROUTING_RECEIPTS_HEADER) and "facts, not a ban" in note
+    acts = [line for line in note.splitlines() if line.startswith("- ")]
+    assert [line.split(":", 1)[0] for line in acts] == [
+        "- promote_chat_to_task → Deck (root-a)", "- steer_task → Build (root-b)"]
+    assert "root-c" not in note and "Not listed: an act recorded under its own agent-steer id" in note
+    assert _append_routing_receipts(ctx) is False  # unchanged receipts: no second row
+    # The rail later records the promote's outcome: a new row; the sent one stays as it was.
+    append_chat_annotation(tmp_path, "cm-1", action="promote_chat_to_task", target="root-a",
+                           target_label="Deck", status="scheduled", routing_token="tok-1")
+    assert _append_routing_receipts(ctx) is True and messages[2]["content"] == note
+    assert "scheduled" in messages[3]["content"] and "dispatched" not in messages[3]["content"]
+    # An owner message relayed into the turn mid-run brings its own receipts.
+    append_chat_annotation(tmp_path, "cm-2", action="steer_task", target="root-d", status="delivered",
+                           routing_token="tok-4")
+    relayed = _boundary(tmp_path, metadata, messages, delivery={"client_message_id": "cm-2"})
+    assert _append_routing_receipts(relayed) is True and "root-d" in messages[-1]["content"]
+    child = _boundary(tmp_path, {**metadata, "delegation_role": "subagent"}, [])
+    assert _append_routing_receipts(child) is False

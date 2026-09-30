@@ -64,7 +64,6 @@ def test_browser_tools_launch_real_chromium(tmp_path, static_page_url, monkeypat
     assert "origin_not_granted" in _browse_page(subagent_ctx, url="http://10.0.0.1")
     assert "BROWSER_LOCAL_READONLY_BLOCKED" in _browse_page(subagent_ctx, url="http://169.254.1.1")
     assert "BROWSER_LOCAL_READONLY_BLOCKED" in _browse_page(subagent_ctx, url="http://[::]/")
-    assert "BROWSER_LOCAL_READONLY_BLOCKED" in _browse_page(subagent_ctx, url=f"file://{tmp_path / 'settings.json'}")
     assert "BROWSER_LOCAL_READONLY_BLOCKED" in _browser_action(subagent_ctx, action="evaluate", value="1 + 1")
 
     install_flags = []
@@ -107,6 +106,16 @@ def test_browser_tools_launch_real_chromium(tmp_path, static_page_url, monkeypat
             pytest.skip(screenshot)
         raw = base64.b64decode(ctx.browser_state.last_screenshot_b64 or "")
         assert raw.startswith(b"\x89PNG\r\n\x1a\n")
+        cleanup_browser(ctx)  # Independent Sync API contexts cannot nest on one thread.
+        local = tmp_path / "outside-start" / "index.html"
+        local.parent.mkdir()
+        local.write_text("<h1>Parent-readable local artifact</h1>", encoding="utf-8")
+        try:
+            assert "Parent-readable local artifact" in _browse_page(subagent_ctx, url=local.as_uri())
+            assert "BROWSER_LOCAL_READONLY_BLOCKED" in _browser_action(subagent_ctx, action="evaluate", value="1 + 1")
+        finally:
+            cleanup_browser(subagent_ctx)
+
     finally:
         cleanup_browser(ctx)
 

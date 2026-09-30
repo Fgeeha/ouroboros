@@ -2,13 +2,11 @@
 
 The live-task census the restart drain consults, the teardown arguments that
 finalize interrupted tasks with an honest reason, the managed-update guard on
-preserving queued work, the checkout/update serialization gate, the owned-work
-stop of the owner's manual Restart, the planned restart's engine-pin daemon stop,
-and the event bus shutdown. The restart
-transaction itself — the deferred drain record and the performer that raises
-the exit signal — stays in ``server.py`` for now: the upstream delegation
-train coupled it to the composition root through the planned-handoff
-transaction id (see docs/v7next/LEDGER_CORRECTIONS.md, D11).
+preserving queued work, the checkout/update serialization gate, the owner's manual
+Restart operation, the planned restart's engine-pin daemon stop,
+and the event bus shutdown live here. The planned restart transaction itself stays in
+``server.py``: its planned-handoff transaction id joins the deferred drain record
+to the performer that raises the exit signal.
 """
 
 from __future__ import annotations
@@ -17,7 +15,62 @@ import pathlib
 import time
 from typing import Any
 
-from ouroboros.server_process import DATA_DIR, _owner_restart_requested, _restart_requested, log
+from ouroboros.server_process import (
+    DATA_DIR, _owner_restart_requested, _request_restart_exit, _restart_requested, log,
+)
+
+_RESTARTABLE_UPDATE_PHASES = frozenset({"pending_boot_smoke", "applying_replace"})
+
+
+def _perform_owner_restart(ctx: Any, reply=None) -> tuple[bool, str]:
+    """Run the owner restart operation with an optional transport notice."""
+    ok, restart_msg = _safe_restart_serialized(
+        ctx.safe_restart,
+        reason="owner_restart",
+        unsynced_policy="rescue_and_reset",
+    )
+    if not ok:
+        return False, restart_msg
+    state_dir = DATA_DIR / "state"
+    owner_restart_flag = state_dir / "owner_restart_no_resume.flag"
+    stable_skip_flag = state_dir / "panic_stop.flag"
+    # A Panic flag still owed its durable disabled controls (#1307) is never replaced
+    # or removed here: boot consumes it only after those controls are saved.
+    try:
+        panic_kept = stable_skip_flag.read_text(encoding="utf-8").strip() != "owner_restart_no_resume"
+    except FileNotFoundError:
+        panic_kept = False
+    except Exception:
+        panic_kept = True  # unreadable: unknown, so kept
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        owner_restart_flag.write_text("owner_restart", encoding="utf-8")
+        if not panic_kept:
+            # Pair owner flag with panic_stop for stable-build auto-resume compatibility.
+            stable_skip_flag.write_text("owner_restart_no_resume", encoding="utf-8")
+    except Exception:
+        owner_restart_flag.unlink(missing_ok=True)
+        if not panic_kept:
+            stable_skip_flag.unlink(missing_ok=True)
+        log.warning("Failed to write owner restart no-resume flag", exc_info=True)
+        return False, "could not write restart state."
+    # Everything reversible is behind us (checkout landed, no-resume
+    # intent durable): from here the restart always follows, and every
+    # unconfirmed stop is a critical diagnostic, never a deferral.
+    stopped_task_ids = _stop_owned_work(ctx)
+    try:
+        if reply is not None:
+            # Say only what happened: with nothing owned the stop sentence
+            # named a task that was never running.
+            reply(
+                "Stopping active task. New settings apply to the next message."
+                if stopped_task_ids else "New settings apply to the next message.",
+                "",
+            )
+    except Exception:
+        log.warning("Failed to send owner restart stop notice; continuing restart", exc_info=True)
+    _request_restart_exit(owner=True)
+    return True, ""
 
 
 def _owned_live_task_ids(ctx: Any) -> list:
@@ -34,7 +87,7 @@ def _owned_live_task_ids(ctx: Any) -> list:
     return [tid for tid in dict.fromkeys(task_ids) if tid]
 
 
-def _stop_owned_work(ctx: Any) -> None:
+def _stop_owned_work(ctx: Any) -> list:
     """The owner's manual Restart: stop what this generation owns, then let it re-exec.
 
     Runs AFTER the checkout gate and the durable no-resume flags, so nothing
@@ -47,12 +100,17 @@ def _stop_owned_work(ctx: Any) -> None:
     attested owned-daemon stop exactly as Panic makes it. Between the cancel
     intents and that stop nothing may call ``ensure_owned_gateway`` — it would
     start a dead daemon — which is what the two flags above guarantee.
+
+    Returns the owned live task ids it addressed — captured ONCE, before the
+    stop makes them unreadable — so the caller can tell the owner what was
+    stopped instead of claiming a task was stopped when nothing was running.
     """
     from ouroboros.cancel_intents import request_cancel
     from ouroboros.claudexor_daemon import read_owned_gateway
     from ouroboros.delegate_custody import reconcile_orphaned_runs
 
-    for task_id in _owned_live_task_ids(ctx):
+    stopped = _owned_live_task_ids(ctx)
+    for task_id in stopped:
         try:
             request_cancel(DATA_DIR, task_id, reason="Owner restart", source="owner_restart",
                            requested_by="owner", requested_stop_policy="immediate",
@@ -78,6 +136,7 @@ def _stop_owned_work(ctx: Any) -> None:
         log.warning("Owner restart: delegated-run cancellation did not complete; custody retained",
                     exc_info=True)
     _stop_owned_daemon("Owner restart")
+    return stopped
 
 
 def _stop_owned_daemon(label: str) -> None:
@@ -225,8 +284,7 @@ def _safe_restart_serialized(safe_restart_fn, *, reason: str, unsynced_policy: s
                 "An update intent marker with no update transaction could not be removed; "
                 "restart was deferred rather than applying an orphaned update."
             )
-        allowed_phases = {"pending_boot_smoke", "applying_replace"}
-        if status == "valid" and str(tx.get("phase") or "") not in allowed_phases:
+        if status == "valid" and str(tx.get("phase") or "") not in _RESTARTABLE_UPDATE_PHASES:
             return False, "Managed update merge is still being resolved; restart was deferred."
         return safe_restart_fn(reason=reason, unsynced_policy=unsynced_policy)
     finally:

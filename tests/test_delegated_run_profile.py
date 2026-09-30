@@ -55,6 +55,81 @@ def test_a_read_only_child_uses_the_same_transport_with_a_narrower_profile(tmp_p
     assert payload["access"] == "readonly"
 
 
+@pytest.mark.parametrize("named_default", [
+    {"directory_strategy": "direct"},
+    {"scope_paths": []},
+    {"directory_strategy": "direct", "scope_paths": []},
+])
+def test_naming_the_documented_default_starts_exactly_like_omitting_it(
+    tmp_path, monkeypatch, named_default,
+):
+    """#882: `direct` IS what omission means, and `[]` selects nothing.
+
+    A read-only child never opens an ordinary-folder session, so neither argument
+    can change its run — yet the presence test they used to meet refused the start
+    before any POST, and the startup receipt forbade the child any other substrate.
+    The first real use of the parameter (a read-only auditor naming the documented
+    default) died unrun and still cost two paid rounds. Naming a default is not a
+    different request.
+    """
+    roots = [tmp_path / "omit", tmp_path / "named"]
+    for root in roots:
+        root.mkdir()
+    omitted, _ = _started_request(roots[0], acting=False, monkeypatch=monkeypatch)
+    explicit, payload = _started_request(
+        roots[1], acting=False, monkeypatch=monkeypatch, start_kwargs=named_default)
+    assert "execution" not in explicit
+    assert payload["access"] == "readonly"
+    assert {key: value for key, value in explicit.items() if key != "scope"} == {
+        key: value for key, value in omitted.items() if key != "scope"}
+
+
+@pytest.mark.parametrize("geometry", [
+    {"scope_paths": ["src"]},
+    {"directory_strategy": "direct", "scope_paths": ["src"]},
+    {"directory_strategy": "copy", "scope_paths": ["."]},
+])
+def test_real_geometry_on_a_read_only_child_refuses_before_the_daemon(
+    tmp_path, monkeypatch, geometry,
+):
+    """A REAL geometry request still refuses — typed, unrun, and repairable.
+
+    `copy` or a selected footprint asks for something a read-only child cannot do,
+    so the refusal stands. What it must carry: `definitely_unrun` (the host provably
+    started nothing, so the child ends at $0 instead of waking the model with a fault
+    it cannot act on), a durable start-blocked row (the child's own evidence used to
+    read "delegate_start never attempted" over a call the registry saw), and a repair
+    the parent can apply — omit the arguments — rather than "an ordinary writable
+    folder", which sends an auditor looking for a mutating session it never needed.
+    """
+    from ouroboros import delegate_custody as custody
+    from ouroboros.delegate_evidence import START_BLOCKED
+    from ouroboros.gateways import claudexor as _gw
+    from ouroboros.tools import delegate
+
+    reached = []
+
+    class _NeverReached:
+        def handshake(self, **_kw): reached.append("handshake"); return {}
+        def close(self): pass
+
+    monkeypatch.setattr(_gw, "ClaudexorGateway", lambda *a, **k: _NeverReached())
+    monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "some-route=weak-model:low")
+    ctx = _delegating_ctx(tmp_path, acting=False, task_id="t-geometry")
+    refused = json.loads(delegate._delegate_start(ctx, "audit the folder", **geometry).text)
+    assert refused["status"] == "refused"
+    assert refused["reason"] == "directory_execution_unavailable"
+    assert refused["definitely_unrun"] is True
+    assert "omit directory_strategy and scope_paths" in refused["detail"]
+    assert reached == [], "an argument refusal never reaches the daemon"
+    custody._CUSTODY.clear()
+    rows = [json.loads(line) for line in
+            custody.event_log_path(tmp_path).read_text(encoding="utf-8").splitlines()]
+    blocked = [row for row in rows if row.get("type") == START_BLOCKED]
+    assert [row["reason"] for row in blocked] == ["directory_execution_unavailable"]
+    assert blocked[0]["task_id"] == "t-geometry"
+
+
 def test_the_host_states_its_prohibitions_on_every_delegated_run(tmp_path, monkeypatch):
     request, _ = _started_request(tmp_path, acting=True, monkeypatch=monkeypatch)
     instructions = request["instructions"].lower()
@@ -67,13 +142,17 @@ def test_the_model_has_no_argument_that_could_widen_the_profile():
     entry = next(e for e in delegate.get_tools() if e.name == "delegate_start")
     properties = set(entry.schema["parameters"]["properties"])
     # `retry_of` names an INVOCATION, not authority (ownership-checked replay);
-    # root/bucket/skill_name are a SELECTOR resolved through the same
-    # ResolvedResourceBinding authorizer as ordinary writes (R1 item 9).
+    # `continue_from` names this task's OWN settled run (custody-checked, same
+    # executor and authority, #1196); root/bucket/skill_name are a SELECTOR
+    # resolved through the same ResolvedResourceBinding authorizer as ordinary
+    # writes (R1 item 9).
     assert properties == {
-        "prompt", "subagent_id", "max_seconds", "retry_of", "root", "bucket", "skill_name",
+        "prompt", "subagent_id", "max_seconds", "retry_of", "continue_from", "root", "bucket",
+        "skill_name", "directory_strategy", "scope_paths", "access",
     }
-    assert entry.schema["parameters"]["properties"]["root"]["enum"] == ["skill_payload"]
-    assert not properties & {"access", "mode", "isolation", "scope", "write_surface", "cwd"}
+    assert entry.schema["parameters"]["properties"]["root"]["enum"] == ["active_workspace", "skill_payload"]
+    assert entry.schema["parameters"]["properties"]["access"]["enum"] == ["readonly", "workspace_write"]
+    assert not properties & {"mode", "isolation", "scope", "write_surface", "cwd"}
 
 
 def test_a_read_only_task_cannot_obtain_workspace_write(tmp_path):
@@ -224,7 +303,7 @@ def test_a_mutating_run_requires_an_ACTIVE_workspace_not_merely_agreement(tmp_pa
     ctx.workspace_mode = ""
     record, refusal = _mutation_authority(
         ctx, delegated_run_shape(True))
-    assert refusal and "workspace_not_active" in refusal, refusal
+    assert refusal and "workspace_not_active" in refusal.text, refusal
     assert record == {}
 
 
@@ -285,7 +364,8 @@ def test_a_delegated_run_can_only_be_touched_by_the_task_that_started_it(tmp_pat
 
     for tool, call in (
         ("delegate_wait", lambda ctx, rid: delegate._delegate_wait(ctx, rid, wait_sec=1)),
-        ("delegate_cancel", lambda ctx, rid: delegate._delegate_cancel(ctx, rid, reason="x")),
+        # delegate_wait is the tick contract (str); cancel answers natively.
+        ("delegate_cancel", lambda ctx, rid: delegate._delegate_cancel(ctx, rid, reason="x").text),
     ):
         # A run with NO durable start record anywhere: ownership is UNKNOWN, which is a
         # different fact from "demonstrably someone else's" and is refused on its own name.
@@ -352,7 +432,7 @@ def test_a_mutating_run_is_refused_when_the_root_and_the_granted_write_root_disa
     ctx.workspace_root = str(inside_the_drive)
     ctx.workspace_mode = "self_worktree"
 
-    out = json.loads(delegate._delegate_start(ctx, "edit the README"))
+    out = json.loads(delegate._delegate_start(ctx, "edit the README").text)
     assert out["status"] == "refused", out
     # A worktree overlapping the data drive is refused as "not an active workspace" —
     # `workspace_mode_block_reason` fires first and is the stronger statement.
@@ -361,7 +441,7 @@ def test_a_mutating_run_is_refused_when_the_root_and_the_granted_write_root_disa
     # And a mutating child whose constraint granted no write_root at all is refused too,
     # rather than the host picking a directory on its behalf.
     ctx.task_constraint = TaskConstraint(mode="acting_subagent", surface="self_worktree")
-    out = json.loads(delegate._delegate_start(ctx, "edit the README"))
+    out = json.loads(delegate._delegate_start(ctx, "edit the README").text)
     assert out["status"] == "refused", out
     assert out["reason"] in ("write_root_missing", "workspace_not_active"), out
 
@@ -378,11 +458,11 @@ def test_the_guards_that_protect_a_delegated_run_fail_closed(tmp_path, monkeypat
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
     ctx.task_id = "t-a"
     ctx.task_metadata = {"root_task_id": "t-a"}
-    assert json.loads(delegate._delegate_cancel(ctx, "run-x"))["reason"] == "run_not_owned"
+    assert json.loads(delegate._delegate_cancel(ctx, "run-x").text)["reason"] == "run_not_owned"
     ctx.task_id = ""
     delegate._CUSTODY["run-x"] = delegate._RunCustody(
         task_id="t-a", route_id="r", model="m", project_id="p", project_owned=False)
-    assert json.loads(delegate._delegate_cancel(ctx, "run-x"))["reason"] == "run_not_owned"
+    assert json.loads(delegate._delegate_cancel(ctx, "run-x").text)["reason"] == "run_not_owned"
     delegate._CUSTODY.clear()
 
     # 2. A run with no knowable deadline gets a conservative cap, never an omitted one:
@@ -390,26 +470,35 @@ def test_the_guards_that_protect_a_delegated_run_fail_closed(tmp_path, monkeypat
     bare = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
     bare.task_id = "t-a"
     bare.task_metadata = {"root_task_id": "t-a"}          # no deadline_at at all
-    # The cap is the EXISTING task ceiling SSOT, not a second hardcoded one: a 1h guess
-    # would have truncated a headless/benchmark run that legitimately has no deadline.
-    from ouroboros.config import get_task_abs_ceiling_sec
+    # The cap is the EXISTING operation-window SSOT, not a second hardcoded one: a 1h guess
+    # would have truncated a headless/benchmark run that legitimately has no deadline. A
+    # task without a lifetime bound (the shipped default) still sends a FINITE cap.
+    from ouroboros.config import OPERATION_WINDOW_FALLBACK_SEC, get_task_abs_ceiling_sec
 
-    assert delegate._bounded_max_seconds(bare, None) == int(get_task_abs_ceiling_sec())
+    assert get_task_abs_ceiling_sec() is None
+
+    def _seconds(context, requested):
+        return delegate.bounded_max_seconds(context, requested).seconds
+
+    assert _seconds(bare, None) == OPERATION_WINDOW_FALLBACK_SEC
+    # A finite configured lifetime is the window itself.
+    monkeypatch.setenv("OUROBOROS_TASK_ABS_CEILING_SEC", "7200")
+    assert _seconds(bare, None) == 7200
 
     # ...but never past Claudexor's own schema bound. The task ceiling clamps only from
     # BELOW, so an owner who raises it past a week would make every deadline-less start
     # send an out-of-schema value and get a 400 instead of a run.
     monkeypatch.setenv("OUROBOROS_TASK_ABS_CEILING_SEC", "1000000")
-    assert delegate._bounded_max_seconds(bare, None) == delegate._CLAUDEXOR_MAX_SECONDS
+    assert _seconds(bare, None) == delegate._CLAUDEXOR_MAX_SECONDS
 
     # ...and an EXPLICIT ask is clamped by the same bound. `max_seconds` is a
     # model-supplied tool argument with no maximum in its schema, so clamping only the
     # fallback branch left the ask itself able to sail past it — the same defect, one
     # branch over from the one that was fixed.
-    assert delegate._bounded_max_seconds(bare, 1_000_000) == delegate._CLAUDEXOR_MAX_SECONDS
-    assert delegate._bounded_max_seconds(bare, 120) == 120
+    assert _seconds(bare, 1_000_000) == delegate._CLAUDEXOR_MAX_SECONDS
+    assert _seconds(bare, 120) == 120
     # An explicit narrower ask still wins — the cap is a floor for the unknown case only.
-    assert delegate._bounded_max_seconds(bare, 120) == 120
+    assert _seconds(bare, 120) == 120
 
     # 3. P34P1.8: an EXPIRED deadline is NOT the same fact as having none.
     #    `deadline_remaining_sec` answers 0.0 for both, so the fallback above handed an
@@ -430,7 +519,7 @@ def test_the_guards_that_protect_a_delegated_run_fail_closed(tmp_path, monkeypat
                           "deadline_at": (utc_now() + datetime.timedelta(hours=1)).isoformat()}
     assert delegate.deadline_expired(live) is False
     # ...and the live deadline still NARROWS the bound, as it always did.
-    assert 0 < delegate._bounded_max_seconds(live, None) <= 3600
+    assert 0 < _seconds(live, None) <= 3600
 
     # The refusal is at the START, before the daemon is touched: nothing spent, nothing
     # registered, and the reason names the honest next move.
@@ -444,7 +533,7 @@ def test_the_guards_that_protect_a_delegated_run_fail_closed(tmp_path, monkeypat
     from ouroboros.gateways import claudexor as _gw
 
     monkeypatch.setattr(_gw, "ClaudexorGateway", lambda *a, **k: _NeverReached())
-    refused = json.loads(delegate._delegate_start(expired, "start something new"))
+    refused = json.loads(delegate._delegate_start(expired, "start something new").text)
     assert refused["status"] == "refused" and refused["reason"] == "task_deadline_expired"
     assert refused["definitely_unrun"] is True
     assert reached == [], "expired nanny never reaches daemon"
@@ -487,7 +576,7 @@ def test_an_unresolvable_write_root_is_a_typed_refusal_not_a_traceback(tmp_path)
     ctx.workspace_mode = "self_worktree"
     record, refusal = _mutation_authority(
         ctx, delegated_run_shape(True))
-    assert refusal and "write_root_mismatch" in refusal, refusal
+    assert refusal and "write_root_mismatch" in refusal.text, refusal
     assert record == {}
 
 
@@ -523,5 +612,5 @@ def test_an_inactive_workspace_is_refused_even_when_the_root_is_set(tmp_path):
     record, refusal = _mutation_authority(
         ctx, delegated_run_shape(True))
     assert refusal, "an inactive workspace must be refused"
-    assert "workspace_not_active" in refusal, refusal
+    assert "workspace_not_active" in refusal.text, refusal
     assert record == {}

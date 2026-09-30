@@ -1,9 +1,8 @@
-"""CPL-5: the runtime invariant ``model-visible ⟺ logged`` for ``model_send``.
+"""The runtime invariant ``model-visible ⟺ logged`` for ``model_send``.
 
 The invariant binds exactly one object — the physical candidate payload at the
 last host-controlled pre-transport seam (``llm_attempt._candidate_before_dispatch``)
-— per the design note ``docs/v7next/DESIGN_MODEL_VISIBLE_LOGGED.md`` (narrowed
-per roast finding F15):
+— per the design note ``docs/MODEL_SEND_OBSERVABILITY.md``:
 
 - **Forward** (``sent ⟹ logged``): every physical attempt persists a sealed
   durable record of its exact send copy before dispatch (the ``model_send_seal``
@@ -63,7 +62,7 @@ EXCLUSION_CLASSES = frozenset({
 # Lane-level disclosed limit for delegated/harness model calls (agent_session
 # executor lanes): the host never holds the final wire bytes there, so their
 # accounting rows carry this marker instead of a fabricated seal (same honesty
-# pattern as the scope session's ``host_file_read_attestation: unobserved``).
+# pattern as the scope brief's ``read_provenance_expected`` fact).
 MODEL_SEND_SEAL_UNOBSERVED = "unobserved"
 
 VIOLATION_EVENT_TYPE = "model_send_invariant_violation"
@@ -131,13 +130,12 @@ def persist_physical_candidate(
     ``persist_call`` refs describe the redacted-by-default CAS blob; the two
     digest domains are deliberately labelled rather than equated.
 
-    The manifest carries the CPL-5 ``model_send_seal`` block (additive key under
+    The manifest carries the ``model_send_seal`` block (additive key under
     the existing SCHEMA_VERSION object; readers ignore unknown keys), and the
     returned ``manifest_ref`` is stamped ``model_send_seal_version`` so the
     accounting row it lands on names its attempt as seam-sealed — the join key
-    the reverse reconciliation sweep enforces. (Moved here whole from
-    ``observability.py`` at its module-size ceiling; that module keeps the
-    historical compatibility name.)
+    the reverse reconciliation sweep enforces. ``observability.py`` keeps the
+    compatibility export so existing callers use this same implementation.
     """
     from ouroboros.anthropic_native_custody import physical_custody_projection
     from ouroboros.observability import persist_call
@@ -443,24 +441,32 @@ def reconcile_model_send_seals(
     THROUGH THE SEALING SEAM (its ledger ``candidate_manifest_ref`` carries
     ``model_send_seal_version``) must still resolve to its durable seal. An
     orphan on either side is a typed durable fact — the sweep deletes no seals
-    and fabricates no attempts. Fail-soft: an unreadable ledger is UNKNOWN
-    accounting state and skips every conclusion. Manifests promoted from a
+    and fabricates no attempts. "No attempt row" is asked of the live replay
+    UNION the compaction archive, never of the live file alone, because a
+    folded attempt is absent from it by design. Fail-soft: an unreadable
+    ledger is UNKNOWN accounting state and skips every conclusion, and so is
+    an archive that cannot be read. Manifests promoted from a
     child drive (``promoted_call_manifest``) are excluded — their attempt rows
     legitimately live in the child's ledger, not this one.
     """
     report: Dict[str, Any] = {
+        "status": "completed", "manifests_checked": 0,
         "seals": 0, "sealed_attempts": 0,
         "orphan_seals": 0, "unlogged_attempts": 0,
         "facts_written": 0, "truncated": False,
     }
     try:
         root = pathlib.Path(drive_root)
-        from ouroboros.usage_ledger import _final_rows, _locked, _read_records_locked
+        from ouroboros.usage_accounting import read_usage_records
 
-        with _locked(root):
-            finals = _final_rows(_read_records_locked(root))
+        # Reservation precedes seal persistence. Select this pass's manifests
+        # before its live snapshot so a newly created seal cannot be mistaken
+        # for an orphan merely because its reservation arrived after the read.
+        manifest_paths = _seal_manifest_paths(root, max_manifests)
+        finals = {str(row["attempt_id"]): row for row in read_usage_records(root, final_only=True)}
     except Exception:
         log.debug("model_send reconciliation skipped: ledger state unknown", exc_info=True)
+        report["status"] = "unknown"
         return report
 
     def _write(fact: Dict[str, Any]) -> None:
@@ -472,11 +478,13 @@ def reconcile_model_send_seals(
                 report["facts_written"] += 1
         except Exception:
             log.debug("model_send reconciliation fact write failed", exc_info=True)
+            report["status"] = "unknown"
 
     try:
-        _reconcile_seal_directions(root, finals, _write, report, max_manifests)
+        _reconcile_seal_directions(root, finals, _write, report, manifest_paths)
     except Exception:
         log.debug("model_send reconciliation failed soft", exc_info=True)
+        report["status"] = "unknown"
     return report
 
 
@@ -485,12 +493,39 @@ def _reconcile_seal_directions(
     finals: Dict[str, Dict[str, Any]],
     _write: Any,
     report: Dict[str, Any],
-    max_manifests: int,
+    manifest_paths: List[pathlib.Path],
 ) -> None:
-    for manifest_path in _seal_manifest_paths(root, max_manifests):
+    live_ids = set(finals)
+    archive_loaded = False
+    archived_ids: Optional[frozenset] = None
+
+    def _attempt_row_exists(attempt_id: str) -> bool:
+        nonlocal archive_loaded, archived_ids
+        if attempt_id in live_ids:
+            return True
+        if not archive_loaded:
+            archive_loaded = True
+            try:
+                from ouroboros.usage_compaction import archived_attempt_ids
+
+                # One validated history snapshot per pass, not one full chain
+                # walk per seal. Its lifetime is this batch, independent of the
+                # reader's cross-call cache TTL. The next pass reads anew.
+                archived_ids = archived_attempt_ids(root)
+            except Exception:
+                log.debug("model_send reconciliation: archived history unknown", exc_info=True)
+        # UNKNOWN skips reverse accusations for this pass; forward checks below
+        # still use the known live rows. Never turn a failed read into absence.
+        if archived_ids is None:
+            report["status"] = "unknown"
+        return archived_ids is None or attempt_id in archived_ids
+
+    for manifest_path in manifest_paths:
+        report["manifests_checked"] = report.get("manifests_checked", 0) + 1
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except Exception:
+            report["status"] = "unknown"
             continue
         if not isinstance(manifest, dict) or manifest.get("promoted_call_manifest"):
             continue
@@ -499,7 +534,7 @@ def _reconcile_seal_directions(
             continue
         report["seals"] += 1
         attempt_id = str(seal.get("attempt_id") or manifest.get("call_id") or "")
-        if attempt_id and attempt_id not in finals:
+        if attempt_id and not _attempt_row_exists(attempt_id):
             report["orphan_seals"] += 1
             _write({
                 "type": VIOLATION_EVENT_TYPE,
@@ -524,9 +559,8 @@ def _reconcile_seal_directions(
         report["sealed_attempts"] += 1
         seal = None
         try:
-            manifest = json.loads(
-                pathlib.Path(str(ref.get("path") or "")).read_text(encoding="utf-8")
-            )
+            from ouroboros.observability import read_call_manifest_ref
+            manifest = read_call_manifest_ref(root, ref, task_id=str(row.get("task_id") or ""))
             if isinstance(manifest, dict):
                 seal = manifest.get("model_send_seal")
         except Exception:

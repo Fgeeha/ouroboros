@@ -28,45 +28,6 @@ def coerce_queue_order(value: Any, default: int = 0) -> int:
         return default
 
 
-def record_scheduled_admission(
-    task: Dict[str, Any], admitted: Any, record: Dict[str, Any],
-) -> None:
-    """Project a cron dispatch refusal into terminal task/schedule state."""
-    from supervisor import queue as q
-
-    block = (
-        str(admitted.get("_admission_blocked") or "")
-        if isinstance(admitted, dict)
-        else ""
-    )
-    if not block:
-        record["failure_count"] = int(record.get("failure_count") or 0)
-        record["last_error"] = ""
-        return
-    detail = f"Scheduled task was not queued: {block}."
-    try:
-        from ouroboros.task_results import STATUS_FAILED, write_task_result
-
-        write_task_result(
-            q.DRIVE_ROOT,
-            str(task["id"]),
-            STATUS_FAILED,
-            result=detail,
-            reason_code=block,
-            # ABI-3: a never-dispatched refusal spent a confirmed zero — stamped
-            # under the honest name; the retired alias is read-tolerance only.
-            accounted_upper_bound_usd=0.0,
-        )
-    except Exception:
-        q.log.warning(
-            "Failed to terminalize admission-blocked scheduled task %s",
-            task.get("id"),
-            exc_info=True,
-        )
-    record["failure_count"] = int(record.get("failure_count") or 0) + 1
-    record["last_error"] = detail
-
-
 def prefer_terminalization_retry_rows(tasks: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
     """Drop ordinary duplicate rows when a snapshot carries shutdown custody."""
     marker_ids = {
@@ -614,11 +575,8 @@ def reserve_task_admission(
             if reserved == token:
                 return {"status": "already_reserved", "reason": ""}
             return {"status": "blocked", "reason": "duplicate_task_id"}
-        if tid in queue.RUNNING or any(
-            isinstance(row, dict) and str(row.get("id") or "") == tid
-            for row in queue.PENDING
-        ):
-            return {"status": "blocked", "reason": "duplicate_task_id"}
+        # A confirmed admission remains replayable while its task is still live.
+        # Only the durable token proves this is that same admission.
         try:
             from ouroboros.task_results import load_task_result
 
@@ -627,7 +585,11 @@ def reserve_task_admission(
             ) or {}
         except Exception:
             return {"status": "blocked", "reason": "task_id_lookup_failed"}
-        if existing:
+        from ouroboros.routing_wait import is_own_admission_stub
+
+        if existing and not is_own_admission_stub(existing, token):
+            # The emitted stub of THIS admission is its own pre-receipt (#1160), not
+            # another task owning the id: the request it belongs to still reserves.
             admission = existing.get("promotion_admission")
             if (
                 isinstance(admission, dict)
@@ -640,20 +602,23 @@ def reserve_task_admission(
                     "promotion_admission": dict(admission),
                 }
             return {"status": "blocked", "reason": "duplicate_task_id"}
+        if tid in queue.RUNNING or any(
+            isinstance(row, dict) and str(row.get("id") or "") == tid
+            for row in queue.PENDING
+        ):
+            return {"status": "blocked", "reason": "duplicate_task_id"}
         if require_worker_pool:
             try:
                 from supervisor import workers
 
-                disabled_reason = str(workers._WORKER_POOL_DISABLED_REASON or "")
-                pool = workers.WORKERS if worker_pool is None else worker_pool
-                worker_count = len(pool)
+                pool_state = workers._worker_pool_execution_state(worker_pool)
             except Exception:
                 return {"status": "blocked", "reason": "worker_pool_state_unavailable"}
-            if disabled_reason or worker_count <= 0:
+            if not pool_state["available"]:
                 return {
                     "status": "blocked",
                     "reason": "worker_pool_unavailable",
-                    "worker_pool_disabled_reason": disabled_reason or "no_workers",
+                    "worker_pool_disabled_reason": pool_state["disabled_reason"],
                 }
         queue.ADMISSION_RESERVATIONS[tid] = token
         return {"status": "reserved", "reason": ""}
@@ -674,7 +639,6 @@ def release_task_admission(task_id: str, admission_token: str) -> bool:
 
 __all__ = [
     "enqueue_subagent_with_scheduled_result",
-    "record_scheduled_admission",
     "release_task_admission",
     "reserve_task_admission",
     "subagent_schedule_owned",

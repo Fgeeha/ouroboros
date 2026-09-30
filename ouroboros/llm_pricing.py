@@ -11,11 +11,12 @@ no cost.
 from __future__ import annotations
 
 import logging
-import os
 import time
 from typing import Any, Dict, Optional, Tuple
 
 from ouroboros.provider_models import normalize_model_identity
+from ouroboros.config import runtime_setting
+from ouroboros.net_transport import requests_verify_kwargs
 
 
 # The moved warnings keep the logger identity they were emitted under.
@@ -55,7 +56,7 @@ def fetch_openrouter_pricing(*, timeout_sec: float = 5.0) -> Dict[str, Tuple[Opt
 
     try:
         url = "https://openrouter.ai/api/v1/models"
-        resp = requests.get(url, timeout=max(0.1, min(5.0, float(timeout_sec))))
+        resp = requests.get(url, timeout=max(0.1, min(5.0, float(timeout_sec))), **requests_verify_kwargs())
         resp.raise_for_status()
 
         data = resp.json()
@@ -141,6 +142,81 @@ def fetch_openrouter_pricing(*, timeout_sec: float = 5.0) -> Dict[str, Tuple[Opt
         return {}
 
 
+def _endpoint_pricing_schedule(pricing: Any, source: dict):
+    """Retain exact endpoint rates and prompt overrides; malformed prices stay unknown."""
+    from decimal import Decimal, InvalidOperation
+    from math import isfinite
+    from ouroboros.pricing import PricingSchedule
+
+    def rate(value):
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            number = Decimal(str(value))
+            result = float(number * 1_000_000)
+            return result if number >= 0 and isfinite(result) else None
+        except (InvalidOperation, TypeError, ValueError, OverflowError):
+            return None
+
+    def row(values):
+        return PricingSchedule(tuple(rate(values.get(key)) for key in (
+            "prompt", "input_cache_read", "input_cache_write", "completion")),
+            cache_write_1h=rate(values.get("input_cache_write_1h")), source=source)
+
+    if not isinstance(pricing, dict):
+        return row({})
+    tiers = []
+    try:
+        for override in pricing.get("overrides") or []:
+            minimum = int(override["min_prompt_tokens"])
+            if minimum <= 0:
+                return row({})
+            # An override replaces the fields it supplies. Missing base cache
+            # prices still remain unknown; none are inferred from token input.
+            tiers.append((minimum, row({**pricing, **override})))
+    except (TypeError, ValueError, KeyError, OverflowError):
+        return row({})
+    base = row(pricing)
+    return PricingSchedule(base, tuple(tiers), cache_write_1h=base.cache_write_1h, source=source)
+
+
+def fetch_openrouter_endpoint_pricing(model: str, *, timeout_sec: float = 5.0) -> Dict[str, Tuple[Optional[float], ...]]:
+    """Read one model's endpoint tariffs, preserving the complete potential route pool.
+
+    Tier tags and prices are provider facts from the documented endpoints API.
+    Status is retained as evidence, never used to erase an expensive endpoint;
+    a temporary outage cannot turn a tariff into an execution prohibition.
+    """
+    from urllib.parse import quote
+    import requests
+
+    author, separator, slug = model.partition("/")
+    if not separator or not author or not slug:
+        return {}
+    url = f"https://openrouter.ai/api/v1/models/{quote(author, safe='')}/{quote(slug, safe='')}/endpoints"
+    try:
+        response = requests.get(url, timeout=max(0.1, min(5.0, float(timeout_sec))), **requests_verify_kwargs())
+        response.raise_for_status()
+        payload = response.json().get("data") or {}
+        endpoints = payload.get("endpoints")
+        if payload.get("id") != model or not isinstance(endpoints, list):
+            return {}
+        rows = {}
+        for endpoint in endpoints:
+            tag = endpoint.get("tag") if isinstance(endpoint, dict) else None
+            if not isinstance(tag, str) or not tag or tag in rows or endpoint.get("model_id") != model:
+                return {}  # An unbound/omitted row cannot certify a pool upper estimate.
+            suffix = tag.rsplit("/", 1)[-1] if "/" in tag else ""
+            tier = "priority" if suffix in {"fast", "priority"} else "flex" if suffix == "flex" else "default"
+            source = {"provider": "openrouter", "model": model, "endpoint_tag": tag,
+                      "service_tier": tier, "url": url, "status": endpoint.get("status")}
+            rows[tag] = _endpoint_pricing_schedule(endpoint.get("pricing"), source)
+        return rows
+    except (requests.RequestException, TypeError, ValueError, AttributeError) as error:
+        log.warning("Failed to fetch OpenRouter endpoint pricing for %s: %s", model, error)
+        return {}
+
+
 def fetch_cloudru_pricing(*, timeout_sec: float = 5.0) -> Dict[str, Tuple[Optional[float], ...]]:
     """Fetch cloud.ru Foundation Models pricing as ``cloudru/<id>`` -> per-1M USD.
 
@@ -155,7 +231,7 @@ def fetch_cloudru_pricing(*, timeout_sec: float = 5.0) -> Dict[str, Tuple[Option
     import logging
     log = logging.getLogger("ouroboros.llm")
 
-    api_key = (os.environ.get("CLOUDRU_FOUNDATION_MODELS_API_KEY", "") or "").strip()
+    api_key = (runtime_setting("CLOUDRU_FOUNDATION_MODELS_API_KEY", "") or "").strip()
     if not api_key:
         return {}
     try:
@@ -164,10 +240,10 @@ def fetch_cloudru_pricing(*, timeout_sec: float = 5.0) -> Dict[str, Tuple[Option
         return {}
 
     base_url = (
-        os.environ.get("CLOUDRU_FOUNDATION_MODELS_BASE_URL", "") or ""
+        runtime_setting("CLOUDRU_FOUNDATION_MODELS_BASE_URL", "") or ""
     ).strip() or "https://foundation-models.api.cloud.ru/v1"
     try:
-        rate = float(os.environ.get("OUROBOROS_RUB_USD_RATE", ""))
+        rate = float(runtime_setting("OUROBOROS_RUB_USD_RATE", ""))
     except (TypeError, ValueError):
         return {}
     if rate <= 0:
@@ -178,6 +254,7 @@ def fetch_cloudru_pricing(*, timeout_sec: float = 5.0) -> Dict[str, Tuple[Option
             f"{base_url.rstrip('/')}/models",
             headers={"Authorization": f"Bearer {api_key}"},
             timeout=max(0.1, min(5.0, float(timeout_sec))),
+            **requests_verify_kwargs(),
         )
         resp.raise_for_status()
         models = resp.json().get("data", []) or []
@@ -238,7 +315,7 @@ class _GenerationCostMixin:
             base_url = str(active_target.get("base_url") or "").rstrip("/")
             api_key = str(active_target.get("api_key") or "")
             url = f"{base_url}/generation?id={generation_id}"
-            resp = requests.get(url, headers={"Authorization": f"Bearer {api_key}"}, timeout=5)
+            resp = requests.get(url, headers={"Authorization": f"Bearer {api_key}"}, timeout=5, **requests_verify_kwargs())
             if resp.status_code == 200:
                 data = resp.json().get("data") or {}
                 cost = data.get("total_cost") or data.get("usage", {}).get("cost")
@@ -246,7 +323,7 @@ class _GenerationCostMixin:
                     return float(cost)
             # Generation cost can lag the chat response; retry once.
             time.sleep(0.5)
-            resp = requests.get(url, headers={"Authorization": f"Bearer {api_key}"}, timeout=5)
+            resp = requests.get(url, headers={"Authorization": f"Bearer {api_key}"}, timeout=5, **requests_verify_kwargs())
             if resp.status_code == 200:
                 data = resp.json().get("data") or {}
                 cost = data.get("total_cost") or data.get("usage", {}).get("cost")

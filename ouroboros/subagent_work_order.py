@@ -6,6 +6,51 @@ import json
 from hashlib import sha256
 from typing import Any, Mapping
 
+
+def input_source_selection_receipt(task: Mapping[str, Any]) -> dict[str, Any]:
+    """Composition fact retained by existing work-order/model-send sources.
+
+    This selects automatic inputs, never filesystem access or semantic purity.
+    The selection persists for the task; first-position/mail ordering is the
+    caller's ordinary collaboration procedure, not a second host controller.
+    """
+    from ouroboros.contracts.task_contract import task_input_sources
+
+    if task_input_sources(task) != "declared":
+        return {}
+    return {
+        "input_sources": "declared",
+        "included": [
+            "SYSTEM.md and BIBLE.md; existing reference-book projections",
+            "explicit assignment, question, evidence and normalized task authority",
+            "runtime access, tools, workspace, clock, resource and budget facts",
+            "this child's own retained progress, tool and event history",
+        ],
+        "omitted_automatic": [
+            "shared autobiography: identity, WORLD, dialogue and scratchpad",
+            "global/project knowledge, indexes, patterns, journal and workpad",
+            "shared review history, health narratives, update letters, registry and installed-skill summaries",
+            "parent context, notes, review_notes, predecessor narrative and inherited attachments",
+            "task-tree blackboard, routing manifests and other-task summaries",
+        ],
+        "lifetime": "Entire task, including tools, retries, fallback, compaction and selected API descendants.",
+        "collaboration": (
+            "Ordinary task messages remain available; input selection imposes no collaboration order. "
+            "The host does not gate mailbox delivery or detect the first position."
+        ),
+        "later_inputs": (
+            "Tools, messages, reviews and restored sources are additional inputs; reading outside "
+            "the declared corpus changes the claim. Retained model-send/tool-source projections "
+            "record the actual sequence."
+        ),
+        "limitations": (
+            "No sandbox, no semantic filtering of declared facts or governance/authority, and no "
+            "promise about learned priors. Vendor-side context is unobserved. This receipt records "
+            "host composition, not blanket blindness. Native agent sessions are unsupported."
+        ),
+    }
+
+
 def _text(value: Any) -> str:
     if isinstance(value, list):
         value = "\n".join(f"- {item}" for item in value if str(item).strip())
@@ -49,6 +94,7 @@ def _render_external_work_order(task: Mapping[str, Any]) -> str:
         key: value for key, value in contract.items() if key not in represented_keys
     }
     sections: list[tuple[str, Any]] = [
+        ("INPUT SOURCE SELECTION", input_source_selection_receipt(task)),
         ("OBJECTIVE", task.get("objective") or contract.get("objective") or task.get("description")),
         ("PARENT CONTEXT / REFERENCES", "\n\n".join(context_sections)),
         ("EXPECTED OUTPUT", task.get("expected_output") or contract.get("expected_output")),

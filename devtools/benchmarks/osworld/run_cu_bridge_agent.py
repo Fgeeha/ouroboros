@@ -623,6 +623,7 @@ def _gate_tool_trace(data_dir: Path, ouro_task_id: str, latest_status: Any = Non
         log_path = data_dir / "state" / "headless_tasks" / ouro_task_id / "data" / "logs" / "tools.jsonl"
         if not (ouro_task_id and log_path.is_file()):
             return trace
+        rows = []
         for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
             line = line.strip()
             if not line:
@@ -631,15 +632,24 @@ def _gate_tool_trace(data_dir: Path, ouro_task_id: str, latest_status: Any = Non
                 row = json.loads(line)
             except Exception:
                 continue
-            if not isinstance(row, dict) or row.get("type") != "tool_call":
+            if not isinstance(row, dict) or row.get("type") not in {"tool_call", "tool_call_started", "tool_call_timeout"}:
                 continue
+            rows.append(row)
+        from ouroboros.tool_call_log import logical_calls
+
+        for call in logical_calls(rows):
+            row = call.get("settled") or call.get("started") or call.get("wait_ended") or {}
             tool = str(row.get("tool") or "")
             if not tool.startswith(prefix):
                 continue
             trace.append({
                 "tool": tool[len(prefix):],
                 "args": row.get("args"),
-                "is_error": bool(row.get("is_error")),
+                "is_error": bool(row.get("is_error")) if call.get("settled") else None,
+                "state": call["state"],
+                "wait_ended": bool(call.get("wait_ended")),
+                "settled": bool(call.get("settled")),
+                "invocation_id": call.get("invocation_id"),
             })
     except Exception:  # noqa: BLE001 - a sidecar must never change the flow
         pass
@@ -662,24 +672,42 @@ def _dataset_name(variant: str) -> str:
     return {"v2": "OSWorld-V2", "v1": "OSWorld"}.get(variant, f"OSWorld-{variant}")
 
 
+def _round_cap_fact(raw: Any, source: str) -> dict[str, Any]:
+    """One provenance row; ``value`` is None unless ``raw`` is a positive integer cap."""
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        value = 0
+    if value >= 1:
+        return {"value": value, "source": source}
+    unlimited = str(raw).strip().lower() in {"unlimited", "inf", "\u221e"}
+    return {"value": None, "source": source, "unbounded": unlimited, "raw": str(raw)}
+
+
 def _effective_max_rounds(settings_path: Path) -> dict[str, Any]:
     """Report the round budget the bench server actually honors, with provenance.
 
     The server applies settings.json over env at startup, so settings wins; this
-    is best-effort disclosure, not enforcement (there is no per-task step cap)."""
+    is best-effort disclosure, not enforcement (there is no per-task step cap).
+    ``value`` is None when the server has NO finite round cap ("unlimited", the
+    runtime default without a settings document) or it cannot be proven — never a
+    number the server may not honor, so a declared step budget is refused rather
+    than certified. A document without the key keeps the runtime's legacy 200."""
+    document: Any = None
     try:
-        settings = json.loads(Path(settings_path).read_text(encoding="utf-8"))
-        if isinstance(settings, dict) and settings.get("OUROBOROS_MAX_ROUNDS") is not None:
-            return {"value": int(settings["OUROBOROS_MAX_ROUNDS"]), "source": "settings"}
-    except Exception:
+        document = json.loads(Path(settings_path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
         pass
+    except Exception:
+        return {"value": None, "source": "settings_unreadable"}
+    if isinstance(document, dict) and document.get("OUROBOROS_MAX_ROUNDS") is not None:
+        return _round_cap_fact(document["OUROBOROS_MAX_ROUNDS"], "settings")
     env_val = os.environ.get("OUROBOROS_MAX_ROUNDS")
     if env_val:
-        try:
-            return {"value": int(env_val), "source": "env"}
-        except ValueError:
-            pass
-    return {"value": 200, "source": "default"}
+        return _round_cap_fact(env_val, "env")
+    if document is not None:
+        return {"value": 200, "source": "legacy_document_default"}
+    return {"value": None, "source": "default", "unbounded": True}
 
 
 def _gate_turn_budget(args: Any) -> int:
@@ -1003,7 +1031,15 @@ def _refuse_uncapped_step_claim(budget: dict[str, Any]) -> None:
             "reserves"
         )
     server = budget.get("server_round_cap") or {}
-    server_value = int(server.get("value") or 0)
+    if server.get("value") is None:
+        # No finite (or no provable) server cap is NOT a cap of zero: an unlimited
+        # runtime would let the example run past the declared budget.
+        raise SystemExit(
+            f"server round cap is not a finite proven bound (source: {server.get('source')}); "
+            f"set OUROBOROS_MAX_ROUNDS={worker_cap} in the lane settings.json so the declared "
+            "budget is the one the runtime enforces"
+        )
+    server_value = int(server["value"])
     if server_value > worker_cap:
         raise SystemExit(
             f"server round cap {server_value} (source: {server.get('source')}) exceeds the "
@@ -1079,6 +1115,7 @@ def _collect_budget_counters(data_dir: Path, latest: dict[str, Any], ouro_task_i
     screenshots = gui = remote_exec = total = 0
     src = log_path if log_path.is_file() else (fallback if fallback.is_file() else None)
     if src is not None:
+        rows = []
         for line in src.read_text(encoding="utf-8", errors="replace").splitlines():
             line = line.strip()
             if not line:
@@ -1087,10 +1124,15 @@ def _collect_budget_counters(data_dir: Path, latest: dict[str, Any], ouro_task_i
                 row = json.loads(line)
             except Exception:
                 continue
-            if not isinstance(row, dict) or row.get("type") != "tool_call":
+            if not isinstance(row, dict) or row.get("type") not in {"tool_call", "tool_call_started", "tool_call_timeout"}:
                 continue
             if src is fallback and str(row.get("task_id") or "") != ouro_task_id:
                 continue
+            rows.append(row)
+        from ouroboros.tool_call_log import logical_calls
+
+        for call in logical_calls(rows):
+            row = call.get("settled") or call.get("started") or call.get("wait_ended") or {}
             tool = str(row.get("tool") or "")
             if not tool.startswith(prefix):
                 continue

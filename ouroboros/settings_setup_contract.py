@@ -11,6 +11,7 @@ from ouroboros.provider_models import (
     ANTHROPIC_DIRECT_DEFAULTS,
     CLOUDRU_DIRECT_DEFAULTS,
     DEEPSEEK_DIRECT_DEFAULTS,
+    ZAI_DIRECT_DEFAULTS,
     MINIMAX_DIRECT_DEFAULTS,
     MINIMAX_REGION_ENDPOINTS,
     OPENAI_DIRECT_DEFAULTS,
@@ -20,9 +21,57 @@ from ouroboros.secret_masking import (
     MASKED_SECRET_SETTING_KEYS as SECRET_SETTING_KEYS,
 )
 from ouroboros.task_pacing import COST_PLANNING_MARGIN_USD
-from ouroboros.model_slots import MODEL_ACCOUNTS_KEY, MODEL_CONTEXT_WINDOWS_KEY, normalize_model_role_options
+from ouroboros.model_slots import (
+    MODEL_ACCOUNTS_KEY, MODEL_CONTEXT_WINDOWS_KEY, MODEL_PROCESSING_PREFERENCES_KEY,
+    PROCESSING_PREFERENCE_KEY, normalize_model_role_options, normalize_processing_preference,
+)
 from ouroboros.provider_models import parse_claudexor_model, provider_for_model
 
+
+
+_SAVED_TOTAL_BUDGET: Dict[str, Any] = {"stamp": None, "raw": ""}
+
+
+def _saved_total_budget() -> str:
+    """The owner's CURRENT saved ``TOTAL_BUDGET``, or "" when the document has none.
+
+    ``TOTAL_BUDGET`` is an immediate setting, but a worker process re-projects the
+    settings document into its environment only when a task STARTS, so for the
+    hours a task runs that environment answers with the budget of its first
+    minute: an owner who topped the budget up mid-run watched the task stop at
+    the old number. The document itself is the one channel every process already
+    shares (``loop_tool_execution._get_tool_timeout`` reads it through the locked
+    loader on every tool call; the MCP reload stat-gates it), so the resolver asks
+    it first. The read is unlocked (saves are
+    atomic, and only writers need the settings lock) and re-parses only when the
+    file changed, so a reservation costs one ``stat``; any failure -- a missing
+    file, a refused integrity pin -- leaves the environment answering, because a
+    settings hiccup must never become a money-path exception."""
+    from ouroboros import config
+    from ouroboros.settings_integrity import read_settings_json_verified
+
+    path = config.SETTINGS_PATH
+    try:
+        found = path.stat()
+    except OSError:
+        return ""
+    stamp = (str(path), found.st_dev, found.st_ino, found.st_mtime_ns, found.st_size)
+    if _SAVED_TOTAL_BUDGET["stamp"] != stamp:
+        try:
+            document = read_settings_json_verified(path)
+        except Exception:
+            # Never remembered: a refused pin or a transient read error must not
+            # become a sticky answer; the environment (the last verified
+            # projection of this same document) answers until a read succeeds.
+            return ""
+        if not isinstance(document, dict):
+            # Without a pin the verified reader answers None for an absent,
+            # unreadable or undecodable file instead of raising: the same
+            # failure, the same rule -- the environment answers, nothing is kept.
+            return ""
+        saved = document.get("TOTAL_BUDGET")
+        _SAVED_TOTAL_BUDGET.update(stamp=stamp, raw="" if saved is None else str(saved).strip())
+    return str(_SAVED_TOTAL_BUDGET["raw"])
 
 
 def resolve_total_budget_usd() -> Optional[float]:
@@ -40,7 +89,7 @@ def resolve_total_budget_usd() -> Optional[float]:
     non-positive value IS an owner decision and keeps its historical meaning of
     no finite global budget.
     """
-    raw = str(os.environ.get("TOTAL_BUDGET", "") or "").strip()
+    raw = _saved_total_budget() or str(os.environ.get("TOTAL_BUDGET", "") or "").strip()
     default = float(SETTINGS_DEFAULTS["TOTAL_BUDGET"])
     if not raw:
         return default
@@ -74,6 +123,7 @@ _MODEL_DEFAULTS = {
     "cloudru": {key: value for key, value in CLOUDRU_DIRECT_DEFAULTS.items() if key != "heavy"},
     "minimax": {key: value for key, value in MINIMAX_DIRECT_DEFAULTS.items() if key != "heavy"},
     "deepseek": {key: value for key, value in DEEPSEEK_DIRECT_DEFAULTS.items() if key != "heavy"},
+    "zai": {key: value for key, value in ZAI_DIRECT_DEFAULTS.items() if key != "heavy"},
     "anthropic": {key: value for key, value in ANTHROPIC_DIRECT_DEFAULTS.items() if key != "heavy"},
     # No defaults: model names are server-specific; user must fill all slots.
     "openai-compatible": {"main": "", "light": "", "vision": "", "fallback": ""},
@@ -85,7 +135,7 @@ for _profile_defaults in _MODEL_DEFAULTS.values():
 
 _STEPS = _rows(("id", "title", "railCopy", "copy", "footer"), (
     ("accounts", "Connect your accounts", "Subscriptions + API", "Connect Codex to start without an API key, or add an API key or local model. The same account can serve models and agents.", "Add more subscriptions or API access later in Settings → Accounts. Subscription limits and optional provider credits still apply."),
-    ("models", "Choose models", "model slots", "Review the visible model defaults derived from your current setup, then edit anything you want before launch.", "Plain openai/... or anthropic/... remains router-style. Direct values use openai::... and anthropic::...."),
+    ("models", "Choose models", "model slots", "Review the visible model defaults derived from your current setup, then edit anything you want before launch.", "Each slot names its source. OpenRouter stays the source for ids such as openai/gpt-5.6-terra; a provider's own key routes that slot straight to the provider."),
     ("review_mode", "Choose review mode", "Advisory vs blocking", "Decide how strict pre-commit review should be before Ouroboros starts modifying itself.", "Pick both review enforcement and the initial runtime mode before Ouroboros starts."),
     ("budget", "Review limits", "Quota + API budget", "Review subscription quotas and optional API spending limits.", "When subscription quota is exhausted, work waits for renewal or your choice of another account or model. This integration does not enable paid provider credits."),
     ("summary", "Review before launch", "Final check", "Check the final provider, model, review, and budget picture. Ouroboros will save these onboarding values before starting.", "The same onboarding values remain editable later in Settings."),
@@ -97,13 +147,15 @@ _STEP_ORDER = [step["id"] for step in _STEPS]
 # "More options" disclosure. Every input stays mounted in the DOM either way.
 _PROVIDER_FIELDS = _rows(("id", "stateKey", "settingKey", "settingsInputId", "label", "placeholder", "note", "inputType", "group"), (
     ("openrouter-key", "openrouterKey", "OPENROUTER_API_KEY", "s-openrouter", "OpenRouter API Key", "sk-or-v1-...", "Optional. Best when you want one router for OpenAI, Anthropic, Google, and more.", "password", "primary"),
-    ("openai-key", "openaiKey", "OPENAI_API_KEY", "s-openai", "OpenAI API Key", "sk-...", "Optional. If this is the only remote key, the next step prefills direct openai::... models.", "password", "primary"),
-    ("cloudru-key", "cloudruKey", "CLOUDRU_FOUNDATION_MODELS_API_KEY", "s-cloudru-key", "Cloud.ru Foundation Models API Key", "Cloud.ru API key", "Optional. If this is the only remote key, the next step prefills direct cloudru::... models.", "password", "more"),
-    ("minimax-key", "minimaxKey", "MINIMAX_API_KEY", "s-minimax-key", "MiniMax API Key", "MiniMax API key", "Optional. If this is the only remote key, the next step prefills direct minimax::... models.", "password", "more"),
+    ("openai-key", "openaiKey", "OPENAI_API_KEY", "s-openai", "OpenAI API Key", "sk-...", "Optional. If this is the only remote key, the next step prefills OpenAI's own model ids.", "password", "primary"),
+    ("cloudru-key", "cloudruKey", "CLOUDRU_FOUNDATION_MODELS_API_KEY", "s-cloudru-key", "Cloud.ru Foundation Models API Key", "Cloud.ru API key", "Optional. If this is the only remote key, the next step prefills Cloud.ru's own model ids.", "password", "more"),
+    ("minimax-key", "minimaxKey", "MINIMAX_API_KEY", "s-minimax-key", "MiniMax API Key", "MiniMax API key", "Optional. If this is the only remote key, the next step prefills MiniMax's own model ids.", "password", "more"),
     ("minimax-region", "minimaxRegion", "MINIMAX_REGION", "s-minimax-region", "MiniMax Region", "global_en or cn_zh", "Choose global_en for the global endpoint or cn_zh for the China endpoint.", "text", "more"),
-    ("deepseek-key", "deepseekKey", "DEEPSEEK_API_KEY", "s-deepseek-key", "DeepSeek API Key", "sk-...", "Optional. If this is the only remote key, the next step prefills direct deepseek::... models.", "password", "more"),
-    ("anthropic-key", "anthropicKey", "ANTHROPIC_API_KEY", "s-anthropic", "Anthropic API Key", "sk-ant-...", "Optional. Saved for direct anthropic::... models and Claude tooling.", "password", "primary"),
-    ("openai-compatible-url", "compatibleBaseUrl", "OPENAI_COMPATIBLE_BASE_URL", "s-compatible-url", "OpenAI-compatible Base URL", "http://localhost:11434/v1", "Base URL for your OpenAI-compatible endpoint (e.g. Ollama, LM Studio, vLLM). Required when using openai-compatible:: models.", "url", "more"),
+    ("deepseek-key", "deepseekKey", "DEEPSEEK_API_KEY", "s-deepseek-key", "DeepSeek API Key", "sk-...", "Optional. If this is the only remote key, the next step prefills DeepSeek's own model ids.", "password", "more"),
+    ("zai-key", "zaiKey", "ZAI_API_KEY", "s-zai-key", "Z.ai API Key (GLM)", "...", "Optional. If this is the only remote key, the next step prefills Z.ai's own GLM model ids.", "password", "more"),
+    ("zai-plan", "zaiPlan", "ZAI_PLAN", "s-zai-plan", "Z.ai Plan", "payg or coding", "Choose payg (pay-as-you-go, default) or coding (Coding Plan endpoint; officially intended for supported coding tools only).", "text", "more"),
+    ("anthropic-key", "anthropicKey", "ANTHROPIC_API_KEY", "s-anthropic", "Anthropic API Key", "sk-ant-...", "Optional. Saved for models routed straight to Anthropic, and for Claude tooling.", "password", "primary"),
+    ("openai-compatible-url", "compatibleBaseUrl", "OPENAI_COMPATIBLE_BASE_URL", "s-compatible-url", "OpenAI-compatible Base URL", "http://localhost:11434/v1", "Base URL for your OpenAI-compatible endpoint (e.g. Ollama, LM Studio, vLLM). Required whenever a slot uses the OpenAI-compatible endpoint as its source.", "url", "more"),
     ("openai-compatible-key", "compatibleApiKey", "OPENAI_COMPATIBLE_API_KEY", "s-compatible-key", "OpenAI-compatible API Key", "Leave empty for no auth", "API key for the endpoint. Leave empty if your server does not require authentication.", "password", "more"),
 ))
 
@@ -111,13 +163,14 @@ _PROVIDER_FIELDS = _rows(("id", "stateKey", "settingKey", "settingsInputId", "la
 # leaf wire contract so onboarding, Settings, repair, and persistence cannot drift.
 
 _PROFILE_SPECS = {
-    "openrouter": ("OpenRouter", "OpenRouter is present, so the next step keeps router-style defaults while still saving any extra direct keys you paste here.", "OpenRouter-style routing remains active. Unprefixed provider IDs like openai/gpt-5.6-terra or anthropic/claude-sonnet-5 continue to route through OpenRouter."),
-    "openai": ("OpenAI", "OpenAI is present, so the next step prefills direct openai:: model values.", "OpenAI-only setup detected. These defaults are explicit and official."),
-    "cloudru": ("Cloud.ru Foundation Models", "Cloud.ru is present, so the next step prefills direct cloudru:: model values.", "Cloud.ru-only setup detected. These defaults use explicit cloudru:: model IDs."),
-    "minimax": ("MiniMax", "MiniMax is present, so the next step prefills direct minimax:: model values.", "MiniMax-only setup detected. These defaults include MiniMax-M3 and MiniMax-M2.7."),
-    "deepseek": ("DeepSeek", "DeepSeek is present, so the next step prefills direct deepseek:: model values.", "DeepSeek-only setup detected. These defaults use deepseek-v4-pro for main work and deepseek-v4-flash for the light lane. Blocking deep/scope review in Max context mode additionally needs the owner 1M-window acknowledgement in Settings."),
-    "anthropic": ("Anthropic", "Anthropic is present, so the next step prefills direct anthropic:: model values.", "Anthropic-only setup detected. These defaults are explicit and official."),
-    "openai-compatible": ("OpenAI-compatible endpoint", "An OpenAI-compatible base URL is configured. Enter the model names your server exposes in the next step.", "OpenAI-compatible endpoint detected. Use openai-compatible::your-model-name for every slot. The model list is whatever your server supports."),
+    "openrouter": ("OpenRouter", "OpenRouter is present, so the next step keeps router-style defaults while still saving any extra direct keys you paste here.", "OpenRouter-style routing remains active. OpenRouter stays the source for ids such as openai/gpt-5.6-terra or anthropic/claude-sonnet-5."),
+    "openai": ("OpenAI", "OpenAI is present, so the next step prefills OpenAI's own model ids.", "OpenAI-only setup detected. These defaults are explicit and official."),
+    "cloudru": ("Cloud.ru Foundation Models", "Cloud.ru is present, so the next step prefills Cloud.ru's own model ids.", "Cloud.ru-only setup detected. These defaults use Cloud.ru's own model ids."),
+    "minimax": ("MiniMax", "MiniMax is present, so the next step prefills MiniMax's own model ids.", "MiniMax-only setup detected. These defaults include MiniMax-M3 and MiniMax-M2.7."),
+    "deepseek": ("DeepSeek", "DeepSeek is present, so the next step prefills DeepSeek's own model ids.", "DeepSeek-only setup detected. These defaults use deepseek-v4-pro for main work and deepseek-v4-flash for the light lane."),
+    "zai": ("Z.ai (GLM)", "Z.ai is present, so the next step prefills Z.ai's own GLM model ids.", "Z.ai-only setup detected. These defaults use glm-5.3 for main work and glm-5.3-flash for the light lane. The plan setting selects the pay-as-you-go or Coding Plan endpoint."),
+    "anthropic": ("Anthropic", "Anthropic is present, so the next step prefills Anthropic's own model ids.", "Anthropic-only setup detected. These defaults are explicit and official."),
+    "openai-compatible": ("OpenAI-compatible endpoint", "An OpenAI-compatible base URL is configured. Enter the model names your server exposes in the next step.", "OpenAI-compatible endpoint detected. Choose the OpenAI-compatible endpoint as the source and enter the model names your server exposes. The model list is whatever your server supports."),
     "direct-multi": ("Direct multi-provider", "Multiple direct providers are present, so the next step keeps your model values editable without forcing one provider family.", "Multiple direct providers are configured. Start here, then split model slots across them if you want."),
     "local": ("Local-first", "No remote key is present yet, so local-only setup remains available below.", "Local-only setup detected. Review the model values and local routing before launch."),
 }
@@ -131,7 +184,7 @@ _MODEL_SLOTS = _rows(("slot", "stateKey", "settingKey", "inputId", "label", "not
 ))
 
 _REVIEW_MODES = _rows(("value", "label", "tone", "className", "copy"), (
-    ("advisory", "Advisory", "Flexible", "advisory", "Faster and cheaper. Review still runs, but you decide how to handle findings. Best when you want iteration speed and can manually watch for drift."),
+    ("advisory", "Advisory", "Flexible", "advisory", "Review still runs. After feedback, Ouroboros can fix, reject or finish; raw reviewer findings remain visible."),
     ("blocking", "Blocking", "Strict", "blocking", "Slower and more expensive, but much safer. Critical review findings stop commits, which dramatically reduces the chance of gradual code degradation."),
 ))
 
@@ -139,6 +192,7 @@ _RUNTIME_MODES = _rows(("value", "label", "tone", "className", "copy"), (
     ("light", "Light", "Safest", "light", "Self-modification of the main repo is disabled. Best for trying Ouroboros out without repo self-modification."),
     ("advanced", "Advanced", "Default", "advanced", "Self-modification of the evolutionary layer is allowed (current behaviour). Protected core/contract/release files stay guarded by Advanced mode."),
     ("pro", "Pro", "Power", "pro", "Direct protected-surface mode. Protected core/contract/release edits are allowed on disk, but commits still require the normal triad + scope review gate."),
+    ("cyber_pro", "Cyber Pro", "Maximum power", "cyber-pro", "Host and configuration authority, including credentials, models, Supervisor and protected rewrites. Review scope and Blocking or Advisory enforcement remain owner-controlled."),
 ))
 
 _LOCAL_ROUTING_MODES = _rows(("value", "buttonLabel", "label", "flags"), (
@@ -217,7 +271,7 @@ _SUBSCRIPTION_FIELDS = _rows(("id", "payloadKey", "label", "note"), (
     ("skip-subscription-presets", SKIP_SUBSCRIPTION_PRESETS_FIELD, "Finish without agent defaults", "Completes onboarding without moving reviewers and subagents onto the connected subscriptions. Everything stays editable in Settings afterwards."),
 ))
 
-_MODEL_SUGGESTIONS = list(dict.fromkeys(("google/gemini-3.8-flash", "x-ai/grok-4.6", "openai/gpt-5.6-terra", "openai/gpt-5.6-sol", "openai/gpt-5.6-luna", "openai::gpt-5.6-terra", "openai::gpt-5.6-sol", "openai::gpt-5.6-luna", "anthropic/claude-sonnet-5", "anthropic/claude-opus-5", "anthropic::claude-sonnet-5", "anthropic::claude-opus-5", "anthropic::claude-opus-4-6", "deepseek/deepseek-v4-pro", "deepseek::deepseek-v4-pro", "deepseek::deepseek-v4-flash", "openai-compatible::meta-llama/compatible", "cloudru::zai-org/GLM-4.7", "minimax::MiniMax-M3", "minimax::MiniMax-M2.7")))
+_MODEL_SUGGESTIONS = list(dict.fromkeys(("google/gemini-3.8-flash", "x-ai/grok-4.6", "openai/gpt-5.6-terra", "openai/gpt-5.6-sol", "openai/gpt-5.6-luna", "openai::gpt-5.6-terra", "openai::gpt-5.6-sol", "openai::gpt-5.6-luna", "anthropic/claude-sonnet-5", "anthropic/claude-opus-5", "anthropic::claude-sonnet-5", "anthropic::claude-opus-5", "anthropic::claude-opus-4-6", "deepseek/deepseek-v4-pro", "deepseek::deepseek-v4-pro", "deepseek::deepseek-v4-flash", "zai::glm-5.3", "zai::glm-5.3-flash", "openai-compatible::meta-llama/compatible", "cloudru::zai-org/GLM-4.7", "minimax::MiniMax-M3", "minimax::MiniMax-M2.7")))
 
 
 def _string(value: Any) -> str:
@@ -293,6 +347,7 @@ def derive_provider_profile(settings: dict) -> str:
         ("CLOUDRU_FOUNDATION_MODELS_API_KEY", "cloudru"),
         ("MINIMAX_API_KEY", "minimax"),
         ("DEEPSEEK_API_KEY", "deepseek"),
+        ("ZAI_API_KEY", "zai"),
         ("ANTHROPIC_API_KEY", "anthropic"),
     ]
     configured = [name for key, name in direct if flags[key]]
@@ -405,14 +460,19 @@ def build_initial_setup_state(settings: dict, host_mode: str = "desktop") -> dic
     state.update(budget_state)
     state["modelAccounts"] = normalize_model_role_options(MODEL_ACCOUNTS_KEY, settings.get(MODEL_ACCOUNTS_KEY))[0]
     state["modelContextWindows"] = normalize_model_role_options(MODEL_CONTEXT_WINDOWS_KEY, settings.get(MODEL_CONTEXT_WINDOWS_KEY))[0]
+    state["processingPreference"] = normalize_processing_preference(settings.get(PROCESSING_PREFERENCE_KEY))
+    state["modelProcessingPreferences"] = normalize_model_role_options(MODEL_PROCESSING_PREFERENCES_KEY, settings.get(MODEL_PROCESSING_PREFERENCES_KEY))[0]
     state.update({slot["stateKey"]: _string(settings.get(slot["settingKey"])) or defaults[slot["slot"]] for slot in _MODEL_SLOTS})
     return state
 
 
-def build_setup_bootstrap(settings: dict, host_mode: str = "desktop") -> dict:
+def build_setup_bootstrap(settings: dict, host_mode: str = "desktop", *, fresh_install: bool = False) -> dict:
     normalized_host = "web" if host_mode == "web" else "desktop"
     return {
         "hostMode": normalized_host,
+        # Display provenance only; completion re-proves install eligibility.
+        # Unknown/legacy callers preserve existing model choices conservatively.
+        "freshInstall": fresh_install,
         "supportsLocalRuntimeControls": normalized_host == "web",
         "stepOrder": list(_STEP_ORDER),
         "modelDefaults": {key: dict(value) for key, value in _MODEL_DEFAULTS.items()},
@@ -502,7 +562,7 @@ def validate_setup_payload(data: dict, current_settings: dict) -> Tuple[dict, st
     has_remote = any(
         value
         for setting_key, value in keys.items()
-        if setting_key not in {"OPENAI_COMPATIBLE_API_KEY", "MINIMAX_REGION"}
+        if setting_key not in {"OPENAI_COMPATIBLE_API_KEY", "MINIMAX_REGION", "ZAI_PLAN"}
     )
     has_local = bool(local_source)
     if not has_remote and not has_local and not (pending_subscription or selected_subscription):
@@ -545,12 +605,17 @@ def validate_setup_payload(data: dict, current_settings: dict) -> Tuple[dict, st
         return {}, "Local-only setups must route at least one model to the local runtime."
 
     prepared = dict(current_settings)
-    for key in (MODEL_ACCOUNTS_KEY, MODEL_CONTEXT_WINDOWS_KEY):
+    for key in (MODEL_ACCOUNTS_KEY, MODEL_CONTEXT_WINDOWS_KEY, MODEL_PROCESSING_PREFERENCES_KEY):
         if key in data:
             try:
                 prepared[key] = normalize_model_role_options(key, data[key])[1]
             except ValueError as exc:
                 return {}, str(exc)
+    if PROCESSING_PREFERENCE_KEY in data:
+        try:
+            prepared[PROCESSING_PREFERENCE_KEY] = normalize_processing_preference(data[PROCESSING_PREFERENCE_KEY])
+        except ValueError as exc:
+            return {}, str(exc)
     prepared.update(models)
     prepared.update(keys)
     prepared.update(parsed_budget)

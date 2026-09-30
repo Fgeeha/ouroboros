@@ -13,7 +13,7 @@ fingerprint (provider + base_url + model + headers/beta + relevant options):
                   direct, whose 1M is an undiscoverable per-request beta header)
     failed      — a probe was attempted and errored (transient; retried later)
 
-``unknown`` (unprobeable | failed | no record) => FAIL-CLOSED for any >=1M gate.
+``unknown`` (unprobeable | failed | no record) keeps sizing evidence unknown.
 
 Probes are opportunistic and cached (24h for confirmed, 10 min for failed). Gate
 readers pass ``allow_fetch=False`` so the hot path never blocks on a network
@@ -27,7 +27,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import pathlib
 import re
 import threading
@@ -42,6 +41,7 @@ from ouroboros.utils import (
     read_json_dict,
     utc_now_iso,
 )
+from ouroboros.config import runtime_setting
 
 log = logging.getLogger(__name__)
 
@@ -833,8 +833,8 @@ def cold_start_density_probe(
     source: str,
     model_role: str = "", model_account_override: Optional[str] = None,
 ) -> str:
-    """The cold-start rung shared by the packed deep self-review and the commit
-    gate (scope ladder and triad fit). Returns a typed outcome:
+    """The cold-start density rung for the commit triad packet.
+    Returns a typed outcome:
 
     ``"warm"`` — a fresh exact-model witness already governs: nothing is sent;
     ``"no_sample"`` — nothing to measure on; ``"failed"`` / ``"no_usage"`` /
@@ -1067,10 +1067,11 @@ def _openai_compatible_metadata_window(
         import httpx
 
         if api_key is None:
-            from ouroboros.config import load_settings
-            api_key = str((load_settings() or {}).get("OPENAI_COMPATIBLE_API_KEY") or "")
+            from ouroboros.config import runtime_settings
+            api_key = str((runtime_settings() or {}).get("OPENAI_COMPATIBLE_API_KEY") or "")
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-        resp = httpx.get(str(base_url).rstrip("/") + "/models", headers=headers, timeout=5.0)
+        from ouroboros.net_transport import verify_kwargs
+        resp = httpx.get(str(base_url).rstrip("/") + "/models", headers=headers, timeout=5.0, **verify_kwargs())
         resp.raise_for_status()
         payload = resp.json()
         items = payload.get("data") if isinstance(payload, dict) else payload
@@ -1107,8 +1108,8 @@ def _provider_metadata_window(
     if p in {"openai-compatible", "minimax"}:
         if p == "minimax" and api_key is None:
             try:
-                from ouroboros.config import load_settings
-                api_key = str((load_settings() or {}).get("MINIMAX_API_KEY") or "")
+                from ouroboros.config import runtime_settings
+                api_key = str((runtime_settings() or {}).get("MINIMAX_API_KEY") or "")
             except Exception:
                 api_key = ""
         return _openai_compatible_metadata_window(model, base_url, allow_fetch, api_key=api_key)
@@ -1150,12 +1151,12 @@ _PROBE_CANARIES = ["OBOCANARYBEGIN7Q", "OBOCANARYMID7Q", "OBOCANARYEND7Q"]
 
 
 def _generative_probe_enabled() -> bool:
-    return (os.environ.get("OUROBOROS_GENERATIVE_PROBE", "1") or "").strip().lower() not in {"", "0", "false", "no", "off"}
+    return (runtime_setting("OUROBOROS_GENERATIVE_PROBE", "1") or "").strip().lower() not in {"", "0", "false", "no", "off"}
 
 
 def _generative_probe_pad_chars() -> int:
     try:
-        return max(200_000, int(os.environ.get("OUROBOROS_GENERATIVE_PROBE_CHARS", "5000000") or "5000000"))
+        return max(200_000, int(runtime_setting("OUROBOROS_GENERATIVE_PROBE_CHARS", "5000000") or "5000000"))
     except (ValueError, TypeError):
         return 5_000_000
 
@@ -1251,7 +1252,7 @@ def probe(
 
     if not allow_fetch:
         # Hot path: never block on the network. Return the (possibly stale) cache
-        # marked stale, else unprobeable — both read as unknown for >=1M gates.
+        # marked stale, else unprobeable — both retain unknown sizing evidence.
         if cached:
             return _cached_evidence(cached, fp, model, provider, stale=True,
                                     detail="stale (no fetch on hot path)")
@@ -1328,7 +1329,7 @@ def probe(
                                 detail="provider unreachable during probe")
     else:
         ev = CapabilityEvidence(0, STATUS_UNPROBEABLE, SOURCE_NONE, fp, model, provider, ts=utc_now_iso(),
-                                detail="no provider metadata; owner-ack required for a >=1M gate")
+                                detail="no provider window metadata; sizing evidence is unknown")
     _store_evidence(drive_root, "probes", fp, ev.to_json())
     return ev
 
@@ -1340,7 +1341,7 @@ def probe(
 # excluding it would starve the route of density witnesses entirely.
 _CACHE_INCLUSIVE_PROMPT_TOKEN_PROVIDERS = frozenset({
     "openrouter", "openai", "openai-compatible", "cloudru", "local", "anthropic",
-    "deepseek",
+    "deepseek", "zai",
 })
 
 
@@ -1352,6 +1353,12 @@ def observe_token_density(request: Any, usage: Optional[Dict[str, Any]], *, driv
         cache_bearing = bool(cached or int(normalized.get("cache_write_tokens") or 0))
         provider = str(request.provider or "").strip().lower()
         if cache_bearing and provider not in _CACHE_INCLUSIVE_PROMPT_TOKEN_PROVIDERS:
+            return
+        # A route may answer with ANOTHER model. Its tokenizer is not the
+        # requested model's, so the row would teach one model a stranger's
+        # density. The witness belongs to the model that produced it, and this
+        # store is keyed by the requested one, so there is nothing to learn.
+        if (normalized.get("claudexor") or {}).get("served_other_model"):
             return
         real = int(normalized.get("prompt_tokens") or normalized.get("input_tokens") or 0)
         # A cache-inclusive total landing on 2 x cached_tokens (+-1) is a gateway

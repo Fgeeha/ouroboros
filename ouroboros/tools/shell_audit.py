@@ -7,6 +7,7 @@ import re
 from typing import List, TYPE_CHECKING
 
 from ouroboros.shell_parse import (
+    POSIX_SHELL_HEADS,
     collect_leading_env,
     embedded_absolute_path_tokens,
     is_absolute_path_text,
@@ -50,7 +51,6 @@ if TYPE_CHECKING:
 _UNDECLARED_OUTPUTS_MARKER = "⚠️ ARTIFACT_OUTPUT_UNDECLARED"
 _UNDECLARED_OUTPUT_SCAN_MAX_FILES = 5000
 _UNDECLARED_OUTPUT_METADATA_COMMANDS = frozenset({"chmod", "chown", "mkdir", "rm"})
-_SHELL_WRAPPER_COMMANDS = frozenset({"sh", "bash", "zsh"})
 
 
 def _redirect_targets_for_audit(argv: list[str]) -> set[str]:
@@ -70,7 +70,7 @@ def _writer_targets_for_output_audit(argv: list[str]) -> set[str]:
         except Exception:
             command_argv = list(segment)
         command = pathlib.PurePath(command_argv[0]).name.lower().removesuffix(".exe") if command_argv else ""
-        if command in _SHELL_WRAPPER_COMMANDS:
+        if command in POSIX_SHELL_HEADS:
             body = shell_command_string(command_argv)
             if body:
                 targets.update(_writer_targets_for_output_audit(shell_argv_with_inline(body)))
@@ -272,7 +272,13 @@ def _mentioned_user_file_outputs_without_declaration(
             except (OSError, RuntimeError, TypeError, ValueError):
                 continue
             paths_to_check: list[tuple[pathlib.Path, pathlib.Path]] = [(path, lexical_path)]
-            if path.is_dir():
+            try:
+                is_directory = path.is_dir()
+            except (OSError, ValueError):
+                # This is a parser candidate, not an established filesystem
+                # address. Quoted prose can contain an overlong path component.
+                continue
+            if is_directory:
                 try:
                     for child in path.iterdir():
                         if len(paths_to_check) >= _UNDECLARED_OUTPUT_SCAN_MAX_FILES:
@@ -330,6 +336,23 @@ def _mentioned_user_file_outputs_without_declaration(
                         continue
                 mentioned.append(path_text)
     return mentioned
+
+
+def _disclose_output_audit_failure(ctx: ToolContext, result: str, error_name: str) -> str:
+    """Keep the completed process authoritative when its optional audit failed."""
+    if not error_name:
+        return result
+    base = _published_tool_result(ctx, None)
+    if isinstance(base, ToolResult) and base.text == result and base.meta.get("output_audit_unavailable"):
+        return result  # The nested run_script shell already disclosed this gap.
+    text = (f"{result}\n\n⚠️ ARTIFACT_AUDIT_GAP: output audit unavailable after process "
+            f"execution ({error_name}). The process outcome above is unchanged; "
+            "inspect existing files before deciding whether to retry.")
+    if isinstance(base, ToolResult) and base.text == result:
+        return _publish_tool_result(ctx, _replace_tool_result(
+            base, text=text, meta_updates={"output_audit_unavailable": error_name},
+        ))
+    return text
 
 
 def _masked_green_disclosure(ctx: ToolContext, result: str, cmd) -> str:

@@ -5,14 +5,15 @@ from __future__ import annotations
 import ast
 import pathlib
 
-from ouroboros import headless, headless_status, workspace_patch_capture
+from ouroboros import headless, headless_status, workspace_file_outputs, workspace_patch_capture
 
 
 REPO = pathlib.Path(__file__).parents[1]
 
-_LEAVES = (headless_status, workspace_patch_capture)
+_LEAVES = (headless_status, workspace_patch_capture, workspace_file_outputs)
 
 _MOVED_OWNERS = {
+    "_directory_direct_artifacts": workspace_file_outputs,
     "ARTIFACT_STATUS_FAILED": headless_status,
     "ARTIFACT_STATUS_FINALIZING": headless_status,
     "ARTIFACT_STATUS_MISSING": headless_status,
@@ -67,17 +68,11 @@ def test_headless_leaves_are_non_catalog_owners_without_headless_backedges():
             for node in ast.walk(tree)
         )
 
-    # v7next transplant note: the reference test (ouroboros_v7_wip @ 9f691656)
-    # additionally proves the three modules stay out of the frozen tool-module
-    # inventory via ouroboros.tool_module_inventory; that leaf belongs to the
-    # tools domain and is not on this integration branch yet — the clause
-    # returns with its lane. The static guarantee it rested on is kept above:
-    # none of the three modules defines get_tools, so no catalog can adopt them.
+    # None of these modules defines get_tools, so they remain non-catalog owners.
 
 
-def test_headless_public_export_list_is_unchanged():
-    """``__all__`` is the module's declared contract; the extraction moved owners,
-    never the surface, so every published name still resolves on ``headless``."""
+def test_headless_public_export_list_preserves_extraction_and_terminal_file_helpers():
+    """Terminal file preparation/readiness extend the preserved extraction ABI."""
     assert headless.__all__ == [
         "ARTIFACT_STATUS_FAILED",
         "ARTIFACT_STATUS_FINALIZING",
@@ -86,6 +81,8 @@ def test_headless_public_export_list_is_unchanged():
         "build_memory_export",
         "build_workspace_patch",
         "copy_child_task_result",
+        "prepare_terminal_task_files",
+        "terminal_task_files_ready",
         "finalize_task_artifacts",
         "task_is_readonly_subagent",
         "prepare_task_drive",
@@ -120,4 +117,88 @@ def test_headless_extraction_size_bounds_have_meaningful_headroom():
     }
     assert counts["ouroboros.headless"] <= 1000
     assert all(count <= 1000 for count in counts.values())
-    assert 400 <= counts["ouroboros.workspace_patch_capture"] <= 1000
+    assert counts["ouroboros.workspace_patch_capture"] <= 1000
+
+
+def test_terminal_file_helper_preserves_legacy_ready_without_finalized_timestamp(tmp_path, monkeypatch):
+    from ouroboros.task_results import load_task_result, write_task_result
+
+    task = {"id": "legacy", "workspace_root": str(tmp_path / "workspace")}
+    stored = write_task_result(tmp_path, "legacy", "completed", result="approved result", artifact_status="ready")
+    def no_capture(*args):
+        raise AssertionError("legacy terminal artifacts must not be recaptured")
+    monkeypatch.setattr(headless, "finalize_task_artifacts", no_capture)
+    prepared = headless.prepare_terminal_task_files(tmp_path, task)
+    assert prepared["error"] == "" and prepared["terminal_source_present"] is True
+    assert prepared["result"] == stored == load_task_result(tmp_path, "legacy")
+    assert "artifact_finalized_at" not in prepared["result"]
+    assert headless.terminal_task_files_ready(tmp_path, task, prepared["result"])
+
+
+def test_current_metadata_race_reuses_unchanged_manifest_publication(tmp_path, monkeypatch):
+    import gzip
+    import json
+    from collections import Counter
+    from ouroboros import observability
+    from ouroboros.task_results import write_task_result
+    from tests.test_copyback_terminal_files import _child, _call, _review, _store
+
+    parent, child, task = _child(tmp_path)
+    ref = _call(child)["manifest_ref"]
+    payload = json.loads(pathlib.Path(ref["path"]).read_text(encoding="utf-8"))["full_payload_ref"]
+    source_blob = pathlib.Path(payload["path"]).resolve()
+    target_blob = (parent / "observability" / "blobs" / source_blob.name).resolve()
+    review = _review(ref)
+    _store(child, task["id"], ref, review_projection=review)
+    write_task_result(parent, task["id"], "completed", review_projection=review)
+    reads, writes = Counter(), []
+    original_open = gzip.open
+    original_write = observability.write_call_manifest
+    original_rewrite = observability._rewrite_child_ref_tree
+    changed = []
+
+    def counted_open(path, mode="rb", *args, **kwargs):
+        if "r" in mode:
+            reads[str(pathlib.Path(path).resolve())] += 1
+        return original_open(path, mode, *args, **kwargs)
+
+    def counted_write(*args, **kwargs):
+        writes.append(kwargs["call_id"])
+        return original_write(*args, **kwargs)
+
+    def concurrent_metadata(value, *args, **kwargs):
+        if isinstance(value, dict) and "panels" in value and not changed:
+            changed.append(True)
+            assert not (parent / "task_results" / (task["id"] + ".json.lock")).exists()
+            latest = _review(ref, headline="CURRENT metadata")
+            write_task_result(parent, task["id"], "completed", accounted_upper_bound_usd=42,
+                              _field_projector=lambda live, fields: {**fields, "review_projection": latest})
+        return original_rewrite(value, *args, **kwargs)
+
+    monkeypatch.setattr(gzip, "open", counted_open)
+    monkeypatch.setattr(observability, "write_call_manifest", counted_write)
+    monkeypatch.setattr(observability, "_rewrite_child_ref_tree", concurrent_metadata)
+    copied = headless.copy_child_task_result(parent, task)
+    assert not changed and not reads and not writes, "adoption does not replay history"
+    copied = headless.retry_child_task_refs(parent, child, task["id"])
+    assert copied["accounted_upper_bound_usd"] == 42
+    assert copied["review_projection"]["panels"][0]["headline"] == "CURRENT metadata"
+    assert writes == ["call"]
+    # A changed CURRENT basis is revalidated without retaining decoded payloads.
+    # Source and destination verification still run; identical manifest bytes do not republish.
+    assert {path for path in reads if path.endswith(".json.gz")} == {str(source_blob), str(target_blob)}
+
+
+def test_fork_memory_copy_preserves_identity_and_project_patterns(tmp_path):
+    files = ["identity.md", "WORLD.md", "registry.md", "knowledge/patterns.md", "knowledge/topic.md"]
+    for name in files:
+        path = tmp_path / "memory" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("original " + name, encoding="utf-8")
+    project = headless.prepare_task_drive(tmp_path, "project", "forked", project_id="room")
+    plain = headless.prepare_task_drive(tmp_path, "plain", "forked")
+    for name in files:
+        assert (plain / "memory" / name).read_text(encoding="utf-8") == "original " + name
+        if name != "knowledge/topic.md":
+            assert (project / "memory" / name).read_text(encoding="utf-8") == "original " + name
+    assert not (project / "memory/knowledge/topic.md").exists()

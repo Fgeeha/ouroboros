@@ -266,10 +266,9 @@ _CHILD_SHA_RE = re.compile(r"child_result_sha256[\"'=:\s]+([0-9a-f]{64})")
 
 
 def _s6_slot_binder(body: dict) -> str:
-    """Slot = wire model id × tool-bearing shape: the parent loop runs on
-    ``mock-model`` with tools, the supervisor's semantic-duplicate probe runs on the
-    light slot (same slug) WITHOUT tools, and the child runs on ``mock-child`` — so
-    every fixture ordinal is deterministic even while parent and child overlap."""
+    """Bind parent ``mock-model`` and child ``mock-child`` by model and request shape.
+    Tool-less calls keep a separate slot, so an unexpected auxiliary model request
+    is a fixture miss even while parent and child overlap."""
     return f"{body.get('model') or ''}|{'tools' if body.get('tools') else 'plain'}"
 
 
@@ -301,8 +300,6 @@ S6_FIXTURE = {
         "objective": "List the repository root and report the entries you saw.",
         "expected_output": "A short list of repository root entries.",
     }},
-    # The supervisor's admission duplicate-probe (light slot, tool-less).
-    ("root", "mock-model|plain", 1): {"final": "No existing task duplicates this request."},
     ("root", "mock-model|tools", 2): _s6_wait_step,
     ("root", "mock-model|tools", 3): _s6_dispose_step,
     ("root", "mock-model|tools", 4): {"final": f"{S6_PARENT_MARKER}: child absorbed; done."},
@@ -378,7 +375,13 @@ def test_s6_subagent_tree_lineage_quiescence_and_child_result_handoff(
             assert S6_CHILD_MARKER in wait_blob, "child result text never reached the parent"
 
             # Quiescence: the child's terminal task_done precedes the parent's.
-            done_ids = [str(row.get("task_id") or "") for row in oracle.events("task_done")]
+            def terminal_done_ids():
+                rows = oracle.events("task_done")
+                ids = [str(row.get("task_id") or "") for row in rows]
+                return ids if child_id in ids and parent_id in ids else None
+
+            done_ids = wait_until(terminal_done_ids, 60)
+            assert done_ids is not None, done_ids
             assert child_id in done_ids and parent_id in done_ids, done_ids
             assert done_ids.index(child_id) < done_ids.index(parent_id), done_ids
 

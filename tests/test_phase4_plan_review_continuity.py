@@ -191,7 +191,7 @@ def test_compacted_wave_keeps_the_full_blocking_count() -> None:
 @pytest.mark.parametrize("current_ids", [("s1", "s2"), ("s1", "s2", "s3", "s4")])
 def test_continuation_roster_change_degrades_to_fresh_dispatch(tmp_path, current_ids) -> None:
     """A changed reviewer roster is a cache miss, not a validity event: the wave
-    re-dispatches fresh with the self-contained packet and the typed cause."""
+    re-dispatches fresh with the self-contained packet and the typed cause on every packet slot."""
     from ouroboros.review_substrate import ReviewSlot
     from ouroboros.tools.plan_review_artifacts import continuation_inputs, persist_wave
 
@@ -221,7 +221,7 @@ def test_continuation_roster_change_degrades_to_fresh_dispatch(tmp_path, current
         tmp_path, "task-1", {"wave_artifact": ref}, current, user_content="continue",
     )
 
-    assert restarted == "prior_reviewer_assignment_set_changed"
+    assert restarted == {sid: "prior_reviewer_assignment_set_changed" for sid in current_ids}
     assert messages == {} and threads == {}
     assert slots_out == current  # exactly as configured, never rebound to prior rows
 
@@ -250,12 +250,14 @@ def test_continuation_uses_the_currently_configured_slot_pin(tmp_path) -> None:
         tmp_path, "task-1", {"wave_artifact": ref}, [prior], user_content="continue",
     )
 
-    assert restarted == ""
+    assert restarted == {}
     assert threads == {"s1": "thread-1"}
     assert rebound[0].session_profile == "profile-a"
 
 
-def test_agent_session_continuation_restarts_fresh_when_prior_thread_is_missing(tmp_path) -> None:
+def test_agent_session_continuation_without_a_recorded_thread_is_not_a_restart(tmp_path) -> None:
+    """A session slot resumes its sticky thread by its idempotency key: a missing recorded id
+    passes no thread and states no cause (its settled receipt is the disclosure)."""
     from ouroboros.review_substrate import ReviewSlot
     from ouroboros.tools.plan_review_artifacts import continuation_inputs, persist_wave, slot_row
 
@@ -274,7 +276,7 @@ def test_agent_session_continuation_restarts_fresh_when_prior_thread_is_missing(
         tmp_path, "task-1", {"wave_artifact": ref}, [slot], user_content="continue",
     )
 
-    assert restarted == "prior_review_thread_missing:s1"
+    assert restarted == {}
     assert messages == {} and threads == {}
     assert slots_out == [slot]
 
@@ -288,8 +290,8 @@ def test_exact_wave_custody_gaps_degrade_to_a_named_fresh_dispatch(tmp_path) -> 
     slot = ReviewSlot(slot_id="s1", model="model-s1")
 
     for previous, expected in (
-        (None, "prior_exact_wave_missing"),
-        ({"paid": True}, "prior_exact_wave_ref_missing"),
+        (None, {}),  # a first cycle has nothing to continue and discloses nothing
+        ({"paid": True}, {"s1": "prior_exact_wave_ref_missing"}),
     ):
         _slots, messages, threads, restarted = continuation_inputs(
             tmp_path, "task-1", previous, [slot], user_content="continue",
@@ -301,7 +303,7 @@ def test_exact_wave_custody_gaps_degrade_to_a_named_fresh_dispatch(tmp_path) -> 
     _slots, _messages, _threads, restarted = continuation_inputs(
         tmp_path, "task-1", {"wave_artifact": ref}, [slot], user_content="continue",
     )
-    assert restarted.startswith("prior_exact_wave_unreadable:")
+    assert restarted["s1"].startswith("prior_exact_wave_unreadable:")
 
 
 def test_api_chat_continuation_uses_exact_slot_transcript() -> None:
@@ -352,7 +354,7 @@ def test_api_chat_continuation_restarts_fresh_on_invalid_transcript(
         tmp_path, "task-1", {"wave_artifact": ref}, [slot], user_content="continue",
     )
 
-    assert restarted == "prior_api_transcript_invalid:s1"
+    assert restarted == {"s1": "prior_api_transcript_invalid:s1"}
     assert messages == {} and threads == {}
 
 
@@ -937,8 +939,8 @@ def test_roster_change_preserves_undisposed_prior_blocking_findings(_harness) ->
     for actor in wave2["actors"]:
         assert {
             "kind": "capability_delta",
-            "requested": "continuation of prior thread",
-            "effective": "fresh session, full packet",
+            "requested": "continuation of prior transcript",
+            "effective": "fresh full packet",
             "reason": "prior_reviewer_assignment_set_changed",
         } in actor["capability_delta"]
     recorded_prior = next(w for w in state["waves"] if w["cycle_index"] == 1)
@@ -952,10 +954,10 @@ def test_degraded_progress_line_discloses_untrusted_counts(_harness) -> None:
     _harness.progress.clear()
     _call(_harness.make_ctx())
 
-    assert (
-        "📐 plan_task: DEGRADED (0/3 parseable reviewers; counts are untrusted) — "
-        "0 blocking / 0 note / 0 need_evidence; cycles paid 1/2"
-    ) in _harness.progress
+    # Three unparseable answers: the owner line states who answered and nothing else; the
+    # typed reason ("no findings JSON array found …") stays in the Reviews group and the task detail.
+    assert "📐 Plan review: none of the 3 reviewers answered." in _harness.progress
+    assert not any("parseable" in line or "no findings JSON array" in line for line in _harness.progress)
 
 
 def test_clean_progress_line_stays_byte_identical(_harness) -> None:
@@ -965,9 +967,7 @@ def test_clean_progress_line_stays_byte_identical(_harness) -> None:
     _harness.progress.clear()
     _call(_harness.make_ctx())
 
-    assert (
-        "📐 plan_task: GREEN — 0 blocking / 0 note / 0 need_evidence; cycles paid 1/2"
-    ) in _harness.progress
+    assert "📐 Plan review: all 3 reviewers answered — no findings." in _harness.progress
 
 
 def test_session_output_schema_admits_null_in_its_own_optional_fields() -> None:

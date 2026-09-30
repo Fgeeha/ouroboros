@@ -85,7 +85,20 @@ def test_projection_failure_and_torn_ledger_are_not_a_known_zero(tmp_path, monke
 def test_global_remaining_is_disclosed_without_fabricating_a_tree_amount():
     ceiling = task_pacing.CostCeiling(state="active", ceiling_usd=5.0)
     text = task_pacing.wrapup_last_fit_text(None, ceiling, 2.0)
-    assert "spend is unavailable" in text and "global model budget remaining is $2.000" in text
+    assert "spend is unavailable" in text and "$2.00 left across all tasks" in text
+
+
+def test_the_stop_sentence_opens_with_the_bound_that_binds():
+    """An owner whose WALLET ran dry at $125 of a $400 cap must not read a per-task-cap story."""
+    capped = task_pacing.CostCeiling(state="active", ceiling_usd=239.66, root_cap_usd=400.0)
+    wallet = task_pacing.wrapup_last_fit_text(125.661, capped, 21.834)
+    assert wallet.startswith("The shared Total budget is nearly used up: $21.83 left across all tasks.")
+    assert "$125.66 of its own $400.00 cap, so the task cap is not what stopped it" in wallet
+    assert wallet.endswith("Raise Total budget in Settings for more room.")
+    cap = task_pacing.wrapup_last_fit_text(390.0, capped, 500.0)
+    assert cap.startswith("This task's tree spent $390.00 of its own $400.00 cap; the shared Total budget still has $500.00.")
+    assert "Raise Total budget" not in cap
+    assert task_pacing.wrapup_unaffordable_text(125.661, capped, 0.4).startswith("The shared Total budget is nearly used up")
 
 
 def test_local_final_call_path_does_not_request_an_unneeded_wallet_projection(tmp_path, monkeypatch):
@@ -118,6 +131,37 @@ def test_local_soft_landing_keeps_the_same_local_affordability_contract(tmp_path
         assert loop._soft_land_exhausted_ceiling(ctx, ceiling)[0] == "local final"
 
 
+def test_forced_prompt_facts_are_priced_before_the_wrap_up_is_admitted(tmp_path, monkeypatch):
+    """The typed facts block is added INSIDE ``_prepare_forced_prompt``, so the tokens
+    it adds go through the existing wrap-up reservation probe, never around it."""
+    from types import SimpleNamespace
+    from ouroboros import loop
+    from tests.test_tree_cost_ceiling import _ctx
+
+    decision = {"required": True, "status": "advisory_open", "allow": True, "closed": False,
+                "outcome": "DEGRADED", "enforcement": "advisory", "reviewer_slots_degraded": True}
+    ctx = _ctx(active_use_local=True, drive_root=tmp_path, drive_logs=tmp_path / "logs",
+               llm=SimpleNamespace(), llm_trace={"force_plan_decision": decision})
+    priced = []
+    monkeypatch.setattr(task_pacing, "prepared_wrapup_candidate",
+                        lambda _ctx, messages, **_k: (priced.append(messages), (_request(1.5, "local"), messages))[1])
+    monkeypatch.setattr(loop, "_forced_final_answer", lambda *_a, **_k: ("local final", {}, {}))
+    ceiling = task_pacing.resolve_cost_ceiling(10.0, {"cost_hard_stop_pct": 50}, root_cap_usd=0.5)
+    scope = accounting.UsageScope(drive_root=tmp_path, task_id="local-soft", root_task_id="local-soft", global_limit_usd=0.0)
+    with accounting.usage_scope(scope):
+        assert loop._soft_land_exhausted_ceiling(ctx, ceiling)[0] == "local final"
+    (messages,) = priced
+    last = next(m for m in reversed(messages) if m["role"] == "user")
+    assert "[TASK_STATE_FACTS]" in str(last["content"]) and "plan_review_open=true" in str(last["content"])
+    assert "[BUDGET LIMIT]" in str(last["content"])
+    # Nothing to state, nothing priced: a closed gate adds no block to the probe.
+    priced.clear()
+    ctx.llm_trace = {"force_plan_decision": {**decision, "status": "closed", "closed": True}}
+    with accounting.usage_scope(scope):
+        loop._soft_land_exhausted_ceiling(ctx, ceiling)
+    assert "[TASK_STATE_FACTS]" not in str(next(m for m in reversed(priced[0]) if m["role"] == "user")["content"])
+
+
 @pytest.mark.parametrize("root_cap", [None, 50.0])
 def test_live_wallet_triggers_the_existing_final_call_path_without_a_root_cap(tmp_path, monkeypatch, root_cap):
     from types import SimpleNamespace
@@ -148,7 +192,7 @@ def test_live_wallet_triggers_the_existing_final_call_path_without_a_root_cap(tm
         accounting.reserve_attempt(_request(2.0, "another-root"))
         result = loop._check_budget_limits(ctx, 10.0, ceiling)
         assert result[0] == "verified final" and len(admitted) == 1 and len(prepared) == 1
-        assert "global model budget remaining is $2.000" in prepared[0]
+        assert "$2.00 left across all tasks" in prepared[0]
         assert ctx.accumulated_usage["cost_stop_rail"] == "wrapup_reservation_last_fit"
         assert _wrapup_global_remaining() == 0.5
         accounting.release_attempt(admitted[0], "controlled final callback did not send")

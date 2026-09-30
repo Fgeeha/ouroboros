@@ -172,7 +172,7 @@ def test_ui_smoke_agents_panel_list_editor(direct_server_with_data):
                 set_cadence("every_n", "x")
                 save_expecting("Every-N cadence")
                 assert page.locator(".available-subagent-row[data-invalid]").count() == 1
-                fresh.locator('[data-subagent-field="model"]').fill("openai/gpt-5.6-luna")
+                fresh.locator('[data-subagent-field="model"]').fill("openai/gpt-5.6-sol-high")
                 page.wait_for_function(
                     "() => document.querySelector('[data-subagents-validation]').hidden"
                     " && !document.querySelector('.available-subagent-row[data-invalid]')", timeout=5_000)
@@ -247,8 +247,10 @@ def _wizard_step_until(page, predicate_js: str, forward: bool, limit: int = 8) -
             return
         if forward and page.evaluate("() => Boolean(document.getElementById('next-btn')?.disabled)"):
             for selector, value in placeholders.items():
-                if page.locator(selector).count() and not page.input_value(selector):
-                    page.fill(selector, value)
+                # Account discovery can hold Continue while optional API fields stay collapsed.
+                field = page.locator(selector)
+                if field.is_visible() and not field.input_value():
+                    field.fill(value)
         button = "#next-btn" if forward else "#back-btn"
         try:
             # A step may hold its button while it settles (a probe, a preview).

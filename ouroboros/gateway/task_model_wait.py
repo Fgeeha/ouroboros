@@ -6,7 +6,6 @@ import asyncio
 import copy
 import json
 from contextlib import nullcontext
-from functools import partial
 from typing import Any
 
 from starlette.responses import JSONResponse
@@ -24,8 +23,7 @@ def history_wait_row(entry: dict) -> dict | None:
            if key not in {"type", "ts", "task_id", "quota_clock", "is_progress"} and not key.startswith("_")}
     return {"text": "", "role": "system", "ts": str(entry.get("ts") or ""), "is_progress": False,
             "system_type": "task_model_wait", "task_id": str(entry["task_id"]),
-            "model_waits": {str(entry["wait_id"]): row},
-            **({"ephemeral_decision": True} if entry.get("ephemeral_decision") else {})}
+            "model_waits": {str(entry["wait_id"]): row}}
 
 
 def history_wait_overlay(messages: list[dict], owner_limit: int) -> tuple[list[dict], list[dict], bool]:
@@ -110,7 +108,7 @@ def _live_task(task_id: str) -> dict:
         return task
 
 
-def _decide(root: Any, body: dict, *, get_background_model_wait: Any = None) -> JSONResponse:
+def _decide(root: Any, body: dict) -> JSONResponse:
     from ouroboros.gateway.owner_settings import CommitBoundary
     from ouroboros.owner_mailbox import KIND_MODEL_WAIT, write_owner_message
     from supervisor.queue import _task_drive_for_task
@@ -123,26 +121,27 @@ def _decide(root: Any, body: dict, *, get_background_model_wait: Any = None) -> 
     transformation_completed = False
     mailbox_attempted = False
     owner = None
+    operation_wait = False
 
     def phase_owner():
-        if task_id == "bg-consciousness":
-            return get_background_model_wait() if callable(get_background_model_wait) else None
-        from supervisor.active_activity import get_direct_activity_registry
         from ouroboros.post_task_checkpoint import post_task_model_wait
+        from ouroboros.review_operation import review_operation_controller
 
-        return (get_direct_activity_registry().ephemeral_model_wait(root, task_id)
-                or post_task_model_wait(root, task_id))
+        # A paid review operation owns its reviewers' waits, during and after
+        # the author's turn: only its exact live controller may consume them.
+        if operation_wait:
+            return review_operation_controller(root, task_id, wait_id)
+        return post_task_model_wait(root, task_id)
 
     def live_task():
         if owner is None:
+            if operation_wait:
+                raise WaitDecisionRefused("task_not_live")  # never the author's mailbox
             return _live_task(task_id)
-        if owner.closed or phase_owner() is not owner:
+        current = phase_owner()
+        if owner.closed or current is None or (current is not owner and (
+                not getattr(owner, "owner_id", "") or getattr(current, "owner_id", "") != owner.owner_id)):
             raise WaitDecisionRefused("task_not_live")
-        if owner.task.get("_ephemeral_turn"):
-            from ouroboros.cancel_intents import cancel_pending
-
-            if cancel_pending(owner.canonical_root, task_id):
-                raise WaitDecisionRefused("cancel_pending")
         return owner.task
 
     def mutate(wait_id, transform):
@@ -166,9 +165,10 @@ def _decide(root: Any, body: dict, *, get_background_model_wait: Any = None) -> 
         row = mutate(wait_id, discard)
     try:
         task_id, wait_id, action = _action(body)
+        from ouroboros.review_operation import names_review_operation
+
+        operation_wait = names_review_operation(root, task_id, wait_id)
         owner = phase_owner()
-        if task_id == "bg-consciousness" and owner is None:
-            raise WaitDecisionRefused("task_not_live")
         task = live_task()
         attempt = int(task.get("_attempt") or 1)
 
@@ -227,12 +227,21 @@ def _decide(root: Any, body: dict, *, get_background_model_wait: Any = None) -> 
             # Re-check after the optional settings write. A persistent owner
             # choice may have landed even when cancellation now fences the task.
             with owner.lock if owner is not None else nullcontext():
-                task = live_task()
-                control = {**action, "wait_id": wait_id, "task_attempt": attempt}
-                mailbox_attempted = True
-                if not write_owner_message(owner.drive_root if owner is not None else _task_drive_for_task(task, task_id), json.dumps(control), task_id,
-                                           msg_id=f"model_wait:{wait_id}:{action['request_id']}", kind=KIND_MODEL_WAIT):
-                    raise WaitDecisionRefused("mailbox_write_failed", row, 503)
+                if getattr(owner, "consumes_pending_action", False):
+                    # A review operation consumes the claimed row itself (the author's
+                    # mailbox is not its ingress): its controller already applied it, or
+                    # it is still pending before that exact live controller.
+                    row = mutate(wait_id, lambda previous: None)
+                    applied = row.get("applied_request_id") == action["request_id"]
+                    if not applied and (row.get("pending_action") != action or owner.closed):
+                        raise WaitDecisionRefused("task_not_live", row)
+                else:
+                    task = live_task()
+                    control = {**action, "wait_id": wait_id, "task_attempt": attempt}
+                    mailbox_attempted = True
+                    if not write_owner_message(owner.drive_root if owner is not None else _task_drive_for_task(task, task_id), json.dumps(control), task_id,
+                                               msg_id=f"model_wait:{wait_id}:{action['request_id']}", kind=KIND_MODEL_WAIT):
+                        raise WaitDecisionRefused("mailbox_write_failed", row, 503)
         return JSONResponse({"ok": True, "decision_id": body["decision_id"], "request_id": action["request_id"],
                              "state": row["state"], "wait": row, "duplicate": duplicate, "applied": applied,
                              "saved": saved()},
@@ -247,11 +256,9 @@ def _decide(root: Any, body: dict, *, get_background_model_wait: Any = None) -> 
                           saved=saved())
 
 
-async def answer_model_wait_decision(
-    root: Any, body: dict, *, get_background_model_wait: Any = None,
-) -> tuple[int, dict]:
+async def answer_model_wait_decision(root: Any, body: dict) -> tuple[int, dict]:
     """Share the existing wait effect and settings-writer receipts across transports."""
-    decide = partial(_decide, get_background_model_wait=get_background_model_wait)
+    decide = _decide
     if body.get("persist_role") is True:
         from ouroboros.gateway.settings import _run_settings_writer
 

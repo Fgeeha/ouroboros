@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from ouroboros.headless import retry_child_task_refs
 import gzip
 import json
 import pathlib
@@ -85,6 +86,7 @@ def test_copyback_promotes_trace_manifest_and_blobs_before_headless_gc(tmp_path)
     )
 
     copied = copy_child_task_result(parent, {"id": task_id, "drive_root": str(child)})
+    copied = retry_child_task_refs(parent, child, task_id)
 
     assert copied is not None
     assert copied["child_ref_promotion"]["status"] == "complete"
@@ -104,7 +106,7 @@ def test_copyback_promotes_trace_manifest_and_blobs_before_headless_gc(tmp_path)
         "result"
     ] == "exact tool result"
 
-    report = prune_headless_task_drives(parent, retention_days=7, now=_future_now())
+    report = prune_headless_task_drives(parent, retention_days=7, now=_future_now(), live=lambda _task: False)
     assert report["pruned"][0]["task_id"] == task_id
     assert not child.exists()
     assert read_blob_ref(parent, promoted_manifest["full_payload_ref"])["prompt"] == "exact prompt"
@@ -176,6 +178,7 @@ def test_pipeline_loop_outcome_trace_refs_are_rebased_and_readable_after_gc(tmp_
     )
 
     copied = copy_child_task_result(parent, {"id": task_id, "drive_root": str(child)})
+    copied = retry_child_task_refs(parent, child, task_id)
 
     assert copied is not None
     nested_refs = copied["loop_outcome"]["trace_refs"]
@@ -183,8 +186,12 @@ def test_pipeline_loop_outcome_trace_refs_are_rebased_and_readable_after_gc(tmp_
     nested_tool = nested_refs["tool_call_refs"][0]["manifest_ref"]
     assert pathlib.Path(nested_request["path"]).is_relative_to(parent / "observability")
     assert pathlib.Path(nested_tool["path"]).is_relative_to(parent / "observability")
-    prune_headless_task_drives(parent, retention_days=0, now=_future_now())
-    assert not child.exists()
+    # A root whose post-task synthesis is still owed keeps its drive (and mailbox) until it settles.
+    report = prune_headless_task_drives(parent, retention_days=0, now=_future_now(), live=lambda _task: False)
+    assert report["custody_pending"] == [{"task_id": task_id, "reason": "post_work_open"}] and child.exists()
+    write_task_result(parent, task_id, "completed", root_phase_checkpoint={"post_task_synthesis": "completed"})
+    report = prune_headless_task_drives(parent, retention_days=0, now=_future_now(), live=lambda _task: False)
+    assert not child.exists(), report
     assert read_blob_ref(parent, _manifest(nested_request)["full_payload_ref"])[
         "messages"
     ][0]["content"] == "exact pipeline prompt"
@@ -253,12 +260,13 @@ def test_real_truncated_tool_source_envelope_remains_actor_readable_after_gc(tmp
     )
 
     copied = copy_child_task_result(parent, {"id": task_id, "drive_root": str(child)})
+    copied = retry_child_task_refs(parent, child, task_id)
 
     assert copied is not None
     request_ref = copied["loop_outcome"]["trace_refs"]["llm_call_refs"][0][
         "request_ref"
     ]
-    prune_headless_task_drives(parent, retention_days=0, now=_future_now())
+    prune_headless_task_drives(parent, retention_days=0, now=_future_now(), live=lambda _task: False)
     payload = read_blob_ref(parent, _manifest(request_ref)["full_payload_ref"])
     promoted_ref = _source_ref_from_visible_result(payload["messages"][0]["content"])
     assert promoted_ref == produced_ref
@@ -301,6 +309,7 @@ def test_task_source_read_contract_mismatch_is_typed_unavailable(tmp_path, misma
     )
 
     copied = copy_child_task_result(parent, {"id": task_id, "drive_root": str(child)})
+    copied = retry_child_task_refs(parent, child, task_id)
 
     assert copied is not None
     gap = copied["review_evidence"]["exact_source_ref"]
@@ -310,7 +319,7 @@ def test_task_source_read_contract_mismatch_is_typed_unavailable(tmp_path, misma
         parent / "task_results" / "artifacts" / task_id / pathlib.Path(ref["path"])
     ).exists()
     assert prune_headless_task_drives(
-        parent, retention_days=0, now=_future_now()
+        parent, retention_days=0, now=_future_now(), live=lambda _task: False
     )["pruned"]
 
 
@@ -344,6 +353,7 @@ def test_copyback_promotes_service_full_log_refs_in_durable_evidence_and_tool_pa
     )
 
     copied = copy_child_task_result(parent, {"id": task_id, "drive_root": str(child)})
+    copied = retry_child_task_refs(parent, child, task_id)
 
     assert copied is not None
     evidence_ref = copied["verification_ledger"]["entries"][0]["services"][0][
@@ -355,7 +365,7 @@ def test_copyback_promotes_service_full_log_refs_in_durable_evidence_and_tool_pa
     nested_ref = json.loads(tool_payload["result"])["full_log_ref"]
     assert read_blob_ref(parent, nested_ref, expected_kind="txt") == "READY\nfull service log\n"
 
-    prune_headless_task_drives(parent, retention_days=0, now=_future_now())
+    prune_headless_task_drives(parent, retention_days=0, now=_future_now(), live=lambda _task: False)
     assert not child.exists()
     assert read_blob_ref(parent, evidence_ref, expected_kind="txt").endswith("service log\n")
     assert read_blob_ref(parent, nested_ref, expected_kind="txt").startswith("READY")
@@ -383,30 +393,32 @@ def test_interrupted_live_ref_promotion_blocks_gc_until_idempotent_retry(
         artifact_status="ready",
         trace_refs={"tool_call_refs": [{"manifest_ref": trace["manifest_ref"]}]},
     )
-    real = observability.promote_call_manifest_ref
+    real = observability.write_call_manifest
     monkeypatch.setattr(
         observability,
-        "promote_call_manifest_ref",
+        "write_call_manifest",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("interrupted copy")),
     )
 
     copied = copy_child_task_result(parent, {"id": task_id, "drive_root": str(child)})
+    copied = retry_child_task_refs(parent, child, task_id)
 
     assert copied is not None
     assert copied["child_ref_promotion"]["status"] == "incomplete"
     assert copied["child_ref_promotion"]["pending_refs"]
-    assert remove_subagent_task_drive(parent, task_id) is False
-    report = prune_headless_task_drives(parent, retention_days=0, now=_future_now())
+    assert remove_subagent_task_drive(parent, task_id, live=lambda _task: False) is False
+    report = prune_headless_task_drives(parent, retention_days=0, now=_future_now(), live=lambda _task: False)
     assert report["pruned"] == []
-    assert report["skipped"][0]["reason"] == "child_refs_unpromoted"
+    assert report["skipped"][0]["reason"] == "child_refs_pending"
     assert child.exists()
 
-    monkeypatch.setattr(observability, "promote_call_manifest_ref", real)
+    monkeypatch.setattr(observability, "write_call_manifest", real)
     retried = copy_child_task_result(parent, {"id": task_id, "drive_root": str(child)})
+    retried = retry_child_task_refs(parent, child, task_id)
     assert retried is not None
     assert retried["child_ref_promotion"]["status"] == "complete"
     assert retried["child_ref_promotion"]["pending_refs"] == []
-    assert prune_headless_task_drives(parent, retention_days=0, now=_future_now())["pruned"]
+    assert prune_headless_task_drives(parent, retention_days=0, now=_future_now(), live=lambda _task: False)["pruned"]
 
 
 def test_digest_mismatch_becomes_typed_unavailable_and_does_not_pin_drive(tmp_path):
@@ -425,6 +437,7 @@ def test_digest_mismatch_becomes_typed_unavailable_and_does_not_pin_drive(tmp_pa
     )
 
     copied = copy_child_task_result(parent, {"id": task_id, "drive_root": str(child)})
+    copied = retry_child_task_refs(parent, child, task_id)
 
     assert copied is not None
     unavailable = copied["trace_refs"]["tool_call_refs"][0]["redacted_projection_ref"]
@@ -433,7 +446,7 @@ def test_digest_mismatch_becomes_typed_unavailable_and_does_not_pin_drive(tmp_pa
     assert "path" not in unavailable
     assert copied["child_ref_promotion"]["unavailable_refs"]
     assert copied["child_ref_promotion"]["pending_refs"] == []
-    assert prune_headless_task_drives(parent, retention_days=0, now=_future_now())["pruned"]
+    assert prune_headless_task_drives(parent, retention_days=0, now=_future_now(), live=lambda _task: False)["pruned"]
 
 
 def test_concurrent_copyback_is_idempotent_and_copies_only_referenced_source_handle(
@@ -493,7 +506,7 @@ def test_concurrent_copyback_is_idempotent_and_copies_only_referenced_source_han
     with ThreadPoolExecutor(max_workers=2) as pool:
         first, second = list(
             pool.map(
-                lambda _ordinal: copy_child_task_result(parent, task),
+                lambda _ordinal: (copy_child_task_result(parent, task), retry_child_task_refs(parent, child, task_id))[1],
                 range(2),
             )
         )
@@ -550,6 +563,7 @@ def test_copyback_source_handle_promotion_survives_a_lost_write_race(tmp_path, m
     monkeypatch.setattr(artifacts_module, "store_actor_source_bytes", _losing_store)
 
     copied = copy_child_task_result(parent, {"id": task_id, "drive_root": str(child)})
+    copied = retry_child_task_refs(parent, child, task_id)
 
     promotion = copied["child_ref_promotion"]
     assert promotion["status"] == "complete"
@@ -624,13 +638,14 @@ def test_legacy_missing_child_ref_is_typed_gap_without_permanent_retention(tmp_p
     )
 
     copied = copy_child_task_result(parent, {"id": task_id, "drive_root": str(child)})
+    copied = retry_child_task_refs(parent, child, task_id)
 
     assert copied is not None
     gap = copied["trace_refs"]["tool_call_refs"][0]["redacted_projection_ref"]
     assert gap["availability"] == "unavailable"
     assert gap["reason"] == "source_missing"
     assert copied["child_ref_promotion"]["status"] == "complete"
-    assert prune_headless_task_drives(parent, retention_days=0, now=_future_now())["pruned"]
+    assert prune_headless_task_drives(parent, retention_days=0, now=_future_now(), live=lambda _task: False)["pruned"]
 
 
 def test_startup_sweep_retries_only_pending_refs_then_prunes_without_manual_copyback(
@@ -670,20 +685,20 @@ def test_startup_sweep_retries_only_pending_refs_then_prunes_without_manual_copy
             ]
         },
     )
-    real = observability.promote_call_manifest_ref
+    real = observability.write_call_manifest
 
     def _interrupt_pending(*args, **kwargs):
-        ref = args[2] if len(args) > 2 else kwargs.get("ref") or {}
-        if ref.get("call_id") == "startup-retry-pending":
+        if kwargs.get("call_id") == "startup-retry-pending":
             raise OSError("first copy interrupted")
         return real(*args, **kwargs)
 
     monkeypatch.setattr(
         observability,
-        "promote_call_manifest_ref",
+        "write_call_manifest",
         _interrupt_pending,
     )
     copied = copy_child_task_result(parent, {"id": task_id, "drive_root": str(child)})
+    copied = retry_child_task_refs(parent, child, task_id)
     assert copied is not None
     assert copied["child_ref_promotion"]["status"] == "incomplete"
 
@@ -705,12 +720,15 @@ def test_startup_sweep_retries_only_pending_refs_then_prunes_without_manual_copy
             "canonical_newer": True,
         },
     )
-    monkeypatch.setattr(observability, "promote_call_manifest_ref", real)
+    monkeypatch.setattr(observability, "write_call_manifest", real)
     # The sweep reads its drive root from its owner module (v7 server split).
     monkeypatch.setattr(server_maintenance, "DATA_DIR", parent)
     monkeypatch.setenv("OUROBOROS_GC_RETENTION_DAYS", "1")
+    # This test process owns no supervisor maps: it states the absence the probe proves in production.
+    monkeypatch.setattr("supervisor.queue.task_settlement_liveness", lambda _task: False)
 
-    server_maintenance._startup_prune_sweeps()
+    # The retry and the settlement ride the off-loop drive-custody pass, never startup.
+    server_maintenance._run_drive_custody_pass()
 
     settled = load_task_result(parent, task_id) or {}
     assert settled["child_ref_promotion"]["status"] == "complete"
@@ -758,28 +776,32 @@ def test_startup_prune_retries_missing_pending_source_into_typed_gap(
         artifact_status="ready",
         trace_refs={"tool_call_refs": [{"manifest_ref": trace["manifest_ref"]}]},
     )
-    real = observability.promote_call_manifest_ref
+    real = observability.write_call_manifest
     monkeypatch.setattr(
         observability,
-        "promote_call_manifest_ref",
+        "write_call_manifest",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("interrupted")),
     )
     copied = copy_child_task_result(parent, {"id": task_id, "drive_root": str(child)})
+    copied = retry_child_task_refs(parent, child, task_id)
     assert copied is not None
     assert copied["child_ref_promotion"]["status"] == "incomplete"
     pathlib.Path(trace["manifest_ref"]["path"]).unlink()
-    monkeypatch.setattr(observability, "promote_call_manifest_ref", real)
+    monkeypatch.setattr(observability, "write_call_manifest", real)
 
+    # Exact manifest custody landed before the projection write failed. Losing
+    # the old locator does not lose that preserved version; retry can finish.
+    assert observability.retry_pending_child_ref_promotions(parent)["completed"] == [task_id]
     report = prune_headless_task_drives(
-        parent, retention_days=0, now=_future_now()
+        parent, retention_days=0, now=_future_now(), live=lambda _task: False
     )
 
-    assert report["promotion_retry"]["completed"] == [task_id]
     assert report["pruned"][0]["task_id"] == task_id
     settled = load_task_result(parent, task_id) or {}
-    gap = settled["trace_refs"]["tool_call_refs"][0]["manifest_ref"]
-    assert gap["availability"] == "unavailable"
-    assert gap["reason"] == "source_missing"
+    recovered = settled["trace_refs"]["tool_call_refs"][0]["manifest_ref"]
+    manifest = observability.read_call_manifest_ref(parent, recovered, task_id=task_id)
+    assert observability.read_blob_ref(parent, manifest["full_payload_ref"])["result"] == "lost before retry"
+    assert settled["child_ref_promotion"]["unavailable_refs"] == []
     assert settled["child_ref_promotion"]["status"] == "complete"
 
 
@@ -790,21 +812,42 @@ def test_periodic_maintenance_invokes_pending_ref_promotion_sweep(
     import ouroboros.server_maintenance as server_maintenance
     import supervisor.task_lifecycle as task_lifecycle
     import supervisor.terminal_delivery as terminal_delivery
+    import threading
 
-    calls: list[pathlib.Path] = []
+    calls: list[tuple[pathlib.Path, str]] = []
+    threads: list = []
     # The cadence state and drive root live in the maintenance owner (v7 server split).
+    # The retry is history-sized, so it rides the 300 s reconcile block on its own
+    # daemon thread and latch — never the 20 s cancel sweep, which runs beside it here.
     monkeypatch.setattr(server_maintenance, "DATA_DIR", tmp_path)
     monkeypatch.setattr(server_maintenance.time, "time", lambda: 10_000.0)
     monkeypatch.setattr(server_maintenance, "_LAST_CANCEL_INTENT_SWEEP", [0.0])
+    monkeypatch.setattr(server_maintenance, "_CANCEL_INTENT_SWEEP_LOCK", threading.Lock())
+    monkeypatch.setattr(server_maintenance, "_RECONCILE_SWEEP_LOCK", threading.Lock())
+    monkeypatch.setattr(server_maintenance, "_periodic_zombie_reconcile", lambda **kwargs: None)
     monkeypatch.setattr(task_lifecycle, "sweep_cancel_intents", lambda: {})
     monkeypatch.setattr(terminal_delivery, "replay_pending_deliveries", lambda _root: None)
     monkeypatch.setattr(
         observability,
         "retry_pending_child_ref_promotions",
-        lambda root: calls.append(pathlib.Path(root)) or {},
+        lambda root, **_kw: calls.append((pathlib.Path(root), threading.current_thread().name)) or {},
         raising=False,
     )
 
-    server_maintenance._periodic_supervisor_maintenance([10_000.0], [10_000.0])
+    def tracked(**kwargs):
+        thread = threading.Thread(**kwargs)
+        threads.append(thread)
+        return thread
 
-    assert calls == [tmp_path]
+    monkeypatch.setattr(server_maintenance, "threading", SimpleNamespace(Thread=tracked))
+
+    server_maintenance._periodic_supervisor_maintenance([10_000.0], [0.0])
+
+    for thread in threads:
+        thread.join(5)
+    assert [thread.name for thread in threads] == ["terminal-maintenance", "reconcile-maintenance"]
+    assert calls == [(tmp_path, "reconcile-maintenance")]
+    assert server_maintenance._RECONCILE_SWEEP_LOCK.acquire(timeout=2)
+    server_maintenance._RECONCILE_SWEEP_LOCK.release()
+    assert server_maintenance._CANCEL_INTENT_SWEEP_LOCK.acquire(timeout=2)
+    server_maintenance._CANCEL_INTENT_SWEEP_LOCK.release()

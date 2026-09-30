@@ -129,6 +129,65 @@ def _capture(page, browser_name, width, state):
         page.screenshot(path=str(target / f"skills-{browser_name}-{width}-{state}.png"))
 
 
+@pytest.mark.parametrize("browser_name,width", [("chromium", 1440), ("webkit", 390)])
+def test_presence_workspace_save_and_runtime_reset_keep_owner_folder(skills_browser, browser_name, width):
+    browser = getattr(skills_browser, browser_name).launch(headless=True)
+    try:
+        page = browser.new_page(viewport={"width": width, "height": 900})
+        state, installed = _open_skills(page)
+        runtime = {
+            "defaults": {"model_slot": "main", "inline_max_rounds": 10},
+            "overrides": {}, "workspace_root": "/work/current",
+            "state_fingerprint": "a" * 64,
+        }
+        state["extensions"] = [{**installed, "enabled": True, "review_status": "clean",
+            "review_gate": {"executable_review": True}, "presence_runtime": runtime}]
+        writes = []
+
+        def save(route):
+            body = route.request.post_data_json
+            assert body["expected_state_fingerprint"] == runtime["state_fingerprint"]
+            writes.append(body)
+            runtime["overrides"] = body["runtime_overrides"]
+            if "workspace_root" in body:
+                runtime["workspace_root"] = body["workspace_root"]
+            runtime["state_fingerprint"] = str(len(writes)) * 64
+            route.fulfill(content_type="application/json", body=json.dumps({
+                "ok": True, "skill": "weather", "presence_runtime": runtime,
+            }))
+
+        page.route("**/api/owner/skills/weather/presence-runtime", save)
+        page.goto("http://skills.test/", wait_until="networkidle")
+        card = page.locator('.skills-card[data-skill="weather"]')
+        card.locator('.skills-details > summary').click()
+        form = card.locator('[data-presence-runtime-form]')
+        folder = form.locator('[name="workspace_root"]')
+        assert folder.input_value() == "/work/current"
+        selected = "/work/shared documents/quarterly reports"
+        folder.fill(selected)
+        form.locator('[name="model_slot"]').select_option("light")
+        _capture(page, browser_name, width, "presence-workspace-edit")
+        assert folder.bounding_box()["width"] > 200
+        form.locator('button[type="submit"]').click()
+        page.wait_for_function("document.querySelector('[data-presence-runtime-form]').dataset.stateFingerprint === '1'.repeat(64)")
+        assert writes[0]["workspace_root"] == selected
+        assert writes[0]["runtime_overrides"]["model_slot"] == "light"
+        if not form.is_visible():
+            card.locator('.skills-details > summary').click()
+        assert folder.input_value() == selected
+        form.locator('[data-presence-runtime-reset]').click()
+        page.wait_for_function("document.querySelector('[data-presence-runtime-form]').dataset.stateFingerprint === '2'.repeat(64)")
+        assert "workspace_root" not in writes[1]
+        assert writes[1]["runtime_overrides"] == {"model_slot": None, "inline_max_rounds": None}
+        if not form.is_visible():
+            card.locator('.skills-details > summary').click()
+        assert folder.input_value() == selected
+        _capture(page, browser_name, width, "presence-workspace-saved")
+        assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+    finally:
+        browser.close()
+
+
 @pytest.mark.parametrize("browser_name", ["chromium", "webkit"])
 @pytest.mark.parametrize("width", [390, 1440])
 def test_skills_failure_recovery_and_current_catalog_refresh(skills_browser, browser_name, width):
@@ -301,6 +360,58 @@ def test_skills_late_enrichment_preserves_presence_and_portalled_menu(skills_bro
         _release_read(state, '/api/state', {'github_token_configured': False})
         _release_read(state, '/api/skills/lifecycle-queue', {'events': [ghost]})
         assert page.locator('#skills-list').inner_html() == before
+    finally:
+        _close_pending_browser(browser, state)
+
+
+@pytest.mark.parametrize("browser_name", ["chromium", "webkit"])
+@pytest.mark.parametrize("menu_open", [False, True], ids=["menu-closed", "menu-open"])
+def test_skills_list_never_waits_for_the_hub_and_late_hub_facts_patch_in_place(skills_browser, browser_name, menu_open):
+    """The list paints from the local read alone; hub facts unknown at that moment
+    (null) arrive with ONE re-read after the catalog lands — same card, same menu."""
+    browser = getattr(skills_browser, browser_name).launch(headless=True)
+    try:
+        page = browser.new_page(viewport={"width": 1280, "height": 900})
+        state, installed = _open_skills(page)
+        hub = {**installed, "source": "ouroboroshub", "payload_root": "skills/ouroboroshub/weather",
+               "review_gate": {"executable_review": False}, "review_stale": False, "review_profile": "",
+               "grants": {}, "permissions": [], "content_hash": "c" * 64, "published": None}
+        state["extensions"] = [{**hub, "official_hub_verified": None, "owner_attestable": None}]
+        state["hold_paths"] = {"/api/marketplace/ouroboroshub/catalog"}
+        page.goto("http://skills.test/", wait_until="domcontentloaded")
+        card = page.locator('.skills-card[data-skill="weather"]')
+        card.wait_for()
+        assert state["requests"].count(("GET", "/api/extensions")) == 1
+        assert card.locator('.skills-attest-review').count() == 0
+        assert "Published" not in card.inner_text()
+        page.evaluate("window.keptCard = document.querySelector('.skills-card[data-skill=weather]')")
+        menu = '.skills-card[data-skill="weather"] .skills-card-menu-dialog'
+        if menu_open:
+            card.locator('[data-skill-menu-trigger]').click()
+            menu = 'body > .skills-card-menu-dialog'
+            page.evaluate("window.keptMenu = document.querySelector('body > .skills-card-menu-dialog')")
+        state["extensions"] = [{**hub, "official_hub_verified": True, "owner_attestable": True}]
+        catalog = {"slug": "weather", "sanitized_name": "weather", "display_name": "Weather",
+                   "latest_version": "1.0", "summary": "Local forecast", "official": True}
+        _release_read(state, "/api/marketplace/ouroboroshub/catalog", {"results": [catalog]})
+        page.wait_for_selector(f'{menu} .skills-attest-review', state="attached")
+        page.wait_for_function("document.querySelector('.skills-card[data-skill=weather]').textContent.includes('Published')")
+        assert state["requests"].count(("GET", "/api/extensions")) == 2
+        assert page.evaluate("keptCard === document.querySelector('.skills-card[data-skill=weather]')")
+        order = page.evaluate(f"[...document.querySelector('{menu}').children].map(el => el.className)")
+        assert sum("skills-attest-review" in name for name in order) == 1
+        assert next(i for i, name in enumerate(order) if "skills-attest-review" in name) \
+            < next(i for i, name in enumerate(order) if "skills-update" in name)
+        if menu_open:
+            assert page.evaluate("keptMenu === document.querySelector('body > .skills-card-menu-dialog')")
+            page.keyboard.press("Escape")
+        page.wait_for_function("() => !document.querySelector('#skills-refresh').disabled")
+        _capture(page, browser_name, 1280, f"late-hub-facts-{'open' if menu_open else 'closed'}")
+        # A settled view has nothing pending: Refresh reads the listing once.
+        state["hold_paths"].clear()
+        before = state["requests"].count(("GET", "/api/extensions"))
+        _refresh(page)
+        assert state["requests"].count(("GET", "/api/extensions")) == before + 1
     finally:
         _close_pending_browser(browser, state)
 

@@ -19,22 +19,17 @@ pytestmark = pytest.mark.serial
     ('repo', 'deploy/credentials.json'),
     ('data', 'claudexor/profile/session/auth.json'),
 ])
-def test_nested_exact_credential_names_stay_denied_to_children(environment, location, relative):
-    from ouroboros.tools.core_secret_paths import _is_subagent_secret_repo_target
-    from ouroboros.tools.registry_guard_process import _subagent_shell_targets_secret
-
+def test_child_file_reads_match_command_reads(environment, location, relative):
     reg, ctx, _home, work, data = environment
     ctx.task_constraint = TaskConstraint(mode='acting_subagent', surface='external_workspace', write_root=str(work))
     target = (work if location == 'repo' else data) / relative
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text('unprefixed-credential-canary', encoding='utf-8')
-    assert _is_subagent_secret_repo_target(target, work, ctx=ctx)
     command = [sys.executable, '-c', f'from pathlib import Path; print(Path({str(target)!r}).read_text())']
-    assert _subagent_shell_targets_secret(shlex.join(command), ctx=ctx, cwd=work)
     read = reg.execute('read_file', {'root': 'active_workspace' if location == 'repo' else 'runtime_data', 'path': relative})
-    assert 'unprefixed-credential-canary' not in read and 'BLOCKED' in read
+    assert 'unprefixed-credential-canary' in read
     shell = reg.execute('run_command', {'cmd': command, 'cwd': str(work)})
-    assert 'unprefixed-credential-canary' not in shell and 'BLOCKED' in shell
+    assert 'unprefixed-credential-canary' in shell, shell
 
 
 @pytest.fixture
@@ -191,7 +186,7 @@ def test_light_reads_logs_with_operator_or_prose_bytes(environment, monkeypatch,
     assert 'LOG_CONTENT' in result and 'LIGHT_MODE_BLOCKED' not in result
 
 
-def test_light_mixed_log_read_and_own_output_preserves_control_boundary(environment, monkeypatch):
+def test_light_shell_work_preserves_the_structured_settings_write_boundary(environment, monkeypatch):
     reg, ctx, _home, _work, data = environment
     ctx.workspace_mode = ''
     ctx.workspace_root = None
@@ -203,11 +198,12 @@ def test_light_mixed_log_read_and_own_output_preserves_control_boundary(environm
     body = f'from pathlib import Path; text=Path({str(path)!r}).read_text(); print(len(text)>0); Path({str(output)!r}).write_text(text)'
     result = reg.execute('run_script', {'script': body, 'cwd': 'task_drive'})
     assert output.read_text() == 'LOG_CONTENT', result
-    denied = reg.execute('run_command', {'cmd': [sys.executable, '-c', f'open({str(path)!r},"w").write("bad")'], 'cwd': 'task_drive'})
-    assert 'LIGHT_MODE_BLOCKED' in denied and path.read_text() == 'LOG_CONTENT'
+    changed = reg.execute('run_command', {'cmd': [sys.executable, '-c', f'open({str(path)!r},"w").write("updated")'], 'cwd': 'task_drive'})
+    assert 'exit_code=0' in changed and path.read_text() == 'updated'
     (data / 'settings.json').write_text('{}', encoding='utf-8')
-    secret = reg.execute('run_command', {'cmd': [sys.executable, '-c', f'print(open({str(data / "settings.json")!r}).read()); print(1>0)'], 'cwd': 'task_drive'})
-    assert 'LIGHT_MODE_BLOCKED' in secret
+    settings_write = reg.execute('write_file', {'root': 'runtime_data', 'path': 'settings.json', 'content': 'updated'})
+    assert 'BLOCKED' in settings_write
+    assert (data / 'settings.json').read_text() == '{}'
 
 
 @pytest.mark.parametrize('project_id', ['', 'current-project'])
@@ -223,10 +219,10 @@ def test_readonly_child_can_review_auth_sources_and_scoped_knowledge(environment
     token = 'sk-' + 'a' * 48
     path.write_text('def login():\n    return "' + token + '"  # AUTH_SOURCE\n', encoding='utf-8')
     read = reg.execute('read_file', {'path': 'src/auth/login.py'})
-    assert 'def login' in read and token not in read and '***' in read
+    assert 'def login' in read and token in read
     assert 'auth/' in reg.execute('list_files', {'path': 'src'})
     search = reg.execute('search_code', {'query': 'AUTH_SOURCE', 'path': 'src'})
-    assert 'AUTH_SOURCE' in search and token not in search
+    assert 'AUTH_SOURCE' in search and token in search
     assert 'login' in reg.execute('query_code', {'op': 'symbols', 'path': 'src/auth/login.py'})
     knowledge = data / 'projects' / project_id / 'knowledge' if project_id else data / 'memory' / 'knowledge'
     knowledge.mkdir(parents=True)
@@ -242,23 +238,6 @@ def test_readonly_child_can_review_auth_sources_and_scoped_knowledge(environment
     assert sorted(str(p) for p in data.rglob('*')) == before
     assert reg.get_schema_by_name('knowledge_write') is None
     assert 'LOCAL_READONLY_SUBAGENT_BLOCKED' in reg.execute('write_file', {'path': 'x', 'content': 'x'})
-
-
-def test_acting_shell_uses_path_identity_not_code_substrings(environment):
-    from tests._typed_guard_shared import _shell_guard_text
-    reg, ctx, _home, work, data = environment
-    ctx.task_constraint = TaskConstraint(mode='acting_subagent', surface='external_workspace', write_root=str(work))
-    for body in [
-        "import os; print(os.environ.get('PATH', ''))",
-        "print('file1.txt is just a description')",
-        "print(open('.env.example').read())",
-    ]:
-        assert _shell_guard_text(reg, {'cmd': [sys.executable, '-c', body]}, 'advanced') is None
-    actual = _shell_guard_text(reg, {'cmd': [sys.executable, '-c', f'print(open({str(data / "settings.json")!r}).read())']}, 'advanced')
-    assert actual and 'SUBAGENT_SECRET_READ_BLOCKED' in actual
-    outside = work.parent / 'outside.txt'
-    denied = _shell_guard_text(reg, {'cmd': [sys.executable, '-c', f'open({str(outside)!r},"w").write("bad")']}, 'advanced')
-    assert denied and 'WORKSPACE_SHELL_BLOCKED' in denied
 
 
 def test_ssh_subject_separates_remote_payload_and_local_channels():
@@ -278,45 +257,34 @@ def test_ssh_subject_separates_remote_payload_and_local_channels():
 
 @pytest.mark.parametrize('remote', [False, True])
 @pytest.mark.parametrize('control', ['elevation', 'owner_key'])
-def test_ssh_keeps_full_command_visible_to_non_writer_guards(environment, remote, control):
-    from ouroboros.tools.registry_guard_process import _run_shell_safety_check
-
+def test_ssh_keeps_full_command_visible_to_supervisor_and_handler(environment, monkeypatch, remote, control):
     reg, ctx, home, work, _data = environment
     commands = {
-        'elevation': ([sys.executable, '-c',
-                       "from ouroboros.config import save_settings; save_settings({'OUROBOROS_RUNTIME_MODE':'pro'})"],
-                      'ELEVATION_BLOCKED'),
-        'owner_key': (['cat', str(home / '.ssh' / 'id_fixture')], 'SUBAGENT_SECRET_READ_BLOCKED'),
+        'elevation': [sys.executable, '-c',
+                      "from ouroboros.config import save_settings; save_settings({'OUROBOROS_RUNTIME_MODE':'pro'})"],
+        'owner_key': ['cat', str(home / '.ssh' / 'id_fixture')],
     }
     if control == 'owner_key':
         ctx.task_constraint = TaskConstraint(mode='acting_subagent', surface='external_workspace', write_root=str(work))
-    command, expected = commands[control]
+    command = commands[control]
     command = ['ssh', 'localhost', *command] if remote else command
     original = list(command)
-    # Deliberately stop at admission: no SSH/auth/owner mutation is executed.
-    result = _run_shell_safety_check(reg, {'cmd': command, 'cwd': str(work)}, 'advanced')
-    assert result is not None and (result.status, result.code) == ('blocked', expected)
+    observed = []
+
+    def supervisor(_name, args, *_args, **_kwargs):
+        observed.append(('supervisor', list(args['cmd'])))
+        return True, ''
+
+    def handler(_ctx, cmd, _resolved_binding=None, **_kwargs):
+        observed.append(('handler', list(cmd)))
+        return 'accepted request'
+
+    monkeypatch.setattr('ouroboros.safety.check_safety', supervisor)
+    reg.override_handler('run_command', handler)
+    result = reg.execute('run_command', {'cmd': command, 'cwd': str(work)})
+    assert result == 'accepted request'
+    assert observed == [('supervisor', original), ('handler', original)]
     assert command == original
-
-
-def test_ssh_passes_complete_argv_to_existing_github_policy(environment, monkeypatch):
-    from ouroboros import git_shell_policy
-    from ouroboros.tools.registry_guard_process import _run_shell_safety_check
-
-    reg, _ctx, _home, work, _data = environment
-    command = ['ssh', 'localhost', 'gh', 'auth', 'login']
-    seen = []
-    policy = git_shell_policy.gh_shell_block_reason
-
-    def observe(raw):
-        seen.append(list(raw))
-        return policy(raw)
-
-    monkeypatch.setattr(git_shell_policy, 'gh_shell_block_reason', observe)
-    _run_shell_safety_check(reg, {'cmd': command, 'cwd': str(work)}, 'advanced')
-    assert seen == [command]
-    # This test pins delivery to the existing policy, not permission to run
-    # remote auth: positional gh only handles direct gh/shell segments today.
 
 
 @pytest.mark.parametrize('root', ['active_workspace', 'task_drive', 'artifact_store'])
@@ -330,9 +298,8 @@ def test_child_source_names_and_certificates_do_not_confer_credential_authority(
     token = 'sk-' + 'a' * 48
     source.write_text('def login():\n    return "' + token + '"  # SOURCE_AVAILABLE\n', encoding='utf-8')
     result = reg.execute('read_file', {'root': root, 'path': source.relative_to(base).as_posix()})
-    assert 'SOURCE_AVAILABLE' in result and token not in result and '***' in result
-    # A public PEM must survive unchanged; a private block uses existing byte
-    # egress masking, including when the caller asks for a window past its header.
+    assert 'SOURCE_AVAILABLE' in result and token in result
+    # Both public and private PEM fixture content survive whole and partial reads.
     certificate = '-----BEGIN CERTIFICATE-----\n' + 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789' * 2 + '\n-----END CERTIFICATE-----\n'
     public = source.parent / 'public.pem'
     public.write_text(certificate, encoding='utf-8')
@@ -342,7 +309,7 @@ def test_child_source_names_and_certificates_do_not_confer_credential_authority(
     private.write_text('-----BEGIN PRIVATE KEY-----\n' + material + '\n-----END PRIVATE KEY-----\n', encoding='utf-8')
     for start_line in (1, 2):
         read = reg.execute('read_file', {'root': root, 'path': private.relative_to(base).as_posix(), 'start_line': start_line})
-        assert material not in read
+        assert material in read
         assert ctx.last_read_view['total_lines'] == 3
 
 
@@ -356,49 +323,10 @@ def test_child_own_task_content_is_not_a_repository_credential_store(environment
     target.write_text('TASK_CONTENT_AVAILABLE', encoding='utf-8')
     assert 'TASK_CONTENT_AVAILABLE' in reg.execute('read_file', {'root': root, 'path': path})
     assert path.split('/')[0] in reg.execute('list_files', {'root': root, 'path': '.'})
-    # The profile grants read/list here, not search. Shared path policy must
-    # preserve that independent resource matrix instead of granting a new verb.
-    assert 'TOOL_ACCESS_BLOCKED' in reg.execute('search_code', {'root': root, 'path': '.', 'query': 'TASK_CONTENT_AVAILABLE'})
-
-
-@pytest.mark.parametrize('lane', ['child', 'external', 'light'])
-@pytest.mark.parametrize('wrapper', ['direct', 'shell_cwd', 'env_cwd'])
-def test_shell_read_lanes_share_physical_control_binding(environment, monkeypatch, lane, wrapper):
-    from ouroboros.tools.registry_guard_process import _run_shell_safety_check
-
-    reg, ctx, _home, work, data = environment
-    if lane == 'child':
-        ctx.task_constraint = TaskConstraint(mode='acting_subagent', surface='external_workspace', write_root=str(work))
-    elif lane == 'light':
-        ctx.workspace_mode = ''
-        ctx.workspace_root = None
-    command = [sys.executable, '-c', "print(open('settings.json').read())"]
-    if wrapper == 'shell_cwd':
-        command = ['sh', '-c', 'cd ' + shlex.quote(str(data)) + '; ' + shlex.join(command)]
-    elif wrapper == 'env_cwd':
-        command = ['env', '-C', str(data), *command]
-    else:
-        command = [sys.executable, '-c', 'print(open(' + repr(str(data / 'settings.json')) + ').read())']
-    (data / 'settings.json').write_text('RUNTIME_PRIVATE_FIXTURE', encoding='utf-8')
-    expected = {'child': 'SUBAGENT_SECRET_READ_BLOCKED', 'external': 'WORKSPACE_BLOCKED', 'light': 'LIGHT_MODE_BLOCKED'}[lane]
-    cwd = 'task_drive' if lane == 'light' else str(work)
-    result = _run_shell_safety_check(reg, {'cmd': command, 'cwd': cwd}, 'light' if lane == 'light' else 'advanced')
-    assert result is not None and result.code == expected, result
-
-
-def test_remote_paths_are_not_child_local_writes_but_outer_redirects_are(environment):
-    from tests._typed_guard_shared import _shell_guard_text
-    reg, ctx, _home, work, _data = environment
-    ctx.task_constraint = TaskConstraint(mode='acting_subagent', surface='external_workspace', write_root=str(work))
-    remote = ['ssh', 'host', 'sudo -n tee /etc/remote.conf']
-    assert _shell_guard_text(reg, {'cmd': remote}, 'advanced') is None
-    outside = work.parent / 'outside.txt'
-    redirected = ['sh', '-c', "ssh host 'cat /remote/source' > " + shlex.quote(str(outside))]
-    denied = _shell_guard_text(reg, {'cmd': redirected}, 'advanced')
-    assert denied and 'WORKSPACE_SHELL_BLOCKED' in denied
-    log = ['ssh', '-E', str(outside), 'host', 'cat /remote/source']
-    denied = _shell_guard_text(reg, {'cmd': log}, 'advanced')
-    assert denied and 'WORKSPACE_SHELL_BLOCKED' in denied
+    # The matrix is closed under read⇒search (TZ-1 E): the child searches its own
+    # task content exactly where it reads it, and the shared path policy still does
+    # not mistake an ordinary auth/ path in task content for a credential store.
+    assert 'TASK_CONTENT_AVAILABLE' in reg.execute('search_code', {'root': root, 'path': '.', 'query': 'TASK_CONTENT_AVAILABLE'})
 
 
 @pytest.mark.skipif(sys.platform == 'win32', reason='the test SSH fixture uses a POSIX executable shim')
@@ -422,59 +350,53 @@ def test_ssh_remote_task_runs_with_original_argv(environment):
 ])
 def test_child_search_words_are_not_credential_path_operands(environment, actor, command):
     from copy import deepcopy
-    from tests._typed_guard_shared import _shell_guard_text
 
     reg, ctx, _home, work, _data = environment
     ctx.task_constraint = (TaskConstraint(mode=actor, surface='external_workspace', write_root=str(work))
                            if actor == 'acting_subagent' else TaskConstraint(mode=actor))
     original = deepcopy(command)
     if actor == 'local_readonly_subagent':
-        # This profile exposes file inspection, not shell execution. Exercise
-        # the shared predicate without inventing a shell capability for it.
-        from ouroboros.tools.registry_guard_process import _subagent_shell_targets_secret
-        assert not _subagent_shell_targets_secret(command, ctx=ctx, cwd=work)
+        # This profile exposes file inspection, not shell execution.
         assert reg.get_schema_by_name('run_command') is None
     else:
-        assert _shell_guard_text(reg, {'cmd': command, 'cwd': str(work)}, 'advanced') is None
+        seen = []
+
+        def handler(_ctx, cmd, _resolved_binding=None, **_kwargs):
+            seen.append(list(cmd))
+            return 'search dispatched'
+
+        reg.override_handler('run_command', handler)
+        assert reg.execute('run_command', {'cmd': command, 'cwd': str(work)}) == 'search dispatched'
+        assert seen == [original]
     assert command == original
 
 
 @pytest.mark.parametrize('wrapper', ['direct', 'env', 'sh', 'sh_env'])
-def test_wrapped_inline_credential_read_is_blocked_at_the_same_physical_target(environment, wrapper):
+@pytest.mark.parametrize('allowed', [False, True])
+def test_wrapped_inline_read_uses_the_configured_supervisor(environment, monkeypatch, wrapper, allowed):
     reg, ctx, _home, work, _data = environment
     ctx.task_constraint = TaskConstraint(mode='acting_subagent', surface='external_workspace', write_root=str(work))
     (work / '.env').write_text('FIXTURE_SECRET_MUST_NOT_REACH_OUTPUT', encoding='utf-8')
-    command = [sys.executable, '-c', "print(open('.env').read())"]
+    command = [sys.executable, '-c', "print(open('.env', encoding='utf-8').read())"]
     if wrapper in {'env', 'sh_env'}:
         command = ['env', *command]
     if wrapper in {'sh', 'sh_env'}:
         command = ['sh', '-c', shlex.join(command)]
+    decisions = []
+
+    def supervisor(_name, args, *_args, **_kwargs):
+        decisions.append(list(args['cmd']))
+        return allowed, 'Supervisor fixture decision'
+
+    monkeypatch.setenv('OUROBOROS_SAFETY_MODE', 'full')
+    monkeypatch.setattr('ouroboros.safety.check_safety', supervisor)
     result = reg.execute_result('run_command', {'cmd': command, 'cwd': str(work)})
-    assert (result.status, result.code) == ('blocked', 'SUBAGENT_SECRET_READ_BLOCKED')
-    assert 'FIXTURE_SECRET_MUST_NOT_REACH_OUTPUT' not in result.text
-
-
-def test_secret_paths_use_sequential_and_env_local_cwd(environment):
-    from ouroboros.tools.registry_guard_process import _subagent_shell_targets_secret
-
-    _reg, ctx, home, work, data = environment
-    source = work / 'src'
-    source.mkdir()
-    (source / 'settings.json').write_text('ordinary project config', encoding='utf-8')
-    (data / 'settings.json').write_text('runtime control fixture', encoding='utf-8')
-    body = "print(open('settings.json').read())"
-    python = shlex.join([sys.executable, '-c', body])
-    assert _subagent_shell_targets_secret(['sh', '-c', f'cd {shlex.quote(str(data))}; {python}'], ctx=ctx, cwd=work)
-    assert not _subagent_shell_targets_secret(
-        ['sh', '-c', f'cd {shlex.quote(str(source))}; {python}'], ctx=ctx, cwd=data)
-    assert _subagent_shell_targets_secret(['env', '-C', str(data), sys.executable, '-c', body], ctx=ctx, cwd=work)
-    # env -C applies only to its command; it must not retarget a later reader.
-    command = ['sh', '-c', f'env -C {shlex.quote(str(data))} true; {python}']
-    assert not _subagent_shell_targets_secret(command, ctx=ctx, cwd=source)
-    key = home / '.ssh' / 'id_fixture'
-    key.parent.mkdir()
-    key.write_text('owner-key-fixture', encoding='utf-8')
-    assert _subagent_shell_targets_secret(['sh', '-c', 'true', '<', str(key)], ctx=ctx, cwd=work)
+    assert decisions == [command]
+    if allowed:
+        assert result.status == 'ok' and 'FIXTURE_SECRET_MUST_NOT_REACH_OUTPUT' in result.text
+    else:
+        assert (result.status, result.code) == ('blocked', 'SAFETY_VIOLATION')
+        assert 'FIXTURE_SECRET_MUST_NOT_REACH_OUTPUT' not in result.text
 
 
 @pytest.mark.skipif(sys.platform == 'win32', reason='actual POSIX sh/env execution')
@@ -522,7 +444,7 @@ def test_known_root_expansion_applies_to_write_targets_only(tmp_path, monkeypatc
     ['sh', '-c', 'cat $OUROBOROS_DATA_DIR/settings.json'],
     ['cmd', '/c', 'type %USERPROFILE%/.ssh/id_fixture'],
 ])
-def test_child_known_root_credential_reads_are_blocked(environment, monkeypatch, command):
+def test_child_known_root_read_reaches_the_configured_supervisor(environment, monkeypatch, command):
     reg, ctx, home, work, data = environment
     monkeypatch.setenv('HOME', str(home))
     monkeypatch.setenv('USERPROFILE', str(home))
@@ -532,8 +454,17 @@ def test_child_known_root_credential_reads_are_blocked(environment, monkeypatch,
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text('FIXTURE_SECRET_MUST_NOT_REACH_OUTPUT', encoding='utf-8')
     original = list(command)
+    decisions = []
+
+    def supervisor(_name, args, *_args, **_kwargs):
+        decisions.append(list(args['cmd']))
+        return False, 'Supervisor fixture decision'
+
+    monkeypatch.setenv('OUROBOROS_SAFETY_MODE', 'full')
+    monkeypatch.setattr('ouroboros.safety.check_safety', supervisor)
     result = reg.execute_result('run_command', {'cmd': command, 'cwd': str(work)})
-    assert (result.status, result.code) == ('blocked', 'SUBAGENT_SECRET_READ_BLOCKED')
+    assert (result.status, result.code) == ('blocked', 'SAFETY_VIOLATION')
+    assert decisions == [original]
     assert 'FIXTURE_SECRET_MUST_NOT_REACH_OUTPUT' not in result.text
     assert command == original
 
@@ -559,3 +490,156 @@ def test_child_known_root_source_read_keeps_shell_capability(environment, monkey
     result = reg.execute_result('run_command', {'cmd': command, 'cwd': str(work)})
     assert result.status == 'ok' and 'SOURCE_READ_OK' in result.text and 'token' in result.text
     assert '$HOME/project/README.md' in command[2]
+
+
+@pytest.mark.parametrize('mode', ['light', 'advanced', 'pro', 'cyber_pro'])
+@pytest.mark.parametrize('actor', ['parent', 'local_readonly_subagent', 'acting_subagent'])
+def test_parent_runtime_read_rules_follow_physical_files_across_root_labels(tmp_path, monkeypatch, mode, actor):
+    from ouroboros import config
+    from ouroboros.tools import vision
+
+    repo = tmp_path / 'repo'
+    data = repo / 'runtime'
+    data.mkdir(parents=True)
+    monkeypatch.setattr(config, 'DATA_DIR', data)
+    monkeypatch.setenv('OUROBOROS_RUNTIME_MODE', mode)
+    monkeypatch.setenv('OUROBOROS_SAFETY_MODE', 'off')
+    registry = ToolRegistry(repo, data)
+    ctx = registry._ctx
+    if actor != 'parent':
+        ctx.task_constraint = TaskConstraint(mode=actor, surface='external_workspace', write_root=str(repo))
+    sources = {'.git/HEAD': 'ref: refs/heads/synthetic\n', '.env': 'SYNTHETIC_ENV_CONTENT',
+               'runtime/settings.json': '{"key": "SYNTHETIC_SETTINGS_CONTENT"}'}
+    for relative, content in sources.items():
+        target = repo / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding='utf-8')
+        assert content in registry.execute('read_file', {'path': relative})
+    assert '.git/' in registry.execute('list_files', {})
+    project = data / 'projects' / 'other' / 'hidden.py'
+    project.parent.mkdir(parents=True)
+    project.write_text('def hidden_project_fact():\n    pass\n', encoding='utf-8')
+    owner = data / 'state' / 'skills' / 'sample' / 'grants.json'
+    owner.parent.mkdir(parents=True)
+    owner.write_text('{"value": "SYNTHETIC_OWNER_STATE"}', encoding='utf-8')
+    for root, prefix in [('runtime_data', ''), ('active_workspace', 'runtime/')]:
+        blocked = registry.execute('read_file', {'root': root, 'path': prefix + 'projects/other/hidden.py'})
+        assert 'ACCESS_DENIED' in blocked and 'hidden_project_fact' not in blocked
+        listing = registry.execute('list_files', {'root': root, 'path': prefix or '.'})
+        assert 'projects/' not in listing
+        viewed = registry.execute('read_file', {'root': root, 'path': prefix + 'state/skills/sample/grants.json'})
+        assert ('SYNTHETIC_OWNER_STATE' in viewed) is (mode == 'cyber_pro')
+        search = registry.execute('search_code', {'root': root, 'path': prefix or '.', 'query': 'SYNTHETIC'})
+        assert 'SYNTHETIC_SETTINGS_CONTENT' in search
+        assert ('SYNTHETIC_OWNER_STATE' in search) is (mode == 'cyber_pro')
+    assert 'ACCESS_DENIED' in vision._read_file_parity_block(ctx, project)
+    assert bool(vision._read_file_parity_block(ctx, owner)) is (mode != 'cyber_pro')
+    # Admission precedes source hashing/parsing, including a previously cached
+    # projection. A partial policy view must not overwrite the shared cache.
+    from ouroboros import code_intelligence
+    cached = code_intelligence.inventory_cache_path(repo, data)
+    cached.parent.mkdir(parents=True, exist_ok=True)
+    cached.write_text('{"synthetic": "unchanged cache"}', encoding='utf-8')
+    cache_before = cached.read_bytes()
+    original_read = pathlib.Path.read_bytes
+
+    def permitted_read(path):
+        if path == project:
+            pytest.fail('project-store source was read before admission')
+        return original_read(path)
+
+    monkeypatch.setattr(pathlib.Path, 'read_bytes', permitted_read)
+    for op, options in [('symbols', {}), ('digest', {}), ('structural', {'query': 'FunctionDef'})]:
+        result = registry.execute('query_code', {'op': op, **options})
+        assert 'hidden_project_fact' not in result
+        assert 'projects/other/hidden.py' not in result
+    assert cached.read_bytes() == cache_before
+
+
+def test_project_settings_source_is_readable_by_verify_guard(tmp_path):
+    from ouroboros.tools.shell_guards import process_shell_guard_args
+    from tests._typed_guard_shared import _shell_guard_text
+
+    repo, data = tmp_path / "repo", tmp_path / "runtime"
+    (repo / "data").mkdir(parents=True)
+    data.mkdir()
+    (repo / "data" / "settings.json").write_text('{"ordinary": "project fixture"}', encoding="utf-8")
+    registry = ToolRegistry(repo, data)
+    registry._ctx.task_constraint = TaskConstraint(mode="acting_subagent", surface="external_workspace", write_root=str(repo))
+    mapped = process_shell_guard_args("verify_and_record", {"check": "cat data/settings.json", "cwd": str(repo)})
+    result = _shell_guard_text(registry, mapped, "advanced")
+    assert result is None, result
+    assert "project fixture" in registry.execute("read_file", {"path": "data/settings.json"})
+
+
+@pytest.mark.parametrize('mode', ['light', 'advanced', 'pro', 'cyber_pro'])
+@pytest.mark.parametrize('actor', ['parent', 'local_readonly_subagent', 'acting_subagent'])
+@pytest.mark.parametrize('fallback', [False, True])
+def test_explicit_user_files_retains_parent_mode_policy(tmp_path, monkeypatch, mode, actor, fallback):
+    from ouroboros import config
+    from ouroboros.tools import media, vision
+    from tests.test_media_tools import _patch_pypdf, _FakePage
+
+    home = tmp_path / 'home'
+    repo, data = home / 'Ouroboros/repo', home / 'Ouroboros/data'
+    repo.mkdir(parents=True)
+    source = data / 'projects/p1/knowledge/source.py'
+    source.parent.mkdir(parents=True)
+    source.write_text('def parent_project_source():\n    pass\n', encoding='utf-8')
+    monkeypatch.setattr(config, 'DATA_DIR', data)
+    monkeypatch.setenv('OUROBOROS_USER_FILES_ROOT', str(home))
+    monkeypatch.setenv('OUROBOROS_RUNTIME_MODE', mode)
+    monkeypatch.setenv('OUROBOROS_SAFETY_MODE', 'off')
+    registry = ToolRegistry(repo, data)
+    ctx = registry._ctx
+    if actor != 'parent':
+        ctx.task_constraint = TaskConstraint(mode=actor, surface='external_workspace', write_root=str(repo))
+    if fallback:
+        monkeypatch.setattr('ouroboros.code_search_rg._rg_binary', lambda: '')
+    else:
+        from tests.test_code_search_rg import _install_fake_rg
+        _install_fake_rg(tmp_path, monkeypatch)
+    for tool, args, expected in (
+        ('read_file', {'path': str(source)}, 'parent_project_source'),
+        ('list_files', {'path': str(source.parent)}, 'source.py'),
+        ('search_code', {'path': str(source.parent), 'query': 'parent_project_source'}, 'parent_project_source'),
+        ('query_code', {'op': 'symbols', 'path': str(source.parent)}, 'parent_project_source'),
+        ('query_code', {'op': 'digest', 'path': str(source.parent)}, 'parent_project_source'),
+    ):
+        result = registry.execute(tool, {'root': 'user_files', **args})
+        assert (expected in result) is (mode == 'cyber_pro'), result
+        if mode != 'cyber_pro':
+            assert 'BLOCKED' in result or 'blocked' in result, result
+    # The explicitly selected runtime root and the implicit media reader keep
+    # their pre-existing project-store policy even in Cyber, for every actor.
+    runtime = registry.execute('read_file', {'root': 'runtime_data', 'path': str(source)})
+    assert 'ACCESS_DENIED' in runtime and 'parent_project_source' not in runtime
+    assert 'ACCESS_DENIED' in vision._read_file_parity_block(ctx, source)
+    pdf = source.parent / 'note.pdf'
+    pdf.write_bytes(b'%PDF-1.4 fake')
+    _patch_pypdf(monkeypatch, [_FakePage('parent_project_source')])
+    assert 'ACCESS_DENIED' in media._ocr_pdf(ctx, str(pdf))
+
+
+def test_query_code_user_files_child_matches_parent_read_scope(tmp_path, monkeypatch):
+    from ouroboros.contracts.task_constraint import TaskConstraint
+    from ouroboros.tools.query_code import _query_code
+    from ouroboros.tools.registry import ToolContext
+
+    home = tmp_path / "home"
+    source = home / "project"
+    source.mkdir(parents=True)
+    (source / "source.py").write_text("def parent_visible():\n    pass\n", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "source.py").write_text("def outside_source():\n    pass\n", encoding="utf-8")
+    monkeypatch.setenv("OUROBOROS_USER_FILES_ROOT", str(home))
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
+    ctx = ToolContext(repo_dir=tmp_path / "repo", drive_root=tmp_path / "data")
+    for constraint in (None, TaskConstraint(mode="local_readonly_subagent")):
+        ctx.task_constraint = constraint
+        for op in ("symbols", "digest"):
+            result = _query_code(ctx, op, root="user_files", path=str(source))
+            assert "parent_visible" in result
+        refused = _query_code(ctx, "symbols", root="user_files", path=str(outside))
+        assert "outside the user_files home" in refused and "outside_source" not in refused

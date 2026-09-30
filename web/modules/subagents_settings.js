@@ -1,22 +1,22 @@
-// Available subagents editor shared by Settings and first-run onboarding.
-// Reviewer quorum and role policy stay in reviewer_slots.js; only neutral
-// route/model/account/effort presentation is shared.
+// Settings/onboarding actor editor; reviewer policy stays in reviewer_slots.js.
 
 import {
     FACET_ACCOUNTS, FACET_CATALOG, FACET_QUOTA, READ_OK, accountRows,
-    bindStatusSurface, boundedStatusRefresh, claudexorStatus, familyLabel,
+    bindStatusSurface, boundedStatusRefresh, claudexorStatus,
 } from './claudexor_status_store.js';
 import { renderSegmentedField } from './page_header.js';
 import { harnessIdentityMarkup } from './harness_presentation.js';
 import {
     EFFORT_CHOICES, ROUTE_KIND_AGENT_SESSION, ROUTE_KIND_API_MODEL,
-    compoundSessionEffortConflict, changeRouteChoice, routeModelFields,
+    compoundSessionEffortConflict, configuredApiProviders, changeRouteChoice, routeModelFields,
     routeModelInputHtml, routeTargetFromModel, routeSupportsAccount, effortSelectHtml,
     encodeRouteChoice, indexProfilesByHarness, mintStableId, profileOptionsFor,
-    routeChoiceGroups, selectHtml, serializeRouteSpec, sessionModelOptions, updateRouteControlOptions,
+    routeChoiceGroups, sameEngineAs, selectHtml, serializeRouteSpec, sessionModelOptions, updateRouteControlOptions,
+    PROCESSING_CHOICES, PROCESSING_PREFERENCE_KEY, processingDetailsHtml, processingIntentLabel, accountScopedModelCatalog,
 } from './route_editor_primitives.js';
 import { modelChooserHtml, bindModelChoosers } from './model_chooser.js';
-import { harnessMap, rowMeta, rowStatus, sessionRouteVerdict } from './subagent_status_primitives.js';
+import { mergeModelCatalog, catalogReadNote, mergeHarnessModelCatalog } from './settings_catalog.js';
+import { harnessMap, rowIdentity, rowMeta, rowStatus, sessionRouteVerdict } from './subagent_status_primitives.js';
 import { revealNewRow } from './ui_helpers.js';
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
 
@@ -24,7 +24,7 @@ export const MAX_AVAILABLE_SUBAGENTS = 10;
 export const SUBAGENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
 
 const SETTING_KEYS = new Set(['enabled', 'items']);
-const ROW_KEYS = new Set(['subagent_id', 'name', 'recommended_use', 'route', 'effort']);
+const ROW_KEYS = new Set(['subagent_id', 'name', 'recommended_use', 'route', 'effort', 'processing_preference', 'access', 'enabled']);
 const ROUTE_KEYS = new Set(['kind', 'target_id', 'credential_profile_id']);
 
 function ownUnknownKeys(value, allowed) {
@@ -42,13 +42,18 @@ function canonicalRow(row) {
         if (!route.credential_profile_id) delete route.credential_profile_id;
     }
     // `name` is retired (owner decision 1=A): a legacy value parses and is
-    // DROPPED — identity is the neutral subagent_id plus derived route facts,
-    // and recommended_use is the one semantic field.
+    // DROPPED — a row is named by its route-derived handle, subagent_id is a
+    // hidden stored join key, and recommended_use is the one semantic field.
+    // `enabled` is written only when the owner switched the row OFF: an
+    // untouched roster keeps its exact canonical bytes and fingerprint.
     return {
         subagent_id: String(row?.subagent_id || '').trim(),
         recommended_use: String(row?.recommended_use || ''),
         route,
         ...(row?.effort ? { effort: String(row.effort).trim().toLowerCase() } : {}),
+        ...(row?.processing_preference ? { processing_preference: String(row.processing_preference).trim().toLowerCase() } : {}),
+        ...(route.kind === ROUTE_KIND_AGENT_SESSION ? { access: row?.access ?? 'full' } : {}),
+        ...(row?.enabled === false ? { enabled: false } : {}),
     };
 }
 
@@ -64,6 +69,38 @@ function attachUiKeys(setting, previousItems = []) {
         return { ...row, _uiKey: key };
     });
     return setting;
+}
+
+// The SHAPE verdict for one saved row, in the owner's words (`row N …`), or ''
+// when the bytes can be canonicalized. Semantic and list-wide rules (stable ID
+// spelling, route completeness, effort conflicts) belong to `rowErrors` below,
+// which judges the live draft; this one answers only "can this be loaded".
+function rowParseError(row, index) {
+    const at = `row ${index + 1}`;
+    if (!row || typeof row !== 'object' || Array.isArray(row)) return `${at} must be an object`;
+    const rowUnknown = ownUnknownKeys(row, ROW_KEYS);
+    if (rowUnknown.length) return `${at} has unknown field: ${rowUnknown[0]}`;
+    if (typeof row.subagent_id !== 'string') return `${at} stable ID must be a string`;
+    if (row.name !== undefined && typeof row.name !== 'string') return `${at} name must be a string`;
+    if (typeof row.recommended_use !== 'string') return `${at} recommended use must be a string`;
+    // Absent means enabled; anything other than a real boolean is refused
+    // rather than coerced, so a typo can never read as "switched off".
+    if (row.enabled !== undefined && typeof row.enabled !== 'boolean') return `${at} enabled must be true or false`;
+    if (row.effort != null && typeof row.effort !== 'string') return `${at} effort must be a string`;
+    if (row.processing_preference != null && typeof row.processing_preference !== 'string') return `${at} processing must be a string`;
+    if (!row.route || typeof row.route !== 'object' || Array.isArray(row.route)) return `${at} needs a route object`;
+    const routeUnknown = ownUnknownKeys(row.route, ROUTE_KEYS);
+    if (routeUnknown.length) return `${at} route has unknown field: ${routeUnknown[0]}`;
+    if (typeof row.route.kind !== 'string') return `${at} route kind must be a string`;
+    if (typeof row.route.target_id !== 'string') return `${at} route target must be a string`;
+    if (row.route.credential_profile_id != null && typeof row.route.credential_profile_id !== 'string') return `${at} account pin must be a string`;
+    const routeKind = row.route.kind.trim().toLowerCase();
+    if (![ROUTE_KIND_API_MODEL, ROUTE_KIND_AGENT_SESSION].includes(routeKind)) return `${at} has unsupported route kind`;
+    if (row.access !== undefined && !['workspace_write', 'full'].includes(row.access)) return `${at} access must be workspace_write or full`;
+    if (row.access !== undefined && routeKind !== ROUTE_KIND_AGENT_SESSION) return `${at} access requires an Agent session`;
+    if (!routeSupportsAccount({ ...row.route, kind: routeKind })
+        && String(row.route.credential_profile_id || '').trim()) return `${at} has an account pin on an API route`;
+    return '';
 }
 
 /** Parse without replacing malformed saved bytes with an empty list. */
@@ -94,69 +131,24 @@ export function parseAvailableSubagentsSetting(value) {
     }
     const canonicalItems = [];
     for (const [index, row] of input.items.entries()) {
-        if (!row || typeof row !== 'object' || Array.isArray(row)) {
-            return { setting: null, error: `row ${index + 1} must be an object` };
-        }
-        const rowUnknown = ownUnknownKeys(row, ROW_KEYS);
-        if (rowUnknown.length) {
-            return { setting: null, error: `row ${index + 1} has unknown field: ${rowUnknown[0]}` };
-        }
-        if (typeof row.subagent_id !== 'string') {
-            return { setting: null, error: `row ${index + 1} stable ID must be a string` };
-        }
-        if (row.name !== undefined && typeof row.name !== 'string') {
-            return { setting: null, error: `row ${index + 1} name must be a string` };
-        }
-        if (typeof row.recommended_use !== 'string') {
-            return { setting: null, error: `row ${index + 1} recommended use must be a string` };
-        }
-        if (row.effort !== undefined && row.effort !== null && typeof row.effort !== 'string') {
-            return { setting: null, error: `row ${index + 1} effort must be a string` };
-        }
-        if (!row.route || typeof row.route !== 'object' || Array.isArray(row.route)) {
-            return { setting: null, error: `row ${index + 1} needs a route object` };
-        }
-        const routeUnknown = ownUnknownKeys(row.route, ROUTE_KEYS);
-        if (routeUnknown.length) {
-            return { setting: null, error: `row ${index + 1} route has unknown field: ${routeUnknown[0]}` };
-        }
-        if (typeof row.route.kind !== 'string') {
-            return { setting: null, error: `row ${index + 1} route kind must be a string` };
-        }
-        if (typeof row.route.target_id !== 'string') {
-            return { setting: null, error: `row ${index + 1} route target must be a string` };
-        }
-        if (row.route.credential_profile_id !== undefined
-            && row.route.credential_profile_id !== null
-            && typeof row.route.credential_profile_id !== 'string') {
-            return { setting: null, error: `row ${index + 1} account pin must be a string` };
-        }
-        const routeKind = row.route.kind.trim().toLowerCase();
-        if (![ROUTE_KIND_API_MODEL, ROUTE_KIND_AGENT_SESSION].includes(routeKind)) {
-            return { setting: null, error: `row ${index + 1} has unsupported route kind` };
-        }
-        if (!routeSupportsAccount({ ...row.route, kind: routeKind })
-            && String(row.route.credential_profile_id || '').trim()) {
-            return { setting: null, error: `row ${index + 1} has an account pin on an API route` };
-        }
+        const rowError = rowParseError(row, index);
+        if (rowError) return { setting: null, error: rowError };
         canonicalItems.push(canonicalRow({
             ...row,
-            route: { ...row.route, kind: routeKind },
+            route: { ...row.route, kind: row.route.kind.trim().toLowerCase() },
         }));
     }
     const setting = { enabled: input.enabled, items: canonicalItems };
     const errors = validateAvailableSubagentsSetting(setting);
     if (errors.length) return { setting: null, error: `saved value is invalid: ${errors[0]}` };
-    return {
-        setting,
-        error: '',
-    };
+    return { setting, error: '' };
 }
 
-// One row's owner-facing errors, named the way the card is ("Subagent N").
-// `ids` accumulates in list order so a repeated stable ID blames the later row;
-// the list validator and the per-row display read this one source.
-function rowErrors(row, index, ids) {
+// One row's owner-facing errors, named the way the card is ("Subagent N"); the
+// list validator and the per-row display read this one source. `ids` accumulates
+// in list order so a repeated stable ID blames the later row. `rows` (with their inherited
+// processing) ride only on the save of an EDITED roster: twins saved earlier load and re-save.
+function rowErrors(row, index, ids, rows = null, inherited = '') {
     const errors = [];
     const id = String(row?.subagent_id || '').trim();
     if (!SUBAGENT_ID_PATTERN.test(id)) {
@@ -166,6 +158,11 @@ function rowErrors(row, index, ids) {
     }
     ids.add(id);
     const route = row?.route || {};
+    if (row?.access !== undefined && !['workspace_write', 'full'].includes(row.access)) {
+        errors.push('access must be Working files or Full system access.');
+    } else if (row?.access !== undefined && route.kind !== ROUTE_KIND_AGENT_SESSION) {
+        errors.push('can select access only with an Agent session.');
+    }
     if (![ROUTE_KIND_API_MODEL, ROUTE_KIND_AGENT_SESSION].includes(route.kind)) {
         errors.push('must use API model or Agent session.');
     }
@@ -188,11 +185,14 @@ function rowErrors(row, index, ids) {
     if (row?.effort && !EFFORT_CHOICES.includes(String(row.effort))) {
         errors.push('has an unsupported reasoning effort.');
     }
+    if (row?.processing_preference && !PROCESSING_CHOICES.includes(row.processing_preference)) errors.push('needs Standard, Fast, Economy or inherited processing.');
     const encodedEffort = route.kind === ROUTE_KIND_AGENT_SESSION
         ? compoundSessionEffortConflict(route.target_id, row?.effort) : '';
     if (encodedEffort) {
         errors.push(`effort “${row.effort}” conflicts with compound route effort “${encodedEffort}”.`);
     }
+    const twin = rows && String(route.target_id || '').trim() ? sameEngineAs(rows, index, inherited) : -1;
+    if (twin >= 0) errors.push(`runs the same engine as Subagent ${twin + 1} — change its model, effort, access, account or processing, or remove it.`);
     return errors.map((text) => `Subagent ${index + 1} ${text}`);
 }
 
@@ -201,29 +201,19 @@ function listLevelErrors(setting) {
         ? [`Available subagents supports at most ${MAX_AVAILABLE_SUBAGENTS} rows.`] : [];
 }
 
-export function validateAvailableSubagentsSetting(setting) {
+export function validateAvailableSubagentsSetting(setting, { uniqueEngines = false, processingPreference = '' } = {}) {
     if (!setting || typeof setting.enabled !== 'boolean' || !Array.isArray(setting.items)) {
         return ['Available subagents configuration is not loaded.'];
     }
-    const errors = listLevelErrors(setting);
     const ids = new Set();
-    setting.items.forEach((row, index) => errors.push(...rowErrors(row, index, ids)));
-    return errors;
+    const rows = uniqueEngines ? setting.items : null;
+    return [...listLevelErrors(setting), ...setting.items.flatMap((row, index) => rowErrors(row, index, ids, rows, processingPreference))];
 }
 
 export function buildAvailableSubagentsSetting(setting) {
     return {
         enabled: Boolean(setting?.enabled),
-        items: (setting?.items || []).map((row) => {
-            const out = canonicalRow(row);
-            out.subagent_id = out.subagent_id.trim();
-            out.route.target_id = out.route.target_id.trim();
-            if (out.route.credential_profile_id) {
-                out.route.credential_profile_id = out.route.credential_profile_id.trim();
-            }
-            if (out.effort) out.effort = out.effort.trim();
-            return out;
-        }),
+        items: (setting?.items || []).map(canonicalRow),
     };
 }
 
@@ -241,12 +231,8 @@ export function availableSubagentsSavePayload({ loaded = false, parseError = '',
 
 /** Preview the current Settings draft without turning its generated actor rows into owner input. */
 export function availableSubagentsPreviewPayload(settingsDraft, subscriptionsConnected) {
-    const payload = {
-        ...(settingsDraft || {}),
-        subscriptionsConnected: Boolean(subscriptionsConnected),
-    };
-    delete payload.OUROBOROS_SUBAGENTS;
-    return payload;
+    const { OUROBOROS_SUBAGENTS: _roster, ...draft } = settingsDraft || {};
+    return { ...draft, subscriptionsConnected: Boolean(subscriptionsConnected) };
 }
 
 export function generatedPreviewCanReplace({
@@ -317,11 +303,11 @@ export function availableSubagentRowMarkup(row, state, index = 0) {
     const harnesses = harnessMap(state.snapshot);
     const routeGroups = routeChoiceGroups({
         harnesses: state.catalogKnown ? (state.snapshot?.harnesses || []) : [],
-        modelSources: state.modelSources,
-        currentChoice: encodeRouteChoice(row),
-        catalogKnown: state.catalogKnown,
+        modelSources: state.modelSources, providers: state.providers,
+        providerProfiles: state.providerProfiles, currentChoice: encodeRouteChoice(row),
+        catalogKnown: state.catalogKnown, accountsKnown: state.accountsKnown,
     });
-    const modelOptions = sessionModelOptions(harnesses[split.harness], split.model, {
+    const modelOptions = sessionModelOptions(accountScopedModelCatalog(harnesses[split.harness], row.route.credential_profile_id), split.model, {
         catalogKnown: state.catalogKnown,
     });
     const profileOptions = profileOptionsFor(
@@ -333,24 +319,15 @@ export function availableSubagentRowMarkup(row, state, index = 0) {
     const errors = rowErrors(row, index, new Set());
     const meta = rowMeta(row, state, errors);
     const invalid = Boolean(row._uiAttempted) && errors.length > 0;
-    const routeIdentity = session || split.subscription
-        ? harnessIdentityMarkup(split.harness || split.source, {
-            // A retained snapshot is useful for preserving the controls, but
-            // its daemon-provided product name is evidence only while the
-            // current catalog read is known. During a read gap the shared
-            // presentation catalog supplies the safe, stable fallback.
-            label: split.subscription ? `${split.sourceLabel} model` : familyLabel(split.harness, state.snapshot, {
-                catalogKnown: state.catalogKnown,
-            }),
-            className: 'available-subagent-route-identity',
-        })
-        : harnessIdentityMarkup('api', {
-            channel: 'api',
-            className: 'available-subagent-route-identity',
-        });
+    const identity = rowIdentity(row, state);
+    const routeIdentity = harnessIdentityMarkup(identity.harnessId, {
+        label: identity.label, channel: identity.channel,
+        className: 'available-subagent-route-identity',
+    });
     return `
         <article class="available-subagent-row" data-subagent-row="${escapeHtml(rowKey)}" aria-labelledby="${escapeHtml(headingId)}"${invalid ? ' data-invalid' : ''}>
             <div class="available-subagent-head">
+                <label class="available-subagent-enable" title="Owner switch: a switched-off subagent keeps its configuration and stays editable, and no new delegation or reviewer reference may select it."><input class="ui-checkbox" type="checkbox" data-subagent-field="enabled" aria-label="Subagent ${ordinal} enabled for new work"${row.enabled === false ? '' : ' checked'}></label>
                 <h4 class="available-subagent-heading" id="${escapeHtml(headingId)}">Subagent ${ordinal}</h4>
                 <div class="available-subagent-route-identity-wrap">${routeIdentity}</div>
                 <span class="settings-inline-status" data-subagent-status data-tone="${escapeHtml(status.tone)}" title="${escapeHtml(status.text)}">${escapeHtml(status.label)}</span>
@@ -371,8 +348,14 @@ export function availableSubagentRowMarkup(row, state, index = 0) {
                     ? selectHtml(`data-subagent-field="account" aria-label="Account for Subagent ${ordinal}"`, [{ label: '', options: profileOptions }], row.route.credential_profile_id || '')
                     : ''}
                 ${effortSelectHtml(`data-subagent-field="effort" aria-label="Reasoning effort for Subagent ${ordinal}"`, row.effort || '', 'route default')}
+                ${session ? selectHtml(`id="actor-${escapeHtml(rowKey)}-access" data-subagent-field="access" aria-label="Access for Subagent ${ordinal}"`, [{ label: '', options: [
+                    { value: 'full', label: 'Full system access (default)' },
+                    { value: 'workspace_write', label: 'Working files' },
+                ] }], row.access || 'full') : ''}
             </div>
-            <div id="actor-${escapeHtml(rowKey)}-meta" class="available-subagent-meta ui-field-help" data-subagent-meta${meta.tone ? ` data-tone="${escapeHtml(meta.tone)}"` : ''} title="${escapeHtml(meta.text)}"${meta.text ? '' : ' hidden'}>${escapeHtml(meta.text)}</div>
+            ${processingDetailsHtml(`data-subagent-field="processing_preference" aria-label="Processing for Subagent ${ordinal}"`, row.processing_preference, state.processingPreference)}
+            ${session ? `<div class="ui-field-help" id="actor-${escapeHtml(rowKey)}-access-help">Full system access can reach outside the working folder. The selected agent must support it. Explicit task restrictions still apply.</div>` : ''}
+            <div id="actor-${escapeHtml(rowKey)}-meta" class="available-subagent-meta ui-field-help" data-subagent-meta${meta.history ? ' data-run-history' : ''}${meta.tone ? ` data-tone="${escapeHtml(meta.tone)}"` : ''} title="${escapeHtml(meta.text)}"${meta.text ? '' : ' hidden'}>${escapeHtml(meta.text)}</div>
         </article>`;
 }
 
@@ -395,7 +378,8 @@ export function availableSubagentsRenderSignature(state, nowMs = Date.now()) {
         state.snapshot?.subagent_last_delegation || null,
         (state.setting?.items || []).map((row) => row?.route?.kind === ROUTE_KIND_AGENT_SESSION
             ? sessionRouteVerdict(row, state, nowMs).text : ''),
-        state.apiModels, state.modelSources,
+        state.apiModels, state.modelSources, state.modelCatalogNote, state.processingPreference,
+        state.providers, state.providerProfiles,
     ]);
 }
 
@@ -433,7 +417,9 @@ export function createAvailableSubagentsEditor({
         accountsKnown: false,
         quotaKnown: false,
         snapshot: null,
-        apiModels: [], modelSources: [],
+        apiModels: [], modelSources: [], modelCatalogNote: '', processingPreference: '',
+        // Providers with a stored key, named by the contract (setSourceContext).
+        providers: [], providerProfiles: {},
         signature: '',
         statusDisposer: null,
         catalogDisposer: null,
@@ -450,31 +436,25 @@ export function createAvailableSubagentsEditor({
         state.catalogKnown = store?.facet?.(FACET_CATALOG) === READ_OK;
         state.accountsKnown = store?.facet?.(FACET_ACCOUNTS) === READ_OK;
         state.quotaKnown = store?.facet?.(FACET_QUOTA) === READ_OK;
-        state.snapshot = store?.snapshot || null;
+        const snapshot = store?.snapshot;
+        state.snapshot = snapshot ? { ...snapshot, harnesses: snapshot.harnesses?.map((harness) =>
+            mergeHarnessModelCatalog(state.snapshot?.harnesses?.find((old) => old.id === harness.id), harness)) } : null;
     }
 
     function validationErrors() {
         if (!state.loaded) {
-            // An unrelated Settings save may omit a field the response did not
-            // load at all. Once the response carries saved bytes or an explicit
-            // migration/repair candidate, though, its parse error is actionable
-            // and must block rather than masquerade as an accepted repair.
+            // Only an omitted response field may stay out of an unrelated save;
+            // malformed saved bytes or an explicit repair candidate must report errors.
             if (state.unloadedOmissionAllowed) return [];
             return [state.parseError
                 || 'Available subagents draft is still loading. Retry the preview before finishing.'];
         }
         if (state.parseError) return [state.parseError];
-        return validateAvailableSubagentsSetting(state.setting);
+        return validateAvailableSubagentsSetting(state.setting, { uniqueEngines: state.dirty, processingPreference: state.processingPreference });
     }
 
-    // The ONE painter of verdicts, patching in place (never innerHTML, so the
-    // caret survives): every row's head status, error tint and meta line, and
-    // the section-level line — reconciled together, so a fix typed into a
-    // field can never clear one and leave the other red, and a keystroke that
-    // makes the draft dirty (or re-routes a session) shows in the head at
-    // once. The section line says: a load/parse problem always; otherwise the
-    // roster's own errors, only for the rows the owner has tried to save —
-    // until then a fresh entry carries its hint.
+    // Patch verdicts and inherited intent in place, preserving the caret.
+    // Structural errors always show; row errors follow an attempted save.
     function renderValidation() {
         const container = host();
         if (!container) return;
@@ -483,14 +463,17 @@ export function createAvailableSubagentsEditor({
             : (state.saveAttempted ? listLevelErrors(state.setting) : []);
         const ids = new Set();
         state.setting.items.forEach((row, index) => {
-            const rowErrs = state.loaded ? rowErrors(row, index, ids) : [];
+            const rowErrs = state.loaded ? rowErrors(row, index, ids, state.dirty ? state.setting.items : null, state.processingPreference) : [];
             const judged = Boolean(row._uiAttempted) && rowErrs.length > 0;
             if (judged && !structural) shown.push(...rowErrs);
             const el = container.querySelector(`[data-subagent-row="${row._uiKey || row.subagent_id}"]`);
             if (!el) return;
+            const processingSummary = el.querySelector('[data-processing-summary]');
+            if (processingSummary) processingSummary.textContent = processingIntentLabel(row.processing_preference, state.processingPreference);
             el.toggleAttribute('data-invalid', judged);
             el.querySelectorAll('[data-subagent-field]').forEach((field) => {
-                field.setAttribute('aria-describedby', `actor-${row._uiKey || row.subagent_id}-meta`);
+                const prefix = `actor-${row._uiKey || row.subagent_id}`;
+                field.setAttribute('aria-describedby', `${prefix}-meta${field.dataset.subagentField === 'access' ? ` ${prefix}-access-help` : ''}`);
                 if (field.dataset.subagentField !== 'recommended_use') field.setAttribute('aria-invalid', String(judged));
             });
             const status = rowStatus(row, state);
@@ -503,6 +486,7 @@ export function createAvailableSubagentsEditor({
             const metaEl = el.querySelector('[data-subagent-meta]');
             if (!metaEl) return;
             Object.assign(metaEl, { hidden: !meta.text, textContent: meta.text, title: meta.text });
+            metaEl.toggleAttribute('data-run-history', Boolean(meta.history));
             if (meta.tone) metaEl.dataset.tone = meta.tone;
             else delete metaEl.dataset.tone;
         });
@@ -512,10 +496,6 @@ export function createAvailableSubagentsEditor({
         if (state.saveAttempted) onJudged(!shown.length);
     }
 
-    // The Save/Finish button says the owner tried to commit the draft: the rows
-    // that exist now are judged from here on; an entry added later is fresh
-    // again. Everything is already patched in place, so the signature advances
-    // and the next status tick skips the repaint.
     function noteSaveAttempt() {
         state.saveAttempted = true;
         state.setting.items.forEach((row) => { row._uiAttempted = true; });
@@ -528,13 +508,17 @@ export function createAvailableSubagentsEditor({
             state.dirty = true;
             onDirtyChange(true);
         }
-        // Text inputs already paint their own value. Advancing the signature
-        // here lets an unchanged late status settle skip a destructive
-        // innerHTML rewrite; structural changes deliberately request one.
+        // Text and fixed choices hold their draft; status keeps the same nodes.
         state.signature = structural ? '' : availableSubagentsRenderSignature(state);
         renderValidation();
         onChange(buildAvailableSubagentsSetting(state.setting));
     }
+
+    // A new row's hidden keys are neutral: a label copied from its source would rot with the route.
+    const mintRowKeys = () => ({
+        subagent_id: mintStableId('subagent', state.setting.items.map((item) => item.subagent_id)),
+        _uiKey: mintStableId('actor_row', state.setting.items.map((item) => item._uiKey)),
+    });
 
     function bindRows(container) {
         container.querySelectorAll?.('[data-subagent-row]').forEach((rowElement) => {
@@ -546,8 +530,16 @@ export function createAvailableSubagentsEditor({
                 row.recommended_use = String(event.target.value || '');
                 markDirty();
             });
+            // Held as a draft like every other field: the section's Save is the
+            // one writer, and `false` is stored only while the box is cleared.
+            rowElement.querySelector('[data-subagent-field="enabled"]')?.addEventListener('change', (event) => {
+                if (event.target.checked) delete row.enabled;
+                else row.enabled = false;
+                markDirty();
+            });
             rowElement.querySelector('[data-subagent-field="route"]')?.addEventListener('change', (event) => {
                 row.route = changeRouteChoice(row.route, event.target.value);
+                if (row.route.kind !== ROUTE_KIND_AGENT_SESSION) delete row.access;
                 markDirty({ structural: true });
                 paint();
             });
@@ -559,7 +551,7 @@ export function createAvailableSubagentsEditor({
                     const structural = previous !== encodeRouteChoice(row);
                     if (structural) delete row.route.credential_profile_id;
                     markDirty({ structural });
-                    if (structural) paint();
+                    if (structural) paint(); else renderValidation(); // keeps the disclosed id current, caret intact
                 },
             );
             rowElement.querySelector('[data-subagent-field="account"]')?.addEventListener('change', (event) => {
@@ -569,19 +561,19 @@ export function createAvailableSubagentsEditor({
                 markDirty({ structural: true });
                 paint();
             });
-            rowElement.querySelector('[data-subagent-field="effort"]')?.addEventListener('change', (event) => {
-                const effort = String(event.target.value || '');
-                if (effort) row.effort = effort;
-                else delete row.effort;
-                markDirty();
-            });
+            for (const field of ['effort', 'processing_preference', 'access']) {
+                rowElement.querySelector(`[data-subagent-field="${field}"]`)?.addEventListener('change', (event) => {
+                    const value = String(event.target.value || '');
+                    if (value) row[field] = value;
+                    else delete row[field];
+                    markDirty();
+                });
+            }
             rowElement.querySelector('[data-subagent-duplicate]')?.addEventListener('click', () => {
                 if (state.setting.items.length >= MAX_AVAILABLE_SUBAGENTS) return;
-                const copy = canonicalRow(row);
-                copy.subagent_id = mintStableId(`${row.subagent_id || 'subagent'}_copy`,
-                    state.setting.items.map((item) => item.subagent_id));
-                copy._uiKey = mintStableId('actor_row',
-                    state.setting.items.map((item) => item._uiKey));
+                // A copy IS the same engine, so it is born a judged draft: its card
+                // names the twin until one engine field changes.
+                const copy = { ...canonicalRow(row), ...mintRowKeys(), _uiAttempted: true };
                 state.setting.items.splice(state.setting.items.indexOf(row) + 1, 0, copy);
                 markDirty({ structural: true });
                 paint();
@@ -606,8 +598,8 @@ export function createAvailableSubagentsEditor({
         const errors = validationErrors();
         const diagnostics = diagnosticsText(state.diagnostics);
         const source = state.source ? `Source: ${state.source}.` : '';
-        const readProblem = state.statusError
-            ? 'Live agent availability could not be read. Saved rows remain unchanged.' : '';
+        const readProblem = [state.statusError
+            ? 'Live agent availability could not be read. Saved rows remain unchanged.' : '', state.modelCatalogNote].filter(Boolean).join(' ');
         if (discoveryOnly && container.querySelector('.available-subagents-list')) {
             state.setting.items.forEach((row, index) => {
                 const el = container.querySelector(`[data-subagent-row="${row._uiKey || row.subagent_id}"]`);
@@ -649,17 +641,11 @@ export function createAvailableSubagentsEditor({
         });
         container.querySelector('[data-subagent-add]')?.addEventListener('click', () => {
             if (state.setting.items.length >= MAX_AVAILABLE_SUBAGENTS) return;
-            const id = mintStableId('subagent', state.setting.items.map((row) => row.subagent_id));
-            const uiKey = mintStableId('actor_row', state.setting.items.map((row) => row._uiKey));
-            state.setting.items.push({
-                subagent_id: id,
-                recommended_use: '',
-                route: { kind: ROUTE_KIND_API_MODEL, target_id: '' },
-                _uiKey: uiKey,
-            });
+            const row = { recommended_use: '', route: { kind: ROUTE_KIND_API_MODEL, target_id: '' }, ...mintRowKeys() };
+            state.setting.items.push(row);
             markDirty({ structural: true });
             paint();
-            revealRow(uiKey);
+            revealRow(row._uiKey);
         });
         bindRows(container);
         disposeChoosers = bindModelChoosers(container);
@@ -668,8 +654,7 @@ export function createAvailableSubagentsEditor({
         return true;
     }
 
-    // After the repaint (whose last act restores the previous focus): the row
-    // that just appeared is scrolled into view and its Description takes the caret.
+    // Reveal the new row after the painter restores previous focus.
     function revealRow(uiKey) {
         const row = host()?.querySelector?.(`[data-subagent-row="${uiKey}"]`);
         revealNewRow(row, row?.querySelector?.('[data-subagent-field="recommended_use"]'));
@@ -777,9 +762,7 @@ export function createAvailableSubagentsEditor({
                 subscriptionsConnected: state.accountsKnown && connected.length > 0,
             });
             if (generation !== state.previewGeneration) return false;
-            // This is still the unsaved migration/default candidate.  Preserve
-            // that provenance so a later clean account-status change may
-            // refresh it again; onboarding editors keep the endpoint source.
+            // Retain migration provenance for later clean refreshes; onboarding keeps the endpoint source.
             const result = applyGeneratedPreview({ ...response, source: state.source });
             if (!result.applied) state.previewSignature = '';
             return result.applied;
@@ -808,10 +791,10 @@ export function createAvailableSubagentsEditor({
         if (!state.catalogDisposer) {
             const target = getDoc();
             const onCatalog = (event) => {
-                state.modelSources = event?.detail?.model_sources || [];
-                state.apiModels = (event?.detail?.items || [])
-                    .map((item) => String(item.value || item.id || ''))
-                    .filter(Boolean);
+                const catalog = mergeModelCatalog({ items: state.apiModels, model_sources: state.modelSources }, event?.detail);
+                state.modelSources = catalog.model_sources;
+                state.apiModels = catalog.items;
+                state.modelCatalogNote = catalogReadNote(catalog);
                 state.signature = '';
                 paint({ discoveryOnly: true });
             };
@@ -840,6 +823,13 @@ export function createAvailableSubagentsEditor({
         reloadStatus,
         refreshGeneratedPreview: maybeRefreshGeneratedPreview,
         applyGeneratedPreview,
+        applyOwnerPreview(response) {
+            const parsed = parseAvailableSubagentsSetting(response?.available_subagents);
+            if (!parsed.setting) return { applied: false, error: parsed.error };
+            load(parsed.setting, { source: 'configured_by_owner', diagnostics: response?.diagnostics || [] });
+            markDirty({ structural: true }); paint();
+            return { applied: true, error: '' };
+        },
         setPreviewFailure,
         validate: validationErrors,
         noteSaveAttempt,
@@ -848,6 +838,12 @@ export function createAvailableSubagentsEditor({
         get loaded() { return state.loaded; },
         get dirty() { return state.dirty; },
         get parseError() { return state.parseError; },
+        setProcessingPreference(value) { state.processingPreference = String(value || ''); paint({ discoveryOnly: true }); },
+        setSourceContext({ settings = {}, providerProfiles = {} } = {}) {
+            state.providerProfiles = providerProfiles || {};
+            state.providers = configuredApiProviders(settings, state.providerProfiles);
+            paint({ discoveryOnly: true });
+        },
     };
 }
 
@@ -863,7 +859,8 @@ export function renderSubagentsSection() {
             <h3>Available subagents</h3>
             <div class="settings-section-copy">
                 Describe when Ouroboros should choose each numbered subagent, then select how it runs.
-                Internal references stay stable automatically. A route that is unavailable stays saved
+                Clearing a subagent's checkbox keeps its configuration and stops new tasks and reviews
+                from choosing it. Internal references stay stable automatically. A route that is unavailable stays saved
                 and returns an explicit refusal instead of silently changing actor or model. An unpinned
                 session row may rotate among compatible healthy accounts for that same route.
             </div>
@@ -937,14 +934,11 @@ export function availableSubagentsLoadValue(settings) {
 
 /** Whether this response carries owner or repair bytes that must be fixed in-place. */
 export function availableSubagentsHasExplicitDraft(settings) {
-    const raw = settings?.OUROBOROS_SUBAGENTS;
-    if (raw !== undefined && raw !== null && raw !== '') return true;
     const meta = settings?._meta?.available_subagents;
-    return meta != null
-        && Object.prototype.hasOwnProperty.call(meta, 'candidate')
-        && meta.candidate !== undefined
-        && meta.candidate !== null
-        && meta.candidate !== '';
+    return [settings?.OUROBOROS_SUBAGENTS,
+        meta != null && Object.prototype.hasOwnProperty.call(meta, 'candidate')
+            ? meta.candidate : undefined,
+    ].some(value => value !== undefined && value !== null && value !== '');
 }
 
 export function initSubagentsSection({
@@ -971,6 +965,7 @@ export function initSubagentsSection({
 export function applySubagentsSettings(settings) {
     if (!settingsEditor) return;
     const meta = settings?._meta?.available_subagents || {};
+    settingsEditor.setProcessingPreference(settings?.[PROCESSING_PREFERENCE_KEY]);
     settingsEditor.load(availableSubagentsLoadValue(settings), {
         source: settingsSource(settings),
         diagnostics: meta.diagnostics || meta.diagnostic || [],
@@ -986,12 +981,13 @@ export function destroySubagentsSection() {
 }
 
 export function collectSubagentsSettings() { return settingsEditor?.collect() || {}; }
+export function setSubagentsProcessingPreference(value) { settingsEditor?.setProcessingPreference(value); }
+/** The providers the roster picker may offer, from the loaded settings document. */
+export function setSubagentsSourceContext(settings, providerProfiles) { settingsEditor?.setSourceContext({ settings, providerProfiles }); }
 
 export function validateSubagentsDraft() { return settingsEditor?.validate() || ['Available subagents editor is not loaded.']; }
 
 /** Settings' Save button: the draft's own errors become visible from here on. */
 export function noteSubagentsSaveAttempt() { settingsEditor?.noteSaveAttempt(); }
-
-// Compatibility name retained for focused callers; the signature now covers
-// the actor list rather than the retired singleton route.
+// Compatibility name for callers of the actor-list signature.
 export const renderSignature = availableSubagentsRenderSignature;

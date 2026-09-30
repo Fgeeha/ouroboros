@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Shared import-graph core for the domain manifest tools (plan §7.1, CPL-1).
+"""Shared import-graph core for the domain manifest tools.
 
 Single home of the machinery that both the report generator
-(``scripts/v7next_domain_report.py``) and the gate checker
+(``scripts/domain_report.py``) and the gate checker
 (``scripts/check_domains.py``) consume, so the two tools cannot drift apart —
 the same discipline the checker itself enforces on runtime code (the
 literal-copy ban).
@@ -17,8 +17,7 @@ Provides:
 - the domain quotient (cross-domain edges keyed by domain pair, with exact
   module-edge witnesses) and Tarjan SCC over domain nodes;
 - the literal-copy scan: normalized function-body source segments appearing
-  in more than one domain (the span-normalization approach follows
-  ``scripts/v7next_transplant.py``: exact source segments, not name matching).
+  in more than one domain (exact source segments, not name matching).
 
 This is analysis tooling, not runtime code: nothing under ``ouroboros/``
 imports it.
@@ -43,7 +42,7 @@ MANIFEST_PATH = REPO_ROOT / "ouroboros" / "domains.toml"
 DOMAIN_MAP_PATH = REPO_ROOT / "docs" / "DOMAIN_MAP.md"
 
 STRICT, TYPE_ONLY, LAZY, DYNAMIC = "strict", "type_checking", "lazy", "dynamic"
-# Executed at import time but failure-tolerant / entrypoint-only (F0 review F4):
+# Executed at import time but failure-tolerant / entrypoint-only:
 # a `try: import x except ImportError/Exception` or an import under
 # `if __name__ == "__main__"` must not stand as a strict cycle witness.
 GUARDED = "guarded"
@@ -86,8 +85,8 @@ def try_swallows_import_failure(node: ast.Try) -> bool:
     """True when at least one handler catches import failure (or everything)
     AND does not re-raise. A handler whose body contains a top-level ``raise``
     may propagate the failure (``except ImportError: raise``), so it is not a
-    swallow — misclassifying it as guarded would hide a strict cycle witness
-    (F0 review round 2). A conditional re-raise nested in an ``if`` still
+    swallow — misclassifying it as guarded would hide a strict cycle witness.
+    A conditional re-raise nested in an ``if`` still
     counts as re-raising here: erring toward STRICT is the safe direction."""
     for h in node.handlers:
         reraises = any(isinstance(s, ast.Raise) for s in ast.walk(h))
@@ -403,7 +402,10 @@ def duplicate_bodies(manifest: Manifest, root: pathlib.Path = REPO_ROOT,
             for child in ast.iter_child_nodes(node):
                 if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     qual = f"{prefix}{child.name}"
-                    segment = ast.get_source_segment(source, child)
+                    # For ordinary source line endings, normalization cannot grow
+                    # the raw span. Embedded splitlines-only separators are not counted.
+                    span = (getattr(child, "end_lineno", None) or child.lineno) - child.lineno + 1
+                    segment = ast.get_source_segment(source, child) if span >= min_lines else None
                     if segment is not None:
                         norm = _normalize_body(segment)
                         if norm.count("\n") + 1 >= min_lines:

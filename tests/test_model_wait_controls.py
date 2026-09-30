@@ -121,14 +121,14 @@ def test_pinned_wait_rejects_other_catalog_account_before_new_generation(live_wa
     polls = []
 
     def catalog(source, profile=None, **kwargs):
-        assert profile == "account-a" and len(gateway.operations) == 1
+        assert profile == "account-a" and len(gateway.accepted_operations) == 1
         polls.append(profile)
         return {"source": source, "credentialProfileId": "account-b" if len(polls) == 1 else "account-a",
                 "models": [{"id": "exact-model"}]}
 
     monkeypatch.setattr(client, "claudexor_model_catalog", catalog)
     client.chat([], MODEL, model_role="light")
-    assert len(polls) == 2 and len(gateway.operations) == 2
+    assert len(polls) == 2 and len(gateway.accepted_operations) == 2
     assert all(payload["account"] == {"mode": "pin", "profileId": "account-a"} for payload, _key in gateway.uploads)
 
 
@@ -144,11 +144,11 @@ def _loop_tools(ctx, owner):
     return tools
 
 
-def test_main_wait_does_not_call_configured_api_fallback_before_owner_switch(main_call, monkeypatch):
-    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+def test_main_quota_calls_configured_api_fallback_before_any_owner_wait(main_call, monkeypatch):
+    """Owner order: Auto rotation, then the configured fallback, and only then the owner question."""
     from ouroboros.llm_attempt import _attempt_request, _candidate_before_dispatch
 
-    ctx, gateway, owner, events, decide, _observations = main_call
+    ctx, gateway, owner, events, _decide, _observations = main_call
     tools = _loop_tools(ctx, owner)
     monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", "openai::alternate")
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
@@ -170,13 +170,7 @@ def test_main_wait_does_not_call_configured_api_fallback_before_owner_switch(mai
                                            before_dispatch=_candidate_before_dispatch(request_body, request))
 
     def catalog(*args, **kwargs):
-        assert api_calls == [] and len(gateway.operations) == 1
-        row = next(event for event in reversed(list(events.queue)) if event.get("type") == "task_model_wait")
-        response = decide({"request_id": "switch-api", "decision_id": f"model_wait:task-one:{row['wait_id']}",
-                           "revision": row["revision"], "action": "switch", "model": "openai::alternate",
-                           "credential_profile_id": "", "use_local": False, "persist_role": False})
-        assert response.status_code == 202
-        raise ClaudexorUnavailable("subscription_window_exhausted", "still waiting")
+        pytest.fail("the owner is asked only after every configured route of the round failed")
 
     monkeypatch.setattr(ctx.llm, "_chat_remote", send)
     monkeypatch.setattr(ctx.llm, "claudexor_model_catalog", catalog)
@@ -184,7 +178,8 @@ def test_main_wait_does_not_call_configured_api_fallback_before_owner_switch(mai
         ctx.messages, tools, ctx.llm, ctx.drive_logs, lambda *_args, **_kwargs: None, queue.Queue(),
         task_id="task-one", drive_root=ctx.drive_root, event_queue=events)
     assert text == "Finished" and api_calls == ["openai"]
-    assert usage["_model_route"] == {} and len(gateway.operations) == 1
+    assert not [event for event in list(events.queue) if event.get("type") == "task_model_wait"]
+    assert usage["_model_route"] == {} and len(gateway.accepted_operations) == 1
     assert any(message.get("content") == "verified read A" for message in ctx.messages)
     assert any(message.get("content") == "completed review B" for message in ctx.messages)
 
@@ -328,9 +323,10 @@ def test_pre_call_wrap_keeps_the_existing_transport_episode_no_call(main_call, m
     assert trace["forced_finalization"]["source"] == "transport_unavailable_no_resend"
 
 
-def test_pre_call_wrap_keeps_older_wire_death_custody_without_summary(tmp_path, monkeypatch):
+@pytest.mark.parametrize("interactive", [False, True])
+def test_outage_wrap_keeps_older_wire_death_custody_without_summary(tmp_path, monkeypatch, interactive):
     import httpx
-    from ouroboros import loop_llm_call
+    from ouroboros import loop_llm_call, loop_transport
     from ouroboros.outcomes import REASON_OWNER_REQUESTED_FINALIZATION
     from supervisor.owner_stop import owner_stop_control_id
     from tests.test_transport_death_retry import _LedgerLLM, _ledger, _loop_kwargs, _no_chain
@@ -349,8 +345,8 @@ def test_pre_call_wrap_keeps_older_wire_death_custody_without_summary(tmp_path, 
     monkeypatch.setattr(loop, "_run_cross_model_fallback_chain", _no_chain)
     posted = []
 
-    def release_repeat_after_control_check(_seconds, _deadline, **kwargs):
-        assert not kwargs["wake_check"]() and not posted
+    def release_wait_after_control_check(_seconds, wake_check):
+        assert not wake_check() and not posted
         posted.append(True)
         intent = cancel_intents.request_cancel(tmp_path, "t-death",
             requested_stop_policy=cancel_intents.STOP_POLICY_FINALIZE)
@@ -359,16 +355,25 @@ def test_pre_call_wrap_keeps_older_wire_death_custody_without_summary(tmp_path, 
             msg_id=owner_stop_control_id(intent), kind=owner_mailbox.KIND_FINALIZE_NOW)
         return True
 
-    monkeypatch.setattr(loop_llm_call, "_sleep_within_deadline", release_repeat_after_control_check)
+    if interactive:
+        monkeypatch.setattr(loop_llm_call, "_sleep_within_deadline",
+                            lambda seconds, deadline, **kw: release_wait_after_control_check(seconds, kw["wake_check"]))
+    else:
+        monkeypatch.setattr(loop_transport, "interruptible_wait_sleep", release_wait_after_control_check)
     kwargs = _loop_kwargs(tmp_path, ControlledLLM(), [])
+    kwargs["tools"]._ctx.is_direct_chat = interactive
     with model_wait.task_model_wait_scope(task={"id": "t-death"}, drive_root=tmp_path,
-            event_queue=None, worker_slot_held=True) as owner:
+            event_queue=None, worker_slot_held=not interactive) as owner:
         owner.tool_context = kwargs["tools"]._ctx
         _text, usage, trace = loop.run_llm_loop(**kwargs)
     assert posted and llm.calls == 1
     assert [row["state"] for row in _ledger(tmp_path)] == ["reserved", "dispatched", "unresolved"]
     assert loop_llm_call.provider_no_call_source(usage, False)[0] == "provider_outcome_unknown_no_resend"
-    assert trace["forced_finalization"]["control_reason"] == "finalize_requested"
+    if interactive:
+        assert trace["forced_finalization"]["control_reason"] == "finalize_requested"
+    else:
+        assert "owner requested Wrap up" in _text
+        assert trace["forced_finalization"]["source"] == "provider_outcome_unknown_no_resend"
 
 
 @pytest.mark.parametrize("stop,expected_reason", [
@@ -427,7 +432,7 @@ def test_real_main_control_preserves_candidate_without_new_summary(main_call, mo
         task_id="task-one", drive_root=ctx.drive_root, event_queue=events)
     assert len(held) == 1 and text == completed["message"]["content"]
     assert usage["reason_code"] == trace["forced_finalization"]["reason_code"] == expected_reason
-    assert len(gateway.operations) == 2  # Paid answer + interrupted call, never a summary retry.
+    assert len(gateway.accepted_operations) == 2  # Paid answer + interrupted call, never a summary retry.
     assert trace["forced_finalization"]["source"].startswith("model_wait_retained_candidate")
     if stop == "wrap_unknown":
         assert usage["_last_llm_error_kind"] == "provider_outcome_unknown"
@@ -500,7 +505,7 @@ def test_hard_cancel_returns_empty_events_to_real_worker_loop_and_keeps_queue_ow
             return None  # End the test's worker only after verifying retained ownership.
 
     worker_process.worker_main(1, Input(), events, str(ctx.drive_root), str(ctx.drive_root))
-    assert len(reads) == 2 and len(gateway.operations) == 1 and not crashes
+    assert len(reads) == 2 and len(gateway.accepted_operations) == 1 and not crashes
     assert ledger(ctx.drive_root)[-1]["state"] == "unresolved"
 
 
