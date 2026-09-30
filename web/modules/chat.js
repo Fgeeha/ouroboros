@@ -1,5 +1,5 @@
 import { escapeHtmlAttr, escapeHtmlText as escapeHtml } from './utils.js';
-import { destroyChatMarkdown, enhanceChatMarkdown, mountChatMarkdown, renderChatMarkdown } from './chat_markdown.js';
+import { bindMarkdownTables, destroyChatMarkdown, enhanceChatMarkdown, mountChatMarkdown, renderChatMarkdown } from './chat_markdown.js';
 import { renderPageHeader } from './page_header.js';
 import { PAGE_ICONS } from './page_icons.js';
 import { showToast } from './toast.js';
@@ -141,6 +141,9 @@ import {
     renderCollapsedActivity,
     renderLiveCardMeta as renderCardMeta,
     ensureLiveActionsEl,
+    cardRowEvidenceRef,
+    cardRowSummary,
+    evidenceLinkHtml,
 } from './chat_activity.js';
 
 export {
@@ -896,11 +899,11 @@ export function createChatInstance({
         // A child is never a convertible unit (it inherits its root's Project by
         // lineage) and its title is its role: both root writers skip it.
         const work = !record.isSubagent && blockHasWork(record);
-        // The first row of work lands after the title writers ran for its frame:
-        // an empty title takes the placeholder here, the writers own it from then on.
+        // The first row of work lands after the title writers ran for its frame: an empty title
+        // takes a name here (Working is the chip's word, #1369); the writers own it from then on.
         if (work && !record.titleEl.textContent) {
             record.titleEl.textContent = record.suggestedName || record.lastHumanHeadline
-                || (record.finished ? 'Task activity' : 'Working...');
+                || (record.finished ? 'Task activity' : '');
         }
         const wanted = isMain && work && record.root.dataset.projectBound !== '1'
             && !(window.__ouroTaskBindings || {})[record.groupId];
@@ -1227,10 +1230,7 @@ export function createChatInstance({
         const taskId = taskKey(msg?.task_id);
         const record = phase && taskId ? liveCardRecords.get(taskId) : null;
         if (!record) return undefined;
-        const lines = String(msg.text ?? msg.content ?? '').split('\n');
-        const headline = lines[0].trim();
-        const rowId = taskKey(msg.card_row_id) || `${taskKey(msg.system_type)}|${rawTs}`;
-        const summary = { phase, headline, body: lines.slice(1).join('\n').trim(), dedupeKey: `cardrow|${rowId}`, cardRowRevision: msg.card_row_revision };
+        const summary = cardRowSummary(msg, phase, rawTs);
         return withStableViewport(() => {
             const before = captureLiveCardProjection(record);
             let fresh;
@@ -1239,7 +1239,7 @@ export function createChatInstance({
                 fresh = mergeHistoricalTimelineItem(record, summary, msg, normalizeLogTs(rawTs));
             } else {
                 const { timelineUpdate } = updateLiveTimelineItem(record, summary, {
-                    ts: normalizeLogTs(rawTs), rawTs, syntheticKey: summary.dedupeKey, headline, inPlaceByKey: true,
+                    ts: normalizeLogTs(rawTs), rawTs, syntheticKey: summary.dedupeKey, headline: summary.headline, inPlaceByKey: true,
                 });
                 fresh = !['none', 'duplicate-skip'].includes(timelineUpdate);
             }
@@ -1536,7 +1536,7 @@ export function createChatInstance({
         // P1: last bounded activity projection (remembered even while
         // the collapsed line is suppressed on unnamed root cards) + sticky cost.
         clearStickyCardState(record);
-        record.titleEl.textContent = record.suggestedName || (blockHasWork(record) ? 'Working...' : '');
+        record.titleEl.textContent = record.suggestedName || '';
         setLiveCardPhase(record, 'working');
         record.countEl.hidden = true;
         record.countEl.textContent = '0 notes';
@@ -1709,7 +1709,8 @@ export function createChatInstance({
         }
         record.updates += 1;
         const wasFinished = record.finished;
-        const headline = summary.headline || record.lastHumanHeadline || 'Working...';
+        // No placeholder: a frame naming nothing is no narration; the chip says Working (#1369).
+        const headline = summary.headline || record.lastHumanHeadline || '';
         const syntheticKey = summary.dedupeKey || dedupeKey || `${summary.phase || 'working'}|${headline}|${summary.body || ''}`;
         const isLegacyParentSubagentKey = syntheticKey.startsWith('parent-subagent:');
         // Failure/timeout update one row; success feeds the fold.
@@ -1730,8 +1731,7 @@ export function createChatInstance({
         const activeHeadline = shouldPromote
             ? headline
             : (record.lastHumanHeadline
-                || (record.updates > 1 ? record.titleEl.textContent : '')
-                || 'Working...');
+                || (record.updates > 1 ? record.titleEl.textContent : ''));
         // Only task facts own the outcome chip under a hold; failed tools are diagnostics.
         if (summary.observedOutcome && !record.finished) record.observedOutcome = summary.observedOutcome;
         const desiredPhase = desiredLiveCardPhase(record, record.finished ? summary.phase || 'done' : '');
@@ -2268,6 +2268,7 @@ export function createChatInstance({
                 originId: opts.originId || '',
                 terminalTime: opts.terminalTime || null,
                 skillReview: opts.skillReview || null,
+                evidenceRef: opts.evidenceRef || null,
             });
             // Mirror the sessionStorage slice(-200): the in-memory copy exists
             // only to feed that snapshot, so it obeys the same cap (P3).
@@ -2303,9 +2304,11 @@ export function createChatInstance({
         const timeFmt = formatMsgTime(ts);
         const timeHtml = timeFmt ? `<div class="msg-time" title="${escapeHtmlAttr(timeFmt.full)}">${escapeHtml(timeFmt.short)}</div>` : '';
         const pendingHtml = pending ? `<div class="msg-pending">Queued until reconnect</div>` : '';
+        // A placed row with no card keeps the record link its card row would offer.
         bubble.innerHTML = `
             <div class="sender">${escapeHtml(sender)}</div>
             <div class="message${richMarkdown ? ' ui-rich-content' : ''}">${rendered}</div>
+            ${evidenceLinkHtml(opts.evidenceRef)}
             ${pendingHtml}
             ${timeHtml}
         `;
@@ -2505,6 +2508,14 @@ export function createChatInstance({
                     reorderDirtyCardIfNeeded(rec);
                     ensureLiveCardVisible(rec);
                 }
+                // A stored row as its bubble: its own identity and labels, plus what its kind adds.
+                const addStoredRow = (msg, taskId, extra) => addMessage(msg.text, msg.role, !!msg.markdown, msg.ts || null, false, {
+                    historyId: msg.history_id, historyPosition: msg.history_position,
+                    systemType: msg.system_type || '', taskId,
+                    source: msg.source || '', initiator: msg.initiator || '',
+                    senderLabel: msg.sender_label || '', senderSessionId: msg.sender_session_id || '',
+                    ...extra,
+                });
                 for (const msg of messages) {
                     _historyRow = msg;
                     const taskId = msg.task_id || '';
@@ -2518,12 +2529,7 @@ export function createChatInstance({
                         || cardRowsAttached.has(msg) || attachCardRow(msg, msg.ts || '') !== undefined
                     ) continue;
                     if (isPlacedCardRow(msg)) {
-                        addMessage(msg.text, msg.role, !!msg.markdown, msg.ts || null, false, {
-                            historyId: msg.history_id, historyPosition: msg.history_position,
-                            systemType: msg.system_type || '', taskId,
-                            source: msg.source || '', initiator: msg.initiator || '',
-                            senderLabel: msg.sender_label || '', senderSessionId: msg.sender_session_id || '',
-                        });
+                        addStoredRow(msg, taskId, { evidenceRef: cardRowEvidenceRef(msg) });
                         continue;
                     }
                     // Reconnect: a durably recorded submission must not stay
@@ -2589,17 +2595,10 @@ export function createChatInstance({
                     if (msg.chat_annotation && msg.client_message_id) {
                         pendingSubmissions.delete(String(msg.client_message_id));
                     }
-                    addMessage(msg.text, msg.role, !!msg.markdown, msg.ts || null, false, {
-                        historyId: msg.history_id, historyPosition: msg.history_position,
-                        systemType: msg.system_type || '',
-                        source: msg.source || '',
-                        initiator: msg.initiator || '',
-                        senderLabel: msg.sender_label || '',
-                        senderSessionId: msg.sender_session_id || '',
+                    addStoredRow(msg, taskId, {
                         clientMessageId: msg.client_message_id || '',
                         originProjected: msg.origin_projected === true,
                         originId: msg.origin_id || '',
-                        taskId,
                         chatAnnotation: msg.chat_annotation || null,
                         skillReview: msg.system_type === 'skill_review' && msg.skill && msg.job_id
                             ? { skill: msg.skill, jobId: msg.job_id }
@@ -3466,6 +3465,8 @@ export function createChatInstance({
         }
     }
     const disposeReadingGestures = reading.bindGestures(navigateHistoryAtEdge);
+    // Compact tables share rich-answer keyboard/overflow affordances; destroy releases them.
+    bindMarkdownTables(messagesDiv);
     function retryHistoricalUpserts() {
         const ready = [...pendingHistoryUpserts.values()].filter(row =>
             !historyNodes(row.history_id).some(node => historyNodeIsProtected(node, messagesDiv)));
@@ -3683,34 +3684,26 @@ export function createChatInstance({
         if (msg.role === 'assistant' || msg.role === 'system') {
             return withRemoteActivity(() => {
             const explicitTaskId = msg.task_id || '';
+            // Every path ends by syncing status; `unread` rows also count toward the badge.
+            const settled = (result, unread = result) => {
+                if (unread) incrementUnreadIfNeeded(msg);
+                syncChatStatus();
+                return result;
+            };
             const reference = admitCardMetadata(msg);
-            if (reference !== undefined) {
-                syncChatStatus();
-                return reference;
-            }
+            if (reference !== undefined) return settled(reference, false);
             const review = attachReviewFromRow(msg, msg.ts || '', true);
-            if (review !== undefined) {
-                syncChatStatus();
-                return review;
-            }
+            if (review !== undefined) return settled(review, false);
             const cardRow = attachCardRow(msg, msg.ts || '');
-            if (cardRow !== undefined) {
-                if (cardRow) incrementUnreadIfNeeded(msg);
-                syncChatStatus();
-                return cardRow;
-            }
+            if (cardRow !== undefined) return settled(cardRow);
             if (PROJECT_ROW_TYPES.has(msg.system_type)) {
-                const added = addProjectRow(msg, msg.content, { taskId: explicitTaskId });
-                if (added) incrementUnreadIfNeeded(msg);
-                syncChatStatus();
-                return Boolean(added);
+                return settled(Boolean(addProjectRow(msg, msg.content, { taskId: explicitTaskId })));
             }
             learnSubagentLineage(msg);
             if (msg.is_progress) {
                 showTaskIncidentToast(msg);
                 const changed = updateLiveCardFromProgressMessage(msg, { grantCancelAuthority: true });
-                syncChatStatus();
-                return changed;
+                return settled(changed, false);
             }
 
             // An early final (post-task still running) is NOT the turn's
@@ -3737,16 +3730,11 @@ export function createChatInstance({
 
             if (msg.system_type === 'task_summary') {
                 const changed = appendTaskSummaryToLiveCard(msg);
-                if (changed) incrementUnreadIfNeeded(msg);
-                syncChatStatus();
-                return Boolean(changed);
+                return settled(Boolean(changed));
             }
             // A placed host row is never a child's answer; with no card it stays a System row.
             if (explicitTaskId && !msg.card_row && subagentChildParents.has(explicitTaskId)) {
-                const changed = routeSubagentFinalMessageToCard(explicitTaskId, msg);
-                if (changed) incrementUnreadIfNeeded(msg);
-                syncChatStatus();
-                return Boolean(changed);
+                return settled(Boolean(routeSubagentFinalMessageToCard(explicitTaskId, msg)));
             }
             let changed = false;
             if (finalizing) changed = markLiveCardFinalizing(explicitTaskId, msg) || changed;
@@ -3759,10 +3747,10 @@ export function createChatInstance({
                 source: msg.source || '',
                 initiator: msg.initiator || '',
                 taskId: explicitTaskId,
+                // A placed row whose card is not in this chat keeps its record link.
+                evidenceRef: isPlacedCardRow(msg) ? cardRowEvidenceRef(msg) : null,
             });
-            if (added || changed) incrementUnreadIfNeeded(msg);
-            syncChatStatus();
-            return Boolean(added || changed || routingCleared);
+            return settled(Boolean(added || changed || routingCleared), added || changed);
             });
         }
     });

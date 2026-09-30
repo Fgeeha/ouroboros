@@ -1114,7 +1114,8 @@ test('a direct turn renders tool work as an activity block and needs host author
         const card = walkCard(messages, 'eph-1');
         assert.ok(card, 'real tool work reveals the activity block');
         assert.ok(convertButton(card), 'a working direct turn is offered conversion in Main');
-        assert.equal(card.querySelector('[data-live-title]').textContent, 'Working...', 'the running placeholder title');
+        assert.equal(card.querySelector('[data-live-phase]').textContent, 'Working', 'the chip states the running state');
+        assert.equal(card.querySelector('[data-live-title]').textContent, '', 'no title repeats the chip (#1369)');
         assert.equal(card.querySelector('[data-cancel-run]'), null, 'no host cancelable marker: no Cancel');
         handlers.get('chat')({
             chat_id: 1, role: 'assistant', is_progress: true,

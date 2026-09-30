@@ -286,3 +286,12 @@ test('a content button toggles on click and keyboard, but not on a selecting dra
     assert.deepEqual([clicks, activated, prevented], [2, 3, 2]);
     globalThis.getSelection = saved;
 });
+
+
+test('collapsed activity uses the same punctuation-labelled fences as the expanded timeline', () => {
+    for (const label of ['c++', 'c#', 'objective-c', 'md-js']) {
+        const source = '```' + label + '  \r\n# comment\r\nint value = 2;\r\n```';
+        assert.equal(plainActivityText(source), '# comment\nint value = 2;');
+        assert.equal(boundActivityPreview(source), '# comment int value = 2;');
+    }
+});

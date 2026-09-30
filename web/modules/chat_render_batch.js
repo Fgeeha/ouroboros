@@ -790,6 +790,7 @@ export function updateLiveTimelineItem(record, summary, { ts, rawTs, syntheticKe
             fullBody: summary.fullBody || summary.body || it.fullBody || '',
             fullRef: summary.fullRef || it.fullRef || '',
             truncated: summary.truncated || it.truncated || false,
+            evidenceRef: summary.evidenceRef || it.evidenceRef || null,
             // A call's failure frame replaces its receipt start: the row is
             // content again once it reports an error.
             receipt: Boolean(summary.receipt),
@@ -837,6 +838,8 @@ export function updateLiveTimelineItem(record, summary, { ts, rawTs, syntheticKe
             fullBody: summary.fullBody || summary.body || '',
             fullRef: summary.fullRef || '',
             truncated: summary.truncated || false,
+            // A late-review row's exact record link (#1369); null on every other row.
+            evidenceRef: summary.evidenceRef || null,
             receipt: Boolean(summary.receipt),
             ts: ts || '',
             sourceTs: rawTs,

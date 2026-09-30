@@ -486,6 +486,9 @@
  *   ordinary row.
  * @property {string=} card_row_id  // the row's stable identity across live delivery, outbox replay and history
  * @property {number=} card_row_revision  // canonical source order, independent of delivery timestamp
+ * @property {Object=} late_evidence
+ *   Late-review identity, reviewed revision and exact applied source_ref served by
+ *   taskSourceDownloadUrl; not an original reviewer transcript or a copy of the row.
  * @property {string=} target_label
  * @property {string=} project_id
  * @property {string=} project_name
