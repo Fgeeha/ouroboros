@@ -587,7 +587,8 @@ destination; a Send that fails keeps it with the draft and files. Reading on,
 even inside a bounded box, supersedes a ↓ or question still loading. A wheel,
 swipe or key over a bounded box moves that box, not the conversation, until the
 box reaches its edge.
-A scrollbar drag follows new replies only when released at the live edge.
+A scrollbar drag follows new replies only when released at the live edge; a
+wheel, swipe or key reading down follows once its scrolling ends there.
 Expanding a line or receiving its full output leaves it in place; only a newer
 line moves a card timeline to its end.
 New replies remain below in the same live conversation without moving the passage.
