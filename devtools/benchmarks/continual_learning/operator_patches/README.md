@@ -254,7 +254,11 @@ the external checkout root (a clean clone at `549998d` plus the patches above).
     from `run_clb.py` and removed the legacy HEAVY/CODE pins: it does not apply on top of
     that patch (conflict in `_docker_launcher.py`), keeps the old pins, and writes its own
     one-row roster instead of forwarding the launcher's. Its restart-refusal handling
-    targets an admission fence that exists only in the local engine build it ran on. It
+    targets an admission fence that exists only in the local engine build it ran on, and
+    it treats more than that fence's receipt as a restart refusal: any HTTP 503 whose body
+    mentions `restart` or `retryable` (`"retryable": false` included), or cannot be read,
+    re-enters the restart wait (up to 1800 s) instead of spending one of the six 5 s
+    submit retries; no test pins a 503 that keeps the fast-retry path. The delta
     was never run on a 7.x engine, and the 7.4.5 code shows two breaks: the injected
     `remote_work` manifest lacks `plugin_api: "2.0"`, so the engine refuses its native-seed
     trust and the live loop has no tools; and the task record no longer carries `cost_usd`
@@ -296,7 +300,11 @@ the external checkout root (a clean clone at `549998d` plus the patches above).
       `api_chat` rows, scope and advisory through a same-model scout row). Without the pin
       the isolated settings inherit the host's structured slots, which override the flat
       single-model review keys.
-    - Turn-1 responses attest the resolved configuration in `Response.metadata`.
+    - Turn-1 responses record eleven `OUROBOROS_*` settings in `Response.metadata`
+      (`config_attestation`). The values are the bench process's environment strings, not
+      the engine's resolved configuration: an unset key is recorded as an empty string
+      even where the Docker launcher passes the engine a default
+      (`OUROBOROS_TASK_REVIEW_MODE` becomes `auto`).
 
     Last end-to-end run: 2026-09-03, CL-Bench `run-all` groups
     `2026-09-03T05-22-33.505496Z` (control) and `2026-09-03T05-22-33.505495Z` (treatment),
@@ -306,9 +314,35 @@ the external checkout root (a clean clone at `549998d` plus the patches above).
     `clone_version=6.113.5 head=5fd3157e`. Active in that run: the earlier restart gate and
     retry, the 1800 s drain, the reviewer-slot pin, the sandbox lifetime override and the
     config attestation. Added afterwards and exercised by unit tests only: the
-    official-parser answer locator, the boundary readiness wait, the cadence `off` and the
-    current restart gate. The patch also rewrites the post-submission section of the
-    adapter's `METHODOLOGY.md` with the full account.
-    Verified: the patch reproduces its source tree byte for byte on `a691cf3`;
+    official-parser answer locator, the boundary readiness wait, the cadence `off`, the
+    current restart gate, the fail-closed forced request (a missing, unreadable or
+    non-object `state.json` now withholds the request instead of reading as empty) and the
+    handling of 503 restart refusals. The patch also rewrites the post-submission section
+    of the adapter's `METHODOLOGY.md` with the full account.
+    Contributor-reported historical verification: the patch reproduces its source tree
+    byte for byte on `a691cf3`;
     `tests/test_ouroboros_submission_ports.py` 140 passed and
     `tests/test_ouroboros_live_parity.py` 76 passed in the bench venv.
+### Limited startup smoke (2026-09-30)
+
+The archived delta was applied unchanged to CL-Bench
+`a691cf3553f5475e45e4769b270fb26fdbec23e3` in a separate checkout. A short offline
+smoke passed on Python 3.13.13: adapter and bridge-entrypoint imports, the
+entrypoint's `--help`, construction and `respond` / `observe` / `reset` with one
+fixture provider response, and these two original patched tests:
+
+- `test_task_assistant_text_is_oldest_first_and_parser_prefers_latest_valid`
+- `test_format_repair_locates_answer_with_the_official_parser`
+
+The smoke completed in about four seconds with exit 0; both tests passed.
+External socket connections were disabled during the smoke and no model call
+was made. The environment used the historical direct dependency pins
+(`pydantic==2.12.5`, `litellm==1.81.6`, `openai==2.16.0`,
+`python-dotenv==1.2.1`, `pytest==9.0.2`), with newly resolved transitive versions;
+it was not a reconstruction of the September 3 environment.
+
+This checks adapter startup and local plumbing only. The Ouroboros 6.113.5
+engine, Docker image, restart/evolution flow, benchmark score and compatibility
+with current Ouroboros were not tested. The historical verification counts
+above remain the contributor's results; this smoke does not replace them or
+remove the reproducibility gaps described in this addendum.
