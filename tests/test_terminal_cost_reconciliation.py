@@ -1,4 +1,5 @@
 """Selection is a no-write proof, never an ownership or accounting authority."""
+import contextlib
 import json
 import logging
 import time
@@ -28,11 +29,18 @@ def task(env, tid="root", **fields):
     return task_results.write_task_result(env.root, tid, "cancelled", result="kept answer", **fields)
 
 
-def attempt(env, tid="root", *, logical=None, cost=0.4, final=True, provider="openai"):
-    reservation = usage.reserve_attempt(usage.AttemptRequest(
-        model="test", provider=provider, drive_root=env.root, task_id=tid,
-        root_task_id=logical or tid, reservation_usd=1.0, global_limit_usd=100.0))
-    usage.mark_dispatched(reservation)
+def attempt(env, tid="root", *, logical=None, cost=0.4, final=True, provider="openai", non_task=False):
+    # ``system:*`` probes/one-shots dispatch under the explicit non-task scope
+    # their real producers bind (``update_letter``, ``llm_probe``): no task
+    # control owner, so no task-result Pause/sleep admission read.
+    scope = (usage.usage_scope(usage.UsageScope(drive_root=env.root, task_id=tid, root_task_id=logical or tid,
+                                                non_task_operation=True))
+             if non_task else contextlib.nullcontext())
+    with scope:
+        reservation = usage.reserve_attempt(usage.AttemptRequest(
+            model="test", provider=provider, drive_root=env.root, task_id=tid,
+            root_task_id=logical or tid, reservation_usd=1.0, global_limit_usd=100.0))
+        usage.mark_dispatched(reservation)
     if final:
         usage.settle_attempt(reservation, {"prompt_tokens": 7}, cost_usd=cost, cost_final=True)
     return reservation
@@ -137,9 +145,13 @@ def test_unrelated_bucket_does_not_invalidate_but_logical_root_bucket_does(env, 
     assert reconciliation._EQUAL_PROJECTIONS[key(env)].scopes == (True, "old")
     counts = observe(monkeypatch)
     attempt(env, "unrelated")  # missing result isn't memoized
+    # The measured seam is maintenance: the attempt's own launch admission
+    # reads its task's pause row before dispatch, which is not a projection.
+    counts.clear()
     maintenance._reconcile_abandoned_usage(env.root)
     assert not counts
     attempt(env, "child", logical="old", cost=0.6)
+    counts.clear()
     maintenance._reconcile_abandoned_usage(env.root)
     assert counts["projections"] == 2 and counts["ownership"] == 1
     row = task_results.load_task_result(env.root, "root")
@@ -371,10 +383,11 @@ def test_settled_system_scopes_own_no_result_but_their_real_root_still_does(env,
     # Probe/test money settles under non-task ``system:*`` scopes; one such scope
     # still rolls up into a real root that no row of its own names.
     task(env, "owed")
-    attempt(env, "system:update_letter", logical="owed", cost=0.6)
+    attempt(env, "system:update_letter", logical="owed", cost=0.6, non_task=True)
     for _ in range(20 if compact else 1):
         for scope in ("system:capability_probe", "system:provider_test", "system:update_letter"):
-            attempt(env, scope, logical="owed" if scope == "system:update_letter" else None, cost=0.0)
+            attempt(env, scope, logical="owed" if scope == "system:update_letter" else None, cost=0.0,
+                    non_task=True)
     task(env, "broken")
     attempt(env, "broken")
     broken = task_results.task_result_path(env.root, "broken")

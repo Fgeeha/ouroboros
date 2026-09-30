@@ -100,8 +100,7 @@ def test_runtime_keeps_the_admitted_occurrences_due_time_after_schedule_advances
     due = "2026-09-29T00:30:00+00:00"
     claimed = "2026-09-30T03:00:00+00:00"
     (tmp_path / "state" / "scheduled_tasks.json").write_text(json.dumps({"tasks": [{
-        # An owner row: a source-less legacy row's relation is unknown and held.
-        "id": "follow-up", "enabled": trigger == "cron", "name": "Review results", "source": "owner",
+        "id": "follow-up", "enabled": trigger == "cron", "name": "Review results",
         "trigger": {"type": trigger, "run_at": due, "expr": "30 0 * * *"},
         "next_run_at": "2026-10-01T00:30:00+00:00",
     }]}), encoding="utf-8")

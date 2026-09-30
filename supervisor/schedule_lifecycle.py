@@ -150,7 +150,9 @@ def _merge_onto_current(existing: Dict[str, Any], incoming: Dict[str, Any]) -> D
                 "a skill-manifest schedule is enabled by its skill's readiness; use the "
                 "disable/restore lifecycle action, which records the owner's decision so "
                 "the skill resync cannot undo it")
-    if _is_suppressed(merged):
+    if _is_suppressed(merged) or merged.get("delete_requested_at"):
+        # A suppressed skill row, or a deleted row waiting only for work it
+        # already accepted: neither an edit nor a save re-arms future runs.
         merged["enabled"] = False
     return merged
 
@@ -195,6 +197,9 @@ def upsert_scheduled_task(record: Dict[str, Any], *, drive_root: pathlib.Path | 
         elif incoming.get("source") != "task_followup":
             incoming["source"] = "owner"
             incoming["followup_relation"] = {"kind": "independent", "revision": uuid.uuid4().hex}
+        elif origin_of(incoming):
+            # Normalization below drops template lineage; keep its provenance.
+            incoming["followup_origin"] = origin_of(incoming)
         incoming["task"] = normalize_template(incoming)
         if incoming.get("followup_origin"):
             incoming["task"]["metadata"]["objective_author"] = {
@@ -300,8 +305,9 @@ def mutate_scheduled_task(action: str, schedule_id: str, *, reason: str,
             if current is None:
                 return {"ok": False, "changed": False, "status": "not_found",
                         "schedule_id": wanted, "audit": "not_written"}
-            # An exact release request never becomes generic enable on replay.
-            if operation == "restore" and (expected_hold_id or current.get("followup_hold") or
+            # An exact release request never becomes generic enable on replay,
+            # and a relationship decision only resolves an observed hold.
+            if operation == "restore" and (expected_hold_id or resolved or current.get("followup_hold") or
                     (not _is_consumed_once(current) and policy_view(root, data, current).get("hold"))):
                 return restore_followup(root, data, current, expected_hold_id=expected_hold_id,
                                         resolved=resolved, actor=actor, task_id=task_id, reason=reason)
@@ -323,11 +329,11 @@ def mutate_scheduled_task(action: str, schedule_id: str, *, reason: str,
             detail, removed = "", False
             if operation == "disable":
                 current["enabled"] = False
-                if skill_row or current.get("source") == "task_followup":
+                if skill_row:
                     current["manual_override"] = "disabled"
                 status = "updated"
             elif operation == "delete":
-                if skill_row or current.get("source") == "task_followup":
+                if skill_row:
                     # Retained as a suppressed record: dropping the row would only
                     # have it recreated by the next lifecycle resync, and the owner
                     # would never see that their delete did not hold.
@@ -335,20 +341,27 @@ def mutate_scheduled_task(action: str, schedule_id: str, *, reason: str,
                     current["manual_override"] = "deleted"
                     status = "suppressed"
                 else:
-                    from supervisor.schedule_occurrence import owed, work_settled
+                    from supervisor.followup_policy import relation_kind
+                    from supervisor.schedule_occurrence import deletion_settled, owed
 
                     status, owes = "deleted", owed(current, drive_root=root)
-                    if owes is not False or not work_settled(current, drive_root=root):
+                    continuation = relation_kind(current) != "independent"
+                    if owes is not False or not deletion_settled(current, drive_root=root):
                         # An accepted run waits to be re-queued: removal is deferred until it
                         # starts, because deleting a row never takes back an admission (#1315).
+                        # A continuation's row also carries its task's Stop/Restart release
+                        # and start binding, so it stays until that task settles.
                         current["enabled"], current["delete_requested_at"] = False, utc_now_iso()
                         status = "delete_deferred"
-                        detail = ("an accepted run is still owed; the row will be removed after that run "
-                                  "starts and reaches settlement" if owes else
-                                  "the occurrence receipt is missing, unreadable or conflicting; "
-                                  "the disabled row is retained until its execution history can be established"
-                                  if owes is None else
-                                  "this schedule retains unsettled work; deletion waits for its settlement")
+                        if owes is None:
+                            detail = ("the occurrence receipt is missing, unreadable or conflicting; the disabled "
+                                      "row is retained until its execution history can be established")
+                        elif owes:
+                            detail = ("an accepted run is still owed; the row will be removed once that run starts"
+                                      + (" and its task settles" if continuation else ""))
+                        else:
+                            detail = ("no new run starts; this row continues a task that has not settled "
+                                      "and is removed once it settles")
                     else:
                         tasks = [item for item in tasks if str(item.get("id") or "") != wanted]
                         removed = True
@@ -387,9 +400,10 @@ def mutate_scheduled_task(action: str, schedule_id: str, *, reason: str,
                     if not dispatchable:
                         status, detail = "restored_not_ready", blocker
             else:
-                current.pop("manual_override", None)
+                # A new explicit Restore may cancel a still-pending deletion;
+                # exact hold releases return above and never change this intent.
                 current["enabled"] = True
-                current.pop("delete_requested_at", None)  # restoring withdraws a deferred delete
+                current.pop("delete_requested_at", None)
                 status = "updated"
             changed = status not in UNCHANGED_STATUSES
             if changed:

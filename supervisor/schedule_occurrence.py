@@ -209,26 +209,48 @@ def owed(record: Dict[str, Any], *, drive_root: Optional[pathlib.Path] = None) -
 
 
 def work_settled(record: Dict[str, Any], *, drive_root: Optional[pathlib.Path] = None) -> bool:
-    """Occurrence settlement is not task settlement: keep its control row until both."""
+    """Occurrence settlement is not task settlement: keep its control row until both.
+
+    A receipt-less claim positively never started, and a row that never admitted
+    anything owes nothing: neither needs the queue, so a worker without a fresh
+    snapshot deletes it at once. Otherwise the admitted task must be absent from
+    the queue and settled; a collected result of a task no occurrence still
+    names is settled history. Unreadable or unknown evidence keeps the row.
+    """
     from supervisor.queue_schedules import _schedule_running_or_queued
     from ouroboros.task_status import SETTLED_STATUSES
 
     root = drive_root if drive_root is not None else _queue().DRIVE_ROOT
     occ = record.get("occurrence") if isinstance(record.get("occurrence"), dict) else {}
     tid = str(occ.get("task_id") or record.get("last_task_id") or "")
-    if _schedule_running_or_queued(str(record.get("id") or ""), root, task_id=tid) is not False:
-        return False
-    if not tid:
-        return not record.get("completed_at") and not record.get("occurrence")
     try:
+        if occ and _unstarted_claim(occ, _read_back(str(occ.get("task_id") or ""), drive_root=root)):
+            # Only an earlier occurrence's task can be unsettled.
+            occ, tid = {}, str(record.get("last_task_id") or "")
+            if not tid:
+                return True
+        elif not occ and not tid and not record.get("completed_at"):
+            return True
+        if _schedule_running_or_queued(str(record.get("id") or ""), root, task_id=tid) is not False:
+            return False
+        if not tid:
+            return not occ
         result = _read_back(tid, drive_root=root)
-        if occ and _unstarted_claim(occ, result):
-            # A receipt-less claim never started: only an earlier occurrence's task can be unsettled.
-            prior = str(record.get("last_task_id") or "")
-            return not prior or _read_back(prior, drive_root=root).get("status") in SETTLED_STATUSES
-        return result.get("status") in SETTLED_STATUSES
+        return (not occ) if not result else result.get("status") in SETTLED_STATUSES
     except Exception:
         return False
+
+
+def deletion_settled(record: Dict[str, Any], *, drive_root: Optional[pathlib.Path] = None) -> bool:
+    """Whether a deferred delete/GC may drop the row: nothing retained still needs it.
+
+    An independent schedule's row has no role once its accepted run starts. A
+    continuation (related, or an unrecorded published relationship) is the
+    task's Stop/Restart release and ``scheduled_start`` binding until it settles.
+    """
+    from supervisor.followup_policy import relation_kind
+
+    return relation_kind(record) == "independent" or work_settled(record, drive_root=drive_root)
 
 
 def repair_followup_binding(record: Dict[str, Any]) -> bool:
@@ -286,7 +308,7 @@ def discard_claim(record: Dict[str, Any], data: Dict[str, Any]) -> bool:
     """Drop unaccepted work and finish any earlier deferred delete atomically."""
     record.pop("occurrence", None)
     record.pop("hold", None)
-    if record.get("delete_requested_at") and work_settled(record):
+    if record.get("delete_requested_at") and deletion_settled(record):
         data["tasks"] = [row for row in data.get("tasks") or [] if row is not record]
         return True
     return False

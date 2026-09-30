@@ -50,6 +50,132 @@ function isSkillManaged(s) {
     return Boolean(s && (String(s.source || '') === 'skill_manifest' || String(s.skill || '')));
 }
 
+// The server names the lifecycle word; these fall back for an older payload
+// so a row is never silently promoted to "active" by a missing field.
+export function scheduleStatus(s) {
+    const once = String((s.trigger || {}).type || 'cron') === 'once';
+    if (s.status) return String(s.status);
+    if (s.delete_requested_at) return 'delete_pending';
+    if (once && s.completed_at) return 'consumed';
+    if (isSkillManaged(s) && ['disabled', 'deleted'].includes(String(s.manual_override || ''))) return 'suppressed';
+    return s.enabled === false ? 'disabled' : 'active';
+}
+
+// Retained rows — a fired one-shot, a suppressed skill row — are history, not
+// schedules wearing a disabled flag. A deleted row still finishing accepted
+// work is not history: it stays in the standing list until it disappears.
+export function isRetainedSchedule(s) {
+    return ['consumed', 'suppressed'].includes(scheduleStatus(s));
+}
+
+export function scheduleRowHtml(s) {
+    const managed = isSkillManaged(s);
+    const trigger = s.trigger || {};
+    const once = String(trigger.type || 'cron') === 'once';
+    // One-shot rows have no cron: show the fire instant + a "one-shot" tag. A cron
+    // expression runs in its record's zone, or the server's when none is stored.
+    const timing = once
+        ? `one-shot · at/after ${scheduleInstantHtml(trigger.run_at)}`
+        : `${esc(trigger.expr || s.cron || '')} (${s.timezone ? esc(s.timezone) : 'server time zone'})`;
+    const next = s.next_run_at ? scheduleInstantHtml(s.next_run_at) : '';
+    const status = scheduleStatus(s);
+    const enabled = status === 'active';
+    const consumed = status === 'consumed';
+    const suppressed = status === 'suppressed';
+    const pendingDelete = status === 'delete_pending';
+    const id = esc(s.id || '');
+    // A due occurrence that waits (capacity, a missing folder, an unknown fact) says why.
+    const waiting = s.hold && s.hold.reason
+        ? ` · <span class="activity-tag" title="${esc(s.hold.detail || '')}">waiting: ${esc(s.hold.reason)}</span>` : '';
+    const relation = String(s.relation || 'unknown');
+    const hold = s.followup_hold || {};
+    const work = s.billing_group || {};
+    const binding = work.billing_group_id ? ` · work ${esc(work.billing_group_id)} · cap ${work.billing_group_limit_usd == null ? 'unbounded' : '$' + esc(work.billing_group_limit_usd)}` : '';
+    const explanations = {
+        origin_stopped: 'Original work stopped or restarted', relationship_unknown: 'Relationship needs a decision',
+        origin_owner_paused: 'Original work is paused', owner_restart_in_progress: 'Restart in progress',
+        followup_authority_unavailable: 'Original work details unavailable', work_deadline_passed: 'Original hard deadline passed',
+        pending_binding_unavailable: 'Fired task awaits verified work binding',
+        followup_result_persistence_unavailable: 'Task record could not be saved',
+    };
+    const statusLabel = pendingDelete ? 'deletion pending' : status;
+    const sub = `${timing}${next && !consumed && !pendingDelete ? ` · next ${next}` : ''} · ${esc(statusLabel)} · ${esc(relation)}${binding}${s.deadline_at ? ` · deadline ${scheduleInstantHtml(s.deadline_at, { includeYear: true })}` : ''}${hold.reason ? ` · ${esc(explanations[hold.reason] || hold.reason)}` : ''}${s.followup_wait ? ` · ${esc(explanations[s.followup_wait] || s.followup_wait)}` : ''}${s.completed_at ? ' · already fired' : ''}${managed && s.skill ? ` · ${esc(s.skill)}` : ''}${waiting}`;
+    // The exact hold release stays available wherever a hold exists, including on a
+    // deleted row whose accepted task still needs it; it never re-enables the row.
+    const holdControl = !hold.hold_id ? ''
+        : relation === 'unknown'
+            ? '<span class="activity-tag">resolve relationship in conversation</span>'
+            : !s.hold_persisted
+                ? '<span class="activity-tag">hold persistence pending</span>'
+                : `<button type="button" class="btn btn-xs btn-default" data-act="schedule-toggle" data-id="${id}" data-action="restore" data-hold-id="${esc(hold.hold_id || '')}">Restore hold</button>`;
+    // A consumed one-shot cannot be re-armed, so it carries no Enable: the
+    // only honest control left is removing the receipt. A suppressed skill
+    // row offers Restore, which asks the server to re-evaluate the skill.
+    // A skill row that is disabled WITHOUT the owner's marker is held back by
+    // its skill's readiness and re-arms on resync; an Enable button there
+    // would offer to lift a suppression nobody applied. A pending deletion can
+    // be explicitly cancelled; naming it Enable would hide that extra effect.
+    const cancelDelete = !hold.hold_id && !(once && s.completed_at)
+        ? `<button type="button" class="btn btn-xs btn-default" data-act="schedule-toggle" data-id="${id}" data-action="restore">Cancel deletion</button>` : '';
+    const readinessHeld = managed && !enabled && !suppressed;
+    const lifecycle = pendingDelete
+        ? `<span class="activity-tag">${relation === 'independent'
+            ? 'deletion waits for its accepted run to start' : 'deletion waits for its task to finish'}</span>${holdControl}${cancelDelete}`
+        : status === 'waiting'
+            ? '<span class="activity-tag">waiting for existing control</span>'
+            : hold.hold_id
+                ? holdControl
+                : consumed
+                    ? '<span class="activity-tag">consumed once · history</span>'
+                    : readinessHeld
+                        ? '<span class="activity-tag">disabled by skill readiness</span>'
+                        : `<button type="button" class="btn btn-xs btn-default" data-act="schedule-toggle" data-id="${id}" data-action="${suppressed || !enabled ? 'restore' : 'disable'}">${enabled ? 'Disable' : (suppressed ? 'Restore' : 'Enable')}</button>`;
+    return `<div class="activity-row activity-schedule${enabled || hold.hold_id || s.followup_wait ? '' : ' off'}">
+        <div class="activity-row-main">
+            <span class="activity-name">${esc(s.name || s.id || 'schedule')}</span>
+            <span class="activity-sub">${sub}</span>
+        </div>
+        <div class="activity-row-actions">${lifecycle}
+           <button type="button" class="btn btn-xs btn-danger" data-act="schedule-delete" data-id="${id}" data-managed="${managed ? '1' : ''}">Delete</button></div>
+    </div>`;
+}
+
+// What one lifecycle response means for the owner: ``[text, level]`` or null.
+// The response says two separable things: whether the schedule CHANGED, and
+// whether both audit facts landed. A change whose outcome record was lost is
+// neither a clean success nor a failure, and saying either would be wrong.
+export function scheduleOutcomeToast(action, outcome) {
+    if (!outcome || typeof outcome !== 'object' || typeof outcome.changed !== 'boolean') {
+        return [`Schedule ${action}: the server did not say what happened.`, 'error'];
+    }
+    const detail = String(outcome.detail || outcome.status || 'no status reported');
+    if (outcome.changed === false) return [`Schedule ${action} did not change anything: ${detail}`, 'error'];
+    // Restriction refresh can change bookkeeping while REFUSING release.
+    // Only typed applied outcomes may produce an applied/success message.
+    if (!['updated', 'deleted', 'delete_deferred', 'suppressed', 'restored_not_ready',
+        'hold_released', 'changed_audit_incomplete'].includes(outcome.status)) {
+        return [`Schedule ${action} refused: ${detail}`, 'error'];
+    }
+    if (outcome.audit !== 'recorded') return [`Schedule ${action} applied, but its audit record is incomplete: ${detail}`, 'warn'];
+    if (outcome.status === 'delete_deferred') return [`Schedule deletion is pending: ${detail}`, 'info'];
+    if (outcome.status === 'restored_not_ready') {
+        return [`Schedule suppression lifted, but it is not ready to run: ${detail}`, 'warn'];
+    }
+    if (outcome.ok !== true) return [`Schedule ${action} changed, but did not finish successfully: ${detail}`, 'warn'];
+    // Name what actually happened: a delete on a skill row is a durable
+    // suppression, and saying "deleted" would claim a removal that did not occur.
+    const done = outcome.status === 'suppressed' ? 'suppressed (kept disabled until restored)' : `${action}d`;
+    // Lifecycle actions govern FUTURE dispatch; a run already admitted keeps
+    // going. Silence here would let the owner read the button as a stop.
+    if (outcome.running_or_queued === true) {
+        return [`Schedule ${done}. A task it already admitted is queued or running and was not cancelled.`, 'info'];
+    }
+    if (outcome.running_or_queued === null || outcome.running_or_queued === undefined) {
+        return [`Schedule ${done}. Whether a task it already started is still running is unknown.`, 'info'];
+    }
+    return outcome.status === 'suppressed' ? [`Schedule ${done}.`, 'info'] : null;
+}
+
 export function initActivity({ mount, ws } = {}) {
     if (!mount) return { refresh: () => {} };
     let busy = false;
@@ -100,7 +226,10 @@ export function initActivity({ mount, ws } = {}) {
             // The owner's Restart holds never-started work under the same
             // hold carrier (restart_retention.py): same Resume, its own words.
             const restartHeld = heldRow(t) && t._budget_pause_hold.reason === 'owner_restart_hold';
-            const sleeping = t._budget_pause?.reason === 'sleep';
+            const waiting = q.owner_wait;
+            const warmSleeping = kind === 'running' && waiting?.state === 'waiting'
+                && waiting.reason === 'sleep' && waiting.sleep?.mode === 'warm';
+            const sleeping = t._budget_pause?.reason === 'sleep' || warmSleeping;
             const ownerPaused = t._budget_pause?.reason === 'owner'
                 || ownerFencedRoots.has(String(t.root_task_id || t.id || q.id || ''));
             const phase = (census?.active_chat_activities || []).find((entry) =>
@@ -108,7 +237,7 @@ export function initActivity({ mount, ws } = {}) {
             const resumable = paused && (!ownerPaused || phase === 'budget_paused');
             const kindLabel = phase === 'unknown' ? 'pause status unknown'
                 : phase === 'budget_pausing' ? 'pausing' : restartHeld ? 'held after Restart'
-                : (paused ? (ownerPaused ? 'paused' : sleeping ? 'sleeping' : 'paused (budget)') : kind);
+                : (paused ? (ownerPaused ? 'paused' : sleeping ? 'sleeping' : 'paused (budget)') : sleeping ? 'sleeping' : kind);
             const meta = `${esc(kindLabel)}${q.type ? ` · ${esc(q.type)}` : ''}${rt}`;
             return `<div class="activity-row">
                 <div class="activity-row-main">
@@ -176,76 +305,6 @@ export function initActivity({ mount, ws } = {}) {
         </div>`;
     }
 
-    // The server names the lifecycle word; these fall back for an older payload
-    // so a row is never silently promoted to "active" by a missing field.
-    function scheduleStatus(s) {
-        const once = String((s.trigger || {}).type || 'cron') === 'once';
-        if (s.status) return String(s.status);
-        if (once && s.completed_at) return 'consumed';
-        if (isSkillManaged(s) && ['disabled', 'deleted'].includes(String(s.manual_override || ''))) return 'suppressed';
-        return s.enabled === false ? 'disabled' : 'active';
-    }
-
-    function scheduleRow(s) {
-        const managed = isSkillManaged(s);
-        const trigger = s.trigger || {};
-        const once = String(trigger.type || 'cron') === 'once';
-        // One-shot rows have no cron: show the fire instant + a "one-shot" tag. A cron
-        // expression runs in its record's zone, or the server's when none is stored.
-        const timing = once
-            ? `one-shot · at/after ${scheduleInstantHtml(trigger.run_at)}`
-            : `${esc(trigger.expr || s.cron || '')} (${s.timezone ? esc(s.timezone) : 'server time zone'})`;
-        const next = s.next_run_at ? scheduleInstantHtml(s.next_run_at) : '';
-        const status = scheduleStatus(s);
-        const enabled = status === 'active';
-        const consumed = status === 'consumed';
-        const suppressed = status === 'suppressed';
-        const id = esc(s.id || '');
-        // A due occurrence that waits (capacity, a missing folder, an unknown fact) says why.
-        const waiting = s.hold && s.hold.reason
-            ? ` · <span class="activity-tag" title="${esc(s.hold.detail || '')}">waiting: ${esc(s.hold.reason)}</span>` : '';
-        const relation = String(s.relation || 'unknown');
-        const hold = s.followup_hold || {};
-        const work = s.billing_group || {};
-        const binding = work.billing_group_id ? ` · work ${esc(work.billing_group_id)} · cap ${work.billing_group_limit_usd == null ? 'unbounded' : '$' + esc(work.billing_group_limit_usd)}` : '';
-        const explanations = {
-            origin_stopped: 'Original work stopped or restarted', relationship_unknown: 'Relationship needs a decision',
-            origin_owner_paused: 'Original work is paused', owner_restart_in_progress: 'Restart in progress',
-            followup_authority_unavailable: 'Original work details unavailable', work_deadline_passed: 'Original hard deadline passed',
-            pending_binding_unavailable: 'Fired task awaits verified work binding',
-            followup_result_persistence_unavailable: 'Task record could not be saved',
-        };
-        const sub = `${timing}${next && !consumed ? ` · next ${next}` : ''} · ${esc(status)} · ${esc(relation)}${binding}${s.deadline_at ? ` · deadline ${scheduleInstantHtml(s.deadline_at, { includeYear: true })}` : ''}${hold.reason ? ` · ${esc(explanations[hold.reason] || hold.reason)}` : ''}${s.followup_wait ? ` · ${esc(explanations[s.followup_wait] || s.followup_wait)}` : ''}${s.completed_at ? ' · already fired' : ''}${managed && s.skill ? ` · ${esc(s.skill)}` : ''}${waiting}`;
-        // A consumed one-shot cannot be re-armed, so it carries no Enable: the
-        // only honest control left is removing the receipt. A suppressed skill
-        // row offers Restore, which asks the server to re-evaluate the skill.
-        // A skill row that is disabled WITHOUT the owner's marker is held back by
-        // its skill's readiness and re-arms on resync; an Enable button there
-        // would offer to lift a suppression nobody applied.
-        const readinessHeld = managed && !enabled && !suppressed;
-        const lifecycle = status === 'waiting'
-            ? '<span class="activity-tag">waiting for existing control</span>'
-            : hold.hold_id
-                ? (relation === 'unknown'
-                    ? '<span class="activity-tag">resolve relationship in conversation</span>'
-                    : !s.hold_persisted
-                        ? '<span class="activity-tag">hold persistence pending</span>'
-                        : `<button type="button" class="btn btn-xs btn-default" data-act="schedule-toggle" data-id="${id}" data-action="restore" data-hold-id="${esc(hold.hold_id || '')}">Restore hold</button>`)
-            : consumed
-            ? '<span class="activity-tag">consumed once · history</span>'
-            : readinessHeld
-                ? '<span class="activity-tag">disabled by skill readiness</span>'
-                : `<button type="button" class="btn btn-xs btn-default" data-act="schedule-toggle" data-id="${id}" data-action="${suppressed || !enabled ? 'restore' : 'disable'}">${enabled ? 'Disable' : (suppressed ? 'Restore' : 'Enable')}</button>`;
-        return `<div class="activity-row activity-schedule${enabled || hold.hold_id || s.followup_wait ? '' : ' off'}">
-            <div class="activity-row-main">
-                <span class="activity-name">${esc(s.name || s.id || 'schedule')}</span>
-                <span class="activity-sub">${sub}</span>
-            </div>
-            <div class="activity-row-actions">${lifecycle}
-               <button type="button" class="btn btn-xs btn-danger" data-act="schedule-delete" data-id="${id}" data-managed="${managed ? '1' : ''}">Delete</button></div>
-        </div>`;
-    }
-
     function renderSchedules(data) {
         if (!Array.isArray(data?.tasks)) throw new Error('Schedules unavailable');
         const tasks = data.tasks;
@@ -255,9 +314,9 @@ export function initActivity({ mount, ws } = {}) {
         // restorable) but collapsed, so the standing schedules are the list.
         const standing = [];
         const retained = [];
-        for (const s of tasks) (['consumed', 'suppressed'].includes(scheduleStatus(s)) ? retained : standing).push(s);
+        for (const s of tasks) (isRetainedSchedule(s) ? retained : standing).push(s);
         const parts = standing.length
-            ? standing.map(scheduleRow)
+            ? standing.map(scheduleRowHtml)
             : ['<div class="activity-empty">No active or disabled schedules.</div>'];
         if (retained.length) {
             // A refresh rebuilds this markup, so the disclosure carries the state
@@ -266,7 +325,7 @@ export function initActivity({ mount, ws } = {}) {
             // the app undoing their action.
             parts.push(`<details class="activity-history" data-activity-history${historyOpen ? ' open' : ''}>
                 <summary>History &amp; suppressed (${retained.length})</summary>
-                ${retained.map(scheduleRow).join('')}
+                ${retained.map(scheduleRowHtml).join('')}
             </details>`);
         }
         return parts.join('');
@@ -355,52 +414,9 @@ export function initActivity({ mount, ws } = {}) {
         return outcome;
     }
 
-    // The response says two separable things: whether the schedule CHANGED, and
-    // whether both audit facts landed. A change whose outcome record was lost is
-    // neither a clean success nor a failure, and saying either would be wrong.
     function reportScheduleOutcome(action, outcome) {
-        if (!outcome || typeof outcome !== 'object' || typeof outcome.changed !== 'boolean') {
-            showToast(`Schedule ${action}: the server did not say what happened.`, 'error');
-            return;
-        }
-        const detail = String(outcome.detail || outcome.status || 'no status reported');
-        if (outcome.changed === false) {
-            showToast(`Schedule ${action} did not change anything: ${detail}`, 'error');
-            return;
-        }
-        // Restriction refresh can change bookkeeping while REFUSING release.
-        // Only typed applied outcomes may produce an applied/success message.
-        if (!['updated', 'deleted', 'suppressed', 'restored_not_ready',
-            'hold_released', 'changed_audit_incomplete'].includes(outcome.status)) {
-            showToast(`Schedule ${action} refused: ${detail}`, 'error');
-            return;
-        }
-        if (outcome.audit !== 'recorded') {
-            showToast(`Schedule ${action} applied, but its audit record is incomplete: ${detail}`, 'warn');
-            return;
-        }
-        if (outcome.status === 'delete_deferred') {
-            showToast(`Schedule deletion is pending: ${detail}`, 'info');
-            return;
-        }
-        if (outcome.status === 'restored_not_ready') {
-            showToast(`Schedule suppression lifted, but it is not ready to run: ${detail}`, 'warn');
-        } else if (outcome.ok !== true) {
-            showToast(`Schedule ${action} changed, but did not finish successfully: ${detail}`, 'warn');
-            return;
-        }
-        // Name what actually happened: a delete on a skill row is a durable
-        // suppression, and saying "deleted" would claim a removal that did not occur.
-        const done = outcome.status === 'suppressed' ? 'suppressed (kept disabled until restored)' : `${action}d`;
-        // Lifecycle actions govern FUTURE dispatch; a run already admitted keeps
-        // going. Silence here would let the owner read the button as a stop.
-        if (outcome.running_or_queued === true) {
-            showToast(`Schedule ${done}. A task it already admitted is queued or running and was not cancelled.`, 'info');
-        } else if (outcome.running_or_queued === null || outcome.running_or_queued === undefined) {
-            showToast(`Schedule ${done}. Whether a task it already started is still running is unknown.`, 'info');
-        } else if (outcome.status === 'suppressed') {
-            showToast(`Schedule ${done}.`, 'info');
-        }
+        const toast = scheduleOutcomeToast(action, outcome);
+        if (toast) showToast(...toast);
     }
 
     mount.addEventListener('click', async (event) => {

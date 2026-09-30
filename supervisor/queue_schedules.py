@@ -268,7 +268,7 @@ def _is_consumed_once(record: Dict[str, Any]) -> bool:
 
 def _is_suppressed(record: Dict[str, Any]) -> bool:
     """A skill row the owner disabled or deleted and the resync may not re-arm."""
-    return (str(record.get("source") or "") in {"skill_manifest", "task_followup"}
+    return (str(record.get("source") or "") == "skill_manifest"
             and str(record.get("manual_override") or "").strip().lower() in SUPPRESSED_OVERRIDES)
 
 
@@ -277,7 +277,11 @@ def schedule_lifecycle_status(record: Dict[str, Any]) -> str:
 
     ``consumed`` and ``suppressed`` are RETAINED history: neither dispatches
     again, and neither is an ``active`` schedule wearing a disabled flag.
+    ``delete_pending`` outranks them: a deleted row that still owes accepted
+    work stays visible until that work no longer needs it, then disappears.
     """
+    if record.get("delete_requested_at"):
+        return "delete_pending"
     if _is_consumed_once(record):
         return "consumed"
     if record.get("followup_hold"):
@@ -352,6 +356,9 @@ def _schedule_projection_row(raw: Dict[str, Any]) -> Dict[str, Any]:
     # one can come back, and only after its skill is re-evaluated.
     row["retained"] = status in {"consumed", "suppressed", "held"}
     row["restorable"] = status == "suppressed" or bool(raw.get("followup_hold") and raw.get("hold_persisted", True))
+    row["delete_pending"] = status == "delete_pending"
+    if row["delete_pending"]:
+        row["delete_requested_at"] = _bounded_projection_text(raw.get("delete_requested_at"), 64)
     from supervisor.followup_policy import relation_kind, origin_of
     row["relation"] = relation_kind(raw)
     row["followup_origin"] = origin_of(raw)
@@ -448,7 +455,7 @@ def schedule_activity_projection(data: Dict[str, Any]) -> Dict[str, Any]:
         row["suppressed"] = status == "suppressed"
         projected = _schedule_projection_row(row)
         for key in ("retained", "restorable", "relation", "followup_origin", "followup_hold",
-                    "followup_wait", "hold_persisted", "billing_group", "deadline_at"):
+                    "followup_wait", "hold_persisted", "billing_group", "deadline_at", "delete_pending"):
             row[key] = projected[key]
         tasks.append(row)
     out["tasks"] = tasks
@@ -591,9 +598,9 @@ def sync_skill_schedules(skills: List[Any], *, drive_root: pathlib.Path | None =
                 and schedule_id not in touched
                 and not _is_suppressed(record)
             ):
-                from supervisor.schedule_occurrence import owed, work_settled
+                from supervisor.schedule_occurrence import owed
 
-                if owed(record, drive_root=drive_root) is False and work_settled(record, drive_root=drive_root):
+                if owed(record, drive_root=drive_root) is False:
                     by_id.pop(schedule_id, None)
                 else:
                     record.update(enabled=False, delete_requested_at=utc_now_iso())
@@ -806,7 +813,7 @@ def check_scheduled_tasks() -> None:
                         continue
                 elif verdict == "settled":
                     occurrences.settle(record)
-                    if record.get("delete_requested_at") and occurrences.work_settled(record):
+                    if record.get("delete_requested_at") and occurrences.deletion_settled(record):
                         data["tasks"] = [row for row in data.get("tasks") or [] if row is not record]
                         continue
                 elif verdict in {"prepare", "republish"}:
@@ -814,7 +821,7 @@ def check_scheduled_tasks() -> None:
                     continue
                 else:
                     continue
-            if record.get("delete_requested_at") and occurrences.work_settled(record):
+            if record.get("delete_requested_at") and occurrences.deletion_settled(record):
                 data["tasks"] = [row for row in data.get("tasks") or [] if row is not record]
                 changed = True
                 continue
@@ -880,7 +887,7 @@ def check_scheduled_tasks() -> None:
         from ouroboros.retention import age_cutoff, get_gc_retention_days
 
         kept, pruned = _prune_consumed_once(list(data.get("tasks") or []),
-                                            age_cutoff(get_gc_retention_days()), work_settled=occurrences.work_settled)
+                                            age_cutoff(get_gc_retention_days()), work_settled=occurrences.deletion_settled)
         if pruned:
             data["tasks"], changed = kept, True
         if changed:

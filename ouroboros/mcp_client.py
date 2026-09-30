@@ -1315,6 +1315,10 @@ class MCPManager:
                 text=text,
                 meta={"dynamic_provider": True},
             )
+        # Joined normal return (either SDK error bit): this invocation's call is over.
+        from ouroboros.owner_pause import record_mcp_call_returned
+
+        record_mcp_call_returned(prefixed_name)
         text = _model_facing_result(
             cfg,
             tool.raw_name,

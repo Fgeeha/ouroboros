@@ -74,16 +74,31 @@ def test_same_author_related_independent_and_unknown(world):
     assert not row(root, related['id']).get('last_task_id')
 
 
-def test_new_relation_required_and_unknown_never_pins_fresh_wallet(world):
+def test_new_relation_required_and_unrecorded_legacy_keeps_its_own_wallet_until_resolved(world):
     ctx, root, _ = world
+    # New work must decide its relationship; the published producer never recorded one.
     assert 'followup_relation_required' in _handle_schedule_followup(ctx, objective='x', run_at=DEADLINE)
     legacy = {'id': 'legacy', 'source': 'task_followup', 'task': {'metadata': {'origin_task_id': ORIGIN}}}
-    schedules._write_scheduled_tasks({'tasks': [legacy]}, root)
+    garbled = {'id': 'garbled', 'source': 'task_followup', 'followup_relation': {'kind': 'garbled'},
+               'task': {'metadata': {'origin_task_id': ORIGIN}}}
+    schedules._write_scheduled_tasks({'tasks': [legacy, garbled]}, root)
     queue.check_scheduled_tasks()
+    assert not row(root, 'legacy').get('followup_hold'), 'no blanket hold merely for being published'
+    assert 'followup_relation' not in row(root, 'legacy'), 'the relationship stays honestly unrecorded'
+    assert row(root, 'garbled')['followup_hold']['reason'] == 'relationship_unknown'
+    # Its fired task pays from its OWN root (the previous rule), never the origin's
+    # cap or a template's forged group; a recorded but unreadable relationship
+    # still acquires no wallet at all.
     task = {'id': 'legacy-fired', 'metadata': {'schedule_id': 'legacy', 'billing_group': BINDING}}
-    result = task_billing_fields(task, task['id'], 999.0, root, pin_initial=True)
-    assert result['billing_group_id'].startswith('unavailable:')
+    result = task_billing_fields(task, task['id'], 999.0, root, pin_initial=True, persist_initial=False)
+    assert (result['billing_group_id'], result['billing_group_limit_usd']) == ('legacy-fired', 999.0)
+    garbled_task = {'id': 'garbled-fired', 'metadata': {'schedule_id': 'garbled'}}
+    assert task_billing_fields(garbled_task, 'garbled-fired', 999.0, root, pin_initial=True,
+                               persist_initial=False)['billing_group_id'].startswith('unavailable:')
     assert load_task_result(root, task['id']) is None
+    # Only an actual Stop holds it; its release then needs the relationship decision.
+    stop(root)
+    queue.check_scheduled_tasks()
     held = row(root, 'legacy')['followup_hold']['hold_id']
     result = restore(root, 'legacy', held)
     assert result['status'] == 'relationship_required'
@@ -91,6 +106,7 @@ def test_new_relation_required_and_unknown_never_pins_fresh_wallet(world):
     assert result['status'] == 'hold_released', result
     resolved = row(root, 'legacy')['followup_relation']
     assert resolved['billing_group'] == BINDING and resolved['deadline_at'] == DEADLINE
+    assert task_billing_fields(task, task['id'], 999.0, root, persist_initial=False)['billing_group_id'] == ORIGIN
 
 
 def test_unknown_related_resolution_cannot_invent_missing_origin(world):
@@ -98,7 +114,10 @@ def test_unknown_related_resolution_cannot_invent_missing_origin(world):
     queue.upsert_scheduled_task({'id': 'lost', 'source': 'task_followup',
                                 'task': {'metadata': {'origin_task_id': 'lost-origin'}}}, drive_root=root)
     before = row(root, 'lost')
-    result = restore(root, 'lost', before['followup_hold']['hold_id'], relation='related')
+    # A collected origin records no Stop: the published row is not held, and its
+    # template lineage survives normalization as host provenance.
+    assert not before.get('followup_hold') and before['followup_origin']['task_id'] == 'lost-origin'
+    result = restore(root, 'lost', '', relation='related')
     assert result['status'] == 'followup_origin_unavailable'
     assert row(root, 'lost') == before
 
@@ -313,6 +332,7 @@ def test_legacy_template_normalization_keeps_origin_but_cannot_forge_money(world
     schedules._write_scheduled_tasks({'tasks': [legacy]}, root)
     edited = copy.deepcopy(legacy)
     edited['task']['metadata']['origin_task_id'] = 'forged'
+    stop(root)  # the actual control that holds an unrecorded relationship
     stored = queue.upsert_scheduled_task(edited, drive_root=root)
     assert stored['followup_origin'] == {'task_id': ORIGIN, 'root_task_id': ORIGIN}
     assert 'billing_group' not in stored['task']['metadata']
@@ -330,6 +350,10 @@ def test_legacy_fired_unknown_without_receipt_keeps_id_and_waits_for_custody(wor
               'task': {'metadata': {'origin_task_id': ORIGIN, 'origin_root_task_id': ORIGIN}}}
     schedules._write_scheduled_tasks({'tasks': [legacy]}, root)
     write_task_result(root, 'same-fired-id', 'scheduled', metadata={'schedule_id': 'legacy'})
+    queue.check_scheduled_tasks()
+    # The upgrade alone holds nothing, and a receipt-less fired task is never replayed.
+    assert not row(root, 'legacy').get('followup_hold') and pending == []
+    stop(root)
     queue.check_scheduled_tasks()
     held = row(root, 'legacy')['followup_hold']['hold_id']
     assert restore(root, 'legacy', held, relation='related')['ok']
@@ -415,17 +439,18 @@ def test_public_gateway_rejects_template_money_and_save_cannot_release_hold(worl
     assert current['followup_hold'] == held and current['followup_relation'] == registered['followup_relation']
 
 
-def test_followup_disable_survives_save_and_explicit_restore_releases_only_that_disable(world):
+def test_followup_disable_is_an_ordinary_disable_and_restore_lifts_only_it(world):
     _, root, pending = world
     registered = register(world)
     queue.mutate_scheduled_task('disable', registered['id'], reason='Independent owner disable', actor='owner:test', drive_root=root)
-    edited = row(root, registered['id'])
-    edited['enabled'] = True
-    queue.upsert_scheduled_task(edited, drive_root=root)
-    assert row(root, registered['id'])['enabled'] is False
-    assert schedules.schedule_lifecycle_status(row(root, registered['id'])) == 'suppressed'
+    current = row(root, registered['id'])
+    # Only skill-manifest rows keep a resync-proof suppression marker.
+    assert current['enabled'] is False and 'manual_override' not in current
+    assert schedules.schedule_lifecycle_status(current) == 'disabled'
+    queue.check_scheduled_tasks()
+    assert pending == []
     result = restore(root, registered['id'], '')
-    assert result['ok'], result
+    assert result['ok'] and result['status'] == 'updated', result
     assert schedules.schedule_lifecycle_status(row(root, registered['id'])) == 'active'
     queue.check_scheduled_tasks()
     assert len(pending) == 1
@@ -467,10 +492,22 @@ def test_exact_restore_replay_cannot_lift_separate_suppression(world, suppressio
             assert response.status_code == 200, response.text
             return response.json()
         if not later:
-            assert action(suppression)['changed']
+            first = action(suppression)
+            assert first['changed']
+            if suppression == 'delete':
+                # Never fired: Delete really removes it; nothing restorable remains.
+                assert first['status'] == 'deleted' and first['schedule'] is None
+                assert action('restore', expected_hold_id=held)['status'] == 'not_found'
+                return
         assert action('restore', expected_hold_id=held)['status'] == 'hold_released'
         if later:
-            assert action(suppression)['changed']
+            outcome = action(suppression)
+            assert outcome['changed']
+            if suppression == 'delete':
+                assert outcome['status'] == 'deleted'
+                replay = action('restore', expected_hold_id=held)
+                assert replay['status'] == 'not_found' and not replay['changed']
+                return
         before = row(root, sid)
         replay = action('restore', expected_hold_id=held)
         assert not replay['changed'], replay

@@ -558,6 +558,16 @@ def current_tool_operation(source: Any, name: str) -> str:
     return str(active[2].get("operation_id") or "") if active and active[0] is source and active[1] == name else ""
 
 
+def record_mcp_call_returned(name: str) -> None:
+    """The host joined this open invocation's MCP call: its final response and
+    clean session/transport exit arrived. Only that caller records it, never a
+    runner still running after its timeout nor result text or provider meta;
+    it settles this claim alone, not other processes, runs or money."""
+    active = _TOOL_OPERATION.get()
+    if active and active[1] == name and not active[2].get("closed"):
+        active[2]["mcp_call_returned"] = True
+
+
 @contextmanager
 def operation_start(source: Any = None):
     """Final local operation-start point after preparation, serialized with Pause.

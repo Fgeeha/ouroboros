@@ -219,8 +219,9 @@ def _scheduled_tasks_digest(env: Any, *, limit: int = 8) -> Optional[Dict[str, A
     from supervisor.queue_schedules import schedule_lifecycle_status
     root = pathlib.Path(env.drive_path("state/scheduled_tasks.json")).parent.parent
     data = observed_store(root, data)
-    tasks = [t for t in data.get("tasks", []) if isinstance(t, dict) and
-             (t.get("enabled", True) or t.get("followup_hold") or t.get("followup_wait"))]
+    # A deleted row still finishing accepted work stays in view until it goes.
+    tasks = [t for t in data.get("tasks", []) if isinstance(t, dict) and (t.get("enabled", True)
+             or t.get("followup_hold") or t.get("followup_wait") or t.get("delete_requested_at"))]
     if not tasks:
         return None
     out: Dict[str, Any] = {"active": [], "held": [], "waiting": []}
@@ -232,6 +233,9 @@ def _scheduled_tasks_digest(env: Any, *, limit: int = 8) -> Optional[Dict[str, A
                  "followup_wait": record.get("followup_wait"), "hold_persisted": record.get("hold_persisted"),
                  "timezone": record.get("timezone") or "local", "next_run_at": record.get("next_run_at") or ""}
         entry["run_at" if trigger.get("type") == "once" else "cron"] = trigger.get("run_at" if trigger.get("type") == "once" else "expr", "")
+        if status == "delete_pending":
+            out.setdefault("delete_pending", []).append(entry)
+            continue
         out["held" if record.get("followup_hold") else "waiting" if record.get("followup_wait") else "active"].append(entry)
     if len(tasks) > limit:
         out["omitted_count"] = len(tasks) - limit

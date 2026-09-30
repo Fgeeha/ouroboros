@@ -517,6 +517,10 @@ def local_producer_observation(ctx: Any, *, timeout_sec: float) -> Dict[str, Any
 
 # --- durable row --------------------------------------------------------------------
 
+class BudgetPauseSuperseded(ValueError):
+    """A compare-and-set lost: a newer pause, state, grant or wait owns the row."""
+
+
 def set_budget_pause(root: Any, task_id: str, row: Dict[str, Any],
                      expected_pause_id: Optional[str] = None, *,
                      expected_state: Any = None,
@@ -533,7 +537,9 @@ def set_budget_pause(root: Any, task_id: str, row: Dict[str, Any],
     file lock against the row as it is NOW, so a grant, a revocation or a
     consumption written from a stale reading refuses (``ValueError``) instead
     of overwriting a newer pause, grant or state — pauseA -> Resume -> pauseB
-    -> late revoke of A must never land on B (#1196).
+    -> late revoke of A must never land on B (#1196). A refusal is typed
+    ``BudgetPauseSuperseded`` (an observer's lost race is benign); an empty
+    ``expected_grant_id`` means "no grant", ``None`` skips that comparison.
     """
     from ouroboros.task_results import (
         _TRULY_TERMINAL_STATUSES, require_writable_task_result_schema,
@@ -553,14 +559,14 @@ def set_budget_pause(root: Any, task_id: str, row: Dict[str, Any],
         if current.get("status") in _TRULY_TERMINAL_STATUSES:
             raise ValueError("a terminal task cannot be budget-paused")
         if expected_owner_wait is not None and current.get("owner_wait") != expected_owner_wait:
-            raise ValueError("sleep checkpoint changed before retention")
+            raise BudgetPauseSuperseded("sleep checkpoint changed before retention")
         old = current.get("budget_pause") or {}
         if expected_pause_id is not None and str(old.get("pause_id") or "") != expected_pause_id:
-            raise ValueError("budget pause identity changed")
+            raise BudgetPauseSuperseded("budget pause identity changed")
         if expected_states is not None and str(old.get("state") or "") not in expected_states:
-            raise ValueError(f"budget pause state changed: {old.get('state')!r} is not {sorted(expected_states)}")
+            raise BudgetPauseSuperseded(f"budget pause state changed: {old.get('state')!r} is not {sorted(expected_states)}")
         if expected_grant_id is not None and str((old.get("grant") or {}).get("grant_id") or "") != str(expected_grant_id):
-            raise ValueError("budget pause grant changed")
+            raise BudgetPauseSuperseded("budget pause grant changed")
         retained_wait = ({"owner_wait": {**expected_owner_wait, "state": "retained"}}
                          if expected_owner_wait is not None else {})
         return stamp_task_result_schema({**current, **retained_wait, "budget_pause": dict(row)})

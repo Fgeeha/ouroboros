@@ -1,7 +1,12 @@
 """Relationship admission over the existing schedule/result/control owners.
 
-Provenance is host-authored; relationship is an explicit model decision. Unknown
-relationships never dispatch or acquire a wallet. A Stop's identity survives in
+Provenance is host-authored; relationship is an explicit model decision. A row
+written before relationships were recorded (no ``followup_relation`` at all)
+keeps its published launch and own-root expense rules, relationship still
+``unknown``: only an actual Stop, manual Restart or owner Pause of its origin
+holds it, and no shared wallet is inferred. A published owner-door row (no
+source, origin or relationship) is independent. A recorded but unreadable
+relationship never dispatches or acquires a wallet. A Stop's identity survives in
 the original result; Restart's identity lives in the existing schedule document.
 Neither enabled nor a timestamp releases a control. The lifecycle writer alone
 records an audited release of the exact observed hold.
@@ -55,13 +60,22 @@ def new_stop_fields(source, *, previous=None, action_id="", action_binding=()):
             "requested_at": utc_now_iso(), **({"action_receipts": receipts} if receipts else {})}}, False
 
 
+def legacy_unrecorded(record):
+    """No relationship decision was ever recorded: the published row shape."""
+    return "followup_relation" not in record
+
+
 def relation_kind(record):
     relation = record.get("followup_relation") or {}
     if isinstance(relation, dict) and relation.get("kind") in {"related", "independent"}:
         return relation["kind"]
     # Only the established skill producer or an explicit owner creation has
-    # independent semantics. An arbitrary historical source is not proof.
+    # independent semantics. An arbitrary historical source is not proof. The
+    # published owner door stamped no source, origin or relationship: that
+    # structural shape is an owner schedule, never a task's continuation.
     if record.get("source") == "owner" or (record.get("source") == "skill_manifest" and record.get("skill")):
+        return "independent"
+    if not record.get("source") and not record.get("followup_origin") and legacy_unrecorded(record):
         return "independent"
     return "unknown"
 
@@ -141,8 +155,11 @@ def policy_view(root, data, record):
         control_ids = origin_ids | {_validated_single_cancel_target(root, tid) for tid in origin_ids}
         for tid in sorted(control_ids):
             row = load_task_result(pathlib.Path(root), tid, strict=True)
-            if not row:
+            # A published row outlives its collected origin (no recorded Stop
+            # there); an unreadable origin still raises as unknown authority.
+            if not row and not (kind == "unknown" and legacy_unrecorded(record)):
                 raise ValueError("followup_origin_unavailable")
+            row = row or {}
             intent = active_intent(root, tid, strict=True) or {}
             stop = intent.get("followup_stop") or row.get("followup_stop") or {}
             if not stop:
@@ -182,7 +199,10 @@ def policy_view(root, data, record):
     except Exception:
         wait = "followup_authority_unavailable"
     controls = {key: value for key, value in controls.items() if released.get(key) != value}
-    reason = ("relationship_unknown" if kind == "unknown" else
+    # An unrecorded (published) relationship is held only by an actual control;
+    # its release then needs the relationship decision like any unknown one.
+    unknown_hold = kind == "unknown" and (controls or not legacy_unrecorded(record))
+    reason = ("relationship_unknown" if unknown_hold else "" if kind == "unknown" else
               "origin_stopped" if any(not key.startswith("pause:") for key in controls) else
               "origin_owner_paused" if controls else "")
     hold = None
@@ -286,7 +306,10 @@ The occurrence owner persists dispatch before the physical handoff inside this f
         if row is None:
             from ouroboros.task_results import load_task_result
             actual = load_task_result(pathlib.Path(root), str(task.get("id") or ""), strict=True) or {}
-            yield ((actual.get("metadata") or {}).get("followup_relation") or {}).get("kind") == "independent"
+            meta = actual.get("metadata") if isinstance(actual.get("metadata"), dict) else {}
+            # Only related work needs its row; a published task recorded none.
+            kind = (meta.get("followup_relation") or {}).get("kind") if "followup_relation" in meta else ""
+            yield bool(actual) and kind in {"", "independent", "unknown"}
             return
         with control_guard(root, row):
             view = refresh_policy(root, data, row)
@@ -294,13 +317,20 @@ The occurrence owner persists dispatch before the physical handoff inside this f
 
 
 def bound_task(task, record):
-    """Prepared work must carry the current host relationship and original money."""
+    """Prepared work must carry the current host relationship and original money.
+
+    Independent and unrecorded (published) rows carry neither money nor a
+    deadline: a task frozen before relationships existed keeps its identity.
+    """
     from ouroboros.deadline_utils import parse_deadline_ts
     carried = (task.get("metadata") or {}).get("followup_relation") or {}
-    if carried.get("kind") != relation_kind(record):
+    kind = relation_kind(record)
+    if kind == "independent":
+        return carried.get("kind") in {None, "unknown", "independent"}
+    if kind != "related":
+        return legacy_unrecorded(record) and carried.get("kind") in {None, "unknown"}
+    if carried.get("kind") != kind:
         return False
-    if relation_kind(record) != "related":
-        return relation_kind(record) == "independent"
     relation = record.get("followup_relation") or {}
     if (task.get("metadata") or {}).get("billing_group") != relation.get("billing_group"):
         return False
@@ -355,10 +385,14 @@ def normalize_template(record):
 
 
 def task_binding(root, record):
-    """The host row is the only authority for scheduled whole-work money."""
+    """The host row is the only authority for scheduled whole-work money.
+
+    ``None`` means the task's own root economics: independent work, and an
+    unrecorded (published) relationship, which never borrows its origin's cap.
+    """
     from ouroboros.usage_admission import UNAVAILABLE_GROUP_PREFIX
     kind = relation_kind(record)
-    if kind == "independent":
+    if kind == "independent" or (kind == "unknown" and legacy_unrecorded(record)):
         return None
     binding = (record.get("followup_relation") or {}).get("billing_group") or {}
     if kind != "related" or not binding.get("billing_group_limit_source"):

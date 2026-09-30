@@ -70,7 +70,7 @@ def test_readonly_input_scan_failure_and_symlink_refuse_before_engine(tmp_path, 
 def test_restored_unstarted_claim_recovers_and_delete_preserves_accepted_work(q, monkeypatch):  # noqa: F811
     from supervisor import schedule_occurrence as occurrence
 
-    _row(q, intent={"kind": "system_repo"}, source="owner")  # a follow-up row's delete is a suppression
+    _row(q, intent={"kind": "system_repo"})
     real_prepare = occurrence.prepare
     monkeypatch.setattr(occurrence, "prepare", lambda _: (_ for _ in ()).throw(RuntimeError("crash")))
     with pytest.raises(RuntimeError):

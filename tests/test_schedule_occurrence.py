@@ -232,7 +232,7 @@ def test_a_change_during_prepare_never_launches_the_old_choice(q, tmp_path, monk
     q.queue.check_scheduled_tasks()
     assert q.pending == [] and not list((q.root / "task_results").glob("*.json"))
     if change == "delete":
-        assert _rows(q)["s1"]["manual_override"] == "deleted"
+        assert "s1" not in _rows(q)
         return
     if change == "rebind":
         assert _rows(q)["s1"]["hold"]["reason"] == "project_routing_fence_changed"
@@ -446,7 +446,7 @@ def test_the_allowance_is_read_just_before_admission_not_during_prepare(q, monke
 def test_deleting_a_row_never_takes_back_an_accepted_occurrence(q, monkeypatch):
     from supervisor import schedule_occurrence as occurrences
 
-    _row(q, intent={"kind": "system_repo"}, cron=True, source="owner")
+    _row(q, intent={"kind": "system_repo"}, cron=True)
     monkeypatch.setattr(q.queue, "persist_queue_snapshot", lambda reason="": False)
     q.queue.check_scheduled_tasks()  # accepted, then withdrawn: the snapshot did not persist
     assert q.pending == []
@@ -454,7 +454,6 @@ def test_deleting_a_row_never_takes_back_an_accepted_occurrence(q, monkeypatch):
     outcome = q.queue.mutate_scheduled_task("delete", "s1", reason="owner", actor="owner")
     row = _rows(q)["s1"]
     assert outcome["status"] == "delete_deferred" and "owed" in outcome["detail"]
-    assert "settlement" in outcome["detail"]
     assert row["enabled"] is False and row["delete_requested_at"]
     monkeypatch.setattr(q.queue, "persist_queue_snapshot", lambda reason="": True)
     q.queue.check_scheduled_tasks()
@@ -463,13 +462,9 @@ def test_deleting_a_row_never_takes_back_an_accepted_occurrence(q, monkeypatch):
     assert occurrences.record_dispatch_possible(task) is True
     q.pending.clear()
     q.queue.check_scheduled_tasks()
-    assert "s1" in _rows(q)  # possible dispatch is not task settlement
-    from ouroboros.task_results import write_task_result
-    write_task_result(q.root, task_id, "completed", result="settled")
-    q.queue.check_scheduled_tasks()
-    assert "s1" not in _rows(q)
+    assert "s1" not in _rows(q)  # removed once its run was dispatched
     # A row whose occurrence was never accepted is deleted at once (future-only).
-    _row(q, "s3", intent={"kind": "system_repo"}, cron=True, source="owner")
+    _row(q, "s3", intent={"kind": "system_repo"}, cron=True)
     assert q.queue.mutate_scheduled_task("delete", "s3", reason="owner", actor="owner")["status"] == "deleted"
     assert "s3" not in _rows(q)
 

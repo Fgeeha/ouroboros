@@ -265,8 +265,7 @@ def test_worker_delete_reads_receipt_from_its_canonical_table_root(q, tmp_path, 
     from ouroboros.tools.followup import _manage_schedules
 
     canonical, child = tmp_path / "canonical", tmp_path / "child"
-    # An owner row: deleting a task follow-up is a retained suppression, not this receipt read.
-    row = {"id": "s1", "enabled": True, "source": "owner", "task": {},
+    row = {"id": "s1", "enabled": True, "source": "task_followup", "task": {},
            "trigger": {"type": "once", "run_at": "2000-01-01T00:00:00+00:00"},
            "occurrence": {"phase": "admitted" if state_kind == "admitted_missing" else "claimed",
                           "token": "same-token", "task_id": "same-task"}}
@@ -290,10 +289,7 @@ def test_worker_delete_reads_receipt_from_its_canonical_table_root(q, tmp_path, 
     assert outcome["ok"] and outcome["running_or_queued"] is None  # no snapshot required for custody
     rows = queue_schedules.load_schedule_store(canonical)["tasks"]
     if state_kind == "missing":
-        # The canonical root proves the claim unstarted; this worker cannot see queue
-        # absence, so the unknown retains the row until the supervisor observes it.
-        assert outcome["status"] == "delete_deferred" and "unsettled work" in outcome["detail"]
-        assert len(rows) == 1 and rows[0]["delete_requested_at"] and not rows[0]["enabled"]
+        assert outcome["status"] == "deleted" and outcome["schedule"] is None and not rows
     else:
         assert outcome["status"] == "delete_deferred" and outcome["schedule"] is not None
         assert len(rows) == 1 and rows[0]["delete_requested_at"] and not rows[0]["enabled"]

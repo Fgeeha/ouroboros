@@ -167,7 +167,10 @@ def task_billing_fields(task: Dict[str, Any], root_task_id: str, root_limit: Opt
                         and canonical == relation.get("billing_group")
                         and canonical.get("billing_group_limit_source")):
                     return {"root_limit_usd": root_limit, **canonical}
-                if (root_meta.get("followup_relation") or {}).get("kind") != "independent":
+                # Independent work, or a task whose published row recorded no
+                # relationship, keeps its own root; nothing else invents one.
+                recorded = root_meta.get("followup_relation") if "followup_relation" in root_meta else {"kind": ""}
+                if (recorded or {}).get("kind") not in {"", "independent", "unknown"}:
                     return unavailable
             else:
                 scheduled_binding = task_binding(budget_root, schedule)

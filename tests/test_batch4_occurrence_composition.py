@@ -96,6 +96,7 @@ def test_resolved_fired_followup_rebinds_only_same_positively_unrun_receipt(worl
     write_task_result(root, tid, 'scheduled', schedule_admission={} if evidence == 'missing' else receipt,
                       metadata=copy.deepcopy(task['metadata']))
     original_id = row(root, registered['id'])['occurrence'].copy()
+    stop(root)  # an unrecorded relationship is held only by an actual control
     queue.check_scheduled_tasks()
     held = row(root, registered['id'])['followup_hold']['hold_id']
     assert restore(root, registered['id'], held, relation='related')['status'] == 'hold_released'

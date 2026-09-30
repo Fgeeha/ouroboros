@@ -1112,11 +1112,14 @@ class ToolRegistry:
                 # settles its local call; owned processes/runs keep their own
                 # custody. Errors/timeouts and opaque remote acknowledgements
                 # prove neither settlement nor the absence of remote effects.
-                # A local extension's joined return comes through a separate
-                # host-owned sidechannel; its body/metadata never attest custody.
+                # Host-owned sidechannels record a local extension's joined
+                # return and an MCP call joined to its final response (that
+                # call ended, not any remote job it began); body/metadata never
+                # attest custody.
                 # Explicit unknown completion also overrides an OK client exit.
                 handoff["settled"] = (
-                    handoff.get("local_extension_returned") is True or (
+                    handoff.get("local_extension_returned") is True
+                    or handoff.get("mcp_call_returned") is True or (
                     handoff.get("builtin_returned") is True and not typed.meta.get("dynamic_provider")
                     and (typed.meta.get("operation_outcome") in {"completed", "completed_no_effect"} or (
                         "operation_outcome" not in typed.meta and typed.status == "ok"

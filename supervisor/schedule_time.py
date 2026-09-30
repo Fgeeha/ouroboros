@@ -71,9 +71,9 @@ def prune_consumed_once_records(tasks: list, cutoff_epoch: float, *, work_settle
     """``(kept, pruned_count)`` — drop CONSUMED one-shot records (``trigger.type ==
     "once"`` + ``enabled=False`` + ``completed_at``) whose completion is older than
     the unified GC retention cutoff (epoch seconds; ``retention.age_cutoff``). The
-    consumed one-shot remains its work's binding/Restore row until the caller
-    positively proves that work settled. Consumption alone is not settlement.
-    A missing task identity cannot prove settlement and retains the row. ONLY one-shots are pruned: a
+    caller's ``work_settled`` predicate keeps a consumed continuation as its
+    task's binding/Restore row until that task settles (consumption alone is not
+    settlement); an independent one-shot is a durable receipt that ages out. ONLY one-shots are pruned: a
     disabled CRON row is a standing schedule the owner may re-enable, and is kept
     even if it carries a stray ``completed_at``. ENABLED records are never pruned,
     nor one whose occurrence has not settled (#1315); an unparseable ``completed_at``
@@ -81,14 +81,12 @@ def prune_consumed_once_records(tasks: list, cutoff_epoch: float, *, work_settle
     kept, pruned = [], 0
     for record in tasks:
         if (isinstance(record, dict) and not record.get("enabled", True)
-                and record.get("completed_at") and not record.get("followup_hold")
-                and not record.get("followup_wait")
-                and not isinstance(record.get("occurrence"), dict)):
+                and record.get("completed_at") and not isinstance(record.get("occurrence"), dict)):
             trigger = record.get("trigger") if isinstance(record.get("trigger"), dict) else {}
             if str(trigger.get("type") or "") == "once":
                 done = parse_schedule_time(record.get("completed_at"), datetime.timezone.utc)
                 if done is not None and done.timestamp() < float(cutoff_epoch):
-                    if not record.get("last_task_id") or work_settled is None or not work_settled(record):
+                    if work_settled is not None and not work_settled(record):
                         kept.append(record)
                         continue
                     pruned += 1

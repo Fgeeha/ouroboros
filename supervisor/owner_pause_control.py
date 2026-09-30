@@ -246,8 +246,15 @@ _LAST_SETTLE_CHECK: Dict[str, float] = {}
 
 def _record_settled_member(q: Any, item: Dict[str, Any]) -> None:
     """A parked member whose sent work was running at its park: a fresh,
-    observe-only custody read records it settled once nothing is open."""
-    from ouroboros.budget_pause import budget_pause_row, observe_task_runs, set_budget_pause
+    observe-only custody read records it settled once nothing is open.
+
+    The custody read runs off-lock, so the write compares the pause, state
+    and grant it read: a Resume, revocation or newer pause landing meanwhile
+    wins, and this stale observation is dropped for the next pass to redo.
+    """
+    from ouroboros.budget_pause import (
+        BudgetPauseSuperseded, budget_pause_row, observe_task_runs, set_budget_pause,
+    )
     from ouroboros.owner_pause import SETTLEMENT_EXTERNAL_RUNNING, SETTLEMENT_SETTLED
 
     task_id = str(item.get("id") or "")
@@ -258,9 +265,14 @@ def _record_settled_member(q: Any, item: Dict[str, Any]) -> None:
     observed = observe_task_runs(result_root, task_id, reason="owner_pause_settlement_check", request_stop=False)
     if observed.get("custody_read") != "ok" or observed.get("runs"):
         return
-    set_budget_pause(result_root, task_id, {**row, "settlement": SETTLEMENT_SETTLED,
-                                            "settlement_observed_at": utc_now_iso()},
-                     expected_pause_id=str(row.get("pause_id") or ""))
+    try:
+        set_budget_pause(result_root, task_id, {**row, "settlement": SETTLEMENT_SETTLED,
+                                                "settlement_observed_at": utc_now_iso()},
+                         expected_pause_id=str(row.get("pause_id") or ""),
+                         expected_state=str(row.get("state") or ""),
+                         expected_grant_id=str((row.get("grant") or {}).get("grant_id") or ""))
+    except BudgetPauseSuperseded:
+        log.debug("Owner pause settlement of %s superseded by a newer pause row", task_id, exc_info=True)
 
 
 def settle_requested_owner_pauses(q: Any = None, *, now: Optional[float] = None) -> List[str]:
@@ -294,9 +306,14 @@ def settle_requested_owner_pauses(q: Any = None, *, now: Optional[float] = None)
             parked = [dict(item) for item in q.PENDING if isinstance(item, dict)
                       and root_id in (str(item.get("root_task_id") or ""), str(item.get("id") or ""))
                       and isinstance(item.get("_budget_pause"), dict)]
-        try:
-            for item in parked:
+        # One member's failure never skips its siblings or the tree's own census.
+        for item in parked:
+            try:
                 _record_settled_member(q, item)
+            except Exception:
+                log.warning("Owner pause settlement re-check of %s (tree %s) failed; it stays pausing",
+                            item.get("id"), root_id, exc_info=True)
+        try:
             if refresh_owner_pause_tree(root_id) == FENCE_PAUSED:
                 settled.append(root_id)
         except Exception:

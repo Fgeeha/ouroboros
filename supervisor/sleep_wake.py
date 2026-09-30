@@ -1,4 +1,4 @@
-"""The sleep-wake policy for COLD model sleeps (owner Batch4 6B).
+"""The sleep-wake policy for COLD model sleeps.
 
 A cold sleep is parked like an exact pause (``_budget_pause`` marker, reason
 ``sleep``) and nothing wakes it but its OWN selected sources: this pass, run
@@ -13,7 +13,9 @@ the owner's Resume and not its root's model selection; it is VETOED, keeping
 the readiness recorded, by any hold on the row (an owner Restart or Panic
 hold), by a closed owner Pause fence over its tree and by a root that is
 itself paused — and every money/deadline/lifetime/custody refusal of the
-grant owner still applies. Readiness is never permission.
+grant owner still applies. Readiness is never permission. The off-lock record
+compares the pause id, state and grant it read, so a Resume, revocation or
+newer pause landing meanwhile wins and the next pass re-observes.
 """
 
 from __future__ import annotations
@@ -64,7 +66,7 @@ def _vetoed(q: Any, task: Dict[str, Any]) -> str:
 
 def wake_ready_sleepers(q: Any = None) -> List[Dict[str, Any]]:
     """One pass: record readiness, then grant the ready and unvetoed (typed outcomes)."""
-    from ouroboros.budget_pause import budget_pause_row, set_budget_pause
+    from ouroboros.budget_pause import BudgetPauseSuperseded, budget_pause_row, set_budget_pause
     from supervisor.budget_resume import grant_exact_sleep_resume
 
     if q is None:
@@ -83,8 +85,15 @@ def wake_ready_sleepers(q: Any = None) -> List[Dict[str, Any]]:
                 if not reason:
                     continue
                 ready = {"reason": reason, "observed_at": time.time()}
+                # Readiness was read off-lock: a Resume, revocation or newer
+                # pause that landed meanwhile wins; the next pass re-observes.
                 set_budget_pause(root, task_id, {**row, "sleep_ready": ready},
-                                 expected_pause_id=str(row.get("pause_id") or ""))
+                                 expected_pause_id=str(row.get("pause_id") or ""),
+                                 expected_state=str(row.get("state") or ""),
+                                 expected_grant_id=str((row.get("grant") or {}).get("grant_id") or ""))
+        except BudgetPauseSuperseded:
+            log.debug("Sleep readiness of %s superseded by a newer pause row", task_id, exc_info=True)
+            continue
         except Exception:
             log.warning("Sleep readiness of %s unreadable; it keeps sleeping", task_id, exc_info=True)
             continue

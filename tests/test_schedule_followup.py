@@ -57,12 +57,12 @@ def test_once_schedule_fires_exactly_once_and_is_marked_done(tmp_path):
         "trigger": {"type": "once", "run_at": "2000-01-01T00:00:00+00:00"},
         "task": {"type": "task", "text": "resume the blocked plan after the window resets", "chat_id": 1,
                  "metadata": {"origin_task_id": "t-origin", "resource_intent": {"kind": "system_repo"}}},
-    }, host_followup={"followup_relation": {"kind": "independent", "revision": "explicit-test-decision"}})
+    })
     queue.upsert_scheduled_task({
         "id": "fu-future", "name": "Later", "enabled": True, "source": "task_followup",
         "trigger": {"type": "once", "run_at": "2999-01-01T00:00:00+00:00"},
         "task": {"type": "task", "text": "far future"},
-    }, host_followup={"followup_relation": {"kind": "independent", "revision": "explicit-test-decision"}})
+    })
     queue.check_scheduled_tasks()
     queue.check_scheduled_tasks()  # a consumed one-shot never re-fires
     assert len(pending) == 1
@@ -93,7 +93,7 @@ def test_once_schedule_survives_a_refused_admission_and_retries(tmp_path, monkey
         "trigger": {"type": "once", "run_at": "2000-01-01T00:00:00+00:00"},
         "task": {"type": "task", "text": "resume after the window resets", "chat_id": 1,
                  "metadata": {"resource_intent": {"kind": "system_repo"}}},
-    }, host_followup={"followup_relation": {"kind": "independent", "revision": "explicit-test-decision"}})
+    })
     real_enqueue = queue.enqueue_task
     attempts: list = []
     monkeypatch.setattr(
@@ -129,7 +129,7 @@ def test_once_schedule_refused_by_the_consciousness_door_waits_on_the_row(tmp_pa
         "task": {"type": "task", "text": "resume later", "chat_id": 1,
                  "metadata": {"initiator": "consciousness", "usage_category": "consciousness_task",
                               "resource_intent": {"kind": "system_repo"}}},
-    }, host_followup={"followup_relation": {"kind": "independent", "revision": "explicit-test-decision"}})
+    })
     fires: list = []
     monkeypatch.setattr(
         queue, "enqueue_task",
@@ -735,9 +735,10 @@ def test_consumed_once_records_are_pruned_past_gc_retention(tmp_path):
     })
     queue.check_scheduled_tasks()
     ids = {r["id"] for r in queue.list_scheduled_tasks(tmp_path)["tasks"]}
-    # Only the aged-out CONSUMED ONE-SHOT is pruned; a disabled cron row is a
+    # Only the aged-out CONSUMED ONE-SHOTS are pruned (an owner schedule's receipt
+    # ages out with or without a recorded task id); a disabled cron row is a
     # standing schedule the owner may re-enable, even when it carries completed_at.
-    assert ids == {"consumed-unidentified", "consumed-fresh", "enabled-future", "disabled-cron", "disabled-cron-stamped"}
+    assert ids == {"consumed-fresh", "enabled-future", "disabled-cron", "disabled-cron-stamped"}
     assert pending == []
 
 
