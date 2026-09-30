@@ -69,6 +69,7 @@ _FILE_FLAGS = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEX
                | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOCTTY", 0))
 _CHAT_MEDIA_DIGEST_RE = re.compile(r"chat-media-([0-9a-f]{64})\.[a-z0-9]+")
 _DELEGATED_SOURCE_RE = re.compile(r"source_handles/delegated_activity/([A-Za-z0-9][A-Za-z0-9_.-]*-([0-9a-f]{64})\.jsonl)")
+_ACCEPTANCE_SOURCE_RE = re.compile(r"source_handles/context_checkpoints/(acceptance-([0-9a-f]{64})\.json)")
 
 Route = Tuple[pathlib.Path, List[str]]  # (directory opened by absolute path, segments below it)
 
@@ -319,7 +320,11 @@ def serve_task_source(drive_root: Any, stores: List[pathlib.Path], result: Dict[
     like chat media: only ``source_handles/delegated_activity/<id>-<sha256>.jsonl`` whose
     basename is ``name`` qualifies, read from the task's own stores (canonical first)
     through the confined descent and verified against the digest its name carries. Any
-    other path must be a source the task result publishes, returned as its verified JSON.
+    other path must be a source the task result publishes, returned as its verified JSON,
+    or this author's own host acceptance record named by its digest: a late notice keeps
+    linking the record it was sent with after a newer publication replaced its panel's
+    ref (#1369), resolved by the same membership ``get_task_result(review_source_sha256=)``
+    verifies (``task_finalization.host_acceptance_source``).
     """
     match = _DELEGATED_SOURCE_RE.fullmatch(str(source or ""))
     if match:
@@ -335,7 +340,17 @@ def serve_task_source(drive_root: Any, stores: List[pathlib.Path], result: Dict[
         return Response(artifact_store.read_task_result_source_bytes(drive_root, result, name, source),
                         media_type="application/json")
     except (OSError, ValueError, RuntimeError):
-        return json_error("task source is unavailable or does not match its recorded identity", 404)
+        pass
+    record = _ACCEPTANCE_SOURCE_RE.fullmatch(str(source or ""))
+    try:
+        if record and record.group(1) == name:
+            from ouroboros.task_finalization import host_acceptance_source
+
+            return Response(host_acceptance_source(drive_root, task_id, record.group(2))[1],
+                            media_type="application/json")
+    except (OSError, ValueError, RuntimeError):
+        pass
+    return json_error("task source is unavailable or does not match its recorded identity", 404)
 
 
 class _DescriptorResponse(Response):

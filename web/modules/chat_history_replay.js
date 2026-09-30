@@ -66,6 +66,7 @@ export function mergeHistoricalTimelineItem(record, summary, row, ts) {
         item.historyPosition = row.history_position;
         item.dedupeKey = key;
         item.count = 1;
+        if (summary.evidenceRef && !item.evidenceRef) item.evidenceRef = summary.evidenceRef;
     } else {
         record.items.push({
             cardRowRevision: summary.cardRowRevision,
@@ -73,6 +74,7 @@ export function mergeHistoricalTimelineItem(record, summary, row, ts) {
             fullHeadline: summary.fullHeadline || summary.headline || 'Update',
             body: summary.body || '', fullBody: summary.fullBody || summary.body || '',
             fullRef: summary.fullRef || '', truncated: summary.truncated || false,
+            evidenceRef: summary.evidenceRef || null,
             ts: ts || '', sourceTs: row.ts || '', count: 1, dedupeKey: key, ...activity,
             ...(evolving ? source : { historyId: identity, historyPosition: row.history_position }),
             lineKey: evolving && !String(key).startsWith('cardrow|') ? `terminal-${String(key).replace(/[^A-Za-z0-9_-]/g, '-')}`
