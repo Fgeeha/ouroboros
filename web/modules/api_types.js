@@ -478,6 +478,7 @@
  * @property {string=} project_id
  * @property {string=} project_name
  * @property {string=} handoff_id  // immutable origin/destination receipt identity
+ * @property {Object=} terminal_time  // host-owned occurrence; ts remains publication time
  * @property {string=} completion_answer  // a Project root's model-authored final answer, mirrored into Main
  * @property {number=} chat_id
  * @property {boolean=} project_thread  // server-stamped: chat_id is a reserved Project thread; Main never adopts it even before projectChatIds learns the project
@@ -732,6 +733,7 @@
  * @property {boolean=} outcome_final  // true only after the canonical task outcome settles; false marks a pre-finalization narrative
  * @property {{status: string, phase: string, ts: string, provenance: string, model_execution?: Object}=} historical_terminal
  * @property {Object=} model_execution
+ * @property {{v: 1, occurred_at: ?string, source: "executor_terminal"|"unknown", attempt: Object}=} terminal_time  // a task_summary row's host end fact; `ts` stays its publication time
  */
 
 /**
@@ -1324,9 +1326,7 @@
 /**
  * @typedef {Object} TaskPauseRequest
  * @property {string} request_id
- */
-
-/**
+ *
  * @typedef {Object} TaskPauseResponse
  * @property {boolean=} ok
  * @property {string=} task_id
@@ -1343,9 +1343,7 @@
 /**
  * @typedef {Object} TaskContinueRequest
  * @property {string} action_nonce
- */
-
-/**
+ *
  * @typedef {Object} TaskContinueResponse
  * @property {boolean=} ok
  * @property {string=} task_id
@@ -1589,7 +1587,8 @@ export const GATEWAY_CONTRACT_VERSION = '7.5.1';
  * @property {boolean} has_more Older bytes remain or a disclosed source gap prevents establishing EOF.
  * @property {string|null} next_cursor Opaque room-bound older continuation.
  * @property {string|null} page_cursor Replays a frozen page; null for an unavailable source boundary.
- * @property {{complete:boolean,truncated_by:Array<string>}} window Whole-history coverage.
+ * @property {{complete:boolean,truncated_by:Array<string>}} window Bounds/gaps of this response.
+ * @property {{v:1,view:string,upper:Object,spans:Object}=} coverage Delivered physical byte spans, after deferrals.
  * @property {string} [next_before_ts] Legacy field retained for compatibility.
  * @property {string} [error]
  * @property {string} [reason_code]

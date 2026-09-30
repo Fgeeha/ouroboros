@@ -276,3 +276,29 @@ def test_control_seed_keeps_admitted_source_deadline_and_budget(pool):  # noqa: 
     row = load_task_result(pool.root, 'bound', strict=True)
     assert all(row[key] == value for key, value in facts.items())
     assert row['metadata']['billing_group'] == admitted['metadata']['billing_group']
+
+
+def test_paused_split_root_seed_keeps_the_attempt_its_child_copyback_proves(pool):  # noqa: F811 - pytest fixture
+    """A Pause seed writes the host attempt key, so the resumed run's child end time still transfers."""
+    from ouroboros.agent import OuroborosAgent
+    from ouroboros.headless import copy_child_task_result
+    from ouroboros.task_results import load_task_result, write_task_result
+    from ouroboros.terminal_time import task_attempt_witness, terminal_time_fact
+    from supervisor import queue
+    from supervisor.owner_pause_control import request_owner_pause
+
+    host, child = pool.root, pool.root / 'child'
+    task = queue.enqueue_task({'id': 'split', 'root_task_id': 'split', 'type': 'task', 'chat_id': 1,
+                               'text': 'split work', 'drive_root': str(child), 'child_drive_root': str(child),
+                               'budget_drive_root': str(host)})
+    assert request_owner_pause('split', request_id='pause-split')['state'] == 'paused'
+    assert load_task_result(host, 'split', strict=True)['task_attempt'] == task['_attempt']
+    assert queue.resume_budget_paused_task('split')['ok']
+    actor = SimpleNamespace(env=SimpleNamespace(drive_root=child, budget_drive_root=host), _task_started_ts=1790000000.0)
+    OuroborosAgent._persist_running_record(actor, task)
+    source = write_task_result(child, 'split', 'completed', _terminal_observed=True, result='Child answer')
+    copied = copy_child_task_result(host, task)
+    for row in (copied, load_task_result(host, 'split')):
+        assert task_attempt_witness(row) == task_attempt_witness(source)
+        assert terminal_time_fact(row) == source['terminal_time']
+        assert source['terminal_time']['source'] == 'executor_terminal'

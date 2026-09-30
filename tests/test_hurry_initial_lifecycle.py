@@ -129,15 +129,18 @@ def test_real_admission_hurry_and_pre_running_death_recover(pool, monkeypatch, o
     persisted = {key for key in (
         "type", "chat_id", "metadata", "task_contract", "parent_task_id", "delegation_role",
         "project_id", "workspace_root", "workspace_mode", "memory_mode", "budget_drive_root",
-        "_attempt", "queued_at", "admitted_dispatch", "_admission_owner_token", "origin_message_text",
+        "queued_at", "admitted_dispatch", "_admission_owner_token", "origin_message_text",
         "origin_message_ref", "objective", "title", "suggested_name", "original_task_id", "timeout_retry_from",
         "deadline_at", "root_cost_ceiling_usd", "billing_group", "task_constraint", "objective_author",
         "owner_corpus", "task_group_id", "task_group",
     ) if key in admitted}
     assert set(row) == ({"task_id", "status", "_schema_version", "ts", "updated_at", "owner_hurry",
-                         "root_task_id", "description"} | persisted | ({"started_at"} if phase == "assigned" else set()))
+                         "root_task_id", "description", "task_attempt"} | persisted
+                        | ({"started_at"} if phase == "assigned" else set()))
     assert all(row[key] == admitted[key] for key in persisted)
     assert row["root_task_id"] == task_id and row["description"] == admitted["text"]
+    # The host attempt key (terminal_time witness), never the queue-private `_attempt`.
+    assert row["task_attempt"] == admitted["_attempt"]
     assert row["owner_hurry"]["attempt_key"] == 1
     assert [entry["kind"] for entry in drain_owner_entries(pool.root, task_id)] == [KIND_HURRY]
     assert not (pool.root / "logs/chat.jsonl").exists()

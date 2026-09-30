@@ -371,7 +371,7 @@ def ensure_control_task_result(task_id: str) -> Dict[str, Any]:
         fields = {key: task[key] for key in (
             "type", "chat_id", "metadata", "task_contract", "root_task_id", "parent_task_id",
             "delegation_role", "project_id", "workspace_root", "workspace_mode", "memory_mode",
-            "budget_drive_root", "_attempt", "queued_at", "admitted_dispatch", "_admission_owner_token",
+            "budget_drive_root", "queued_at", "admitted_dispatch", "_admission_owner_token",
             "origin_message_text", "origin_message_ref", "objective", "title", "suggested_name",
             "original_task_id", "timeout_retry_from", "deadline_at", "root_cost_ceiling_usd",
             "billing_group", "task_constraint", "objective_author", "owner_corpus", "task_group_id", "task_group",
@@ -380,9 +380,11 @@ def ensure_control_task_result(task_id: str) -> Dict[str, Any]:
             key: task.get(key) for key in ("metadata", "root_task_id", "parent_task_id", "delegation_role",
                                           "original_task_id", "timeout_retry_from")})["root_task_id"]
         fields["description"] = task.get("description") or task.get("text") or ""
+        # The host attempt key the assignment mirror and the executor's start copy write:
+        # a split root's copyback authenticates its terminal time against it (terminal_time).
+        fields["task_attempt"] = int((meta.get("attempt") if status == "running" else 0) or task.get("_attempt") or 1)
         if status == "running":
-            fields.update(_attempt=meta.get("attempt") or task.get("_attempt") or 1,
-                          started_at=meta.get("started_at"))
+            fields["started_at"] = meta.get("started_at")
         return write_task_result(root, task_id, status, create_only=True, strict_existing_dict=True, **fields)
 
 

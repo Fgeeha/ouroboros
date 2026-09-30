@@ -621,29 +621,27 @@ and what enforces each.
   `stream_rejected`, never unknown/not-dispatched; keep both across sync/async/process boundaries. Local rejection never rotates accounts.
   Only the engine classifies substitution; no host model-string matching.
 - Caller hints use capabilities; explicitly unsupported options refuse. Record
-  submitted options/`appliedOptions` provider echoes; absent keys stay unknown.
-  Effort: usage/events/Logs, no automatic chat/toast/incident or mismatch dispatch
-  gate. Keep substitution/terminal notices and deliberate weaker-reviewer plan facts.
-- `effort_evidence.py` checks shape/coherence of model `effortResolution` (stored as
-  `effort_resolution`) and sessions' unique final `final/telemetry.yaml` attempt.
+  submitted options and provider `appliedOptions` echoes; absent keys stay unknown.
+  Effort appears in usage/events/Logs, not automatic chat/toasts/incidents or a
+  mismatch gate. Keep substitution/terminal notices and weaker-reviewer plan facts.
+- `effort_evidence.py` validates model `effortResolution` (stored as
+  `effort_resolution`) and the unique final session `final/telemetry.yaml` attempt.
   Live/late reads share `model_effort_usage`; missing/malformed clears stale reports.
-  `submitted` is preparation, never dispatch;
-  null means omission, not `none`. Known native `parameter` may remain when null
-  and is required when submitted is non-null. Paired `observed`/`observedSource`
-  supply provider observation; `source` names resolution authority. Preserve
-  source-qualified `downward`/`floor` and future tokens: engine native order,
-  never host preference-scale re-ranking.
-- The engine's active-turn token is a transport fact: the CALLER owns the slot
-  (`llm_claudexor.ModelTurnState` on the loop context, also used by consciousness);
-  only the engine boundary writes it. Fresh slot per logical
-  turn, cleared when dispatch leaves this transport; never derived from message roles,
-  prose or the last stored assistant envelope (BIBLE P5); never checkpointed (a cold
-  restart starts empty); never forked by a reprepare, thread offload or kwargs copy;
-  a dispatched durable result updates it; released `invalid_continuation` repair clears
-  it with message envelopes. Other non-dispatched, unknown or legacy results preserve
-  it; never in usage, events, progress or task cards. Opt-in is gated on the last SUCCESSFUL handshake's version —
-  not the next-spawn pin, not a liveness projection a failed probe can blank (WHY:
-  ARCHITECTURE §6 "The live turn slot"; the `llm_claudexor.py` docstring).
+  `submitted` is preparation, not dispatch; null means omitted, not `none`.
+  Native `parameter` may be known when submitted is null and is required otherwise.
+  Paired `observed`/`observedSource` report provider evidence; `source` names
+  resolution authority. Preserve source-qualified `downward`/`floor` and future
+  tokens in engine-native order, never re-rank by host preference.
+- The engine's active-turn token is transport, owned by the caller's
+  `llm_claudexor.ModelTurnState` slot (including consciousness); only the engine
+  boundary writes it. Start empty per logical turn and cold restart; clear on
+  departure from this transport. Never derive it from messages (BIBLE P5), copy
+  it on reprepare/offload, checkpoint it or publish it in usage/events/cards.
+  A dispatched durable result updates it; released `invalid_continuation` clears
+  it with message envelopes. Other non-dispatched, unknown or legacy results
+  preserve it. Opt in by the last successful handshake version, not a next-spawn
+  pin or failed liveness probe (ARCHITECTURE §6 "The live turn slot";
+  `llm_claudexor.py` docstring).
 - Pass `model_role` and captured account at every helper/reviewer seam: shared model
   names do not share pins; account evidence remains source/profile/fingerprint-bound.
   Manual context sizing grants no scope authority; ACK binds the actual route.
@@ -1041,8 +1039,10 @@ and what enforces each.
   and failures per operation; repeated edges cannot turn deduplicated failure into
   success. New operations retry durable sources. Capacity, publication order and
   paid identity stay separate.
-- Mirror actual split-root execution start/binding into the canonical result through
-  its terminal-preserving writer. Recover legacy bindings only from positive child
+- Mirror actual split-root or split-subagent execution start/attempt/binding into
+  the canonical result through its terminal-preserving writer; copyback transfers
+  a child's terminal occurrence only for the attempt the canonical row names, and a
+  start written without it stays unknown. Recover legacy bindings only from positive child
   start plus existing queue/worker orphan proof, never while pending/cancelled and
   never as permission to resume.
 - `headless.prepare_terminal_task_files` adopts answer, output files and receipt

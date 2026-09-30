@@ -17,7 +17,7 @@ from ouroboros.gateway._helpers import (
 )
 from ouroboros.gateway.cost_breakdown import make_cost_breakdown_endpoint  # noqa: F401 — historical import path (router)
 from ouroboros.gateway.history_paging import (
-    HistoryCursorError, deferred_before, history_page_tokens, progress_quota_predicate,
+    HistoryCursorError, deferred_before, history_page_coverage, history_page_tokens, progress_quota_predicate,
     replay_evidence_rows, room_view_fingerprint, select_history_page,
 )
 from ouroboros.cost_projection import carry_cost_meta, live_root_cost_projection
@@ -186,13 +186,10 @@ def _user_annotation(
 
 
 def _origin_fallback_rows(data_dir, thread_id: int, human_tail: list) -> list:
-    """Binding-backed origin rows for a Project thread (v6.73.0 lens fallback).
+    """Binding-backed context absent from this physical page, with disclosed cap.
 
-    Synthesizes a start-message row from the binding's own ``source_text`` for
-    every cross-thread origin whose canonical row is NOT among the rows actually
-    emitted to the client — identity-deduped (client_message_id, else ts), hard-
-    capped at ``_ORIGIN_SYNTH_CAP`` with a DISCLOSED omission note naming the
-    omitted count and the durable full-copy source (BIBLE P1: no silent cut)."""
+    The immutable source ref links it to canonical adoption, never ts alone.
+    """
     from ouroboros.project_dialogue import project_origin_rows
 
     origin_rows = project_origin_rows(data_dir, thread_id)
@@ -203,14 +200,12 @@ def _origin_fallback_rows(data_dir, thread_id: int, human_tail: list) -> list:
         for m in human_tail
         if m.get("role") == "user" and m.get("client_message_id")
     }
-    emitted_ts = {str(m.get("ts") or "") for m in human_tail if m.get("role") == "user"}
+    emitted_origins = {m.get("origin_id") for m in human_tail if m.get("origin_id")}
     synthesized: list = []
     for index, row in enumerate(origin_rows):
         ref = row.get("ref") or {}
         cmid = str(ref.get("client_message_id") or "")
-        if (cmid and cmid in emitted_ids) or (
-            not cmid and str(ref.get("ts") or "") in emitted_ts
-        ):
+        if (cmid and cmid in emitted_ids) or row["origin_id"] in emitted_origins:
             continue
         synthesized.append({
             "text": str(row.get("text") or ""),
@@ -225,6 +220,7 @@ def _origin_fallback_rows(data_dir, thread_id: int, human_tail: list) -> list:
             "client_message_id": cmid,
             "task_id": "",
             "origin_projected": True,
+            "origin_id": row["origin_id"],
         })
         if len(synthesized) >= _ORIGIN_SYNTH_CAP:
             omitted = sum(
@@ -325,7 +321,7 @@ def _copy_task_summary_metadata(rec: Dict[str, Any], entry: Dict[str, Any]) -> N
     """Copy terminal chat facts for task summaries."""
     if entry.get("type") != "task_summary":
         return
-    for key in ("model_execution", "review_projection", "history_retention"):
+    for key in ("model_execution", "review_projection", "history_retention", "terminal_time"):
         if isinstance(entry.get(key), dict):
             rec[key] = dict(entry[key])
     if entry.get("suggested_name"):
@@ -680,7 +676,7 @@ def _make_thread_filter(
 
     Returns the one thread predicate shared by both durable stream readers."""
 
-    from ouroboros.project_dialogue import bound_room_chat, room_membership
+    from ouroboros.project_dialogue import bound_room_chat, matching_project_origin, room_membership
 
     belongs = room_membership(thread_id if thread_id in project_chat_ids else 1,
                               project_chat_ids, project_source_refs, bindings_by_task)
@@ -705,6 +701,7 @@ def _make_thread_filter(
 
     _row_matches_thread.question_project_chat = _question_project_chat
     _row_matches_thread.evidence_matches = belongs
+    _row_matches_thread.origin_identity = lambda entry: matching_project_origin(entry, project_source_refs)
     return _row_matches_thread
 
 
@@ -840,10 +837,14 @@ def _collect_chat_rows(
                 # before the producer stripped markdown; a no-op on new rows.
                 # The durable chat.jsonl is never rewritten.
                 rec["text"] = strip_markdown(rec["text"])
+                if isinstance(entry.get("terminal_time"), dict):
+                    rec["terminal_time"] = dict(entry["terminal_time"])
                 for key in ("project_id", "project_name", "target_label", "status", "completion_answer", "handoff_id"):
                     if key in entry:
                         rec[key] = str(entry.get(key) or "")
             annotation = _user_annotation(role, rec["client_message_id"], chat_annotations)
+            if origin := getattr(row_matches_thread, "origin_identity", lambda entry: "")(entry):
+                rec["origin_id"] = origin
             if annotation is not None:
                 rec["chat_annotation"] = annotation
             # Skill-review rows already carry the exact-job reference the
@@ -1521,32 +1522,31 @@ def _assemble_history_response(
         before[source] = max([before[source], *(entry["_history_end"] for entry in selections[source][0] or ()
                                                if entry.get("history_id") in deferred_lineage)])
 
-    # A wake-up is an ordinary direct turn with its own task id and its own
-    # durable result, so it needs no replay hack. The retired loop's progress
-    # rows (the pseudo task id "bg-consciousness") carry no task_result at all:
-    # they replay as any other row whose task result is gone, and the client's
-    # durable task-detail read settles that card as "Outcome unavailable". They
-    # are never stamped terminal here — a row with no result is not a Done.
+    # Wake-ups have their own task/result and need no replay special case.
+    # Retired "bg-consciousness" progress has no task_result: replay treats it
+    # like any missing-result row; the client's durable task-detail read shows
+    # "Outcome unavailable". Never stamp it terminal here: no result is not Done.
 
     # Hidden source evidence shares ordinary keyed replay. It carries no new
     # review/cost authority and never consumes the conversation quota.
     messages.extend(replay_evidence_rows(messages, replay_evidence))
     tokens = history_page_tokens(page)
+    stream_gaps = {"chat": chat_gaps | selections["chat"][2], "progress": progress_gaps | selections["progress"][2]}
     window = _window_metadata(
             chat_quota_rows, progress_quota_rows, n_human, n_progress,
             chat_path, progress_path, archive_dir,
             human_rows_dropped, lineage_truncated, review_overlays_truncated,
-            {"chat": chat_gaps | selections["chat"][2], "progress": progress_gaps | selections["progress"][2]},
+            stream_gaps,
         ) if recent else {"complete": False, "truncated_by": ["page", *(
             f"{source}_{gap}" for source in ("chat", "progress") for gap in sorted(selections[source][2])
         )]}
     if tokens["has_more"]:
         window["complete"] = False
-        if not window["truncated_by"]:
-            window["truncated_by"].append("quota")
+        window["truncated_by"] = window["truncated_by"] or ["quota"]
     payload = {
         "messages": messages,
         "window": window,
+        "coverage": history_page_coverage(page, stream_gaps),
         **tokens,
     }
     # Same rendering options as starlette's JSONResponse — serialized here so

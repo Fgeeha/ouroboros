@@ -318,7 +318,13 @@ def test_explicit_receipt_requires_id_routed_chat_and_exact_bytes(late, tmp_path
 
 @pytest.mark.parametrize('cap', ['unlimited', 'unknown', 'prior_hold', 'prior_spend', 'live_global'])
 def test_original_cap_and_live_money_fences_use_original_wallet(late, tmp_path, monkeypatch, cap):
+    import time
+    from ouroboros import pricing
     from ouroboros.usage_accounting import AttemptRequest, reserve_attempt
+    # The wave fence needs a priced reviewer seat: an unpriced one adds nothing and fits. Pin the
+    # catalog row; a live fetch that times out, or a test's leftover 30 s retry_after, leaves none.
+    monkeypatch.setitem(pricing._cached_pricing, 'openrouter', {'openai/gpt-4.1-nano': (0.1, 0.025, None, 0.4)})
+    monkeypatch.setitem(pricing._pricing_fetched_at, 'openrouter', time.time())
     f = delivered(tmp_path, monkeypatch, retry=True, cap='unlimited' if cap in {'unlimited', 'live_global'} else 'unknown' if cap == 'unknown' else 'finite')
     monkeypatch.setenv('OUROBOROS_PER_TASK_COST_USD', '0.00001')
     if cap == 'prior_hold':
@@ -623,6 +629,8 @@ def test_handoff_failures_preserve_unknown_identity_without_resend(late, tmp_pat
     pointers = load_task_result(f.root, f.tid).get('review_operations') or {}
     assert pointers  # the preparation intent precedes the complete paid-request pointer
     assert any(p.get('source_ref') for p in pointers.values()) is (boundary != 'before_pointer')
+    # Only a recorded refusal, never an unknown preparation, leaves the debt retryable below.
+    assert boundary != 'before_pointer' or [p.get('state') for p in pointers.values()] == ['preparation_refused'], pointers
     claims = (load_task_result(f.root, f.accounting).get('task_acceptance_review_accounting') or {}).get('claims_by_binding') or {}
     assert bool(claims) is (boundary == 'after_claim')
     second = _request(f, ctx, _source(ctx, text='A separately requested retry after the handoff fault'))
@@ -630,6 +638,43 @@ def test_handoff_failures_preserve_unknown_identity_without_resend(late, tmp_pat
         until(lambda: len(late.calls) == 3)
     else:
         assert second['reason'] == 'existing_paid_operation' and not late.calls, second
+
+
+@pytest.mark.parametrize('reader', ['author', 'paid_stamp'])
+def test_a_read_denied_by_a_concurrent_replace_never_refuses_the_owner_panel(late, tmp_path, monkeypatch, reader):
+    """Windows denies an open that meets another thread's atomic replace of the same
+    task result. One such instant at a strict preclaim read (the author's before
+    dispatch, or the paid stamp's on a reviewer racing the author's publication) is
+    not unreadable authority: the owner's panel still buys its three reviewers once."""
+    import pathlib
+    from ouroboros import review_dispatch, review_operation
+    f = delivered(tmp_path, monkeypatch, retry=True)
+    ctx = _caller(f)
+    inside, denied = set(), []
+    preclaim, read_text = review_dispatch.task_acceptance_preclaim_refusal, pathlib.Path.read_text
+
+    def observed_preclaim(admission):
+        if (threading.current_thread() is not threading.main_thread()) == (reader == 'paid_stamp'):
+            inside.add(threading.get_ident())
+        try:
+            return preclaim(admission)
+        finally:
+            inside.discard(threading.get_ident())
+
+    def denied_once(path, *args, **kwargs):
+        if threading.get_ident() in inside and path.parent.name == 'task_results' and not denied:
+            denied.append(path.name)
+            raise PermissionError(13, 'The process cannot access the file', str(path))
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(review_dispatch, 'task_acceptance_preclaim_refusal', observed_preclaim)
+    monkeypatch.setattr(pathlib.Path, 'read_text', denied_once)
+    result = _request(f, ctx, _source(ctx))
+    assert result['status'] in {'pending', 'announced', 'published', 'settled'}, result
+    until(lambda: len(late.calls) == 3)
+    until(lambda: not review_operation._LIVE)
+    claims = (load_task_result(f.root, f.accounting).get('task_acceptance_review_accounting') or {}).get('claims_by_binding') or {}
+    assert denied and len(late.calls) == 3 and len(claims) == 1, (denied, claims)
 
 
 @pytest.mark.parametrize('amount,explicit,expected', [(None, 'original_admission', None), (2.0, 'original_admission', 2.0), (None, '', 9.0)])
