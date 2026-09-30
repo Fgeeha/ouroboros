@@ -212,6 +212,71 @@ def test_delayed_quorum_callback_keeps_one_final_historical_notice(
     assert again['reason'] == 'existing_paid_operation' and len(late.calls) == 3
 
 
+@pytest.mark.parametrize('order', ['drain_first', 'together'])
+def test_drain_and_last_slot_callback_settling_one_wave_queue_one_live_notice(late, tmp_path, monkeypatch, order):
+    """The drain's own settlement and the last slot's complete callback settle one wave.
+
+    ``drain_first``: the drain collects every slot and announces; the callback's
+    mailbox duty mark then lands and its settlement republishes. ``together``:
+    both reconcile the one pending run at once. The outbox owes one notice and
+    exactly one live copy is queued; no reviewer is bought again.
+    """
+    from ouroboros import acceptance_settlement as settlement
+    from ouroboros import review_dispatch, review_operation
+    from supervisor.terminal_delivery import pending_deliveries
+
+    f = delivered(tmp_path, monkeypatch)
+    ctx = _caller(f)
+    ctx.event_queue = queue.Queue()
+    drain = threading.current_thread()
+    complete, drain_entered, drain_done = threading.Event(), threading.Event(), threading.Event()
+    announce, settle = settlement.announce_acceptance_settlement, settlement.settle_acceptance_operation
+    collect, met, barrier = review_dispatch.collect_task_acceptance_run, [], threading.Barrier(2, timeout=10)
+
+    def last_slot_callback(usage_ctx, request, wave):
+        if all(wave['slots'].values()):
+            complete.set()
+            assert (drain_done if order == 'drain_first' else drain_entered).wait(10)
+        return announce(usage_ctx, request, wave)
+
+    def drain_settlement(usage_ctx, **kwargs):
+        if threading.current_thread() is not drain:
+            return settle(usage_ctx, **kwargs)
+        assert complete.wait(10)  # every slot is already in custody
+        drain_entered.set()
+        try:
+            return settle(usage_ctx, **kwargs)
+        finally:
+            drain_done.set()
+
+    def meeting_collect(run, **kwargs):
+        barrier.wait()
+        met.append(threading.current_thread().name)
+        return collect(run, **kwargs)
+
+    monkeypatch.setattr(settlement, 'announce_acceptance_settlement', last_slot_callback)
+    monkeypatch.setattr(settlement, 'settle_acceptance_operation', drain_settlement)
+    if order == 'together':
+        monkeypatch.setattr(review_dispatch, 'collect_task_acceptance_run', meeting_collect)
+    try:
+        result = _request(f, ctx, _source(ctx, text='Review this delivered historical answer.'))
+    finally:
+        for gate in (complete, drain_entered, drain_done):
+            gate.set()
+        until(lambda: not review_operation._LIVE)
+
+    assert result['status'] in {'announced', 'published'}, result
+    assert len(met) == (2 if order == 'together' else 0), met
+    notices = [row for row in list(ctx.event_queue.queue) if row.get('system_type') == 'acceptance_late_settlement']
+    owed, = pending_deliveries(f.root)
+    panel, = load_task_result(f.root, f.tid)['review_projection']['panels']
+    assert len(notices) == 1 and notices[0]['chat_id'] == 7, notices
+    assert notices[0]['delivery_id'] == owed['delivery_id'] and notices[0]['text'] == owed['text']
+    assert owed['text'] == panel['late_settlement']['note'] and len(late.calls) == 3
+    if order == 'drain_first':  # the callback's duty mark was consumed, not left to re-announce
+        assert not settlement.late_publication_owed(f.tid, panel['late_settlement']['reviewed_subject']['retry_key'])
+
+
 def _late_effects(f):
     from ouroboros import review_operation
     ledger = f.root / 'state' / 'usage_attempts.jsonl'

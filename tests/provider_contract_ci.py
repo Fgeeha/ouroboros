@@ -310,6 +310,31 @@ def delegate_start_canary_arguments(nonce: str):
     }
 
 
+def delegate_start_canary_context():
+    """Synthetic, non-executing roster that makes the requested selector well-defined.
+
+    delegate_start takes subagent_id only for a direct fresh start, as an exact
+    Agent-session actor id from Available subagents; asked for it with no roster,
+    the request leaves that premise unstated. This synthetic block borrows Main's
+    catalog heading and relevant row vocabulary; nothing is registered or started.
+    """
+    roster = {"rows": [{
+        "subagent_id": CANARY_SUBAGENT_ID,
+        "route_class": "Agent session",
+        "recommended_use": (
+            "Synthetic provider-contract canary actor. Nothing is registered or "
+            "started: the returned call is validated, never executed."
+        ),
+    }]}
+    return (
+        "## Available subagents\n\n"
+        + json.dumps(roster, ensure_ascii=False, indent=1)
+        + "\n\nNo configured session is running and nothing is being retried: this "
+        "is a direct fresh start of that Agent session actor, which requires its "
+        "subagent_id. "
+    )
+
+
 def _delegate_start_tool(tools):
     return next(
         tool
@@ -745,6 +770,7 @@ def run_provider_contract_canary(
     conversation = [{
         "role": "user",
         "content": (
+            f"{delegate_start_canary_context()}"
             f"Call {CANARY_TOOL_NAME} exactly once with exactly this JSON object "
             f"as its arguments: {arguments_json}. Do not add, omit, or change a field. "
             f"{continuation_instruction}"
