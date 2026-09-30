@@ -295,15 +295,15 @@ def test_the_transport_error_code_is_the_failure_class_name():
     assert cx.ClaudexorSubscriptionWindowExhausted("x").code == SUBSCRIPTION_WINDOW_EXHAUSTED
 
 
-def test_the_window_class_is_transient_and_scheduled_by_its_reset():
+def test_the_window_class_keeps_reset_as_fact_without_sleeping_the_call():
     exc = cx.ClaudexorSubscriptionWindowExhausted("spent", reset_at="2030-01-01T00:00:00Z")
     classification = classify_llm_exception(exc)
     assert classification.kind == SUBSCRIPTION_WINDOW_EXHAUSTED
     assert classification.kind != "quota_exhausted"
-    assert classification.retry_same_request is True
-    # Scheduled by the reset instant, never by the 60s-capped exponential backoff.
-    assert classification.retry_after_sec is not None
-    assert classification.retry_after_sec > 60.0
+    # Configured alternatives and the caller-owned visible wait handle access.
+    # A dated reset does not grant this call a blind sleep or another dispatch.
+    assert classification.retry_same_request is False
+    assert classification.retry_after_sec is None
     assert classification.reset_at == "2030-01-01T00:00:00Z"
 
 
@@ -318,11 +318,10 @@ def _control_problem(code: str, context: dict, status: int = 409) -> cx.Claudexo
     return excinfo.value
 
 
-def test_a_pool_heals_on_a_timer_only_when_the_engine_dated_it():
-    """Owner decision: a credential pool exhausted for a STRUCTURAL reason (every enabled
-    account refused the model, every account disabled: the engine names no reset) must not
-    masquerade as a quota timer. Both producer seams (run failure, ControlProblem) key on
-    the structured `resetsAt` through one helper; nothing reads the prose."""
+def test_a_dated_pool_refusal_keeps_its_cause_without_inventing_quota_or_retry():
+    """The existing transport wrapper may carry a dated pool refusal, but its
+    own code still distinguishes unavailable routes from a spent quota window.
+    A reset is observation, never proof of recovery or permission to resend a run."""
     reset = "2030-01-01T00:00:00Z"
     dated_failure = {"code": "credential_pool_exhausted", "resetsAt": reset,
                      "safeMessage": "every account is cooling down"}
@@ -332,13 +331,12 @@ def test_a_pool_heals_on_a_timer_only_when_the_engine_dated_it():
         assert (dated.code, dated.reset_at) == ("credential_pool_exhausted", reset)
     dated_run = cx.run_failure_error("run-1", "failed", dated_failure)
     assert dated_run.reported_cause == "every account is cooling down"
-    # A dated pool heals on the same timer as a spent window, so it is SCHEDULED
-    # against its reset (not the short backoff) and keeps its own code as evidence.
+    # Dated or not, a pool refusal keeps its own cause. Nothing schedules a new
+    # delegated run or sleeps this classifier's caller until the reported reset.
     dated_class = classify_llm_exception(dated_run)
-    assert (dated_class.kind, dated_class.retry_same_request) == (SUBSCRIPTION_WINDOW_EXHAUSTED, True)
+    assert (dated_class.kind, dated_class.retry_same_request) == ("provider_error", False)
     assert dated_class.provider_code == "credential_pool_exhausted"
-    assert dated_class.reset_at == reset and dated_class.retry_after_sec is not None
-    assert dated_class.retry_after_sec > 60.0
+    assert dated_class.reset_at == reset and dated_class.retry_after_sec is None
 
     # Other direction: an absent, empty or null reset is structural: a plain refusal
     # under the SAME code, the engine's words still carried beside it.
