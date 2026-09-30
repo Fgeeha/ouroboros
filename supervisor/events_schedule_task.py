@@ -216,6 +216,12 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
         task_constraint, workspace_root, workspace_mode, acting_reject_detail = _resolve_subagent_constraint(
             ctx, tid=tid, requested_constraint=task_constraint, workspace_root=workspace_root,
             workspace_mode=workspace_mode, base_sha=str(evt.get("base_sha") or ""), parent_task_id=str(parent_id or ""))
+    workspace_copy = {}
+    if (not acting_reject_detail and isinstance(task_constraint, dict)
+            and task_constraint.get("surface") == "self_worktree"):
+        from ouroboros.workspace_copies import admitted_copy_metadata
+
+        workspace_copy = admitted_copy_metadata(workspace_root)
     allowed_resources = normalize_allowed_resources(evt.get("allowed_resources") or {})
     task_contract = evt.get("task_contract") if isinstance(evt.get("task_contract"), dict) else build_task_contract({
         "id": tid,
@@ -232,6 +238,9 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
         "session_id": session_id,
         "delegation_role": delegation_role,
     })
+    if delegation_role == "subagent" and not acting_reject_detail:
+        task_contract = {**task_contract, "workspace": {
+            **task_contract.get("workspace", {}), "root": workspace_root, "mode": workspace_mode}}
     live_max_depth = _events().get_max_subagent_depth()
     max_depth = admitted_depth_cap(task_contract, live_max_depth)
     task_contract, depth_provenance = stamp_depth_provenance(
@@ -254,6 +263,8 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
         "context": task_context,
         "workspace_root": workspace_root,
         "workspace_mode": workspace_mode, "project_id": project_id,
+        "parent_workspace": evt.get("parent_workspace"),
+        **({"workspace_copy": workspace_copy} if workspace_copy else {}),
         **{key: evt[key] for key in ("directory_strategy", "scope_paths") if key in evt},
         "allowed_resources": allowed_resources,
         "task_contract": task_contract,
@@ -507,6 +518,8 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
             "task_constraint": task_constraint,
             "workspace_root": workspace_root,
             "workspace_mode": workspace_mode,
+            "parent_workspace": evt.get("parent_workspace"),
+            **({"workspace_copy": workspace_copy} if workspace_copy else {}),
             **{key: evt[key] for key in ("directory_strategy", "scope_paths") if key in evt},
             "project_id": project_id,
             "allowed_resources": allowed_resources,

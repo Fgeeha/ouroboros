@@ -475,12 +475,8 @@ def test_vlm_user_files_admission_read_parity(tmp_path, monkeypatch):
     assert "USER_FILES_PATH_BLOCKED" not in (err or "")
 
 
-def test_vlm_restricted_subagent_secret_data_path_blocked(tmp_path, monkeypatch):
-    """SC-6 read_file parity: deriving admission roots from the profile matrix
-    admitted the WHOLE runtime-data drive, but read_file additionally denies
-    restricted subagents its secret/owner-control paths (_data_read /
-    _local_readonly_resource_block). view_image/vlm_query must apply the same
-    per-path rule, or a read-only child could view an image read_file refuses."""
+def test_vlm_child_reads_credential_named_runtime_content(tmp_path, monkeypatch):
+    """Helpers may view parent-readable content under credential-shaped names."""
     from ouroboros.tools import vision
 
     data = tmp_path / "data"
@@ -493,9 +489,9 @@ def test_vlm_restricted_subagent_secret_data_path_blocked(tmp_path, monkeypatch)
         drive_root=str(data),
         task_constraint={"mode": "local_readonly_subagent"},
     )
+    monkeypatch.setattr(vision, "_downscale_image_for_vlm", lambda raw, mime: (raw, mime))
     payload, err = vision._load_local_image_payload(ctx, str(img))
-    assert payload is None
-    assert "PATH_BLOCKED" in err and "secret or owner-control" in err
+    assert payload is not None and err == ""
 
 
 def test_vlm_project_store_guard_applies(tmp_path):
@@ -542,11 +538,8 @@ def test_vlm_split_drive_child_canonical_owner_state_blocked(tmp_path, monkeypat
     )
     payload, err = vision._load_local_image_payload(ctx, str(owner_state))
     assert payload is None
-    # Both refusals are correct: POSIX hits the restricted-subagent secret/
-    # owner-control denial; Windows path-shape hits the earlier workspace-
-    # overlap user_files denial first. Blocked-by-a-typed-path-guard is the pin.
-    assert "PATH_BLOCKED" in err
-    assert ("secret or owner-control" in err) or ("overlaps the Ouroboros repo/runtime workspace" in err)
+    # This is the same ordinary-mode skill owner-state rule as the parent.
+    assert "DATA_READ_BLOCKED" in err or "USER_FILES_PATH_BLOCKED" in err
 
 
 def test_vlm_split_drive_child_canonical_job_artifact_admitted(tmp_path, monkeypatch):

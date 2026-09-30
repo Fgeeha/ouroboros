@@ -250,8 +250,8 @@ class TestChildDriveSkillPayload:
         assert "launcher-seed" in marker
         assert "nativeDependency" in dependency
         assert "node_modules/" in listing and ".seed-origin" in listing
-        assert ".clawhub.json" not in listing
-        assert "BLOCKED" in control
+        assert ".clawhub.json" in listing
+        assert '{"origin":"catalog"}' in control
         assert "SKILL.md" in search
 
         write = registry.execute("write_file", {

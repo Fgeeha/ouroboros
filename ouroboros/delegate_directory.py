@@ -42,6 +42,13 @@ def default_shaped_directory_options(strategy, scope_paths) -> bool:
     return strategy in (None, "direct") and not scope_paths
 
 
+def git_directory_options_refusal(target_root, strategy, scope_paths, *, git_workspace=False):
+    """One argument-shape check for scheduling and direct Git session starts."""
+    if (git_workspace or (Path(target_root) / ".git").exists()) and not default_shaped_directory_options(strategy, scope_paths):
+        return "Directory options apply to ordinary folders; Git workspaces keep their snapshot contract."
+    return ""
+
+
 def blocked_geometry_refusal(ctx, authority, selector_root, strategy, scope_paths):
     """Typed pre-POST refusal for geometry this shape can never serve, else ``None``.
 

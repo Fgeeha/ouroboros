@@ -553,7 +553,7 @@ class OuroborosAgent:
         task_metadata = dict(task.get("metadata") or {}) if isinstance(task.get("metadata"), dict) else {}
         for key in (
             "parent_task_id", "root_task_id", "session_id", "actor_id", "delegation_role", "role",
-            "workspace_root", "workspace_mode", "memory_mode",
+            "workspace_root", "workspace_mode", "memory_mode", "parent_workspace", "workspace_copy",
             "drive_root", "child_drive_root", "budget_drive_root", "root_cost_ceiling_usd",
             "model_lane", "requested_model_lane", "effective_model_lane",
             "model", "use_local_model", "requested_executor",

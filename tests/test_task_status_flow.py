@@ -35,7 +35,10 @@ def test_schedule_task_live_emits_strict_contract_and_requested_status(tmp_path,
 
     _configure_test_subagent(monkeypatch)
     event_queue = _FakeEventQueue(status_root=tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
     ctx = SimpleNamespace(
+        repo_dir=repo,
         task_depth=0,
         pending_events=[],
         event_queue=event_queue,
@@ -96,7 +99,10 @@ def test_schedule_task_falls_back_to_pending_events_when_live_queue_unavailable(
     from ouroboros.tools.control import _schedule_task
 
     _configure_test_subagent(monkeypatch)
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
     ctx = SimpleNamespace(
+        repo_dir=repo,
         task_depth=0,
         pending_events=[],
         event_queue=_FakeEventQueue(fail=True),
@@ -323,7 +329,10 @@ def test_schedule_task_memory_modes_prepare_declared_drive_shape(tmp_path, monke
     (parent_memory / "knowledge" / "pattern.md").write_text("stable pattern", encoding="utf-8")
 
     event_queue = _FakeEventQueue()
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
     ctx = SimpleNamespace(
+        repo_dir=repo,
         task_depth=0,
         pending_events=[],
         event_queue=event_queue,
@@ -382,7 +391,10 @@ def test_configured_session_child_materializes_initial_and_steered_attachments(t
         attachment_manifest=steered_manifest,
     )
     event_queue = _FakeEventQueue()
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
     ctx = SimpleNamespace(
+        repo_dir=repo,
         task_depth=0, pending_events=[], event_queue=event_queue,
         drive_root=tmp_path, task_id="parent-attachments",
         task_contract={"attachment_manifest": [dict(row) for row in parent_manifest]},
@@ -422,7 +434,10 @@ def test_schedule_task_rejects_legacy_description_schema(tmp_path, monkeypatch):
     from ouroboros.tools.control import _schedule_task
 
     _configure_test_subagent(monkeypatch)
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
     ctx = SimpleNamespace(
+        repo_dir=repo,
         task_depth=0,
         pending_events=[],
         event_queue=None,
