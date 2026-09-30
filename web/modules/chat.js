@@ -2622,12 +2622,9 @@ export function createChatInstance({
                 }
                 _historyRow = null;
 
-                // A terminal-root projection is the durable result authority,
-                // even though it is an intentionally hidden history row.  Do
-                // not let a later authored_root_summary (which may still say
-                // `finalizing`) leave the card open after restart.  Resolve it
-                // only after replay has seen all narrative rows so the
-                // terminal fact cannot itself be downgraded by later prose.
+                // The hidden terminal-root projection is the durable outcome
+                // authority. Apply its projected phase after narrative rows,
+                // which may still say finalizing; status alone loses failures.
                 for (const [tid, historicalTerminal] of historicalTerminals) {
                     if (!historicalTerminalProjections.has(tid)) continue;
                     const terminalRecord = { ...historicalTerminal, task_id: tid };
@@ -2639,7 +2636,7 @@ export function createChatInstance({
                     const rec = liveCardRecords.get(tid);
                     if (!rec) continue;
                     insertCardIfNeeded(tid);
-                    finishLiveCard(tid, taskTerminalPhase(terminalRecord));
+                    finishLiveCard(tid, historicalTerminal.phase);
                 }
 
                 // Every block the predicate admits is in the transcript after a rebuild.

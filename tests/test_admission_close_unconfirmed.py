@@ -26,7 +26,7 @@ from ouroboros.outcomes import (
     OUTCOME_TIER_SOLVED, _objective_axis,
 )
 from ouroboros.project_dialogue import TASK_CAUSE_PHRASES, _completion_verdict, outcome_phase
-from tests.test_acceptance_async_loop import ANSWER, _terminal_record, call, full_loop as _full_loop, keep  # noqa: F401
+from tests.test_acceptance_async_loop import ANSWER, _terminal_record, call, full_loop as _full_loop, keep, select_completion  # noqa: F401
 from tests.test_acceptance_fence_transport import _pooled_agent
 
 full_loop = _full_loop  # noqa: F811 - shared real-loop fixture
@@ -169,9 +169,7 @@ def test_blocking_fail_verdict_is_never_laundered_by_the_note(full_loop, monkeyp
             return {"content": "", "tool_calls": [call("task_acceptance_review", {"claim": ANSWER}, "first-review")]}, 0.0
         if f.model_step == 2:
             assert f.entered.wait(5) and not f.release.is_set()
-            observation = f.ctx._acceptance_observation
-            return {"content": json.dumps({"delivery_control": "replace", "full_answer": reauthored,
-                                           "acceptance_subject": {"owner_source_sha256": observation["owner_source_sha256"]}})}, 0.0
+            return select_completion(f, reauthored), 0.0
         assert f.model_step < 5, ("the fence bought model rounds", f.progress)
         return keep(f), 0.0
 
