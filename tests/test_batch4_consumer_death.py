@@ -1,10 +1,10 @@
 """Confirmed worker death retires an exact answer consumer, never its bill."""
+import contextlib
+import multiprocessing
 import os
 import queue as stdqueue
-import subprocess
-import sys
 import time
-from types import SimpleNamespace
+import traceback
 
 import pytest
 
@@ -94,6 +94,27 @@ def test_confirmed_death_retires_only_exact_consumer(tmp_path, monkeypatch, evid
         assert not ua.usage_projection(tmp_path, root_task_id=task_id)['cost_final']
 
 
+def _run_dispatched_consumer(root, task_id):
+    """A real spawned worker owns the ledger identity, including in Windows venvs."""
+    with (root / 'child.log').open('w', encoding='utf-8') as log:
+        with contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
+            try:
+                from ouroboros import usage_accounting as ua, model_wait
+
+                with ua.usage_scope(ua.UsageScope(drive_root=root, task_id=task_id, root_task_id=task_id)):
+                    with model_wait.task_model_wait_scope(
+                            task={'id': task_id, '_attempt': 3}, drive_root=root,
+                            event_queue=None, worker_slot_held=True):
+                        def send():
+                            (root / 'sent').touch()
+                            time.sleep(120)
+                        ua.execute_physical_attempt(
+                            ua.AttemptRequest(model='m', provider='test', reservation_usd=.2), send)
+            except BaseException:
+                traceback.print_exc(file=log)
+                raise
+
+
 def test_real_process_death_uses_recorded_birth_and_retains_unknown_money(tmp_path, monkeypatch):
     from ouroboros import usage_accounting as ua
     from ouroboros.task_results import write_task_result, load_task_result
@@ -103,46 +124,41 @@ def test_real_process_death_uses_recorded_birth_and_retains_unknown_money(tmp_pa
     task_id = 'physical-consumer'
     write_task_result(tmp_path, task_id, 'running', root_task_id=task_id)
     marker = tmp_path / 'sent'
-    code = '''import pathlib,sys,time
-from ouroboros import usage_accounting as ua, model_wait
-root=pathlib.Path(sys.argv[1]); task_id=sys.argv[2]
-with ua.usage_scope(ua.UsageScope(drive_root=root, task_id=task_id, root_task_id=task_id)):
- with model_wait.task_model_wait_scope(task={'id':task_id,'_attempt':3}, drive_root=root, event_queue=None,worker_slot_held=True):
-  def send():
-   (root/'sent').touch()
-   time.sleep(120)
-  ua.execute_physical_attempt(ua.AttemptRequest(model='m',provider='test',reservation_usd=.2),send)
-'''
     monkeypatch.setenv('TOTAL_BUDGET', '1000')
-    with (tmp_path / 'child.log').open('w') as log:
-        process = subprocess.Popen([sys.executable, '-c', code, str(tmp_path), task_id], stdout=log, stderr=log)
-        try:
-            proc = SimpleNamespace(pid=process.pid, exitcode=None, is_alive=lambda: process.poll() is None)
-            slot = workers.Worker(0, proc, stdqueue.Queue(), busy_task_id=task_id)
-            monkeypatch.setattr(workers, 'WORKERS', {0: slot})
-            task = {'id': task_id, 'root_task_id': task_id, '_attempt': 3, 'type': 'task', 'chat_id': 1}
-            workers.RUNNING[task_id] = {'task': task, 'attempt': 3, 'worker_id': 0}
-            worker_pool_lifecycle._record_worker_pids()
-            assert slot.process_birth
-            end = time.monotonic() + 20
-            while not marker.exists() and process.poll() is None and time.monotonic() < end:
-                time.sleep(.02)
-            assert marker.exists(), (tmp_path / 'child.log').read_text()
-            before = ua.read_usage_records(tmp_path, final_only=True)
-            assert before[-1]['state'] == 'dispatched'
-            assert before[-1]['local_answer_owner_birth'] == slot.process_birth
+    # Like production Windows workers, spawn bypasses the venv redirector and
+    # retains the actual Python child's handle, PID and exit status.
+    process = multiprocessing.get_context('spawn').Process(target=_run_dispatched_consumer, args=(tmp_path, task_id))
+    process.start()
+    try:
+        slot = workers.Worker(0, process, stdqueue.Queue(), busy_task_id=task_id)
+        monkeypatch.setattr(workers, 'WORKERS', {0: slot})
+        task = {'id': task_id, 'root_task_id': task_id, '_attempt': 3, 'type': 'task', 'chat_id': 1}
+        workers.RUNNING[task_id] = {'task': task, 'attempt': 3, 'worker_id': 0}
+        worker_pool_lifecycle._record_worker_pids()
+        assert slot.process_birth
+        end = time.monotonic() + 20
+        while not marker.exists() and process.is_alive() and time.monotonic() < end:
+            time.sleep(.02)
+        assert marker.exists(), (tmp_path / 'child.log').read_text(encoding='utf-8')
+        before = ua.read_usage_records(tmp_path, final_only=True)
+        assert before[-1]['state'] == 'dispatched'
+        assert before[-1]['local_answer_owner_pid'] == process.pid
+        assert before[-1]['local_answer_owner_birth'] == slot.process_birth
+        process.kill()
+        process.join(5)
+        assert not process.is_alive() and process.exitcode is not None
+        workers.ensure_workers_healthy()
+        job = queue._reap_queue.get_nowait()
+        job['skip_respawn'] = True
+        monkeypatch.setattr('ouroboros.headless.prepare_terminal_task_files',
+                            lambda *_a, **_k: {'terminal_source_present': False})
+        worker_health.recover_confirmed_dead_worker(job)
+        assert before[-1]['local_answer_consumer_id'] in load_task_result(tmp_path, task_id)['retired_model_consumers']
+        assert not any(b['kind'] == 'model_handoff' for b in conflicting_writers(queue, task_id))
+        assert ua.read_usage_records(tmp_path, final_only=True) == before
+    finally:
+        if process.is_alive():
             process.kill()
-            proc.exitcode = process.wait(5)
-            workers.ensure_workers_healthy()
-            job = queue._reap_queue.get_nowait()
-            job['skip_respawn'] = True
-            monkeypatch.setattr('ouroboros.headless.prepare_terminal_task_files',
-                                lambda *_a, **_k: {'terminal_source_present': False})
-            worker_health.recover_confirmed_dead_worker(job)
-            assert before[-1]['local_answer_consumer_id'] in load_task_result(tmp_path, task_id)['retired_model_consumers']
-            assert not any(b['kind'] == 'model_handoff' for b in conflicting_writers(queue, task_id))
-            assert ua.read_usage_records(tmp_path, final_only=True) == before
-        finally:
-            if process.poll() is None:
-                process.kill()
-            process.wait(5)
+        process.join(5)
+        assert not process.is_alive()
+        process.close()
