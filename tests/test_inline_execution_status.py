@@ -139,7 +139,8 @@ def test_actual_pool_assignment_rebinds_direct_and_native_split_start(tmp_path, 
     from supervisor import worker_assignment, workers
     root, child = tmp_path / "canonical", tmp_path / "child"
     root.mkdir(); child.mkdir()
-    task = {"id": "resumed", "_attempt": 2, "_is_direct_chat": True, "budget_drive_root": str(root)}
+    task = {"id": "resumed", "_attempt": 2, "_is_direct_chat": True,
+            "budget_drive_root": str(root), "drive_root": str(child)}
     write_task_result(root, "resumed", "running", task_attempt=2,
                       execution_owner=execution_owner_record(root, task, "direct"))
     monkeypatch.setattr(workers, "DRIVE_ROOT", root)
@@ -151,6 +152,25 @@ def test_actual_pool_assignment_rebinds_direct_and_native_split_start(tmp_path, 
     actor._persist_running_record(task)
     assert load_task_result(child, "resumed")["execution_owner"] == load_task_result(root, "resumed")["execution_owner"]
     assert load_task_result(root, "resumed")["execution_owner"]["task_attempt"] == 2
+
+
+def test_nofork_resume_publishes_pool_owner_at_actual_native_start(tmp_path, monkeypatch):
+    from ouroboros.agent import OuroborosAgent
+    from supervisor import worker_assignment, workers
+
+    task = {"id": "resumed", "_attempt": 1, "_is_direct_chat": True, "budget_drive_root": str(tmp_path)}
+    previous = execution_owner_record(tmp_path, task, "direct")
+    write_task_result(tmp_path, "resumed", "scheduled", task_attempt=1, execution_owner=previous)
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    worker_assignment._mirror_assigned_running_status(task)
+    assigned = load_task_result(tmp_path, "resumed")
+    assert assigned["status"] == "scheduled" and assigned["execution_owner"] == previous
+    assert task["_execution_owner"]["kind"] == "pooled"
+    native = object.__new__(OuroborosAgent)
+    native.env = SimpleNamespace(drive_root=tmp_path)
+    native._persist_running_record(task)
+    running = load_task_result(tmp_path, "resumed")
+    assert running["status"] == "running" and running["execution_owner"]["kind"] == "pooled"
 
 
 @pytest.mark.parametrize("flags,kind", [({}, "pooled"), ({"_is_direct_chat": True}, "direct"),
@@ -174,6 +194,61 @@ def test_canonical_assignment_beats_a_pre_resume_child_owner(tmp_path):
     observed = load_effective_task_result(root, "resumed")
     assert observed["execution_owner"]["kind"] == "pooled"
     assert observed["status"] == "failed"
+
+
+@pytest.mark.parametrize("child_terminal", [False, True])
+def test_canonical_new_attempt_stays_bound_beside_old_child(tmp_path, monkeypatch, child_terminal):
+    from supervisor import worker_assignment, workers
+
+    root, child = tmp_path / "canonical", tmp_path / "child"
+    _seed(root, "retry", "pooled", child_drive_root=str(child))
+    _seed(child, "retry", _attempt=1,
+          execution_owner=execution_owner_record(root, {"id": "retry", "_attempt": 1}, "pooled"))
+    monkeypatch.setattr(workers, "DRIVE_ROOT", root)
+    worker_assignment._mirror_assigned_running_status(
+        {"id": "retry", "_attempt": 2, "budget_drive_root": str(root), "drive_root": str(child)})
+    write_task_result(root, "retry", "running", ts=_stamp(time.time() - 200))
+    if child_terminal:
+        write_task_result(child, "retry", "completed", result="Actual child answer")
+    observed = load_effective_task_result(root, "retry")
+    assert observed["task_attempt"] == observed["execution_owner"]["task_attempt"] == 2
+    assert "_attempt" not in observed  # an old secondary carrier cannot be borrowed either
+    if child_terminal:
+        assert observed["status"] == "completed" and observed["result"] == "Actual child answer"
+    else:
+        assert observed["status"] == "failed" and observed["execution_observation"]["kind"] == "pooled"
+        assert reconcile_orphaned_running_tasks(root) == 1
+
+
+@pytest.mark.parametrize("outcome_failure", [False, True])
+def test_projection_does_not_claim_a_terminal_was_already_recorded(tmp_path, outcome_failure):
+    from ouroboros.outcomes import infra_failed_axes
+
+    fields = {"outcome_axes": infra_failed_axes("provider_unavailable")} if outcome_failure else {}
+    _seed(tmp_path, "orphan", "pooled", **fields)
+    observation = load_effective_task_result(tmp_path, "orphan")["execution_observation"]
+    assert observation["state"] == "terminal" and observation["reason"] == "projected_terminal"
+    assert observation["basis"] == ("recorded_outcome" if outcome_failure else "pooled_worker_restart")
+    assert load_task_result(tmp_path, "orphan")["status"] == "running"
+    assert reconcile_orphaned_running_tasks(tmp_path) == 1
+    assert load_task_result(tmp_path, "orphan")["status_reconciled_from"] == "running"
+    assert load_effective_task_result(tmp_path, "orphan")["execution_observation"]["reason"] == "recorded_terminal"
+
+
+def test_effective_observation_reuses_its_queue_read(tmp_path, monkeypatch):
+    from ouroboros import task_status
+
+    _seed(tmp_path, "inline", "direct", _is_direct_chat=True)
+    actual, reads = task_status._load_queue_snapshot, []
+
+    def counted(root):
+        reads.append(root)
+        return actual(root)
+
+    monkeypatch.setattr(task_status, "_load_queue_snapshot", counted)
+    row = load_effective_task_result(tmp_path, "inline", materialize_artifacts=False)
+    assert row["status"] == "running" and row["execution_observation"]["state"] == "unknown"
+    assert len(reads) == 1
 
 
 def test_unconsumed_resume_keeps_its_pause_custody(tmp_path):

@@ -120,6 +120,8 @@ def _mirror_assigned_running_status(task: Dict[str, Any]) -> None:
 
         task["_execution_owner"] = execution_owner_record(
             task.get("budget_drive_root") or _pool().DRIVE_ROOT, task, "pooled")
+        if not str(task.get("drive_root") or ""):
+            return  # no fork mirror: the actual native start publishes RUNNING
         _is_subagent = str(task.get("delegation_role") or "") == "subagent"
         _mirror = {
             "execution_owner": task["_execution_owner"], "task_attempt": int(task.get("_attempt") or 0),

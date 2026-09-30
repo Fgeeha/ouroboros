@@ -577,7 +577,7 @@ def sync_skill_schedules(skills: List[Any], *, drive_root: pathlib.Path | None =
             ):
                 from supervisor.schedule_occurrence import owed
 
-                if owed(record) is False:
+                if owed(record, drive_root=drive_root) is False:
                     by_id.pop(schedule_id, None)
                 else:
                     record.update(enabled=False, delete_requested_at=utc_now_iso())

@@ -10,7 +10,7 @@ result and the queue snapshot — never a second ledger or scheduler:
   schedule list show it, and the mind decides whether to say anything;
 - task result ``schedule_admission``: ``{schedule_id, token, due_at, status,
   dispatch: none|possible, task}`` — the frozen task an accepted occurrence runs;
-- queued task ``metadata.schedule_occurrence``: ``{schedule_id, token}``.
+- queued task ``metadata.schedule_occurrence``: ``{schedule_id, token, due_at, claimed_at}``.
 
 A pass claims under the queue+table locks (briefly), prepares everything
 expensive WITHOUT them (resource intent, folder checks, preflight, memory fork,
@@ -148,6 +148,16 @@ def reconcile(record: Dict[str, Any]) -> tuple[str, Optional[Dict[str, Any]]]:
         return _SETTLED, None
     if ours and isinstance(admission.get("task"), dict):
         task = copy.deepcopy(admission["task"])
+        metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+        timing = metadata.get("schedule_occurrence")
+        if (isinstance(timing, dict) and timing.get("token") == token
+                and timing.get("schedule_id") == record.get("id")):
+            # Legacy accepted tasks froze identity before timing was projected.
+            # Enrich host facts only; neither today's template nor clock is evidence.
+            for key, value in (("due_at", admission.get("due_at") or occ.get("due_at")),
+                               ("claimed_at", occ.get("claimed_at"))):
+                if not timing.get(key) and value:
+                    timing[key] = value
         if "_owner_hold" in result:
             task["_owner_hold"] = copy.deepcopy(result["_owner_hold"])
         return "republish", task
@@ -496,7 +506,9 @@ def _write_receipt(item: Dict[str, Any], record: Dict[str, Any]) -> bool:
     from ouroboros.task_results import STATUS_SCHEDULED, write_task_result
 
     task, occ = item["task"], item["occurrence"]
-    receipt = {"schedule_id": item["schedule_id"], "token": occ["token"], "due_at": occ.get("due_at"),
+    timing = (task.get("metadata") or {}).get("schedule_occurrence") or {}
+    receipt = {"schedule_id": item["schedule_id"], "token": occ["token"],
+               "due_at": timing.get("due_at") or occ.get("due_at"),
                "status": "accepted", "dispatch": "none", "task": task}
 
     def _accept(current: Dict[str, Any], incoming: Dict[str, Any]) -> Optional[Dict[str, Any]]:

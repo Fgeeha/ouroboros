@@ -946,9 +946,9 @@ def effective_task_result(
         )
         parent_authoritative_fields = parent_authoritative_fields | _parent_workspace_artifact_lifecycle_fields(result)
         # Pool assignment can rebind a paused direct turn before its old child
-        # replica receives the new start. The canonical owner wins that interval.
+        # replica receives the new start. Owner and its attempt remain one fact.
         if "execution_owner" in result:
-            parent_authoritative_fields = parent_authoritative_fields | {"execution_owner"}
+            parent_authoritative_fields = parent_authoritative_fields | {"execution_owner", "task_attempt", "_attempt"}
         canonical_pause = result.get("budget_pause") if isinstance(result.get("budget_pause"), dict) else {}
         # Only a STALE nonterminal replica (the worker's pre-pause ``running``
         # row) yields to the live pause; a replica that already reached a
@@ -974,6 +974,8 @@ def effective_task_result(
 
     merged = _normalize_workspace_artifact_status(merged)
 
+    queue_snapshot = None
+    terminal_projection = ""
     parent_status = str(merged.get("status") or "").lower()
     if parent_status not in FINAL_STATUSES:
         queue_snapshot = _load_queue_snapshot(pathlib.Path(drive_root))
@@ -999,6 +1001,7 @@ def effective_task_result(
             if queue_status == "unknown":
                 merged["queue_reconciliation_warning"] = "queue snapshot missing or invalid"
             elif _terminal_failure_from_outcome(merged):
+                terminal_projection = "recorded_outcome"
                 merged["status"] = STATUS_CANCELLED if str(merged.get("status") or "").strip().lower() == STATUS_CANCELLED else STATUS_FAILED
                 merged["status_reconciled_from"] = parent_status
                 artifact_status = str(merged.get("artifact_status") or "").strip().lower()
@@ -1013,6 +1016,7 @@ def effective_task_result(
                 pathlib.Path(drive_root), task_id, merged, _events_index,
                 queue_snapshot=queue_snapshot,
             ):
+                terminal_projection = "pooled_worker_restart"
                 orphan_reason = (
                     "interrupted_retry_lost"
                     if parent_status == STATUS_INTERRUPTED
@@ -1041,7 +1045,12 @@ def effective_task_result(
     # A legacy ``cancel_requested`` status (old files awaiting boot migration)
     # projects the same pending state.
     _apply_cancel_state_projection(pathlib.Path(drive_root), task_id, merged)
-    merged["execution_observation"] = task_execution_observation(drive_root, merged)
+    merged["execution_observation"] = task_execution_observation(drive_root, merged, queue_snapshot=queue_snapshot)
+    if terminal_projection:
+        # This read inferred a terminal; a later persisted terminal is a recorded
+        # fact even when its historical status_reconciled_from marker survives.
+        merged["execution_observation"].update(
+            source="effective_task_result", reason="projected_terminal", basis=terminal_projection)
 
     if not materialize_artifacts:
         # Status/cost projection only: no artifact view (no store listing) and no

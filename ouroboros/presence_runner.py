@@ -922,6 +922,7 @@ def _build_task(
     task: dict[str, Any] = {
         "id": task_id,
         "type": "presence",
+        "source": "presence",
         "chat_id": chat_id,
         "actor_id": str(event.actor.get("platform_actor_id") or event.actor.get("id") or actor_id),
         "text": str(event.text or "").strip(),
@@ -1118,7 +1119,7 @@ def run_presence_turn(
                               execution_owner=execution_owner_record(drive_root, task, "presence"),
                               create_only=True, strict_existing_dict=True,
                               metadata=task["metadata"], chat_id=chat_id,
-                              _is_direct_chat=True, source="presence", result="Task is running.")
+                              _is_direct_chat=True, source=task["source"], result="Task is running.")
             start = _stored_turn(Path(drive_root), task_id, identity)
             if str(start.get("status") or "") != STATUS_RUNNING or (
                     start.get("metadata") or {}).get("presence_event_identity") != identity:

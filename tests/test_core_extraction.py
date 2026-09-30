@@ -134,9 +134,10 @@ def test_core_catalog_schema_bytes_and_handler_owners_are_stable():
     # `options` description says optional 0-6 and `options` leaves the required keys. Rolled
     # again for TZ-1 V10: forward_to_worker also writes into a queued task's mailbox, so its
     # description and `task_id` description say "running or queued" and when each reads it.
-    # Diffing the whole catalog base to head shows exactly those edits and nothing else.
+    # Presence peer mail expands only forward_to_worker's description; the
+    # catalog comparison preserves every parameter and handler owner.
     assert hashlib.sha256(schema_bytes).hexdigest() == (
-        "968eecad1c04b7f8a265d17bdb5dc42a8a5239373a0a5724ad8c8d5489d06ef3"
+        "d51c4783df9c532f763a7d57c0ff732b86ca397c0875e151fcc1430fb8e3489e"
     )
     assert {
         entry.name: (entry.handler.__module__, entry.handler.__name__)

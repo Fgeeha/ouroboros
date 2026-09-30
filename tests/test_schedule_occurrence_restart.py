@@ -293,3 +293,92 @@ def test_worker_delete_reads_receipt_from_its_canonical_table_root(q, tmp_path, 
         assert outcome["status"] == "delete_deferred" and outcome["schedule"] is not None
         assert len(rows) == 1 and rows[0]["delete_requested_at"] and not rows[0]["enabled"]
         assert ("accepted run" in outcome["detail"]) is (state_kind == "accepted")
+
+
+@pytest.mark.parametrize("clocks", ["both", "receipt_only", "row_only", "unknown"])
+def test_legacy_accepted_republish_preserves_authored_task_and_known_clocks(q, clocks):  # noqa: F811
+    from ouroboros.context_runtime_facts import task_schedule_fact
+
+    _row(q, intent={"kind": "system_repo"})
+    q.queue.check_scheduled_tasks()
+    row = _rows(q)["s1"]
+    task = copy.deepcopy(q.pending[0])
+    task_id = task["id"]
+    timing = task["metadata"]["schedule_occurrence"]
+    timing.pop("due_at", None)
+    timing.pop("claimed_at", None)
+    task.update(text="Accepted authored instructions, unchanged.", context="frozen context",
+                workspace_root="/frozen/resource", workspace_mode="external", memory_mode="forked")
+    task["metadata"]["resource_intent"] = {"kind": "explicit_resource", "root": "/frozen/resource"}
+    receipt = copy.deepcopy(load_task_result(q.root, task_id)["schedule_admission"])
+    receipt["task"] = task
+    due, claimed_at = receipt["due_at"], row["occurrence"]["claimed_at"]
+    if clocks in {"row_only", "unknown"}:
+        receipt.pop("due_at")
+    with queue_schedules.schedule_transaction(q.root):
+        table = queue_schedules.load_schedule_store(q.root)
+        if clocks in {"receipt_only", "unknown"}:
+            table["tasks"][0]["occurrence"].pop("due_at")
+            table["tasks"][0]["occurrence"].pop("claimed_at")
+        table["tasks"][0]["task"]["text"] = "Later edit must not replace accepted text"
+        queue_schedules._write_scheduled_tasks(table)
+    write_task_result(q.root, task_id, "scheduled", schedule_admission=receipt)
+    q.pending.clear()
+    row = _rows(q)["s1"]
+    verdict, frozen = occurrence.reconcile(row)
+    assert verdict == "republish"
+    restored = occurrence.prepare(occurrence.view(row, frozen))["task"]
+    expected_due = due if clocks != "unknown" else None
+    expected_claimed = claimed_at if clocks in {"both", "row_only"} else None
+    facts = task_schedule_fact(restored)["schedule_occurrence"]
+    assert facts["due_at"] == expected_due and facts["claimed_at"] == expected_claimed
+    preserved = copy.deepcopy(restored)
+    for key in ("due_at", "claimed_at"):
+        preserved["metadata"]["schedule_occurrence"].pop(key, None)
+    assert preserved == task  # Only the retained host clocks enriched the frozen task.
+    q.queue.check_scheduled_tasks()
+    [queued] = q.pending
+    assert queued["text"] == task["text"] and queued["workspace_root"] == task["workspace_root"]
+    stored = load_task_result(q.root, task_id)["schedule_admission"]
+    assert stored["task"]["text"] == task["text"] and stored.get("due_at") == expected_due
+
+
+@pytest.mark.parametrize("accepted_in", ["table_root", "unrelated_queue_root"])
+def test_skill_resync_uses_selected_root_for_accepted_receipt(q, tmp_path, accepted_in):  # noqa: F811
+    selected = tmp_path / "selected"
+    row = {"id": "skill-demo-daily", "name": "demo/daily", "enabled": True,
+           "source": "skill_manifest", "skill": "demo",
+           "trigger": {"type": "cron", "expr": "0 * * * *"}, "timezone": "UTC",
+           "task": {"type": "task", "text": "frozen"},
+           "occurrence": {"phase": "claimed", "token": "claimed-token", "task_id": "claimed-task"}}
+    queue_schedules._write_scheduled_tasks({"tasks": [row]}, selected)
+    receipt_root = selected if accepted_in == "table_root" else q.root
+    write_task_result(receipt_root, "claimed-task", "scheduled", schedule_admission={
+        "schedule_id": "skill-demo-daily", "token": "claimed-token", "dispatch": "none",
+        "task": {"id": "claimed-task", "text": "accepted immutable work"}})
+    queue_schedules.sync_skill_schedules([], drive_root=selected)
+    rows = queue_schedules.load_schedule_store(selected)["tasks"]
+    if accepted_in == "table_root":
+        assert len(rows) == 1, "a receipt in the selected root must preserve accepted work"
+        assert rows[0]["enabled"] is False and rows[0]["delete_requested_at"]
+        assert load_task_result(selected, "claimed-task")["schedule_admission"]["task"]["text"] == "accepted immutable work"
+    else:
+        assert rows == [], "a receipt in another root cannot create an obligation here"
+
+
+@pytest.mark.parametrize("mismatch", ["token", "schedule_id"])
+def test_clock_enrichment_does_not_cross_frozen_occurrence_identity(q, monkeypatch, mismatch):  # noqa: F811
+    from ouroboros.context_runtime_facts import task_schedule_fact
+
+    row = {"id": "schedule", "occurrence": {
+        "task_id": "task", "token": "our-token", "phase": "admitted",
+        "due_at": "2000-01-01T00:00:00+00:00", "claimed_at": "2000-01-01T00:00:01+00:00"}}
+    timing = {"schedule_id": "schedule", "token": "our-token"}
+    timing[mismatch] = "foreign"
+    task = {"id": "task", "text": "frozen", "metadata": {"schedule_occurrence": timing}}
+    result = {"status": "scheduled", "schedule_admission": {
+        "token": "our-token", "dispatch": "none", "task": task, "due_at": "2000-01-01T00:00:00+00:00"}}
+    monkeypatch.setattr(occurrence, "_read_back", lambda *_a, **_kw: copy.deepcopy(result))
+    verdict, projected = occurrence.reconcile(row)
+    assert verdict == "republish" and projected == task
+    assert task_schedule_fact(projected)["schedule_occurrence"]["due_at"] is None

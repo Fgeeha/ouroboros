@@ -69,7 +69,13 @@ def test_cross_process_peer_reaches_real_presence_drain_without_owner_authority(
 
     class Agent:
         def handle_task(self, task):
+            from ouroboros.agent import OuroborosAgent
+
             tid = task["id"]
+            native = object.__new__(OuroborosAgent)
+            native.env = SimpleNamespace(drive_root=data)
+            native._persist_running_record(task)
+            assert load_task_result(data, tid)["source"] == "presence"
             env = {**os.environ, "OUROBOROS_DATA_DIR": str(data), "OUROBOROS_APP_ROOT": str(tmp_path),
                    "OUROBOROS_REPO_DIR": str(repo), "PYTHONDONTWRITEBYTECODE": "1"}
             child = subprocess.run([sys.executable, "-c", _PEER_PROCESS, str(data), str(repo), tid, str(sender)],
