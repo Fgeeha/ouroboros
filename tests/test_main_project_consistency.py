@@ -377,7 +377,7 @@ def test_host_producer_refuses_when_its_admission_receipt_is_not_written(host, m
     assert not host.pending and "could not be queued" in notices[-1]
 
 
-EXTERNAL_CHAT = 95576155
+EXTERNAL_CHAT = 3141592  # synthetic external owner chat id (>= 1000, no room's derived id)
 
 
 def _bind_external_owner():

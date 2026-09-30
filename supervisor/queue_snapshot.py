@@ -727,6 +727,7 @@ def restore_pending_from_snapshot(
                  "snapshot_ts": ts[:64], "action": "treated_as_stale"},
             )
         stale = ts_unix is None or (time.time() - ts_unix) > max_age_sec
+        from ouroboros.project_admission import hold_unreadable_result
         from ouroboros.task_results import (
             _TRULY_TERMINAL_STATUSES, STATUS_CANCEL_REQUESTED, STATUS_CANCELLED,
             load_task_result, write_task_result,
@@ -856,11 +857,7 @@ def restore_pending_from_snapshot(
                         acceptance_held.append(str(task.get("id") or ""))
                         log.warning("Snapshot restore retained paused row %s under a hold: its "
                                     "result authority is unreadable", task.get("id"), exc_info=True)
-                    if not (_exact_pause_row(task) or task.get("_project_admission_restore_hold")
-                            or task.get("_owner_wait_resume")) and (task.get("project_id") or "_project_admission" in task):
-                        task["_project_admission_restore_hold"] = {"reason": "project_routing_fence_lookup_failed",
-                            "detail": "The task result is unreadable; the accepted task waits for it."}
-                    if _exact_pause_row(task) or task.get("_project_admission_restore_hold"):
+                    if hold_unreadable_result(task) or _exact_pause_row(task):
                         # A receipt read failure cannot select a terminal policy for conserved
                         # work: its pause, its Project hold, or accepted Project work held here.
                         _append_held_pending_row(task)

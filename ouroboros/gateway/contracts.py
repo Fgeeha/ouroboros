@@ -1151,7 +1151,7 @@ class TaskDetailResponse(TypedDict, total=False):
     # Current hurry plus prior same-id attempts; detail-only, absent if never hurried (S3/HQ1).
     owner_hurry: OwnerHurryProjection
     owner_hurry_history: list[OwnerHurryProjection]
-    project_admission_hold: Dict[str, Any]  # While queued/running: {reason, detail, label} of a held row, else {}.
+    project_admission_hold: Dict[str, Any]  # While the queue snapshot lists the row: its hold {reason, detail, label} or {}.
     error: str
 
 

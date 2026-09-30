@@ -1779,6 +1779,7 @@ def _drop_cancelled_pending() -> bool:
     if not PENDING:
         return True
     try:
+        from ouroboros.project_admission import hold_unreadable_result
         from ouroboros.task_results import (
             STATUS_CANCEL_REQUESTED, STATUS_CANCELLED, _TRULY_TERMINAL_STATUSES,
             load_task_result, write_task_result,
@@ -1853,7 +1854,9 @@ def _drop_cancelled_pending() -> bool:
                 )
                 survivors.extend(pending_rows[index:])
                 break
-            if marker is not None or not tid:
+            if marker is not None or not tid or hold_unreadable_result(t):
+                # Accepted Project work first losing its result keeps the same row;
+                # this pass's hold revalidation persists it (restore's rule).
                 survivors.append(t)
             else:
                 survivors.append(_make_terminalization_retry_task(

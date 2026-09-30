@@ -452,12 +452,12 @@ def revalidate_project_holds() -> None:
 
     A hold never grants a replay. The original carrier and prepared directory,
     a positive scheduled result and schedule's own no-dispatch receipt must all
-    agree; an exact budget continuation instead needs its live single-use
-    Resume grant. A child whose parent was proven interrupted takes the
-    restore's shutdown custody; an unreadable ancestor keeps it waiting.
-    Unknown facts retain the same row. Semantic refusals use the existing
-    terminalization owner; clearing this hold changes no independent control.
-    """
+    agree; a continuation instead needs its live single-use budget Resume grant
+    or its live update transaction's resolver resume. A child whose parent was
+    proven interrupted takes the restore's shutdown custody; an unreadable
+    ancestor keeps it waiting. Unknown facts retain the same row. Semantic
+    refusals use the existing terminalization owner; clearing this hold changes
+    no independent control."""
     import os
     import time
     import copy
@@ -471,6 +471,7 @@ def revalidate_project_holds() -> None:
     from supervisor import queue
     from supervisor.queue_snapshot import _descends_from, _interrupted_ancestors
     from supervisor.schedule_occurrence import restore_allowed
+    from supervisor.update_merge import assisted_resume_authorizes
     from ouroboros.projects_registry import _load_bindings, project_binding_for_task
 
     held = [task for task in queue.PENDING if task.get("_project_admission_restore_hold")]
@@ -489,7 +490,7 @@ def revalidate_project_holds() -> None:
     interrupted = _interrupted_ancestors([], children, unknown=lineage_unknown) if children else set()
     snapshot, read_error = None, None
     try:
-        data, present = _strict_admission_snapshot(queue.DRIVE_ROOT, allow_missing=True)
+        data, present = _strict_admission_snapshot(queue.DRIVE_ROOT, allow_missing=True, identity_only=True)
         snapshot = ({row["id"]: row for row in data["projects"]}, present)
     except (OSError, ValueError, TypeError, RuntimeError) as exc:
         read_error = exc
@@ -515,7 +516,7 @@ def revalidate_project_holds() -> None:
             # old RUNNING mirror was best-effort. Fresh queue admission supplies
             # positive 'none'; canonical possible handoff always vetoes that row.
             stored = load_task_result(queue.DRIVE_ROOT, tid, strict=True) or {}
-            granted = _exact_resume_granted(task, queue.DRIVE_ROOT)
+            granted = _exact_resume_granted(task, queue.DRIVE_ROOT) or assisted_resume_authorizes(task, stored)
             if (stored.get("admission_outcome") == "never_admitted"
                     or tid in queue.RUNNING or tid in queue.ADMISSION_RESERVATIONS or counts[tid] != 1
                     or not granted and (
@@ -606,8 +607,11 @@ def revalidate_project_holds() -> None:
     # Unknown persistence puts the exact original hold back; later passes recheck.
     changed = any(prior != {key: task[key] for key in effects if key in task}
                   for prior, task in zip(before, held))
-    if changed and queue.persist_queue_snapshot(reason="project_hold_revalidated") is not True:
-        for task, hold in released:
+    persisted = not changed or queue.persist_queue_snapshot(reason="project_hold_revalidated") is True
+    for task, hold in released:
+        if persisted:
+            task.pop("_managed_update_resume", None)  # a spent resolver resume never reaches a worker
+        else:
             task["_project_admission_restore_hold"] = hold
 
 

@@ -82,6 +82,9 @@ def test_same_id_recovers_once_with_original_resources_and_visible_wait(host, tm
     assert not sent[0].get("_project_admission_restore_hold") and not host.attempts
     assert not effective_task_result(host.root, load_task_result(host.root, "held"),
                                      materialize_artifacts=False)["project_admission_hold"]
+    write_task_result(host.root, "held", "completed", result="Done.")  # outside the queue: key absent
+    assert "project_admission_hold" not in effective_task_result(
+        host.root, load_task_result(host.root, "held"), materialize_artifacts=False)
 
 
 @pytest.mark.parametrize("guard", ["owner_hold", "budget_pause", "budget_root", "acceptance", "reservation",
@@ -192,6 +195,21 @@ def test_batch_revalidation_reads_registry_once_and_healthy_sibling_progresses(h
     workers.WORKERS[0].busy_task_id = None
     workers.assign_tasks()
     assert reads == [True, True] and [row["id"] for row in sent] == ["main", "held"]
+
+
+def test_held_row_recovers_beside_a_room_with_malformed_routing(host, tmp_path, monkeypatch):  # noqa: F811
+    """R4: an unrelated room's malformed routing field does not block the held room's release."""
+    prepared = copy.deepcopy(accepted(host, tmp_path))
+    registry.create_project(host.root, "other", name="Other")
+    path, original = restore_unreadable(host)
+    data = json.loads(original)
+    next(row for row in data["projects"] if row["id"] == "other")["routing_generation"] = "0"
+    path.write_text(json.dumps(data))
+    sent = worker(host, monkeypatch)
+    workers.assign_tasks()
+    workers.assign_tasks()
+    assert [row["id"] for row in sent] == ["held"] and not host.pending
+    assert sent[0]["_project_admission"] == prepared["_project_admission"]
 
 
 def test_stop_during_project_hold_wins_recovery(host, tmp_path, monkeypatch):  # noqa: F811

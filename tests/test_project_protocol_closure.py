@@ -127,8 +127,9 @@ def test_unreadable_restore_conserves_without_releasing_when_source_recovers(roo
     assert held["_project_admission_restore_hold"] and not load_task_result(room.root, "held")
 
 
-@pytest.mark.parametrize("bad", [{"lifecycle": []}, {"routing_generation": {}}, {"working_dir": []}])
-def test_healthy_display_thread_and_source_identity_survive_malformed_neighbor(room, bad):  # noqa: F811
+@pytest.mark.parametrize("bad", [{"lifecycle": []}, {"routing_generation": {}}, {"routing_generation": "0"},
+                                 {"working_dir": []}])
+def test_healthy_display_thread_and_source_identity_survive_malformed_neighbor(room, tmp_path, bad):  # noqa: F811
     registry.bind_task_to_project(room.root, "bound", "target", origin={"absent": "system"})
     target = registry.get_project(room.root, "target")
     change_row(room.root, "other", **bad)
@@ -138,9 +139,32 @@ def test_healthy_display_thread_and_source_identity_survive_malformed_neighbor(r
     registry.stamp_project_thread(room.root, frame)
     assert frame["project_thread"] is True  # Main exclusion used by live/history consumers
     assert registry.task_presentation_snapshot(room.root, "bound")["project_name"] == "Target"
-    assert room.queue.enqueue_task(task())["_admission_blocked"] == "project_routing_fence_lookup_failed"
+    # R4: the selected healthy room still admits; only the malformed room's own routing,
+    # every writer and the whole-registry derived-folder census refuse.
+    assert not room.queue.enqueue_task(task()).get("_admission_blocked")
+    assert registry.project_scope_admission(room.root, project_id="target")["project"]["id"] == "target"
+    assert room.queue.enqueue_task(task("other-work", project_id="other"))["_admission_blocked"] == (
+        "project_routing_fence_lookup_failed")
+    with pytest.raises(ValueError):
+        registry.project_scope_admission(room.root, workspace_root=str(tmp_path))
     with pytest.raises(ValueError):
         registry.update_project(room.root, "target", name="Must not write")
+    assert [row["id"] for row in room.pending] == ["attempt"]
+
+
+@pytest.mark.parametrize("bad", [{"chat_id": "4"}, {"id": "other/invalid"}, "duplicate"])
+def test_malformed_neighbor_identity_still_refuses_every_room(room, bad):  # noqa: F811
+    from ouroboros.server_routing_context import _reserved_project_for_chat
+
+    chat = registry.get_project(room.root, "target")["chat_id"]
+    if bad == "duplicate":
+        change_row(room.root, "other", id="target")
+    else:
+        change_row(room.root, "other", **bad)
+    assert room.queue.enqueue_task(task())["_admission_blocked"] == "project_routing_fence_lookup_failed"
+    with pytest.raises(ValueError):
+        _reserved_project_for_chat(SimpleNamespace(DRIVE_ROOT=room.root), chat)
+    assert not room.pending
 
 
 @pytest.mark.parametrize("intent_kind", ["explicit_none", "explicit_resource", "room_default"])
@@ -172,10 +196,13 @@ def test_strict_incoming_and_global_steering_cannot_use_display_fallback(room): 
 
     ctx = SimpleNamespace(DRIVE_ROOT=room.root)
     project_chat = registry.get_project(room.root, "target")["chat_id"]
+    other_chat = registry.get_project(room.root, "other")["chat_id"]
     change_row(room.root, "other", lifecycle=[])
-    with pytest.raises(ValueError):
-        _reserved_project_for_chat(ctx, project_chat)
+    assert _reserved_project_for_chat(ctx, project_chat)["id"] == "target"  # a healthy room keeps routing
+    with pytest.raises(ValueError):  # the malformed room itself is unavailable, never Main
+        _reserved_project_for_chat(ctx, other_chat)
     assert not _owner_lane_allows(ctx, {"chat_id": 7}, "foreign", project_chat)
+    assert not _owner_lane_allows(ctx, {"chat_id": 7}, "foreign", other_chat)
     assert _reserved_project_for_chat(ctx, 1) == {}
     assert _owner_lane_allows(ctx, {"chat_id": 7}, "foreign", 1)
 
@@ -206,7 +233,7 @@ def test_real_api_derived_scope_survives_other_room_creation(room, tmp_path, mon
     assert load_task_result(room.root, "api-derived")["api_admission"]["status"] == "accepted"
 
 
-def test_derived_guard_normalizes_only_changed_paths_under_q(room, tmp_path, monkeypatch):  # noqa: F811
+def test_derived_guard_resolves_every_claimed_folder_again_under_q(room, tmp_path, monkeypatch):  # noqa: F811
     from ouroboros import project_facts
 
     folder = tmp_path / "folder"
@@ -224,8 +251,35 @@ def test_derived_guard_normalizes_only_changed_paths_under_q(room, tmp_path, mon
         return original(path)
     monkeypatch.setattr(project_facts, "_normalized_workspace", normalize)
     admitted = room.queue.enqueue_task(task(), project_admission=basis)
-    assert not admitted.get("_admission_blocked")
-    assert calls == [(str(tmp_path / "irrelevant-new-path"), True)]
+    assert not admitted.get("_admission_blocked")  # an unchanged folder through an alias still admits
+    assert calls == [(basis["workspace_claims"]["workspace"], True), (str(alias), True),
+                     (str(tmp_path / "irrelevant-new-path"), True)]
+
+
+@pytest.mark.parametrize("swap", [None, "room_folder", "task_folder"])
+def test_derived_admission_refuses_a_folder_swapped_onto_a_room_after_preparation(room, tmp_path, swap):  # noqa: F811
+    """R5: preparation's realpath is not reused. A registered room folder, or the task's own
+    folder, replaced by a symlink before the final read cannot admit a second derived identity
+    for the room's folder; the unchanged folder still admits its prepared derived scope."""
+    old, new = tmp_path / "old", tmp_path / "new"
+    old.mkdir()
+    new.mkdir()
+    registry.update_project(room.root, "target", working_dir=str(old))
+    basis = registry.project_scope_admission(room.root, workspace_root=str(new))
+    derived = basis["project_id"]
+    assert derived.startswith("proj_") and basis["workspace_claims"]["owners"] == []
+    if swap:
+        moved, destination = (old, new) if swap == "room_folder" else (new, old)
+        moved.rename(tmp_path / f"{moved.name}-aside")
+        moved.symlink_to(destination, target_is_directory=True)
+        # A fresh preparation now selects the registered room for the task's folder.
+        assert registry.project_scope_admission(room.root, workspace_root=str(new))["project_id"] == "target"
+    admitted = room.queue.enqueue_task(task("derived", project_id=derived, workspace_root=str(new)),
+                                       project_admission=basis)
+    if swap:
+        assert admitted["_admission_blocked"] == "project_routing_fence_changed" and not room.pending
+    else:
+        assert room.pending == [admitted] and admitted["_project_admission"]["project_id"] == derived
 
 
 def test_restored_invalid_basis_never_reaches_worker_and_main_sibling_runs(tmp_path, monkeypatch):
@@ -256,7 +310,7 @@ def test_incoming_routing_refuses_corrupt_authority_before_direct_or_mailbox(roo
     direct, receipts = [], []
     ctx = _ctx(room.root, direct=lambda *_a, **_k: direct.append(True))
     chat_id = registry.get_project(room.root, "target")["chat_id"]
-    change_row(room.root, "other", lifecycle=[])
+    change_row(room.root, "target", lifecycle=[])  # the addressed room's own routing is corrupt
     class Bridge:
         def get_updates(self, **kwargs):
             return [{"update_id": 1, "message": {"chat": {"id": chat_id}, "from": {"id": 1},

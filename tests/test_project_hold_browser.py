@@ -76,7 +76,9 @@ def test_project_hold_reload_reconnect_and_automatic_same_id_recovery(
     path = registry._registry_path(root)
     original = path.read_bytes()
     data = json.loads(original)
-    next(row for row in data["projects"] if row["id"] == "neighbour-room")["lifecycle"] = []
+    # The room's OWN routing authority is unreadable (the display lens still lists it); a
+    # malformed unrelated room would not hold this work, so the neighbour stays healthy.
+    next(row for row in data["projects"] if row["id"] == PROJECT)["routing_generation"] = "0"
     path.write_text(json.dumps(data))
     host.pending.clear()
     queue.restore_pending_from_snapshot()

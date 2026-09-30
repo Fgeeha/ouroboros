@@ -27,6 +27,23 @@ def host_unscoped(task: dict) -> bool:
             and not task.get("project_id") and "_project_admission" not in task)
 
 
+def hold_unreadable_result(task: dict) -> bool:
+    """Whether accepted Project work whose own result is unreadable waits held, never failed.
+
+    Restore and live assignment share this rule: the same row keeps its id,
+    payload and resources; hold release rechecks its original receipt, scope and
+    no-dispatch evidence while Stop/terminal results stay independent. Exact
+    pauses and owner-wait handoffs keep their own authority.
+    """
+    pause = task.get("_budget_pause")
+    if (not task.get("_project_admission_restore_hold") and not task.get("_owner_wait_resume")
+            and not (isinstance(pause, dict) and pause.get("exact_continuation") is True)
+            and (task.get("project_id") or "_project_admission" in task)):
+        task["_project_admission_restore_hold"] = {"reason": "project_routing_fence_lookup_failed",
+                                                   "detail": "The task result is unreadable; the accepted task waits for it."}
+    return bool(task.get("_project_admission_restore_hold"))
+
+
 def project_hold_fact(task: dict) -> dict:
     """Read-only waiting fact; no new task phase or owner-action claim."""
     hold = task.get("_project_admission_restore_hold")
@@ -59,7 +76,7 @@ def _registry_snapshot(drive_root: Any, *, allow_missing: bool = False) -> tuple
     return data, True
 
 
-def _routing_row(raw: Any) -> dict:
+def _routing_row(raw: Any, *, identity_only: bool = False) -> dict:
     from ouroboros.projects_registry import PROJECT_ACTIVE, PROJECT_LIFECYCLES
 
     if not isinstance(raw, dict):
@@ -69,9 +86,9 @@ def _routing_row(raw: Any) -> dict:
         raise ValueError("Project registry contains an invalid id")
     row = {"lifecycle": PROJECT_ACTIVE, "routing_generation": 0,
            "chat_id": project_chat_id(pid), "working_dir": "", **raw}
-    if (not isinstance(row["lifecycle"], str) or row["lifecycle"] not in PROJECT_LIFECYCLES
+    if type(row["chat_id"]) is not int or row["chat_id"] <= 0 or not identity_only and (
+            not isinstance(row["lifecycle"], str) or row["lifecycle"] not in PROJECT_LIFECYCLES
             or type(row["routing_generation"]) is not int or row["routing_generation"] < 0
-            or type(row["chat_id"]) is not int or row["chat_id"] <= 0
             or not isinstance(row["working_dir"], str)
             or any(key in row and (not isinstance(row[key], str) or not row[key])
                    for key in ("routing_incarnation", "created_at"))):
@@ -79,14 +96,18 @@ def _routing_row(raw: Any) -> dict:
     return row
 
 
-def _strict_admission_snapshot(drive_root: Any, *, allow_missing: bool = False) -> tuple[dict, bool]:
+def _strict_admission_snapshot(drive_root: Any, *, allow_missing: bool = False,
+                               identity_only: bool = False) -> tuple[dict, bool]:
     """Lockless committed authority. Only absent legacy fields receive defaults.
 
     ``allow_missing`` admits absence only while no commit witness exists: beside
     it a missing registry is unavailable, so no strict reader or registry writer
     mistakes that loss for zero rooms. A registry lost before its first witness
     stamp landed (never committed, or a failed stamp not yet retried) still reads
-    as a first boot.
+    as a first boot. ``identity_only`` checks every row's object, unique id and
+    chat reservation, leaving routing fields to the reader that selects a room
+    (``_routing_row``): a malformed unrelated room never blocks a healthy one.
+    Writers and the derived-folder census stay whole-registry strict.
     """
     if allow_missing:
         from ouroboros.projects_registry import _registry_witness_path
@@ -95,7 +116,7 @@ def _strict_admission_snapshot(drive_root: Any, *, allow_missing: bool = False) 
     data, present = _registry_snapshot(drive_root, allow_missing=allow_missing)
     rows, seen = [], set()
     for raw in data["projects"]:
-        row = _routing_row(raw)
+        row = _routing_row(raw, identity_only=identity_only)
         if row["id"] in seen:
             raise ValueError("Project registry contains a duplicate id")
         seen.add(row["id"])
@@ -103,13 +124,14 @@ def _strict_admission_snapshot(drive_root: Any, *, allow_missing: bool = False) 
     return {**data, "projects": rows}, present
 
 
-def routing_reservations(drive_root: Any) -> list:
-    """Strict rows of every lifecycle for execution chat routing.
+def reserved_project_for_chat(drive_root: Any, chat_id: int) -> dict:
+    """Strict execution chat routing: every row's identity, then the matched room's routing.
 
     Absence is positive only without a commit witness; beside it a missing
     registry is unavailable, never no rooms.
     """
-    return _strict_admission_snapshot(drive_root, allow_missing=True)[0]["projects"]
+    rows = _strict_admission_snapshot(drive_root, allow_missing=True, identity_only=True)[0]["projects"]
+    return next((_routing_row(row) for row in rows if row["chat_id"] == chat_id), {})
 
 
 def display_registry_snapshot(drive_root: Any) -> dict:
@@ -170,10 +192,7 @@ def validate_project_admission(view: Any) -> dict:
         if "workspace_claims" in view:
             claims = view["workspace_claims"]
             if (not isinstance(claims, dict) or not isinstance(claims.get("workspace"), str)
-                    or not claims["workspace"] or not isinstance(claims.get("paths"), dict)
-                    or not isinstance(claims.get("owners"), list)
-                    or any(not isinstance(k, str) or not k or not isinstance(v, str) or not v
-                           for k, v in claims["paths"].items())
+                    or not claims["workspace"] or not isinstance(claims.get("owners"), list)
                     or any(not isinstance(v, list) or len(v) != 4 or not isinstance(v[0], str)
                            or not v[0] or sanitize_project_id(v[0]) != v[0]
                            or type(v[1]) is not int or v[1] < 0
@@ -243,44 +262,52 @@ def project_admission_basis(project_id: str, project: Optional[dict], *, frozen:
 
 def project_admission_view(drive_root: Any, project_id: str, *,
                            allow_unregistered: bool = False, frozen: bool = False) -> dict:
-    data, present = _strict_admission_snapshot(drive_root, allow_missing=allow_unregistered)
-    rows = data["projects"]
-    project = next((row for row in rows if row["id"] == project_id), None)
+    data, present = _strict_admission_snapshot(drive_root, allow_missing=allow_unregistered, identity_only=True)
+    project = next((_routing_row(row) for row in data["projects"] if row["id"] == project_id), None)
     if project is None and not allow_unregistered:
         raise ProjectAdmissionError("project_routing_fence_changed", "The registered Project is missing.")
     return {**project_admission_basis(project_id, project, frozen=frozen), "registry_present": present}
 
 
+def _folder_owners(rows: Any, canonical: str) -> list:
+    """Ordered claims of the active rooms whose folder resolves to ``canonical`` now.
+
+    Every folder is resolved at each call: an earlier normcase(realpath) cannot
+    certify a path that an external rename or symlink swap has since redirected.
+    """
+    from ouroboros.project_facts import _normalized_workspace
+    from ouroboros.projects_registry import PROJECT_ACTIVE
+
+    return [[row["id"], row["routing_generation"], row.get("routing_incarnation"), row.get("created_at")]
+            for row in rows if row["lifecycle"] == PROJECT_ACTIVE and row["working_dir"]
+            and _normalized_workspace(row["working_dir"]) == canonical]
+
+
 def project_scope_admission(drive_root: Any, *, project_id: str = "", workspace_root: str = "") -> dict:
     """Select API/derived scope and its basis in ONE read, before drive preparation.
 
-    Path matching retains normcase(realpath), off the queue lock. For a derived
-    scope, the relevant ordered ownership claims are fenced at the final read;
-    activity and presentation fields never participate in that comparison.
+    Path matching uses normcase(realpath). For a derived scope, the ordered
+    ownership claims are fenced at the final read, which resolves the folders
+    again; activity and presentation fields never participate in that comparison.
     """
     if not project_id and not workspace_root:
         return project_admission_basis("", None, frozen=True)
     from ouroboros.project_facts import _normalized_workspace
     import hashlib
 
-    from ouroboros.projects_registry import PROJECT_ACTIVE
-
-    data, present = _strict_admission_snapshot(drive_root, allow_missing=True)
+    derived = not project_id  # its folder census reads every row's routing strictly
+    data, present = _strict_admission_snapshot(drive_root, allow_missing=True, identity_only=not derived)
     rows = data["projects"]
-    if not project_id and workspace_root:
+    if derived:
         canonical = _normalized_workspace(workspace_root)
-        paths = {row["working_dir"]: _normalized_workspace(row["working_dir"])
-                 for row in rows if row["lifecycle"] == PROJECT_ACTIVE and row["working_dir"]}
-        owners = [[row["id"], row["routing_generation"], row.get("routing_incarnation"), row.get("created_at")]
-                  for row in rows if row["lifecycle"] == PROJECT_ACTIVE
-                  and paths.get(row["working_dir"]) == canonical]
+        owners = _folder_owners(rows, canonical)
         project_id = owners[0][0] if owners else ""
         if not project_id:
             project_id = "proj_" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
-        census = {"workspace": canonical, "paths": paths, "owners": owners}
+        census = {"workspace": canonical, "owners": owners}
     else:
         census = None
-    project = next((row for row in rows if row["id"] == project_id), None)
+    project = next((_routing_row(row) for row in rows if row["id"] == project_id), None)
     view = {**project_admission_basis(project_id, project, frozen=True), "registry_present": present}
     if census is not None:
         view["workspace_claims"] = census
@@ -295,14 +322,16 @@ def project_admission_guard(drive_root: Any, view: dict, *, snapshot: Optional[t
     snapshot and deletion census also own Q. A rebind overlapping read→append may
     linearize after admission; a completed prior rebind must match the original
     resource basis. No registry lock, stat shortcut or provisional queue row.
-    This removes lock waits, not the O(registry size) read/parse cost under Q.
+    This removes lock waits, not the O(registry size) read/parse cost under Q,
+    nor a derived census's filesystem resolution of each active folder.
     """
     from ouroboros.projects_registry import PROJECT_ACTIVE
 
     validate_project_admission(view)
     pid, prior = view["project_id"], view["project"]
     if snapshot is None:
-        data, present = _strict_admission_snapshot(drive_root, allow_missing=not view.get("registry_present", True))
+        data, present = _strict_admission_snapshot(
+            drive_root, allow_missing=not view.get("registry_present", True), identity_only=True)
         indexed = {row["id"]: row for row in data["projects"]}
     else:
         # Only a caller continuously holding Q may share this committed read.
@@ -312,6 +341,7 @@ def project_admission_guard(drive_root: Any, view: dict, *, snapshot: Optional[t
             raise FileNotFoundError("Project registry is unavailable")
     rows = indexed.values()
     current = indexed.get(pid)
+    current = None if current is None else _routing_row(current)
     if current is not None and current["lifecycle"] != PROJECT_ACTIVE:
         raise ProjectAdmissionError("project_routing_fence", "The Project no longer accepts new work.",
                                     current["lifecycle"])
@@ -325,18 +355,10 @@ def project_admission_guard(drive_root: Any, view: dict, *, snapshot: Optional[t
         from ouroboros.project_facts import _normalized_workspace
 
         claims = view["workspace_claims"]
-        paths = dict(claims["paths"])
-        owners = []
-        for row in rows:
-            path = row["working_dir"]
-            if row["lifecycle"] != PROJECT_ACTIVE or not path:
-                continue
-            if path not in paths:
-                # Only changed/new raw paths require filesystem normalization
-                # under Q. Unchanged paths reuse preparation's canonical evidence.
-                paths[path] = _normalized_workspace(path)
-            if paths[path] == claims["workspace"]:
-                owners.append([row["id"], row["routing_generation"], row.get("routing_incarnation"), row.get("created_at")])
-        if owners != claims["owners"]:
+        # The task folder and every active room folder resolve again under Q, so a
+        # symlink swap before this read cannot admit a second identity for one
+        # folder; a swap after admission stays unfenced. The census is whole-registry strict.
+        if (_normalized_workspace(claims["workspace"]) != claims["workspace"]
+                or _folder_owners(map(_routing_row, rows), claims["workspace"]) != claims["owners"]):
             raise ProjectAdmissionError("project_routing_fence_changed", "Project folder ownership changed during preparation.")
     yield current

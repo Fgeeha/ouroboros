@@ -116,6 +116,85 @@ def test_first_restore_keeps_accepted_project_row_waiting_through_unreadable_res
         assert sent[1]["drive_root"] == prepared["drive_root"]
 
 
+def _uncertain_child(host, monkeypatch):  # noqa: F811
+    """The real child admission whose committed receipt cannot be read back (`_admission_uncertain`)."""
+    from supervisor import task_admission
+
+    write_task_result(host.root, "parent", "running", chat_id=1)
+    child = {"id": "held", "type": "task", "text": "Child work", "chat_id": 1, "project_id": "target",
+             "root_task_id": "parent", "parent_task_id": "parent", "delegation_role": "subagent", "depth": 1,
+             "_project_admission": registry.project_admission_view(host.root, "target", frozen=True)}
+    committed, write = [], task_admission.write_task_result
+
+    def write_then_tear(root, tid, *args, **kwargs):
+        stored = write(root, tid, *args, **kwargs)
+        path = results.task_result_path(root, tid)
+        committed.append(path.read_bytes())
+        path.write_text("{torn")  # committed, then unreadable before its readback
+        return stored
+
+    monkeypatch.setattr(task_admission, "write_task_result", write_then_tear)
+    admitted, reason, _detail, _persist = task_admission.enqueue_subagent_with_scheduled_result(
+        host.ctx, child, result_fields={"chat_id": 1}, admitted_task_contract={}, admitted_depth_provenance={},
+        direct_child_count=0, pending_ref=host.pending)
+    monkeypatch.setattr(task_admission, "write_task_result", write)
+    assert not reason and admitted["_admission_uncertain"] and admitted in host.pending
+    return copy.deepcopy(admitted), committed[0]
+
+
+@pytest.mark.parametrize("producer", ["promotion", "child_uncertain"])
+@pytest.mark.parametrize("veto", [None, "stop", "terminal"])
+def test_live_accepted_project_row_waits_through_its_first_unreadable_result(host, tmp_path, monkeypatch,  # noqa: F811
+                                                                              producer, veto):
+    """R2: a normally accepted, never-restored Project row whose own result first becomes
+    unreadable keeps its id, payload and resources under the existing hold instead of failed
+    custody; the healthy neighbor proceeds. Once readable, the original receipt releases it
+    exactly once, while Stop or a terminal result settles it without a handoff."""
+    from ouroboros.cancel_intents import request_cancel
+    from ouroboros.gateway.state import _chat_activities_snapshot_safe
+
+    accepted(host, tmp_path, tid="sibling")
+    if producer == "promotion":
+        prepared = copy.deepcopy(accepted(host, tmp_path))
+        result = host.root / "task_results" / "held.json"
+        original = result.read_bytes()
+        result.write_text("{torn")
+    else:
+        prepared, original = _uncertain_child(host, monkeypatch)
+        result = host.root / "task_results" / "held.json"
+    assert prepared["admitted_dispatch"] == "none" and "_project_admission_restore_hold" not in prepared
+    sent = worker(host, monkeypatch)
+    workers.assign_tasks()
+    assert [row["id"] for row in sent] == ["sibling"]  # a healthy neighbor is not blocked
+    held = next(row for row in host.pending if row["id"] == "held")
+    assert held["_project_admission_restore_hold"] and not held.get("_terminalization_retry")
+    if producer == "promotion":  # the census lists roots; a child's wait shows on its parent's tree
+        census = {row["activity_id"]: row for row in _chat_activities_snapshot_safe(host.root, availability={})}
+        assert census["held"]["project_admission_hold"]["label"] == "Waiting for Project verification"
+    snapshot = json.loads(queue.QUEUE_SNAPSHOT_PATH.read_text())
+    assert next(row for row in snapshot["pending"] if row["id"] == "held")["task"]["_project_admission_restore_hold"]
+    queue.RUNNING.clear()
+    workers.WORKERS[0].busy_task_id = None
+    result.write_bytes(original)  # the original receipt is readable again
+    if veto == "stop":
+        request_cancel(host.root, "held", reason="owner stopped")
+    elif veto == "terminal":
+        write_task_result(host.root, "held", "failed", result="Settled by its own owner.")
+    for _pass in range(3):
+        workers.assign_tasks()
+        queue.RUNNING.clear()
+        workers.WORKERS[0].busy_task_id = None
+    assert [row["id"] for row in sent] == (["sibling"] if veto else ["sibling", "held"])  # never replayed
+    assert "held" not in {row["id"] for row in host.pending} and not host.attempts
+    stored = load_task_result(host.root, "held")
+    # A dispatched child without a prepared drive keeps its receipt status (no RUNNING mirror).
+    assert stored["status"] == ({"stop": "cancelled", "terminal": "failed"}.get(veto)
+                                or ("running" if producer == "promotion" else "scheduled"))
+    if not veto:
+        for key in ("_project_admission", "workspace_root", "drive_root", "text"):
+            assert sent[1].get(key) == prepared.get(key)
+
+
 RESOLVER = "update_assisted_merge_test"
 
 
@@ -137,8 +216,10 @@ def _drain(slot):
     return sent
 
 
-@pytest.mark.parametrize("veto", [None, "possible"])
-def test_assisted_resolver_recovers_same_id_after_restore_scope_hold(pool, veto):  # noqa: F811
+@pytest.mark.parametrize("prior", [None, "possible"])
+def test_assisted_resolver_recovers_same_id_after_restore_scope_hold(pool, prior):  # noqa: F811
+    """Unreadable bindings hold the restored resolver; once scope is verifiable it runs once,
+    under its first-dispatch receipt or, if it may have reached a worker, boot recovery's resume."""
     from supervisor import update_merge
 
     tx = _resolver(pool.root)
@@ -147,7 +228,7 @@ def test_assisted_resolver_recovers_same_id_after_restore_scope_hold(pool, veto)
     receipt = load_task_result(pool.root, RESOLVER, strict=True)
     assert receipt["status"] == "scheduled" and receipt["host_admission"]["status"] == "accepted"
     assert queue.persist_queue_snapshot()
-    if veto == "possible":  # the resolver may already have reached a worker
+    if prior == "possible":  # the resolver may already have reached a worker
         write_task_result(pool.root, RESOLVER, "scheduled", admitted_dispatch="possible")
     bindings = registry._bindings_path(pool.root)
     bindings.parent.mkdir(parents=True, exist_ok=True)
@@ -162,8 +243,11 @@ def test_assisted_resolver_recovers_same_id_after_restore_scope_hold(pool, veto)
     bindings.write_text('{"bindings": {}}')
     workers.assign_tasks()
     workers.assign_tasks()
-    assert _drain(pool.slot) == ([] if veto else [RESOLVER])
-    assert [row["id"] for row in queue.PENDING] == ([RESOLVER] if veto else [])
+    assert _drain(pool.slot) == [RESOLVER] and not queue.PENDING
+    stored = load_task_result(pool.root, RESOLVER, strict=True)
+    assert stored["host_admission"] == receipt["host_admission"]  # no fresh receipt was minted
+    assert queue.RUNNING[RESOLVER]["task"]["admitted_dispatch"] == "possible"
+    assert "_managed_update_resume" not in queue.RUNNING[RESOLVER]["task"]
 
 
 def test_resolver_boot_reenqueue_of_an_existing_id_fabricates_no_receipt(pool):  # noqa: F811
@@ -319,6 +403,72 @@ def test_boot_recovery_claims_no_resume_until_its_resolver_is_admitted(pool, tmp
     assert [row["id"] for row in queue.PENDING] == [RESOLVER]
     workers.assign_tasks()
     assert _drain(pool.slot) == [RESOLVER]
+
+
+@pytest.mark.parametrize("veto", [None, "stop", "terminal", "torn", "bound", "foreign_tx"])
+def test_boot_recovery_resumes_a_resolver_restored_from_its_claimed_handoff_once(pool, tmp_path, monkeypatch, veto):  # noqa: F811
+    """R1: the server dies after the handoff, before its assign snapshot. Restore holds the
+    claimed 'possible' row beside the worker's readable result; the NEXT real boot recovery's
+    same-id resume then releases that exact row once. Stop, a terminal or unreadable result,
+    a scope change and another transaction each keep it from ever being sent again."""
+    from ouroboros.cancel_intents import request_cancel
+    from supervisor import update_merge
+
+    _boot_recovery(pool, tmp_path, monkeypatch)
+    assert update_merge.finalize_managed_update_on_boot(supervisor_ready=True)["resumed"] is True
+    receipt = load_task_result(pool.root, RESOLVER, strict=True)["host_admission"]
+    claimed, put = [], pool.slot.in_q.put
+    pool.slot.in_q.put = lambda row, *a, **k: (claimed.append(queue.QUEUE_SNAPSHOT_PATH.read_bytes()), put(row, *a, **k))
+    workers.assign_tasks()
+    assert _drain(pool.slot) == [RESOLVER] and len(claimed) == 1
+    write_task_result(pool.root, RESOLVER, "running", started_at="2026-01-01T00:00:00Z")  # the worker ran
+    queue.RUNNING.clear()
+    pool.slot.busy_task_id = None
+    queue.PENDING.clear()
+    queue.QUEUE_SNAPSHOT_PATH.write_bytes(claimed[0])  # the post-handoff snapshot never landed
+    assert queue.restore_pending_from_snapshot() == 1
+    [held] = queue.PENDING
+    assert held["_project_admission_restore_hold"] and held["admitted_dispatch"] == "possible"
+    workers.assign_tasks()
+    assert not _drain(pool.slot)  # restore alone never replays a possibly dispatched row
+    path = results.task_result_path(pool.root, RESOLVER)
+    original = path.read_bytes()
+    if veto == "stop":
+        request_cancel(pool.root, RESOLVER, reason="owner stopped")
+    elif veto == "terminal":  # shutdown custody settled it: boot recovery mints a fresh id
+        write_task_result(pool.root, RESOLVER, "cancelled", cancel_origin={"source": "snapshot_restore",
+                                                                           "reason": "server_shutdown"})
+    elif veto == "torn":
+        path.write_text("{torn")
+    elif veto == "bound":  # the unscoped resolver's assignment changed after its admission
+        registry.create_project(pool.root, "room")
+        registry.bind_task_to_project(pool.root, RESOLVER, "room", origin={"absent": "system"})
+    resumed = update_merge.finalize_managed_update_on_boot(supervisor_ready=True)["resumed"]
+    assert resumed is (veto != "torn")
+    if veto == "foreign_tx":  # the transaction that granted this resume is no longer live
+        assert update_merge.clear_update_tx()
+    for _pass in range(3):
+        workers.assign_tasks()
+    fresh = update_merge.read_update_tx().get("task_id")
+    assert _drain(pool.slot) == {None: [RESOLVER], "terminal": [fresh]}.get(veto, [])  # at most once
+    waiting = [row["id"] for row in queue.PENDING if row.get("_project_admission_restore_hold")]
+    assert waiting == ([RESOLVER] if veto in {"torn", "foreign_tx"} else [])
+    if veto == "torn":  # unknown dispatch waits; the next boot's resume, not readability, releases it
+        path.write_bytes(original)
+        workers.assign_tasks()
+        assert not _drain(pool.slot) and queue.PENDING[0]["_project_admission_restore_hold"]
+        assert update_merge.finalize_managed_update_on_boot(supervisor_ready=True)["resumed"] is True
+        workers.assign_tasks()
+        workers.assign_tasks()
+        assert _drain(pool.slot) == [RESOLVER] and not queue.PENDING
+        return
+    stored = load_task_result(pool.root, RESOLVER, strict=True)
+    assert stored["status"] == {None: "running", "stop": "cancelled", "terminal": "cancelled",
+                                "bound": "failed", "foreign_tx": "running"}[veto]
+    if veto is None:  # the same accepted row continues: 'possible' kept, no receipt minted
+        assert queue.RUNNING[RESOLVER]["task"]["admitted_dispatch"] == "possible"
+        assert "_managed_update_resume" not in queue.RUNNING[RESOLVER]["task"]
+        assert stored["host_admission"] == receipt and stored["admitted_dispatch"] == "possible"
 
 
 @pytest.mark.parametrize("bindings", ["torn", "healthy"])

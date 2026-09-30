@@ -694,12 +694,9 @@ def _main_lane_chat(chat_id: int) -> bool:
 
 def _reserved_project_for_chat(ctx: Any, chat_id: int) -> Dict[str, Any]:
     """Execution routing requires positive absence, not an unavailable display lens."""
-    from ouroboros.project_admission import routing_reservations
+    from ouroboros.project_admission import reserved_project_for_chat
 
     cid = int(chat_id or 0)
     if _main_lane_chat(cid):
         return {}  # Host-attested: this chat cannot belong to a Project room.
-    for project in routing_reservations(ctx.DRIVE_ROOT):
-        if project["chat_id"] == cid:
-            return dict(project)
-    return {}
+    return reserved_project_for_chat(ctx.DRIVE_ROOT, cid)

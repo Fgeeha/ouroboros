@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import { computeHydratedDirectActivities, chatStatusCounts, computeDerivedChatStatus } from '../modules/chat_activity.js';
 import { summarizeProjectActivities } from '../modules/project_activity.js';
 import { handoffPhase } from '../modules/project_handoff.js';
+import { desiredLiveCardPhase, setHistoricalUnavailable, setLiveCardPhase, setLiveCardTypingVisible } from '../modules/task_phase_chip.js';
+import { readFileSync } from 'node:fs';
 
 const hold = { label: 'Waiting for Project verification', reason: 'project_routing_fence_lookup_failed', detail: 'Authority is unreadable.' };
 const held = { activity_id: 'same-id', chat_id: 7, kind: 'managed_task', phase: 'queued', project_admission_hold: hold };
@@ -46,4 +48,30 @@ test('Main handoff keeps a budget pause beside the Project wait, as the sidebar 
     assert.deepEqual(handoffPhase({ ...held, phase: 'budget_pausing' }, null), { text: `Pausing… · ${hold.label}`, className: 'warn' });
     assert.deepEqual(handoffPhase(held, null), { text: hold.label, className: 'warn' });
     assert.equal(handoffPhase(paused, { status: 'cancelled' }).text, 'Cancelled');
+});
+
+test('a held card with retained progress waits statically; Stop, terminal and same-ID recovery outrank it', () => {
+    const card = { finished: false, isSubagent: false, root: { dataset: {} },
+        phaseEl: { hidden: false, dataset: {}, attrs: {}, textContent: '', className: '',
+            getAttribute(key) { return this.attrs[key]; }, setAttribute(key, value) { this.attrs[key] = value; } },
+        phaseSecondaryEl: { hidden: true, textContent: '', isConnected: true },
+        inlineTypingEl: { style: { display: '' }, isConnected: true } };
+    setLiveCardPhase(card, 'working', 'Working', 'chat-live-phase working');  // replayed progress
+    assert.equal(card.inlineTypingEl.style.display, '');
+    assert.equal(setHistoricalUnavailable(card, false, hold.label), true);  // census restore
+    assert.equal(card.phaseEl.textContent, hold.label);
+    assert.equal(card.phaseEl.className, 'chat-live-phase warn');  // static amber, no pulse class
+    assert.equal(card.phaseEl.dataset.phase, 'working');  // still unfinished, never a terminal phase
+    assert.equal(card.inlineTypingEl.style.display, 'none');
+    setLiveCardTypingVisible(card, true);  // a later typing writer cannot animate the wait
+    assert.equal(card.inlineTypingEl.style.display, 'none');
+    assert.equal(setHistoricalUnavailable(card, false), false);  // no census fact: the hold stays
+    assert.equal(desiredLiveCardPhase({ ...card, cancelPendingPolicy: 'immediate' }).text, 'Cancelling…');
+    assert.equal(desiredLiveCardPhase({ ...card, finished: true }, 'error').phase, 'error');
+    assert.equal(setHistoricalUnavailable(card, false, ''), true);  // same-ID recovery
+    assert.equal(card.phaseEl.textContent, 'Working');
+    assert.equal(card.inlineTypingEl.style.display, '');
+    const chat = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
+    assert.match(chat, /restoreCardActivity\(liveCardRecords\.get\(k\), v\.project_admission_hold\?\.label\)/);
+    assert.match(chat, /function restoreCardActivity\(record, held = ''\) \{\n\s+if \(!setHistoricalUnavailable\(record, false, held\)\)/);
 });

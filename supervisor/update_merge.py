@@ -292,6 +292,25 @@ def authorized_assisted_task(
     return authorized_assisted_task_strict(task_id, task_metadata)[1]
 
 
+def assisted_resume_authorizes(task: Dict[str, Any], stored: Dict[str, Any]) -> bool:
+    """Whether boot recovery's same-id resume is this restore-held resolver row's handoff authority.
+
+    ``enqueue_assisted_resolution_task`` marks only a held row whose result it read as
+    readable and non-terminal. Release re-reads both: a lost, unreadable, terminal or
+    cancel-requested result, or another transaction, keeps the hold. This continues a
+    possibly dispatched run; it never proves a first dispatch.
+    """
+    from ouroboros.task_results import _TRULY_TERMINAL_STATUSES, STATUS_CANCEL_REQUESTED
+
+    marker = task.get("_managed_update_resume")
+    metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    managed = metadata.get("managed_update") if isinstance(metadata.get("managed_update"), dict) else {}
+    return bool(isinstance(marker, dict) and marker.get("authority_fingerprint")
+                and marker["authority_fingerprint"] == managed.get("authority_fingerprint")
+                and stored and stored.get("status") not in _TRULY_TERMINAL_STATUSES | {STATUS_CANCEL_REQUESTED}
+                and authorized_assisted_task(str(task.get("id") or ""), metadata))
+
+
 def create_rescue_local_ref(local_snapshot: str) -> str:
     """Pin the given sha — the durable carrier of the owner's uncommitted+untracked work
     (the STASH commit since the stash-first order; the synthetic local snapshot on legacy
@@ -582,10 +601,11 @@ def enqueue_assisted_resolution_task(tx: Dict[str, Any]) -> str:
     result AND a transaction whose ``resolver_submitted_id`` (``""`` from the apply, written
     ahead of every first admission, reset when that admission is provably refused) never named
     this id. A READABLE non-terminal result is the managed resume of the same id as possibly
-    dispatched. A result unreadable, or missing after that submission (deleted, or quarantined
-    by a fail-soft reader) or on a transaction too old to say, is unknown dispatch: never
-    replayed, whether a queue row already holds the id (it keeps the existing restore hold) or
-    not; the transaction waits for the next boot."""
+    dispatched; a restore-held queue row carries that authority to hold release
+    (``assisted_resume_authorizes``). A result unreadable, or missing after that submission
+    (deleted, or quarantined by a fail-soft reader) or on a transaction too old to say, is
+    unknown dispatch: never replayed, whether a queue row already holds the id (it keeps the
+    existing restore hold) or not; the transaction waits for the next boot."""
     from supervisor import workers
     from supervisor.queue import _queue_lock, enqueue_task, enqueue_with_admission_receipt
     from supervisor.update_merge_policy import assisted_objective
@@ -594,6 +614,7 @@ def enqueue_assisted_resolution_task(tx: Dict[str, Any]) -> str:
     prior_terminal_status = ""
     never_scheduled = False  # proven first admission of this id
     unknown = ""  # why this id may already have run: no receipt, no replay
+    resumable = False  # a readable non-terminal result: the managed same-id resume
     if task_id and task_id not in workers.RUNNING:
         try:
             from ouroboros.task_results import _TRULY_TERMINAL_STATUSES, load_task_result
@@ -605,6 +626,7 @@ def enqueue_assisted_resolution_task(tx: Dict[str, Any]) -> str:
             unknown = "task_result_missing" if not prior and not never_scheduled else ""
             if str(prior.get("status") or "") in _TRULY_TERMINAL_STATUSES:
                 prior_terminal_status = str(prior.get("status") or "")
+            resumable = bool(prior) and not prior_terminal_status
         except Exception:
             _g.log.warning("assisted resolver %s: prior result unreadable", task_id, exc_info=True)
             unknown = "task_result_unreadable"
@@ -661,12 +683,18 @@ def enqueue_assisted_resolution_task(tx: Dict[str, Any]) -> str:
             # transaction instead of leaving boot recovery permanently gated. A restored
             # row whose dispatch is unknown keeps (or takes) the restore hold: no replay.
             pending.update(task)
+            pending.pop("_managed_update_resume", None)
             if unknown:
                 if not pending.get("_project_admission_restore_hold"):  # a snapshot row carries None
                     pending["_project_admission_restore_hold"] = {
                         "reason": "project_routing_fence_lookup_failed",
                         "detail": "The resolver may already have run; automatic recovery is not authorized."}
                 refusal = unknown
+            elif resumable and pending.get("_project_admission_restore_hold"):
+                # This boot's same-id resume rides the held row (never snapshotted): release
+                # keeps its 'possible' fact and scope/Stop checks, and mints no receipt.
+                pending["_managed_update_resume"] = {
+                    "authority_fingerprint": task["metadata"]["managed_update"]["authority_fingerprint"]}
         elif task_id not in workers.RUNNING:
             # A first admission records its submission ahead in the transaction, then takes
             # the receipt hold release reads (a failed write keeps it receipt-less); a

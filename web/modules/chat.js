@@ -1054,8 +1054,8 @@ export function createChatInstance({
         }
     }
 
-    function restoreCardActivity(record) {
-        if (!setHistoricalUnavailable(record, false)) return;
+    function restoreCardActivity(record, held = '') {
+        if (!setHistoricalUnavailable(record, false, held)) return;
         renderLiveCardMeta(record);
         syncCancelRunButton(record);
     }
@@ -3579,13 +3579,11 @@ export function createChatInstance({
         activeDirectActivities.clear();
         for (const [k, v] of nextMap.entries()) {
             activeDirectActivities.set(k, v);
-            restoreCardActivity(liveCardRecords.get(k));
+            restoreCardActivity(liveCardRecords.get(k), v.project_admission_hold?.label);
             markReviewAnchor(liveCardRecords.get(k));
-            noteDirectTurn(liveCardRecords.get(k), String(v.kind || '') !== 'managed_task');
+            noteDirectTurn(liveCardRecords.get(k), v.kind !== 'managed_task');
             if (v.kind === 'managed_task') missingManagedTaskIds.delete(k);
-            if (v.clientMessageId) {
-                pendingSubmissions.delete(v.clientMessageId);
-            }
+            if (v.clientMessageId) pendingSubmissions.delete(v.clientMessageId);
         }
         for (const taskId of globallyActiveActivityIds) missingManagedTaskIds.delete(taskId);
         for (const row of settledDirectRows) {
