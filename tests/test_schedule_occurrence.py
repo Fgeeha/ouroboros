@@ -16,7 +16,7 @@ from ouroboros.task_results import load_task_result, write_task_result
 
 @pytest.fixture
 def q(tmp_path, monkeypatch):
-    from supervisor import queue, queue_schedules, state
+    from supervisor import queue, queue_schedules, state, workers
 
     root = tmp_path / "data"  # project folders live beside, never inside, the data root
     root.mkdir()
@@ -25,7 +25,7 @@ def q(tmp_path, monkeypatch):
     queue.init(root)
     pending: list = []
     queue.init_queue_refs(pending, {}, {"value": 0})
-    monkeypatch.setattr(queue, "REPO_DIR", tmp_path / "repo", raising=False)
+    monkeypatch.setattr(workers, "REPO_DIR", tmp_path / "repo")
     (tmp_path / "repo").mkdir()
     monkeypatch.setattr(queue_schedules, "resync_skill_schedules", lambda *_a: {})
     monkeypatch.setattr("ouroboros.config.get_bg_wakeup_min_sec", lambda: 0)  # waits end at once here
@@ -75,8 +75,6 @@ def test_one_occurrence_one_receipt_with_the_room_address(q):
 
 def test_capacity_waits_on_the_row_without_phantom_roots(q, monkeypatch):
     from ouroboros import consciousness_allowance
-    from supervisor import schedule_occurrence
-
     monkeypatch.setenv("OUROBOROS_CONSCIOUSNESS_MAX_TASKS", "1")
     monkeypatch.setattr(consciousness_allowance, "allowance_window", lambda _root: {
         "status": "available", "limit_usd": 10.0, "accounted_usd": 0.0, "unknown_unmetered": 0, "resets_at": ""})
@@ -89,10 +87,8 @@ def test_capacity_waits_on_the_row_without_phantom_roots(q, monkeypatch):
     assert not list((q.root / "task_results").glob("*.json"))  # no failed root, ever
     held_task = row["occurrence"]["task_id"]
     token = row["occurrence"]["token"]
-    assert row["occurrence"]["admission"] == "refused"
-    # Reconstruct process-local queue/claim state. No old Python object proves
-    # this claim unrun; the persisted actual refusal must carry it across boot.
-    schedule_occurrence._FRESH_CLAIMS.clear()
+    assert row["occurrence"]["phase"] == "claimed"
+    # Reconstruct the live queue; the persisted claim carries recovery across boot.
     q.pending = []
     q.queue.init(q.root)
     q.queue.init_queue_refs(q.pending, {}, {"value": 0})
@@ -457,7 +453,8 @@ def test_deleting_a_row_never_takes_back_an_accepted_occurrence(q, monkeypatch):
     task_id = _rows(q)["s1"]["occurrence"]["task_id"]
     outcome = q.queue.mutate_scheduled_task("delete", "s1", reason="owner", actor="owner")
     row = _rows(q)["s1"]
-    assert outcome["status"] == "deleted" and "settlement" in outcome["detail"]
+    assert outcome["status"] == "delete_deferred" and "owed" in outcome["detail"]
+    assert "settlement" in outcome["detail"]
     assert row["enabled"] is False and row["delete_requested_at"]
     monkeypatch.setattr(q.queue, "persist_queue_snapshot", lambda reason="": True)
     q.queue.check_scheduled_tasks()

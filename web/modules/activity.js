@@ -379,6 +379,10 @@ export function initActivity({ mount, ws } = {}) {
             showToast(`Schedule ${action} applied, but its audit record is incomplete: ${detail}`, 'warn');
             return;
         }
+        if (outcome.status === 'delete_deferred') {
+            showToast(`Schedule deletion is pending: ${detail}`, 'info');
+            return;
+        }
         if (outcome.status === 'restored_not_ready') {
             showToast(`Schedule suppression lifted, but it is not ready to run: ${detail}`, 'warn');
         } else if (outcome.ok !== true) {
@@ -391,7 +395,7 @@ export function initActivity({ mount, ws } = {}) {
         // Lifecycle actions govern FUTURE dispatch; a run already admitted keeps
         // going. Silence here would let the owner read the button as a stop.
         if (outcome.running_or_queued === true) {
-            showToast(`Schedule ${done}. A task it already started is still running and was not stopped.`, 'info');
+            showToast(`Schedule ${done}. A task it already admitted is queued or running and was not cancelled.`, 'info');
         } else if (outcome.running_or_queued === null || outcome.running_or_queued === undefined) {
             showToast(`Schedule ${done}. Whether a task it already started is still running is unknown.`, 'info');
         } else if (outcome.status === 'suppressed') {

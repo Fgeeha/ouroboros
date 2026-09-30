@@ -87,6 +87,8 @@ def _task_record(
         "total_rounds": data.get("total_rounds"),
         "result_preview": _preview(result),
     }
+    if isinstance(data.get("execution_observation"), dict):
+        record["execution_observation"] = dict(data["execution_observation"])
     if isinstance(data.get("task_contract"), dict):
         record["task_contract"] = data.get("task_contract")
     if isinstance(data.get("artifact_bundle"), dict):

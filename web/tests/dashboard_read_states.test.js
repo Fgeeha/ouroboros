@@ -297,7 +297,7 @@ test('Activity reports what a lifecycle action actually did, delete included', a
     await click('schedule-toggle', 'active');
     assert.match(toasts().at(-1), /audit record is incomplete: the change is durable/);
     await click('schedule-toggle', 'active');
-    assert.match(toasts().at(-1), /still running and was not stopped/);
+    assert.match(toasts().at(-1), /queued or running and was not cancelled/);
     await click('schedule-toggle', 'active');
     assert.match(toasts().at(-1), /is unknown/);
     // A clean change with nothing in flight has nothing to disclose.

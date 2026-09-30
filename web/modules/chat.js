@@ -47,6 +47,7 @@ import {
 } from './task_control_menu.js';
 import { openConfirmDialog } from './confirm_dialog.js';
 import { bindEnterSubmit } from './ui_interactions.js';
+import { mountEmptyChatWelcome } from './welcome_preference.js';
 import {
     captureLiveCardPhaseState,
     desiredLiveCardPhase,
@@ -332,6 +333,7 @@ export function createChatInstance({
             const prefs = await apiClient.uiPreferences();
             if (destroyed) return;
             nestedSubagentsExpanded = prefs?.nested_subagents_expanded === true;
+            emptyWelcome?.setPreference(prefs?.welcome);
         } catch {
             nestedSubagentsExpanded = false;
         }
@@ -431,7 +433,6 @@ export function createChatInstance({
     let hydrationGatePromise = null;
     // One derived physical coverage/status for the mounted reading window.
     let historyWindow = null;
-    let welcomeShown = false;
     // Saved page and whole recent read gate only the cross-instance place; reshow
     // targets and visible mutations use live geometry.
     let restoredPageReady = !initialScrollState?.history;
@@ -1409,7 +1410,7 @@ export function createChatInstance({
         if (!tid || !nm) return false;
         const record = liveCardRecords.get(tid);
         if (!record) {
-            // task_named is broadcast to every instance, so bound the early-name buffer.
+            // task_named reaches every instance, so bound the early-name buffer.
             pendingSuggestedNames.set(tid, nm);
             if (pendingSuggestedNames.size > 100) {
                 const oldest = pendingSuggestedNames.keys().next().value;
@@ -1593,7 +1594,7 @@ export function createChatInstance({
     window.addEventListener('ouro:page-shown', handlePageShown);
     document.addEventListener('visibilitychange', handlePageShown);
 
-    // Fetch/cache beyond the 4000-char preview on expansion; bound scrolling; render while expanded.
+    // Beyond the 4000-char preview: fetch/cache on expansion, bounded scroll, render while expanded.
     async function fetchFullLineOutput(item, record) {
         item._fetchingFull = true;
         let changed = false;
@@ -2346,16 +2347,8 @@ export function createChatInstance({
 
     const markPendingDropped = (clientMessageId) => markPendingDelivered(clientMessageId, true);
 
-    function ensureWelcomeMessage() {
-        if (!isMain) return;
-        if (welcomeShown) return;
-        const hasRealBubbles = Array.from(messagesDiv.querySelectorAll('.chat-bubble')).some(
-            bubble => !bubble.classList.contains('typing-bubble')
-        );
-        if (hasRealBubbles) return;
-        welcomeShown = true;
-        addMessage('Ouroboros has awakened', 'assistant', false, null, false, { ephemeral: true });
-    }
+    // Host-owned empty state: never a bubble, a history row or a model reply.
+    const emptyWelcome = isMain ? mountEmptyChatWelcome(messagesDiv) : null;
 
     // Hydration triggers share one sticky request; reconnect/resync still refetch.
     function awaitInitialHydration({ includeUser = false } = {}) {
@@ -2498,7 +2491,7 @@ export function createChatInstance({
                     const taskId = msg.task_id || '';
                     if (msg.system_type === 'project_question_pointer') { chatDecision.appendQuestionPointer(msg); continue; }
                     if (isReplayEvidenceRow(msg)) continue;
-                    // Owner-bound reviews attached in pass 1 are not terminal chat bubbles.
+                    // Owner-bound reviews attached in pass 1 are not terminal bubbles.
                     if (
                         admitCardMetadata(msg) !== undefined
                         || attachReviewFromRow(msg, msg.ts || '', true) !== undefined
@@ -2707,7 +2700,9 @@ export function createChatInstance({
             const armedAtStart = liveCardBound.begin();
             const cardsAtStart = new Set(liveCardRecords.keys());
             try {
-                // An empty feed shows the read in flight (#1102); a painted one is left alone.
+                // No welcome until this read lands.
+                emptyWelcome?.historyPending();
+                // An empty feed shows the read in flight (#1102); a painted one stays.
                 if (historyControls.beginRecent()) syncLoadOlderControl();
                 const data = await fetchHistory(null);
                 // Closed rooms do not consume late responses.
@@ -2769,6 +2764,8 @@ export function createChatInstance({
                 const wasFirstLoad = !historyLoaded;
                 historyLoaded = true;
                 lastHistorySyncSucceeded = true;
+                messagesDiv.dataset.historyHydrated = 'true';
+                emptyWelcome?.historyRead(data.window?.complete === true);
                 liveCardBound.settle({ rebuilt: wasFirstLoad || armedAtStart, size: liveCardRecords.size });
                 modelWaits.retainCards(liveCardRecords);
                 // ANY successful sync leaves the instance hydrated
@@ -2787,8 +2784,9 @@ export function createChatInstance({
                 return messages.length > 0;
             } catch (err) {
                 lastHistorySyncSucceeded = false;
+                emptyWelcome?.historyRead(false);
                 initialHydrationPromise = null;
-                // Never leave an empty feed blank: the failure and its Retry replace the loading state.
+                // Never leave an empty feed blank: failure and Retry replace the loading state.
                 historyControls.endRecent(err); syncLoadOlderControl();
                 const socketState = ws?.ws?.readyState;
                 const expectedDisconnect = socketState !== WebSocket.OPEN;
@@ -2860,7 +2858,6 @@ export function createChatInstance({
         historyLoaded = true;
         // The next successful source read reconciles this offline preview.
         if (!lastHistorySyncSucceeded) liveCardBound.arm();
-        ensureWelcomeMessage();
     })();
 
     function rememberInput(text) {
@@ -3317,7 +3314,7 @@ export function createChatInstance({
             && [record.summaryButtonEl, record.reviewsHostEl].some(node => historyNodeIsProtected(node, messagesDiv)));
     }
 
-    // One retirement path for a message node: its media, decision views and markdown go with it.
+    // One retirement path per message node: media, decision views and markdown go with it.
     function releaseMessageNode(node) {
         chatMedia.release(node); chatDecision.releaseViews(node); destroyChatMarkdown(node); node.remove();
     }
@@ -3863,8 +3860,7 @@ export function createChatInstance({
                 : waitForHydrationWindow().then(
                     () => awaitInitialHydration({ includeUser: !historyLoaded }),
                 )))
-            .then((hasMessages) => {
-                if (!hasMessages) ensureWelcomeMessage();
+            .then(() => {
                 if (reconnectBanner) {
                     addMessage(reconnectBanner, 'system', false, null, false, { ephemeral: true, systemType: 'reconnect' });
                     if (shouldClearReconnectParams) clearPendingReconnectBanner();
@@ -3929,6 +3925,7 @@ export function createChatInstance({
         destroy() {
             if (destroyed) return;
             destroyed = true;
+            emptyWelcome?.dispose();
             cancelHistoryPaint();
             for (const dispose of wsDisposers) {
                 try { dispose(); } catch {}

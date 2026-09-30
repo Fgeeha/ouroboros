@@ -365,6 +365,10 @@ class _OpenAICompatibleLaneMixin:
                 {k: v for k, v in tool.items() if k != "cache_control"}
                 for tool in self._sanitize_chat_completion_tools(tools)
             ]
+            for tool in prepared_tools:  # each "function" is the sanitizer's own copy
+                # The Responses API serving OpenAI models here tries strict mode for a
+                # tool WITHOUT `strict`, requiring every property; a set value stays.
+                tool["function"].setdefault("strict", False)
             if server_web_tool:
                 prepared_tools.append(server_web_tool)
             # Tool cache markers are placed once, at the send-time payload finalizer

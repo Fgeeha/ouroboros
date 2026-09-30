@@ -17,9 +17,6 @@ from ouroboros.contracts.task_constraint import normalize_task_constraint, resol
 from ouroboros.project_facts import filter_out_project_store as _filter_out_project_store
 from ouroboros.project_facts import project_store_access_block as _project_store_access_block
 from ouroboros.protected_artifacts import block_reason_for_path
-from ouroboros.credential_shapes import (  # noqa: F401 — historical facade surface (tools/core re-exports)
-    SUBAGENT_CREDENTIAL_FILE_NAMES as _SUBAGENT_SECRET_FILE_NAMES,
-)
 from ouroboros.tool_access import (
     ResolvedResourceBinding,
     UserFilesPathBlockedError,
@@ -31,15 +28,6 @@ from ouroboros.tool_access import (
     user_files_path_block_reason,
 )
 from ouroboros.tools.registry import ToolContext, active_repo_dir_for
-from ouroboros.tools.core_secret_paths import (  # noqa: F401 — re-exported moved surface (core facade identity)
-    make_subagent_secret_target_check,
-    is_restricted_subagent_profile,
-    _is_subagent_secret_data_path,
-    _is_subagent_secret_repo_path,
-    _is_subagent_secret_repo_target,
-    _filter_subagent_secret_repo_listing,
-    _filter_subagent_secret_listing,
-)
 from ouroboros.tools.tool_result import ToolResult, _publish_tool_result, completed_local_read
 from ouroboros.utils import safe_relpath
 
@@ -49,10 +37,8 @@ log = logging.getLogger(__name__)
 _SKILL_OWNER_STATE_FILENAMES = SKILL_OWNER_STATE_FILENAMES
 
 
-def _raw_owner_secret_access_allowed(ctx: ToolContext) -> bool:
-    """Cyber Pro owner mode may inspect explicitly selected home-file bytes."""
-    if is_restricted_subagent_profile(ctx):
-        return False
+def _skill_owner_state_read_allowed(ctx: ToolContext) -> bool:
+    """Skill owner-state reads follow the parent runtime mode for every actor."""
     try:
         from ouroboros.config import get_runtime_mode
         from ouroboros.runtime_mode_policy import runtime_mode_at_least
@@ -60,6 +46,36 @@ def _raw_owner_secret_access_allowed(ctx: ToolContext) -> bool:
         return runtime_mode_at_least(get_runtime_mode(), "cyber_pro")
     except Exception:
         return False
+
+
+def _runtime_data_read_check(ctx: ToolContext, *, listing: bool = False, root: str = "") -> Callable[[pathlib.Path], str]:
+    """Prepare the parent's runtime rules once for this read/list/search call."""
+    from ouroboros.tools.core_secret_paths import runtime_data_roots
+
+    # Explicit user_files uses its own per-mode runtime-overlap policy. Cyber
+    # parents already read those files there; child parity must not narrow it.
+    roots = [] if root == "user_files" else runtime_data_roots(ctx)
+    owner_state_blocked = not listing and not _skill_owner_state_read_allowed(ctx)
+
+    def check(target: pathlib.Path) -> str:
+        target = pathlib.Path(target).resolve(strict=False)
+        for data_root in roots:
+            try:
+                relative = target.relative_to(data_root).as_posix()
+            except ValueError:
+                continue
+            if reason := _project_store_access_block(relative):
+                return str(reason)
+            if (owner_state_blocked and _is_skill_owner_state_target(target, data_root)
+                    and target.name.lower() != "review.json"):
+                return "⚠️ DATA_READ_BLOCKED: skill owner state is not readable through generic data tools."
+        return ""
+
+    return check
+
+
+def _runtime_data_read_block(ctx: ToolContext, target: pathlib.Path, *, listing: bool = False, root: str = "") -> str:
+    return _runtime_data_read_check(ctx, listing=listing, root=root)(target)
 
 
 def _direct_resource_binding(
@@ -85,8 +101,7 @@ def _direct_resource_binding(
 
 
 def _render_line_slice(path: str, content: str, max_lines: int = 2000, start_line: int = 1,
-                       start_char: int = 0, extent: Optional[Dict[str, Any]] = None,
-                       *, mask_secrets: bool = False) -> str:
+                       start_char: int = 0, extent: Optional[Dict[str, Any]] = None) -> str:
     """Return a line-ranged file view with the shared read-tool header.
 
     ``extent`` (when a dict is passed) receives the DELIVERED window as FACTS,
@@ -112,14 +127,7 @@ def _render_line_slice(path: str, content: str, max_lines: int = 2000, start_lin
     than the budget can never be delivered whole by any line window, so the reader
     advances WITHIN it by re-reading the same window with a growing ``start_char``.
     Disclosed in the header, so the view never silently masquerades as the whole line.
-    Restricted reads mask complete key blocks before selecting this window,
-    preserving source positions. The masking notice is outside its file extent.
     """
-    original_content, masked = content, 0
-    if mask_secrets:
-        from ouroboros.secret_masking import mask_secret_bytes
-
-        content, masked = mask_secret_bytes(content, preserve_layout=True)
     start_raw, max_raw = _coerce_line_window(start_line, max_lines)
     max_raw = max(1, max_raw)
     lines = content.splitlines(keepends=True)
@@ -155,13 +163,11 @@ def _render_line_slice(path: str, content: str, max_lines: int = 2000, start_lin
         extent.update({"start_line": start, "end_line": end, "total_lines": total, "start_char": offset,
                        "first_line": first_line, "body_start": len(header), "body_chars": len(body),
                        "partial_head": partial_head, "line_ends": line_ends,
-                       "complete_chars": len(original_content),
-                       "complete_sha256": hashlib.sha256(original_content.encode("utf-8")).hexdigest(),
+                       "complete_chars": len(content),
+                       "complete_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
                        "source_start_char": source_start, "source_end_char": source_start + len(body),
-                       "range_basis": "unicode_text_universal_newlines", "source_masked": bool(masked)})
+                       "range_basis": "unicode_text_universal_newlines", "source_masked": False})
     rendered = header + body
-    if masked and body != "".join(original_content.splitlines(keepends=True)[start - 1:end])[offset:]:
-        rendered += f"\n⚠️ SECRET_BYTES_MASKED: source contains {masked} secret-shaped span(s); matching bytes replaced with *."
     return rendered
 
 
@@ -310,17 +316,6 @@ def _repo_read(
 ) -> str:
     """Read a repo file; root-level memory names return a runtime_data read hint."""
     target = _resolved_binding.target_path if _resolved_binding is not None else ctx.repo_path(path)
-    repo_root = (
-        _resolved_binding.base_path
-        if _resolved_binding is not None
-        else active_repo_dir_for(ctx)
-    )
-    if is_restricted_subagent_profile(ctx) and _is_subagent_secret_repo_target(target, repo_root, ctx=ctx):
-        return _publish_tool_result(ctx, ToolResult(
-            status="blocked",
-            code="LEGACY_BLOCKED",
-            text="⚠️ REPO_READ_BLOCKED: this subagent cannot read repo secret or control files.",
-        ))
     try:
         content = _read_source_text(target, extent)
     except FileNotFoundError:
@@ -346,7 +341,7 @@ def _repo_read(
             text=f"⚠️ NOT_FOUND: file does not exist: {target}",
         ))
     return _render_line_slice(display_path or path, content, max_lines=max_lines, start_line=start_line,
-                              start_char=start_char, extent=extent, mask_secrets=is_restricted_subagent_profile(ctx))
+                              start_char=start_char, extent=extent)
 
 
 def _repo_list(
@@ -361,15 +356,6 @@ def _repo_list(
         else active_repo_dir_for(ctx)
     )
     target = _resolved_binding.target_path if _resolved_binding is not None else ctx.repo_path(dir)
-    secret_check = make_subagent_secret_target_check(repo_root, ctx=ctx) if is_restricted_subagent_profile(ctx) else None
-    if secret_check and secret_check(target):
-        # First-class tool error, not an ok-shaped one-element JSON listing
-        # (v6.54.3, review round 5 — the whole-call block IS the result).
-        return _publish_tool_result(ctx, ToolResult(
-            status="blocked",
-            code="LEGACY_BLOCKED",
-            text="⚠️ REPO_LIST_BLOCKED: this subagent cannot list repo secret or control paths.",
-        ))
     # ctx.repo_path already normalized absolute/redundant-prefix dirs; pass the
     # resulting root-relative form so _list_dir doesn't re-nest the raw input.
     try:
@@ -377,8 +363,8 @@ def _repo_list(
     except ValueError:
         listed_rel = dir
     items = _list_dir(repo_root, listed_rel, max_entries)
-    if secret_check:
-        items = _filter_subagent_secret_repo_listing(items, repo_root, ctx=ctx, secret_check=secret_check)
+    runtime_check = _runtime_data_read_check(ctx, listing=True)
+    items = [item for item in items if not runtime_check(repo_root / item.rstrip("/"))]
     return json.dumps(items, ensure_ascii=False, indent=2)
 
 
@@ -399,7 +385,8 @@ def _data_read(
 ) -> str:
     """Read a drive text file; duplicate drive_root prefixes are stripped."""
     task_constraint = normalize_task_constraint(getattr(ctx, "task_constraint", None))
-    norm = _normalize_data_read_path(ctx, path)
+    norm = (_resolved_binding.target_path.relative_to(_resolved_binding.base_path).as_posix()
+            if _resolved_binding is not None else _normalize_data_read_path(ctx, path))
     if (b := _project_store_access_block(norm)):
         return b
     if _resolved_binding is not None:
@@ -413,19 +400,12 @@ def _data_read(
             ))
     else:
         target = ctx.drive_path(norm)
-    if is_restricted_subagent_profile(ctx) and _is_subagent_secret_repo_target(
-        target, active_repo_dir_for(ctx), ctx=ctx,
-    ):
-        return _publish_tool_result(ctx, ToolResult(
-            status="blocked", code="DATA_BLOCKED",
-            text="⚠️ DATA_READ_BLOCKED: this subagent cannot read secret or owner-control data files.",
-        ))
     state_root = (
-        _resolved_binding.state_drive_root
+        _resolved_binding.base_path
         if _resolved_binding is not None
         else pathlib.Path(ctx.drive_root)
     )
-    if (not _raw_owner_secret_access_allowed(ctx)
+    if (not _skill_owner_state_read_allowed(ctx)
             and _is_skill_owner_state_target(target, state_root) and target.name.lower() != "review.json"):
         # Owner item A.20: this refusal was the one in the family that shipped WITHOUT
         # the warning marker, so the adapter read a policy denial as a successful read
@@ -443,18 +423,11 @@ def _data_read(
         # start_char is a sub-line cursor request and must be honored, not swallowed.
         if _is_cognitive_data_path(norm) and start_raw == 1 and max_raw == 2000 and not _coerce_start_char(start_char):
             if display_path is None:
-                if is_restricted_subagent_profile(ctx):
-                    from ouroboros.secret_masking import mask_secret_bytes
-
-                    content, masked = mask_secret_bytes(content, preserve_layout=True)
-                    if masked:
-                        content += f"\n⚠️ SECRET_BYTES_MASKED: {masked} secret-shaped span(s) replaced with *."
                 return content
             full_line_count = max(1, len(content.splitlines()))
-            return _render_line_slice(display_path, content, max_lines=full_line_count, start_line=1, extent=extent,
-                                      mask_secrets=is_restricted_subagent_profile(ctx))
+            return _render_line_slice(display_path, content, max_lines=full_line_count, start_line=1, extent=extent)
         return _render_line_slice(display_path or norm, content, max_lines=max_raw, start_line=start_raw,
-                                  start_char=start_char, extent=extent, mask_secrets=is_restricted_subagent_profile(ctx))
+                                  start_char=start_char, extent=extent)
     except FileNotFoundError:
         if norm.replace("\\", "/").startswith("memory/"):
             explanation = (
@@ -486,29 +459,12 @@ def _data_list(
     _resolved_binding: ResolvedResourceBinding | None = None,
 ) -> str:
     task_constraint = normalize_task_constraint(getattr(ctx, "task_constraint", None))
-    norm_dir = _normalize_data_read_path(ctx, dir)
+    norm_dir = (_resolved_binding.target_path.relative_to(_resolved_binding.base_path).as_posix()
+                if _resolved_binding is not None else _normalize_data_read_path(ctx, dir))
     # Whole-call block states are FIRST-CLASS tool errors, never ok-shaped
     # one-element JSON listings (v6.54.3, review round 5).
     if (b := _project_store_access_block(norm_dir)):
         return str(b)
-    secret_check = make_subagent_secret_target_check(active_repo_dir_for(ctx), ctx=ctx) if is_restricted_subagent_profile(ctx) else None
-    if secret_check:
-        try:
-            list_target = (
-                _resolved_binding.target_path
-                if _resolved_binding is not None
-                else ctx.drive_path(norm_dir)
-            )
-        except ValueError as e:
-            return _publish_tool_result(ctx, ToolResult(
-                status="blocked", code="DATA_BLOCKED", text=f"⚠️ DATA_LIST_BLOCKED: {e}",
-            ))
-        if secret_check(list_target):
-            return _publish_tool_result(ctx, ToolResult(
-                status="blocked",
-                code="DATA_BLOCKED",
-                text="⚠️ DATA_LIST_BLOCKED: this subagent cannot list secret or owner-control data paths.",
-            ))
     if _resolved_binding is not None:
         root = _resolved_binding.base_path
         try:
@@ -520,8 +476,6 @@ def _data_list(
                 text="⚠️ DATA_LIST_BLOCKED: resolved target escapes runtime_data root.",
             ))
         items = _filter_out_project_store(norm_dir, _list_dir(root, rel, max_entries))
-        if secret_check:
-            items = _filter_subagent_secret_listing(items, root, ctx=ctx, secret_check=secret_check)
         return json.dumps(items, ensure_ascii=False, indent=2)
     if task_constraint and task_constraint.has_selected_skill and task_constraint.payload_root:
         try:
@@ -534,8 +488,6 @@ def _data_list(
         return json.dumps(items, ensure_ascii=False, indent=2)
     # Drop any projects/<id> entry so a generic root listing never exposes the store.
     items = _filter_out_project_store(_normalize_data_read_path(ctx, dir), _list_dir(ctx.drive_root, dir, max_entries))
-    if secret_check:
-        items = _filter_subagent_secret_listing(items, pathlib.Path(ctx.drive_root), ctx=ctx, secret_check=secret_check)
     return json.dumps(items, ensure_ascii=False, indent=2)
 
 
@@ -571,25 +523,6 @@ def _access_or_block(ctx: ToolContext, root: str, operation: str) -> tuple[str, 
             text=f"⚠️ TOOL_ACCESS_BLOCKED: {str(decision.reason).rstrip('.')}.",
         ))
     return normalized, ""
-
-
-def _local_readonly_resource_block(
-    ctx: ToolContext,
-    normalized: str,
-    target: pathlib.Path,
-    base: pathlib.Path,
-    *,
-    action: str,
-    secret_check: Callable[[pathlib.Path], bool] | None = None,
-) -> str:
-    # Reading policy follows the physical target for every resource spelling.
-    # Acting children still retain their independent declared write surface.
-    repo_root = pathlib.Path(base) if normalized in {"active_workspace", "system_repo"} else active_repo_dir_for(ctx)
-    if is_restricted_subagent_profile(ctx) and (
-        secret_check(target) if secret_check else _is_subagent_secret_repo_target(target, repo_root, ctx=ctx)
-    ):
-        return f"⚠️ {action}_BLOCKED: this subagent cannot access secret or owner-control data files."
-    return ""
 
 
 def _root_display_path(root: str, path: str) -> str:
@@ -693,20 +626,11 @@ def _read_file(
     except ValueError:
         opened = str(target)
     opened_root = str(binding.root)  # the NORMALIZED root the binding used, not the model's spelling
+    if runtime_block := _runtime_data_read_block(ctx, target, root=binding.root):
+        return _publish_tool_result(ctx, ToolResult(status="blocked", code="DATA_BLOCKED", text=runtime_block))
     protected_block = block_reason_for_path(ctx, target, "read_bytes", binding)
     if protected_block:
         return protected_block
-    if normalized == "system_repo":
-        block_msg = _local_readonly_resource_block(
-            ctx, normalized, target, binding.base_path, action="READ_FILE"
-        )
-        if block_msg:
-            # `_local_readonly_resource_block` is also a predicate on the search
-            # walk, so it stays pure; the READ_FILE_BLOCKED refusal is published
-            # here, where it IS the whole result.
-            return _publish_tool_result(ctx, ToolResult(
-                status="blocked", code="LEGACY_BLOCKED", text=block_msg,
-            ))
     if normalized in {"active_workspace", "system_repo"}:
         display_path = (
             f"{target} (project room)"
@@ -734,39 +658,11 @@ def _read_file(
             _resolved_binding=binding,
             extent=extent,
         ), start_char=start_char))
-    block_msg = _local_readonly_resource_block(
-        ctx, normalized, target, binding.base_path, action="READ_FILE"
-    )
-    if block_msg:
-        return _publish_tool_result(ctx, ToolResult(
-            status="blocked", code="LEGACY_BLOCKED", text=block_msg,
-        ))
     try:
         content = _read_source_text(target, extent)
-        raw_owner_secret_access = _raw_owner_secret_access_allowed(ctx)
         rendered = _render_line_slice(_root_display_path(normalized, path), content,
-                                      max_lines=max_lines, start_line=start_line, start_char=start_char,
-                                      extent=extent, mask_secrets=(
-                                          is_restricted_subagent_profile(ctx) and not raw_owner_secret_access
-                                      ))
-        if normalized == "user_files" and not raw_owner_secret_access:
-            # Egress seam for owner-home reads (#447 X1/В23): the file may be
-            # read; bytes in a recognized credential format or a PEM block leave
-            # as the masked form (***), and secrets in unrecognized formats are
-            # not detected at all (owner answer 5=A removed the opaque-run rule).
-            # Masking happens on the rendered slice; the search egress applies
-            # the same seam to its match lines.
-            from ouroboros.secret_masking import mask_secret_bytes
-
-            rendered, masked = mask_secret_bytes(rendered)
-            if masked:
-                extent["source_masked"] = True
-                rendered += (
-                    f"\n⚠️ SECRET_BYTES_MASKED: {masked} span(s) in this view matched a "
-                    "recognized credential format or a PEM block and were replaced with "
-                    "***; secrets in unrecognized formats are not detected. Reference "
-                    "the masked ones by location, not value."
-                )
+                                      max_lines=max_lines, start_line=start_line,
+                                      start_char=start_char, extent=extent)
         if normalized == "task_drive":
             # D7 coverage acknowledgement: what counts as read is what the DELIVERY
             # layer will actually hand the model, so the hook receives the rendered
@@ -835,6 +731,8 @@ def _list_files(
             code="LEGACY_TOOL_ERROR",
             text=f"⚠️ LIST_FILES_ERROR ({type(exc).__name__}): {exc}",
         ))
+    if runtime_block := _runtime_data_read_block(ctx, binding.target_path, listing=True, root=binding.root):
+        return _publish_tool_result(ctx, ToolResult(status="blocked", code="DATA_BLOCKED", text=runtime_block))
     protected_list_block = block_reason_for_path(
         ctx, binding.target_path, "static_introspection", binding
     )
@@ -858,8 +756,6 @@ def _list_files(
         if normalized == "skill_payload":
             rel = binding.target_path.relative_to(binding.base_path).as_posix() or "."
             items = _list_dir(binding.base_path, rel, max_entries)
-            if is_restricted_subagent_profile(ctx):
-                items = _filter_subagent_secret_listing(items, binding.base_path, ctx=ctx)
             return json.dumps(items, ensure_ascii=False, indent=2)
         if normalized == "user_files":
             items = _list_user_files_dir(
@@ -868,11 +764,6 @@ def _list_files(
             return json.dumps(items, ensure_ascii=False, indent=2)
         rel = binding.target_path.relative_to(binding.base_path).as_posix() or "."
         items = _list_dir(binding.base_path, rel, max_entries)
-        if is_restricted_subagent_profile(ctx):
-            if normalized == "system_repo":
-                items = _filter_subagent_secret_repo_listing(items, binding.base_path, ctx=ctx)
-            elif normalized in {"task_drive", "skill_payload", "artifact_store", "user_files", "deliverables"}:
-                items = _filter_subagent_secret_listing(items, binding.base_path, ctx=ctx)
         return json.dumps(items, ensure_ascii=False, indent=2)
     except _ListingMiss as exc:
         # A miss is discovery, not a failed tool: the same warning severity the

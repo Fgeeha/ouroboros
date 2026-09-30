@@ -90,23 +90,17 @@ def _visible_file(
     repo_root: pathlib.Path,
     rel_path: str,
     binding: ResolvedResourceBinding | None = None,
-    secret_check: Callable[[pathlib.Path], bool] | None = None,
+    runtime_check: Callable[[pathlib.Path], str] | None = None,
 ) -> bool:
     try:
         target = (repo_root / rel_path).resolve(strict=False)
     except Exception:
         return False
-    try:
-        from ouroboros.tools.core import is_restricted_subagent_profile as _is_local_readonly_subagent, _is_subagent_secret_repo_target
+    from ouroboros.tools.core_file_tools import _runtime_data_read_block
 
-        if _is_local_readonly_subagent(ctx) and (
-            secret_check(target) if secret_check else _is_subagent_secret_repo_target(target, repo_root, ctx=ctx)
-        ):
-            return False
-    except Exception:
-        pass
     return not (
-        block_reason_for_path(ctx, target, "read_bytes", binding)
+        (runtime_check(target) if runtime_check is not None else _runtime_data_read_block(ctx, target, root=binding.root if binding else ""))
+        or block_reason_for_path(ctx, target, "read_bytes", binding)
         or block_reason_for_path(ctx, target, "static_introspection", binding)
     )
 
@@ -117,7 +111,7 @@ def _inventory_rows(
     repo_root: pathlib.Path,
     opts: dict[str, Any],
     binding: ResolvedResourceBinding | None = None,
-    secret_check: Callable[[pathlib.Path], bool] | None = None,
+    runtime_check: Callable[[pathlib.Path], str] | None = None,
 ) -> list[str]:
     from ouroboros.code_intelligence import (
         impact_files,
@@ -138,24 +132,24 @@ def _inventory_rows(
     rows: list[str] = []
     if op in {"symbols", "definition"}:
         for file, symbol in symbol_definitions(inventory, query, path=path, kind=kind or "any"):
-            if _visible_file(ctx, repo_root, file.path, binding, secret_check):
+            if _visible_file(ctx, repo_root, file.path, binding, runtime_check):
                 rows.append(f"{file.path}:{symbol.line_start} {symbol.kind} {symbol.signature or symbol.name}")
     elif op == "references":
         for file, ref in symbol_references(inventory, query, path=path):
-            if _visible_file(ctx, repo_root, file.path, binding, secret_check):
+            if _visible_file(ctx, repo_root, file.path, binding, runtime_check):
                 rows.append(f"{file.path}:{ref.line} {query}{' in ' + ref.enclosing if ref.enclosing else ''}")
     elif op in {"callers", "callees"}:
         iterator = symbol_callers(inventory, query, path=path) if op == "callers" else symbol_callees(inventory, query, path=path)
         for file, call in iterator:
-            if _visible_file(ctx, repo_root, file.path, binding, secret_check):
+            if _visible_file(ctx, repo_root, file.path, binding, runtime_check):
                 rows.append(f"{file.path}:{call.line} {call.enclosing + ' -> ' if call.enclosing else ''}{call.name}")
     elif op == "impact":
         for file, reason in impact_files(inventory, path or query, depth=depth):
-            if _visible_file(ctx, repo_root, file.path, binding, secret_check):
+            if _visible_file(ctx, repo_root, file.path, binding, runtime_check):
                 rows.append(f"{file.path}  {reason}")
     elif op == "relevant_files":
         for idx, (file, score, reason) in enumerate(relevant_files(inventory, query, limit=min(_MAX_LIMIT, offset + limit)), 1):
-            if _visible_file(ctx, repo_root, file.path, binding, secret_check):
+            if _visible_file(ctx, repo_root, file.path, binding, runtime_check):
                 top_symbols = ", ".join(symbol.name for symbol in file.symbols[:5])
                 rows.append(f"{idx}. {file.path} score={score:.2f} reason={reason}{' symbols=' + top_symbols if top_symbols else ''}")
     return rows
@@ -169,7 +163,7 @@ def _structural(
     lang: str,
     limit: int,
     binding: ResolvedResourceBinding | None = None,
-    secret_check: Callable[[pathlib.Path], bool] | None = None,
+    runtime_check: Callable[[pathlib.Path], str] | None = None,
 ) -> list[str]:
     # Conservative first step: use tree-sitter when available, otherwise a Python
     # ast fallback plus literal matching. Query may be a tree-sitter S-expression
@@ -249,7 +243,7 @@ def _structural(
             rel = fp.relative_to(repo_root).as_posix()
         except ValueError:
             continue
-        if not _visible_file(ctx, repo_root, rel, binding, secret_check):
+        if not _visible_file(ctx, repo_root, rel, binding, runtime_check):
             continue
         if not ts_node_type:
             continue
@@ -320,30 +314,12 @@ def _query_code(
     try:
         normalized_root = binding.root
         if normalized_root == "system_repo":
-            try:
-                from ouroboros.tool_access import active_tool_profile
-
-                if active_tool_profile(ctx) == "acting_subagent":
-                    return "⚠️ TOOL_ACCESS_BLOCKED: query_code root=system_repo is not available to acting subagents."
-            except Exception:
-                pass
             repo_root = binding.base_path
         elif normalized_root == "active_workspace":
             repo_root = binding.base_path
         elif normalized_root == "skill_payload":
             repo_root = binding.base_path
         elif normalized_root == "user_files":
-            # Read-only structured intelligence over an EXTERNAL workspace target
-            # (e.g. the SWE-bench dig-direct /app) — R1. Restricted subagents must
-            # not read arbitrary owner home; the main/live task is allowed. An
-            # empty path is a HARD ERROR: it will not scan the entire home.
-            try:
-                from ouroboros.tool_access import active_tool_profile
-
-                if active_tool_profile(ctx) in ("acting_subagent", "local_readonly_subagent"):
-                    return "⚠️ TOOL_ACCESS_BLOCKED: query_code root=user_files is not available to subagents."
-            except Exception:
-                pass
             if not str(path or "").strip():
                 raise ValueError(
                     "root=user_files requires an explicit path (e.g. '/app' or a project subdir); "
@@ -372,17 +348,11 @@ def _query_code(
     except ValueError as exc:
         return f"⚠️ TOOL_ARG_ERROR (query_code): {exc}"
 
+    from ouroboros.tools.core_file_tools import _runtime_data_read_check
+
+    runtime_check = _runtime_data_read_check(ctx, root=binding.root)
     limit = min(max(1, int(limit or 40)), _MAX_LIMIT)
     offset = max(0, int(offset or 0))
-    secret_check = None
-    try:
-        from ouroboros.tools.core_secret_paths import is_restricted_subagent_profile, make_subagent_secret_target_check
-
-        if op != "architecture" and is_restricted_subagent_profile(ctx):
-            secret_check = make_subagent_secret_target_check(repo_root, ctx=ctx)
-    except Exception:
-        pass  # Preserve the existing per-target fallback on policy preparation failure.
-
     try:
         if op == "architecture":
             # Architecture facts (CPL-3) are defined over the Ouroboros repo's
@@ -405,7 +375,7 @@ def _query_code(
             # page after the first and blamed the query for it (#447 D6).
             rows = _structural(
                 ctx, repo_root, query, scoped_path, str(lang or "any"),
-                min(_MAX_LIMIT, offset + limit), binding, secret_check
+                min(_MAX_LIMIT, offset + limit), binding, runtime_check
             )
         else:
             from ouroboros.code_intelligence import build_code_inventory
@@ -417,38 +387,30 @@ def _query_code(
                 # Do not cache an external/ephemeral user_files target's inventory
                 # in the live code-intel cache.
                 persist = False
-            try:
-                from ouroboros.tools.core import is_restricted_subagent_profile as _is_local_readonly_subagent, _is_subagent_secret_repo_target
+            from ouroboros.tools.core_secret_paths import is_restricted_subagent_profile
 
-                if _is_local_readonly_subagent(ctx):
-                    persist = False
-                    exclude_paths = [
-                        p for p in repo_root.rglob("*")
-                        if (secret_check(p) if secret_check else _is_subagent_secret_repo_target(p, repo_root, ctx=ctx))
-                    ]
-            except Exception:
-                pass
-            inventory = build_code_inventory(repo_root, drive_root=pathlib.Path(ctx.drive_root), persist=persist, exclude_paths=exclude_paths)
+            # Cache writes retain their existing actor/mode contract independently
+            # of file visibility; Cyber acting tasks may persist as before.
+            if is_restricted_subagent_profile(ctx):
+                persist = False
+            inventory = build_code_inventory(
+                repo_root, drive_root=pathlib.Path(ctx.drive_root), persist=persist, exclude_paths=exclude_paths,
+                path_allowed=lambda target: _visible_file(ctx, repo_root, target.relative_to(repo_root).as_posix(), binding, runtime_check),
+            )
             inventory.files = [
                 file for file in inventory.files
-                if _visible_file(ctx, repo_root, file.path, binding, secret_check)
+                if _visible_file(ctx, repo_root, file.path, binding, runtime_check)
             ]
             if op == "digest":
                 # Whole-repo map (folded from the former codebase_digest tool):
                 # a compact file/symbol inventory to orient in an unfamiliar repo.
                 from ouroboros.code_intelligence import render_codebase_digest
                 digest_text = render_codebase_digest(inventory)
-                if normalized_root == "user_files":
-                    # Same В23 egress seam: a secret-shaped file/symbol NAME in
-                    # the owner's home must not surface raw (#447 s2r2).
-                    from ouroboros.secret_masking import mask_secret_bytes
-
-                    digest_text, _masked = mask_secret_bytes(digest_text)
                 return digest_text
             rows = _inventory_rows(ctx, inventory, repo_root, {
                 "op": op, "query": query, "path": scoped_path, "kind": kind,
                 "depth": depth, "limit": limit, "offset": offset,
-            }, binding, secret_check)
+            }, binding, runtime_check)
     except Exception as exc:
         return f"⚠️ QUERY_CODE_ERROR: {type(exc).__name__}: {exc}"
 
@@ -473,26 +435,6 @@ def _query_code(
                 "Narrow the query or path= instead of paging past the cap."
             )
         return f"No results for op `{op}` `{label}`. {_empty_hint(op, label)}"
-    def _mask_user_files_rows(text: str) -> str:
-        # Same egress seam as read_file/search (#447 В23): in query_code
-        # snippets over the owner's home, bytes in a recognized credential
-        # format or a PEM block are masked; secrets in unrecognized formats
-        # are not detected.
-        from ouroboros.tools.core_secret_paths import is_restricted_subagent_profile
-
-        if normalized_root != "user_files" and not is_restricted_subagent_profile(ctx):
-            return text
-        from ouroboros.secret_masking import mask_secret_bytes
-
-        masked, count = mask_secret_bytes(text)
-        if count:
-            masked += (
-                f"\n⚠️ SECRET_BYTES_MASKED: {count} span(s) matched a recognized "
-                "credential format or a PEM block and were replaced with ***; "
-                "secrets in unrecognized formats are not detected."
-            )
-        return masked
-
     header = f"{op} `{label}` — {len(shown)} of {total}"
     if next_offset < total:
         header += f" — next offset={next_offset}"
@@ -504,7 +446,7 @@ def _query_code(
             if total >= _MAX_LIMIT
             else f" — more may exist; continue with offset={next_offset}"
         )
-    return _mask_user_files_rows(header + "\n\n" + "\n".join(shown)) + _next_step_hint(op)
+    return header + "\n\n" + "\n".join(shown) + _next_step_hint(op)
 
 
 def _empty_hint(op: str, label: str) -> str:

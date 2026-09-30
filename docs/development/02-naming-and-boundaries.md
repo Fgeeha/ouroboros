@@ -54,8 +54,8 @@ of core" step in `.github/workflows/ci.yml`); the rest is review-only.
   refuse owner input or output on a SUFFIX or WORD inside a file name; dotenv
   spellings are the one surviving tail rule. Owner locations are a physical list
   (`credential_shapes.owner_credential_locations`), so an unlisted store keeps
-  ordinary access; `make_subagent_secret_target_check` is prepared once per call
-  and never retained; `pem_capture_refusal` keeps effective Cyber's finding
+  ordinary access. Helpers inherit the parent's reads without file-name filters
+  or content masking; `pem_capture_refusal` keeps effective Cyber's finding
   advisory with the requested bytes while ordinary modes keep the exclusion; the
   SSH config exception permits no key writes under `.ssh`.
 - An unlaunchable sole cmd element gets an actionable argv/shell hint, never
@@ -113,21 +113,22 @@ its before/after byte size in the commit or PR.
 
 Recoverable tool failures are evidence for the next LLM turn, not triggers for a
 host-authored recovery workflow: return a typed, redacted result naming the
-failed stage, the completed external effects and an actionable repair hint, and
+failed stage, completed external effects and an actionable repair hint, and
 let the LLM decide. Host code owns deterministic integrity, authority boundaries
 and truthful receipts only — no task-specific auto-retry, fallback, cleanup,
 resume or terminal-flow state machines. Explicitly naming a documented default is
 never a different request: an argument whose value is what omitting it already
 means — `directory_strategy="direct"` with no `scope_paths` on a shape that cannot
-serve the argument, or `workspace_root` naming the Ouroboros repository itself —
+serve the argument, or `workspace_root` naming the Ouroboros repository —
 takes the omitted path, disclosed in the result; only a value that genuinely asks
-for something is refused there, typed, at the earliest layer holding the authority
-to judge it, with the repair named. Models fill every key of a tool schema, so an
+for something is refused there, typed, at the earliest layer with authority to
+judge it, repair named. Models may fill optional keys (OpenAI's Responses API
+tries strict mode if unset; the OpenRouter lane sends `strict:false`), so an
 optional argument's empty or mode-irrelevant form (`max_wait_minutes` on a quiz that
 does not wait, `0` with `""`, a range end past a knowledge note, a zone beside an
 offset-carrying instant) is that same omitted path, and a refusal that only restates its rule is
 retried unchanged: it names the field, the value received and the repair in ONE
-reply (house helpers for both sentences: `tools/arg_feedback`).
+reply (house helpers for both: `tools/arg_feedback`).
 
 A producer that knows its call failed publishes that fact typed
 (`tool_result._publish_tool_result`, or a first-line `⚠️ IDENTIFIER` the legacy

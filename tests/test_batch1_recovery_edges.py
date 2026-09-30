@@ -67,21 +67,21 @@ def test_readonly_input_scan_failure_and_symlink_refuse_before_engine(tmp_path, 
     assert list(outside.iterdir()) == []
 
 
-def test_restored_claim_missing_receipt_and_delete_preserve_unknown(q, monkeypatch):  # noqa: F811
+def test_restored_unstarted_claim_recovers_and_delete_preserves_accepted_work(q, monkeypatch):  # noqa: F811
     from supervisor import schedule_occurrence as occurrence
 
-    _row(q, intent={"kind": "system_repo"})
+    _row(q, intent={"kind": "system_repo"}, source="owner")  # a follow-up row's delete is a suppression
     real_prepare = occurrence.prepare
     monkeypatch.setattr(occurrence, "prepare", lambda _: (_ for _ in ()).throw(RuntimeError("crash")))
     with pytest.raises(RuntimeError):
         q.queue.check_scheduled_tasks()
     claimed = copy.deepcopy(_rows(q)["s1"]["occurrence"])
-    occurrence._FRESH_CLAIMS.clear()  # fresh process: no local proof of no admission
     monkeypatch.setattr(occurrence, "prepare", real_prepare)
     q.queue.check_scheduled_tasks()
-    assert not q.pending and _rows(q)["s1"]["hold"]["reason"] == "occurrence_evidence_missing"
-    q.queue.mutate_scheduled_task("delete", "s1", reason="owner", actor="owner")
-    assert _rows(q)["s1"]["occurrence"] == claimed
+    assert [task["id"] for task in q.pending] == [claimed["task_id"]]
+    outcome = q.queue.mutate_scheduled_task("delete", "s1", reason="owner", actor="owner")
+    assert outcome["status"] == "delete_deferred"
+    assert _rows(q)["s1"]["occurrence"]["token"] == claimed["token"]
 
 
 def test_late_owner_hold_survives_republish_and_cannot_dispatch(q):  # noqa: F811

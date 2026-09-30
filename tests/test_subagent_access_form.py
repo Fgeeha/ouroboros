@@ -38,7 +38,7 @@ def test_api_all_fields_form_queues_without_changing_write_surface(registry, acc
         "objective": "Inspect the assigned source.", "expected_output": "Findings.",
         "role": "", "context": "", "constraints": "", "memory_mode": "forked",
         "input_sources": "shared",
-        "write_surface": surface, "write_root": "", "directory_strategy": "direct",
+        "write_surface": surface, "write_root": "", "workspace_root": "", "directory_strategy": "direct",
         "scope_paths": [], "protected_paths_grant": False, "external_tool_grants": [],
         "allowed_origins": [], "delegation_intent": "", "may_mutate": False,
         "may_fan_out": True, "max_children": 0, "requested_depth": 0,

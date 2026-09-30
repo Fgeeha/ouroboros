@@ -908,13 +908,13 @@ class UiPreferencesResponse(TypedDict):
     sidebar_width: int  # px; 0 = CSS default (resizable side sections, v6.33.0)
     project_panel_width: int  # px; 0 = CSS default
     project_seen_revision: dict[str, int]  # monotonic paint ACK per active Project
+    welcome: dict[str, str]  # install-wide empty-Main UI copy: mode default|hidden|custom and plain text
 
 
 class GitLogResponse(TypedDict):
     commits: list[Dict[str, Any]]
-    # Tag rows: {tag, date, sha (peeled commit), message} — the mirror said
-    # ``list[str]`` while ``list_versions`` has always emitted dicts; corrected
-    # (behavioural documentation) in the 2026-08-31 updates redesign.
+    # Tag rows: {tag, date, sha (peeled commit), message} — the mirror said ``list[str]`` while ``list_versions``
+    # has always emitted dicts; corrected (behavioural documentation) in the 2026-08-31 updates redesign.
     tags: list[Dict[str, Any]]
     branch: str
     sha: str

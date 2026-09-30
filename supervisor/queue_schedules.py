@@ -593,7 +593,7 @@ def sync_skill_schedules(skills: List[Any], *, drive_root: pathlib.Path | None =
             ):
                 from supervisor.schedule_occurrence import owed, work_settled
 
-                if owed(record) is False and work_settled(record):
+                if owed(record, drive_root=drive_root) is False and work_settled(record, drive_root=drive_root):
                     by_id.pop(schedule_id, None)
                 else:
                     record.update(enabled=False, delete_requested_at=utc_now_iso())
@@ -764,7 +764,6 @@ def check_scheduled_tasks() -> None:
     from supervisor import schedule_occurrence as occurrences
 
     claims: List[Dict[str, Any]] = []
-    retired_claims: list[tuple[str, str]] = []
     with schedule_transaction(_queue().DRIVE_ROOT):
         now_monotonic = time.monotonic()
         if now_monotonic - _last_skill_schedule_sync >= _SKILL_SCHEDULE_SYNC_INTERVAL_SEC:
@@ -802,12 +801,9 @@ def check_scheduled_tasks() -> None:
                 verdict, stored = occurrences.reconcile(record)
                 changed = changed or verdict != "live"
                 if verdict == "reconsider":
-                    # A positive refusal/fresh claim is not frozen admitted work.
-                    # Drop its old basis without consuming the row; ordinary due
-                    # evaluation below decides the edited timing and controls.
-                    old = record.pop("occurrence")
-                    retired_claims.append((str(_queue().DRIVE_ROOT), str(old.get("token") or "")))
-                    record.pop("hold", None)
+                    # Unstarted work follows the current authored timing/control.
+                    if occurrences.discard_claim(record, data):
+                        continue
                 elif verdict == "settled":
                     occurrences.settle(record)
                     if record.get("delete_requested_at") and occurrences.work_settled(record):
@@ -890,7 +886,6 @@ def check_scheduled_tasks() -> None:
         if changed:
             if _write_scheduled_tasks(data) is False:
                 return
-            occurrences._FRESH_CLAIMS.difference_update(retired_claims)
             _queue().persist_queue_snapshot(reason="scheduled_tasks")
     if claims:
         occurrences.admit([occurrences.prepare(claimed) for claimed in claims])

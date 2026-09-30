@@ -145,14 +145,17 @@ def _mirror_assigned_running_status(task: Dict[str, Any]) -> None:
     in memory and the snapshot is a ghost a stale or absent snapshot leaves
     forever. Never raises: a task that runs without its mirror is better than an
     assignment tick that stops."""
-    if not str(task.get("drive_root") or ""):
-        return
     try:
         from ouroboros.task_results import STATUS_RUNNING, write_task_result
+        from ouroboros.task_status import execution_owner_record
 
+        task["_execution_owner"] = execution_owner_record(
+            task.get("budget_drive_root") or _pool().DRIVE_ROOT, task, "pooled")
+        if not str(task.get("drive_root") or ""):
+            return  # no fork mirror: the actual native start publishes RUNNING
         _is_subagent = str(task.get("delegation_role") or "") == "subagent"
         _mirror = {
-            "task_attempt": int(task.get("_attempt") or 1),
+            "execution_owner": task["_execution_owner"], "task_attempt": int(task.get("_attempt") or 0),
             "root_task_id": task.get("root_task_id"),
             "session_id": task.get("session_id"),
             "actor_id": task.get("actor_id"),
@@ -207,11 +210,14 @@ def _mirror_assigned_running_status(task: Dict[str, Any]) -> None:
         _mirror = {key: value for key, value in _mirror.items() if value is not None}
         def before_dispatch(current, fields):
             attempt = int(current.get("task_attempt") or 0)
-            if attempt > _mirror["task_attempt"] or current.get("status") == STATUS_RUNNING:
-                return None  # a worker/newer attempt already published its facts
+            owner = current.get("execution_owner")
+            same_start = (current.get("status") == STATUS_RUNNING
+                          and (not owner or owner == _mirror["execution_owner"]))
+            if attempt > _mirror["task_attempt"] or same_start:
+                return None  # a worker/newer attempt already published; another owner is rebound
             return fields
         write_task_result(
-            _pool().DRIVE_ROOT,
+            task.get("budget_drive_root") or _pool().DRIVE_ROOT,
             str(task.get("id") or ""),
             STATUS_RUNNING,
             _field_projector=before_dispatch, strict_existing_dict=True,

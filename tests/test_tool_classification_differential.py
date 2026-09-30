@@ -384,6 +384,8 @@ CURRENT_PRODUCER_CONTRACTS = {
     "INTEGRATE_CAPPED_TREE": (True, "integration_blocked"),
     "INTEGRATE_DIRECTORY_SURFACE_MISMATCH": (True, "integration_blocked"),
     "INTEGRATE_FILE_OUTPUTS_UNAVAILABLE": (True, "integration_blocked"),
+    "INTEGRATE_APPLY_UNKNOWN": (True, "integration_blocked"),
+    "INTEGRATE_COPY_BINDING_MISMATCH": (True, "integration_blocked"),
     # The harvest puts every identifier first. A standalone capture failure
     # is an error; the actual successful-write suffix is pinned separately.
     "OUTPUT_CAPTURE_FAILED": (True, "error"),

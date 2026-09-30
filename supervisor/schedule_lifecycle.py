@@ -337,12 +337,18 @@ def mutate_scheduled_task(action: str, schedule_id: str, *, reason: str,
                 else:
                     from supervisor.schedule_occurrence import owed, work_settled
 
-                    status, owes = "deleted", owed(current)
-                    if owes is not False or not work_settled(current):
+                    status, owes = "deleted", owed(current, drive_root=root)
+                    if owes is not False or not work_settled(current, drive_root=root):
                         # An accepted run waits to be re-queued: removal is deferred until it
                         # starts, because deleting a row never takes back an admission (#1315).
                         current["enabled"], current["delete_requested_at"] = False, utc_now_iso()
-                        detail = "this schedule retains unresolved or unsettled work; deletion waits for its settlement"
+                        status = "delete_deferred"
+                        detail = ("an accepted run is still owed; the row will be removed after that run "
+                                  "starts and reaches settlement" if owes else
+                                  "the occurrence receipt is missing, unreadable or conflicting; "
+                                  "the disabled row is retained until its execution history can be established"
+                                  if owes is None else
+                                  "this schedule retains unsettled work; deletion waits for its settlement")
                     else:
                         tasks = [item for item in tasks if str(item.get("id") or "") != wanted]
                         removed = True
@@ -394,7 +400,7 @@ def mutate_scheduled_task(action: str, schedule_id: str, *, reason: str,
             recorded = _audit_schedule_mutation(
                 phase="outcome", result=status, before=before,
                 after=(None if removed else current), **audit)
-            achieved = status in {"updated", "deleted", "suppressed"}
+            achieved = status in {"updated", "deleted", "delete_deferred", "suppressed"}
             if changed and not recorded:
                 # Keep the lifecycle blocker beside the audit disclosure: a lost
                 # outcome record must not erase WHY the row is still not ready.

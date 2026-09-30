@@ -55,6 +55,8 @@ def _subtask_outcome_summary(data: Dict[str, Any], receipts: list | None = None)
     summary: Dict[str, Any] = {
         "outcome_axes": normalize_outcome_axes(data),
     }
+    if isinstance(data.get("execution_observation"), dict):
+        summary["execution_observation"] = dict(data["execution_observation"])
     # R5: CURRENT delegated-custody reconciliation state next to the historical
     # axes, on the full single-child handoff surfaces only (get_task_result /
     # wait_task — wait_tasks' batch projection is a pinned compact contract).
@@ -1007,6 +1009,8 @@ def _children_roster_projection(
             "accounted_upper_bound_usd": _cost["accounted_upper_bound_usd"],
             "child_result_sha256": _child_result_sha256(row),
             "outcome_axes": normalize_outcome_axes(row),
+            **({"execution_observation": dict(row["execution_observation"])}
+               if isinstance(row.get("execution_observation"), dict) else {}),
         })
     return disclosed_list_projection(
         roster, key="children_roster", limit=max(1, int(limit)), item=lambda entry: entry,
@@ -1033,6 +1037,8 @@ def _compact_child_projection(tid: str, data: Dict[str, Any], known_hash: Any) -
         "result": data.get("result"),
         "trace_summary": data.get("trace_summary"),
     }
+    if isinstance(data.get("execution_observation"), dict):
+        projected["execution_observation"] = dict(data["execution_observation"])
     # The result hash binds this limitation too; keep its host authorship
     # separate from the unchanged model answer, including an empty answer.
     from ouroboros.task_finalization import terminal_host_notice_text

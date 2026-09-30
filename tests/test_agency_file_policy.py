@@ -76,10 +76,10 @@ def test_child_reads_lists_and_searches_ordinary_credential_named_files(files, m
     assert search.status == "ok" and all(name in search.text for name in names), search.text
 
 
-def test_ordinary_child_still_respects_physical_owner_stores_and_dotenv(files, monkeypatch):
+def test_ordinary_child_reads_parent_visible_owner_files_and_dotenv(files, monkeypatch):
     registry, ctx, _home, work, data = files
-    # The chosen workspace includes the fixture HOME, so owner-location policy
-    # is exercised without an earlier outside-selected-root refusal.
+    # The selected workspace contains the fixture HOME. These are readable
+    # by the parent; credential-write and staging policy stay independent.
     monkeypatch.setattr(Path, "home", lambda: work)
     ctx.task_constraint = TaskConstraint(mode="local_readonly_subagent")
     owner_key = work / ".ssh" / "id_rsa"
@@ -96,7 +96,7 @@ def test_ordinary_child_still_respects_physical_owner_stores_and_dotenv(files, m
                        ("active_workspace", ".env"),
                        ("runtime_data", "settings.json")):
         result = registry.execute_result("read_file", {"root": root, "path": path})
-        assert result.status == "blocked" and "OWNER_LOCATION_CANARY" not in result.text, result.text
+        assert result.status == "ok" and "OWNER_LOCATION_CANARY" in result.text, result.text
     assert owner_key.read_text() == "OWNER_LOCATION_CANARY"
 
 

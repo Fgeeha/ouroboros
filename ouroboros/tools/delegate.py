@@ -110,7 +110,7 @@ from ouroboros.delegate_interactions import (  # noqa: F401
 # facade back); re-exported here because sibling code, the tests and
 # monkeypatch targets name them on THIS surface.
 from ouroboros.deadline_utils import deadline_expired
-from ouroboros.delegate_directory import blocked_geometry_refusal, default_shaped_directory_options
+from ouroboros.delegate_directory import blocked_geometry_refusal
 from ouroboros.delegate_registration_policy import resolve_registration
 from ouroboros.delegate_shared import (  # noqa: F401
     _emit,
@@ -530,10 +530,9 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
                         return _fail("delegate_start", "directory_execution_unavailable", str(exc), definitely_unrun=True)
                     snapshot, snap_error = None, ""
                 else:
-                    if not default_shaped_directory_options(directory_strategy, scope_paths):
-                        return _fail("delegate_start", "directory_execution_unavailable",
-                                     "Directory options apply to ordinary folders; Git workspaces keep their snapshot contract.",
-                                     definitely_unrun=True)
+                    from ouroboros.delegate_directory import git_directory_options_refusal
+                    if error := git_directory_options_refusal(target_root, directory_strategy, scope_paths):
+                        return _fail("delegate_start", "directory_execution_unavailable", error, definitely_unrun=True)
                     snapshot, snap_error = _provision_snapshot(ctx, drive, target_root, invocation_id)
                 if snap_error:
                     _settle_refused_provision(ctx, gateway, snap_error, invocation_id, history_facts)

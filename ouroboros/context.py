@@ -264,6 +264,7 @@ from ouroboros.context_runtime_facts import (  # noqa: E402,F401 — re-exported
     _queue_context_fact,
     _runtime_budget_info,
     task_execution_clock_fact,
+    task_schedule_fact,
 )
 
 
@@ -349,6 +350,7 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None, sc
             "budget_drive_root": task.get("budget_drive_root"),
             "deadline_at": task.get("deadline_at"),
             **task_execution_clock_fact(task, ctx),
+            **task_schedule_fact(task),
             "allowed_resources": task.get("allowed_resources"),
             "context": task.get("context"),
         },
@@ -395,11 +397,14 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None, sc
     try:
         from ouroboros.config import get_allow_mutative_subagents
         from ouroboros.contracts.task_constraint import VALID_WRITE_SURFACES
+        from ouroboros.workspace_copies import workspace_copy_source_is_system
 
+        copy_source_is_system = workspace_copy_source_is_system(ctx or env, str(task.get("workspace_root") or ""))
         runtime_data["capabilities"] = {
             "allow_mutative_subagents": bool(get_allow_mutative_subagents()),
             "mutative_subagent_surfaces": sorted(
-                s for s in VALID_WRITE_SURFACES if get_allow_mutative_subagents(s)
+                s for s in VALID_WRITE_SURFACES
+                if get_allow_mutative_subagents(s, source_is_system_repo=copy_source_is_system)
             ),
             "write_surfaces": sorted(VALID_WRITE_SURFACES),
             "web_search_backend": runtime_setting("OUROBOROS_WEBSEARCH_BACKEND", "auto"),
@@ -412,7 +417,8 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None, sc
                 "applies to every surface; when it is empty the runtime mode decides, "
                 "SURFACE-AWARE: advanced/pro/cyber_pro allow every surface, light allows "
                 "external_workspace/genesis — they build outside the Ouroboros runtime — "
-                "and keeps self_worktree off). mutative_subagent_surfaces lists what is "
+                "including isolated project copies; own-body self_worktree stays off). "
+                "mutative_subagent_surfaces lists what is "
                 "actually schedulable RIGHT NOW. Read THIS before declaring you cannot "
                 "spawn acting subagents."
             ),

@@ -14,7 +14,7 @@ import pytest
 from supervisor import state, state_initialization
 from tests import test_schedule_occurrence as schedule_fixtures
 from tests import test_state_authority as state_fixtures
-from tests._shared import stop_socket_sharer
+from tests._shared import stop_socket_sharer, wait_test_child_stop
 
 root, _prior, _write = state_fixtures.root, state_fixtures._prior, state_fixtures._write
 q, _rows = schedule_fixtures.q, schedule_fixtures._rows
@@ -436,10 +436,8 @@ def test_actual_pooled_worker_requests_separate_session_command_before_owner_exi
         assert time.monotonic() - started < .5
         proc.join(timeout=5)
         assert not proc.is_alive()
-        deadline = time.monotonic() + 3
-        while pid_is_alive(child_pid) and not pid_is_zombie(child_pid) and time.monotonic() < deadline:
-            time.sleep(.01)
-        assert not pid_is_alive(child_pid) or pid_is_zombie(child_pid), (receipt, proc.exitcode, seen)
+        verdict = wait_test_child_stop(child_pid)
+        assert verdict["child_stopped"], (receipt, proc.exitcode, seen, verdict)
     finally:
         try:
             if proc.is_alive():

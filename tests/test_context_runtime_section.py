@@ -94,6 +94,39 @@ def test_runtime_section_includes_light_runtime_mode_rule(tmp_path, monkeypatch)
     assert "runtime_data/uploads" in payload["runtime_mode_rule"]
 
 
+@pytest.mark.parametrize("trigger", ["once", "cron"])
+def test_runtime_keeps_the_admitted_occurrences_due_time_after_schedule_advances(tmp_path, trigger):
+    env = _make_health_env(tmp_path)
+    due = "2026-09-29T00:30:00+00:00"
+    claimed = "2026-09-30T03:00:00+00:00"
+    (tmp_path / "state" / "scheduled_tasks.json").write_text(json.dumps({"tasks": [{
+        # An owner row: a source-less legacy row's relation is unknown and held.
+        "id": "follow-up", "enabled": trigger == "cron", "name": "Review results", "source": "owner",
+        "trigger": {"type": trigger, "run_at": due, "expr": "30 0 * * *"},
+        "next_run_at": "2026-10-01T00:30:00+00:00",
+    }]}), encoding="utf-8")
+    task = {"id": "late-run", "type": "task", "metadata": {"schedule_occurrence": {
+        "schedule_id": "follow-up", "token": "occurrence-token", "due_at": due, "claimed_at": claimed,
+    }}}
+    runtime = json.loads(build_runtime_section(env, task).split("\n\n", 1)[1])
+    assert runtime["task"]["schedule_occurrence"] == {
+        "schedule_id": "follow-up", "due_at": due, "claimed_at": claimed,
+    }
+    if trigger == "once":
+        assert "scheduled_tasks" not in runtime  # consumed one-shot no longer appears in the digest
+    else:
+        assert runtime["scheduled_tasks"]["active"][0]["next_run_at"] != due
+
+
+def test_runtime_does_not_invent_a_due_time_for_legacy_or_ordinary_work(tmp_path):
+    env = _make_health_env(tmp_path)
+    task = {"id": "legacy", "metadata": {"schedule_occurrence": {"schedule_id": "old", "token": "t"}}}
+    legacy = json.loads(build_runtime_section(env, task).split("\n\n", 1)[1])
+    assert legacy["task"]["schedule_occurrence"] == {"schedule_id": "old", "due_at": None, "claimed_at": None}
+    ordinary = json.loads(build_runtime_section(env, {"id": "ordinary"}).split("\n\n", 1)[1])
+    assert "schedule_occurrence" not in ordinary["task"]
+
+
 def test_runtime_section_includes_filesystem_affordances_with_ctx(tmp_path, monkeypatch):
     from ouroboros.tools.registry import ToolContext
 
