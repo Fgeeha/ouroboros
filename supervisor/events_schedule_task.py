@@ -238,7 +238,7 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
         "session_id": session_id,
         "delegation_role": delegation_role,
     })
-    if workspace_copy:
+    if delegation_role == "subagent" and not acting_reject_detail:
         task_contract = {**task_contract, "workspace": {
             **task_contract.get("workspace", {}), "root": workspace_root, "mode": workspace_mode}}
     live_max_depth = _events().get_max_subagent_depth()

@@ -664,6 +664,9 @@ def _child_workspace(ctx, metadata, params):
     if selected_folder:
         try:
             selected_path = Path(selected_folder).expanduser()
+            if not selected_path.is_absolute() and (not parent_workspace["root"]
+                    or parent_workspace.get("availability") == "unavailable"):
+                raise ValueError("relative workspace_root needs an available parent folder; name an absolute readable folder")
             workspace_root = admit_child_start_folder(ctx,
                 selected_path if selected_path.is_absolute() else Path(parent_workspace["root"]) / selected_path, params)
             workspace_mode = "read_only"
@@ -687,7 +690,7 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
         return _publish_scheduling_refusal(
             ctx, "error", "TOOL_ARG_ERROR", "⚠️ TOOL_ARG_ERROR (schedule_subagent): unsupported argument(s): "
             f"{bad}. Use the strict schema: subagent_id, objective, expected_output, "
-            "optional role/context/constraints/memory_mode and (for mutative children) "
+            "optional role/context/constraints/memory_mode/workspace_root and (for mutative children) "
             "write_surface/write_root/protected_paths_grant/external_tool_grants.")
     internal = dict(internal or {})
     if set(internal) - _INTERNAL_SCHEDULE_OPTIONS:

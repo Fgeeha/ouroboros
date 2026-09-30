@@ -131,3 +131,23 @@ def test_read_start_mode_alone_cannot_bypass_workspace_write_admission(geometry)
     result = registry.execute_result("write_file", {"path": "new.txt", "content": "unadmitted"})
     assert result.status == "blocked" and "WORKSPACE_MODE_BLOCKED" in result.text
     assert not (selected / "new.txt").exists()
+
+
+def test_home_search_does_not_replay_ancestry_for_each_file(geometry, monkeypatch):
+    from ouroboros import tool_access_reads
+
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
+    home, repo, data, first = geometry
+    root = ToolContext(repo_dir=repo, drive_root=data, task_id="root", workspace_root=first, workspace_mode="external")
+    registry, _ctx = child(geometry, "child", "root", home / "work", capture_parent_workspace(root))
+    documents = home / "documents"
+    documents.mkdir()
+    for index in range(40):
+        (documents / f"input-{index}.txt").write_text(f"LOCAL_INPUT_{index}\n", encoding="utf-8")
+    def unexpected_ancestry(_ctx):
+        pytest.fail("an in-home file asked for the outside-home ancestry policy")
+    monkeypatch.setattr(tool_access_reads, "read_allows_outside_home", unexpected_ancestry)
+    read = registry.execute("read_file", {"root": "user_files", "path": str(documents / "input-0.txt")})
+    assert "LOCAL_INPUT_0" in read, read
+    result = registry.execute("search_code", {"root": "user_files", "path": str(documents), "query": "LOCAL_INPUT_"})
+    assert "Found 40 matches" in result, result

@@ -21,6 +21,11 @@ def capture_parent_workspace(ctx: Any) -> dict[str, str]:
     from ouroboros.tools.tool_resolution import active_repo_dir_for
 
     access = _access()
+    meta = getattr(ctx, "task_metadata", None) or {}
+    if (getattr(ctx, "is_direct_chat", False) and not getattr(ctx, "workspace_root", None)
+            and isinstance(meta, dict) and meta.get("_project_room_note")):
+        return {"root": str(meta.get("_project_room_dir") or ""), "mode": "", "source": "project_room",
+                "availability": "unavailable", "detail": str(meta["_project_room_note"])}
     if getattr(ctx, "workspace_root", None):
         source = "active_workspace"
     elif access.project_room_lens_dir(ctx) is not None:
@@ -122,7 +127,8 @@ def admit_child_start_folder(ctx: Any, value: Any, params: dict) -> str:
         raise ValueError("workspace_root cannot select a starting folder for genesis, which creates its own empty project")
     folder = readonly_start_folder(value)
     write_root = str(params.get("write_root") or "").strip()
-    if write_root and pathlib.Path(write_root).expanduser().resolve(strict=False) != pathlib.Path(folder):
+    if (str(params.get("write_surface") or "").strip().lower() == "external_workspace" and write_root
+            and pathlib.Path(write_root).expanduser().resolve(strict=False) != pathlib.Path(folder)):
         raise ValueError("workspace_root and write_root name different folders; select one acting workspace")
     from ouroboros.tools.tool_resolution import _root_containing_absolute_path
 
