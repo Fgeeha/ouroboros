@@ -134,10 +134,11 @@ test('a tool frame mints the task card before any census lists the turn: a tool 
         f.log({ type: 'tool_call_started', tool: 'read_file', tool_call_id: 'c1', args: { path: 'README.md' }, _is_direct_chat: true });
         assert.ok(f.card(), 'the first tool call mints the block');
         assert.ok(f.card().querySelector('[data-turn-into-project]'), 'conversion is offered in Main from the first content row');
-        assert.equal(f.card().querySelector('[data-live-title]').textContent, 'Working...', 'the placeholder title of a running task card');
+        assert.equal(f.card().querySelector('[data-live-phase]').textContent, 'Working', 'the chip says the running state');
+        assert.equal(f.card().querySelector('[data-live-title]').textContent, '', 'no title repeats the chip on a running task card (#1369)');
         f.log({ type: 'tool_call_finished', tool: 'read_file', tool_call_id: 'c1', args: { path: 'README.md' }, duration_sec: 0.3, _is_direct_chat: true });
         f.census(direct());
-        assert.equal(f.card().querySelector('[data-live-title]').textContent, 'Working...', 'the census lane fact does not change chrome');
+        assert.equal(f.card().querySelector('[data-live-title]').textContent, '', 'the census lane fact does not change chrome');
         assert.ok(f.card().querySelector('[data-turn-into-project]'));
     } finally { f.close(); }
 });
@@ -168,7 +169,7 @@ test('a direct turn with two successful tools is the task card: ONE evidence row
         f.log({ type: 'tool_call_finished', tool: 'web_search', tool_call_id: 'c2', args: { query: 'ouroboros' }, duration_sec: 1.2 });
         assert.ok(f.card(), 'the first tool call mints the block live');
         assert.ok(f.card().querySelector('[data-turn-into-project]'), 'a working direct turn is offered conversion in Main');
-        assert.equal(f.card().querySelector('[data-live-title]').textContent, 'Working...', 'the running placeholder title');
+        assert.equal(f.card().querySelector('[data-live-title]').textContent, '', 'a running card without a name or narration has no title (#1369)');
         assert.equal(f.rows().length, 1, 'four frames about two calls are the block\'s one evidence row');
         // The stub cannot repaint an in-place patch; the producer states the folded row.
         const c1 = { tool: 'read_file', tool_call_id: 'c1', args: { path: 'README.md' } };
@@ -550,7 +551,7 @@ test('a wait-only block carries no title and no conversion until its first row o
         f.emit('chat', wait({ role: 'system', revision: 2, state: 'resolved', resolution: 'quota_restored' }));
         assert.equal(f.card(), null, 'the block leaves with its attention');
         f.log({ type: 'tool_call_started', tool: 'read_file', tool_call_id: 'c1', args: { path: 'README.md' } });
-        assert.equal(f.card().querySelector('[data-live-title]').textContent, 'Working...');
+        assert.equal(f.card().querySelector('[data-live-title]').textContent, '', 'work arrived, but the chip already says Working (#1369)');
         assert.ok(f.card().querySelector('[data-turn-into-project]'));
         assert.equal(f.status(), 'Thinking...', 'the header keeps the census verdict for a direct turn');
     } finally { f.close(); }
@@ -576,7 +577,7 @@ test('a coined name titles a direct task card live and stays after its final', (
     try {
         f.census(direct());
         f.log({ type: 'tool_call_started', tool: 'read_file', tool_call_id: 'c1', args: { path: 'README.md' } });
-        assert.equal(f.card().querySelector('[data-live-title]').textContent, 'Working...');
+        assert.equal(f.card().querySelector('[data-live-title]').textContent, '');
         f.emit('task_named', { task_id: TASK, suggested_name: 'Проверка карточки' });
         assert.equal(f.card().querySelector('[data-live-title]').textContent, 'Проверка карточки');
         f.emit('chat', { ...final, tool_calls: 1 });
