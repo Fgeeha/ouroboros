@@ -1373,7 +1373,7 @@ exceptions.
 |---|---|---|
 | A question or decision is waiting | required | a confirmed lifecycle fact: the question carries a positive wait |
 | A task finished or stopped | required | a positive typed terminal fact on a ROOT task |
-| Messages Ouroboros sends while working | LLM-first | Ouroboros chose to speak outside the turn's answer (a proactive message, or an optional question) |
+| Messages Ouroboros sends while working | LLM-first | Ouroboros chose to speak outside the turn's answer (a proactive message in its room or as a Main notice, or an optional question) |
 | Ordinary replies in Main | separate toggle | an ordinary finished reply in the Main thread |
 
 *Required* means the application asks for delivery from its own state rather

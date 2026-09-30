@@ -420,6 +420,10 @@ CURRENT_PRODUCER_CONTRACTS = {
     "MCP_CATALOG_UNAVAILABLE": (True, "unavailable"),
     "TASK_FORBIDDEN": (True, "blocked"),
     "native:LEGACY_BLOCKED:TASK_FORBIDDEN": (True, "blocked"),
+    # #1412: send_user_message(destination="main") refuses a caller with no Main
+    # voice (delegated, Presence, agent-to-agent) through native ACCESS_BLOCKED.
+    "MAIN_NOTICE_BLOCKED": (True, "blocked"),
+    "native:ACCESS_BLOCKED:MAIN_NOTICE_BLOCKED": (True, "blocked"),
 }
 
 

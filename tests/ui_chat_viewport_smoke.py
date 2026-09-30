@@ -186,7 +186,13 @@ def run_chat_viewport_smoke(
         )
 
     def begin_noop_read(page):
-        read_to_latest(page)
+        # Establish follow through the existing reader action for the no-op
+        # precondition, even when a concurrent restore already hid the button.
+        # Physical button and wheel interactions are exercised separately below.
+        page.locator("#chat-scroll-bottom").dispatch_event("click")
+        page.evaluate(_SETTLE_TWO_FRAMES)
+        state = jump_state(page)
+        assert state["remaining"] <= 1 and state["dotHidden"], state
         return set_remaining(page, 40)["scrollTop"]
 
     def assert_noop_read(page, before):
