@@ -23,7 +23,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
   │   ├── modules/project_handoff.js ← Main-only transfer anchors: converted cards stay visible; one receipt row per `handoff_id` folds under the first card; shadows return on eviction; phase from census/task detail; `receiptNotice` words the typed receipt (§3 Project handoff receipts)
   │   ├── modules/project_reference.js ← the one control that points at a Project, and the only raiser of `ouro:open-project` (DESIGN "References and actions")
   │   ├── modules/project_activity.js ← pure `active_chat_activities` census projection for Project dots; complete supervisor-ready snapshots clear absences, partial/unavailable/disconnected reads keep explicitly unknown rows (§3 Liveness census and the chat header)
-  │   ├── modules/project_work_pointer.js ← Project-room pointer to an already loaded root card; no execution or history authority (§3 Project rooms)
+  │   ├── modules/project_work_pointer.js, project_read_state.js ← Pointer to a loaded root card, no execution or history authority; a room's read receipt (§3 Project rooms)
   │   ├── modules/model_wait.js ← Model-wait views and owner actions inside existing chat cards, through the shared decision ingress (§6 Quota and auth waits)
   │   ├── modules/task_checkpoints.js, cancel_presentation.js ← Typed task checkpoints and recorded cancellation-cause text shared by Chat and Logs (§3)
   │   ├── modules/dashboard.js, logs.js, costs.js, files.js ← Dashboard tab host; Logs (backfill plus live-stream duplicate guard); Costs (an open zero is never shown as free); Files browser over `/api/files/*` (§3 Dashboard, Files)
@@ -425,7 +425,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       │   ├── history.py       ← Shared Chat room/quiz/media/review/terminal projection + cost breakdown factories
       │   ├── history_contracts.py ← Descriptive paged Chat history response, re-exported by contracts.py
       │   ├── schedule_contracts.py ← Typed schedule list/upsert/lifecycle-action responses, re-exported by contracts.py
-      │   ├── history_paging.py ← Physical range selection over retained chat/progress JSONL chains, frozen room-bound page/continuation cursors and read gaps; no stored history copy
+      │   ├── history_paging.py ← Physical range selection over retained chat/progress JSONL chains, frozen room-bound page/continuation cursors, read gaps and a Project room's `latest_arrival`; no stored history copy
       │   ├── cost_breakdown.py ← Ledger-derived dashboard buckets and root-task detail breakdown over the same physical-attempt authority
       │   ├── projects.py      ← GET/POST /api/projects, /from-task, /update, /delete
       │   └── _helpers.py      ← Shared request-root/coercion/JSON error envelope and `run_sync_to_completion`, the settled worker wait for request-owned blocking work

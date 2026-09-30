@@ -228,7 +228,7 @@ body.resizing-panels { user-select: none; }
     line-height: 1;
 }
 
-/* Per-project "new activity" indicator: a standard small red dot at the row's end. */
+/* Per-project unread-messages indicator: a standard small red dot at the row's end. */
 .nav-project-row { position: relative; }
 .nav-unread-dot {
     flex: 0 0 auto;
