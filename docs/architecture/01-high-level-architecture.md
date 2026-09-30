@@ -351,7 +351,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── task_continuation.py ← Durable review continuation state
       ├── task_results.py      ← Durable task results `task_results/<id>.json`; the locked `task_acceptance_review_accounting` claim (minted at first physical reviewer dispatch; a claim without a recoverable terminal host run is UNKNOWN, never permission to re-dispatch); the read-only root review-capacity projection is WALLET and cancellation only (`root_task_id`, `cap_cycles`, `claimed_cycles`, `remaining_cycles`, `binding_seen`, `dedupe`, `state`, `reason`), no time axis (§6 Task acceptance)
       ├── task_result_schema.py ← Task-result schema admission: the `_schema_version` stamp, the classifier, and the quarantine an unstamped, future, malformed or retired-key row lands in
-      ├── task_status.py       ← Effective status, lineage and waits; root/task/attempt-bound execution_owner and dated execution_observation separate lifecycle from liveness (§5); only pooled owners enter worker-boot orphan inference. task_has_live_queue_ownership: §10 invariant 14
+      ├── task_status.py       ← Effective status/lineage/waits; root/task/attempt-bound execution_owner and dated execution_observation separate lifecycle from liveness (§5); only pooled owners enter worker-boot orphan inference. task_has_live_queue_ownership: §10 invariant 14
       ├── git_shell_policy.py  ← Structural git argv classifiers for the shell guards
       ├── protected_artifacts.py ← Execute-only black-box policy for protected artifacts
       ├── shell_parse.py       ← Shared command/argv normalization and POSIX wrapper grammar; observed targets, not semantic permission judgments (§6 Safety and runtime mode)
