@@ -5,10 +5,10 @@ and the paid repeat rail (a dispatched typed transport death, ``provider_outcome
 never overlap, and while the round holds a repeat record that record outranks the
 wait terminal:
 
-- a dispatched death on an interactive turn takes the repeat rail and never opens a
-  wait episode (unknown is not the episode's kind);
-- inside an episode the chain's local-only pass exists for ``transport_unavailable``
-  alone, and a round record blocks even that pass;
+- a dispatched death on an inline Presence turn (the one caller that keeps the
+  repeat rail) takes the repeat rail and never opens a wait episode;
+- the configured-route walk runs once BEFORE a wait episode opens and never inside
+  one, and a round record blocks it;
 - an episode exhausted on a round that still holds a repeat record ends on the
   record's source, worded as both the wait and the unresolved attempt — and that
   wording names the class the repeat was RELEASED with (it rides the round record,
@@ -16,8 +16,8 @@ wait terminal:
   closed the window or the later free redial's own class;
 - the terminal precedence is decided once, at the provider-death rail: a round
   record outranks the latched wait cause, which outranks the overflow salvage —
-  so the ``context_overflow`` a failed local-only pass leaves in the mutable kind
-  never turns a waited-out outage into the overflow terminal.
+  so the ``context_overflow`` a failed route walk leaves behind never turns a
+  waited-out outage into the overflow terminal.
 """
 
 from __future__ import annotations
@@ -41,9 +41,19 @@ from tests.test_transport_death_retry import (
     _loop_kwargs,
     _no_chain,
     _overflow_failure,
+    _presence_turn,
     _released_connect,
     _status_failure,
 )
+
+
+def _failing_walk(walks):
+    """A configured-route walk that finds no answer and records the kind it was entered with."""
+    def chain(**kwargs):
+        walks.append(kwargs["accumulated_usage"].get("_last_llm_error_kind"))
+        return (None, kwargs["active_model"], kwargs["active_use_local"],
+                kwargs["context_fit_plan"], kwargs["active_context_mode"])
+    return chain
 
 
 @pytest.fixture
@@ -55,12 +65,12 @@ def no_sleep(monkeypatch):
     return sleeps
 
 
-@pytest.mark.parametrize("turn_flag", ["is_direct_chat"])
+@pytest.mark.parametrize("turn_flag", ["presence"])
 @pytest.mark.parametrize("deaths", [2, 3])
 def test_interactive_turn_death_takes_the_repeat_rail_and_never_enters_a_wait_episode(
     tmp_path, monkeypatch, no_sleep, turn_flag, deaths,
 ):
-    """A direct-chat turn whose DISPATCHED request died with a typed
+    """An inline Presence turn whose DISPATCHED request died with a typed
     transport death is on the paid repeat rail (its round dispatch is primary),
     never in the free wait episode: `provider_outcome_unknown` is not the
     episode's `transport_unavailable`, so no `network_wait` event exists, the
@@ -76,11 +86,10 @@ def test_interactive_turn_death_takes_the_repeat_rail_and_never_enters_a_wait_ep
     monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
     llm = _ScriptedLLM(*([_death] * deaths))
     notes = []
-    kwargs = _loop_kwargs(tmp_path, llm, notes)
-    setattr(kwargs["tools"]._ctx, turn_flag, True)
+    kwargs = _presence_turn(_loop_kwargs(tmp_path, llm, notes))
     result, usage, trace = run_llm_loop(**kwargs)
 
-    assert llm.calls == 3  # the primary send plus two paid repeats, whatever the turn kind
+    assert llm.calls == 3  # the primary send plus two paid repeats
     assert no_sleep == [4.0, 8.0]  # the repeat rail's backoffs, never the episode's wait
     assert _events(tmp_path, "network_wait") == []
     assert not any("provider connection" in note.lower() for note in notes)
@@ -97,7 +106,7 @@ def test_interactive_turn_death_takes_the_repeat_rail_and_never_enters_a_wait_ep
 
 
 @pytest.mark.parametrize("turn,with_record", [
-    ("managed", False), ("is_direct_chat", True), ("is_direct_chat", False),
+    ("managed", False), ("presence", True), ("presence", False),
 ])
 def test_wait_episode_exhausted_on_a_round_holding_a_repeat_record_takes_the_unknown_source(
     tmp_path, monkeypatch, no_sleep, turn, with_record,
@@ -114,7 +123,8 @@ def test_wait_episode_exhausted_on_a_round_holding_a_repeat_record_takes_the_unk
 
     clock = _FakeClock(monkeypatch)
     monkeypatch.setattr(loop_transport, "get_task_idle_timeout_sec", lambda: 60)
-    monkeypatch.setattr(loop_mod, "_run_cross_model_fallback_chain", _no_chain)
+    walks = []
+    monkeypatch.setattr(loop_mod, "_run_cross_model_fallback_chain", _failing_walk(walks))
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
     monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", "other/model")
     monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
@@ -126,8 +136,10 @@ def test_wait_episode_exhausted_on_a_round_holding_a_repeat_record_takes_the_unk
         deadline = datetime.now(timezone.utc) + timedelta(seconds=get_finalization_grace_sec() + 8)
         kwargs["tools"]._ctx.task_metadata = {"deadline_at": deadline.isoformat()}
     else:
-        setattr(kwargs["tools"]._ctx, turn, True)
+        _presence_turn(kwargs)
     result, usage, trace = run_llm_loop(**kwargs)
+    # One walk before the wait; a round record (an unresolved paid repeat) blocks even that one.
+    assert walks == ([] if with_record else ["transport_unavailable"])
 
     assert (3 if with_record else 2) <= llm.calls <= len(script)  # the episode ended; the turn never recovered
     assert no_sleep == ([4.0] if with_record else [])  # one repeat backoff; released redials never re-arm it
@@ -175,8 +187,7 @@ def test_deadline_refused_redial_still_names_the_class_the_repeat_was_released_w
     monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
     llm = _ScriptedLLM(_death, _released_connect, _released_connect)
     notes = []
-    kwargs = _loop_kwargs(tmp_path, llm, notes)
-    kwargs["tools"]._ctx.is_direct_chat = True  # This caller retains the bounded paid-repeat rail.
+    kwargs = _presence_turn(_loop_kwargs(tmp_path, llm, notes))  # Inline Presence alone keeps the paid-repeat rail.
     # Room for the grant (backoff 4 s + the admission reserve) and for one wait.
     metadata = {"deadline_at": (
         datetime.now(timezone.utc) + timedelta(seconds=get_finalization_grace_sec() + 8)
@@ -220,8 +231,7 @@ def test_generic_terminal_names_the_class_the_repeat_was_released_with(tmp_path,
     monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
     llm = _ScriptedLLM(_death, _released_connect, lambda: _status_failure(400))
     notes = []
-    kwargs = _loop_kwargs(tmp_path, llm, notes)
-    kwargs["tools"]._ctx.is_direct_chat = True
+    kwargs = _presence_turn(_loop_kwargs(tmp_path, llm, notes))
     result, usage, trace = run_llm_loop(**kwargs)
 
     assert llm.calls == 3  # the primary send, its released repeat, one free redial
@@ -240,31 +250,32 @@ def test_generic_terminal_names_the_class_the_repeat_was_released_with(tmp_path,
 
 
 def test_fallback_chain_fence_holds_inside_a_wait_episode_too(monkeypatch):
-    """`fallback_chain_allowed` on the combined tree: inside a wait episode the
-    one local-only chain pass exists for `transport_unavailable` alone (never
-    for the unknown kind), and a round record — an unresolved attempt of this
-    round — blocks even that pass whatever the kind says, because no candidate
-    may dial over a request that may still be live."""
-    monkeypatch.setenv("USE_LOCAL_FALLBACK", "1")
-    routable = SimpleNamespace(exact_model_route=False)
+    """`fallback_chain_allowed` on the combined tree: the configured-route walk runs
+    BEFORE a wait episode opens (remote routes included) and never inside one; a round
+    record — an unresolved paid repeat of this round — blocks it whatever the kind says;
+    an unknown outcome walks only when it is eligible for a new generation."""
+    monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
+    routable = SimpleNamespace(exact_model_route=False, task_id="t")
     record = {"round_id": "r", "count": 1, "backoff_sec": 4.0}
     episode = loop_transport.TransportWaitEpisode(started_monotonic=1.0, interactive=True, wait_bound_sec=900.0)
 
-    assert loop_transport.fallback_chain_allowed(routable, "provider_outcome_unknown", episode) is False
-    assert loop_transport.fallback_chain_allowed(
-        routable, "transport_unavailable", episode, {TRANSPORT_DEATHS_KEY: record},
-    ) is False
-    assert episode.local_pass_used is False  # neither refusal spent the episode's single local pass
-    assert loop_transport.fallback_chain_allowed(routable, "transport_unavailable", episode) is True
-    assert episode.local_pass_used is True
-    assert loop_transport.fallback_chain_allowed(routable, "transport_unavailable", episode) is False  # once per episode
-    assert loop_transport.fallback_chain_allowed(routable, "provider_outcome_unknown", None) is False
+    assert loop_transport.fallback_chain_allowed(routable, "transport_unavailable", None, {}) is True
+    assert loop_transport.fallback_chain_allowed(routable, "provider_outcome_unknown", None, {}) is True
+    for kind in ("transport_unavailable", "provider_outcome_unknown", "bad_request"):
+        assert loop_transport.fallback_chain_allowed(routable, kind, episode, {}) is False
+        assert loop_transport.fallback_chain_allowed(routable, kind, None, {TRANSPORT_DEATHS_KEY: record}) is False
+    rejoinable = {"_pending_transport_outcome": {"same_operation_recoverable": True}}
+    assert loop_transport.fallback_chain_allowed(routable, "provider_outcome_unknown", None, rejoinable) is False
+    presence = SimpleNamespace(exact_model_route=False, task_id="t", current_task_type="presence")
+    assert loop_transport.fallback_chain_allowed(presence, "provider_outcome_unknown", None, {}) is False
+    assert loop_transport.fallback_chain_allowed(presence, "transport_unavailable", None, {}) is True
+    assert not hasattr(episode, "local_pass_used")
 
 
 def _overflowing_local_pass(spend_window):
-    """The episode's one local-only chain pass, failing with a context overflow
-    exactly as ``call_llm_with_retry`` stamps it, and slow enough that the wait
-    window is already spent when the round gate reads it (``spend_window``)."""
+    """The one configured-route walk before the wait, failing with a context overflow
+    exactly as ``call_llm_with_retry`` stamps it, and slow enough that the owner
+    deadline is already spent when the round gate reads it (``spend_window``)."""
     chain_calls = {"n": 0}
 
     def failing_chain(**kwargs):
@@ -283,13 +294,14 @@ def _overflowing_local_pass(spend_window):
     return failing_chain, chain_calls
 
 
-@pytest.mark.parametrize("turn", ["managed", "is_direct_chat"])
+@pytest.mark.parametrize("turn", ["managed"])
 def test_latched_wait_cause_outranks_the_overflow_a_failed_local_pass_left(tmp_path, monkeypatch, turn):
-    """outage latched → the episode's one local-only pass fails with a context
-    overflow → the binding window (a managed task's deadline, an interactive
-    turn's idle bound) is spent before any redial: the round now holds BOTH
-    facts (``wait_cause == "transport_unavailable"`` and the pass's
-    ``context_overflow`` in the mutable kind), and the latched wait cause wins —
+    """outage → the one route walk before the wait fails with a context overflow →
+    the owner deadline is spent before any redial: the round's own outage owns its
+    wait (the walk's overflow never re-aims it), and the latched wait cause wins —
+    (An interactive turn's idle bound measures waiting from episode entry, which now
+    follows the walk, so a slow walk cannot spend it; the rail-level precedence is
+    pinned below.)
     durable source ``transport_unavailable_no_resend``, the wait terminal's
     ``provider_unavailable``/``infra_failed`` stamps, the outage wording and no
     forced-final dial — never the overflow salvage's source, ``llm_api_error``
@@ -321,9 +333,9 @@ def test_latched_wait_cause_outranks_the_overflow_a_failed_local_pass_left(tmp_p
     monkeypatch.setattr(loop_mod, "_run_cross_model_fallback_chain", failing_chain)
     result, usage, trace = run_llm_loop(**kwargs)
 
-    assert llm.calls == 1 and chain_calls["n"] == 1  # the primary send and the local pass; no redial, no forced dial
-    assert clock.sleeps == []  # the window was spent inside the pass, so the episode never slept
-    assert usage["_last_llm_error_kind"] == "context_overflow"  # the pass's overwrite is still the sticky kind
+    assert llm.calls == 1 and chain_calls["n"] == 1  # the primary send and the walk; no redial, no forced dial
+    assert clock.sleeps == []  # the window was spent inside the walk, so the episode never slept
+    assert usage["_last_llm_error_kind"] == "transport_unavailable"  # the round's own outage, not the walk's overflow
     assert usage["execution_status"] == "infra_failed"
     assert usage["reason_code"] == "provider_unavailable"
     assert trace["forced_finalization"]["source"] == "transport_unavailable_no_resend"

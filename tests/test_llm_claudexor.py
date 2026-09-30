@@ -77,7 +77,7 @@ def test_display_redacts_typed_details_without_mutating_custody():
     ("invalid_request", 400, False, "bad_request", False, "", 42),
     ("invalid_request", 400, False, "bad_request", False, "", "  "),
     ("auth_required", 401, False, "auth_error", False, "auth", "context_length_exceeded"),
-    ("subscription_window_exhausted", 429, False, "subscription_window_exhausted", True, "quota", "context_length_exceeded"),
+    ("subscription_window_exhausted", 429, False, "subscription_window_exhausted", False, "quota", "context_length_exceeded"),
     ("unsupported_parameter", 400, False, "bad_request", False, "", "context_length_exceeded"),
     ("invalid_request", 400, True, "provider_outcome_unknown", False, "", "context_length_exceeded"),
 ])

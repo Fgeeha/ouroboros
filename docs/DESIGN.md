@@ -1001,9 +1001,12 @@ Permanent group-wide Local changes remain in Models.
 A pool confirmed to contain both accounts requiring sign-in and accounts waiting
 for quota says "Waiting for access" and names both causes. It keeps automatic
 continuation and opens Accounts without selecting a profile or initiating login.
-Unknown pool availability is not this state. The confirmed quota component uses
-the same execution-clock pause; an authentication-only wait still consumes that
-clock, and calendar deadlines stay fixed.
+A dated pool refusal without a confirmed cause says "Waiting for an account",
+retains the engine's reset forecast and keeps automatic continuation without
+claiming quota exhaustion or guaranteed availability. It never offers sign-in.
+Only confirmed quota pauses the execution clock; authentication and unconfirmed
+availability waits consume it. Calendar deadlines remain fixed. Configured
+fallback routes are tried before a wait card is shown.
 
 A submitted action is shown as pending until the task reports its application.
 A saved Settings change and a still-pending task change are disclosed separately.
