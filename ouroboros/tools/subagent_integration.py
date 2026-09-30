@@ -8,9 +8,9 @@ or verifies native external_workspace changes already present in the shared tree
 The parent stays the sole committer: applying stages changes but never
 commits; the parent reviews and runs ``commit_reviewed`` itself.
 
-Routing is top-only: ``target_root`` defaults to ``ctx.active_repo_dir()`` — the
-live repo for the root agent, or the parent's own worktree for a nested acting
-parent, so descendants bubble their patches up one level at a time.
+Only the immediate parent integrates a child. A bound copy returns to its
+recorded source under the parent's current write rights; legacy patches target
+the active repo. Descendant patches still bubble up one level at a time.
 """
 
 from __future__ import annotations
@@ -860,7 +860,7 @@ def _integrate_subagent_patch(
 
     if child_copy:
         if refusal := copy_apply_refusal(ctx, target, touched):
-            return f"⚠️ {refusal}"
+            return f"⚠️ INTEGRATE_TARGET_FORBIDDEN: {refusal}"
         try:
             outcome = _locked_apply(
                 ctx, target, patch_path, touched, child_copy["baseline_sha"],

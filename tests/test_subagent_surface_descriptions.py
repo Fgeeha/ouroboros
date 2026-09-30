@@ -8,7 +8,9 @@ from supervisor.events_subagent_admission import _compose_subagent_text
 def test_schedule_and_integration_describe_the_three_write_surfaces():
     schedule = next(entry.schema for entry in control_tools() if entry.name == "schedule_subagent")
     description = schedule["description"]
-    assert "self_worktree is an isolated git worktree" in description
+    assert "workspace_root selects the starting folder" in description
+    assert "self_worktree copies that Git source's current eligible files" in description
+    assert "including uncommitted work" in description
     assert "external_workspace write directly to the SHARED" in description
     assert "without reapplying" in description
     assert "Harness-delegated work uses a private snapshot" in description
