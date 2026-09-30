@@ -99,7 +99,7 @@ Run roots are append-only outside `repo/` and live `data/`; the focused contract
   and declared process `outputs` register/copy the canonical artifact; a
   rewrite keeps the previous copy in non-manifest history with last-5
   retention — recovery, never a second deliverable list. `root=deliverables`
-  stays read/list/search-only and is never granted to children.
+  stays read/list/search-only for every actor, including children.
 - Large task files stream (`artifacts.stream_artifact_file`, atomic
   `copy_artifact_file`): never a whole dataset in a bytes object, and a read is
   rejected as soon as it exceeds the source's initial regular-file size rather
@@ -306,17 +306,19 @@ and 23 (`delegated_transport`), both critical. The imperatives:
   execution" (`tests/test_browser_url_policy.py`,
   `tests/test_browser_isolation.py`, `tests/test_browser_redirect_chain.py`).
 - Acting children return `workspace.patch`; only the parent commits the live body,
-  applying via `integrate_subagent_patch` then its own `commit_reviewed`.
-  `external_workspace` verifies and records without re-applying. Edit/capture text preserves external Git authority and patch-only `self_worktree`. Capture bases prove no authorship; compare via explicit `vcs_diff`. A genesis project's directory is its durable deliverable
-  (until it declares a `.gitignore`, small
-  text build output rides `workspace.patch`, bounded by the
-  per-file source-patch boundary and Git's binary verdict; no total
-  source-patch cap). The canonical/replica terminal field-custody projection
-  is ONE pure reducer for copy-back and effective reads — every change adds a
-  stale-replica regression at BOTH seams
-  (`tests/test_available_subagents_runtime_review_fixes.py`). Do not broaden
-  generic data-tool behavior while fixing isolation (`forward_to_worker`
-  writes only to validated running or queued tasks in the current lineage).
+  through `integrate_subagent_patch` then its own `commit_reviewed`. Isolated Git
+  children copy current eligible source contents, including uncommitted inputs;
+  isolation never identifies a project as Ouroboros's body. Preserve source and
+  baseline through capture, cleanup and integration; apply only the child's delta.
+  `external_workspace` verifies shared effects without re-applying; external Git
+  authority and patch-only `self_worktree` stay distinct. A capture base proves
+  no authorship: use `vcs_diff`. Genesis directories are durable deliverables;
+  until `.gitignore` exists, small text build outputs ride `workspace.patch`,
+  bounded per file and by Git's binary verdict, never by a total source-patch cap.
+  One pure reducer owns canonical/replica terminal fields for copyback and
+  effective reads; changes need stale-replica tests at BOTH seams
+  (`tests/test_available_subagents_runtime_review_fixes.py`). `forward_to_worker`
+  follows shared addressability (ARCHITECTURE §6).
 - A custody row carries its owner's kind; every sweep, audit and counter over
   custody rows states which kinds it covers. A review-owned run
   (`RunCustody.review_owned`) belongs to its panel — never the task's open

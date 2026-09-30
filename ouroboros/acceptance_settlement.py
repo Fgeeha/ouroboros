@@ -423,6 +423,8 @@ _VERSION_CLAUSES = {
 # closes as ``unpublished`` so the existing maintenance pass retries it.
 _LATE_UNPUBLISHED: set = set()
 _LATE_LOCK = threading.Lock()
+# Makes "is this notice already owed?" and its enqueue one step for every settler in this process.
+_LATE_NOTICE_LOCK = threading.Lock()
 
 
 def late_publication_owed(task_id: str, retry_key: str) -> bool:
@@ -605,7 +607,8 @@ def attach_late_acceptance_settlement(usage_ctx: Any, request: Any, wave: Dict[s
     the task's own review projection through the existing locked writer, and
     announced ONCE in the task's room through the existing terminal-delivery
     outbox (durably owed, keyed by ``delivery_id``; a second settlement of the
-    same wave finds nothing left to reconcile and announces nothing). The owner
+    same wave, concurrent or later, finds that notice already owed or delivered
+    and queues no second live copy). The owner
     sees it; the next turn reads it in chat history. The acceptance twin of plan
     review's historical supplement (docs/architecture/06-agent-core.md).
     """
@@ -620,7 +623,7 @@ def settle_acceptance_operation(usage_ctx: Any, *, retry_key: str, task_id: str,
     """Collect one wave of a terminal task purely, publish it and announce it once.
 
     Returns ``announced`` (publication read back, row enqueued), ``published``
-    (read back; the row was already delivered),
+    (read back; the row was already owed or delivered),
     ``settled`` (nothing was pending), ``pending`` (still in flight),
     ``unpublished`` (the canonical record or durable notice custody did not
     take the settlement; retry duty remains), ``source_unreadable`` (a published source exists but cannot
@@ -695,7 +698,7 @@ def enqueue_late_acceptance_settlement(usage_ctx: Any, task_id: str, retry_key: 
                                       result: Dict[str, Any], panel: Dict[str, Any]) -> str:
     """Owe the already-published fact, also after an old controller lost its outbox write."""
     from supervisor.terminal_delivery import (
-        ENQUEUE_ALREADY_DELIVERED, ENQUEUE_QUEUED, enqueue_terminal_delivery_outcome,
+        ENQUEUE_ALREADY_DELIVERED, ENQUEUE_QUEUED, enqueue_terminal_delivery_outcome, pending_deliveries,
     )
 
     root = _result_root(usage_ctx)
@@ -714,20 +717,27 @@ def enqueue_late_acceptance_settlement(usage_ctx: Any, task_id: str, retry_key: 
         from ouroboros.task_finalization import review_source_reader
 
         evidence["read"] = review_source_reader(task_id, evidence["source_ref"])
-    # The operation outlives the execution drive; replay belongs to the same
-    # canonical root as its publication and the supervisor's delivery registry.
-    outcome = enqueue_terminal_delivery_outcome(root, {
-        "type": "send_message", "chat_id": int(chat_id or 0), "task_id": task_id,
-        "text": str(late.get("note") or ""),
-        "role": "system", "system_type": LATE_SETTLEMENT_SYSTEM_TYPE,
-        "delivery_id": f"acceptance-late:{retry_key}",
-        # The verdict belongs inside the task's card, in its Reviews group, and
-        # stays one row across live delivery, outbox replay and history. The
-        # evidence pointer is neutral: it grants no action and starts no turn.
-        "progress_meta": {"card_row": "reviews", "card_row_id": f"acceptance-late:{retry_key}",
-                          "late_evidence": evidence},
-    }, event_queue=getattr(usage_ctx, "event_queue", None))
-    if outcome not in {ENQUEUE_QUEUED, ENQUEUE_ALREADY_DELIVERED}:
+    delivery_id = f"acceptance-late:{retry_key}"
+    with _LATE_NOTICE_LOCK:
+        # Every settler of one wave ends here: the drain's own collection, the
+        # last slot's callback (whose mailbox duty mark can arrive after the
+        # drain already announced), maintenance, an owner rejoin. A notice the
+        # outbox already owes has custody and replay, so no second live copy.
+        owed = any(row.get("delivery_id") == delivery_id for row in pending_deliveries(root))
+        # The operation outlives the execution drive; replay belongs to the same
+        # canonical root as its publication and the supervisor's delivery registry.
+        outcome = "" if owed else enqueue_terminal_delivery_outcome(root, {
+            "type": "send_message", "chat_id": int(chat_id or 0), "task_id": task_id,
+            "text": str(late.get("note") or ""),
+            "role": "system", "system_type": LATE_SETTLEMENT_SYSTEM_TYPE,
+            "delivery_id": delivery_id,
+            # The verdict belongs inside the task's card, in its Reviews group, and
+            # stays one row across live delivery, outbox replay and history. The
+            # evidence pointer is neutral: it grants no action and starts no turn.
+            "progress_meta": {"card_row": "reviews", "card_row_id": delivery_id,
+                              "late_evidence": evidence},
+        }, event_queue=getattr(usage_ctx, "event_queue", None))
+    if not owed and outcome not in {ENQUEUE_QUEUED, ENQUEUE_ALREADY_DELIVERED}:
         # Publication survived, but a live queue alone is not durable custody.
         # The operation pointer carries this retry duty across controller exit.
         return _unpublished(task_id, retry_key, "unpublished")

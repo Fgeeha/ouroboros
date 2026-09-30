@@ -335,7 +335,7 @@ def test_acting_worktree_add_and_remove_keep_tree_work_outside_the_lock(tmp_path
     monkeypatch.setattr(wt, "_force_rmtree", spy_rmtree)
     handle = wt.provision_worktree(repo_dir=target, task_id="acting1", worktree_root=snaps, data_dir=data)
     assert seen["worktree_add"] == (True, True) and seen["reset"] is False
-    assert (pathlib.Path(handle.path) / "tracked.txt").read_text(encoding="utf-8") == "one\n"  # HEAD content
+    assert (pathlib.Path(handle.path) / "tracked.txt").read_text(encoding="utf-8") == "one\ntwo\n"  # Current source content, including the parent edit
     assert _git(target, "rev-parse", "--verify", handle.branch).returncode == 0
     assert any(row.get("task_id") == "acting1" for row in wt.list_worktrees(data_dir=data))
 

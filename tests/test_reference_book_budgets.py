@@ -323,7 +323,9 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # carried separately from prior speech in the same previous-turn pointer.
     # 14100/14800 -> 17500: TZ2 binding authority and TZ3 Host retry custody
     # coexist in one current Host/Presence map; neither overwrites the other.
-    "docs/architecture/12-host-service-companions-and-chat-ids.md": 17500,
+    # +100: source-bound Presence peer mail and shared execution-observation contract.
+    # The existing lifecycle paragraph is replaced and condensed; no new store or transport.
+    "docs/architecture/12-host-service-companions-and-chat-ids.md": 17600,
     # 7764 -> 8600 (#1195): the fresh selected-subject + immutable peer projection
     # execution check (`skill_peer_inventory.py`, `skill_conflicts.py`) replaces
     # whole-inventory hashing; the chapter had no description of that seam to swap out.

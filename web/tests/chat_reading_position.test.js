@@ -290,6 +290,99 @@ test('a feed scrollbar drag ends with its own last scroll: later scrolls do not 
     assert.equal(f.reading.stick, false, 'a release without a feed drag decides nothing');
 });
 
+test('an animated downward key or wheel follows where its own scrolls leave the feed', t => {
+    const f = fixture(t);
+    const body = f.feed.ownerDocument.body;
+    f.reading.bindGestures(() => {});
+    f.reading.cancel();
+    Object.assign(f.feed, { scrollHeight: 1000, scrollTop: 100, clientHeight: 400 });
+    f.gesture({ type: 'pointerdown', target: { inFeed: true } });
+    // The engine has only begun animating End when the gesture's frame runs.
+    f.gesture({ type: 'keydown', key: 'End', target: body }); f.feed.scrollTop = 150; f.frame();
+    assert.equal(f.reading.stick, false, 'still moving, not yet at the live edge');
+    for (const top of [400, 600]) { f.feed.scrollTop = top; f.reading.scroll(); }
+    assert.equal(f.reading.stick, true, 'its last scroll reaches the live edge: follow');
+    f.gesture({ type: 'scrollend' });
+    f.gesture({ type: 'wheel', deltaY: -1 }); f.feed.scrollTop = 150; f.frame();
+    f.gesture({ type: 'wheel', deltaY: 1 }); f.feed.scrollTop = 320; f.frame();
+    for (const top of [380, 450]) { f.feed.scrollTop = top; f.reading.scroll(); }
+    f.gesture({ type: 'scrollend' }); f.frame(); f.frame();
+    assert.equal(f.reading.stick, false, 'an animation that ends short of the edge does not follow');
+    f.feed.scrollTop = 600; f.reading.scroll();
+    assert.equal(f.reading.stick, false, 'a frame after its scrollend a scroll alone decides nothing');
+    // WebKit reports scrollend after every step of an animated PageDown.
+    f.gesture({ type: 'wheel', deltaY: -1 }); f.feed.scrollTop = 100; f.frame();
+    f.gesture({ type: 'keydown', key: 'PageDown', target: body }); f.frame();
+    for (const top of [300, 500, 594]) {
+        f.feed.scrollTop = top; f.reading.scroll(); f.gesture({ type: 'scrollend' }); f.frame();
+    }
+    assert.equal(f.reading.stick, true, 'the step that lands at the live edge still decides');
+    f.frame();
+    f.feed.scrollTop = 300; f.reading.scroll();
+    assert.equal(f.reading.stick, true, 'once a frame passes without a step, a scroll decides nothing');
+    f.gesture({ type: 'keydown', key: 'PageUp', target: body }); f.frame();
+    f.feed.scrollTop = 600; f.reading.scroll();
+    assert.equal(f.reading.stick, false, 'an upward gesture owes no scrolls that could resume following');
+});
+
+test('a settled gesture ends only the scrolls it owed, not those a newer gesture has yet to deliver', t => {
+    const f = fixture(t);
+    const body = f.feed.ownerDocument.body;
+    f.reading.bindGestures(() => {});
+    f.reading.cancel();
+    Object.assign(f.feed, { scrollHeight: 1000, scrollTop: 100, clientHeight: 400 });
+    f.gesture({ type: 'pointerdown', target: { inFeed: true } });
+    // PageDown ends short of the live edge; End is pressed before that settle's frames run.
+    f.gesture({ type: 'keydown', key: 'PageDown', target: body }); f.frame();
+    f.feed.scrollTop = 300; f.reading.scroll(); f.gesture({ type: 'scrollend' });
+    f.gesture({ type: 'keydown', key: 'End', target: body });
+    f.frame(); f.frame(); f.frame();
+    // End's own scrolls arrive only now.
+    for (const top of [450, 600]) { f.feed.scrollTop = top; f.reading.scroll(); }
+    assert.equal(f.reading.stick, true, 'End reaches the live edge: follow');
+    f.reading.mutate(() => { f.feed.scrollHeight = 1100; }, { remoteContent: true });
+    assert.equal(f.feed.scrollTop, 1100, 'a new reply is followed');
+    f.gesture({ type: 'scrollend' }); f.frame(); f.frame();
+    f.feed.scrollTop = 300; f.reading.scroll();
+    assert.equal(f.reading.stick, true, 'End\'s own settle still ends what it owed');
+});
+
+test('reading inside a box ends what an earlier feed gesture still owes, not a scrollbar still held', t => {
+    const f = fixture(t);
+    f.feed.ownerDocument.defaultView = { getComputedStyle: node => ({ overflowY: node.overflowY || 'visible' }) };
+    const box = { inFeed: true, parentElement: f.feed, overflowY: 'auto', scrollTop: 200, scrollHeight: 1000, clientHeight: 400 };
+    const text = { inFeed: true, parentElement: box };
+    f.reading.bindGestures(() => {});
+    f.reading.cancel();
+    let at = 0;
+    const read = ({ inBox, beforeFrame = false }) => {
+        Object.assign(f.feed, { scrollHeight: 1000, scrollTop: 100, clientHeight: 400 });
+        // An animated wheel down the feed has only begun to move it.
+        f.gesture({ type: 'wheel', deltaY: 1, timeStamp: at += 1000 }); f.feed.scrollTop = 250;
+        if (!beforeFrame) f.frame();
+        const generation = f.reading.generation;
+        if (inBox) f.gesture({ type: 'wheel', deltaY: -1, target: text, timeStamp: at + 500 });
+        const cancelled = f.reading.generation !== generation;
+        f.frame();
+        f.feed.scrollTop = 600; f.reading.scroll(); // the rest of the feed's animation
+        const restored = f.restored();
+        f.reading.mutate(() => { f.feed.scrollHeight = 1100; }, { remoteContent: true });
+        return { stick: f.reading.stick, followed: f.feed.scrollTop === 1100, kept: f.restored() > restored, cancelled };
+    };
+    assert.deepEqual(read({ inBox: false }), { stick: true, followed: true, kept: false, cancelled: false },
+        'control: the feed gesture\'s own last scroll reaches the live edge');
+    assert.deepEqual(read({ inBox: true }), { stick: false, followed: false, kept: true, cancelled: false },
+        'reading up inside a box ends the feed animation\'s claim; no layout is cancelled');
+    assert.deepEqual(read({ inBox: true, beforeFrame: true }), { stick: false, followed: false, kept: true, cancelled: false },
+        'the same before the feed gesture\'s own frame has run');
+    Object.assign(f.feed, { scrollHeight: 1000, scrollTop: 100 });
+    f.gesture({ type: 'pointerdown', target: f.feed });
+    f.feed.scrollTop = 300; f.reading.scroll();
+    f.gesture({ type: 'wheel', deltaY: -1, target: text, timeStamp: at += 1000 }); f.frame();
+    f.feed.scrollTop = 600; f.reading.scroll();
+    assert.equal(f.reading.stick, true, 'a scrollbar still held goes on deciding where it leaves the feed');
+});
+
 test('a box gesture supersedes a ↓ still awaiting history; with nothing pending it cancels nothing', t => {
     const f = fixture(t);
     f.feed.ownerDocument.defaultView = { getComputedStyle: node => ({ overflowY: node.overflowY || 'visible' }) };

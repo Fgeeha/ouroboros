@@ -18,6 +18,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
   │   ├── modules/chat_decision.js, question_presentation.js, chat_render_batch.js, task_phase_chip.js, lifecycle_card.js ← Chat helpers: the typed decision (quiz) cards, one form for a Project question in its room and in its Main mirror, with one pure lifecycle projection shared by both (its Python twin: `project_dialogue.QUESTION_STATUS`); keyed timeline items, DOM patches, history-control presentation and reading anchors; pure desired-phase chip projection where terminal truth wins; skill lifecycle card state with best-effort polling
   │   ├── modules/chat_history.js, chat_history_replay.js, chat_reading_position.js ← Bounded per-chat pages with exact return handles; source-keyed replay without live-task authority; one reading intent (§3 Timeline ownership and ordering)
   │   ├── modules/delegated_activity.js ← Run/seq-based activity projection, Unicode fragment cuts, explicit preview gaps and retained-source links (§3 Child cards and executor presentation)
+  │   ├── modules/welcome_preference.js ← Main's host-owned empty state; copy from the hidden `welcome` preference (DESIGN "Chat authorship and System rows")
   │   ├── modules/project_answer.js ← Main's Project lifecycle rows: the fold of a mirrored final answer and the Project reference under every row (§3 Main rows)
   │   ├── modules/project_handoff.js ← Main-only transfer anchors: every converted card stays visible, at most one receipt row per `handoff_id` folds under the first visible card, shadows restored on eviction, phase from the existing census/task detail; `receiptNotice` words the typed receipt (§3 Project handoff receipts)
   │   ├── modules/project_reference.js ← the one control that points at a Project, and the only raiser of `ouro:open-project` (DESIGN "References and actions")
@@ -80,7 +81,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── version.py           ← Version string from the VERSION file with importlib.metadata fallback
       ├── secret_masking.py    ← Exact Settings/MCP wire-placeholder emitters/recognizers + top-level secret repair before env overlay and persistence (§7)
       ├── settings_integrity.py ← Task-local in-memory settings read view and strict settings-snapshot integrity pin; `OUROBOROS_SETTINGS_SHA256` enables the trust root (§7)
-      ├── credential_shapes.py ← Credential leaf names plus physical owner credential locations (§6 Credential fence and byte masking)
+      ├── credential_shapes.py ← Credential leaf names plus physical owner credential locations (§6 Credential mutation and diagnostic redaction)
       ├── update_channels.py   ← Closed Stable/QA/Development channel mapping and update-network defaults (§8)
       ├── update_letter.py     ← The update letter: `base..target` commit material plus README history rows (only bodies and the oldest row texts are bounded, and disclosed), one accounted LIGHT-slot call, `state/update_letter.json`, one projection shared by the Updates payload and the Runtime-context `official_update` fact (§7; §3 Updates)
       ├── colab_bootstrap.py   ← Google Colab source-mode bootstrap: official update source, stable local `ouroboros` branch, Drive-backed settings/data, personal origin, no-UI server command, native Telegram setup
@@ -175,7 +176,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── openrouter_attribution.py ← Canonical OpenRouter application attribution, centralized so forks do not compete under the same external application identity (§7)
       ├── openai_chat_custom.py ← Pure direct-OpenAI Chat function→custom codec: compact schemas, exact catalog binding, tool-choice projection, prior-call replay, canonical response normalization; no Responses transcript or second stored history
       ├── openai_chat_dispatch.py ← Direct-OpenAI Chat policy leaf: custom+requested reasoning first, exact-dialect fallback with the same reasoning, then task-local explicit `none` only when the physical-attempt rail still permits it; owns the bounded schema-error continuation
-      ├── request_wire_contract.py ← Exact-route request-profile actions and 14-day success-only evidence store; task-local `none` never teaches future dispatch (§6 Context fitting, retry, and compaction; §10 invariant 13)
+      ├── request_wire_contract.py ← Exact-route request-profile actions and 14-day success-only evidence store; profiles keep each function tool's absent/false/true/malformed `strict` state apart, so older collapsed-strictness evidence matches none; task-local `none` never teaches future dispatch (§6 Context fitting, retry, and compaction; §10 invariant 13)
       ├── request_wire_resolution.py ← Deterministic request-profile composition with source-predicated effort bounds/transitions; contradictions fail open to the requested effort with `conflict=True`
       ├── effort_evidence.py ← Live/recovered effort evidence: validate requested, prepared and reported; missing observations stay unknown, native ranking stays with the engine (§6)
       ├── request_wire_receipts.py ← Factory-bound wire candidates + semantic-success receipts (exact serializer digests; tool-choice semantics cannot change)
@@ -225,6 +226,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── headless_status.py ← Artifact and task lifecycle vocabulary shared by the headless owners
       ├── workspace_patch_rules.py ← Pure patch-exclusion rules (env/cache sets, junk regex, lockfiles, credential-shaped names); the I/O checks + `untracked_capture_veto_reason` stay in headless
       ├── workspace_patch_capture.py ← Workspace patch capture: the patch artifact, its manifest, and its git plumbing
+      ├── workspace_copies.py ← Git-copy source/baseline identity and own-body/legacy policy (§6 Delegated subagents)
       ├── coop_checkpoint.py   ← Quiescent checkpoint commits of cooperative trees, off the drain thread: only a MUTATIVE child's `write_root` qualifies (owner-attached folders never); credential-shaped files excluded + disclosed; a root mid merge/rebase/cherry-pick/revert is SKIPPED, because staging an interrupted operation consumes its MERGE_HEAD and commits a half-resolved tree (§5)
       ├── delegate_output.py ← Atomic full outputs delegated_runs/<run>.json (sha256/length), reader-bound delivered EOF coverage and delegate_run_output_consumed facts (§6 Terminal products and their reader)
       ├── delegate_activity.py ← Typed executor speech/problems/technical counts, source_handles/delegated_activity JSONL, emission-committed cursor and bounded terminal drain (§6 Delegated activity)
@@ -295,7 +297,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── subscription_install_presets.py ← Pure sibling install compilers from one normalized draft + one discovery snapshot; output is linear, unpinned, exact-discovery-backed, all-or-nothing (§2)
       ├── settings_setup_contract.py ← SSOT for the setup contract, derived bootstrap state, payload validation, and the `TOTAL_BUDGET` resolver authority `resolve_total_budget_usd`
       ├── owner_mailbox.py     ← Per-task user message mailbox (compat module name); revocation-aware drain and proven-empty peek; the closed task-message provenance set (`ancestor_task`, `peer_via_ancestor`, `system`, `descendant_task`, `independent_task`, `peer_task`)
-      ├── peer_roster.py       ← Host-listed independent roots as a worker reads them (pooled roots from `state/queue_snapshot.json`, direct roots from `direct_roots.json`, hidden-partition roots included): the addressability gate for `forward_to_worker` (descendant/peer/listed-root), the `[INDEPENDENT_ROOTS]` TAIL note (40 rows, the cut disclosed, with foci and recorded start/origin/waits) and the paginated `live_roots` catalogue (§6 Owner routing verbs)
+      ├── peer_roster.py       ← Host-listed roots from queue_snapshot/direct_roots (hidden included); forward_to_worker also admits source-bound inline Presence mailboxes without adding them to roots (§12). [INDEPENDENT_ROOTS] TAIL: 40 rows, cut disclosed, recorded focus/start/origin/waits; paginated live_roots (§6 Owner routing verbs)
       ├── launcher_bootstrap.py ← Bundle-to-repo bootstrap, launch-option parsing, managed sync and selected native-host artifact synchronization (used by launcher.py; §2)
       ├── launcher_onboarding.py ← First-run onboarding as the desktop launcher presents it (serves the gateway /onboarding page; §2)
       ├── launcher_server_reaper.py ← POSIX same-install server discovery, pre-signal descendant capture, root-first termination, live identity revalidation; PID-lock-owning launcher only (Runtime topology below)
@@ -345,13 +347,14 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── server_control.py    ← `restart_current_process` + `execute_panic_stop`
       ├── server_entrypoint.py ← CLI parsing + port binding helpers
       ├── server_runtime.py    ← Startup/onboarding wiring + WS liveness
-      ├── server_web.py        ← `NoCacheStaticFiles`, web-dir resolver and fixed-source `read_author_kit_assets(repo_dir)` for optional author-owned routes; no endpoint or cache
+      ├── server_web.py        ← Static/web roots and fixed-source `read_author_kit_assets(repo_dir)`; no endpoint/cache
       ├── server_process.py, server_liveness.py, server_maintenance.py, server_restart.py, server_owner_routing.py, server_routing_context.py ← Server leaves the composition root calls: the facts one server process shares with every leaf, including applied startup settings; wedge detection for the supervisor generation; the upkeep a generation owes the drive; restart operations (shutdown, the checkout-first manual Restart, the planned restart's engine-pin daemon stop; §9); where one owner message goes; the bounded facts one owner turn may address
+      ├── terminal_cost_reconciliation.py ← Usage recovery/projection (§6)
       ├── task_continuation.py ← Durable review continuation state
       ├── task_results.py      ← Durable task results `task_results/<id>.json`; the locked `task_acceptance_review_accounting` claim (minted at first physical reviewer dispatch; a claim without a recoverable terminal host run is UNKNOWN, never permission to re-dispatch); the read-only root review-capacity projection is WALLET and cancellation only (`root_task_id`, `cap_cycles`, `claimed_cycles`, `remaining_cycles`, `binding_seen`, `dedupe`, `state`, `reason`), no time axis (§6 Task acceptance)
       ├── task_result_schema.py ← Task-result schema admission: the `_schema_version` stamp, the classifier, and the quarantine an unstamped, future, malformed or retired-key row lands in
-      ├── task_status.py       ← Effective-status SSOT, lineage, bounded waits; worker-side `task_has_live_queue_ownership` (§10 invariant 14); the DESTRUCTIVE orphan predicate fails open toward liveness — an in-process direct actor or a missing/stale queue snapshot can never prove a task dead
-      ├── git_shell_policy.py  ← Structural git argv classifiers for the shell guards
+      ├── task_status.py       ← Effective status/lineage/waits; root/task/attempt-bound execution_owner and dated execution_observation separate lifecycle from liveness (§5); only pooled owners enter worker-boot orphan inference. task_has_live_queue_ownership: §10 invariant 14
+      ├── git_shell_policy.py  ← Shell Git argv checks
       ├── protected_artifacts.py ← Execute-only black-box policy for protected artifacts
       ├── shell_parse.py       ← Shared command/argv normalization and POSIX wrapper grammar; observed targets, not semantic permission judgments (§6 Safety and runtime mode)
       ├── argv_budget.py       ← Argv admission counts encoded bytes of argv PLUS environment (ARG_MAX charges both; per-arg `MAX_ARG_STRLEN`, Windows unit limit); asked by skill_exec before exec
@@ -359,7 +362,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── deliverables_paths.py ← Lexical + case-folded deliverables path views
       ├── tool_capabilities.py ← SSOT for the core/parallel-safe/untruncated/stateful-browser tool sets and the cognitive-memory tool class every Presence ceiling carries
       ├── tool_access.py       ← ToolProfile × ResourceRoot × Operation matrix, affordance map, closed-enum `required_capabilities` check
-      ├── tool_access_types.py, tool_access_roots.py, tool_access_paths.py, tool_access_user_files.py ← The access matrix behind that facade: the closed access vocabulary and policy matrix; who is acting and where each resource root physically lives; the physical path primitives; the `user_files` confinement with its secret-name policy
+      ├── tool_access_types.py, tool_access_roots.py, tool_access_paths.py, tool_access_user_files.py, tool_access_reads.py ← Matrix and physical roots; inherited reads, separate action authority (§6 Resource roots and physical file identity)
       ├── tool_policy.py       ← Round-one tool visibility (the sets live in tool_capabilities)
       ├── browser_policy.py    ← The browser tool's target and control-request policy: task-granted concrete origins, metadata/private/reserved refusals, the three-valued Ouroboros control-service identity (`runtime_service_kind`: proven kind / unknown / none); `tools/browser.py` keeps the Playwright lifecycle (§6 MCP and browser-facing external tools)
       ├── skill_payload_binding.py ← Skill payload targeting: `.seed-origin` distinguishes native vs external; read/list/search only for read profiles; bounded manifestless skill_publish recovery
@@ -408,7 +411,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       │   ├── update_progress.py ← Process-local stages owned by the synchronous update executor; status projection and WS invalidation, never recovery authority
       │   ├── schedules.py     ← Cron schedule HTTP surface
       │   ├── files.py         ← File Browser + chat upload
-      │   ├── ui_preferences.py ← `state/ui_preferences.json`: widget order, per-card start-mode overrides (`widget_start_mode`, values from `extension_ui_validation.WIDGET_START_MODES`), nested subagent expansion
+      │   ├── ui_preferences.py ← `state/ui_preferences.json`: widget order, per-card start-mode overrides (`widget_start_mode`, values from `extension_ui_validation.WIDGET_START_MODES`), nested subagent expansion, empty-Main `welcome` copy
       │   ├── models.py        ← Model catalog + provider probes + local-model lifecycle
       │   ├── extensions.py    ← extensions/skills HTTP surface (GET /api/extensions, GET /api/extensions/<skill>/manifest, GET /api/extensions/<skill>/module/<entry:path> — reviewed module sources served from the live loader registration, ALL /api/extensions/<skill>/<rest:path>, POST /api/skills/<skill>/toggle, POST /api/skills/<skill>/delete, POST /api/skills/<skill>/review, POST /api/skills/<skill>/grants)
       │   ├── extension_receipts.py ← Process-qualified extension index/toggle/reconcile receipt projection
@@ -429,7 +432,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── tools/               ← Auto-discovered tool plugins (registry.py owns discovery; frozen module list for packaged builds)
       │   ├── registry.py      ← Tool registry SSOT: loads tool modules, exposes schemas, executes safely; owns the shell-guard/process-tool membership sets
       │   ├── core.py          ← File/data tools (read_file, write_file, list_files) + code search and digest helpers
-      │   ├── core_file_tools.py, core_secret_paths.py, core_artifacts.py ← Core-tool leaves: the read/list file tools with the shared resource-access helpers; the restricted-subagent physical read-denial policy (owner secrets/control state, data roots, repository credential locations, listing redaction); the verbs that put something in front of a human (§6 Credential fence and byte masking)
+      │   ├── core_file_tools.py, core_secret_paths.py, core_artifacts.py ← File reads/lists; delegated action/runtime helpers; human artifact delivery (§6 Credential mutation and diagnostic redaction)
       │   ├── shell.py         ← Process tools `run_command`/`run_script` (in-process `_active_subprocesses` tracking; §9)
       │   ├── shell_guards.py  ← Shared process-path inspection helpers and retained target extractors; process admission is owned by registry_guard_process (§6)
       │   ├── registry_core.py, registry_guards.py, registry_guard_process.py, tool_context.py ← The registry's leaves: the execution authority (load, schemas, safe dispatch); the host-owned pre-dispatch guards (capability/resource, managed-update and skill-payload constraints); process admission over the prepared target with post-execution observations (§6 Safety and runtime mode); and `ouroboros/tools/tool_context.py`, the concrete `ToolContext` + `BrowserState` (its protocol is `contracts/tool_context.py`)
@@ -661,7 +664,7 @@ Bundled resources use the CLI / Headless Boundary lookup order rather than assum
 │   │   ├── update_letter.json     ← the last update letter (key = base/target/channel/ref, state, text, `last_good`); kept after apply and projected against the live HEAD (update_letter.py)
 │   │   ├── projects.json          ← Project registry: immutable id/chat identity, working folder, lifecycle/routing fence, revision; tombstones are durable and never age-pruned
 │   │   ├── project_task_bindings.json ← schema v1 root↔Project bindings with REQUIRED typed origin; one-way enrichment; tombstoning never removes a binding
-│   │   ├── ui_preferences.json    ← owner-local layout preferences + monotonic project_seen_revision ACKs
+│   │   ├── ui_preferences.json    ← owner-local layout/`welcome` prefs + monotonic project_seen_revision ACKs
 │   │   ├── cancel_intents.json    ← compact locked projection of ACTIVE cancel intents; the forensic trail is typed cancel_intent rows in logs/supervisor.jsonl, never read back (cancel_intents.py)
 │   │   ├── terminal_deliveries.json ← delivery-id dedupe, emitted-byte receipts, pending outbox (terminal_delivery.py)
 │   │   ├── extension_companions.json ← runtime snapshot of live companion processes
