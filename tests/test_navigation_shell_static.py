@@ -119,7 +119,23 @@ def test_project_panel_composer_and_welcome_contracts():
     send_group_css = css.split(".chat-send-group {", 1)[1].split(
         ".chat-send-group[data-busy", 1
     )[0]
-    assert "if (!isMain) return;" in chat_js  # ensureWelcomeMessage is main-only
+    # The empty-Main greeting is host copy: mounted for Main only, withdrawn when a
+    # recent read starts and decided by that read's own coverage (a failed read keeps it
+    # withdrawn), set as text and never minted as a chat bubble. What counts as an empty
+    # feed is one rule shared with the history loading state. Its preference is hidden:
+    # Settings has no editor.
+    welcome_js = _read("web/modules/welcome_preference.js")
+    assert "welcome" not in _read("web/modules/settings.js").lower()
+    assert "welcome" not in _read("web/modules/settings_ui.js").lower()
+    assert "const emptyWelcome = isMain ? mountEmptyChatWelcome(messagesDiv) : null;" in chat_js
+    sync_start = chat_js.split("historySyncPromise = (async () => {", 1)[1].split("await fetchHistory(null);", 1)[0]
+    assert "emptyWelcome?.historyPending();" in sync_start
+    assert "emptyWelcome?.historyRead(data.window?.complete === true);" in chat_js
+    assert "lastHistorySyncSucceeded = false;\n                emptyWelcome?.historyRead(false);" in chat_js
+    assert "import { feedIsEmpty } from './chat_render_batch.js';" in welcome_js
+    assert "if (!confirmedEmpty || !copy || !feedIsEmpty(messages)) {" in welcome_js
+    assert "node.lastElementChild.textContent = copy;" in welcome_js
+    assert "Ouroboros has awakened" not in chat_js and "addMessage" not in welcome_js
     assert "padding: 10px 292px" not in css
     assert "right: 8px;\n    bottom: 6px" not in send_group_css
     assert ".chat-text-row:focus-within" in css
