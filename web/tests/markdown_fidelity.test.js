@@ -43,6 +43,27 @@ test('a fenced block is the author text in both compact consumers', () => {
     assert.equal(renderMarkdown(source, { inlineHeadingBreaks: true }), expected);
 });
 
+test('punctuation labels and normal fence whitespace preserve code and preview boundaries', () => {
+    for (const label of ['c++', 'c#', 'objective-c', 'shell-session', 'md-js', 'f#', '<tag>&']) {
+        for (const ending of ['\n', '   \n', '\t\r\n']) {
+            const source = '```' + label + ending + FENCE_BODY + '\n```';
+            assert.equal(renderMarkdown(source), `<pre><code>${escaped(FENCE_BODY)}\n</code></pre>`);
+            assert.equal(renderMarkdown(source, { inlineHeadingBreaks: true }), renderMarkdown(source));
+            assert.equal(joinMarkdownHeadings(source), '```' + label + '\n' + FENCE_BODY + '\n```');
+        }
+    }
+});
+
+test('an inline backtick mention cannot steal the next fenced block', () => {
+    for (const lead of ['Wrap it in ```python``` blocks.\nLater:', 'Use ``` fences like this\n**bold** here']) {
+        const html = renderMarkdown(lead + '\n```python\nx = *a*\n```\n**after**');
+        assert.deepEqual([...html.matchAll(/<pre><code>([\s\S]*?)<\/code><\/pre>/g)].map((m) => m[1]), ['x = *a*\n']);
+        assert.ok(html.endsWith('<strong>after</strong>'));
+    }
+    // Attributes remain outside the compact grammar; no claim of CommonMark parity.
+    assert.doesNotMatch(renderMarkdown('```python title=demo\n# prose\n```'), /<pre>/);
+});
+
 test('an inline code span is literal and keeps formatting around it', () => {
     assert.equal(
         renderMarkdown('Use `**b** *i* ~~s~~ [x](https://e.com/) |a|` with **care** and `&amp;`'),

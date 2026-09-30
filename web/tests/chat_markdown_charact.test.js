@@ -132,8 +132,8 @@ test('joinMarkdownHeadings follows the renderer heading rule and leaves other ma
     assert.equal(joinMarkdownHeadings('```sh\n# comment\nls\n```\nafter'), '```sh\n# comment\nls\n```\nafter');
     assert.equal(joinMarkdownHeadings('## Done —\nnext'), 'Done —\nnext');
     assert.equal(joinMarkdownHeadings('## Title\n```\ncode\n```'), 'Title\n```\ncode\n```');
-    // One fence grammar with the renderer: an indented opener is a fence; a non-word
-    // info string (`md-js`) is not a fence for either, so its `##` line is a heading.
+    // One fence grammar with the renderer: indented and punctuation-labelled
+    // openers keep the code literal in both views.
     assert.equal(joinMarkdownHeadings('   ```md\n## code\n```\nafter'), '   ```md\n## code\n```\nafter');
     // The renderer opens a fence on ANY line ending in ```<info>: a prefixed opener too,
     // and the fence closes on the next line that contains ```.
@@ -145,13 +145,12 @@ test('joinMarkdownHeadings follows the renderer heading rule and leaves other ma
     assert.match(renderMarkdown('```md\n## code\nmore'), /md-h2/);
     assert.equal(joinMarkdownHeadings('## Title\n```md\nmore'), 'Title —\n```md\nmore');
     assert.equal(joinMarkdownHeadings('## Title\n```md\nmore\n```'), 'Title\n```md\nmore\n```');
-    // Fence delimiters follow the renderer byte for byte: trailing blanks or a CR after
-    // the info string make it ordinary text (no fence) for both.
-    // (…so `## code` is a heading and the stray ``` under it is text it is followed by)
-    assert.equal(joinMarkdownHeadings('```md   \n## code\n```'), '```md\ncode —\n```');
-    assert.doesNotMatch(renderMarkdown('```md   \n## code\n```'), /<pre>/);
-    assert.equal(joinMarkdownHeadings('```md\r\n## code\r\n```'), '```md\ncode —\n```');
-    assert.doesNotMatch(renderMarkdown('```md\r\n## code\r\n```'), /<pre>/);
+    // Trailing blanks and CRLF are ordinary fence syntax; the plain preview
+    // normalizes line endings and trailing whitespace while preserving the code markers.
+    assert.equal(joinMarkdownHeadings('```md   \n## code\n```'), '```md\n## code\n```');
+    assert.match(renderMarkdown('```md   \n## code\n```'), /<pre>/);
+    assert.equal(joinMarkdownHeadings('```md\r\n## code\r\n```'), '```md\n## code\n```');
+    assert.match(renderMarkdown('```md\r\n## code\r\n```'), /<pre>/);
     // Linear on hostile brackets: 40k unmatched `[` inside one heading line.
     const brackets = Date.now(); joinMarkdownHeadings(`## ${'['.repeat(40000)}\nnext`);
     assert.ok(Date.now() - brackets < 500, 'link projection must stay linear');
@@ -161,10 +160,10 @@ test('joinMarkdownHeadings follows the renderer heading rule and leaves other ma
     // An entity-like literal is visible as typed on the raw path (9 characters).
     assert.equal(joinMarkdownHeadings(`## ${'q'.repeat(72)}&abcdefg;\nnext`), `${'q'.repeat(72)}&abcdefg;\nnext`);
     assert.equal(joinMarkdownHeadings(`## ${'q'.repeat(71)}&abcdefg;\nnext`), `${'q'.repeat(71)}&abcdefg; —\nnext`);
-    // (its `##` line is a heading; the stray closing ``` right after it is a fence line, so no separator)
-    assert.equal(joinMarkdownHeadings('```md-js\n## code\n```'), '```md-js\ncode —\n```'); // the trailing ``` has no closer: text
+    // A punctuation-labelled closed fence is code; an unclosed one remains prose.
+    assert.equal(joinMarkdownHeadings('```md-js\n## code\n```'), '```md-js\n## code\n```');
     assert.equal(joinMarkdownHeadings('```md-js\n## code\ntext'), '```md-js\ncode —\ntext');
-    assert.match(renderMarkdown('```md-js\n## code\n```'), /md-h2/);
+    assert.doesNotMatch(renderMarkdown('```md-js\n## code\n```'), /md-h2/);
     assert.doesNotMatch(renderMarkdown('   ```md\n## code\n```\nafter'), /md-h2/);
     // Stage-correct visibility: on the rendered path an unmatched `*` is a visible
     // character (80 x + `*` = 81 → prose); on the raw path a literal `<…>` or `&amp;`

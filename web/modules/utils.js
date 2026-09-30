@@ -507,13 +507,15 @@ function headingOrProse(cls, text, breakAfter = false, restore = undefined) {
         ? `<strong class="${cls}">${text}</strong>${breakAfter ? '<br>' : ''}` : text;
 }
 
-// The renderer's fence grammar (`/```(\w*)\n([\s\S]*?)```/`), line by line on the
-// ORIGINAL lines: a line ending in ``` plus a word-only info string right before
-// the newline opens a fence, whatever precedes it — trailing blanks or a CR make it
-// ordinary text, exactly as for the renderer — PROVIDED a later line closes it (the
-// renderer's regex needs the closer; an unclosed opener is ordinary text); the next
-// line containing ``` closes it. `md-js` opens nothing.
-const FENCE_OPEN = /```\w*$/;
+// One compact fence grammar for rendering and both plain previews: an optional
+// whitespace-free language label (no backticks), trailing spaces/tabs, then LF or
+// CRLF. Punctuation in c++, c# or objective-c is part of the label. More prose
+// after a blank is not an info label: accepting it would pair an inline ``` with
+// a later code fence. Prefixed/indented openers and the next-``` closer keep their
+// existing semantics; an opener without a later closer remains ordinary text.
+const FENCE_START = '```[^\\s`]*[\\t ]*\\r?';
+const FENCE_OPEN = new RegExp(FENCE_START + '$');
+export const MARKDOWN_FENCED_CODE = new RegExp(FENCE_START + '\\n([\\s\\S]*?)```', 'g');
 const FENCE_CLOSE = /```/;
 
 /**
@@ -595,7 +597,7 @@ const MARKDOWN_LINK = /(!?)\[([^\]]+)\]\([ \t]*((?:[^()\s]|\([^()\s]*\))+)(?:[ \
 export function renderMarkdown(text, { inlineHeadingBreaks = false } = {}) {
     let html = escapeHtmlText(text);
     const code = codeStash(html);
-    html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (_, _info, body) => code.token(`<pre><code>${body}</code></pre>`));
+    html = html.replace(MARKDOWN_FENCED_CODE, (_, body) => code.token(`<pre><code>${body}</code></pre>`));
     // One pass for both span forms: a double-backtick span may contain backticks.
     html = html.replace(CODE_SPAN, (_, _tick, body) => code.token(`<code class="inline-code">${body}</code>`));
     html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');

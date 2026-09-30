@@ -593,10 +593,12 @@ preference when it opens and on every reconnect; there is no file watcher.
     included), and no formatting rule reaches inside it. A rich answer
     reads code as its Markdown parser does. The compact renderer keeps the
     promise for its own narrower grammar only: a fence opened by three
-    backticks, an optional one-word language and a line break, closed by
-    the next three backticks; and a code span of one or two backticks
-    around text on one line. Other code forms (a span across lines, a
-    longer backtick run, a `~~~` or indented block) are outside that
+    backticks, an optional language label with no whitespace or backticks
+    (`c++`, `c#`, `objective-c` included), optional trailing spaces or tabs,
+    and LF or CRLF, closed by the next three backticks; and a code span of
+    one or two backticks around text on one line. Other code forms (info
+    attributes after a space, a span across lines, a longer backtick run,
+    a `~~~` or indented block) are outside that
     grammar, and the compact renderer does not promise them literal. Rich
     prose reads one stored entity layer (`&amp;` shows `&`); an entity never
     creates structure, and raw HTML stays literal text.

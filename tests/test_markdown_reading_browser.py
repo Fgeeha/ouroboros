@@ -106,7 +106,7 @@ def compact_wide_table(runs):
 
 COMPACT_WIDE = compact_wide_table(8)
 SKILL_REVIEW = (
-    f"# Skill review: demo\n\nReviewers: alpha\n\n## Findings\n\n```\n{FENCE_BODY}\n```\n\n"
+    f"# Skill review: demo\n\nReviewers: alpha\n\n## Findings\n\n```c++\n{FENCE_BODY}\n```\n\n"
     f"### Evidence\n\n{COMPACT_NARROW}\n\n#### Timings\n\n{COMPACT_WIDE}\n"
 )
 ROWS = [
@@ -528,7 +528,7 @@ def test_compact_consumers_show_the_same_code(reading_ui):
         document.querySelector('#chat-messages').append(host);
         const code = host.querySelector('.chat-live-line-body pre > code');
         return [code.textContent, code.children.length];
-    }""", f"Output:\n```\n{FENCE_BODY}\n```\nDone")
+    }""", f"Output:\n```c#\n{FENCE_BODY}\n```\nDone")
     assert timeline == [FENCE_BODY + "\n", 0]
 
 
