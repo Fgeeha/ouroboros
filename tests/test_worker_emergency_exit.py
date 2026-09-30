@@ -353,11 +353,14 @@ def test_wait_rejects_live_child_at_original_bound(monkeypatch):
     from ouroboros import process_containment
 
     clock, pauses = iter((10.0, 10.0, 13.0)), []
-    monkeypatch.setattr(time, "monotonic", lambda: next(clock))
-    monkeypatch.setattr(time, "sleep", pauses.append)
-    monkeypatch.setattr(platform, "pid_is_alive", lambda _pid: True)
-    monkeypatch.setattr(process_containment, "pid_is_zombie", lambda _pid: False)
-    verdict = wait_test_child_stop(123)
+    # Windows closes the call-phase proactor before fixture teardown; it needs
+    # the real clock, so the finite fake must end within the test body.
+    with monkeypatch.context() as probe:
+        probe.setattr(time, "monotonic", lambda: next(clock))
+        probe.setattr(time, "sleep", pauses.append)
+        probe.setattr(platform, "pid_is_alive", lambda _pid: True)
+        probe.setattr(process_containment, "pid_is_zombie", lambda _pid: False)
+        verdict = wait_test_child_stop(123)
     assert verdict["child_stopped"] is False and pauses == [.01]
     with pytest.raises(AssertionError, match="'child_stopped': False"):
         _assert_frozen_child_stop(verdict, lambda: {"after_verdict": "stopped too late"})

@@ -281,6 +281,8 @@ def _record_and_emit_empty_response(
         "_last_llm_error": _short_error_text(log_msg), "execution_status": status,
         "reason_code": reason, "_last_llm_error_kind": kind,
     })
+    from ouroboros.loop_transport import stamp_owner_provider_message
+    stamp_owner_provider_message(accumulated_usage, body_error)  # a body error's own sentence; a blank glitch has none
     accumulated_usage.get("_last_llm_call_meta", {}).update(failure_code=kind)
     return event_type, is_provider_glitch, permanent_body_error
 
@@ -678,16 +680,13 @@ def _exception_provider_message(exc: Exception, safe_error: str = "") -> str:
     cloud.ru content-filter ("guardrails") block vs an ``Extra inputs are not
     permitted`` reasoning_content echo. ``provider_code`` alone cannot tell them
     apart, so surface the body message (sanitized + truncated) into the durable
-    event for the owner. Pure read of ``exc.body``/repr; never changes routing."""
-    body = _exception_body(exc)
-    if isinstance(body, dict):
-        nested = body.get("error")
-        if isinstance(nested, dict) and str(nested.get("message") or "").strip():
-            return sanitize_tool_result_for_log(str(nested.get("message")))[:600]
-        if str(body.get("message") or "").strip():
-            return sanitize_tool_result_for_log(str(body.get("message")))[:600]
-    text = str(safe_error or "").strip()
-    return sanitize_tool_result_for_log(text)[:600] if text else ""
+    event for Logs, never the owner row. Pure read of ``exc.body``/repr; never changes routing."""
+    body = _exception_body(exc)  # always a dict
+    nested = body.get("error") if isinstance(body.get("error"), dict) else {}
+    for text in (nested.get("message"), body.get("message"), str(safe_error or "").strip()):
+        if str(text or "").strip():
+            return sanitize_tool_result_for_log(str(text))[:600]
+    return ""
 
 
 def _provider_code_kind(provider_code: str) -> str:
@@ -990,7 +989,9 @@ def _record_llm_call_error(
     else:
         ctx.accumulated_usage.pop("_last_llm_retry_after_sec", None)
         ctx.accumulated_usage.pop("_last_llm_reset_at", None)
-    for key, value in (("_last_llm_provider_message", provider_message), ("_last_llm_status_code", classification.status_code),
+    from ouroboros.loop_transport import stamp_owner_provider_message
+    stamp_owner_provider_message(ctx.accumulated_usage, error)  # the event above keeps the diagnostic provider_message
+    for key, value in (("_last_llm_status_code", classification.status_code),
                        ("_last_llm_provider_code", classification.provider_code)):
         if value:
             ctx.accumulated_usage[key] = value
@@ -1437,7 +1438,8 @@ def call_llm_with_retry(
             context_fit_event_fields = _context_fit_event_fields(accumulated_usage) if physical_context is not None else {}
             _take_custom_receipts(usage, msg, accumulated_usage)
             for stale in ("_last_llm_error", "_last_llm_error_kind", "_last_llm_retry_same_request",
-                          "_last_llm_status_code", "_last_llm_provider_code", "_last_llm_resource_refusal"):
+                          "_last_llm_status_code", "_last_llm_provider_code", "_last_llm_provider_message",
+                          "_last_llm_provider_fields", "_last_llm_provider_message_cut", "_last_llm_resource_refusal"):
                 accumulated_usage.pop(stale, None)
             cost, display_model, provider, cost_estimated = _normalize_usage_cost(usage, model=model, use_local=use_local)
             accumulated_usage["_observed_route"] = observed_route_stamp(usage)

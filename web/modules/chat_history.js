@@ -11,6 +11,13 @@ export function historyIslandAtEdge(feed, ids, historyNodes) {
     return unambiguous && bottom >= rect.top && bottom <= rect.bottom + 80;
 }
 
+/** A span keeps its byte coordinates while the newest read's chain (`head`) lists
+ * its own last witness: rotation appends one, a replaced or removed earlier
+ * segment changes all. */
+export function sameHistoryChain(head, span) {
+    return typeof span?.chain === 'string' && String(head?.chain).split('.').includes(span.chain.split('.').at(-1));
+}
+
 /** Coverage is byte delivery, never chronology, shared row identity or EOF.
  * The recent read supplies the horizon. A clean overlapping re-read can heal
  * a failed span; evicted bodies and saved descriptors cannot certify bytes.
@@ -24,10 +31,7 @@ export function historyCoverage(recent, pages = []) {
         const delivered = [recent, ...pages].filter(value => value?.v === 1 && value.view === recent.view)
             .map(value => value.spans?.[source]);
         // The newest read lists prefix witnesses through its trailing segments.
-        // A span keeps its coordinates while its own last witness is listed:
-        // rotation appends one, a replaced or removed earlier segment changes all.
-        const listed = new Set(String(head.chain).split('.'));
-        const sameChain = span => typeof span?.chain === 'string' && listed.has(span.chain.split('.').at(-1));
+        const sameChain = span => sameHistoryChain(head, span);
         const valid = span => span && sameChain(span) && Array.isArray(span.gaps)
                 && Number.isSafeInteger(span.from) && Number.isSafeInteger(span.to)
                 && span.from >= 0 && span.from <= span.to;

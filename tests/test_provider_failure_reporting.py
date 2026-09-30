@@ -801,12 +801,6 @@ def test_explicit_terminal_5xx_remains_retryable():
         assert result.retry_same_request is True
 
 
-def test_provider_failure_hint_formats_detail():
-    hint = _provider_failure_hint({"_last_llm_error": "  AuthenticationError('401 invalid_api_key')  "})
-
-    assert hint == " Last provider error: AuthenticationError('401 invalid_api_key')"
-
-
 def test_provider_failure_hint_empty_without_error():
     assert _provider_failure_hint({}) == ""
 
@@ -846,7 +840,8 @@ def test_claudexor_display_reaches_error_and_terminal_without_retry(tmp_path, mo
     assert "private-body" not in event["error"]
     assert ("remote_context_overflow" in [row["type"] for row in rows]) is (kind == "context_overflow")
     hint = _provider_failure_hint(usage)
-    assert f"provider_code={vendor}" in hint and f"parameter={parameter}" in hint
+    assert f'The provider reported error code "{vendor}" and parameter "{parameter}"' in hint
+    assert "The provider said" not in hint and "provider_code=" not in hint and "private-body" not in hint
     assert provider_recovery_hint(usage) == provider_recovery_hint({**usage, "_last_llm_error": repr(error)})
 
 

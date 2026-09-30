@@ -1,4 +1,4 @@
-"""Compact, durable identity for owner-visible subagent messages."""
+"""Compact, durable identity for owner-visible subagent and task-card messages."""
 
 from __future__ import annotations
 
@@ -24,6 +24,23 @@ SUBAGENT_MESSAGE_FIELDS: tuple[str, ...] = (
     "model",
     "executor_route",
 )
+
+# The host's two named placements of a task-keyed row inside its task's card.
+CARD_ROW_PLACEMENTS: tuple[str, ...] = ("timeline", "reviews")
+
+
+def is_task_card_message(meta: Mapping[str, Any] | None) -> bool:
+    """Whether a delivered row belongs inside a task card, not the conversation feed.
+
+    Both are declared facts, never a reading of the text: the host's placement
+    (``card_row``) and a child task's own lineage (``delegation_role`` — the
+    child speaks to its parent, whose card shows it). They hold whether or not a
+    page has that card loaded, so neither is a new conversation message for the
+    Project unread revision (DESIGN "Project unread dot").
+    """
+    source = meta if isinstance(meta, Mapping) else {}
+    return (source.get("card_row") in CARD_ROW_PLACEMENTS
+            or str(source.get("delegation_role") or "").strip().lower() == "subagent")
 
 
 def executor_observation_meta(
