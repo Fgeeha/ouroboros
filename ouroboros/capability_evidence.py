@@ -173,10 +173,9 @@ def is_known(evidence: Any, *, require_fresh: bool = False) -> bool:
 
     The SSOT for "does this record count as evidence at all". ``require_fresh``
     additionally rejects a STALE record — one past its TTL that the probe could not
-    re-verify (an expired cache read on the no-fetch hot path, or a prior record kept
-    across a provider outage). ``probe`` already documents that contract ("a stale or
-    absent record then reads as unknown"); stating it HERE is what keeps every caller
-    from restating it, or forgetting to.
+    re-verify (an expired remote cache read on the no-fetch hot path, or a prior
+    record kept across a provider outage). Callers share this predicate rather
+    than restating the known/fresh distinction.
 
     Accepts any evidence-shaped record (``status`` / ``window_tokens`` / ``stale``),
     so a surface that carries the same fields — e.g. ``reviewer_window.ReviewerWindow``

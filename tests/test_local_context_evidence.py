@@ -1,4 +1,5 @@
 """Local capacity is a serving-instance fact, independent of training and health."""
+import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
@@ -11,12 +12,35 @@ from ouroboros.llm_local import local_context_limits
 
 @pytest.fixture
 def manager(monkeypatch, tmp_path):
+    monkeypatch.delenv("OUROBOROS_IN_WORKER", raising=False)
     manager = local_model.LocalModelManager()
     manager._proc = SimpleNamespace(pid=123, poll=lambda: None)
     manager._status = "ready"
     monkeypatch.setattr(local_model, "get_manager", lambda: manager)
     monkeypatch.setattr(config, "DATA_DIR", tmp_path)
     return manager
+
+
+@pytest.fixture
+def main_plan(manager, monkeypatch, tmp_path):
+    from ouroboros import context_fit
+
+    monkeypatch.setattr(config, "runtime_settings", lambda: {"OUROBOROS_MODEL_CONTEXT_WINDOWS": {}})
+    monkeypatch.setenv("OUROBOROS_MODEL_CONTEXT_WINDOWS", "{}")
+    monkeypatch.setattr(context_fit, "reference_doc_sections", lambda *a, **k: [])
+
+    def build(mode="max", text="source", *, use_local=True, resolver=None):
+        core = context_fit.ContextCore(
+            base_prompt="p", bible_md="b", architecture_md="a", development_md="d",
+            semi_stable_text="s", dynamic_text="y", user_content_json=json.dumps(text),
+            docs_need_development=False,
+        )
+        return context_fit.build_context_fit_plan(
+            SimpleNamespace(drive_root=tmp_path), core,
+            {"id": "local-fit", "model": "local-fixture", "use_local_model": use_local},
+            preferred_mode=mode, route_resolver=resolver or context_fit.resolve_context_fit_route,
+        )
+    return build
 
 
 @pytest.mark.parametrize("unknown", [{}, {"context_length": None}, {"context_length": 0},
@@ -143,8 +167,12 @@ def test_serving_measurement_keeps_input_and_instance_binding(manager, monkeypat
     assert manager.measure_prepared_input(payload)["supported"] is False
 
 
-@pytest.mark.parametrize("window", [0, 16384])
-def test_running_local_dispatch_uses_serving_capacity_without_cloud_fallback(manager, monkeypatch, window):
+@pytest.mark.parametrize("window", [0, 16384, 65536])
+def test_running_local_dispatch_uses_serving_capacity_without_cloud_fallback(
+    manager, main_plan, monkeypatch, tmp_path, window,
+):
+    from ouroboros.context_fit import measure_main_fit
+
     manager._context_length = 131072 if window else 4096
     manager._serving_context_length = window
     client = LLMClient(api_key="unused")
@@ -161,14 +189,83 @@ def test_running_local_dispatch_uses_serving_capacity_without_cloud_fallback(man
         chat=SimpleNamespace(completions=SimpleNamespace(create=create))))
     monkeypatch.setattr(client, "_resolve_remote_target", lambda *a, **k: pytest.fail("cloud fallback"))
     text = "Keep this source intact. " * 1000  # Exceeds the fictitious 4096 allowance.
-    message, usage = client.chat(messages=[{"role": "user", "content": text}],
+    plan = main_plan(text=text)
+    messages = plan.messages_for("max")
+    fit = measure_main_fit(plan, messages, None, drive_root=tmp_path,
+                           profile="owner_max", rendered_mode="max", round_id="local-fit:round:2")
+    assert fit.action == "send"
+    assert fit.measurement.capacity_total_tokens == (window or None)
+    assert plan.max_projection.fits_known_window is (True if window else None)
+    message, usage = client.chat(messages=messages,
                                  model="local-fixture", max_tokens=65536, use_local=True)
     assert message["content"] == "local answer"
     assert usage["provider"] == "local"
     assert len(sent) == 1
     assert sent[0]["messages"][-1]["content"] == text
-    assert sent[0]["max_tokens"] == (4096 if window else 2048)
+    assert sent[0]["max_tokens"] == (window // 4 if window else 2048)
+    assert plan.output_reserve_tokens == fit.measurement.response_reserve_tokens == sent[0]["max_tokens"]
     assert not ce._load(config.DATA_DIR)["probes"]
+
+
+@pytest.mark.parametrize("window", [16384, 65536])
+@pytest.mark.parametrize("mode", ["max", "low", "nano"])
+def test_local_main_forecast_keeps_real_pressure_and_nano_headroom(manager, main_plan, tmp_path, mode, window):
+    from ouroboros.context_budget import NANO_MIN_HEADROOM_TOKENS
+    from ouroboros.context_fit import measure_main_fit
+
+    manager._serving_context_length = window
+    plan = main_plan(mode)
+    messages = plan.messages_for(mode)
+    fit = measure_main_fit(plan, messages, None, drive_root=tmp_path,
+                           profile="owner_" + mode, rendered_mode=mode, round_id="local-fit:round:2")
+    assert fit.action == "send"
+    assert plan.projection(mode).fits_known_window is True
+    assert plan.output_reserve_tokens == local_context_limits(65536)[1]
+    assert fit.measurement.response_reserve_tokens == (
+        NANO_MIN_HEADROOM_TOKENS if mode == "nano" else plan.output_reserve_tokens)
+    messages.append({"role": "user", "content": "pressure " * 100000})
+    pressured = measure_main_fit(plan, messages, None, drive_root=tmp_path,
+                                profile="owner_" + mode, rendered_mode=mode, round_id="local-fit:round:3")
+    assert pressured.action == "reclaim_once"
+    assert pressured.measurement.capacity_deficit_tokens > 0
+
+
+@pytest.mark.parametrize("mode", ["max", "low", "nano"])
+def test_main_forecast_rebinds_remote_local_restart_and_unknown(manager, main_plan, monkeypatch, tmp_path, mode):
+    from ouroboros import context, context_fit, loop
+    from ouroboros.context_budget import NANO_MIN_HEADROOM_TOKENS
+    from ouroboros.tools.registry import ToolRegistry
+
+    def resolve(task, **kwargs):
+        if task["use_local_model"]:
+            return context_fit.resolve_context_fit_route(task, allow_fetch=False)
+        return ({"model": task["model"], "provider": "openai", "use_local": False},
+                SimpleNamespace(route_fp="remote-route", status="confirmed", stale=False, window_tokens=131072))
+
+    monkeypatch.setattr(context, "_context_fit_route", resolve)
+    plan = main_plan(mode, use_local=False, resolver=resolve)
+    assert plan.output_reserve_tokens == 65536
+    registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
+    registry._ctx.task_id = "route-switch"
+    registry._ctx.event_queue = None
+    messages = plan.messages_for(mode)
+    for local, window, reserve in [(True, 16384, 4096), (True, 65536, 16384),
+                                   (True, 0, 2048), (False, 131072, 65536)]:
+        manager._serving_context_length = window
+        plan, active = loop._rebind_context_fit_plan(
+            plan, registry, messages, model="local-fixture" if local else "remote-fixture",
+            use_local=local, preferred_mode=mode, tool_schemas=[], model_role="fallback:0",
+        )
+        assert active == plan.preferred_mode == plan.initial_mode == mode
+        assert plan.output_reserve_tokens == reserve
+        assert plan.window_tokens == window
+        assert plan.projection(mode).fits_known_window is (True if window else None)
+        assert ce.is_known(plan) is bool(window)
+        fit = context_fit.measure_main_fit(plan, messages, None, drive_root=tmp_path,
+            profile="owner_" + mode, rendered_mode=mode, round_id="route-switch:round:2")
+        assert fit.action == "send"
+        assert fit.measurement.capacity_total_tokens == (window or None)
+        assert fit.measurement.response_reserve_tokens == (NANO_MIN_HEADROOM_TOKENS if mode == "nano" else reserve)
 
 
 def test_actual_local_connection_error_is_not_a_synthetic_overflow(manager, monkeypatch):

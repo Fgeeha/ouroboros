@@ -730,8 +730,8 @@ class LocalModelManager:
         """A worker's view of the server its server process owns.
 
         Workers never own the server. The owner publishes the ready instance's
-        service binding; it counts only while that exact process (pid, birth,
-        command hash) is live on the loopback port this worker dispatches to,
+        service binding; it counts only while that exact process (pid and
+        platform-specific fingerprint) is live on this worker's loopback port,
         and its window is that process's own ``--n_ctx`` argument.
         """
         unknown = {"context_window": None, "confirmed": False,
@@ -789,7 +789,7 @@ class LocalModelManager:
             return {**unknown, "reason": f"measurement_unavailable:{type(error).__name__}"}
 
     def get_context_length(self) -> int:
-        """Reported model metadata, or 0 if unknown; not serving capacity or health."""
+        """Metadata (launch value while loading), or 0; not serving capacity or health."""
         try:
             self._context_length = max(0, int(
                 self._context_length or self.health_check().get("context_length") or 0))
