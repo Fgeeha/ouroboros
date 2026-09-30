@@ -7,14 +7,25 @@
 # path filter for every other job. The documentation-only skip is decided inside
 # the shared lane from the event diff, not here.
 #
-# No schedule and no new cron: this is a push event only. Manual runs and the
-# existing `v*` tag checks stay in ci.yml, which calls the same reusable job.
+# No schedule and no new cron. This UI-only manual entry can select one diagnostic;
+# existing full manual/tag checks in ci.yml call the same reusable job unchanged.
 # A red run here reports the branch state; it does not block merges by itself.
 name: UI browser (ouroboros push)
+run-name: ${{ inputs.diagnostic && inputs.diagnostic != 'full' && format('PARTIAL DIAGNOSTIC UI - {0}', inputs.diagnostic) || 'UI browser full lane' }}
 
 on:
   push:
     branches: [ouroboros]
+  workflow_dispatch:
+    inputs:
+      diagnostic:
+        description: Full lane or a partial UI-only diagnostic (never full-suite proof)
+        type: choice
+        default: full
+        options:
+          - full
+          - viewport
+          - inflight
 
 permissions:
   contents: read
@@ -28,6 +39,9 @@ permissions:
 
 jobs:
   ui-smoke:
+    name: ${{ inputs.diagnostic && inputs.diagnostic != 'full' && format('PARTIAL DIAGNOSTIC UI - {0}', inputs.diagnostic) || 'ui-smoke' }}
     uses: ./.github/workflows/ui-browser.yml
+    with:
+      diagnostic: ${{ inputs.diagnostic || 'full' }}
     permissions:
       contents: read
