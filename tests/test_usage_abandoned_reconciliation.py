@@ -1,15 +1,16 @@
 """Existing terminal maintenance closes abandoned work without inventing prices."""
 
-from contextlib import contextmanager
 import hashlib
 import json
 import threading
 import time
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
 
-from ouroboros import server_maintenance as maintenance, usage_accounting as usage
+from ouroboros import server_maintenance as maintenance
+from ouroboros import usage_accounting as usage
 from ouroboros.observability import persist_call
 from ouroboros.task_results import load_task_result, write_task_result
 from ouroboros.usage_ledger import is_abandoned_settlement
@@ -309,7 +310,7 @@ def test_a_daemon_failure_never_starves_a_later_retained_local_receipt(env, monk
 @pytest.mark.parametrize("failed_task", ["child", "root"])
 @pytest.mark.parametrize("compact", [False, True])
 def test_failed_projection_retries_from_settled_or_compacted_truth(env, monkeypatch, failed_task, compact):
-    from ouroboros import usage_compaction, _usage_rows_memo
+    from ouroboros import _usage_rows_memo, usage_compaction
     from supervisor import events_task_done
 
     _terminal(env)
@@ -453,7 +454,9 @@ def test_projection_uses_one_indexed_breakdown_for_distinct_owners(env, monkeypa
     monkeypatch.setattr(usage, "usage_breakdown", aggregate)
     maintenance._reconcile_abandoned_usage(env.root)
     assert aggregations == [{}], "one bulk view, no per-owner full-ledger filters"
-    assert sorted(reads) == sorted(owners), "ownership reads are cached across attempts"
+    # Recovery eligibility is cached across attempts; projection independently
+    # re-reads those two open owners after recovery, never reusing permission.
+    assert sorted(reads) == sorted([*owners, "child-1", "child-2"])
     for task_id in owners:
         stored = load_task_result(env.root, task_id)
         expected = events_task_done._authoritative_terminal_cost(task_id, stored, stored, {}, env.root)
