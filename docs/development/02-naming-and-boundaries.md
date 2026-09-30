@@ -396,13 +396,13 @@ scope policy, safety, and context/memory flows; core capability must not acquire
 a hidden OpenRouter or second-provider dependency. (CHECKLISTS item 2(h) and
 ARCHITECTURE both point here; this is the SSOT sentence.)
 
-Tool-schema changes are provider-contract changes: every shipped built-in schema
-must pass general JSON Schema and the known cross-provider subset over the
-complete registry, trusted integration CI sends that registry in one bounded tool
-canary per supported provider family/API surface in the transport Main uses, and
-pull-request CI stays secretless. Malformed native arguments and invalid schemas
-stay red, diagnostics limited to structural facts, hashes and parse position;
-never add a prose parser, provider hop or unbounded retry to make that contract
+Tool-schema changes are provider-contract changes: validate the full shipped
+registry against JSON Schema and the cross-provider subset, then run the trusted
+bounded canaries through Main's transports; PR jobs stay secretless. Malformed
+arguments and invalid schemas stay red. Console diagnostics contain structural
+facts, hashes and parse positions; selected CI artifacts add safe synthetic
+arguments/attempt evidence, excluding credentials and private native data.
+Never add a prose parser, provider hop or unbounded retry to make the contract
 green (ARCHITECTURE §8 "CI topology").
 
 Adding or changing a provider updates one coherent route contract:

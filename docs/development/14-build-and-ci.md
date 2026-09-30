@@ -76,6 +76,14 @@ installed `ouroboros` distribution is refused explicitly. Owners:
 `test_candidate_checkout`, `test_candidate_checkout_consumers`, `test_test_environment`, `test_ui_fixture_lifecycle`,
 `test_ui_candidate_server`, `test_browser_ci_scope`.
 
+### Reading CI failure evidence
+
+Provider/UI summaries report Actions producer outcomes separately from testcase counts: a passing case cannot override a nonzero session exit. Skips and unavailable credentials remain explicit. Upload/report failures say `diagnostics_incomplete` and do not alter release eligibility. `tests.ci_evidence`, registered after isolation, writes safe projections with `--ci-evidence-dir`; raw JUnit stays outside uploads in `runner.temp/ci-private`.
+
+Provider failures retain every attempt, including earlier retries, with labelled logical, persisted request, received tool-field, partial-assembly and normalized views. Successes are compact. Omitted/redacted views are explicit; original nonstream bodies may be unavailable, and partial assembly cannot exonerate the assembler. Private native data and exception bodies are excluded.
+
+Only the synthetic viewport/inflight fixtures capture screenshot, trace and event/geometry facts before close on failure; capture/cleanup errors preserve the first exception. Dispatch `ui-browser-push.yml` with `viewport` or `inflight` for Linux PARTIAL DIAGNOSTIC checks without paid calls or browser-tool tests. `full` retains the collection guard and existing assertions/gestures/waits; partial success is never full proof. The accounting test checks causal loop progress under lock contention, not a wall-time tick rate.
+
 ### The commit gate mirrors the CI split
 
 `ouroboros/preflight_runner.py::run_hermetic_pytest` mirrors CI in one disposable checkout and scrubbed temporary data root: the node test lane (`cd web && node --test tests/*.test.js`, content-keyed — a candidate without web tests never requires node, while an active web suite cannot silently disappear when node is missing), then the same two logical pytest passes (parallel `not serial`, then flag-free `serial`). The browser no-undef check has two layers: the dependency-free acorn walker in that suite (`web/tests/no_undef.test.js`) is the hermetic gate's, and both CI jobs additionally run ESLint's `no-undef` (`web/eslint.config.js`, exact-pinned, installed with `npm ci`) as an independent second opinion — CI-only, never part of the gate. `LANE_EXCLUSION_EXPR` and `PARALLEL_PASS_FLAGS` are executable SSOTs pinned against both CI jobs; the candidate is captured as one hardened worktree-vs-`HEAD` binary diff, and a capture or apply failure is the typed `PREFLIGHT_CANDIDATE_ASSEMBLY` hard block, never a test failure. The `pyproject.toml` `addopts` line is the single home of the per-test timing report (`--durations=25 --durations-min=1.0`), prepended to every argv, so the same slowest-test evidence appears locally, in both CI jobs and in both gate passes. Contributor rules:

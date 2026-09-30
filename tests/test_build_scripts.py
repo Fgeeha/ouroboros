@@ -1239,7 +1239,8 @@ def test_only_the_browser_push_workflow_drops_the_path_filter():
 
     push = yaml.safe_load((_REPO_PATH / ".github/workflows/ui-browser-push.yml").read_text(encoding="utf-8"))
     trigger = push.get("on", push.get(True))
-    assert list(trigger) == ["push"], "the push lane adds no schedule and no new cron"
+    assert list(trigger) == ["push", "workflow_dispatch"], "the UI-only entry adds no schedule or paid lane"
+    assert trigger["workflow_dispatch"]["inputs"]["diagnostic"]["options"] == ["full", "viewport", "inflight"]
     assert trigger["push"]["branches"] == ["ouroboros"]
     assert "paths" not in trigger["push"] and "paths-ignore" not in trigger["push"]
     assert push["jobs"]["ui-smoke"]["uses"] == "./.github/workflows/ui-browser.yml"
