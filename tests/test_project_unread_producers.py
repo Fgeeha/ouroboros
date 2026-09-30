@@ -199,3 +199,34 @@ def test_every_counted_message_is_stored_before_its_revision_advances(room, monk
                                  options=[{"label": "Yes"}, {"label": "No"}], stake="release timing",
                                  assumption="continuing with the merge", task_id="root-1") == (True, "ok")
     assert stored == [1, 2, 3, 4, 5, 6], "each advance finds its own message already stored"
+
+
+@pytest.mark.parametrize("kind", ["text", "photo", "video", "document", "links", "quiz"])
+def test_failed_canonical_append_keeps_live_delivery_without_a_phantom_revision(room, monkeypatch, kind):
+    """Unread describes stored conversation; a failed log must not mint a revision for an old row."""
+    assert room.deliver("root-1", "stored answer") == 1
+    chat_log = room.root / "logs" / "chat.jsonl"
+    initial = chat_log.read_bytes()
+    append = message_bus.append_jsonl
+    send = {
+        "text": lambda: message_bus.send_with_budget(room.chat_id, "new reply", task_id="root-1"),
+        "photo": lambda: room.bridge.send_photo(room.chat_id, b"png", caption="new photo"),
+        "video": lambda: room.bridge.send_video(room.chat_id, b"mp4", caption="new video"),
+        "document": lambda: room.bridge.send_document(room.chat_id, b"csv", filename="new.csv"),
+        "links": lambda: room.bridge.send_links(room.chat_id, [{"label": "Docs", "url": "https://example.com"}]),
+        "quiz": lambda: room.bridge.send_quiz(room.chat_id, quiz_id="write-q", question="Continue?",
+                                               options=[{"label": "Yes"}, {"label": "No"}], stake="next step",
+                                               assumption="continue", task_id="root-1"),
+    }[kind]
+    monkeypatch.setattr(message_bus, "append_jsonl", lambda path, *args, **kwargs:
+                        False if path == chat_log else append(path, *args, **kwargs))
+    before_frames = len(room.frames)
+    result = send()
+    assert (result is None if kind == "text" else result == (True, "ok")), result
+    assert len(room.frames) > before_frames, "existing best-effort live delivery stays available"
+    assert chat_log.read_bytes() == initial
+    assert room.revision() == 1, "the missing canonical row cannot be acknowledged as a new revision"
+    monkeypatch.setattr(message_bus, "append_jsonl", append)
+    send()
+    assert len(chat_log.read_text(encoding="utf-8").splitlines()) == 2
+    assert room.revision() == 2, "a later successful write still advances exactly once"

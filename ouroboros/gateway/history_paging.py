@@ -426,6 +426,9 @@ def latest_arrival(rows, page, data_dir, row_matches_thread, stored_chat_id, pro
     chain's frozen ``upper`` — or, holding none, passes the fact on, and the one
     that reaches the start of the chat without a gap proves the chat holds none
     below that ``upper`` (``latest_absent``); any other older page names nothing.
+    A legacy child's lineage may first appear on another page. This bounded
+    read can then name its final before the client places it in a child card;
+    that unavailable standalone node remains unacknowledged, not guessed read.
     """
     quiet = page["quiet"]
     if page["replayed"] and page["recent"]:

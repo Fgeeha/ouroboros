@@ -419,6 +419,10 @@ in this Project's conversation that you have not read* — never *something
 moved*. Activity dots, notifications, toasts, task controls and Stop/Panic keep
 their own meaning and are unaffected by it.
 
+Unread revisions follow successfully stored conversation rows. A failed write
+keeps the existing live-delivery behavior but cannot advance saved history's
+revision; this counter is not a guarantee of delivery durability.
+
 - **Counts:** each new standalone message in the conversation — an ordinary or
   proactive reply, a question, a root task's final answer, a standalone System
   message (a root task's terminal incident included), a delivered photo, video,
@@ -452,6 +456,8 @@ their own meaning and are unaffected by it.
   owner's own messages pushed past the newest page is read the same way. A room
   holding no standalone message is read at the bottom once the history reader
   reaches its clean start, through the bounded search or `Load more history`.
+  An old child's final whose lineage is available only on another history page
+  can also keep the dot after the readable conversation has been shown.
 - **Several clients** share one read cursor that only moves forward: a room read
   on one client stops showing the dot on the others at their next state
   refresh, and nothing read is shown unread again.

@@ -823,7 +823,7 @@ class LocalChatBridge:
             owner_id = int(load_state().get("owner_id") or 0)
         except Exception:
             owner_id = 0
-        log_chat(
+        if log_chat(
             "out",
             int(chat_id or 0),
             owner_id,
@@ -835,8 +835,8 @@ class LocalChatBridge:
             download_url=download_url,
             download_url_compat=download_url_compat,
             caption=str(caption or ""),
-        )
-        _advance_project_visible_revision(chat_id)
+        ):
+            _advance_project_visible_revision(chat_id)
         return True, "ok"
 
     def send_video(
@@ -885,7 +885,7 @@ class LocalChatBridge:
             owner_id = int(load_state().get("owner_id") or 0)
         except Exception:
             owner_id = 0
-        log_chat(
+        if log_chat(
             "out",
             int(chat_id or 0),
             owner_id,
@@ -897,8 +897,8 @@ class LocalChatBridge:
             download_url=download_url,
             download_url_compat=download_url_compat,
             caption=str(caption or ""),
-        )
-        _advance_project_visible_revision(chat_id)
+        ):
+            _advance_project_visible_revision(chat_id)
         return True, "ok"
 
     def send_document(
@@ -968,7 +968,7 @@ class LocalChatBridge:
             owner_id = int(load_state().get("owner_id") or 0)
         except Exception:
             owner_id = 0
-        log_chat(
+        if log_chat(
             "out",
             int(chat_id or 0),
             owner_id,
@@ -982,8 +982,8 @@ class LocalChatBridge:
             caption=str(caption or ""),
             size_bytes=size_bytes,
             download_url_compat=download_url_compat,
-        )
-        _advance_project_visible_revision(chat_id)
+        ):
+            _advance_project_visible_revision(chat_id)
         return True, "ok"
 
     def send_links(
@@ -1026,12 +1026,12 @@ class LocalChatBridge:
             owner_id = int(load_state().get("owner_id") or 0)
         except Exception:
             owner_id = 0
-        log_chat(
+        if log_chat(
             "out", int(chat_id or 0), owner_id, safe_title, ts=ts,
             task_id=str(task_id or ""), record_type="links",
             actions=validated, title=safe_title,
-        )
-        _advance_project_visible_revision(chat_id)
+        ):
+            _advance_project_visible_revision(chat_id)
         return True, "ok"
 
     def send_quiz(
@@ -1114,7 +1114,7 @@ class LocalChatBridge:
             owner_id = int(load_state().get("owner_id") or 0)
         except Exception:
             owner_id = 0
-        log_chat(
+        if log_chat(
             "out", int(chat_id or 0), owner_id, payload["question"], ts=ts,
             task_id=str(task_id or ""), record_type="quiz",
             quiz={
@@ -1126,8 +1126,8 @@ class LocalChatBridge:
                 "state": str(state or "open"),
                 **({"host_facts": str(host_facts)} if host_facts else {}),
             },
-        )
-        _advance_project_visible_revision(chat_id)
+        ):
+            _advance_project_visible_revision(chat_id)
         if self._broadcast_fn and msg.get("project_thread"):
             try:
                 from ouroboros.owner_quiz import quiz_states
@@ -1396,6 +1396,7 @@ def log_chat(
     require_write: bool = False,
     ensure_record_boundary: bool = False,
 ) -> Optional[dict]:
+    """Return the stored row, or None on a best-effort failure; require_write still raises."""
     root = drive_root if drive_root is not None else DATA_DIR
     if root:
         from pathlib import Path
@@ -1492,10 +1493,9 @@ def log_chat(
             root / "logs" / "chat.jsonl", record,
             require_lock=require_write, ensure_record_boundary=ensure_record_boundary,
         )
-        if require_write:
-            if not written:
-                raise RuntimeError("canonical message acceptance could not be persisted")
-            return record
+        if require_write and not written:
+            raise RuntimeError("canonical message acceptance could not be persisted")
+        return record if written else None
     elif require_write:
         raise RuntimeError("canonical message acceptance requires a data root")
 
@@ -1550,7 +1550,7 @@ def send_with_budget(chat_id: int, text: str, log_text: Optional[str] = None,
             progress_record.update(dict(progress_meta))
         append_jsonl(DATA_DIR / "logs" / "progress.jsonl", progress_record)
     else:
-        log_chat(
+        stored = log_chat(
             # S3 (Q4): a typed SYSTEM row persists as direction="system", the
             # role history replay already maps to a system rendering — so the
             # receipt survives reload as system, never as Ouroboros's speech.
@@ -1569,7 +1569,7 @@ def send_with_budget(chat_id: int, text: str, log_text: Optional[str] = None,
 
     if _text.strip() in ("", "\u200b"):
         return
-    if not is_progress and not is_task_card_message(progress_meta):  # card content changes a card
+    if not is_progress and stored and not is_task_card_message(progress_meta):  # only stored feed rows count
         _advance_project_visible_revision(chat_id)
     # Budget footers belong in dashboard/status flows, not every chat reply.
     full = _text
