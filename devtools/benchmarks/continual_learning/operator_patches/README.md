@@ -278,8 +278,9 @@ the external checkout root (a clean clone at `549998d` plus the patches above).
       host-visible predicate says the engine is quiet: no promotion request, evolution
       disarmed, no queued or running task, no active direct-chat activity (the post-restart
       auto-resume task runs as one), no pending or claimed restart marker, and no
-      unresolved restart obligation. It needs two consecutive quiet samples, has one 1800 s
-      budget per boundary, and on expiry logs the blockers and submits anyway.
+      unresolved restart obligation. It normally needs two consecutive quiet samples; its legacy-telemetry fallback
+      may proceed after an observed completed cycle with no known blockers. It has one
+      1800 s budget per boundary, and on expiry logs the blockers and submits anyway.
     - On the forced arm, evolution cycles come only from the benchmark boundary: the adapter
       sets `OUROBOROS_POST_TASK_EVOLUTION_CADENCE=off` there. Under the adapter's default
       `every_n:1` (the engine's own default is `llm`) every finished task, including the engine's own post-restart auto-resume task, files
@@ -289,10 +290,11 @@ the external checkout root (a clean clone at `549998d` plus the patches above).
       1800 s (engine default 120 s), a question cancelled by a restart is retried once, and
       submits wait out a pending restart. The earlier form of this gate held 8 submits in
       the 2026-09-03 treatment run.
-    - The answer is located with the same code as the official Claude Code and Codex
-      adapters (`_json_candidates` and `_parse_action_text`, copied verbatim and pinned by a
-      test) over the task's assistant transcript, so a complete answer followed by a
-      delivery-control envelope is not lost.
+    - The answer locator reuses `_json_candidates` and `_parse_action_text`, copied
+      verbatim from the official adapters and pinned by a test. Its live transcript walk
+      additionally skips an echo of the previous delivery and returns no result rather
+      than raising; the format-repair path uses `_parse_action_text`. This preserves a
+      complete answer followed by a delivery-control envelope.
     - The sales sandbox outlives the 2 h library default (`container_timeout` raised to
       24 h at import), which every stateful Ouroboros sales rollout of the submitted run
       exceeded; pgasawa/continual-learning-bench#22 proposes the bench-side fix.
@@ -306,7 +308,7 @@ the external checkout root (a clean clone at `549998d` plus the patches above).
       even where the Docker launcher passes the engine a default
       (`OUROBOROS_TASK_REVIEW_MODE` becomes `auto`).
 
-    Last end-to-end run: 2026-09-03, CL-Bench `run-all` groups
+    Contributor-reported last end-to-end run: 2026-09-03, CL-Bench `run-all` groups
     `2026-09-03T05-22-33.505496Z` (control) and `2026-09-03T05-22-33.505495Z` (treatment),
     `sales_prediction`, `openrouter/anthropic/claude-sonnet-4.6`,
     on Ouroboros 6.113.5 built from a local engine-fix branch (head `1ffa14d5`, not
@@ -323,20 +325,24 @@ the external checkout root (a clean clone at `549998d` plus the patches above).
     byte for byte on `a691cf3`;
     `tests/test_ouroboros_submission_ports.py` 140 passed and
     `tests/test_ouroboros_live_parity.py` 76 passed in the bench venv.
+
 ### Limited startup smoke (2026-09-30)
 
 The archived delta was applied unchanged to CL-Bench
-`a691cf3553f5475e45e4769b270fb26fdbec23e3` in a separate checkout. A short offline
-smoke passed on Python 3.13.13: adapter and bridge-entrypoint imports, the
-entrypoint's `--help`, construction and `respond` / `observe` / `reset` with one
-fixture provider response, and these two original patched tests:
+`a691cf3553f5475e45e4769b270fb26fdbec23e3` in a minimal, separate source copy
+(31 files fetched by their Git blob IDs, rather than a complete checkout). A short
+offline smoke passed on Python 3.13.13: adapter and bridge-entrypoint imports, the
+entrypoint's `--help`, and construction / `respond` / `observe` / `reset` using the
+adapter's `engine="llm"` plumbing mode and one fixture provider response. Neither
+the live bridge nor the Docker engine was started. These two original patched
+tests also passed:
 
 - `test_task_assistant_text_is_oldest_first_and_parser_prefers_latest_valid`
 - `test_format_repair_locates_answer_with_the_official_parser`
 
 The smoke completed in about four seconds with exit 0; both tests passed.
 External socket connections were disabled during the smoke and no model call
-was made. The environment used the historical direct dependency pins
+was made. The environment used five selected direct pins from that commit
 (`pydantic==2.12.5`, `litellm==1.81.6`, `openai==2.16.0`,
 `python-dotenv==1.2.1`, `pytest==9.0.2`), with newly resolved transitive versions;
 it was not a reconstruction of the September 3 environment.
