@@ -3,8 +3,8 @@
 Split verbatim out of ``tests/test_tool_capabilities.py`` by theme. This
 module owns the read-only subagent profile boundary: forbidden tools at
 execute time, the enabled extension tool it may still call, the
-allowed-resources block on web/external tools, and the secret-file,
-task-drive and skill-payload filters on its data and repo reads.
+allowed-resources block on web/external tools, parent-equivalent file reads,
+and task-drive and skill-payload admission.
 """
 import os
 import pathlib
@@ -172,7 +172,7 @@ def test_allowed_resources_block_web_and_external_tools(tmp_path, monkeypatch):
             extension_loader._tools.pop(tool_name, None)
 
 
-def test_local_readonly_subagent_data_read_denies_secret_files(tmp_path):
+def test_local_readonly_subagent_data_reads_and_listings_match_parent(tmp_path):
     from ouroboros.contracts.task_constraint import TaskConstraint
     from ouroboros.tools.registry import ToolContext, ToolRegistry
 
@@ -205,41 +205,25 @@ def test_local_readonly_subagent_data_read_denies_secret_files(tmp_path):
         )
     )
 
-    blocked = registry.execute("read_file", {"root": "runtime_data", "path": "settings.json"})
-    assert "DATA_READ_BLOCKED" in blocked
-    assert "DATA_READ_BLOCKED" in registry.execute("read_file", {"root": "runtime_data", "path": "settings.tmp"})
-    assert "DATA_READ_BLOCKED" in registry.execute("read_file", {"root": "runtime_data", "path": ".settings.json.tmp.123"})
-    assert "DATA_READ_BLOCKED" in registry.execute("read_file", {"root": "runtime_data", "path": ".env.local"})
-    assert "DATA_READ_BLOCKED" in registry.execute("read_file", {"root": "runtime_data", "path": "prod.env"})
-    assert "DATA_READ_BLOCKED" in registry.execute("read_file", {"root": "runtime_data", "path": "state/skills/weather/.grants.json.tmp.123"})
-    assert "DATA_READ_BLOCKED" in registry.execute("read_file", {"root": "runtime_data", "path": "state/skills/weather/review.json.lock"})
-    alias_result = registry.execute("read_file", {"root": "runtime_data", "path": "alias.txt"})
-    if (tmp_path / "alias.txt").exists():
-        assert "DATA_READ_BLOCKED" in alias_result
-    hardlink_result = registry.execute("read_file", {"root": "runtime_data", "path": "hardlink.txt"})
-    if (tmp_path / "hardlink.txt").exists():
-        assert "DATA_READ_BLOCKED" in hardlink_result
+    parent = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
+    for path in ("settings.json", "settings.tmp", ".settings.json.tmp.123", ".env.local", "prod.env",
+                 "state/skills/weather/grants.json", "state/skills/weather/.grants.json.tmp.123",
+                 "state/skills/weather/review.json.lock", "logs/events.jsonl", "alias.txt", "hardlink.txt"):
+        args = {"root": "runtime_data", "path": path}
+        child_result = registry.execute("read_file", args)
+        assert child_result == parent.execute("read_file", args)
+        if path in {"settings.json", "settings.tmp", ".settings.json.tmp.123", ".env.local", "prod.env"}:
+            assert "secret" in child_result
+    for path in (".", "state/skills/weather", "state/skills/weather/grants.json"):
+        args = {"root": "runtime_data", "path": path}
+        assert registry.execute("list_files", args) == parent.execute("list_files", args)
     listing = registry.execute("list_files", {"root": "runtime_data", "path": "."})
-    assert "settings.json" not in listing
-    assert "settings.tmp" not in listing
-    assert ".settings.json.tmp.123" not in listing
-    assert ".env.local" not in listing
-    assert "prod.env" not in listing
-    assert "alias.txt" not in listing
-    assert "hardlink.txt" not in listing
-    assert "secret/control" in listing
-    skill_state_listing = registry.execute("list_files", {"root": "runtime_data", "path": "state/skills/weather"})
-    assert "grants.json" not in skill_state_listing
-    assert ".grants.json.tmp.123" not in skill_state_listing
-    assert "review.json.lock" not in skill_state_listing
-    assert "secret/control" in skill_state_listing
-    assert "DATA_LIST_BLOCKED" in registry.execute("list_files", {"root": "runtime_data", "path": "state/skills/weather/grants.json"})
-    assert "DATA_LIST_BLOCKED" in registry.execute("list_files", {"root": "runtime_data", "path": "state/skills/weather/.grants.json.tmp.123"})
-    readable = registry.execute("read_file", {"root": "runtime_data", "path": "logs/events.jsonl"})
-    assert "{}" in readable
+    for name in ("settings.json", "settings.tmp", ".settings.json.tmp.123", ".env.local", "prod.env"):
+        assert name in listing
+    assert "hidden from this subagent" not in listing
 
 
-def test_local_readonly_subagent_repo_read_denies_secret_files(tmp_path):
+def test_local_readonly_subagent_repo_reads_include_git_and_credential_named_files(tmp_path):
     from ouroboros.contracts.task_constraint import TaskConstraint
     from ouroboros.tools.registry import ToolContext, ToolRegistry
 
@@ -272,48 +256,27 @@ def test_local_readonly_subagent_repo_read_denies_secret_files(tmp_path):
         )
     )
 
-    assert "REPO_READ_BLOCKED" in registry.execute("read_file", {"path": ".git/credentials"})
-    assert "READ_FILE_BLOCKED" in registry.execute("read_file", {"root": "system_repo", "path": ".git/credentials"})
-    assert "REPO_READ_BLOCKED" in registry.execute("read_file", {"path": ".git/config"})
-    assert "READ_FILE_BLOCKED" in registry.execute("read_file", {"root": "system_repo", "path": ".git/config"})
-    assert "REPO_READ_BLOCKED" in registry.execute("read_file", {"path": ".env.local"})
+    for root in ("active_workspace", "system_repo"):
+        assert "https://token@example.invalid" in registry.execute("read_file", {"root": root, "path": ".git/credentials"})
+        assert "[credential]" in registry.execute("read_file", {"root": root, "path": ".git/config"})
+        assert "TOKEN=secret" in registry.execute("read_file", {"root": root, "path": ".env.local"})
+        listing = registry.execute("list_files", {"root": root, "path": "."})
+        assert ".git/" in listing and ".env.local" in listing and "auth_token.json" in listing
+        assert "secret/control" not in listing
+    for path in ("alias.txt", "hardlink.txt"):
+        if (repo / path).exists():
+            assert "https://token@example.invalid" in registry.execute("read_file", {"path": path})
+    assert "credentials" in registry.execute("list_files", {"path": ".git"})
     assert "PROJECT_TOKEN_REPORT" in registry.execute("read_file", {"path": "auth_token.json"})
-    alias_result = registry.execute("read_file", {"path": "alias.txt"})
-    if (repo / "alias.txt").exists():
-        assert "REPO_READ_BLOCKED" in alias_result
-    hardlink_result = registry.execute("read_file", {"path": "hardlink.txt"})
-    if (repo / "hardlink.txt").exists():
-        assert "REPO_READ_BLOCKED" in hardlink_result
-    listing = registry.execute("list_files", {"path": "."})
-    assert ".git/" not in listing
-    assert ".env.local" not in listing
-    assert "auth_token.json" in listing
-    assert "alias.txt" not in listing
-    assert "hardlink.txt" not in listing
-    assert "src/" in listing
-    assert "secret/control" in listing
-    system_listing = registry.execute("list_files", {"root": "system_repo", "path": "."})
-    assert ".git/" not in system_listing
-    assert "auth_token.json" in system_listing
-    assert "secret/control" in system_listing
-    assert "REPO_LIST_BLOCKED" in registry.execute("list_files", {"path": ".git"})
-    readable = registry.execute("read_file", {"path": "src/public.py"})
-    assert "print('ok')" in readable
-    source_with_token_name = registry.execute("read_file", {"path": "src/skill_token.py"})
-    assert "safe source symbol" in source_with_token_name
-    secret_search = registry.execute("search_code", {"query": "LEAK_MARKER"})
-    assert "No matches found" in secret_search
-    assert "auth_token.json:" not in secret_search
+    assert "print('ok')" in registry.execute("read_file", {"path": "src/public.py"})
+    assert ".env.local:" in registry.execute("search_code", {"query": "LEAK_MARKER"})
     assert "auth_token.json:" in registry.execute("search_code", {"query": "PROJECT_TOKEN_REPORT", "path": "auth_token.json"})
-    public_search = registry.execute("search_code", {"query": "safe source symbol"})
-    assert "src/skill_token.py" in public_search
+    assert "src/skill_token.py" in registry.execute("search_code", {"query": "safe source symbol"})
     digest = registry.execute("query_code", {"op": "digest"})
-    # JSON contributes to inventory coverage but has no code-symbol digest row.
-    assert digest.startswith("Codebase Digest (3 files,")
-    assert ".env.local" not in digest
     assert "src/skill_token.py" in digest
-    cached = list((data / "state" / "code_intel").glob("*/inventory.json"))
-    assert not cached
+    assert not list((data / "state" / "code_intel").glob("*/inventory.json"))
+    parent = ToolRegistry(repo_dir=repo, drive_root=data)
+    assert digest == parent.execute("query_code", {"op": "digest"})
 
 
 def test_local_readonly_subagent_task_drive_and_skill_payload_filters(tmp_path):
@@ -344,9 +307,8 @@ def test_local_readonly_subagent_task_drive_and_skill_payload_filters(tmp_path):
     (task_root / "auth_token.json").write_text("ordinary task output", encoding="utf-8")
     assert "ordinary task settings" in registry.execute("read_file", {"root": "task_drive", "path": "settings.json"})
     assert "ordinary task output" in registry.execute("read_file", {"root": "task_drive", "path": "auth_token.json"})
-    denied = registry.execute_result("read_file", {"root": "runtime_data", "path": "settings.json"})
-    assert denied.code == "DATA_BLOCKED"
-    assert denied.text == "⚠️ DATA_READ_BLOCKED: this subagent cannot read secret or owner-control data files."
+    admitted = registry.execute_result("read_file", {"root": "runtime_data", "path": "settings.json"})
+    assert admitted.status == "ok" and '"secret"' in admitted.text
     traversal = registry.execute(
         "read_file",
         {"root": "skill_payload", "bucket": "external", "skill_name": "../../settings.json", "path": "."},

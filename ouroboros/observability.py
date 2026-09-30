@@ -127,8 +127,8 @@ _SECRET_KEY_SEGMENT_MARKERS: Tuple[Tuple[str, ...], ...] = (
     ("api", "key"),
     ("client", "secret"),
 )
-# Entropy token formats live in ``secret_masking`` (shared with the
-# tool-output egress masker); this module keeps its historical private name.
+# Diagnostic token formats live in ``secret_masking``; file-tool reads do not
+# alter source bytes. This module keeps its historical private name.
 _TOKEN_PATTERNS = SECRET_TOKEN_PATTERNS
 _SECRET_QUERY_PARAM_RE = re.compile(
     r"(?i)(?P<prefix>[?&])(?P<key>[A-Za-z_][A-Za-z0-9_.-]*)"

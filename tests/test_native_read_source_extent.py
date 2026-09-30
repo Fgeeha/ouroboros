@@ -109,18 +109,19 @@ def test_invalid_source_fact_never_mints_exact_range(tmp_path, changed):
     assert not {"source_revision", "source_start_char", "source_end_char", "text_sha256"} & extent.keys()
 
 
-def test_masked_reader_body_does_not_prove_original_source_was_delivered(tmp_path):
+def test_readonly_reader_proves_original_source_with_private_key_fixture(tmp_path):
     raw = b"safe preface\n-----BEGIN PRIVATE KEY-----\nmade-up-key-body\n-----END PRIVATE KEY-----\n"
     (tmp_path / "source.md").write_bytes(raw)
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path / "data",
                       task_constraint={"mode": "local_readonly_subagent"})
     full = _read_file(ctx, "source.md", root="system_repo")
-    assert ctx.last_read_view["source_masked"] is True
-    assert "made-up-key-body" not in full
+    assert ctx.last_read_view["source_masked"] is False
+    assert raw.decode() in full
     executor = _executor(tmp_path)
     executor._inspection_ctx = ctx
     extent = executor._read_extent(full, len(full))
-    assert "source_start_char" not in extent and "source_end_char" not in extent
+    assert extent["source_start_char"] == 0 and extent["source_end_char"] == len(raw)
+    assert extent["text_sha256"] == _sha(raw)
 
 
 def test_result_fitting_receipt_matches_exact_text_returned_to_the_reviewer(tmp_path):

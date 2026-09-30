@@ -55,13 +55,16 @@ def test_chat_header_decoration_does_not_clip_menu_and_system_actions_keep_gap(s
     actions = page.locator("#chat-messages .system-message-actions")
     assert actions.count() == 2
     for action in actions.all():
+        # A completion row's terminal-time note sits between its prose and the actions.
         metrics = action.evaluate("""el => {
-            const prose = el.previousElementSibling;
-            return {previous:prose.classList.contains('message') ? 'message' : prose.className, nested:!!el.closest('.message'),
-                gap:el.querySelector('button').getBoundingClientRect().top - prose.getBoundingClientRect().bottom,
+            const note = el.previousElementSibling, prose = note.previousElementSibling;
+            return {previous:note.className, prose:prose.classList.contains('message'), nested:!!el.closest('.message'),
+                note:note.getBoundingClientRect().top - prose.getBoundingClientRect().bottom,
+                gap:el.querySelector('button').getBoundingClientRect().top - note.getBoundingClientRect().bottom,
                 below:el.getBoundingClientRect().bottom - el.querySelector('button').getBoundingClientRect().bottom};
         }""")
-        assert metrics["previous"] == "message" and not metrics["nested"]
+        assert metrics["previous"] == "msg-provenance" and metrics["prose"] and not metrics["nested"], metrics
+        assert metrics["note"] == pytest.approx(8, abs=0.5), metrics
         assert metrics["gap"] == pytest.approx(12, abs=0.5), metrics
         assert metrics["below"] == pytest.approx(12, abs=0.5), metrics
     header = page.locator(".chat-page-header")

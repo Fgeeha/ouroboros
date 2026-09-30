@@ -686,7 +686,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         // Owner-facing mutative-subagents control shows the EFFECTIVE state when it
         // is binary-representable: an explicit value, or unset in advanced/pro
         // (every acting surface on = "On"). Unset in LIGHT mode is surface-aware
-        // (external_workspace/genesis stay on, self_worktree off — see
+        // (external work, including isolated project copies, stays on; own-body copies off — see
         // config.get_allow_mutative_subagents), so neither Off nor On is truthful
         // there: it displays as "Auto". Picking Auto saves the empty value
         // (collectBody maps any non-on/off segment to ''), so the mode default
