@@ -57,8 +57,7 @@ def _refused(q, monkeypatch, *, cron=False):  # noqa: F811
     _row(q, cron=cron, intent={"kind": "system_repo"}, metadata={"initiator": "consciousness"})
     q.queue.check_scheduled_tasks()
     row = _rows(q)["s1"]
-    assert row["occurrence"]["admission"] == "refused" and not q.pending
-    occurrence._FRESH_CLAIMS.clear()  # durable evidence, not the old Python claim
+    assert row["occurrence"]["phase"] == "claimed" and not q.pending
     monkeypatch.setenv("OUROBOROS_CONSCIOUSNESS_MAX_TASKS", "1")
     return row
 
@@ -124,10 +123,9 @@ def test_skill_resync_reconsiders_legacy_refused_claim_under_new_cron(q, monkeyp
         **task, "_admission_blocked": "worker_pool_disabled"})
     q.queue.check_scheduled_tasks()
     data = queue_schedules.load_schedule_store(q.root)
-    assert data["tasks"][0]["occurrence"]["admission"] == "refused"
+    assert data["tasks"][0]["occurrence"]["phase"] == "claimed"
     data["tasks"][0]["occurrence"].pop("fingerprint")
     queue_schedules._write_scheduled_tasks(data)
-    occurrence._FRESH_CLAIMS.clear()
     monkeypatch.setattr(q.queue, "enqueue_task", original)
     queue_schedules.sync_skill_schedules([_skill(tasks=(("daily", "0 12 * * *"),))], drive_root=q.root)
     q.queue.check_scheduled_tasks()
@@ -137,7 +135,7 @@ def test_skill_resync_reconsiders_legacy_refused_claim_under_new_cron(q, monkeyp
     assert len(q.pending) == 1
 
 
-@pytest.mark.parametrize("evidence", ["accepted", "unknown", "dispatch", "foreign", "unreadable"])
+@pytest.mark.parametrize("evidence", ["accepted", "unstarted", "dispatch", "foreign", "unreadable"])
 @pytest.mark.parametrize("cron", [False, True])
 @pytest.mark.parametrize("edit_timing", [False, True])
 def test_api_edit_preserves_accepted_or_unprovable_occurrence(q, monkeypatch, evidence, cron, edit_timing):  # noqa: F811
@@ -158,7 +156,7 @@ def test_api_edit_preserves_accepted_or_unprovable_occurrence(q, monkeypatch, ev
     else:
         with queue_schedules.schedule_transaction(q.root):
             data = queue_schedules.load_schedule_store(q.root)
-            data["tasks"][0]["occurrence"].pop("admission")
+            data["tasks"][0]["occurrence"].pop("admission", None)
             queue_schedules._write_scheduled_tasks(data)
     row["task"]["text"] = "edited future text"
     if edit_timing:
@@ -169,6 +167,13 @@ def test_api_edit_preserves_accepted_or_unprovable_occurrence(q, monkeypatch, ev
     q.queue.check_scheduled_tasks()
     if evidence == "accepted":
         assert [t["text"] for t in q.pending] == ["frozen original"]
+    elif evidence == "unstarted":
+        if edit_timing:
+            assert not q.pending
+            assert "occurrence" not in _rows(q)["s1"]
+        else:
+            assert len(q.pending) == 1 and "edited future text" in q.pending[0]["text"]
+            assert _rows(q)["s1"]["occurrence"]["token"] != held["token"]
     else:
         assert not q.pending
         if evidence != "dispatch":
@@ -256,3 +261,56 @@ def test_retired_row_does_not_authorize_invalid_redispatch(q, case):  # noqa: F8
                           schedule_admission=admission,
                           **({"_owner_hold": {"source": "owner"}} if case == "owner_hold" else {}))
     assert not occurrence.record_dispatch_possible(task)
+
+
+@pytest.mark.parametrize("control", ["disabled", "deleted", "future", "edited", "unchanged"])
+@pytest.mark.parametrize("legacy_refusal", [False, True])
+def test_legacy_unstarted_claim_obeys_current_controls(q, monkeypatch, control, legacy_refusal):  # noqa: F811
+    clock = _clock(monkeypatch)
+    row = _refused(q, monkeypatch)
+    claimed = copy.deepcopy(row["occurrence"])
+    with queue_schedules.schedule_transaction(q.root):
+        data = queue_schedules.load_schedule_store(q.root)
+        current = data["tasks"][0]
+        if legacy_refusal:
+            current["occurrence"]["admission"] = "refused"
+        if control == "deleted":
+            # Older versions deferred this delete because they had forgotten
+            # the process-local claim witness. It must not remain a ghost.
+            current.update(enabled=False, delete_requested_at=clock.instant.isoformat())
+        queue_schedules._write_scheduled_tasks(data)
+    if control == "disabled":
+        _api(q, {"action": "disable", "reason": "owner"}, action=True)
+    elif control in {"future", "edited"}:
+        row["task"]["text"] = "current authored text"
+        if control == "future":
+            row["trigger"]["run_at"] = (clock.instant + datetime.timedelta(days=1)).isoformat()
+        _api(q, row)
+    q.queue.check_scheduled_tasks()
+    q.queue.check_scheduled_tasks()
+    if control in {"disabled", "deleted", "future"}:
+        assert not q.pending and not load_task_result(q.root, claimed["task_id"])
+        if control == "deleted":
+            assert "s1" not in _rows(q)
+        else:
+            assert "occurrence" not in _rows(q)["s1"]
+    else:
+        assert len(q.pending) == 1
+        task = q.pending[0]
+        if control == "unchanged":
+            assert task["id"] == claimed["task_id"]
+            assert task["metadata"]["schedule_occurrence"]["token"] == claimed["token"]
+        else:
+            assert task["id"] != claimed["task_id"] and "current authored text" in task["text"]
+
+
+def test_deferred_unstarted_delete_is_finished_during_admission_recheck(q, monkeypatch):  # noqa: F811
+    _clock(monkeypatch)
+    row = _refused(q, monkeypatch)
+    prepared = occurrence.prepare(occurrence.view(row))
+    with queue_schedules.schedule_transaction(q.root):
+        data = queue_schedules.load_schedule_store(q.root)
+        data["tasks"][0].update(enabled=False, delete_requested_at="2026-09-27T12:00:00+00:00")
+        queue_schedules._write_scheduled_tasks(data)
+    occurrence.admit([prepared])
+    assert not q.pending and "s1" not in _rows(q)

@@ -318,7 +318,7 @@ and 23 (`delegated_transport`), both critical. The imperatives:
   One pure reducer owns canonical/replica terminal fields for copyback and
   effective reads; changes need stale-replica tests at BOTH seams
   (`tests/test_available_subagents_runtime_review_fixes.py`). `forward_to_worker`
-  still targets validated running/queued tasks in the current lineage.
+  follows shared addressability (ARCHITECTURE §6).
 - A custody row carries its owner's kind; every sweep, audit and counter over
   custody rows states which kinds it covers. A review-owned run
   (`RunCustody.review_owned`) belongs to its panel — never the task's open

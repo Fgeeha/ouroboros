@@ -138,6 +138,7 @@ def test_existing_paid_or_unknown_panel_collects_after_calendar_closes(late, tmp
 ])
 def test_worker_public_adapter_uses_venue_authority(late, tmp_path, monkeypatch, venue, evidence, buy):
     """Worker maps are empty even while the supervisor's original writer lives."""
+    import queue
     from supervisor import queue as task_queue, workers
     f = delivered(tmp_path, monkeypatch)
     before = copy.deepcopy(load_task_result(f.root, f.tid)['acceptance_debt'])
@@ -164,6 +165,7 @@ def test_worker_public_adapter_uses_venue_authority(late, tmp_path, monkeypatch,
         (f.root / 'state' / f'{name}.json').write_text(
             '{' if selected and evidence == 'invalid' else json.dumps(payload))
     ctx = _caller(f)
+    ctx.event_queue = queue.Queue()  # This consumer owns a live notification sink.
     source = _source(ctx)
     # A split worker reads the canonical authority, never its private data copy.
     ctx.drive_root = f.worker
@@ -172,6 +174,9 @@ def test_worker_public_adapter_uses_venue_authority(late, tmp_path, monkeypatch,
         until(lambda: len(late.calls) == 3)
         until(lambda: not review_operation._LIVE)
         assert result['status'] in {'pending', 'announced', 'published', 'settled'}, result
+        notices = [event for event in list(ctx.event_queue.queue)
+                   if event.get('system_type') == 'acceptance_late_settlement']
+        assert len(notices) == 1 and notices[0]['task_id'] == f.tid
     else:
         reason = 'control_authority_unavailable' if venue == 'pooled' and evidence == 'invalid' else 'historical_writer_still_live'
         assert result['reason'] == reason, result
