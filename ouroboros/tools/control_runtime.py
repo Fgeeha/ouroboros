@@ -224,13 +224,89 @@ def _update_scratchpad(ctx: ToolContext, content: str) -> str:
     return f"OK: scratchpad block appended ({len(content)} chars, ts={block.get('ts', '?')[:16]})"
 
 
-def _send_user_message(ctx: ToolContext, text: str, reason: str = "") -> str:
-    """Send a separate owner reply without completing the ongoing task."""
+def _main_notice_refusal(ctx: ToolContext, chat_id: object) -> str:
+    """Why this caller may not address Main, or "" when it may.
+
+    Main is the owner's own conversation. A delegated child answers its parent,
+    and a Presence or agent-to-agent turn speaks for an external conversation;
+    none of them gains a Main voice through this argument.
+    """
+    from ouroboros.contracts.chat_id_policy import HIDDEN_CHAT_ID, is_a2a_chat_id
+    from ouroboros.dialogue_provenance import presence_caller_binding, run_origin
+
+    for attr in ("task_metadata", "task_contract"):
+        data = getattr(ctx, attr, None)
+        if not isinstance(data, dict):
+            continue
+        lineage = data.get("lineage") if isinstance(data.get("lineage"), dict) else {}
+        if (str(data.get("delegation_role") or lineage.get("delegation_role") or "").strip() == "subagent"
+                or str(data.get("parent_task_id") or lineage.get("parent_task_id") or "").strip()):
+            return "a delegated task reports to its parent (final result, tree_note or escalate), which decides what reaches the owner"
+    if presence_caller_binding(ctx) is not None:
+        return "a Presence turn speaks for its external conversation, not in the owner's main chat"
+    if str(chat_id) == str(HIDDEN_CHAT_ID):
+        return "a hidden/headless conversation is not an owner-visible root room"
+    if is_a2a_chat_id(chat_id):
+        return "an agent-to-agent conversation has no main-chat voice"
+    # Positive external transport ids can share the Project range; neither a
+    # number (Main's own id included: a wake or scheduled root runs there too)
+    # nor an agent-supplied destination proves an owner-visible room.
+    from ouroboros.projects_registry import project_chat_for_task_tree, reserved_project_chat_ids
+    from ouroboros.tool_access import canonical_data_root
+
+    try:
+        visible_chat = int(chat_id)
+    except (TypeError, ValueError):
+        return "the current chat has no proven owner-visible destination"
+    data_root = canonical_data_root(ctx)
+    projects = reserved_project_chat_ids(data_root)
+    # The durable binding is the one truth about a root's Project: a mid-run
+    # conversion or self-scope binds it without ever reaching current_chat_id.
+    bound_chat = project_chat_for_task_tree(data_root, str(getattr(ctx, "task_id", "") or ""))
+    if (visible_chat not in projects and bound_chat not in projects
+            and not run_origin({"metadata": getattr(ctx, "task_metadata", None)})["owner_ingress"]):
+        return "this root is neither bound to a registered Project nor started by the owner"
+    return ""
+
+
+def _send_user_message(ctx: ToolContext, text: str, reason: str = "", destination: str = "current") -> str:
+    """Send a separate owner reply without completing the ongoing task.
+
+    ``destination="main"`` addresses the owner's main chat from an owner-visible
+    root room: the row is typed ``main_notice``, which the supervisor
+    and history replay pin to Main whatever the sender's Project binding, and
+    which never counts as the task's final answer. When to send one is the
+    model's judgment (BIBLE P5); no host counter or timer triggers it.
+    """
     chat_id = getattr(ctx, "current_chat_id", None)
     if chat_id is None or chat_id == "":  # 0 is a real hidden session, not absence
         return _publish_tool_result(ctx, ToolResult(status="unavailable", code="CAPABILITY_UNAVAILABLE", text=("⚠️ No active chat — cannot send proactive message.")))
     if not text or not text.strip():
         return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=("⚠️ Empty message.")))
+    # Models may fill optional keys: an empty value is the omitted default.
+    target = str(destination or "").strip().lower() or "current"
+    if target not in ("current", "main"):
+        from ouroboros.tools.arg_feedback import argument_refusal
+
+        return argument_refusal(ctx, "SEND_USER_MESSAGE_DESTINATION", [
+            f"destination={destination!r} is not a destination; use 'current' (this room) or 'main' (the owner's main chat)",
+        ], effect="Nothing was sent.")
+    if target == "main":
+        refusal = _main_notice_refusal(ctx, chat_id)
+        if refusal:
+            return _publish_tool_result(ctx, ToolResult(status="blocked", code="ACCESS_BLOCKED", text=(
+                f"⚠️ MAIN_NOTICE_BLOCKED: destination='main' refused: {refusal}. Nothing was sent; "
+                "destination='current' still reaches this conversation.")))
+        from ouroboros.contracts.chat_id_policy import WEB_UI_CHAT_ID
+        from ouroboros.project_dialogue import MAIN_NOTICE_TYPE
+
+        chat_id, system_type = WEB_UI_CHAT_ID, MAIN_NOTICE_TYPE
+    else:
+        # Discriminates the row from a bare final on history replay: the
+        # client treats an UNtyped assistant row with a task_id as the task's
+        # last word and would finalize a still-running live card. Persisted
+        # via log_chat(record_type=...) exactly like media rows.
+        system_type = "proactive_message"
 
     from ouroboros.tools.owner_delivery import deliver_owner_event
     from ouroboros.utils import append_jsonl
@@ -240,11 +316,7 @@ def _send_user_message(ctx: ToolContext, text: str, reason: str = "") -> str:
         "text": text,
         "format": "markdown",
         "is_progress": False,
-        # Discriminates the row from a bare final on history replay: the
-        # client treats an UNtyped assistant row with a task_id as the task's
-        # last word and would finalize a still-running live card. Persisted
-        # via log_chat(record_type=...) exactly like media rows.
-        "system_type": "proactive_message",
+        "system_type": system_type,
         "ts": utc_now_iso(),
     })
     append_jsonl(ctx.drive_logs() / "events.jsonl", {
@@ -252,9 +324,12 @@ def _send_user_message(ctx: ToolContext, text: str, reason: str = "") -> str:
         "type": "proactive_message",
         "task_id": str(getattr(ctx, "task_id", "") or ""),
         "reason": reason,
+        "destination": target,
         "transport_mode": mode,
         "text_preview": text[:200],
     })
+    if target == "main":
+        return "OK: notice sent to the main chat." if mode == "live" else "OK: notice queued for delivery to the main chat."
     if mode == "live":
         return "OK: message sent to owner chat."
     return "OK: message queued for delivery."

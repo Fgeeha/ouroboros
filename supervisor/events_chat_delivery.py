@@ -312,8 +312,10 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
             meta.get("root_task_id") or evt.get("root_task_id"),
         )
         system_type = str(evt.get("system_type") or "")
-        # Project lifecycle rows pin Main; others keep lineage routing.
-        chat_id = int(evt["chat_id"]) if system_type in ("project_started", "project_handoff", "project_completion_summary") else bound_chat or int(evt["chat_id"])
+        from ouroboros.project_dialogue import MAIN_PINNED_ROW_TYPES
+
+        # Project lifecycle rows and a root's Main notice pin Main; others keep lineage routing.
+        chat_id = int(evt["chat_id"]) if system_type in MAIN_PINNED_ROW_TYPES else bound_chat or int(evt["chat_id"])
         if system_type == "acceptance_late_settlement":
             from ouroboros.acceptance_late import supplement_chat
             retained_chat = supplement_chat(ctx.DRIVE_ROOT, evt)
