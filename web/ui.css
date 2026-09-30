@@ -22,6 +22,10 @@
     --type-body: 14px;
     --type-section: 16px;
     --type-page: 24px;
+    /* Not UI sizes: the chat reading ladder, relative to the bubble's reading
+       text (20px and 18px over the 16px bubble; DESIGN.md §1). */
+    --md-heading-major: 1.25em;
+    --md-heading-minor: 1.125em;
     --line-meta: 1.35;
     --line-body: 1.5;
     --line-title: 1.3;

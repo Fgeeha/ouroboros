@@ -261,10 +261,16 @@ def skip_on_provider_environmental_error(
         print(f"[{provider_id}] HTTP {status} body: {safe_body[:500]}", file=sys.stderr)
     if classification.kind is ProviderFailureKind.INCONCLUSIVE:
         detail = safe_body[:200] if safe_body else safe_message[:200]
-        pytest.skip(
-            f"[{provider_id}] inconclusive provider alarm "
-            f"({classification.reason}): {detail}"
-        )
+        try:
+            pytest.skip(
+                f"[{provider_id}] inconclusive provider alarm "
+                f"({classification.reason}): {detail}"
+            )
+        except pytest.skip.Exception as skipped:
+            # Carry the existing decision across pytest's outcome wrapper.
+            skipped.provider_failure_classification = classification
+            skipped.provider_failure_exception_type = type(exc).__name__
+            raise
 
 
 def official_provider_integration_job():
@@ -616,7 +622,17 @@ def _emit_canary_response_warnings(usage):
         )
 
 
-def _chat_canary_turn(client, *, canary: ProviderCanary, chat_kwargs):
+def _observe_canary(observer, event, **facts):
+    """A diagnostic observer cannot change the canary's calls or verdict."""
+    if observer is not None:
+        try:
+            observer.observe(event, **facts)
+        except Exception as exc:
+            # Never expose the exception's provider-controlled text.
+            print(f"provider diagnostics_incomplete: {type(exc).__name__}")
+
+
+def _chat_canary_turn(client, *, canary: ProviderCanary, chat_kwargs, observer=None, turn="tool"):
     """Retry one runtime-classified semantic-empty turn on the exact same route."""
     message = None
     usage = {}
@@ -625,7 +641,15 @@ def _chat_canary_turn(client, *, canary: ProviderCanary, chat_kwargs):
         attempts = attempt + 1
         attempt_kwargs = copy.deepcopy(chat_kwargs)
         attempt_kwargs["bypass_response_cache"] = attempt > 0
-        message, usage = client.chat(**attempt_kwargs)
+        try:
+            message, usage = client.chat(**attempt_kwargs)
+        except BaseException as exc:
+            _observe_canary(observer, "attempt", turn=turn, ordinal=attempts,
+                            request=attempt_kwargs, error=exc)
+            raise
+        _observe_canary(observer, "attempt", turn=turn, ordinal=attempts,
+                        request=attempt_kwargs, message=message, usage=usage,
+                        semantic_empty=_semantic_empty_canary_message(message))
         if not _semantic_empty_canary_message(message):
             return message, usage
 
@@ -756,11 +780,14 @@ def run_provider_contract_canary(
     canary: ProviderCanary,
     tools,
     nonce: str,
+    observer=None,
 ):
     """Exercise the public chat seam without executing the returned tool call."""
     requested_arguments = delegate_start_canary_arguments(nonce)
     arguments_json = json.dumps(requested_arguments, ensure_ascii=False, sort_keys=True)
     final_marker = f"FULL_REGISTRY_CONTINUED_{nonce}"
+    _observe_canary(observer, "expected", arguments=requested_arguments,
+                    final_marker=final_marker if canary.continue_to_final else None)
     continuation_instruction = (
         "After its tool result, read the expected_final_marker field and reply "
         "with exactly that value. "
@@ -781,6 +808,7 @@ def run_provider_contract_canary(
     message, usage = _chat_canary_turn(
         client,
         canary=canary,
+        observer=observer,
         chat_kwargs={
             "messages": conversation,
             "model": canary.model,
@@ -836,6 +864,8 @@ def run_provider_contract_canary(
     final_message, final_usage = _chat_canary_turn(
         client,
         canary=canary,
+        observer=observer,
+        turn="continuation",
         chat_kwargs={
             "messages": continuation,
             "model": canary.model,

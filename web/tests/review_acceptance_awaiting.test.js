@@ -101,7 +101,7 @@ test('the same panel of a task that is not running is a recorded gap, never a ru
     assert.doesNotMatch(markup, /in progress/);
 });
 
-test('a settled failure renders exactly as it always did', () => {
+test('a settled failure without a verdict reads in words and keeps its warning and its detail', () => {
     const settled = panel([actor('s1', FAILED), actor('s2', FAILED), actor('s3', FAILED)], {
         transport_status: 'provider_transport_error', parse_status: 'malformed', enforcement_impact: 'degrades_completion',
     });
@@ -112,7 +112,10 @@ test('a settled failure renders exactly as it always did', () => {
     ];
     for (const status of ['completed', 'running']) {
         const value = group([settled], status);
-        assert.deepEqual(facts(value), { state: 'terminal', tone: 'warn', progress: '', verdict: 'DEGRADED', activeCount: 0 });
+        // #1369: the owner reads words; the stored DEGRADED stays in the attempt detail below.
+        assert.deepEqual(facts(value), {
+            state: 'terminal', tone: 'warn', progress: 'no verdict · 0 of 3 answered · 3 unavailable', verdict: 'DEGRADED', activeCount: 0,
+        });
         assert.equal(value.attempts[0].detailText, [
             'Review panel panel_a72b23783ba34908: task_acceptance · authority=host_root · verdict=DEGRADED · transport=provider_transport_error · parse=malformed · quorum=0/3 (required 2) · enforcement=degrades_completion',
             'Panel reason: recorded reason',
@@ -120,8 +123,20 @@ test('a settled failure renders exactly as it always did', () => {
             ...reviewer('s1'), ...reviewer('s2'), ...reviewer('s3'),
             'Cost unavailable',
         ].join('\n'));
-        assert.match(html(value), /chat-review-group-meta">DEGRADED/);
+        assert.match(html(value), /chat-review-group-meta">no verdict · 0 of 3 answered · 3 unavailable/);
+        assert.match(html(value), /chat-review-group warn/);
+        assert.doesNotMatch(html(value), /-meta">[^<]*DEGRADED/);
     }
+    // A reviewer's own DEGRADED answer is an answer: the panel still has no verdict, and nothing is unavailable.
+    const judged = group([panel([actor('s1', SAID_DEGRADED), actor('s2', SAID_DEGRADED), actor('s3', FAILED)], {
+        transport_status: 'partial', parse_status: 'valid',
+    })], 'completed');
+    assert.deepEqual(facts(judged), {
+        state: 'terminal', tone: 'warn', progress: 'no verdict · 2 of 3 answered · 1 unavailable', verdict: 'DEGRADED', activeCount: 0,
+    });
+    // A settled verdict keeps its own word.
+    const passed = group([panel([actor('s1'), actor('s2'), actor('s3')], { aggregate_signal: 'PASS' })], 'completed');
+    assert.deepEqual([passed.progress, passed.verdict], ['', 'PASS']);
 });
 
 test('an expired window or lost custody stays a warning even while the task runs', () => {
@@ -129,7 +144,9 @@ test('an expired window or lost custody stays a warning even while the task runs
         const value = group([panel([actor('s1', lost), actor('s2', lost), actor('s3', lost)], {
             transport_status: lost.transport_status, parse_status: 'malformed',
         })], 'running');
-        assert.deepEqual(facts(value), { state: 'terminal', tone: 'warn', progress: '', verdict: 'DEGRADED', activeCount: 0 });
+        assert.deepEqual(facts(value), {
+            state: 'terminal', tone: 'warn', progress: 'no verdict · 0 of 3 answered · 3 unavailable', verdict: 'DEGRADED', activeCount: 0,
+        });
         assert.match(value.attempts[0].detailText, new RegExp(`· verdict=DEGRADED · transport=${lost.transport_status} · parse=malformed ·`));
         assert.doesNotMatch(value.attempts[0].detailText, /awaiting/);
     }

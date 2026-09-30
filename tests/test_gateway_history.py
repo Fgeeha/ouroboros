@@ -299,7 +299,7 @@ def test_history_gap_metadata_keeps_reader_failures_fail_soft(tmp_path, monkeypa
 
     assert rows == []
     assert quota == 0
-    assert gaps == set()
+    assert gaps == {"projection_failed"}, "fail-soft, yet disclosed: the missing rows are no clean window"
 
 
 def test_history_gap_metadata_keeps_legacy_reader_call_shape(tmp_path, monkeypatch):

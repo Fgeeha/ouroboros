@@ -404,7 +404,8 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # against the lane bullet; what remains is a mechanism the chapter lacked, so it
     # cannot replace older text. 3283 -> 2969 bytes of section after that pass, plus
     # the `--temp-parent` refusal clause (a nested disposable root is not disposable).
-    "docs/development/14-build-and-ci.md": 19500,
+    # Selected safe CI artifacts and the partial UI diagnostic add a new reader workflow.
+    "docs/development/14-build-and-ci.md": 20900,
 }
 
 
