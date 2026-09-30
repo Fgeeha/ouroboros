@@ -19,7 +19,7 @@ import pytest
 from ouroboros import platform_layer as platform
 from ouroboros.process_containment import pid_is_zombie
 from supervisor import worker_process
-from tests._shared import stop_socket_sharer
+from tests._shared import stop_socket_sharer, wait_test_child_stop
 
 pytestmark = pytest.mark.serial
 
@@ -154,10 +154,9 @@ def _stop_trace(sock, child_pid):
     return _received_events(events) | {"child_after_verdict": child}
 
 
-def _assert_frozen_child_stop(child_pid, diagnose, **context):
-    """Keep the original death predicate before any slower diagnostic observation."""
-    stopped = not platform.pid_is_alive(child_pid) or pid_is_zombie(child_pid)
-    verdict = {"child_stopped": stopped, "t_ns": time.monotonic_ns()}
+def _assert_frozen_child_stop(verdict, diagnose, **context):
+    """Use the wait's terminal observation, frozen before slower diagnostics."""
+    stopped = verdict["child_stopped"]
     trace = dict(context)
     try:
         trace |= diagnose()
@@ -271,11 +270,9 @@ def test_supported_command_is_stopped_even_when_another_owner_fails(tmp_path, mo
         receipt = platform.request_process_tree_kill(proc)
         proc.join(timeout=3)
         assert not proc.is_alive(), receipt
-        deadline = time.monotonic() + 3
-        while platform.pid_is_alive(child_pid) and not pid_is_zombie(child_pid) and time.monotonic() < deadline:
-            time.sleep(.01)
+        verdict = wait_test_child_stop(child_pid)
         _assert_frozen_child_stop(
-            child_pid, lambda: (_stop_trace(trace_parent, child_pid) | {"parent_events": parent_events}
+            verdict, lambda: (_stop_trace(trace_parent, child_pid) | {"parent_events": parent_events}
                                 if trace_parent is not None else {"platform": "windows"}),
             mode=mode, receipt=receipt, worker_exit=proc.exitcode, published=seen)
     finally:
@@ -311,11 +308,11 @@ def test_child_death_during_diagnostics_cannot_pass_the_frozen_verdict(capsys):
 
     try:
         with pytest.raises(AssertionError, match="RuntimeError: observer defect"):
-            _assert_frozen_child_stop(child.pid, broken_observer, mode="observer_defect")
+            _assert_frozen_child_stop(wait_test_child_stop(child.pid, timeout_sec=0), broken_observer, mode="observer_defect")
         with pytest.raises(AssertionError, match="'child_stopped': False"):
-            _assert_frozen_child_stop(child.pid, child_dies_while_tracing, mode="late_death")
+            _assert_frozen_child_stop(wait_test_child_stop(child.pid, timeout_sec=0), child_dies_while_tracing, mode="late_death")
         assert late == {"stopped": True}
-        _assert_frozen_child_stop(child.pid, broken_observer, mode="stopped_before_trace")
+        _assert_frozen_child_stop(wait_test_child_stop(child.pid, timeout_sec=0), broken_observer, mode="stopped_before_trace")
     finally:
         if child.poll() is None:
             child.kill()
@@ -324,6 +321,46 @@ def test_child_death_during_diagnostics_cannot_pass_the_frozen_verdict(capsys):
                if line.startswith("REGISTERED_STOP_TRACE ")]
     assert [(row["mode"], row["verdict"]["child_stopped"], "diagnostic_error" in row) for row in printed] == [
         ("observer_defect", False, True), ("late_death", False, False), ("stopped_before_trace", True, True)]
+
+
+@pytest.mark.parametrize("observed_zombie", [False, True])
+def test_wait_keeps_terminal_observation_across_reaping(monkeypatch, observed_zombie):
+    from ouroboros import process_containment
+
+    probes = []
+
+    def zombie(_pid):
+        probes.append("zombie")
+        return observed_zombie
+
+    def alive(_pid):
+        probes.append("alive")
+        return False  # already reaped, including between the two status probes
+
+    monkeypatch.setattr(process_containment, "pid_is_zombie", zombie)
+    monkeypatch.setattr(platform, "pid_is_alive", alive)
+    verdict = wait_test_child_stop(123, timeout_sec=0)
+    assert verdict["child_stopped"] is True
+    assert probes == (["zombie"] if observed_zombie else ["zombie", "alive"])
+    # Subsequent independent probes may cross zombie -> reaped. No re-read may
+    # turn the wait's positive terminal witness into the old false failure.
+    monkeypatch.setattr(platform, "pid_is_alive", lambda _pid: pytest.fail("terminal witness was discarded"))
+    monkeypatch.setattr(process_containment, "pid_is_zombie", lambda _pid: pytest.fail("terminal witness was discarded"))
+    _assert_frozen_child_stop(verdict, lambda: {"after_verdict": "reaped"})
+
+
+def test_wait_rejects_live_child_at_original_bound(monkeypatch):
+    from ouroboros import process_containment
+
+    clock, pauses = iter((10.0, 10.0, 13.0)), []
+    monkeypatch.setattr(time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(time, "sleep", pauses.append)
+    monkeypatch.setattr(platform, "pid_is_alive", lambda _pid: True)
+    monkeypatch.setattr(process_containment, "pid_is_zombie", lambda _pid: False)
+    verdict = wait_test_child_stop(123)
+    assert verdict["child_stopped"] is False and pauses == [.01]
+    with pytest.raises(AssertionError, match="'child_stopped': False"):
+        _assert_frozen_child_stop(verdict, lambda: {"after_verdict": "stopped too late"})
 
 
 def test_trace_discloses_received_prefix_never_absent_execution():

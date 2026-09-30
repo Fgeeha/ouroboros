@@ -57,6 +57,9 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
     "supervisor/events_schedule_task.py": ("supervisor/events.py", "_events", frozenset({
         "_parent_delegation_budget", "get_max_subagent_depth",
     })),
+    "supervisor/schedule_occurrence.py": ("supervisor/queue.py", "_queue", frozenset({
+        "DRIVE_ROOT",
+    })),
     "supervisor/queue_schedules.py": ("supervisor/queue.py", "_queue", frozenset({
         "DRIVE_ROOT", "PENDING", "RUNNING", "SCHEDULED_TASKS_FILE", "_queue_lock",
         "load_state", "persist_queue_snapshot",  # admission enqueues in schedule_occurrence

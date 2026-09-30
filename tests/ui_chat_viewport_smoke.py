@@ -234,10 +234,7 @@ def run_chat_viewport_smoke(
                     "() => window.__testSockets?.some(socket => socket.readyState === WebSocket.OPEN)",
                     timeout=30_000,
                 )
-                page.wait_for_function(
-                    "() => document.querySelector('#chat-messages')?.innerText.includes('Ouroboros has awakened')",
-                    timeout=30_000,
-                )
+                page.wait_for_selector('#chat-messages[data-history-hydrated="true"]', timeout=30_000)
                 # Threshold assertions start after the page-show restore lease;
                 # WebKit otherwise applies its final scheduled pin mid-scenario.
                 page.evaluate(_SETTLE_RESTORE_FRAMES)

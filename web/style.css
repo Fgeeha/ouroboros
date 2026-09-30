@@ -1489,6 +1489,29 @@ body.resizing-panels { user-select: none; }
     min-width: 0;
 }
 
+/* Host-owned empty state, never an assistant or historical chat bubble. */
+.chat-empty-welcome {
+    align-self: flex-start;
+    max-width: min(80%, 520px);
+    min-width: 0;
+    padding: var(--space-3) var(--space-4);
+    border: 1px solid var(--surface-border);
+    border-radius: var(--radius-lg);
+    background: var(--bg-hover);
+    overflow-wrap: anywhere;
+}
+.chat-empty-welcome-label {
+    color: var(--text-secondary);
+    font-size: var(--type-meta);
+    font-weight: 600;
+}
+.chat-empty-welcome p {
+    margin: var(--space-1) 0 0;
+    color: var(--text-primary);
+    font-size: var(--type-section);
+    white-space: pre-wrap;
+}
+
 .chat-bubble.user {
     background: linear-gradient(135deg, var(--user-bubble-from), var(--user-bubble-to));
     border: 1px solid var(--user-border);

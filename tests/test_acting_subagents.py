@@ -1163,14 +1163,14 @@ def test_acting_structured_write_stays_inside_its_selected_surface(tmp_path):
     assert not (wt.parent / "outside.txt").exists()
 
 
-def test_acting_read_schema_excludes_system_repo(tmp_path):
+def test_acting_read_schema_includes_parent_read_roots(tmp_path):
     reg, _ctx, _wt = _acting_registry(tmp_path)
     schemas = {s["function"]["name"]: s["function"] for s in reg.schemas()}
     rf = schemas.get("read_file")
     if rf:
         root_enum = rf["parameters"]["properties"].get("root", {}).get("enum")
         if isinstance(root_enum, list):
-            assert "system_repo" not in root_enum  # matches acting _POLICY (no system_repo)
+            assert {"system_repo", "user_files", "deliverables", "subagent_projects"} <= set(root_enum)
 
 
 def test_integrate_counts_as_reviewable_effect():
@@ -1287,8 +1287,8 @@ def test_no_workspace_acting_integrate_blocked(tmp_path):
     assert "ACTING_NO_WORKSPACE_BLOCKED" in reg.execute("integrate_subagent_patch", {"task_id": "x"})
 
 
-def test_acting_subagent_cannot_read_secrets(tmp_path):
-    # Acting children may write their surface but must NOT read owner secrets.
+def test_acting_subagent_reads_parent_visible_settings(tmp_path):
+    # Read reach follows the parent; the independent write surface is unchanged.
     from ouroboros.tools.core import _data_read
     repo = tmp_path / "repo"; repo.mkdir()
     drive = tmp_path / "data"; drive.mkdir()
@@ -1298,19 +1298,20 @@ def test_acting_subagent_cannot_read_secrets(tmp_path):
         task_constraint=TaskConstraint(mode="acting_subagent", surface="self_worktree", write_root=str(tmp_path / "wt")),
     )
     out = _data_read(ctx, "settings.json")
-    assert "DATA_READ_BLOCKED" in out and "sk-secret-xyz" not in out
+    assert "sk-secret-xyz" in out and "DATA_READ_BLOCKED" not in out
 
 
 def test_acting_subagent_keeps_workspace_access(tmp_path):
-    # The strict-readonly resource block must NOT restrict acting children's worktree.
-    from ouroboros.tools.core import _local_readonly_resource_block
+    from ouroboros.tools.core import _read_file
     repo = tmp_path / "repo"; repo.mkdir()
     drive = tmp_path / "data"; drive.mkdir()
+    work = tmp_path / "wt"; work.mkdir()
+    (work / "f.txt").write_text("child source", encoding="utf-8")
     ctx = ToolContext(
-        repo_dir=repo, drive_root=drive,
-        task_constraint=TaskConstraint(mode="acting_subagent", surface="self_worktree", write_root=str(tmp_path / "wt")),
+        repo_dir=repo, drive_root=drive, workspace_root=work, workspace_mode="external",
+        task_constraint=TaskConstraint(mode="acting_subagent", surface="self_worktree", write_root=str(work)),
     )
-    assert _local_readonly_resource_block(ctx, "active_workspace", tmp_path / "wt" / "f.txt", tmp_path / "wt", action="write") == ""
+    assert "child source" in _read_file(ctx, "f.txt")
 
 
 # 14. v6.21.0: genesis surface, compare helper, unified GC retention

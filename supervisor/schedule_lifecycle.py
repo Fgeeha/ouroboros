@@ -293,12 +293,15 @@ def mutate_scheduled_task(action: str, schedule_id: str, *, reason: str,
                 else:
                     from supervisor.schedule_occurrence import owed
 
-                    status, owes = "deleted", owed(current)
+                    status, owes = "deleted", owed(current, drive_root=root)
                     if owes is not False:
                         # An accepted run waits to be re-queued: removal is deferred until it
                         # starts, because deleting a row never takes back an admission (#1315).
                         current["enabled"], current["delete_requested_at"] = False, utc_now_iso()
-                        detail = "an accepted run of this schedule is still owed; the row goes once that run starts"
+                        status = "delete_deferred"
+                        detail = ("an accepted run is still owed; the row will be removed once that run starts"
+                                  if owes else "the occurrence receipt is missing, unreadable or conflicting; "
+                                  "the disabled row is retained until its execution history can be established")
                     else:
                         tasks = [item for item in tasks if str(item.get("id") or "") != wanted]
                         removed = True
@@ -349,7 +352,7 @@ def mutate_scheduled_task(action: str, schedule_id: str, *, reason: str,
             recorded = _audit_schedule_mutation(
                 phase="outcome", result=status, before=before,
                 after=(None if removed else current), **audit)
-            achieved = status in {"updated", "deleted", "suppressed"}
+            achieved = status in {"updated", "deleted", "delete_deferred", "suppressed"}
             if changed and not recorded:
                 # Keep the lifecycle blocker beside the audit disclosure: a lost
                 # outcome record must not erase WHY the row is still not ready.
