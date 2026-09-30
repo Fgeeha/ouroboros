@@ -593,9 +593,10 @@ preference when it opens and on every reconnect; there is no file watcher.
     included), and no formatting rule reaches inside it. A rich answer
     reads code as its Markdown parser does. The compact renderer keeps the
     promise for its own narrower grammar only: a fence opened by three
-    backticks, an optional language label with no whitespace or backticks
-    (`c++`, `c#`, `objective-c` included), optional trailing spaces or tabs,
-    and LF or CRLF, closed by the next three backticks; and a code span of
+    backticks, an optional label made of ASCII letters, digits, underscores
+    and `+ # . -` (at least one letter, digit or underscore; `c++`, `c#` and
+    `objective-c` included), optional trailing spaces or tabs, and LF or CRLF,
+    closed by the next three backticks; and a code span of
     one or two backticks around text on one line. Other code forms (info
     attributes after a space, a span across lines, a longer backtick run,
     a `~~~` or indented block) are outside that

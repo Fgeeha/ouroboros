@@ -508,12 +508,12 @@ function headingOrProse(cls, text, breakAfter = false, restore = undefined) {
 }
 
 // One compact fence grammar for rendering and both plain previews: an optional
-// whitespace-free language label (no backticks), trailing spaces/tabs, then LF or
-// CRLF. Punctuation in c++, c# or objective-c is part of the label. More prose
-// after a blank is not an info label: accepting it would pair an inline ``` with
+// word-character language label with + # . - punctuation, then spaces/tabs and
+// LF or CRLF. A nonempty label needs a word character: a prose ``` followed only
+// by punctuation is not an opener. Nor is more prose after a blank, which could pair an inline ``` with
 // a later code fence. Prefixed/indented openers and the next-``` closer keep their
 // existing semantics; an opener without a later closer remains ordinary text.
-const FENCE_START = '```[^\\s`]*[\\t ]*\\r?';
+const FENCE_START = '```(?:(?=[\\w+#.-]*\\w)[\\w+#.-]+)?[\\t ]*\\r?';
 const FENCE_OPEN = new RegExp(FENCE_START + '$');
 export const MARKDOWN_FENCED_CODE = new RegExp(FENCE_START + '\\n([\\s\\S]*?)```', 'g');
 const FENCE_CLOSE = /```/;
@@ -599,7 +599,8 @@ export function renderMarkdown(text, { inlineHeadingBreaks = false } = {}) {
     const code = codeStash(html);
     html = html.replace(MARKDOWN_FENCED_CODE, (_, body) => code.token(`<pre><code>${body}</code></pre>`));
     // One pass for both span forms: a double-backtick span may contain backticks.
-    html = html.replace(CODE_SPAN, (_, _tick, body) => code.token(`<code class="inline-code">${body}</code>`));
+    html = html.replace(CODE_SPAN, (match, _tick, body) => code.holds(body)
+        ? match : code.token(`<code class="inline-code">${body}</code>`));
     html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
     html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
     html = html.replace(/~~(.+?)~~/g, '<del>$1</del>');

@@ -44,7 +44,7 @@ test('a fenced block is the author text in both compact consumers', () => {
 });
 
 test('punctuation labels and normal fence whitespace preserve code and preview boundaries', () => {
-    for (const label of ['c++', 'c#', 'objective-c', 'shell-session', 'md-js', 'f#', '<tag>&']) {
+    for (const label of ['c++', 'c#', 'objective-c', 'shell-session', 'md-js', 'f#', 'asp.net']) {
         for (const ending of ['\n', '   \n', '\t\r\n']) {
             const source = '```' + label + ending + FENCE_BODY + '\n```';
             assert.equal(renderMarkdown(source), `<pre><code>${escaped(FENCE_BODY)}\n</code></pre>`);
@@ -55,13 +55,32 @@ test('punctuation labels and normal fence whitespace preserve code and preview b
 });
 
 test('an inline backtick mention cannot steal the next fenced block', () => {
-    for (const lead of ['Wrap it in ```python``` blocks.\nLater:', 'Use ``` fences like this\n**bold** here']) {
+    for (const lead of [
+        'Wrap it in ```python``` blocks.\nLater:', 'Use ``` fences like this\n**bold** here',
+        'Enclose code in triple backticks (```).\n', 'Wrap it with ```:', 'Close the fence with ```.\nThen:',
+        'Mention ```<>&',
+    ]) {
         const html = renderMarkdown(lead + '\n```python\nx = *a*\n```\n**after**');
         assert.deepEqual([...html.matchAll(/<pre><code>([\s\S]*?)<\/code><\/pre>/g)].map((m) => m[1]), ['x = *a*\n']);
         assert.ok(html.endsWith('<strong>after</strong>'));
     }
     // Attributes remain outside the compact grammar; no claim of CommonMark parity.
     assert.doesNotMatch(renderMarkdown('```python title=demo\n# prose\n```'), /<pre>/);
+});
+
+test('a later inline-code pass cannot hide an already parked fenced block', () => {
+    for (const size of [4, 5]) {
+        for (const label of ['', 'python']) {
+            const ticks = '`'.repeat(size);
+            const html = renderMarkdown(ticks + label + '\nx = *a*\n' + ticks);
+            // Longer fences keep the compact renderer's stray outer ticks, but
+            // their code must not disappear into a nested internal placeholder.
+            assert.equal(html, '`'.repeat(size - 3) + '<pre><code>x = *a*\n</code></pre>' + '`'.repeat(size - 3));
+            assert.doesNotMatch(html, /OUROBOROSCODE/);
+        }
+    }
+    assert.equal(renderMarkdown('Use `literal` and **bold**'),
+        'Use <code class="inline-code">literal</code> and <strong>bold</strong>');
 });
 
 test('an inline code span is literal and keeps formatting around it', () => {
