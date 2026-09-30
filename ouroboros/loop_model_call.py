@@ -861,7 +861,8 @@ def _dispatch_round_model(
         deferral = None
         if waiter is not None:
             from ouroboros.loop_llm_call import classify_llm_exception
-            resource_reason = (lambda error: {"auth_error": "auth", "quota_exhausted": "quota"}.get(
+            resource_reason = (lambda error: {"auth_error": "auth", "quota_exhausted": "quota",
+                "provider_transient": "unavailable", "rate_limit": "unavailable"}.get(
                 classify_llm_exception(error).kind, "")) if getattr(ctx.tools._ctx, "route_wait_on_primary", False) else None
             binding.enter_context(waiter.register_reprepare(
                 role, lambda kwargs: _reprepare_waiting_main(ctx, kwargs), resource_reason=resource_reason))

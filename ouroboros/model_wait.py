@@ -69,7 +69,7 @@ def model_wait_reason(error: Exception) -> str:
     proves none of those facts and keeps its ordinary error path.
     """
     authored = getattr(error, "task_resource_wait_reason", "")
-    if authored in {"auth", "quota"}:
+    if authored in {"auth", "quota", "unavailable"}:
         return authored  # confirmed by the registered caller's refusal classifier
     code = getattr(error, "code", "")
     if code in {"auth_required", "subscription_window_exhausted"}:

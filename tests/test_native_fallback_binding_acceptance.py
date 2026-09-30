@@ -268,8 +268,9 @@ def test_duplicate_model_slots_keep_their_distinct_native_accounts(main_call, mo
     assert [row["state"] for row in ledger(ctx.drive_root)].count("unresolved") == 2
 
 
-@pytest.mark.parametrize("status,reason", [(401, "auth"), (402, "quota")])
-def test_primary_wait_honors_a_direct_api_access_refusal(main_call, monkeypatch, status, reason):
+@pytest.mark.parametrize("status,reason", [(401, "auth"), (402, "quota"), (429, "unavailable"), (503, "unavailable"), (400, "")])
+@pytest.mark.parametrize("wire", ["http", "sse"])
+def test_primary_wait_honors_a_direct_api_access_refusal(main_call, monkeypatch, status, reason, wire):
     """A declared wait must not be undone by a paid fallback merely because access uses an API key."""
     from ouroboros import usage_accounting as ua
     from ouroboros.llm_attempt import _attempt_request, _candidate_before_dispatch
@@ -284,14 +285,20 @@ def test_primary_wait_honors_a_direct_api_access_refusal(main_call, monkeypatch,
     ctx.tools._ctx.model_wait_context = owner
     _switch_model(ctx.tools._ctx, primary="wait")
     sent = []
+    original_send = ctx.llm._chat_remote
 
     def send(target, messages, schemas, *args, **kwargs):
+        if target["provider"] != "openai":
+            return original_send(target, messages, schemas, *args, **kwargs)
         assert target["provider"] == "openai"
         sent.append(target["provider"])
         body = {"messages": deepcopy(messages), "tools": schemas or [], "model": "primary-test"}
         request = _attempt_request(target, body)
 
         def refused():
+            if wire == "sse":
+                from ouroboros.llm_stream import ChatAccumulator
+                ChatAccumulator().accept("message", json.dumps({"error": {"code": status, "message": "Access refused"}}))
             raise httpx.HTTPStatusError("Access refused", request=httpx.Request("POST", "https://fixture.invalid"),
                                        response=httpx.Response(status))
 
@@ -300,6 +307,17 @@ def test_primary_wait_honors_a_direct_api_access_refusal(main_call, monkeypatch,
     monkeypatch.setattr(ctx.llm, "_chat_remote", send)
     monkeypatch.setattr(ctx.llm, "claudexor_model_sources", lambda: pytest.fail("API wait has no subscription observer"))
     owner.owner_control = lambda: "cancelled" if any(row.get("state") == "waiting" for row in owner.waits.values()) else None
+    if not reason:  # Invalid request is not unavailable access: ordinary fallback still works.
+        from ouroboros.loop_model_call import _recover_failed_round
+        assert loop._call_round_model(ctx)[0] is None
+        gateway.results = [_reply(ROUTE_B, {"role": "assistant", "content": "Alternative accepted the request."})]
+        gateway.dispatch = ["response_received"]
+        fallback_cooldown.reset_for_tests()
+        reply, *_ = _recover_failed_round(ctx, ctx.tools, None, None, context_fit_plan=ctx.context_fit_plan,
+            active_context_mode="max", emit_progress=lambda *_a, **_k: None)
+        assert reply["content"] == "Alternative accepted the request."
+        assert not owner.waits and sent == ["openai"] and len(gateway.creates) == 1
+        return
     with pytest.raises(ModelWaitInterrupted, match="cancelled"):
         loop._call_round_model(ctx)
     waits = [row for row in list(events.queue) if row.get("type") == "task_model_wait"]
