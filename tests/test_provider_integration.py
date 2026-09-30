@@ -44,17 +44,21 @@ def shipped_builtin_tools():
     _PROVIDER_CANARIES,
     ids=[canary.canary_id for canary in _PROVIDER_CANARIES],
 )
-def test_full_registry_provider_contract(canary, shipped_builtin_tools):
+def test_full_registry_provider_contract(canary, shipped_builtin_tools, request):
     """Exercise one bounded public-chat canary per physical provider surface."""
-    require_provider_canary_credential(canary)
-    try:
-        _message, usage, _final_message, _final_usage = run_provider_contract_canary(
-            _get_llm_client(),
-            canary=canary,
-            tools=shipped_builtin_tools,
-            nonce=uuid.uuid4().hex,
-        )
-        _emit_canary_response_warnings(usage)
-    except Exception as exc:  # noqa: BLE001
-        skip_on_provider_environmental_error(canary.canary_id, exc)
-        raise
+    from tests.provider_contract_diagnostics import provider_evidence
+
+    with provider_evidence(request, canary) as observer:
+        require_provider_canary_credential(canary)
+        try:
+            _message, usage, _final_message, _final_usage = run_provider_contract_canary(
+                _get_llm_client(),
+                canary=canary,
+                tools=shipped_builtin_tools,
+                nonce=uuid.uuid4().hex,
+                observer=observer,
+            )
+            _emit_canary_response_warnings(usage)
+        except Exception as exc:  # noqa: BLE001
+            skip_on_provider_environmental_error(canary.canary_id, exc)
+            raise
