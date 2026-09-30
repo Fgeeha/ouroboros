@@ -87,55 +87,48 @@ Never freeze the model's reasoning, dialogue representation or collaboration
 strategy to make one incident testable — SYSTEM accretion trains around that
 incident, bloats the resident prefix and forks the authority.
 
-Whether, when and how often to tell or escalate to the owner is behavior, and so
-is the choice to retry, wait or substitute: it belongs to the prompt and the
-model's judgment. A threshold, timer or counter standing in for that judgment
-("after N failures", "after 30 minutes", "if several tasks are affected") is the
-if-else behavior selection BIBLE P5 forbids, whoever proposes it. Numbers
+Whether, when and how often to tell the owner, retry, wait or substitute is the
+prompt's and model's judgment; a threshold, timer or counter standing in for it
+is the if-else selection BIBLE P5 forbids, whoever proposes it, while numbers
 still bound physical, safety, budget, transport and evidence expiry. A missing
-channel is a capability gap, not a rule:
-`send_user_message(destination="main")` lets a registered Project root or a
-host-attested owner-origin root reach Main from elsewhere; a Main root already
-speaks there. Hidden, A2A, Presence and delegated work cannot. No chat number,
-even Main's, is owner proof.
+channel is a capability gap: `send_user_message(destination="main")` gives a
+registered Project root or host-attested owner-origin root a Main voice, never
+hidden, A2A, Presence or delegated work; no chat number, even Main's, is owner proof.
 
 `prompts/SYSTEM.md` is tier-0 for every Main/task profile in both context modes
-and competes with the task for context; the safety supervisor is the one caller
-with a prompt of its own, and Background Consciousness uses SYSTEM.md like any
-other turn, with `prompts/CONSCIOUSNESS.md` as the USER message a wake-up
-receives, never a second system prompt. It carries identity and tone, the
-decision loop, cross-tool policy, prohibitions and safety invariants stated once,
-and the memory contract — whose resident rule is that a note's authored summary
-is its resident face in the knowledge index and an absent carrier renders as a
-visible gap, never as silence. It never carries how a tool works: parameters,
-recipes, typed outcomes and "when to choose it" belong to the `get_tools()`
-schema every profile receives in full each round (delegated, repair, credential
-and contract filters narrow it), so a prompt sentence about a schema is a
-drifting second copy and a new tool needs NO SYSTEM.md mention. Runtime facts are
-assembled ONCE per task attempt, so the Health Invariants block states custody
-obligations as of task start and never refreshes mid-task — a deliberate
-frozen-ContextCore / prompt-cache choice (ARCHITECTURE §6 "Context fitting, retry, and
-compaction"). Check the schema and runtime block before adding a prompt sentence,
-and before removing one. Keep SYSTEM's load-bearing floor rules in its preamble,
-because local-model overflow compaction keeps only the text before a block's
-first `## ` heading (`ouroboros/llm_local.py`); that splitter also leaves BIBLE's
-principle bodies as compaction markers, a disclosed defect (issue #1018), never
-an intended reduction of the constitution (BIBLE P1). Every prompt change reports
-its before/after byte size in the commit or PR.
+and competes with the task for context; only the safety supervisor has its own
+prompt, and a consciousness wake-up gets SYSTEM.md plus
+`prompts/CONSCIOUSNESS.md` as its USER message, never a second system prompt. It
+carries identity and tone, the decision loop, cross-tool policy, prohibitions and
+safety invariants stated once, and the memory contract's resident rule: a note's
+authored summary is its resident face in the knowledge index, and an absent
+carrier renders as a visible gap, never silence. It never carries how a tool
+works: parameters, recipes, typed outcomes and "when to choose it" belong to the
+`get_tools()` schema every profile receives in full each round (delegated,
+repair, credential and contract filters narrow it), so a prompt sentence about a
+schema is a drifting second copy and a new tool needs NO SYSTEM.md mention.
+Runtime facts are assembled ONCE per task attempt, so the Health Invariants block
+states custody obligations as of task start and never refreshes mid-task — a
+deliberate frozen-ContextCore / prompt-cache choice. Check the schema and runtime
+block before adding or removing a prompt sentence. Keep SYSTEM's load-bearing
+floor rules in its preamble, all that local-model overflow compaction keeps
+(ARCHITECTURE §6 "Context fitting, retry, and compaction" owns that compactor,
+its disclosed BIBLE defect and the frozen core). Every prompt change reports its
+before/after byte size in the commit or PR.
 
 Recoverable tool failures are evidence for the next LLM turn, not triggers for a
 host-authored recovery workflow: return a typed, redacted result naming the
 failed stage, completed external effects and an actionable repair hint, and
 let the LLM decide. Host code owns deterministic integrity, authority boundaries
 and truthful receipts only — no task-specific auto-retry, fallback, cleanup,
-resume or terminal-flow state machines. Explicitly naming a documented default is
-never a different request: an argument whose value is what omitting it already
-means — `directory_strategy="direct"` with no `scope_paths` on a shape that cannot
-serve the argument, or `workspace_root` naming the Ouroboros repository —
-takes the omitted path, disclosed in the result; only a value that genuinely asks
-for something is refused there, typed, at the earliest layer with authority to
-judge it, repair named. Models may fill optional keys (OpenAI's Responses API
-tries strict mode if unset; the OpenRouter lane sends `strict:false`), so an
+resume or terminal-flow state machines. Naming a documented default is never a
+different request: a value meaning what omission means —
+`directory_strategy="direct"` with no `scope_paths` on a shape that cannot serve
+it, or `workspace_root` naming the Ouroboros repository — takes the omitted path,
+disclosed in the result; only a value genuinely asking for something is refused,
+typed, at the earliest layer with authority to judge it, repair named. Models may
+fill optional keys (OpenAI's Responses API tries strict mode if unset; the
+OpenRouter lane sends `strict:false`), so an
 optional argument's empty or mode-irrelevant form (`max_wait_minutes` on a quiz that
 does not wait, `0` with `""`, a range end past a knowledge note, a zone beside an
 offset-carrying instant) is that same omitted path, and a refusal that only restates its rule is
@@ -155,8 +148,8 @@ acknowledged on the `supervision_wake_id` that result publishes, never on the
 tool's name (ARCHITECTURE §6 "Delegated subagents").
 
 Enforcement: CHECKLISTS item 13(b) scores the prompt-edit discipline; the
-recoverable-failure boundary is review-only; `tests/test_typed_tool_refusals.py`
-is the shrink-only source lint over returned literals in `ouroboros/tools/`,
+owner-judgment and recoverable-failure boundaries are review-only;
+`tests/test_typed_tool_refusals.py` is the shrink-only source lint over returned literals in `ouroboros/tools/`,
 flagging identifier-less heads (and, growth-only, interpolated `⚠️ {code}` heads,
 which the adapter types only by luck of the runtime value), and its per-file
 allowlist IS that residual's disclosure. A same-file swap is invisible to the count; a marker-shaped refusal
@@ -190,12 +183,12 @@ under a chapter's H1 IS its compact Low/Nano view: re-read and correct it
 whenever the chapter changes.
 
 Track assets with a continuing purpose for the product, contributors, verification,
-legal requirements or evidence for public claims, beyond the work that introduced them. Plans, review packets, run receipts
-and campaign bookkeeping belong in the external work area or durable task evidence,
-not the tracked source tree; a test preserving their presence or wording does not
-give them a permanent product role. Retire temporary campaign tooling when its
-purpose ends. Keep current behavior and its rationale in their existing owners;
-future-work lists and campaign backlog stay outside the tracked product tree.
+legal requirements or evidence for public claims, beyond the work that introduced them. Plans, future-work lists,
+campaign backlog and bookkeeping, review packets and run receipts belong in the
+external work area or durable task evidence, not the tracked source tree; a test
+preserving their presence or wording does not give them a permanent product role.
+Retire temporary campaign tooling when its purpose ends; current behavior and its
+rationale stay in their existing owners.
 Generated snapshots with real product, verification or publication consumers remain
 valid; optional reports use stdout or an explicit output destination. Existing
 review enforces this contract, without automatic deletion or filename matching.
@@ -270,8 +263,8 @@ same owner message — a promoted root, a mid-run scope call, the timeout retry
 replacing a dead attempt — INHERITS the origin's project binding
 (`projects_registry.project_id_for_origin`) instead of re-deriving membership
 from its own id, because a message is one convertible unit, not one per task id.
-A timeout retry binds at RETRY ADMISSION, inside the admitting transaction and
-only once cancellation can no longer win the boundary (ARCHITECTURE §6 "Project binding by task
+A timeout retry binds at RETRY ADMISSION, inside its admission transaction, once
+cancellation can no longer win (ARCHITECTURE §6 "Project binding by task
 and by origin"; `tests/test_retry_project_binding.py`).
 
 One named exception: a verification RECEIPT with no ingress point reconciles by
@@ -320,11 +313,9 @@ correct: `tool_capabilities.OBSERVE_WORLD_MUTATION_TOOLS`, compiled by
 `ouroboros/consciousness_authority.py`, names the verbs that START work or CHANGE
 the world, so a new READ tool reaches Observe by default, pinned against the
 catalog's own `mutates_worktree` marker. That module owns a level's two
-consequences — `disabled_tools` and the per-task `runtime_mode_cap`, the stricter
-of install mode and cap binding even on an advanced/pro/cyber_pro install — and
-for a consciousness-origin task `disabled_tools` binds at DISPATCH ONLY, so the
-wake keeps an owner turn's cached prefix while every other contract keeps both
-enforcement halves (ARCHITECTURE §6 "Background consciousness and Evolution").
+consequences, `disabled_tools` (DISPATCH ONLY for a consciousness-origin task,
+both enforcement halves elsewhere) and the per-task `runtime_mode_cap`
+(ARCHITECTURE §6 "Background consciousness and Evolution").
 
 ### Task-authored messages are never owner text
 

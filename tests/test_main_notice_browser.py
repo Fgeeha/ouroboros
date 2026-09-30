@@ -163,6 +163,10 @@ def _chat_rows(oracle, needle):
             for row in oracle._jsonl("logs/chat.jsonl") if needle in str(row.get("text") or "")]
 
 
+def _identities(rows):
+    return [(row["direction"], row["chat_id"], row["type"], row["task_id"]) for row in rows]
+
+
 def _revision(server, project_id):
     rows = _api(server.base_url, "GET", "/api/projects")["projects"]
     return int(next(row for row in rows if row["id"] == project_id).get("visible_revision") or 0)
@@ -270,10 +274,13 @@ def test_project_root_main_notice_reaches_main_only_and_keeps_the_project_answer
 
                     before_notice.release.set()
                     assert before_answer.arrived.wait(120), "the turn never returned from its notice tool"
+                    # The tool's "sent" receipt is the worker's enqueue; the supervisor persists the
+                    # row after it. Anchor the refresh window on the exact durable Main row itself.
+                    main_row = ("out", 1, "main_notice", task_id)
+                    wait_until(lambda: main_row in _identities(_chat_rows(oracle, notice_mark)), 60)
                     notice_seen_at = time.monotonic()
                     notice_rows = _chat_rows(oracle, notice_mark)
-                    assert [(r["direction"], r["chat_id"], r["type"], r["task_id"]) for r in notice_rows] == [
-                        ("out", 1, "main_notice", task_id)], notice_rows
+                    assert _identities(notice_rows) == [main_row], notice_rows
                     assert any("notice sent to the main chat" in text for text in tool_results), tool_results
                     proactive = [row for row in oracle.events("proactive_message") if row.get("task_id") == task_id]
                     assert [row.get("destination") for row in proactive] == ["main"], proactive
