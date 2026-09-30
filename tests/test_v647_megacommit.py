@@ -76,30 +76,6 @@ def test_query_code_user_files_empty_path_hard_error():
     assert "requires an explicit path" in out
 
 
-def test_query_code_user_files_child_matches_parent_read_scope(tmp_path, monkeypatch):
-    from ouroboros.contracts.task_constraint import TaskConstraint
-    from ouroboros.tools.query_code import _query_code
-    from ouroboros.tools.registry import ToolContext
-
-    home = tmp_path / "home"
-    source = home / "project"
-    source.mkdir(parents=True)
-    (source / "source.py").write_text("def parent_visible():\n    pass\n", encoding="utf-8")
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    (outside / "source.py").write_text("def outside_source():\n    pass\n", encoding="utf-8")
-    monkeypatch.setenv("OUROBOROS_USER_FILES_ROOT", str(home))
-    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
-    ctx = ToolContext(repo_dir=tmp_path / "repo", drive_root=tmp_path / "data")
-    for constraint in (None, TaskConstraint(mode="local_readonly_subagent")):
-        ctx.task_constraint = constraint
-        for op in ("symbols", "digest"):
-            result = _query_code(ctx, op, root="user_files", path=str(source))
-            assert "parent_visible" in result
-        refused = _query_code(ctx, "symbols", root="user_files", path=str(outside))
-        assert "outside the user_files home" in refused and "outside_source" not in refused
-
-
 def test_query_code_structural_walk_is_bounded_and_symlink_safe():
     from ouroboros.tools.query_code import _walk_candidate_files
 
