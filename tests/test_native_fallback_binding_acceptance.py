@@ -403,9 +403,10 @@ def test_primary_choice_survives_shared_cold_continuation(main_call, monkeypatch
     assert inner._route_facts_pending == "dated refusal fact" and effort == "high"
 
 
-@pytest.mark.parametrize("wire", ["managed", "http", "sse"])
-@pytest.mark.parametrize("status", [429, 503, 529])
-@pytest.mark.parametrize("ending", ["answer", "stop", "deadline"])
+@pytest.mark.parametrize("wire,status,ending", [
+    (wire, status, ending) for wire in ("managed", "http", "sse")
+    for status in (429, 503, 529) for ending in ("answer", "stop", "deadline")
+] + [("managed", 503, "wrap")])
 def test_primary_refusal_wait_paces_real_requests_without_catalog_recovery(
         main_call, monkeypatch, wire, status, ending):
     from datetime import datetime, timedelta, timezone
@@ -424,9 +425,9 @@ def test_primary_refusal_wait_paces_real_requests_without_catalog_recovery(
     ctx.context_fit_plan = replace(ctx.context_fit_plan, model=primary,
         provider="claudexor" if wire == "managed" else "openai", model_route=ROUTE if wire == "managed" else {})
     tools = _loop_tools(ctx, owner)
-    tools._ctx.task_model_override, tools._ctx.is_direct_chat = primary, True
+    tools._ctx.task_model_override, tools._ctx.is_direct_chat = primary, ending != "wrap"
     tools._ctx.model_wait_context = owner
-    owner.worker_slot_held = False
+    owner.worker_slot_held = ending == "wrap"
     wait_call = {"id": "wait-primary", "type": "function", "function": {
         "name": "switch_model", "arguments": json.dumps({"primary": "wait"})}}
     first = {"role": "assistant", "content": "", "tool_calls": [wait_call]}
@@ -463,9 +464,18 @@ def test_primary_refusal_wait_paces_real_requests_without_catalog_recovery(
     monkeypatch.setattr(loop_llm_call, "_sleep_within_deadline", lambda seconds, *_a, **_k: bursts.append(seconds) or True)
     def pause(seconds, _wake):
         waits.append(seconds)
-        if ending == "stop":
-            owner_mailbox.write_owner_message(ctx.drive_root, REASON_OWNER_STOPPED_DIRECT_TURN, "task-one",
-                msg_id="stop-primary-wait", kind=owner_mailbox.KIND_FINALIZE_NOW)
+        if ending in {"stop", "wrap"}:
+            from ouroboros.outcomes import REASON_OWNER_REQUESTED_FINALIZATION
+            reason = REASON_OWNER_STOPPED_DIRECT_TURN if ending == "stop" else REASON_OWNER_REQUESTED_FINALIZATION
+            msg_id = "stop-primary-wait"
+            if ending == "wrap":
+                from ouroboros import cancel_intents
+                from supervisor.owner_stop import owner_stop_control_id
+                intent = cancel_intents.request_cancel(ctx.drive_root, "task-one",
+                    requested_stop_policy=cancel_intents.STOP_POLICY_FINALIZE)
+                msg_id = owner_stop_control_id(intent)
+            owner_mailbox.write_owner_message(ctx.drive_root, reason, "task-one",
+                msg_id=msg_id, kind=owner_mailbox.KIND_FINALIZE_NOW)
         elif ending == "deadline":
             tools._ctx.task_metadata["deadline_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
         return ending != "answer"
@@ -493,4 +503,7 @@ def test_primary_refusal_wait_paces_real_requests_without_catalog_recovery(
             assert "owner stopped this chat turn" in notice
         else:
             assert "No new summary request was sent" in notice
+        if ending == "wrap":
+            assert "owner requested Wrap up while the primary provider was refusing requests" in notice
+            assert any(note.endswith("Stop cancels.") for note in notes)
         assert "provider connection was unavailable" not in notice and "$0" not in notice
