@@ -13,6 +13,7 @@ import { clientSurfaceField } from './client_surface.js';
 import { syncResultFilesItem } from './result_files.js';
 import { createChatReadingPosition } from './chat_reading_position.js';
 import { createChatHistoryPager, historyCoverage, historyIslandAtEdge } from './chat_history.js';
+import { createProjectReadReceipt, isAtNewestMessage } from './project_read_state.js';
 import { mergeHistoricalTimelineItem, historyNodeIsProtected, historyRowIds, historyStamps, stampHistoryNode, compareHistoryPosition } from './chat_history_replay.js';
 import { apiClient, apiFetch, fetchTaskDetail, fetchTaskDetailStrict } from './api_client.js';
 import { syncHistoryRetentionItem } from './history_retention.js';
@@ -195,6 +196,7 @@ export function createChatInstance({
     // defers its first hydration to it (bounded by an unconditional deadline).
     isProjectOpening = null,
     onHistoryRetry = null,
+    onReadingLatest,
 }) {
     const container = mountEl || document.getElementById('content');
     const chatSessionId = getOrCreateChatSessionId(sessionStorage, globalThis.crypto);
@@ -420,16 +422,12 @@ export function createChatInstance({
     let inputHistorySeededFromServer = false; // set true only after a successful server-side recall seed
     let historySyncPromise = null;
     let lastHistorySyncSucceeded = false;
-    let historyPaintGeneration = 0;
     // STICKY single-flight hydration promise.
     // Unlike historySyncPromise it survives success, so hydration triggers
     // (bootstrap IIFE, first non-reconnect socket open, refreshHistory without
     // a new revision) short-circuit instead of refetching. Any FAILED sync
     // resets it; scheduleHistorySync and the reconnect path never consult it.
     let initialHydrationPromise = null;
-    // highest project revision whose history has been fetched;
-    // refreshHistory only bypasses the sticky promise for a NEWER revision.
-    let lastLoadedHistoryRevision = 0;
     // one-shot idle gate for Main's deferred first hydration.
     let hydrationGatePromise = null;
     // One derived physical coverage/status for the mounted reading window.
@@ -669,7 +667,8 @@ export function createChatInstance({
             const node = ids && [...ids].flatMap(historyNodes).find(node => node.getClientRects().length);
             return node ? restoreVisibleTimelineAnchor({ node, offset: target.historyAnchor?.offset || 0 }) : false;
         },
-        changed: () => { syncLoadOlderControl(); updateScrollButton(); },
+        // A settled place is where the reader is (the read receipt).
+        changed: () => { syncLoadOlderControl(); updateScrollButton(); readReceipt.note({ discrete: true }); },
     });
 
     function withStableViewport(mutate, options) { return reading.mutate(mutate, options); }
@@ -2778,6 +2777,7 @@ export function createChatInstance({
                     updateMessagesPadding();
                     reading.followAfterLayout();
                 }
+                readReceipt.settle();
                 return messages.length > 0;
             } catch (err) {
                 lastHistorySyncSucceeded = false;
@@ -2802,39 +2802,26 @@ export function createChatInstance({
         return historySyncPromise;
     }
 
-    function cancelHistoryPaint() {
-        historyPaintGeneration += 1;
-    }
-
-    async function refreshHistory({ revision = 0 } = {}) {
-        const generation = ++historyPaintGeneration;
-        const targetRevision = Math.max(0, Number(revision) || 0);
-        // only a NEW revision (or a never-hydrated instance)
-        // forces a real fetch; otherwise the sticky hydration promise answers
-        // and the paint receipt below still runs.
-        if (targetRevision > lastLoadedHistoryRevision || !initialHydrationPromise) {
-            await syncHistory({ includeUser: true });
-        } else {
-            await awaitInitialHydration({ includeUser: true });
-        }
-        if (lastHistorySyncSucceeded && targetRevision > lastLoadedHistoryRevision) {
-            lastLoadedHistoryRevision = targetRevision;
-        }
-        if (destroyed || !lastHistorySyncSucceeded || generation !== historyPaintGeneration || page.hidden) {
-            return { painted: false, revision: targetRevision };
-        }
-        // A successful fetch is not a read acknowledgement until the rebuilt
-        // DOM has crossed an actual browser paint while this Project remains
-        // visible. Two frames cover layout followed by paint/composite. A
-        // destroyed page reports hidden===false, so the paint receipt must also
-        // consult the lifecycle flag — a late paint on a torn-down instance
-        // would otherwise acknowledge a revision that was never shown.
-        await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-        return {
-            painted: !destroyed && generation === historyPaintGeneration && !page.hidden,
-            revision: targetRevision,
-        };
-    }
+    // A new revision needs a read begun after it: one in flight is awaited, never
+    // joined; the sticky hydration answers a covered one (project_read_state.js).
+    const readReceipt = createProjectReadReceipt({
+        read: async (fresh) => {
+            if (!fresh && initialHydrationPromise) await initialHydrationPromise;
+            else {
+                if (historySyncPromise) await historySyncPromise;
+                await syncHistory({ includeUser: true });
+            }
+            return lastHistorySyncSucceeded;
+        },
+        // A destroyed page reports hidden===false, hence the lifecycle flag.
+        isShown: () => !destroyed && !page.hidden,
+        // A place still being restored is not where the reader is.
+        isReadingLatest: latest => !destroyed && !reading.pending && isInstanceVisible() && isAtNewestMessage(latest, {
+            delivered: id => retainedHistoryIds().has(id), nodes: historyNodes, viewport: messagesDiv, header: pageHeader, composer: inputArea,
+            atBottom: () => isNearBottom() && !historyPager.getState().canNewer,
+        }),
+        onReadingLatest,
+    });
 
     (async () => {
         await loadUiPreferences();
@@ -3076,7 +3063,7 @@ export function createChatInstance({
     }
 
     // Scroll events observe position; only positive navigation changes follow intent.
-    messagesDiv?.addEventListener('scroll', () => { reading.scroll(); settleHistoryViewport(); }, { passive: true });
+    messagesDiv?.addEventListener('scroll', () => { reading.scroll(); settleHistoryViewport(); readReceipt.note(); }, { passive: true });
     messagesDiv?.addEventListener('load', reading.reflow, true);
 
     // Navigation plus one coalesced, non-live-region remote-activity bit.
@@ -3292,6 +3279,7 @@ export function createChatInstance({
         historyControls.endRecent(data.reason_code ? new Error('Some saved history could not be loaded.') : null);
         recentCoverage = data.coverage ?? null;
         recentHasOrigins = messages.some(row => row.origin_projected);
+        readReceipt.recent(data);
         const ids = new Set(messages.flatMap(historyRowIds));
         for (const id of recentHistoryIds) if (data.window?.truncated_by?.includes(`${id.split(':')[0]}_source_unavailable`)) ids.add(id);
         recentHistoryIds = ids;
@@ -3374,8 +3362,12 @@ export function createChatInstance({
             pageHistoryIds.set(descriptor.id, new Set(messages.flatMap(historyRowIds)));
             const oldRecentIds = recentHistoryIds;
             const admitted = descriptor.direction === 'latest' && acceptRecentWindow(descriptor, messages);
-            applyHistoryMessages(messages, { archived: descriptor.direction !== 'recent' && descriptor.direction !== 'latest' });
+            const archived = descriptor.direction !== 'recent' && descriptor.direction !== 'latest';
+            applyHistoryMessages(messages, { archived });
             if (admitted) withStableViewport(() => releaseHistoryIds(oldRecentIds));
+            // An older page drawn can show, or name, the newest arrival without a scroll.
+            if (admitted) readReceipt.settle();
+            else if (archived) readReceipt.page(descriptor);
         },
         releasePage: descriptor => {
             const ids = pageHistoryIds.get(descriptor.id) || [];
@@ -3875,11 +3867,11 @@ export function createChatInstance({
         // Called by app.js when this instance's panel is (re)shown so a project
         // thread restores its scroll position instead of jumping to the top (P7).
         restoreScrollPosition: reading.request,
-        refreshHistory,
+        refreshHistory: readReceipt.refresh,
         revealQuestion: (taskId, quizId) => chatDecision.revealQuestion(
             taskId, quizId, projectId, chatId, appendQuizMessage, isInstanceVisible,
             () => { const current = reading.claim(); reading.stick = false; return current; }, reading.scroll),
-        cancelHistoryPaint,
+        cancelHistoryPaint: readReceipt.cancel,
         // app.js fans its already-existing /api/state refresh to every open
         // thread; panels gain convergence without acquiring their own poll.
         hydrateStateSnapshot,
@@ -3912,7 +3904,7 @@ export function createChatInstance({
             if (destroyed) return;
             destroyed = true;
             emptyWelcome?.dispose();
-            cancelHistoryPaint();
+            readReceipt.cancel();
             for (const dispose of wsDisposers) {
                 try { dispose(); } catch {}
             }

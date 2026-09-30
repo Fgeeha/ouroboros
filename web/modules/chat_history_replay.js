@@ -104,6 +104,12 @@ export function historyNodeIsProtected(node, viewport, selection = globalThis.ge
             try { if (selection.getRangeAt(index).intersectsNode(node)) return true; } catch {}
         }
     }
-    const bounds = viewport.getBoundingClientRect(), rect = node.getBoundingClientRect();
+    return historyNodeOnScreen(node, viewport);
+}
+
+/** A rendered node intersecting the feed's viewport (or a band of it); a collapsed one has no boxes. */
+export function historyNodeOnScreen(node, viewport, bounds = viewport.getBoundingClientRect()) {
+    if (!node?.isConnected) return false;
+    const rect = node.getBoundingClientRect();
     return Boolean(node.getClientRects().length && rect.bottom > bounds.top && rect.top < bounds.bottom);
 }
