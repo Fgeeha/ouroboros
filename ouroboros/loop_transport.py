@@ -402,7 +402,7 @@ def reconcile_transport_wait(
         )
         emit_network_wait_event(
             drive_logs, task_id=task_id, phase="entered",
-            elapsed_sec=0.0, redials=0, model=model, detail=error_kind,
+            elapsed_sec=0.0, redials=0, model=model, detail=error_kind if refused else "",
         )
         episode.last_note_monotonic = time.monotonic()
         # Interactive notes keep their existing wording; direct-turn Stop is
