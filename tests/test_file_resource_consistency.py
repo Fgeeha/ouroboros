@@ -554,3 +554,68 @@ def test_parent_runtime_read_rules_follow_physical_files_across_root_labels(tmp_
         assert 'hidden_project_fact' not in result
         assert 'projects/other/hidden.py' not in result
     assert cached.read_bytes() == cache_before
+
+
+def test_project_settings_source_is_readable_by_verify_guard(tmp_path):
+    from ouroboros.tools.shell_guards import process_shell_guard_args
+    from tests._typed_guard_shared import _shell_guard_text
+
+    repo, data = tmp_path / "repo", tmp_path / "runtime"
+    (repo / "data").mkdir(parents=True)
+    data.mkdir()
+    (repo / "data" / "settings.json").write_text('{"ordinary": "project fixture"}', encoding="utf-8")
+    registry = ToolRegistry(repo, data)
+    registry._ctx.task_constraint = TaskConstraint(mode="acting_subagent", surface="external_workspace", write_root=str(repo))
+    mapped = process_shell_guard_args("verify_and_record", {"check": "cat data/settings.json", "cwd": str(repo)})
+    result = _shell_guard_text(registry, mapped, "advanced")
+    assert result is None, result
+    assert "project fixture" in registry.execute("read_file", {"path": "data/settings.json"})
+
+
+@pytest.mark.parametrize('mode', ['light', 'advanced', 'pro', 'cyber_pro'])
+@pytest.mark.parametrize('actor', ['parent', 'local_readonly_subagent', 'acting_subagent'])
+@pytest.mark.parametrize('fallback', [False, True])
+def test_explicit_user_files_retains_parent_mode_policy(tmp_path, monkeypatch, mode, actor, fallback):
+    from ouroboros import config
+    from ouroboros.tools import media, vision
+    from tests.test_media_tools import _patch_pypdf, _FakePage
+
+    home = tmp_path / 'home'
+    repo, data = home / 'Ouroboros/repo', home / 'Ouroboros/data'
+    repo.mkdir(parents=True)
+    source = data / 'projects/p1/knowledge/source.py'
+    source.parent.mkdir(parents=True)
+    source.write_text('def parent_project_source():\n    pass\n', encoding='utf-8')
+    monkeypatch.setattr(config, 'DATA_DIR', data)
+    monkeypatch.setenv('OUROBOROS_USER_FILES_ROOT', str(home))
+    monkeypatch.setenv('OUROBOROS_RUNTIME_MODE', mode)
+    monkeypatch.setenv('OUROBOROS_SAFETY_MODE', 'off')
+    registry = ToolRegistry(repo, data)
+    ctx = registry._ctx
+    if actor != 'parent':
+        ctx.task_constraint = TaskConstraint(mode=actor, surface='external_workspace', write_root=str(repo))
+    if fallback:
+        monkeypatch.setattr('ouroboros.code_search_rg._rg_binary', lambda: '')
+    else:
+        from tests.test_code_search_rg import _install_fake_rg
+        _install_fake_rg(tmp_path, monkeypatch)
+    for tool, args, expected in (
+        ('read_file', {'path': str(source)}, 'parent_project_source'),
+        ('list_files', {'path': str(source.parent)}, 'source.py'),
+        ('search_code', {'path': str(source.parent), 'query': 'parent_project_source'}, 'parent_project_source'),
+        ('query_code', {'op': 'symbols', 'path': str(source.parent)}, 'parent_project_source'),
+        ('query_code', {'op': 'digest', 'path': str(source.parent)}, 'parent_project_source'),
+    ):
+        result = registry.execute(tool, {'root': 'user_files', **args})
+        assert (expected in result) is (mode == 'cyber_pro'), result
+        if mode != 'cyber_pro':
+            assert 'BLOCKED' in result or 'blocked' in result, result
+    # The explicitly selected runtime root and the implicit media reader keep
+    # their pre-existing project-store policy even in Cyber, for every actor.
+    runtime = registry.execute('read_file', {'root': 'runtime_data', 'path': str(source)})
+    assert 'ACCESS_DENIED' in runtime and 'parent_project_source' not in runtime
+    assert 'ACCESS_DENIED' in vision._read_file_parity_block(ctx, source)
+    pdf = source.parent / 'note.pdf'
+    pdf.write_bytes(b'%PDF-1.4 fake')
+    _patch_pypdf(monkeypatch, [_FakePage('parent_project_source')])
+    assert 'ACCESS_DENIED' in media._ocr_pdf(ctx, str(pdf))

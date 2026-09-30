@@ -48,11 +48,13 @@ def _skill_owner_state_read_allowed(ctx: ToolContext) -> bool:
         return False
 
 
-def _runtime_data_read_check(ctx: ToolContext, *, listing: bool = False) -> Callable[[pathlib.Path], str]:
+def _runtime_data_read_check(ctx: ToolContext, *, listing: bool = False, root: str = "") -> Callable[[pathlib.Path], str]:
     """Prepare the parent's runtime rules once for this read/list/search call."""
     from ouroboros.tools.core_secret_paths import runtime_data_roots
 
-    roots = runtime_data_roots(ctx)
+    # Explicit user_files uses its own per-mode runtime-overlap policy. Cyber
+    # parents already read those files there; child parity must not narrow it.
+    roots = [] if root == "user_files" else runtime_data_roots(ctx)
     owner_state_blocked = not listing and not _skill_owner_state_read_allowed(ctx)
 
     def check(target: pathlib.Path) -> str:
@@ -72,8 +74,8 @@ def _runtime_data_read_check(ctx: ToolContext, *, listing: bool = False) -> Call
     return check
 
 
-def _runtime_data_read_block(ctx: ToolContext, target: pathlib.Path, *, listing: bool = False) -> str:
-    return _runtime_data_read_check(ctx, listing=listing)(target)
+def _runtime_data_read_block(ctx: ToolContext, target: pathlib.Path, *, listing: bool = False, root: str = "") -> str:
+    return _runtime_data_read_check(ctx, listing=listing, root=root)(target)
 
 
 def _direct_resource_binding(
@@ -623,7 +625,7 @@ def _read_file(
     except ValueError:
         opened = str(target)
     opened_root = str(binding.root)  # the NORMALIZED root the binding used, not the model's spelling
-    if runtime_block := _runtime_data_read_block(ctx, target):
+    if runtime_block := _runtime_data_read_block(ctx, target, root=binding.root):
         return _publish_tool_result(ctx, ToolResult(status="blocked", code="DATA_BLOCKED", text=runtime_block))
     protected_block = block_reason_for_path(ctx, target, "read_bytes", binding)
     if protected_block:
@@ -727,7 +729,7 @@ def _list_files(
             code="LEGACY_TOOL_ERROR",
             text=f"⚠️ LIST_FILES_ERROR ({type(exc).__name__}): {exc}",
         ))
-    if runtime_block := _runtime_data_read_block(ctx, binding.target_path, listing=True):
+    if runtime_block := _runtime_data_read_block(ctx, binding.target_path, listing=True, root=binding.root):
         return _publish_tool_result(ctx, ToolResult(status="blocked", code="DATA_BLOCKED", text=runtime_block))
     protected_list_block = block_reason_for_path(
         ctx, binding.target_path, "static_introspection", binding

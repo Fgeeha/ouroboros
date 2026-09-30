@@ -98,7 +98,7 @@ def _visible_file(
     from ouroboros.tools.core_file_tools import _runtime_data_read_block
 
     return not (
-        (runtime_check(target) if runtime_check is not None else _runtime_data_read_block(ctx, target))
+        (runtime_check(target) if runtime_check is not None else _runtime_data_read_block(ctx, target, root=binding.root if binding else ""))
         or block_reason_for_path(ctx, target, "read_bytes", binding)
         or block_reason_for_path(ctx, target, "static_introspection", binding)
     )
@@ -348,7 +348,7 @@ def _query_code(
 
     from ouroboros.tools.core_file_tools import _runtime_data_read_check
 
-    runtime_check = _runtime_data_read_check(ctx)
+    runtime_check = _runtime_data_read_check(ctx, root=binding.root)
     limit = min(max(1, int(limit or 40)), _MAX_LIMIT)
     offset = max(0, int(offset or 0))
     try:

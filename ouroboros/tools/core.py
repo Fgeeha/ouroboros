@@ -895,7 +895,7 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
             search_root.relative_to(root_path.resolve(strict=False))
         except ValueError:
             return f"⚠️ SEARCH_ERROR: path escapes root: {display_search_path}"
-    runtime_check = _runtime_data_read_check(ctx)
+    runtime_check = _runtime_data_read_check(ctx, root=binding.root)
     if runtime_block := runtime_check(search_root):
         return runtime_block
     protected_root_block = block_reason_for_path(
@@ -1087,27 +1087,19 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
         "may be incomplete; narrow the path or glob, or raise OUROBOROS_SEARCH_CODE_WALL_SEC."
         if deadline_hit else ""
     )
-    # Typed disclosure, not invisibility (capinv-447): a restricted subagent is
-    # TOLD how many secret/control files its search could not see, mirroring the
-    # listing filters' hidden-entries marker.
     protected_omitted = search_drops.get("protected_artifact", 0)
-    restricted_omitted = search_drops.get("restricted_subagent", 0)
-    restricted_note = (
-        f" {restricted_omitted} secret/control file(s) omitted from this subagent's search."
-        if restricted_omitted else ""
-    )
     # Filter receipt for the remaining ordinary exclusions (D3): oversized,
     # symlinks, excluded names, unreadable, policy-scoped — never silent.
     from ouroboros.code_search_rg import format_dropped_files_note
 
     other_dropped_note = format_dropped_files_note({
         key: count for key, count in search_drops.items()
-        if key not in ("protected_artifact", "restricted_subagent")
+        if key != "protected_artifact"
     })
     if not matches:
         suffix = f" {protected_omitted} protected artifact file(s) omitted." if protected_omitted else ""
         cap_note = f" Scan stopped after {_MAX_SEARCH_FILES_SCANNED} files — narrow the path or glob." if files_capped else ""
-        return f"No matches found for {'regex' if regex else 'literal'} `{query}` in {display_search_path} ({files_searched} files searched).{suffix}{restricted_note}{other_dropped_note}{cap_note}{deadline_note}"
+        return f"No matches found for {'regex' if regex else 'literal'} `{query}` in {display_search_path} ({files_searched} files searched).{suffix}{other_dropped_note}{cap_note}{deadline_note}"
 
     header = f"Found {len(matches)} match{'es' if len(matches) != 1 else ''} in {display_search_path} ({files_searched} files searched)"
     if files_capped:
@@ -1118,8 +1110,6 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
         header += " — stopped at the time budget (results may be incomplete)"
     if protected_omitted:
         header += f" — {protected_omitted} protected artifact file(s) omitted"
-    if restricted_omitted:
-        header += f" — {restricted_omitted} secret/control file(s) omitted from this subagent's search"
     if other_dropped_note:
         header += " —" + other_dropped_note.rstrip(".")
     return header + "\n\n" + "\n".join(matches)
