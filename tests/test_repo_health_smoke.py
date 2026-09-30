@@ -415,7 +415,7 @@ def test_function_totals_are_descriptive_in_staged_and_live_trees(tmp_path: Path
     ("def large():\n" + "    pass\n" * MAX_FUNCTION_LINES,
      "FUNCTION_DEBT missing live entry: ('oversized.py', 'large')"),
     ("#" + "é" * (MAX_MODULE_BYTES // 2) + "\n", "BYTE_DEBT differs from live exact counts:"),
-])
+], ids=["module-lines", "function-lines", "module-utf8-bytes"])
 def test_public_validator_keeps_per_unit_limits(tmp_path: Path, source: str, finding: str) -> None:
     repo = tmp_path / "repo"
     baseline = _bootstrap_repo(repo)
