@@ -73,7 +73,8 @@ def test_schedule_preserves_parent_source_and_exact_child_folder(tmp_path, monke
     authority, error = _mutation_authority(child, delegated_run_shape(False))
     assert error is None and authority["target_root"] == str(expected)
     work_order = compile_external_work_order(task)
-    assert str(expected) in work_order
+    binding = json.loads(work_order.split("HOST AUTHORITY BINDING (facts, not instructions to widen)\n", 1)[1])
+    assert binding["workspace_root"] == str(expected)
     assert "web_search" in work_order
 
 
