@@ -136,6 +136,20 @@ def run_chat_viewport_smoke(
         page.evaluate(_SETTLE_TWO_FRAMES)
         return result
 
+    def read_to_latest(page):
+        # Follow is reading intent: the reader's own wheel reaches the live edge.
+        # A scripted scroll (set_remaining) moves the view but decides nothing.
+        box = page.locator("#chat-messages").bounding_box()
+        page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+        page.mouse.wheel(0, jump_state(page)["remaining"] + 200)
+        page.wait_for_function(
+            """() => {
+                const messages = document.querySelector('#chat-messages');
+                return messages.scrollHeight - messages.scrollTop - messages.clientHeight <= 1;
+            }"""
+        )
+        page.evaluate(_SETTLE_TWO_FRAMES)
+
     def jump_state(page):
         return page.evaluate(
             """() => {
@@ -157,7 +171,7 @@ def run_chat_viewport_smoke(
         )
 
     def begin_noop_read(page):
-        set_remaining(page, 0)
+        read_to_latest(page)
         return set_remaining(page, 40)["scrollTop"]
 
     def assert_noop_read(page, before):
@@ -268,7 +282,9 @@ def run_chat_viewport_smoke(
                 assert state["visible"] and state["dotHidden"], state
                 assert state["label"] == state["title"] == "Scroll to latest message", state
 
-                # The visible pre-mutation distance is the only live-follow truth.
+                # A following reader follows only from within the 48px zone:
+                # the visible pre-mutation distance decides.
+                read_to_latest(page)
                 for case, target in enumerate((0, 40)):
                     assert abs(set_remaining(page, target)["remaining"] - target) <= 2
                     _emit_ws_frame(page, {
@@ -309,9 +325,9 @@ def run_chat_viewport_smoke(
                     set_remaining(page, 0)
                     assert jump_state(page)["dotHidden"]
 
-                # `_savedStick` is deliberately stale here: scroll and delivery
+                # Follow intent is deliberately stale here: scroll and delivery
                 # happen in one JS turn, before a native scroll event can repair it.
-                set_remaining(page, 0)
+                read_to_latest(page)
                 stale = page.evaluate(
                     """frame => {
                         const messages = document.querySelector('#chat-messages');
@@ -397,7 +413,12 @@ def run_chat_viewport_smoke(
                 # Browser visibility is a lifecycle seam. A hidden pinned
                 # reader re-follows; a hidden history reader keeps its saved
                 # numeric position and receives the coalesced activity bit.
-                set_remaining(page, 0)
+                # Following is the reader's intent, set by ↓ or their own
+                # gesture; a scripted scroll event alone decides neither.
+                button.click()
+                page.evaluate(_SETTLE_TWO_FRAMES)
+                state = jump_state(page)
+                assert state["remaining"] <= 6 and state["dotHidden"], state
                 page.evaluate(
                     """() => {
                         window.__testDocumentHidden = true;
@@ -423,7 +444,16 @@ def run_chat_viewport_smoke(
                 state = jump_state(page)
                 assert state["remaining"] <= 6 and state["dotHidden"], state
 
-                set_remaining(page, 300)
+                box = page.locator("#chat-messages").bounding_box()
+                page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+                page.mouse.wheel(0, -300)
+                page.wait_for_function(
+                    """() => {
+                        const messages = document.querySelector('#chat-messages');
+                        return messages.scrollHeight - messages.scrollTop - messages.clientHeight >= 298;
+                    }"""
+                )
+                page.evaluate(_SETTLE_TWO_FRAMES)
                 hidden_top = page.locator("#chat-messages").evaluate("node => node.scrollTop")
                 page.evaluate(
                     """() => {

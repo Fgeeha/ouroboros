@@ -128,7 +128,9 @@ class TestSupportedParametersFilter:
             )
         assert len(sent) == 1
         assert sent[0]["model"] == model
-        assert sent[0]["tools"][0]["function"] == tool["function"]
+        # The OpenRouter wire marks the absent `strict` explicitly false (issue #1411).
+        assert sent[0]["tools"][0]["function"] == {**tool["function"], "strict": False}
+        assert "strict" not in tool["function"]
         assert sent[0]["extra_body"]["provider"] == {
             "require_parameters": True, "allow_fallbacks": True,
         }
@@ -318,7 +320,7 @@ class TestSupportedParametersFilter:
             allow_server_web_search=False,
             skip_capability_fetch=True,
         )
-        assert kwargs["tools"] == [tool]
+        assert kwargs["tools"] == [{**tool, "function": {**tool["function"], "strict": False}}]
 
     def test_chat_path_forwards_main_openrouter_web_search_flag(self, monkeypatch):
         from types import SimpleNamespace
