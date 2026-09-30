@@ -32,14 +32,10 @@ WINDOW_STALE = "stale_unverifiable"
 WINDOW_UNKNOWN = "unknown_conservative"
 WINDOW_SENTINEL = "designated_default_sentinel"
 
-# The metadata probe lives with the shared window resolver (`reviewer_window`) and is
-# rate-limited by the TTL on the evidence record, keyed by the full ROUTE fingerprint
-# rather than the model name: capability is a property of provider+base_url+model, and
-# a hot base-URL change must get its own probe rather than silently reusing the old
-# verdict. EVERY scope route gets that probe, the shipped default included, so the
-# sizing number is a measurement wherever one is reachable; rate-limiting it per
-# PROCESS instead of per TTL left an install that outlived the TTL unable to
-# RE-source it (v6.87.45).
+# The shared resolver (`reviewer_window`) keys remote metadata by full route
+# fingerprint and evidence TTL, not process lifetime or model name alone. Local
+# capacity is live serving-instance evidence on each resolution, never that cache.
+# Both a remote route change and a local restart must reach their own current facts.
 
 
 def is_designated_default_reviewer(model: str) -> bool:
@@ -79,13 +75,10 @@ def scope_window(model: str, *, session: bool = False, model_role: str = "",
     alone cannot say where it came from, and the caller that needs to know then
     guesses.
 
-    Every route gets one lazy metadata-only fetch per evidence-TTL period (never
-    generative, never a paid call), concurrent resolutions of the same route
-    serialized by the per-route lock; inside the TTL the cache answers and the path
-    stays hot-path safe. How often the network is re-asked is owned by
-    ``capability_evidence.probe``'s record TTL, deliberately NOT by the process
-    lifetime (v6.87.45: a per-process memo outlived the 24h record and wedged
-    every commit once an install stayed up past the TTL)."""
+    Remote metadata uses the evidence TTL (never generation or a paid call),
+    with concurrent resolutions serialized by the per-route lock. Local routes
+    read live serving evidence each time. ``capability_evidence.probe`` owns this
+    distinction; process-lifetime memoization would outlive either kind of fact."""
     model = str(model or "")
     try:
         # Probe the scope slot, not the active main route (which honors USE_LOCAL_MAIN).

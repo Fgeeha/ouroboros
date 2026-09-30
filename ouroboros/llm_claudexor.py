@@ -98,7 +98,7 @@ class ClaudexorModelError(RuntimeError):
     """A model-operation fact with its exact role, route and recovery identity."""
 
     def __init__(self, problem: dict, *, model_role: str = "", operation_id: str = "",
-                 route: dict | None = None, unknown: bool = False):
+                 route: dict | None = None, unknown: bool = False, same_operation_recoverable: bool = False):
         self.problem = copy.deepcopy(problem)
         self.code = "model_outcome_unknown" if unknown else str(problem.get("code") or "model_operation_failed")
         super().__init__(f"{self.code}: {problem.get('message') or 'Model operation did not complete'}")
@@ -117,7 +117,7 @@ class ClaudexorModelError(RuntimeError):
             # rejection: no unknown outcome or same-request wire repair.
             self.stream_rejected = self.stream_incomplete = True
             self.retryable = False
-        self.model_role = model_role
+        self.model_role, self.same_operation_recoverable = model_role, same_operation_recoverable  # the latter: a READ failure; rejoin, never regenerate
         self.operation_id = operation_id
         self.route = copy.deepcopy(route or {})
 
@@ -467,12 +467,11 @@ class _ModelInvocation:
             except Exception as error:
                 log.warning("Model custody observer unavailable: %s", type(error).__name__)
 
-    def error(self, problem: dict | None, detail: dict | None = None, *, unknown: bool = False):
-        detail = detail or {}
-        route = (detail.get("dispatch") or {}).get("route") or {}
+    def error(self, problem: dict | None, detail: dict | None = None, *, unknown: bool = False, rejoinable: bool = False):
+        route = ((detail or {}).get("dispatch") or {}).get("route") or {}
         cls = ClaudexorModelError if unknown else ClaudexorModelNotDispatched
-        return cls(problem or {"code": "model_operation_failed", "message": "The engine returned no model result."},
-                   model_role=self.role, operation_id=self.operation_id, route=route, unknown=unknown)
+        return cls(problem or {"code": "model_operation_failed", "message": "The engine returned no model result."}, model_role=self.role,
+                   operation_id=self.operation_id, route=route, unknown=unknown, same_operation_recoverable=rejoinable)
 
     def receive(self) -> dict:
         outage_started = None
@@ -537,21 +536,22 @@ class _ModelInvocation:
                                       "context": {"httpStatus": error.status_code}}) from None
                 # A failed read after creation is never a provider connect failure.
                 # Drop its causal HTTP chain at this boundary: even ConnectError
-                # means only the local control read failed, not inference un-sent.
+                # means only the local control read failed, not inference un-sent (a refused read, 404 too).
                 if error.code != "daemon_unreachable" and not 500 <= error.status_code < 600:
-                    raise self.error({"code": error.code, "message": str(error)}, detail, unknown=True) from None
+                    if self._control_outage():  # rejoin by operation id OR the same create idempotency key
+                        continue
+                    raise self.error({"code": error.code, "message": str(error)}, detail, unknown=True, rejoinable=self.create_attempted) from None
                 if outage_started is None:
                     outage_started = time.monotonic()
                 if self._control_outage():
                     continue
                 if time.monotonic() - outage_started >= self.timeout:
-                    raise self.error({"code": "model_control_unreachable", "message": "Control connection lost; the same model operation may still finish."}, detail, unknown=True) from None
+                    raise self.error({"code": "model_control_unreachable", "message": "Control connection lost; the same model operation may still finish."}, detail, unknown=True, rejoinable=True) from None
             time.sleep(min(config.CLAUDEXOR_MODEL_POLL_INTERVAL_SEC, self.timeout))
 
     def _control_outage(self, *, recovered: bool = False) -> bool:
-        """Managed calls keep the same accepted operation through local HTTP loss."""
-        from ouroboros.loop_transport import (
-            TransportWaitEpisode, emit_network_wait_event, managed_transport_continuation)
+        """Ordinary direct and queued calls keep the same operation through control loss."""
+        from ouroboros.loop_transport import TransportWaitEpisode, emit_network_wait_event, managed_transport_continuation
         waiter = current_model_wait()
         ctx = getattr(waiter, "tool_context", None)
         if not managed_transport_continuation(ctx):

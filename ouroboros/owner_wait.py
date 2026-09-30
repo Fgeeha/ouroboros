@@ -150,6 +150,7 @@ def continuation_state(ctx: Any, messages: list, trace: dict, usage: dict,
         "route": {key: getattr(ctx, key, None) for key in (
             "active_model", "active_effort", "active_use_local", "active_context_mode",
             "active_model_override", "active_effort_override", "active_use_local_override",
+            "active_role_override", "route_wait_on_primary", "primary_route", "_route_facts_pending",
         )},
         "delivery_candidate": asdict(candidate) if candidate is not None else None,
         "delivery": {key: getattr(ctx, key, None) for key in (

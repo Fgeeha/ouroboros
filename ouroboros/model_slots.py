@@ -143,6 +143,27 @@ def task_model_binding(task: dict, *, context_fit_plan: object = None,
     return role, pin
 
 
+def route_binding(model: str, use_local: bool, role: str, *,
+                  overrides: dict | None = None) -> tuple[str, bool, str]:
+    """The complete identity a send on ``role`` uses: model, locality and account.
+
+    A live owner choice for the role (a wait-card switch) replaces the configured
+    route exactly as the send applies it; the account is the configured pin or
+    empty Auto, never an observed Auto account, and routes without accounts have
+    none. Equal model strings with different accounts are different routes.
+    """
+    from ouroboros.provider_models import provider_for_model
+
+    chosen = (overrides or {}).get(role) or {}
+    model, use_local = str(chosen.get("model", model) or ""), bool(chosen.get("use_local", use_local))
+    account = chosen.get("model_account_override")
+    if account is None:
+        account = model_role_option(MODEL_ACCOUNTS_KEY, role) if role else ""
+    if use_local or provider_for_model(model) != "claudexor":
+        account = ""
+    return model, use_local, str(account or "").strip()
+
+
 def task_processing_preference(task: dict, *, model_role: str = "",
                               override: str | None = None) -> str:
     """Capture the actor's intent; an unconfigured fallback preserves that intent."""

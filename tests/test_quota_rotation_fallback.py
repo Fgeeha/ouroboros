@@ -24,7 +24,7 @@ from ouroboros.send_clock import CLOCK_NOTE_PREFIX
 from ouroboros import fallback_cooldown, loop, loop_llm_call, model_wait
 from ouroboros import llm_claudexor as transport
 from ouroboros import usage_accounting as ua
-from ouroboros.loop_llm_call import RETRY_WALL_EXHAUSTED_KEY, call_llm_with_retry, provider_no_call_source
+from ouroboros.loop_llm_call import call_llm_with_retry, provider_no_call_source
 from ouroboros.loop_model_call import RESOURCE_REFUSAL_KEY
 from ouroboros.loop_transport import provider_recovery_hint
 from ouroboros.model_slots import MODEL_ACCOUNTS_KEY
@@ -236,18 +236,60 @@ def test_a_fallback_answer_leaves_no_owner_question_and_no_refusal(main_call, on
     assert not _waits(events) and RESOURCE_REFUSAL_KEY not in usage and len(gateway.accepted_operations) == 1
 
 
-def test_an_unknown_fallback_outcome_asks_no_owner_and_sends_nothing_more(main_call, one_fallback, monkeypatch):
+def test_an_eligible_unknown_fallback_outcome_still_opens_the_primary_refusal_wait(main_call, one_fallback, monkeypatch):
+    """Owner decision 1A: a candidate's eligible unknown outcome does not fence the round. With no
+    configured route left, the primary's retained refusal opens its own visible owner wait (never a
+    sleep to its reset), and the send after that wait is a NEW generation carrying one facts-only
+    input naming the unknown candidate attempt; the old attempt keeps its own identity."""
     ctx, gateway, owner, _events, _decide, _observations = main_call
     gateway.results, gateway.dispatch = [_pool_quota()], ["not_started"]
     assert loop._call_round_model(ctx)[0] is None and ctx.tools._ctx._deferred_resource_refusal is not None
     original = loop._call_round_model
+    sent, asked = [], []
 
     def candidate(round_call):
-        assert round_call.defer_resource_wait is True  # the primary's owner question would follow
-        round_call.accumulated_usage["_last_llm_error_kind"] = "provider_outcome_unknown"
+        sent.append((round_call.active_model, round_call.defer_resource_wait, [dict(row) for row in round_call.messages]))
+        if round_call.defer_resource_wait is False:  # the retained refusal's own send after the owner wait
+            return {"role": "assistant", "content": "after the wait"}, 0.0, "max"
+        round_call.accumulated_usage.update(_last_llm_error_kind="provider_outcome_unknown", _pending_transport_outcome={
+            "physical_attempt_id": "fallback-unknown", "operation_id": "", "outcome": "unknown"})
         return None, 0.0, "max"
 
     monkeypatch.setattr(loop, "_call_round_model", candidate)
+    monkeypatch.setattr(model_wait.ResourceDeferral, "ask_owner",
+                        lambda deferral, _waiter: asked.append(deferral.fact["reason"]))
+    message, *_rest = loop._run_cross_model_fallback_chain(
+        llm=ctx.llm, ctx=ctx.tools._ctx, tools=ctx.tools, messages=ctx.messages, active_model=ctx.active_model,
+        active_use_local=False, tool_schemas=[], active_effort="medium", max_retries=3, drive_logs=ctx.drive_logs,
+        task_id=ctx.task_id, round_idx=1, event_queue=_events, accumulated_usage=ctx.accumulated_usage,
+        task_type="task", emit_progress=lambda *_a, **_kw: None, context_fit_plan=ctx.context_fit_plan,
+        active_context_mode="max")
+    monkeypatch.setattr(loop, "_call_round_model", original)
+    assert message["content"] == "after the wait" and asked == ["quota"]
+    assert [(model, defer) for model, defer, _rows in sent] == [(FALLBACK, True), (MODEL, False)]
+    assert not any("[Transport recovery]" in str(row.get("content")) for row in sent[0][2])
+    notices = [row for row in sent[-1][2] if "[Transport recovery]" in str(row.get("content"))]
+    assert len(notices) == 1 and "fallback-unknown" in notices[0]["content"]
+    assert RESOURCE_REFUSAL_KEY not in ctx.accumulated_usage and len(gateway.accepted_operations) == 1
+
+
+def test_a_readable_unknown_fallback_operation_fences_the_round(main_call, one_fallback, monkeypatch):
+    """Disallowed counterpart: an unknown whose accepted operation could not be READ may still
+    finish, so nothing further is sent — not the owner question's send, not a forced final."""
+    ctx, gateway, owner, _events, _decide, _observations = main_call
+    gateway.results, gateway.dispatch = [_pool_quota()], ["not_started"]
+    assert loop._call_round_model(ctx)[0] is None
+    original = loop._call_round_model
+
+    def candidate(round_call):
+        assert round_call.defer_resource_wait is True
+        round_call.accumulated_usage.update(_last_llm_error_kind="provider_outcome_unknown", _pending_transport_outcome={
+            "physical_attempt_id": "still-readable", "outcome": "unknown", "same_operation_recoverable": True})
+        return None, 0.0, "max"
+
+    monkeypatch.setattr(loop, "_call_round_model", candidate)
+    monkeypatch.setattr(model_wait.ResourceDeferral, "ask_owner",
+                        lambda *_a: pytest.fail("no owner wait may send over a readable operation"))
     message, *_rest = loop._run_cross_model_fallback_chain(
         llm=ctx.llm, ctx=ctx.tools._ctx, tools=ctx.tools, messages=ctx.messages, active_model=ctx.active_model,
         active_use_local=False, tool_schemas=[], active_effort="medium", max_retries=3, drive_logs=ctx.drive_logs,
@@ -256,11 +298,7 @@ def test_an_unknown_fallback_outcome_asks_no_owner_and_sends_nothing_more(main_c
         active_context_mode="max")
     monkeypatch.setattr(loop, "_call_round_model", original)
     assert message is None and not _waits(_events) and len(gateway.accepted_operations) == 1
-    refusal = ctx.accumulated_usage[RESOURCE_REFUSAL_KEY]
-    assert (refusal["owner_wait"], refusal["fallbacks_tried"]) == ("not_asked", [FALLBACK])
-    # The unknown-outcome fence still outranks: nothing is resent, not even a forced final.
     assert provider_no_call_source(ctx.accumulated_usage, False)[0] == "provider_outcome_unknown_no_resend"
-    assert provider_no_call_source({RESOURCE_REFUSAL_KEY: refusal}, True) == ("resource_refusal_no_resend", True)
 
 
 def test_a_candidate_defers_only_while_a_later_route_or_the_owner_question_follows(main_call, monkeypatch):
@@ -604,27 +642,49 @@ def test_main_retry_never_sleeps_to_a_reset_nor_resends_a_spent_window(tmp_path,
     usage = {}
     message, _cost = call_llm_with_retry(Client(), [{"role": "user", "content": "go"}], MODEL, None, "medium", 3,
                                          tmp_path / "logs", "task-one", 1, None, usage, deadline_ts=None)
-    assert message is None and len(calls) == 1 and usage[RETRY_WALL_EXHAUSTED_KEY] is True
+    assert message is None and len(calls) == 1
+    assert usage["_last_llm_retry_same_request"] is False and usage["_last_llm_resource_refusal"] == "quota"
+
+
+def test_dated_pool_classifier_retains_forecast_without_inventing_quota():
+    error = transport.ClaudexorModelNotDispatched({"code": "credential_pool_exhausted",
+        "message": "No usable route", "context": {"poolCause": "unavailable", "resetsAt": RESET}}, route=ROUTE)
+    fact = loop_llm_call.classify_llm_exception(error)
+    assert fact.kind == "provider_error" and fact.provider_code == "credential_pool_exhausted"
+    assert fact.reset_at == RESET and fact.retry_same_request is False and fact.retry_after_sec is None
+    quota = loop_llm_call.classify_llm_exception(transport.ClaudexorModelError(_vendor_quota()["problem"], route=ROUTE))
+    assert quota.kind == "subscription_window_exhausted"  # a proved quota window retains its own meaning
 
 
 @pytest.mark.parametrize("presence", [False, True])
-def test_an_unproven_dated_pool_keeps_its_reset_timer_only_where_waiting_is_allowed(tmp_path, monkeypatch, presence):
-    slept = []
-    monkeypatch.setattr(loop_llm_call, "_sleep_within_deadline", lambda seconds, *_a, **_kw: slept.append(seconds) and False)
+def test_a_dated_unavailable_pool_never_sleeps_to_its_reset_anywhere(tmp_path, monkeypatch, presence):
+    """#1376 overlap / #1409 case 1: a dated pool refusal is a typed resource refusal of its own
+    (``unavailable``, never quota) that is neither resent nor slept on, where waiting is allowed and
+    where it is not; the round's configured routes and the visible wait own what follows."""
+    monkeypatch.setattr(loop_llm_call, "_sleep_within_deadline", lambda *_a, **_kw: pytest.fail("slept to a reset"))
     dated = transport.ClaudexorModelNotDispatched({"code": "credential_pool_exhausted", "message": "no account",
                                                    "context": {"poolCause": "unavailable", "resetsAt": RESET}})
     dated.physical_attempt_capture = SimpleNamespace(state="released", attempt_id="a-1", provider="claudexor",
                                                      route_is_loopback=False)
+    calls = []
 
     class Client:
         def chat(self, **_kwargs):
+            calls.append(1)
             raise dated
 
+    usage = {}
     with model_wait.task_model_wait_scope(task={"id": "task-one", "_presence_turn": presence}, drive_root=tmp_path,
                                           event_queue=None, worker_slot_held=False):
-        call_llm_with_retry(Client(), [{"role": "user", "content": "go"}], MODEL, None, "medium", 3,
-                            tmp_path / "logs", "task-one", 1, None, {}, deadline_ts=None)
-    assert (slept == []) is presence and all(seconds > 3600 for seconds in slept)
+        message, _cost = call_llm_with_retry(Client(), [{"role": "user", "content": "go"}], MODEL, None, "medium", 3,
+                                             tmp_path / "logs", "task-one", 1, None, usage, deadline_ts=None)
+    assert message is None and calls == [1]
+    assert usage["_last_llm_resource_refusal"] == "unavailable" and usage["_last_llm_reset_at"] == RESET
+    assert "_last_llm_retry_after_sec" not in usage
+    assert model_wait.model_wait_reason(dated) == "unavailable"
+    undated = transport.ClaudexorModelNotDispatched({"code": "credential_pool_exhausted", "message": "no account",
+                                                     "context": {"poolCause": "unavailable"}})
+    assert model_wait.model_wait_reason(undated) == ""  # an undated pool proves no resource fact
 
 
 @pytest.mark.parametrize("code,context,outage", [

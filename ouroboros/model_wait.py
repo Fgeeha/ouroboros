@@ -5,11 +5,12 @@ This module keeps only the live call's wait and role overrides. It neither
 schedules work nor records physical attempts: every resumed call still goes
 through LLMClient and the ordinary physical-attempt ledger.
 
-Quota recovery order: the transport's Auto account rotation, then every
-configured route of the round, and only then the owner. A round whose later
-route exists returns its refusal instead of waiting (``ResourceDeferral``); the
-owner question is then opened from that retained refusal, never from another
-generation. An inline Presence turn never waits for quota or for the owner.
+Resource recovery order (quota, sign-in, an engine-dated unavailable pool): the
+transport's Auto account rotation, then every configured route of the round,
+and only then the owner. A round whose later route exists returns its refusal
+instead of waiting (``ResourceDeferral``); the owner question is then opened
+from that retained refusal, never from another generation, and nothing sleeps
+to a reset. An inline Presence turn never waits for a resource or the owner.
 """
 
 from __future__ import annotations
@@ -62,9 +63,14 @@ def model_wait_reason(error: Exception) -> str:
     """Only confirmed resource causes authorize this live waiting contract.
 
     The engine's typed mixed pool means auth plus quota, excluding unknown
-    readiness, disabled accounts and model incompatibility. Generic pool failure
-    proves none of those facts and must keep its ordinary error path.
+    readiness, disabled accounts and model incompatibility. A dated generic pool
+    refusal is ``unavailable`` for this request; its reset forecast proves neither
+    quota exhaustion nor unavailability until that instant. An undated pool failure
+    proves none of those facts and keeps its ordinary error path.
     """
+    authored = getattr(error, "task_resource_wait_reason", "")
+    if authored in {"auth", "quota"}:
+        return authored  # confirmed by the registered caller's refusal classifier
     code = getattr(error, "code", "")
     if code in {"auth_required", "subscription_window_exhausted"}:
         return "auth" if code == "auth_required" else "quota"
@@ -72,6 +78,8 @@ def model_wait_reason(error: Exception) -> str:
     context = problem.get("context") if isinstance(problem, dict) else None
     if code == "credential_pool_exhausted" and isinstance(context, dict) and context.get("poolCause") == "mixed":
         return "auth_quota"
+    if code == "credential_pool_exhausted" and str(getattr(error, "reset_at", "") or "").strip():
+        return "unavailable"
     return ""
 
 
@@ -160,7 +168,7 @@ def execution_elapsed_seconds(meta: dict, now: float) -> float:
 
 _CURRENT: contextvars.ContextVar[TaskModelWait | None] = contextvars.ContextVar(
     "ouroboros_model_wait", default=None)
-_REPREPARE: contextvars.ContextVar[dict[str, Callable] | None] = contextvars.ContextVar(
+_REPREPARE: contextvars.ContextVar[dict[str, tuple[Callable, Callable | None]] | None] = contextvars.ContextVar(
     "ouroboros_model_wait_reprepare", default=None)
 _CALENDAR: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
     "ouroboros_model_wait_calendar", default=())
@@ -417,10 +425,11 @@ class TaskModelWait:
                 self.started_monotonic = time.monotonic() - max(0.0, time.time() - float(started_at))
 
     @contextlib.contextmanager
-    def register_reprepare(self, role: str, callback: Callable[[dict], dict]) -> Iterator[None]:
-        """Bind one call's Main-context preparation without a cross-thread registry."""
+    def register_reprepare(self, role: str, callback: Callable[[dict], dict], *,
+                           resource_reason: Callable[[Exception], str] | None = None) -> Iterator[None]:
+        """Bind one caller's reprepare and optional confirmed-refusal classification."""
         bindings = dict(_REPREPARE.get() or {})
-        bindings[role] = callback
+        bindings[role] = (callback, resource_reason)
         token = _REPREPARE.set(bindings)
         try:
             yield
@@ -458,7 +467,8 @@ class TaskModelWait:
 
     def reprepare(self, role: str, kwargs: dict) -> dict | PreparedModelCall:
         """A route change must rebind any already-prepared Main fit authority."""
-        callback = (_REPREPARE.get() or {}).get(role)
+        binding = (_REPREPARE.get() or {}).get(role)
+        callback = binding[0] if binding else None
         if callback is not None:
             return callback(copy.deepcopy(kwargs))
         from ouroboros.usage_accounting import current_physical_attempt_context
@@ -600,7 +610,11 @@ class TaskModelWait:
         from ouroboros.provider_models import parse_claudexor_model
 
         role = kwargs["model_role"]
-        source, native_model = parse_claudexor_model(kwargs["model"])
+        try:
+            source, native_model = parse_claudexor_model(kwargs["model"])
+        except ValueError:
+            source, native_model = "", kwargs["model"]  # no configured non-generating access observer
+        observes_access = bool(source)
         route = getattr(error, "route", {}) or {}
         problem_context = (getattr(error, "problem", {}) or {}).get("context") or {}
         account_intent = kwargs.get("model_account_override")
@@ -610,13 +624,14 @@ class TaskModelWait:
         scope = current_usage_scope()
         slot_id = str(getattr(scope, "review_slot_id", "") or "")
         reason = model_wait_reason(error)
-        quota_wait = reason in {"quota", "auth_quota"}
+        quota_wait = reason in {"quota", "auth_quota"}  # unavailable does not prove a quota window
         row = {"wait_id": wait_id, "task_attempt": self.attempt, "role": role,
                "_slot_id": slot_id,
                "model": kwargs["model"], "source": source,
                "credential_profile_id": "" if reason == "auth_quota" else str(route.get("credentialProfileId") or problem_context.get("credentialProfileId") or account_intent or ""),
                "credential_harness": "", "reason": reason, "reset_at": str(getattr(error, "reset_at", "") or ""),
-               "auto_continue": self.auto_continue.get(role, True), "state": "waiting",
+               "auto_continue": self.auto_continue.get(role, True) if observes_access else False, "state": "waiting",
+               **({"availability_observation": "unavailable"} if not observes_access else {}),
                "worker_slot_held": self.worker_slot_held, "started_at": utc_now_iso()}
         if self.owner_id:
             row["model_wait_owner_id"] = self.owner_id
@@ -662,7 +677,7 @@ class TaskModelWait:
                 now = time.monotonic()
                 if row.pop("_check_now", False):
                     next_check = 0.0
-                if now >= next_check:
+                if observes_access and now >= next_check:
                     try:
                         if not row["credential_harness"]:
                             sources = llm.claudexor_model_sources()
@@ -791,15 +806,19 @@ def model_waitable(function: Callable | None = None, *, client_parameter: str = 
         from ouroboros.llm_claudexor import ClaudexorModelError
 
         capture = getattr(error, "physical_attempt_capture", None)
+        binding = (_REPREPARE.get() or {}).get(values.get("model_role"))
+        classified = binding[1](error) if binding and binding[1] is not None else ""
+        if classified:
+            error.task_resource_wait_reason = classified
         reason = model_wait_reason(error)
         if not (context and not context.closed and values.get("model_role") and reason
-                and isinstance(error, ClaudexorModelError)
-                and getattr(capture, "state", None) in {"released", "settled"}):
+                and (classified or (isinstance(error, ClaudexorModelError)
+                                    and getattr(capture, "state", None) in {"released", "settled"}))):
             return False
         deferral = _deferral(values["model_role"])
-        # Quota: account rotation, then every configured route, then the owner. Sign-in
-        # keeps its own owner wait wherever waiting is possible.
-        if deferral is not None and (reason != "auth" or not context.waits_allowed):
+        # Account rotation, then every configured route, then the owner: sign-in too, so a
+        # healthy configured route keeps working while the refused account awaits repair.
+        if deferral is not None:
             deferral.retain(receiver, error, values)
             return False
         return bool(context.waits_allowed and values.get("wait_for_resources", True))

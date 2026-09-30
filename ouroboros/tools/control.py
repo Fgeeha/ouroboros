@@ -190,24 +190,18 @@ _SCHEDULE_SUBAGENT_DESCRIPTION = (
 def get_tools() -> List[ToolEntry]:
     from ouroboros.config import EFFORT_SCALE
     return [
-        ToolEntry("finish_task", {
-            "name": "finish_task",
+        ToolEntry("finish_task", {"name": "finish_task",
             "description": "Select the complete answer and request completion of your current task. "
                 "Use finish after considering the observed work, or stop with a rationale naming unfinished work. "
-                "Select exactly one of answer or a host-offered answer_sha256. This grants no success, "
-                "cancels no children, and retains all configured review and owner controls.",
+                "Select exactly one of answer or a host-offered answer_sha256. This grants no success, cancels no children, and retains all configured review and owner controls.",
             "parameters": {"type": "object", "properties": {
-                "action": {"type": "string", "enum": ["finish", "stop"]},
-                "answer": {"type": "string", "description": "The complete answer, including a short correction."},
+                "action": {"type": "string", "enum": ["finish", "stop"]}, "answer": {"type": "string", "description": "The complete answer, including a short correction."},
                 "answer_sha256": {"type": "string", "description": "Exact offered retained or whole held response hash."},
-                "rationale": {"type": "string", "description": "For stop, what remains unfinished."},
-                "acceptance_subject": {"type": "object", "properties": {
-                    "owner_source_sha256": {"type": "string"}, "effective_criteria": {"type": "string"},
-                    "material_tool_indices": {"type": "array", "items": {"type": "integer"}},
+                "rationale": {"type": "string", "description": "For stop, what remains unfinished."}, "acceptance_subject": {"type": "object", "properties": {"owner_source_sha256": {"type": "string"},
+                    "effective_criteria": {"type": "string"}, "material_tool_indices": {"type": "array", "items": {"type": "integer"}},
                 }, "required": ["owner_source_sha256"]},
                 "pending_review": {"type": "string", "enum": ["wait", "finish"], "default": "wait"},
-            }, "required": ["action"]},
-        }, _finish_task),
+            }, "required": ["action"]}}, _finish_task),
         ToolEntry("set_tool_timeout", {
             "name": "set_tool_timeout",
             "description": "Update the global tool timeout in settings.json and apply it immediately without restart.",
@@ -380,6 +374,12 @@ def get_tools() -> List[ToolEntry]:
             "parameters": {"type": "object", "properties": {
                 "text": {"type": "string", "description": "Message text"},
                 "reason": {"type": "string", "description": "Why you're reaching out (logged, not sent)"},
+                "destination": {"type": "string", "enum": ["current", "main"], "default": "current",
+                                "description": "'current' (default): this conversation's room. 'main': the "
+                                               "owner's main chat, for a brief plain-text notice that belongs "
+                                               "there while this work lives in an owner-visible Project room. "
+                                               "It never appears in the Project thread and is not this task's "
+                                               "answer. Delegated, Presence and agent-to-agent work cannot use it."},
             }, "required": ["text"]},
         }, _send_user_message),
         ToolEntry("update_identity", {
@@ -427,11 +427,20 @@ def get_tools() -> List[ToolEntry]:
             "name": "switch_model",
             "description": "Switch to a different LLM model or reasoning effort level. "
                            "Use when you need more power (complex code, deep reasoning) "
-                           "or want to save budget (simple tasks). Takes effect on next round.",
+                           "or want to save budget (simple tasks). Takes effect on next round. "
+                           "After the host moved this turn to a configured fallback, primary='return' "
+                           "or 'wait' goes back to the turn's primary route.",
             "parameters": {"type": "object", "properties": {
                 "model": {"type": "string", "description": "Model name (e.g. anthropic/claude-sonnet-4). Leave empty to keep current."},
                 "effort": {"type": "string", "enum": list(EFFORT_SCALE),
                            "description": "Reasoning effort level (adapted down per route when a model tops out lower). Leave empty to keep current."},
+                "primary": {"type": "string", "enum": ["return", "wait"],
+                            "description": ("Omit to keep the current route. Return to this turn's primary route: its model, role and account policy "
+                                            "(Auto stays Auto) plus the owner's wait-card choice; effort stays. 'return': "
+                                            "if the primary refuses, configured routes are tried again. 'wait': if it "
+                                            "refuses or is unreachable, wait for it where this turn may wait instead of "
+                                            "paid alternatives. The next real request tests it; no timer or probe does. "
+                                            "Not with model.")},
             }, "required": []},
         }, _switch_model),
         ToolEntry("get_task_result", {
