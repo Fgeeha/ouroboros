@@ -73,7 +73,7 @@ test('a held card with retained progress waits statically; Stop, terminal and sa
     assert.equal(card.inlineTypingEl.style.display, '');
     const chat = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
     assert.match(chat, /restoreCardActivity\(liveCardRecords\.get\(k\), v\.project_admission_hold\)/);
-    assert.match(chat, /function restoreCardActivity\(record, held = \{\}\) \{\n\s+if \(!setHistoricalUnavailable\(record, false, held\)\)/);
+    assert.match(chat, /function restoreCardActivity\(record, held = \{\}\) \{\r?\n\s+if \(!setHistoricalUnavailable\(record, false, held\)\)/);
 });
 
 
