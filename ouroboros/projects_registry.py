@@ -711,20 +711,15 @@ def reserved_project_chat_ids(drive_root: Any, *, strict: bool = False) -> set:
     sections shows the task its own thread). ``strict=True`` RAISES on an
     unreadable registry instead of answering "no Projects".
     """
-    out = set()
     try:
-        projects = list_reserved_projects(drive_root, strict=True) if strict else list_reserved_projects(drive_root)
-        for project in projects:
-            try:
-                out.add(int(project.get("chat_id") or 0))
-            except (TypeError, ValueError):
-                continue
+        projects = (_strict_admission_snapshot(drive_root, allow_missing=True, identity_only=True)[0]["projects"]
+                    if strict else list_reserved_projects(drive_root))
+        return {project["chat_id"] for project in projects} - {0}
     except Exception:
         if strict:
             raise
         log.debug("reserved_project_chat_ids failed", exc_info=True)
-    out.discard(0)
-    return out
+    return set()
 
 
 _THREAD_LENS_CACHE: Dict[str, tuple] = {}

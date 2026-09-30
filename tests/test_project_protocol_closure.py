@@ -135,6 +135,7 @@ def test_healthy_display_thread_and_source_identity_survive_malformed_neighbor(r
     change_row(room.root, "other", **bad)
     assert any(row["id"] == "target" and row["name"] == "Target" for row in registry.projects_summary(room.root))
     assert target["chat_id"] in registry.reserved_project_chat_ids(room.root)
+    assert target["chat_id"] in registry.reserved_project_chat_ids(room.root, strict=True)
     frame = {"chat_id": target["chat_id"]}
     registry.stamp_project_thread(room.root, frame)
     assert frame["project_thread"] is True  # Main exclusion used by live/history consumers
@@ -167,6 +168,8 @@ def test_malformed_neighbor_identity_still_refuses_every_room(room, bad):  # noq
     assert room.queue.enqueue_task(task())["_admission_blocked"] == "project_routing_fence_lookup_failed"
     with pytest.raises(ValueError):
         _reserved_project_for_chat(SimpleNamespace(DRIVE_ROOT=room.root), chat)
+    with pytest.raises(ValueError):
+        registry.reserved_project_chat_ids(room.root, strict=True)
     assert not room.pending
 
 
