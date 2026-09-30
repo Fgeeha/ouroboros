@@ -365,15 +365,16 @@ def _target_is_system_repo(ctx: ToolContext) -> bool:
     isolated copy retains its admitted source identity. Legacy copies are
     interpreted as the body, as their original contract required.
     """
-    constraint = normalize_task_constraint(getattr(ctx, "task_constraint", None))
-    if (str(getattr(constraint, "surface", "") or "") == "self_worktree"
-            or str(getattr(ctx, "workspace_mode", "") or "").strip().lower() == "self_worktree"):
-        from ouroboros.workspace_copies import is_system_copy
+    from ouroboros.workspace_copies import copy_binding, source_is_system_repo
+    from ouroboros.tools.tool_resolution import system_repo_dir_for
 
-        return is_system_copy(ctx)
+    constraint = normalize_task_constraint(getattr(ctx, "task_constraint", None))
+    if ((getattr(constraint, "surface", "") == "self_worktree"
+         or getattr(ctx, "workspace_mode", "") == "self_worktree") and not copy_binding(ctx)):
+        return True  # Legacy isolated records were always own-body copies.
     try:
-        return not bool(ctx.is_workspace_mode())
-    except Exception:
+        return source_is_system_repo(ctx.active_repo_dir(), system_repo_dir_for(ctx))
+    except (AttributeError, OSError, ValueError, TypeError):
         return True
 
 
@@ -784,7 +785,10 @@ def _integrate_subagent_patch(
             )
     touched = sorted(set(touched) | {row["path"] for row in file_rows})
 
-    # An explicit target must equal the parent active root; descendants bubble up.
+    from ouroboros.workspace_copies import copy_binding, same_directory, source_is_system_repo, copy_apply_refusal
+    from ouroboros.tools.tool_resolution import system_repo_dir_for
+
+    child_copy = copy_binding(child_result) or child_result.get("workspace_copy") or {}
     constraint = normalize_task_constraint(getattr(ctx, "task_constraint", None))
     is_acting = bool(constraint and getattr(constraint, "mode", "") == ACTING_SUBAGENT_MODE)
     try:
@@ -792,17 +796,9 @@ def _integrate_subagent_patch(
     except Exception as exc:
         return f"⚠️ INTEGRATE_TARGET_ERROR: could not resolve active repo: {type(exc).__name__}: {exc}."
     requested_target = str(target_root or "").strip()
-    if (
-        requested_target
-        and child_surface != "external_workspace"
-        and pathlib.Path(requested_target).resolve(strict=False) != active_root
-    ):
-        return (
-            "⚠️ INTEGRATE_TARGET_FORBIDDEN: integration targets only your own active repo/worktree "
-            "(top-only routing). Drop target_root or set it to the active root; descendant patches "
-            "bubble up one parent at a time."
-        )
-    target = active_root
+    target = pathlib.Path(child_copy["source_root"]).resolve() if child_copy.get("source_root") else active_root
+    if requested_target and child_surface != "external_workspace" and not same_directory(requested_target, target):
+        return "⚠️ INTEGRATE_TARGET_FORBIDDEN: target_root must name this copy's recorded source; legacy patches target the active root."
     if not (target / ".git").exists():
         if child_surface != "external_workspace":
             return f"⚠️ INTEGRATE_TARGET_NOT_GIT: target {target} is not a git working tree."
@@ -820,12 +816,9 @@ def _integrate_subagent_patch(
             touched=touched, file_rows=file_rows,
         )
 
-    from ouroboros.workspace_copies import copy_binding
-
-    child_copy = copy_binding(child_result) or child_result.get("workspace_copy") or {}
     if child_surface == "self_worktree":
         if child_copy:
-            if (pathlib.Path(child_copy.get("source_root") or ".").resolve() != target
+            if (not same_directory(child_copy.get("source_root"), target)
                     or child_copy.get("baseline_sha") != manifest.get("base_head")
                     or child_copy != manifest.get("workspace_copy")):
                 return "⚠️ INTEGRATE_COPY_BINDING_MISMATCH: the recorded copy source, baseline or capture does not match this parent."
@@ -833,7 +826,7 @@ def _integrate_subagent_patch(
             # Legacy records always meant an Ouroboros-body copy. Missing
             # provenance must never turn one into a foreign-project patch.
             return "⚠️ INTEGRATE_SELF_WORKTREE_UNDER_WORKSPACE: legacy system-repo patch cannot be applied to an external workspace."
-        if (not child_copy or child_copy.get("source_is_system_repo") is not False):
+        if source_is_system_repo(target, system_repo_dir_for(ctx)) or (not child_copy and _target_is_system_repo(ctx)):
             capped = _capped_self_repo_refusal(ctx, child_task_id)
             if capped:
                 return capped
@@ -849,7 +842,8 @@ def _integrate_subagent_patch(
             f"protected-path check (git apply --numstat failed): {parse_error[:300]}"
         )
     touched = sorted(patch_touched | {row["path"] for row in file_rows})
-    protected = protected_paths_in(touched) if _target_is_system_repo(ctx) else []
+    target_is_body = source_is_system_repo(target, system_repo_dir_for(ctx)) if child_copy else _target_is_system_repo(ctx)
+    protected = protected_paths_in(touched) if target_is_body else []
     if protected:
         grant_ok = (not is_acting) or bool(getattr(constraint, "protected_paths_grant", False))
         if not (mode_allows_protected_write(runtime_mode) and grant_ok):
@@ -865,13 +859,17 @@ def _integrate_subagent_patch(
             )
 
     if child_copy:
+        if refusal := copy_apply_refusal(ctx, target, touched):
+            return f"⚠️ {refusal}"
         try:
             outcome = _locked_apply(
                 ctx, target, patch_path, touched, child_copy["baseline_sha"],
-                file_changes=file_rows, file_baseline=child_copy.get("file_baseline", {}))
+                file_changes=file_rows, file_baseline=child_copy.get("file_baseline", {}),
+                three_way=bool(child_copy.get("source_index_clean") and child_copy.get("target_head") == child_copy["baseline_sha"]),
+                admission_check=lambda: copy_apply_refusal(ctx, target, touched))
         except (OSError, ValueError, KeyError, subprocess.SubprocessError, zipfile.BadZipFile) as exc:
             return f"⚠️ INTEGRATE_APPLY_UNKNOWN: {type(exc).__name__}: {exc}. Inspect the target before another apply; the captured result is retained."
-        detail = outcome.get("lock_error") or outcome.get("drift_error")
+        detail = outcome.get("admission_refusal") or outcome.get("lock_error") or outcome.get("drift_error")
         if outcome.get("drifted"):
             detail = "source files changed since copy: " + ", ".join(outcome["drifted"])
         proc = outcome["proc"]
@@ -940,7 +938,7 @@ def _integrate_subagent_patch(
         detail = ("Integration did not finish cleanly." if apply_attempted else
                   "Result preparation failed. No file or patch apply was attempted.")
         next_step = ("Inspect with vcs_diff and resolve, or run vcs_restore to abort, then retry or pick another child."
-                     if apply_attempted else "Inspect the existing target/index state with vcs_diff and resolve it, then retry.")
+                     if apply_attempted else "The copy and patch are retained. Reconcile changed source files with this copy, or reject the result.")
         return (f"⚠️ INTEGRATE_CONFLICT: {child_task_id} into {target}: {detail} "
                 f"Details: {stderr[:600]}\n{next_step}")
 
@@ -1082,7 +1080,7 @@ def get_tools() -> List[ToolEntry]:
                 "name": "integrate_subagent_patch",
                 "description": (
                     "Integrate a mutative child's result or record a rejection: self_worktree uses "
-                    "a source-bound baseline check then apply/stage into your active repo (legacy copies keep 3-way apply); native external_workspace "
+                    "a source-bound apply/stage into its recorded source under your current write authority (clean copies support 3-way synthesis); native external_workspace "
                     "verifies files already in the shared tree WITHOUT reapplying. Genesis is a standalone "
                     "directory, not a repo patch. This never commits; self-modification still requires your "
                     "commit_reviewed. For best-of-N pick a child "
@@ -1097,7 +1095,7 @@ def get_tools() -> List[ToolEntry]:
                         "task_id": {"type": "string", "description": "The child subagent task_id whose workspace.patch to integrate."},
                         "decision": {"type": "string", "enum": ["apply", "reject"], "default": "apply", "description": "apply = apply/stage an isolated self_worktree patch, or verify shared external_workspace files already written; reject = record a rejection without applying."},
                         "reason": {"type": "string", "description": "Optional rationale recorded in the verdict (why accept / reject / synthesize)."},
-                        "target_root": {"type": "string", "description": "Optional explicit target repo/worktree root. Defaults to your active repo (live repo for the root agent; your worktree for a nested acting parent — top-only routing)."},
+                        "target_root": {"type": "string", "description": "Optional target repo/worktree root, which must match the copy’s recorded source. Omit to return there under your current write authority; legacy patches target your active root."},
                     },
                     "required": ["task_id"],
                 },

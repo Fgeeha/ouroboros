@@ -417,8 +417,10 @@ def _resolve_subagent_constraint(
     # external build sources, including isolated copies, but never the own body.
     from ouroboros.workspace_copies import source_is_system_repo
 
-    copy_source = str(workspace_root or ctx.REPO_DIR)
-    system_copy = surface == "self_worktree" and source_is_system_repo(copy_source, ctx.REPO_DIR)
+    from ouroboros.tools.tool_resolution import system_repo_dir_for
+    system_repo = getattr(ctx, "REPO_DIR", None) or system_repo_dir_for(ctx)
+    copy_source = str(workspace_root or system_repo)
+    system_copy = surface == "self_worktree" and source_is_system_repo(copy_source, system_repo)
     try:
         from ouroboros.config import get_allow_mutative_subagents
         allowed = bool(get_allow_mutative_subagents(surface, source_is_system_repo=system_copy))

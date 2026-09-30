@@ -366,6 +366,7 @@ class WorktreeHandle:
     untracked_baseline: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     source_is_system_repo: bool = True
     target_head: str = ""
+    source_index_clean: bool = False
     git_dir: str = ""
 
 
@@ -645,6 +646,16 @@ def _provision_git_copy(
             p for p in _git_env(target, "ls-files", "-z", env=real_env)
             .stdout.decode("utf-8", errors="surrogateescape").split("\0") if p
         ]
+        if target_head:
+            # A staged removal is absent from the real index but still in the
+            # HEAD-seeded scratch index. Remove it there before eligible inputs
+            # are staged; a recreated excluded file must not be hashed either.
+            removed = _git_env(target, "diff", "--cached", "--no-renames", "--diff-filter=D",
+                               "--name-only", "-z", target_head, "--", env=real_env).stdout
+            if removed:
+                _git_env(target, "update-index", "--force-remove", "-z", "--stdin", env=env, input_bytes=removed)
+        source_index_clean = bool(target_head and _git_env(
+            target, "diff-index", "--cached", "--quiet", target_head, "--", env=real_env, check=False).returncode == 0)
         untracked_raw = _git_env(
             target, "ls-files", "-z", "--others", "--exclude-standard",
             env=real_env,
@@ -724,7 +735,8 @@ def _provision_git_copy(
             task_id=task, path=str(wt_path), branch=branch, base_sha=baseline_sha,
             repo_dir=str(target), created_at=handle.created_at, parent_task_id=parent_task_id,
             file_baseline=handle.file_baseline, untracked_baseline=handle.untracked_baseline,
-            source_is_system_repo=source_is_system_repo, target_head=target_head, git_dir=git_dir,
+            source_is_system_repo=source_is_system_repo, target_head=target_head,
+            source_index_clean=source_index_clean, git_dir=git_dir,
         )
         entries = [e for e in _load_registry(data_dir, strict=True, op="provision_worktree")
                    if e.get("path") != str(wt_path)]

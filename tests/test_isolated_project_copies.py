@@ -162,6 +162,7 @@ def test_foreign_copy_uses_foreign_policy_in_every_mode(case, monkeypatch, mode)
 
 def test_source_drift_and_wrong_parent_keep_captured_copy(case):
     _, source, _, _ = case
+    (source / "a.txt").write_bytes(b"parent uncommitted\n")
     folder, task = admit(case, "child", "parent")
     (folder / "a.txt").write_bytes(b"child\n")
     artifacts, _ = capture(case, folder, task)
@@ -171,7 +172,7 @@ def test_source_drift_and_wrong_parent_keep_captured_copy(case):
     assert (source / "a.txt").read_bytes() == b"concurrent parent\n"
     assert folder.exists() and (artifacts / "workspace.patch").exists()
     wrong = parent_context(case, source=case[0])
-    assert "INTEGRATE_COPY_BINDING_MISMATCH" in _integrate_subagent_patch(wrong, task_id="child")
+    assert "INTEGRATE_TARGET_FORBIDDEN" in _integrate_subagent_patch(wrong, task_id="child", target_root=str(case[0]))
 
 
 def test_sibling_leaf_snapshot_and_actual_recursion_check(case):
