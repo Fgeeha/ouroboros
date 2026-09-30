@@ -1,5 +1,4 @@
 """The admitted Project address and nested waiting facts reach real gateways."""
-import asyncio
 import json
 from types import SimpleNamespace
 
@@ -81,9 +80,9 @@ def test_queue_gateway_preserves_child_wait_and_recovery_without_root_census_inf
     assert [task["id"] for task in sent] == ["sibling"]
     assert [row["activity_id"] for row in _chat_activities_snapshot_safe(host.root)] == ["sibling"]
     # Its unreadable result cannot deliver detail, but accepted queue custody can.
-    assert asyncio.run(api_task_get(request_for(host, "held"))).status_code in (404, 503)
+    assert host.run_async(api_task_get(request_for(host, "held"))).status_code in (404, 503)
     before = queue.QUEUE_SNAPSHOT_PATH.read_bytes()
-    response = asyncio.run(api_tasks_list(request_for(host, query=b"queue_only=1")))
+    response = host.run_async(api_tasks_list(request_for(host, query=b"queue_only=1")))
     assert response.status_code == 200
     payload = json.loads(response.body)
     held = next(row["task"] for row in payload["queue"]["pending"] if row["id"] == child["id"])
@@ -96,7 +95,7 @@ def test_queue_gateway_preserves_child_wait_and_recovery_without_root_census_inf
     workers.assign_tasks()
     workers.assign_tasks()
     assert [task["id"] for task in sent] == ["sibling", "held"]
-    recovered = json.loads(asyncio.run(api_tasks_list(request_for(host, query=b"queue_only=1"))).body)
+    recovered = json.loads(host.run_async(api_tasks_list(request_for(host, query=b"queue_only=1"))).body)
     row = next(row["task"] for row in recovered["queue"]["running"] if row["id"] == child["id"])
     assert row["project_admission_hold"] == {}
     assert not host.attempts

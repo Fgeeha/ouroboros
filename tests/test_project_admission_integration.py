@@ -1,7 +1,6 @@
 """Admission evidence survives promotion, conversion and repeated recovery."""
 from __future__ import annotations
 
-import asyncio
 import copy
 import json
 from types import SimpleNamespace
@@ -22,7 +21,7 @@ def convert(host, tid="converted"):  # noqa: F811
     async def body():
         return {"task_id": tid, "id": "chosen", "name": "Chosen"}
     request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(drive_root=host.root)), json=body)
-    response = asyncio.run(api_project_from_task(request))
+    response = host.run_async(api_project_from_task(request))
     return response, json.loads(response.body)
 
 
