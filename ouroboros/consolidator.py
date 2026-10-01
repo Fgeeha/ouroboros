@@ -7,7 +7,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ouroboros.contracts.chat_id_policy import is_a2a_chat_id
 from ouroboros import room_consolidation
-from ouroboros.utils import append_jsonl, atomic_write_json, replace_atomic, utc_now_iso, read_text
+from ouroboros.utils import append_jsonl, atomic_write_json, replace_atomic, utc_now_iso, read_text, extract_trailing_json_object
 
 from ouroboros.platform_layer import (
     file_lock_exclusive as _lock_ex, file_lock_exclusive_nb as _lock_nb, file_unlock as _unlock,
@@ -1472,7 +1472,12 @@ Respond with JSON only (no fences), after any useful knowledge reads:
         if raw.startswith("```"):
             raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
 
-        result = json.loads(raw)
+        try:
+            result = json.loads(raw)
+        except json.JSONDecodeError:
+            _, result, _ = extract_trailing_json_object(raw)
+            if result is None:
+                raise
 
         compressed_text = result.get("compressed_block", "")
         if not compressed_text or not compressed_text.strip():
