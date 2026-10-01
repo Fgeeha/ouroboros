@@ -40,3 +40,25 @@ def test_runtime_mode_default_remains_pro():
 def test_runtime_mode_refuses_unsupported_benchmark_modes(mode):
     with pytest.raises(SystemExit):
         parse_args(["--runtime-mode", mode])
+
+
+def test_default_six_hour_benchmark_settings_do_not_mutate_user_defaults(tmp_path, monkeypatch):
+    import copy
+    import os
+
+    from ouroboros.settings_defaults import SETTINGS_DEFAULTS
+
+    before = copy.deepcopy(SETTINGS_DEFAULTS)
+    monkeypatch.setenv("OUROBOROS_TASK_ABS_CEILING_SEC", "1800")
+    template = tmp_path / "template.json"
+    template.write_text('{"OUROBOROS_TASK_ABS_CEILING_SEC": "unlimited"}')
+    original = template.read_bytes()
+    output = tmp_path / "run"
+    output.mkdir()
+    path, metadata = _prepare_applied_settings(template, output, parse_args(["--per-task-cost-usd", "10"]))
+    applied = json.loads(path.read_text())
+    assert applied["OUROBOROS_TASK_ABS_CEILING_SEC"] == 21600
+    assert metadata["task_abs_ceiling_sec"] == 21600
+    assert SETTINGS_DEFAULTS == before
+    assert os.environ["OUROBOROS_TASK_ABS_CEILING_SEC"] == "1800"
+    assert template.read_bytes() == original

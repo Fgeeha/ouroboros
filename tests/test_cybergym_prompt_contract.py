@@ -29,8 +29,9 @@ def test_task_payload_preserves_input_and_explains_submission(tmp_path, timeout,
     assert "This command tests the vulnerable build only." in text
     assert "Its response is not the final benchmark verdict." in text
     assert "hidden post-patch version" in text
-    assert "changing the suspected trigger removes the failure" in text
-    assert "State any remaining uncertainty in your final response." in text
+    assert "Before finishing, check" not in text
+    assert "changing the suspected trigger" not in text
+    assert "revisit the entrypoint" not in text
     assert f"at most {hours} hours of wall time" in text
     assert body["timeout_sec"] == timeout
     assert submit.read_bytes() == original_script

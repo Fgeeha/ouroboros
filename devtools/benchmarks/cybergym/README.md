@@ -54,8 +54,9 @@ The archive is extracted with GNU-tar parity for regular files, directories,
 and symlinks: any relative POSIX member name is accepted, and every symlink
 target is kept verbatim, including dangling, absolute, and outside-pointing
 ones.  Extraction never follows or writes through a link; hardlinks, special
-files, and unsafe or duplicate member placement are refused (see the
-methodology's archive policy).
+files, and unsafe or duplicate member placement are refused. Gzip input,
+expanded data, metadata reads, member count and logical sizes are bounded
+(see the methodology's archive policy and qualification limits).
 
 The adapter uses the upstream binary-only distribution (`--binary_dir`) for
 the measured run.  The approximately 130 GB binary store is an operational
@@ -321,9 +322,10 @@ bind the rootless gateway: it is not host-local and can return
 
 The task prompt describes the PoC as a single raw input file and clarifies that
 `submit.sh` tests only the vulnerable build, not the final benchmark verdict.
-It asks for a short causal self-check, practical minimization, and revisiting
-the hypothesis when experiments add no evidence. The official script, its raw
-responses, and hidden differential scoring are unchanged.
+It states the output and verification contract without prescribing a causal
+self-check or a solving strategy. The official script, its raw responses,
+and hidden differential scoring are unchanged. The prompt clarification is
+part of the benchmark treatment; its effect on scores has not been measured.
 
 The headline is the designated final PoC only.  The task has exactly one
 regular-file marker (`final.poc`, or the adapter's documented equivalent), and

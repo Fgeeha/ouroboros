@@ -19,7 +19,7 @@ import pathlib
 import time
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from typing import Any
+from typing import Any, BinaryIO
 
 from ouroboros.platform_layer import file_lock_exclusive, file_unlock
 
@@ -187,11 +187,14 @@ def _final_path(path_or_workspace: pathlib.Path | str) -> pathlib.Path:
     return target if target.name == FINAL_POC_BASENAME else target / FINAL_POC_BASENAME
 
 
-def final_poc_record(path_or_workspace: pathlib.Path | str) -> FinalPoc:
+def final_poc_record(
+    path_or_workspace: pathlib.Path | str, *, copy_to: BinaryIO | None = None
+) -> FinalPoc:
     """Hash exactly one regular, non-symlink ``final.poc`` file.
 
     CyberGym caps uploaded PoCs at 10 MiB; enforcing that protocol limit here
     prevents an oversized marker from being mistaken for a valid final trial.
+    An optional already-open destination receives exactly the hashed bytes.
     """
     import stat
 
@@ -200,7 +203,7 @@ def final_poc_record(path_or_workspace: pathlib.Path | str) -> FinalPoc:
     # ``read_bytes`` permits a writable workspace process to swap the marker
     # for a symlink between the two operations.  O_NOFOLLOW (where available)
     # plus an fstat/read-size check binds the digest to the inode we inspected.
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(str(target), flags | nofollow)
@@ -264,7 +267,9 @@ def final_poc_record(path_or_workspace: pathlib.Path | str) -> FinalPoc:
         ) from exc
     finally:
         os.close(descriptor)
-    return FinalPoc(str(target.resolve(strict=False)), hashlib.sha256(raw).hexdigest(), len(raw))
+    if copy_to is not None:
+        copy_to.write(raw)
+    return FinalPoc(str(target.parent.resolve(strict=False) / target.name), hashlib.sha256(raw).hexdigest(), len(raw))
 
 
 def final_poc_hash(value: pathlib.Path | str | bytes | bytearray | memoryview) -> str:

@@ -80,7 +80,15 @@ host-side tool access resolves and confines its own reads, so the agent's
 workspace guidance tells it to read such links with `run_command`.  NUL,
 absolute, or escaping member names, duplicate paths, members below a link or
 file, and hardlinks, FIFOs, or devices are still refused; this is not full
-GNU-tar feature parity.
+GNU-tar feature parity. The gzip reader bounds metadata reads before tar
+parsing (1 MiB per read), compressed input (2 GiB), expanded stream offsets
+(16 GiB), member count (250,000), each logical member (2 GiB), and total logical
+member bytes (8 GiB, including sparse extents). These are resource limits,
+not measured maxima of the pinned dataset; synthetic consumer tests cover
+their boundaries, and a full-corpus compatibility run has not been performed.
+Generated description and submit-script reads require bounded regular files;
+final-PoC copies publish only bytes matching the recorded hash. Compressed
+telemetry is bounded before and during decompression by its 16 MiB limit.
 
 The run uses the upstream binary-only server distribution (`--binary_dir`).
 The approximately 130 GB binary store is an external operational input.  It
@@ -363,11 +371,11 @@ RootlessKit and a read-only probe can return `EADDRNOTAVAIL`.
 ## 7. Final submission and diagnostic any-of
 
 The task prompt distinguishes vulnerable-only submission feedback from the
-hidden final differential verdict. It asks for one designated raw-input PoC,
-checking the observed failure against the described vulnerability, practical
-minimization and a trigger control, and reconsidering unproductive hypotheses.
-These are model instructions, not extra scoring gates. The generated official
-`submit.sh` and its responses remain unchanged.
+hidden final differential verdict and asks for one designated raw-input PoC.
+It prescribes no causal self-check, minimization sequence or solving strategy.
+The generated official `submit.sh` and its responses remain unchanged. This
+prompt clarification is part of the benchmark treatment; its effect on scores
+has not been measured.
 
 The headline metric is final-submission success, not “any PoC ever submitted”.
 Each task has exactly one regular-file final marker (`final.poc`, or the
@@ -631,6 +639,10 @@ raw verifier classification, audit and historical recovery rules are unchanged.
 
 The settings template sets `OUROBOROS_TASK_ABS_CEILING_SEC=21600`: six hours
 (6h) is the full-task wall-clock backstop and the adapter's maximum timeout.
+The benchmark CLI and executor also default to six hours. These settings apply
+only to the isolated benchmark; ordinary user/runtime defaults are unchanged.
+Comparisons with three-hour runs must disclose both the time and prompt
+treatment changes; identical agent code alone does not make them comparable.
 This longer limit does not repair the gateway/adapter queue-time discrepancy
 or guarantee six hours of active solving. The diagnostic configuration retains
 `--per-task-cost-usd 10 --per-task-estimate-usd 10` and 600 rounds; earlier

@@ -15,8 +15,10 @@ The upstream server remains the source of truth for vulnerable/fixed exits;
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import dataclasses
+import gzip
 import math
 import os
 import pathlib
@@ -446,6 +448,39 @@ def _remove_archive_entry_at(
         os.unlink(name, dir_fd=dir_fd)
 
 
+_MAX_ARCHIVE_MEMBERS = 250_000
+_MAX_ARCHIVE_COMPRESSED_BYTES = 2 * 1024**3
+_MAX_ARCHIVE_FILE_BYTES = 2 * 1024**3
+_MAX_ARCHIVE_TOTAL_BYTES = 8 * 1024**3
+_MAX_ARCHIVE_STREAM_BYTES = 16 * 1024**3
+_MAX_ARCHIVE_READ_BYTES = 1024**2
+
+
+class _ArchiveReader(gzip.GzipFile):
+    """Bound tar's expanded seeks and metadata reads before it parses a header.
+
+    Member validation alone is too late for PAX/GNU extension headers: tarfile
+    reads their declared payload before yielding the corresponding TarInfo.
+    The pinned input contract is gzip, not arbitrary tar compression formats.
+    """
+
+    def tell(self) -> int:
+        return super().seek(0, os.SEEK_CUR)
+
+    def read(self, size: int = -1) -> bytes:
+        if size < 0 or size > _MAX_ARCHIVE_READ_BYTES:
+            raise ExecutorFailure("task archive metadata read exceeds its limit")
+        if self.tell() + size > _MAX_ARCHIVE_STREAM_BYTES:
+            raise ExecutorFailure("task archive expanded stream exceeds its limit")
+        return super().read(size)
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        target = offset + self.tell() if whence == os.SEEK_CUR else offset
+        if whence not in (os.SEEK_SET, os.SEEK_CUR) or not 0 <= target <= _MAX_ARCHIVE_STREAM_BYTES:
+            raise ExecutorFailure("task archive expanded seek exceeds its limit")
+        return super().seek(target)
+
+
 def _safe_extract(archive: pathlib.Path, destination: pathlib.Path) -> None:
     """Extract a task tree with GNU-tar parity for files, directories and links.
 
@@ -535,12 +570,27 @@ def _safe_extract(archive: pathlib.Path, destination: pathlib.Path) -> None:
             raise ExecutorFailure("task archive staging directory is unavailable") from exc
         staging_identity = (int(staging_info.st_dev), int(staging_info.st_ino))
         root = staging
-        with tarfile.open(archive, "r:*") as tar:
+        with contextlib.ExitStack() as handles:
+            archive_fd = os.open(archive, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            raw = handles.enter_context(os.fdopen(archive_fd, "rb"))
+            info = os.fstat(raw.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_size > _MAX_ARCHIVE_COMPRESSED_BYTES:
+                raise ExecutorFailure("task archive must be a bounded regular non-symlink file")
+            stream = handles.enter_context(_ArchiveReader(fileobj=raw, mode="rb"))
+            tar = handles.enter_context(tarfile.open(fileobj=stream, mode="r:"))
             members: dict[str, tarfile.TarInfo] = {}
             member_types: dict[str, str] = {}
             implicit_dirs: set[str] = {"."}
             link_targets: dict[str, str] = {}
-            for member in tar.getmembers():
+            total_size = 0
+            for index, member in enumerate(tar, 1):
+                if index > _MAX_ARCHIVE_MEMBERS:
+                    raise ExecutorFailure("task archive member count exceeds its limit")
+                if not 0 <= member.size <= _MAX_ARCHIVE_FILE_BYTES:
+                    raise ExecutorFailure("task archive member size exceeds its limit")
+                total_size += member.size
+                if total_size > _MAX_ARCHIVE_TOTAL_BYTES:
+                    raise ExecutorFailure("task archive total size exceeds its limit")
                 relative = _archive_relative(member.name)
                 if relative in members:
                     raise ExecutorFailure("task archive contains duplicate member paths")
