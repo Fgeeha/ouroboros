@@ -226,3 +226,44 @@ def test_child_stop_never_seals_the_parent_root(turn):
     text, _, trace = run([finish('Partial child', action='stop', rationale='Not finished')])
     assert text == 'Partial child' and len(calls) == 1
     assert trace['task_completion']['action'] == 'stop'
+
+
+@pytest.mark.parametrize('refusal', ['unseen_work', 'invalid_subject', 'missing_answer', 'new_owner'])
+def test_refused_completion_cannot_install_a_preparation_choice(tmp_path, monkeypatch, refusal):
+    from copy import deepcopy
+    from ouroboros import loop_acceptance
+    from ouroboros.acceptance_preparation import begin_preparation
+    from ouroboros.loop_delivery import completion_observation, consume_completion_request
+    from ouroboros.tools.control_runtime import _finish_task
+    from tests._acceptance_preparation_helpers import _expose, _fail
+    from tests.test_acceptance_preparation_loop import _delivery_ctx
+
+    monkeypatch.setenv('OUROBOROS_TASK_REVIEW_MODE', 'auto')
+    trace = {'tool_calls': [], 'reasoning_notes': []}
+    registry, ctx = _delivery_ctx(tmp_path, trace)
+    candidate = loop._replace_delivery_candidate(registry, ctx, trace, 'Retained work', control='candidate')
+    _expose(_fail(begin_preparation(trace, registry._ctx)))
+    observed = loop_acceptance.capture_acceptance_observation(registry._ctx, trace, None)
+    registry._ctx._completion_observation = completion_observation(registry._ctx, trace)
+    _finish_task(registry._ctx, action='finish', rationale='The local preparation gap remains.',
+        answer_sha256='unavailable' if refusal == 'missing_answer' else candidate.content_sha256,
+        acceptance_subject={'owner_source_sha256': 'wrong' if refusal == 'invalid_subject'
+                            else observed['owner_source_sha256']})
+    if refusal == 'unseen_work':
+        trace['tool_calls'].append({'tool': 'chat_history', 'result': 'New result', 'is_error': False})
+    elif refusal == 'new_owner':
+        registry._ctx._owner_directives = [{'source': 'owner', 'content': 'A new requirement'}]
+    prior_decision = deepcopy(trace.get('acceptance_decision'))
+    merged = []
+    merge = loop_acceptance.merge_agent_acceptance_stance
+
+    def observe_merge(*args):
+        merged.append(1)
+        return merge(*args)
+
+    monkeypatch.setattr(loop_acceptance, 'merge_agent_acceptance_stance', observe_merge)
+    assert consume_completion_request(registry, ctx, trace) is False
+    assert trace['completion_refusals']
+    assert merged == [] and trace.get('acceptance_decision') == prior_decision
+    assert registry._ctx._delivery_candidate.full_text == 'Retained work'
+    assert registry._ctx._delivery_candidate.acceptance_binding['authoritative'] is False

@@ -167,8 +167,14 @@ def test_preparation_failure_pauses_and_resumes_the_no_tool_tail(full_loop, monk
     monkeypatch.setattr(loop_budget, "_wrapup_global_remaining", lambda: 100.0)
     monkeypatch.setattr(usage_accounting, "refresh_root_accounting", lambda *_a, **_k: dict(tree))
     monkeypatch.setattr(loop, "_forced_final_answer", lambda *_a, **_k: pytest.fail("paid budget final"))
-    monkeypatch.setattr(loop, "_prepare_post_tool_budget_context",
-                        lambda *_a, **_k: pytest.fail("no-tool continuation armed tool controls"))
+    prepared_tool_rounds = []
+    original_prepare = loop._prepare_post_tool_budget_context
+    def prepare_fresh_completion(*args, **kwargs):
+        assert f.model_step == 2, "the saved no-tool continuation armed tool controls"
+        assert f.ctx._execution_trace["tool_calls"][-1]["tool"] == "finish_task"
+        prepared_tool_rounds.append(f.model_step)
+        return original_prepare(*args, **kwargs)
+    monkeypatch.setattr(loop, "_prepare_post_tool_budget_context", prepare_fresh_completion)
     builders = []
 
     def broken(*_a, **_k):
@@ -178,7 +184,10 @@ def test_preparation_failure_pauses_and_resumes_the_no_tool_tail(full_loop, monk
     monkeypatch.setattr(loop_acceptance_review, "_build_host_acceptance_evidence", broken)
     saved = {}
 
-    def main(*_a, **kw):
+    def main(_llm, messages, *_a, **kw):
+        from tests.test_acceptance_async_loop import keep
+
+        f.model_inputs.append(copy.deepcopy(messages))
         f.model_step += 1
         usage = f.ctx._accumulated_usage
         if f.model_step == 2:
@@ -188,6 +197,8 @@ def test_preparation_failure_pauses_and_resumes_the_no_tool_tail(full_loop, monk
             assert f.ctx._delivery_evidence_fingerprint == saved["delivery"]["_delivery_evidence_fingerprint"]
         assert f.model_step <= 2, "Resume reset the preparation incident or round state"
         usage.update(cost=1.25 * f.model_step, rounds=f.model_step)
+        if f.model_step == 2:
+            return keep(f), 1.25  # The resumed author selects the retained no-tool answer.
         return {"content": "The complete report includes the requested budget."}, 1.25
 
     monkeypatch.setattr(loop, "call_llm_with_retry", main)
@@ -200,6 +211,7 @@ def test_preparation_failure_pauses_and_resumes_the_no_tool_tail(full_loop, monk
         assert saved["resume_point"]["budget_tail"] == "no_tool" and saved["round_idx"] == 2
         assert saved["trace"]["acceptance_preparation"]["attempts"] == 1
         assert f.model_step == 1 and builders == [1] and not f.review_sends
+        assert prepared_tool_rounds == [] and saved["trace"]["tool_calls"] == []
         task = {"id": task_id, "type": "task", "root_task_id": task_id, "chat_id": 1, "_attempt": 1}
         workers.RUNNING[task_id] = {"task": task, "worker_id": 0, "attempt": 1}
         workers.WORKERS[0] = SimpleNamespace(busy_task_id=task_id)
@@ -212,6 +224,7 @@ def test_preparation_failure_pauses_and_resumes_the_no_tool_tail(full_loop, monk
         result, usage, trace = f.run()
         assert result == "The complete report includes the requested budget."
         assert f.model_step == 2 and builders == [1] and not f.review_sends
+        assert [row["tool"] for row in trace["tool_calls"]] == ["finish_task"]
         assert usage["rounds"] == 2 and usage["cost"] == 2.5
         assert trace["acceptance_decision"]["status"] == "finalized_unaccepted"
         assert trace["acceptance_decision"]["reason"] == "acceptance_preparation_failed"

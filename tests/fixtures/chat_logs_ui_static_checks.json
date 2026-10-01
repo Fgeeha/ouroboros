@@ -1221,7 +1221,7 @@
     "id": "test_chat_block_chrome_follows_work",
     "path": "web/modules/chat.js",
     "kind": "contains",
-    "value": "    function blockHasWork(record) {\n        const id = record.groupId;\n        // No lane is always shown: the retired bg-consciousness card kind is gone.\n        return record.reviewController?.groups.size > 0"
+    "value": "    function blockHasWork(record) {\n        const id = record.groupId;\n        // Visibility depends on work, never the lane.\n        return record.reviewController?.groups.size > 0"
   },
   {
     "id": "test_chat_block_chrome_follows_work",

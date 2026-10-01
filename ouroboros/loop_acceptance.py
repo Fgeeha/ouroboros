@@ -635,8 +635,8 @@ ACCEPTANCE_DECISION_REASONS = (
     # obligation disposition, so the recorded verdict was replayed for free.
     REASON_IDENTICAL_ACCEPTANCE_REFUSED,
     REASON_DELIVERY_CONTROL_DEGRADED,
-    # Owner Q2A: the forced children_unabsorbed rail runs the panel but cannot
-    # grant a requested improvement pass; the dangling revision terminalizes.
+    # Real forced rails cannot buy an improvement pass; a dangling revision
+    # terminalizes. Historical child-reminder outcomes remain readable.
     "revision_unavailable_on_forced_rail",
     REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE,
     # Forced-rail acceptance bypass (closed set, outcomes.py SSOT): stamped by

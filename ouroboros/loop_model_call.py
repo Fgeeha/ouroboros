@@ -859,7 +859,7 @@ def _dispatch_round_model(
 
     import copy
     from ouroboros.loop_delivery import completion_observation, completion_feedback
-    trace = getattr(ctx.tools._ctx, "_execution_trace", {})
+    trace = getattr(ctx.tools._ctx, "_execution_trace", None) or {}
     observation = completion_observation(ctx.tools._ctx, trace)
     feedback_snapshot = copy.deepcopy({key: trace.get(key) for key in (
         "review_runs", "acceptance_review_outcome", "acceptance_preparation")})

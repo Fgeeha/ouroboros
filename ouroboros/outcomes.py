@@ -111,7 +111,7 @@ BEST_EFFORT_REASON_CODES = frozenset({
     "round_limit",
     "finalization_grace",
     "deadline_local",
-    "children_unabsorbed",
+    "children_unabsorbed",  # Historical records only; reminders no longer force a terminal.
     # S3 (Q1/Q3=A, 2026-08-15): the owner asked the task to summarize and stop.
     # A successful owner-requested finalization is an honest best-effort
     # completion — NEVER recorded as the false ``acceptance_bypassed_deadline``
