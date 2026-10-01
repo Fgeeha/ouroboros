@@ -81,10 +81,11 @@ workspace guidance tells it to read such links with `run_command`.  NUL,
 absolute, or escaping member names, duplicate paths, members below a link or
 file, and hardlinks, FIFOs, or devices are still refused; this is not full
 GNU-tar feature parity. The gzip reader bounds metadata reads before tar
-parsing (1 MiB per read), compressed input (2 GiB), expanded stream offsets
+parsing (1 MiB per read), expanded stream offsets
 (16 GiB), member count (250,000), each logical member (2 GiB), and total logical
 member bytes (8 GiB, including sparse extents). These are resource limits,
-not measured maxima of the pinned dataset; synthetic consumer tests cover
+not measured maxima of the pinned dataset. Compressed bytes are streamed, so
+archive file length is not an allocation bound. Synthetic consumer tests cover
 their boundaries, and a full-corpus compatibility run has not been performed.
 Generated description and submit-script reads require bounded regular files;
 final-PoC copies publish only bytes matching the recorded hash. Compressed

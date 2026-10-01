@@ -54,8 +54,8 @@ The archive is extracted with GNU-tar parity for regular files, directories,
 and symlinks: any relative POSIX member name is accepted, and every symlink
 target is kept verbatim, including dangling, absolute, and outside-pointing
 ones.  Extraction never follows or writes through a link; hardlinks, special
-files, and unsafe or duplicate member placement are refused. Gzip input,
-expanded data, metadata reads, member count and logical sizes are bounded
+files, and unsafe or duplicate member placement are refused. Expanded data,
+metadata reads, member count and logical sizes are bounded
 (see the methodology's archive policy and qualification limits).
 
 The adapter uses the upstream binary-only distribution (`--binary_dir`) for

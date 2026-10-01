@@ -449,7 +449,6 @@ def _remove_archive_entry_at(
 
 
 _MAX_ARCHIVE_MEMBERS = 250_000
-_MAX_ARCHIVE_COMPRESSED_BYTES = 2 * 1024**3
 _MAX_ARCHIVE_FILE_BYTES = 2 * 1024**3
 _MAX_ARCHIVE_TOTAL_BYTES = 8 * 1024**3
 _MAX_ARCHIVE_STREAM_BYTES = 16 * 1024**3
@@ -574,8 +573,8 @@ def _safe_extract(archive: pathlib.Path, destination: pathlib.Path) -> None:
             archive_fd = os.open(archive, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
             raw = handles.enter_context(os.fdopen(archive_fd, "rb"))
             info = os.fstat(raw.fileno())
-            if not stat.S_ISREG(info.st_mode) or info.st_size > _MAX_ARCHIVE_COMPRESSED_BYTES:
-                raise ExecutorFailure("task archive must be a bounded regular non-symlink file")
+            if not stat.S_ISREG(info.st_mode):
+                raise ExecutorFailure("task archive must be a regular non-symlink file")
             stream = handles.enter_context(_ArchiveReader(fileobj=raw, mode="rb"))
             tar = handles.enter_context(tarfile.open(fileobj=stream, mode="r:"))
             members: dict[str, tarfile.TarInfo] = {}

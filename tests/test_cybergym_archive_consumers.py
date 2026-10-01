@@ -6,6 +6,7 @@ import hashlib
 import io
 import os
 import tarfile
+from types import SimpleNamespace
 
 import pytest
 
@@ -21,7 +22,6 @@ from tests.test_cybergym_executor import _config, _write_archive, _DESCRIPTOR_SA
     ("_MAX_ARCHIVE_MEMBERS", 1, [("src/one", "file", "a"), ("src/two", "file", "b")], "member count"),
     ("_MAX_ARCHIVE_FILE_BYTES", 3, [("src/large", "file", "four")], "member size"),
     ("_MAX_ARCHIVE_TOTAL_BYTES", 3, [("src/one", "file", "ab"), ("src/two", "file", "cd")], "total size"),
-    ("_MAX_ARCHIVE_COMPRESSED_BYTES", 1, [("src/one", "file", "a")], "bounded regular"),
     ("_MAX_ARCHIVE_STREAM_BYTES", 1024, [("src/one", "file", "a")], "expanded stream"),
 ])
 def test_archive_limits_refuse_before_publication(tmp_path, monkeypatch, limit, value, entries, message):
@@ -75,11 +75,32 @@ def test_archive_small_legitimate_input_and_links_survive_bounds(tmp_path, monke
     assert os.readlink(tmp_path / "workspace/src/link") == "/missing/target"
 
 
+@pytest.mark.skipif(not _DESCRIPTOR_SAFE_EXTRACT, reason="requires descriptor-safe archive primitives")
+@pytest.mark.parametrize("compressed_bytes", [2_267_326_222, 2_164_985_032])
+def test_archive_compressed_length_does_not_limit_streamed_input(tmp_path, monkeypatch, compressed_bytes):
+    # Compressed lengths of two real archives at the pinned dataset revision.
+    # Model their fstat metadata while exercising extraction with a small payload.
+    archive = tmp_path / "repo-vul.tar.gz"
+    _write_archive(archive, [("src/input", "file", "okay")])
+    source = archive.stat()
+    original_fstat = os.fstat
+
+    def reported_size(fd):
+        info = original_fstat(fd)
+        if (info.st_dev, info.st_ino) == (source.st_dev, source.st_ino):
+            return SimpleNamespace(st_mode=info.st_mode, st_size=compressed_bytes)
+        return info
+
+    monkeypatch.setattr(executor.os, "fstat", reported_size)
+    executor._safe_extract(archive, tmp_path / "workspace")
+    assert (tmp_path / "workspace/src/input").read_bytes() == b"okay"
+
+
 @pytest.mark.skipif(not hasattr(os, "O_NOFOLLOW"), reason="POSIX workspace contract")
 @pytest.mark.parametrize("kind", ["symlink", "fifo"])
 def test_host_consumers_refuse_links_and_fifos(tmp_path, kind):
     target = tmp_path / "outside"
-    target.write_text("outside sentinel")
+    target.write_text("outside sentinel", encoding="utf-8")
     for name in ("repo-vul.tar.gz", "submit.sh", "final.poc"):
         path = tmp_path / name
         if kind == "symlink":
@@ -92,7 +113,7 @@ def test_host_consumers_refuse_links_and_fifos(tmp_path, kind):
         lifecycle._masked_id_from_submit_script(tmp_path / "submit.sh")
     with pytest.raises(FinalPocRefused, match="regular|cannot be opened"):
         final_poc_record(tmp_path)
-    assert target.read_text() == "outside sentinel"
+    assert target.read_text(encoding="utf-8") == "outside sentinel"
 
 
 def test_workspace_text_is_complete_and_bounded(tmp_path):
