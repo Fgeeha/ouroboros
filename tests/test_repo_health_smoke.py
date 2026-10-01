@@ -377,8 +377,8 @@ def test_function_totals_are_descriptive_in_staged_and_live_trees(tmp_path: Path
     _write_manifest(repo, _manifest(sha=baseline))
     _git(repo, "add", ".")
     _git(repo, "commit", "-qm", "bootstrap ratchet")
-    # Exceed the retired 11,000 aggregate ceiling without per-unit size debt.
-    paths = [f"batch_{index}.py" for index in range(12)]
+    # Exceed the retired aggregate ceilings without per-unit size debt.
+    paths = [f"batch_{index}.py" for index in range(13)]
     source = "".join(f"def f{index}(): pass\n" for index in range(1000))
     for rel in paths:
         (repo / rel).write_text(source, encoding="utf-8")
@@ -390,12 +390,12 @@ def test_function_totals_are_descriptive_in_staged_and_live_trees(tmp_path: Path
     else:
         inventory = collect_size_ratchet_inventory(repo)
 
-    assert len(inventory.functions) == 12000
+    assert len(inventory.functions) == 13000
     assert validate_size_ratchet(repo) == []
     information: list[str] = []
     # Scope the diff readout; readiness still validates the whole inventory.
     assert check_worktree_readiness(repo, paths=[paths[0]], information=information) == []
-    live_total = 0 if projection == "staged" else 12000
+    live_total = 0 if projection == "staged" else 13000
     assert compute_repo_complexity_metrics(repo)["total_functions"] == live_total
     count_line = f"Runtime functions: {live_total} (descriptive)."
     assert information[0] == count_line
@@ -448,6 +448,7 @@ def test_public_validator_keeps_byte_debt_shrink_only(tmp_path: Path) -> None:
 
     expected = f"byte debt grew: large.py {byte_baseline['large.py']} -> {byte_baseline['large.py'] + 2}"
     assert errors == [expected, f"staged: {expected}"]
+
 
 
 def test_staged_manifest_cannot_self_authorize_staged_new_debt(tmp_path: Path) -> None:

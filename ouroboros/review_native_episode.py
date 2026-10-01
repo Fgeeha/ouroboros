@@ -40,6 +40,7 @@ from ouroboros.deadline_utils import caller_deadline_arguments, owner_deadline_e
 from ouroboros.review_dispatch import bind_api_review_paid_stamp, invoke_review_paid_stamp
 from ouroboros.review_verdict_extraction import canonicalize_session_verdict
 from ouroboros.triad_review import review_output_shape
+from ouroboros.delegate_custody_usage import observe_failed_review_send
 from ouroboros.usage_accounting import (
     POSITIVE_PHYSICAL_ATTEMPT_STATES,
     BudgetExceeded,
@@ -814,7 +815,7 @@ class NativeToolRoundReviewExecutor(ReviewSlotExecutor):
                             self._observe_sent_view(messages, schemas)
                             landing_sent = landing_sent or landed  # the dispatched send carried the notice
                             invoke_review_paid_stamp(self.assignment.dispatch_stamp)
-                        self._observe_failed_send(exc)
+                        observe_failed_review_send(self.usage_observer, exc)
                         if isinstance(exc, BudgetExceeded) and shape == "report" and last_content:
                             break  # nothing was sent; a report keeps its draft
                         raise
