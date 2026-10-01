@@ -40,8 +40,8 @@ P7 makes context fit a maintenance constraint, not a line-count aesthetic.
 - Runtime Python function/method count stays under
   `ouroboros/review.py::MAX_TOTAL_FUNCTIONS`, using the runtime-only iterator
   (module gates also include tests/devtools). The approved aggregate budget
-  is 11000, adding headroom after simplification for distinct review-operation,
-  state, schedule and tool-custody duties, not duplication. Count each product
+  is 12000 (owner decision 2026-10-01), restoring product headroom after removal
+  of redundant review wrappers, not permitting duplication. Count each product
   candidate; other size and debt-transition
   limits remain unchanged.
 - Enforcement: the OFFICIAL repository's CI runs the dedicated `size_ratchet`

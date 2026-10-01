@@ -203,3 +203,19 @@ def test_input_refusal_has_no_borrowed_quota_reset():
     quota = run_failure_error("r", "failed", {"code": "credential_pool_exhausted",
         "safeMessage": "Pool exhausted", "resetsAt": "2099-01-01T00:00:00Z"})
     assert quota.reset_at == "2099-01-01T00:00:00Z"
+
+
+def test_unresolvable_slot_keeps_its_dispatch_refusal_without_hiding_sibling_health(monkeypatch):
+    from tests.test_plan_review_epoch import _patch_snapshot_health, _profile_slots, _SPENT
+    from ouroboros.review_execution import ReviewRouteUnavailable, session_route_for_review_slot
+    from ouroboros.tools.plan_review_runtime import plan_panel_health_snapshot
+
+    asked = _patch_snapshot_health(monkeypatch, lambda rid, model, pin: _SPENT)
+    slots = _profile_slots(("bad", "=gpt-6-astra", ""),
+                           ("good", "codex=gpt-6-astra:low", "selected-account"))
+    with pytest.raises(ReviewRouteUnavailable, match="unparsable session target"):
+        session_route_for_review_slot(slots[0])
+    assert plan_panel_health_snapshot(slots) == {
+        "good": {"failure_code": "subscription_window_exhausted", "reset_at": _SPENT[1]}}
+    assert asked == [("codex", "gpt-6-astra", "selected-account")]
+    assert session_route_for_review_slot(slots[1]).effort == "high"

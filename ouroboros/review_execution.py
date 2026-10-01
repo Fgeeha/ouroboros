@@ -373,8 +373,9 @@ class ReviewSlotExecutor:
     def _observe_usage(self, usage: Optional[Dict[str, Any]]) -> None:
         observe_review_usage(self.usage_observer, usage)
 
-    def _observe_failed_send(self, exc: BaseException) -> None:
-        observe_failed_review_send(self.usage_observer, exc)
+    def _output_contract(self) -> str:
+        contract = str((self.assignment.request.policy or {}).get("output_contract") or "")
+        return contract or default_output_contract(review_output_shape(self.assignment.request.surface))
 
     def prompt_payload(self) -> Dict[str, Any]:
         """Route-owned projection of what will actually be sent (for the durable
@@ -481,7 +482,7 @@ class ApiChatReviewExecutor(ReviewSlotExecutor):
                 capture = getattr(exc, "physical_attempt_capture", None)
                 if str(getattr(capture, "state", "") or "") in POSITIVE_PHYSICAL_ATTEMPT_STATES:
                     invoke_review_paid_stamp(self.assignment.dispatch_stamp)
-                self._observe_failed_send(exc)
+                observe_failed_review_send(self.usage_observer, exc)
                 raise
         # Null/non-object provider messages follow the caller's empty-response rail.
         raw_text = str(msg.get("content") or "") if isinstance(msg, dict) else ""
@@ -1226,10 +1227,6 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
 
     # -- prompt (route-owned; never the api pack) ------------------------------
 
-    def _output_contract(self) -> str:
-        contract = str((self.assignment.request.policy or {}).get("output_contract") or "")
-        return contract or default_output_contract(review_output_shape(self.assignment.request.surface))
-
     def prompt_payload(self) -> Dict[str, Any]:
         return {"session_prompt": self.session_prompt}
 
@@ -1302,8 +1299,6 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
         # Captured by the physical worker before the logical caller may return.
         # Commit review uses it to patch the exact reserved slot before POST.
         self._pending_invocation_checkpoint = checkpoint
-    def _session_route(self) -> Any:
-        return session_route_for_review_slot(self.assignment.slot)
 
     def _custody_drive(self) -> Any:
         drive = self.assignment.custody_root
@@ -1343,7 +1338,7 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
                 timeout_sec=logical_timeout,
                 logical_key_extra=(self.assignment.call_id,),
                 output_schema=review_session_output_schema(request.surface),
-                session_route=self._session_route(),
+                session_route=session_route_for_review_slot(slot),
                 retry_state=self._retry_state,
                 reconcile_only=bool(getattr(request, "reconcile_only", False)),
                 use_thread=request.surface == "plan_review",
