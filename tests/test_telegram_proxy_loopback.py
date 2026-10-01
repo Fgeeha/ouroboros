@@ -205,6 +205,16 @@ def test_all_telegram_consumers_succeed_through_real_transport(tmp_path, monkeyp
         monkeypatch.setattr(loop, "sock_connect", connect)
         origin = await asyncio.start_server(bot.accept(bot.origin), "127.0.0.1", 0, ssl=server_tls)
         bot.origin_port = origin.sockets[0].getsockname()[1]
+        loop = asyncio.get_running_loop()
+        real_create_connection = loop.create_connection
+        async def create_connection(protocol_factory, host=None, port=None, **kwargs):
+            if host is not None:
+                assert ipaddress.ip_address(host).is_loopback, host
+                if port == 443:
+                    # AnyIO retains 443 after DNS; Windows Proactor bypasses socket.connect.
+                    port = bot.origin_port
+            return await real_create_connection(protocol_factory, host, port, **kwargs)
+        monkeypatch.setattr(loop, "create_connection", create_connection)
         proxy = await asyncio.start_server(bot.accept(lambda r, w: bot.proxy(r, w, scheme)), "127.0.0.1", 0)
         proxy_url = None if scheme == "direct" else f"{scheme}://owner:proxy-secret@127.0.0.1:{proxy.sockets[0].getsockname()[1]}"
         (state / "settings.json").write_text(json.dumps({"TELEGRAM_CHAT_ID": "42", "TELEGRAM_PROXY": proxy_url}), encoding="utf-8")
