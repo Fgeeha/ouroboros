@@ -251,27 +251,36 @@ def test_a_sealed_answer_is_a_seal_without_consulting_the_mailbox(tmp_path):
     assert ctx._task_acceptance_fence_generation_mismatch is False
 
 
+@pytest.mark.serial
 def test_lost_generation_mismatch_ack_cannot_produce_a_blind_seal(monkeypatch, tmp_path, short_wait):
     """#406: the first ``end(terminal)`` is applied as ``released + generation_mismatch`` and
     its ack is lost; the re-send finds no row. Owner mail is durably written before the
     generation moves, so the local mailbox — not the bare ``released`` — decides."""
     from ouroboros.loop import _begin_task_acceptance_fence, _end_task_acceptance_fence
+    from supervisor.events_worker_reports import _handle_acceptance_fence
 
     queue_mod, _pending = _isolated_queue(monkeypatch, tmp_path)
-    events: stdqueue.Queue = stdqueue.Queue()
-    agent = _pooled_agent(tmp_path, events)
-    ctx = _loop_ctx(tmp_path, agent)
-    supervisor = _Supervisor(events, tmp_path)
-    try:
-        assert _begin_task_acceptance_fence(ctx, "root-1")[0]
-        with queue_mod._queue_lock:  # steering: durable mail first, then the generation
-            _owner_mail(tmp_path)
-            queue_mod.ACCEPTANCE_FENCES["root-1"]["owner_message_generation"] += 1
-        supervisor.lose_acks = 1
-        ended = _end_task_acceptance_fence(ctx, outcome="terminal")
-    finally:
-        supervisor.stop()
-    assert [evt.get("expected_generation") for evt in supervisor.seen if evt["action"] == "end"] == [0, 0]
+    seen = []
+    lost_end_ack = False
+
+    def deliver(evt):
+        nonlocal lost_end_ack
+        seen.append(dict(evt))
+        # Exercise the real transition and disk ACK, without making this
+        # generation test depend on thread scheduling inside a 0.4 s window.
+        # Threaded timeout and unanswered-request cases remain transport tests.
+        _handle_acceptance_fence(evt, SimpleNamespace(DRIVE_ROOT=tmp_path))
+        if evt["action"] == "end" and not lost_end_ack:
+            lost_end_ack = True
+            (tmp_path / "state" / "acceptance_fence_acks" / f"{evt['token']}.{evt['req']}.json").unlink()
+
+    ctx = _loop_ctx(tmp_path, _pooled_agent(tmp_path, SimpleNamespace(put=deliver)))
+    assert _begin_task_acceptance_fence(ctx, "root-1")[0]
+    with queue_mod._queue_lock:  # steering: durable mail first, then the generation
+        _owner_mail(tmp_path)
+        queue_mod.ACCEPTANCE_FENCES["root-1"]["owner_message_generation"] += 1
+    ended = _end_task_acceptance_fence(ctx, outcome="terminal")
+    assert [evt.get("expected_generation") for evt in seen if evt["action"] == "end"] == [0, 0]
     assert ended and queue_mod.ACCEPTANCE_FENCES == {}
     assert ctx._task_acceptance_sealed_fence_token is None
     assert ctx._task_acceptance_fence_generation_mismatch is True  # the caller revises, never seals
