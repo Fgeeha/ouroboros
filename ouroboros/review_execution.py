@@ -1177,6 +1177,31 @@ def session_identity_deltas(slot: Any, facts: Dict[str, Any]) -> List[Dict[str, 
     return deltas
 
 
+def session_route_for_review_slot(slot: Any) -> Any:
+    """Resolve the same opaque route for preparation and physical dispatch."""
+    spec = str(getattr(slot, "session_target", "") or "")
+    if spec:
+        import dataclasses
+        from ouroboros.subagents import parse_subagent_harness
+
+        route = parse_subagent_harness(spec)
+        if route is None:
+            raise ReviewRouteUnavailable(
+                f"agent_session slot {slot.slot_id} has an unparsable session target {spec!r}",
+                code="session_target_unparsable")
+        # The slot owns effort; a target string cannot silently override it.
+        route = dataclasses.replace(route, effort=str(slot.effort or ""))
+        pin = str(getattr(slot, "session_profile", "") or "")
+        return dataclasses.replace(route, profile_id=pin) if pin else route
+    route = review_session_route()
+    if route is None:
+        raise ReviewRouteUnavailable(
+            "agent_session review slot has no configured session route "
+            f"({REVIEW_SESSION_ROUTE_ENV} / OUROBOROS_SUBAGENT_HARNESS are empty or `off`)",
+            code="session_route_unconfigured")
+    return route
+
+
 class AgentSessionReviewExecutor(ReviewSlotExecutor):
     """One pinned Claudexor run per reviewer slot.
 
@@ -1278,34 +1303,7 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
         # Commit review uses it to patch the exact reserved slot before POST.
         self._pending_invocation_checkpoint = checkpoint
     def _session_route(self) -> Any:
-        # 6.1: a structured row carries ITS OWN opaque target; the shared
-        # session-route key stays as the legacy fallback for rows without one.
-        spec = str(getattr(self.assignment.slot, "session_target", "") or "")
-        if spec:
-            import dataclasses
-            from ouroboros.subagents import parse_subagent_harness
-
-            route = parse_subagent_harness(spec)
-            if route is None:
-                raise ReviewRouteUnavailable(
-                    f"agent_session slot {self.assignment.slot.slot_id} has an "
-                    f"unparsable session target {spec!r}", code="session_target_unparsable")
-            # D1/6.3: effort has ONE source — the per-slot effort field. The
-            # target_id carries route identity only; any effort a caller
-            # embedded in the spec (`harness=model:effort`) is dropped so the
-            # field can never be silently overridden by the identity string.
-            route = dataclasses.replace(route, effort=str(self.assignment.slot.effort or ""))
-            pin = str(getattr(self.assignment.slot, "session_profile", "") or "")
-            if pin:
-                route = dataclasses.replace(route, profile_id=pin)
-            return route
-        route = review_session_route()
-        if route is None:
-            raise ReviewRouteUnavailable(
-                "agent_session review slot has no configured session route "
-                f"({REVIEW_SESSION_ROUTE_ENV} / OUROBOROS_SUBAGENT_HARNESS are empty or `off`)",
-                code="session_route_unconfigured")
-        return route
+        return session_route_for_review_slot(self.assignment.slot)
 
     def _custody_drive(self) -> Any:
         drive = self.assignment.custody_root
