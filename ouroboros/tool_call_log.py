@@ -215,6 +215,7 @@ def replay_evidence(drive_root: pathlib.Path, task_id: str, want: int = 200) -> 
             row = call.get(slot)
             if row is not None:
                 observations.append({**base, "fact": fact, "live": False,
+                    "receipt": base["receipt"] or row.get("completion_control") is True,
                     "status": ("error" if row.get("is_error") else "ok") if slot == "settled" else "unknown",
                     "hostError": row.get("status") == "host_error"})
     return {"observations": observations, "legacy": legacy, "coverage": coverage}

@@ -66,7 +66,7 @@ def _read_response():
 @pytest.mark.parametrize("authored", [False, True])
 def test_real_round_limit_delivers_only_the_current_authored_final(tmp_path, monkeypatch, authored):
     reply = "I found the record; the remaining check is incomplete." if authored else ""
-    forced = json.dumps({"delivery_control": "replace", "full_answer": reply,
+    forced = json.dumps({"action": "finish", "answer": reply,
                          "presence_finish": {"outcome": "message", "message": reply}}) if authored else ""
     # A real turn's context carries its Presence metadata; that, with the ceiling, arms the forced call.
     presence = {"binding_id": "1" * 32, "event": {"conversation_key": "telegram:bot-1:room-1:topic-1"}}
@@ -197,7 +197,7 @@ def native_agent(tmp_path, monkeypatch):
     return agent, ctx
 
 
-@pytest.mark.parametrize("case", ["accepted_empty", "nonstring", "exception", "budget"])
+@pytest.mark.parametrize("case", ["accepted_empty", "refused_reply_later", "nonstring", "exception", "budget"])
 def test_native_host_replacement_resets_authorship_and_keeps_diagnostic(tmp_path, monkeypatch, native_agent, case):
     from ouroboros.usage_accounting import BudgetExceeded
 
@@ -207,7 +207,7 @@ def test_native_host_replacement_resets_authorship_and_keeps_diagnostic(tmp_path
 
     accepted = []
     real_loop = agent_module.run_llm_loop
-    if case == "accepted_empty":
+    if case == "refused_reply_later":
         monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
         ctx.task_contract = {"capability_ceiling": presence_ceiling_payload(_admission().capability_ceiling)}
         ctx.is_direct_chat = True
@@ -216,9 +216,9 @@ def test_native_host_replacement_resets_authorship_and_keeps_diagnostic(tmp_path
         monkeypatch.setattr(loop, "call_llm_with_retry", lambda *_a, **_kw: (next(replies), 0.0))
 
     def run(**kwargs):
-        if case == "accepted_empty":
+        if case == "refused_reply_later":
             result = real_loop(**kwargs)
-            accepted.append((ctx._presence_completion_accepted, dict(result[1])))
+            accepted.append((ctx._presence_completion_accepted, dict(result[1]), result[2]))
             return result
         if case == "exception":
             error = RuntimeError("Synthetic processing failure")
@@ -226,9 +226,14 @@ def test_native_host_replacement_resets_authorship_and_keeps_diagnostic(tmp_path
             raise error
         if case == "budget":
             raise BudgetExceeded("Synthetic exhausted budget")
-        return ("" if case == "accepted_empty" else None), {
+        # Inject a previously accepted empty result at the agent boundary. Current
+        # reply-later selection refuses empty text earlier, covered separately above.
+        result = ("" if case == "accepted_empty" else None), {
             "terminal_origin": "model_final", "presence_completion_outcome": "message",
         }, {"tool_calls": [], "reasoning_notes": []}
+        if case == "accepted_empty":
+            accepted.append((ctx._presence_completion_accepted, dict(result[1]), result[2]))
+        return result
 
     monkeypatch.setattr(agent_module, "run_llm_loop", run)
     events = agent._handle_task_scoped({"id": "replacement", "chat_id": 7, "type": "presence",
@@ -238,7 +243,7 @@ def test_native_host_replacement_resets_authorship_and_keeps_diagnostic(tmp_path
     assert stored["terminal_origin"] == "host_notice" and stored["result"]
     assert result["outcome"] == "silent" and result["text"] == ""
     assert _cached_result(tmp_path, "replacement").text == ""
-    if case in {"accepted_empty", "nonstring"}:
+    if case in {"accepted_empty", "refused_reply_later", "nonstring"}:
         assert ctx._presence_completion_accepted is False
         assert "empty response" in stored["result"]
         assert "presence_completion_outcome" not in stored["loop_outcome"].get("usage", {})
@@ -246,6 +251,10 @@ def test_native_host_replacement_resets_authorship_and_keeps_diagnostic(tmp_path
             assert accepted[0][0] is True
             assert accepted[0][1]["terminal_origin"] == "model_final"
             assert accepted[0][1]["presence_completion_outcome"] == "message"
+        elif case == "refused_reply_later":
+            assert accepted[0][0] is False
+            assert "presence_completion_outcome" not in accepted[0][1]
+            assert accepted[0][2]["completion_refusals"][0]["reason"] == "answer_unavailable"
     else:
         assert stored["status"] == "failed"
         assert stored["reason_code"] == ("task_exception" if case == "exception" else "budget_exhausted")

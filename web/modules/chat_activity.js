@@ -186,12 +186,13 @@ export function noteToolCall(record, observation) {
     const prev = calls.get(key);
     const fact = observation.fact || (['ok', 'error'].includes(observation.status) ? 'settled' : 'started');
     const next = { ...prev,
-        receipt: Boolean(observation.receipt) && (prev ? prev.receipt : true),
+        receipt: prev?.receipt ?? Boolean(observation.receipt),
         tool: observation.tool || prev?.tool || '',
     };
     if (fact === 'settled') {
         if (!next.settlement || (next.settlement.hostError && !observation.hostError)) {
             next.settlement = { status: observation.status, hostError: Boolean(observation.hostError) };
+            next.receipt = Boolean(observation.receipt);
         }
     } else if (fact === 'wait_ended') next.waitEnded = true;
     else next.started = true;
@@ -227,6 +228,7 @@ export function noteToolHostMetrics(record, host) {
         calls: carry(host?.calls, known.calls),
         errors: carry(host?.errors, known.errors),
         routing: carry(host?.routing, known.routing),
+        completion: carry(host?.completion, known.completion),
         counts,
     };
     return toolEvidenceView(record.toolFold);
@@ -291,12 +293,10 @@ export function toolEvidenceView(fold = null) {
         fullBody: (partial ? 'Invocation evidence is incomplete. ' : '') + perToolLine(host?.counts && typeof host.counts === 'object'
             ? Object.entries(host.counts) : [...liveCounts]),
         visible: true,
-        // Addressing calls report themselves on the owner's message, so a block
-        // that ran nothing else stands on nothing. The host's count decides when
-        // it stated one; otherwise the live map decides, but only while it
-        // accounts for every counted call. Knowing neither means content.
-        receipt: errors <= 0 && (Number.isInteger(host?.routing) ? host.routing >= calls
-            : live.length >= calls && live.length > 0 && live.every((call) => call.receipt)),
+        // Host-stamped routing/completion acts are receipts, never work. Missing
+        // aggregate fields do not erase complete per-invocation receipt evidence.
+        receipt: errors <= 0 && (Number(host?.routing || 0) + Number(host?.completion || 0) >= calls
+            || live.length >= calls && live.length > 0 && live.every((call) => call.receipt)),
         calls,
         errors,
     };
@@ -1440,7 +1440,7 @@ export function costMetaKeys(src) {
 const CARD_META_KEYS = [
     ...COST_META_KEYS, 'executor_route', 'execution_evidence', 'actual_substrate',
     'executor_observation', 'model_execution', 'tool_calls', 'model', 'ts', 'initiator', 'cancel_origin',
-    'delegated_activity',
+    'delegated_activity', 'outcome_axes', 'task_completion',
 ];
 export function cardMetaKeys(src) {
     return Object.fromEntries(CARD_META_KEYS.map((key) => [key, src?.[key]]));

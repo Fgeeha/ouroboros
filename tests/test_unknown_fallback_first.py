@@ -225,18 +225,31 @@ def test_an_unreadable_accepted_operation_is_never_regenerated(data_root, tmp_pa
 
 def test_an_adopted_fallback_that_fails_retains_the_primary_as_a_route(data_root, tmp_path, monkeypatch):
     """Nothing in Settings repeats Main, yet the primary binding is tried when the acting fallback fails."""
+    from tests.test_completion_selection import finish
+
     monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", "fb/one")
     tool_call = {"id": "call-1", "type": "function", "function": {"name": "chat_history", "arguments": "{}"}}
     replies = iter([({"role": "assistant", "content": "", "tool_calls": [tool_call]}, {"prompt_tokens": 1, "completion_tokens": 1})])
     llm = _RouteLLM(data_root, **{PRIMARY: [_death], "fb/one": [None, lambda: RuntimeError("HTTP 400 bad request")]})
     original = llm.chat
+    selections = []
 
     def chat(**kwargs):
         if kwargs["model"] == "fb/one" and llm.scripts["fb/one"] and llm.scripts["fb/one"][0] is None:
             llm.scripts["fb/one"].pop(0)
             llm.sent.append(("fb/one", [dict(row) for row in kwargs["messages"]]))
             return next(replies)
-        return original(**kwargs)
+        message, usage = original(**kwargs)
+        if kwargs["model"] == PRIMARY and len(llm.sent) > 4:
+            # The returned primary answer met the real handover continuation.
+            # Select it explicitly instead of repeating unselected prose forever.
+            assert kwargs["messages"][-1]["role"] == "user"
+            assert any("No completion selection was made" in str(row.get("content"))
+                       for row in kwargs["messages"])
+            selections.append(PRIMARY)
+            assert len(selections) == 1
+            return finish(f"answer from {PRIMARY}"), usage
+        return message, usage
 
     llm.chat = chat
     text, _usage, _trace, registry = _run(tmp_path, llm)
@@ -245,6 +258,7 @@ def test_an_adopted_fallback_that_fails_retains_the_primary_as_a_route(data_root
     # r1: primary unknown -> fb/one answers with a tool call; r2: fb/one refuses -> the primary answers
     # (a later primary round may follow: the host-driven handover's own recovery nudge).
     assert sent[:4] == [PRIMARY, "fb/one", "fb/one", PRIMARY] and set(sent[4:]) <= {PRIMARY}
+    assert selections == [PRIMARY] and len(sent) == 5
     assert text == f"answer from {PRIMARY}"
     facts = [row["content"] for row in llm.sent[2][1] if "[ROUTE FACTS]" in str(row.get("content"))]
     assert len(facts) == 1 and PRIMARY in facts[0] and 'switch_model(primary="wait")' in facts[0]

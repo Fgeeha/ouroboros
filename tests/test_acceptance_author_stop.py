@@ -112,33 +112,58 @@ def _run_stop_loop(tmp_path, monkeypatch, responses, *, stop_services):
                            model_inputs=model_inputs, teardowns=teardowns["count"], ctx=ctx)
 
 
-def _stop_tool_call():
+def _stop_tool_call(front_door="task_acceptance_review"):
+    arguments = ({"action": "stop", "answer": STOP_TEXT, "rationale": STOP_RATIONALE}
+                 if front_door == "finish_task" else
+                 {"claim": STOP_TEXT, "author_action": "stop", "rationale": STOP_RATIONALE})
     return {"content": None, "tool_calls": [{
         "id": "stop-1", "type": "function",
-        "function": {"name": "task_acceptance_review", "arguments": json.dumps({
-            "claim": STOP_TEXT, "author_action": "stop", "rationale": STOP_RATIONALE,
+        "function": {"name": front_door, "arguments": json.dumps(arguments)},
+    }]}
+
+
+def _finish_tool_call(answer):
+    return {"content": None, "tool_calls": [{
+        "id": "finish-selected", "type": "function",
+        "function": {"name": "finish_task", "arguments": json.dumps({
+            "action": "finish", "answer": answer,
         })},
     }]}
 
 
-def test_a_stop_survives_the_service_teardown_round_and_buys_no_panel(tmp_path, monkeypatch):
-    """(a) stop → a running service → the host stops it at delivery → one more
-    round between the cleanup and the panel → recorded ``author_stop``, no
-    panel, not Done, and the agent's rationale in the row's reason slot."""
+@pytest.mark.parametrize("bookkeeping", [None, "list_available_tools", "enable_tools"])
+def test_informed_advisory_finish_allows_successful_schema_bookkeeping(tmp_path, monkeypatch, bookkeeping):
+    answer = "The available export answer, after considering the criticism."
+    reply = _finish_tool_call(answer)
+    arguments = json.loads(reply["tool_calls"][0]["function"]["arguments"])
+    arguments["rationale"] = "I considered the reviewer feedback and am delivering this available result."
+    reply["tool_calls"][0]["function"]["arguments"] = json.dumps(arguments)
+    if bookkeeping:
+        arguments = {"tools": "finish_task"} if bookkeeping == "enable_tools" else {}
+        reply["tool_calls"].insert(0, {"id": "schema", "type": "function", "function": {
+            "name": bookkeeping, "arguments": json.dumps(arguments)}})
+    run = _run_stop_loop(tmp_path, monkeypatch, ["The export endpoint ships.", reply,
+        _finish_tool_call(answer), _finish_tool_call(answer), _finish_tool_call(answer)], stop_services=False)
+    assert len(run.model_inputs) == 2 and len(run.panels) == 1
+    assert run.result == answer
+    assert run.trace["acceptance_decision"]["reason"] == "author_finish"
+    assert run.trace["acceptance_decision"]["reviewer_signal"] == "FAIL"
+    assert not run.trace.get("completion_refusals")
+
+
+@pytest.mark.parametrize("front_door", ["finish_task", "task_acceptance_review"])
+def test_a_stop_survives_service_teardown_without_another_model_round(tmp_path, monkeypatch, front_door):
+    """A selected stop survives teardown without purchasing another author or critic."""
     from ouroboros.outcomes import derive_loop_outcome
     from ouroboros.project_dialogue import _completion_verdict, completion_status_label
 
     run = _run_stop_loop(tmp_path, monkeypatch, [
-        _stop_tool_call(),
-        # The nomination stopped the service; the evidence changed; the host armed a
-        # replacement round. Main restates the same unfinished stop.
-        json.dumps({"delivery_control": "replace", "full_answer": STOP_TEXT}),
-        STOP_TEXT,
+        _stop_tool_call(front_door),
     ], stop_services=True)
+    assert len(run.model_inputs) == 1, "teardown must not buy another author reply for a stop"
     assert run.teardowns >= 1
     assert [event["kind"] for event in run.trace.get("verification_events") or []] == ["services_stopped"]
-    assert any("Task services were finalized before acceptance" in note
-               for note in run.trace.get("reasoning_notes") or [])
+    assert run.trace["task_completion"]["action"] == "stop"
     assert run.panels == [], "an explicit stop must never buy a reviewer panel"
     decision = run.trace["acceptance_decision"]
     assert decision["reason"] == "author_stop" and decision["author_action"] == "stop"
@@ -166,9 +191,9 @@ def test_the_same_teardown_round_still_buys_the_panel_for_a_finish(tmp_path, mon
                 "author_action": "finish", "rationale": "Everything verified.",
             })},
         }]},
-        json.dumps({"delivery_control": "replace", "full_answer": "The export endpoint ships."}),
-        "The export endpoint ships.",
-        "The export endpoint ships.",
+        _finish_tool_call("The export endpoint ships."),
+        _finish_tool_call("The export endpoint ships."),
+        _finish_tool_call("The export endpoint ships."),
     ], stop_services=True)
     assert run.panels, "a finish bound to stale evidence must still be reviewed"
     assert run.trace["acceptance_decision"]["reason"] != "author_stop"
@@ -276,22 +301,15 @@ def test_the_row_reason_slot_carries_the_stop_rationale():
     assert _completion_verdict(record, {}) == TASK_CAUSE_PHRASES["author_stop"]
 
 
-def test_a_stop_after_an_earlier_panel_keeps_its_finality_through_the_keep_round(tmp_path, monkeypatch):
-    """(c) FAIL panel → action-only stop → keep: the stop honoured after an EARLIER
-    panel used to lose its finality on the next delivery pass — the stale reviewed
-    subject of that panel cleared the reviewed latch, the finish intent had been
-    consumed, the keep/replace control re-armed, a SECOND panel ran and Cyber's
-    advisory ``author_finish`` replaced the stop. One panel, final reason
-    ``author_stop``, the agent's rationale on the record, and never Done."""
+def test_a_stop_after_an_earlier_panel_finishes_without_a_keep_round(tmp_path, monkeypatch):
+    """An informed stop after a FAIL panel needs no keep/replacement or new review."""
     from ouroboros.outcomes import derive_loop_outcome
 
     run = _run_stop_loop(tmp_path, monkeypatch, [
         "The export endpoint ships.",                       # reviewed: FAIL, capsule fed back
         _stop_tool_call(),                                  # action-only stop after the feedback
-        json.dumps({"delivery_control": "keep"}),           # the host's control round: keep the stop
-        STOP_TEXT, json.dumps({"delivery_control": "keep"}), STOP_TEXT,
-        json.dumps({"delivery_control": "keep"}), STOP_TEXT,
     ], stop_services=False)
+    assert len(run.model_inputs) == 2
     assert run.panels == ["The export endpoint ships."], "an honoured stop must never buy a second panel"
     decision = run.trace["acceptance_decision"]
     assert decision["reason"] == "author_stop" and decision["author_action"] == "stop"
@@ -382,10 +400,10 @@ def test_a_stop_recorded_under_exhausted_rounds_keeps_its_cause_and_its_rational
 
 @pytest.mark.parametrize("earlier_panel", [True, False])
 def test_evidence_changing_after_an_honoured_stop_neither_reopens_nor_replaces_it(tmp_path, monkeypatch, earlier_panel):
-    """(f) Evidence that changes only AFTER the stop was honoured (a service seen stopped
+    """(f) Evidence that changes only AFTER the stop was selected (a service seen stopped
     at the post-acceptance evidence read) used to supersede the stop like a reviewed
     boundary: the reviewed latch reset, a panel was bought and its host exit replaced
-    the stop. A stop binds no evidence: Main restates, no panel runs, and the row reads
+    the stop. A stop binds no evidence: no second author/panel runs, and the row reads
     the stop's cause, rationale and red objective."""
     import ouroboros.loop as loop
     from ouroboros.outcomes import derive_loop_outcome
@@ -394,7 +412,7 @@ def test_evidence_changing_after_an_honoured_stop_neither_reopens_nor_replaces_i
     real_project, late = loop._project_child_result_dispositions, []
 
     def project(limit_ctx, llm_trace):
-        if (llm_trace.get("acceptance_decision") or {}).get("reason") == "author_stop" and not late:
+        if (getattr(limit_ctx.tools._ctx, "_completion_selected", None) or {}).get("action") == "stop" and not late:
             late.append(True)
             llm_trace.setdefault("verification_events", []).append({"kind": "services_stopped", "services": [
                 {"service_id": "late", "name": "late", "lifecycle": "stopped"}]})
@@ -402,10 +420,8 @@ def test_evidence_changing_after_an_honoured_stop_neither_reopens_nor_replaces_i
 
     monkeypatch.setattr(loop, "_project_child_result_dispositions", project)
     first = ["The export endpoint ships."] if earlier_panel else []
-    keep = json.dumps({"delivery_control": "keep"})
-    run = _run_stop_loop(tmp_path, monkeypatch, [*first, _stop_tool_call(),
-                                                 *[step for _ in range(4) for step in (keep, STOP_TEXT)]],
-                         stop_services=False)
+    run = _run_stop_loop(tmp_path, monkeypatch, [*first, _stop_tool_call()], stop_services=False)
+    assert len(run.model_inputs) == len(first) + 1
     assert late and run.panels == first, "evidence after a stop must never buy a panel"
     decision = run.trace["acceptance_decision"]
     assert decision["reason"] == "author_stop" and decision["author_disposition"]["rationale"] == STOP_RATIONALE
@@ -465,7 +481,7 @@ def test_owner_input_consumes_the_stop_so_a_later_exhausted_exit_is_not_read_as_
 def test_a_local_preparation_stop_after_a_fail_panel_keeps_its_finality(tmp_path, monkeypatch, change):
     """(h) FAIL panel → the next host pass cannot assemble its evidence locally → the
     informed author stops → material (a new working-tree file) or evidence (a late
-    ``services_stopped``) changes and Main restates its stop. The local-preparation stop
+    ``services_stopped``) changes after selection. The local-preparation stop
     kept the FAIL panel's reviewed subject, so ``preparation_delivery_choice`` refused
     the changed material, the stale subject cleared the reviewed latch and the host
     bought two more panels over a stop. Like the reviewer-bound stop it binds no
@@ -486,7 +502,7 @@ def test_a_local_preparation_stop_after_a_fail_panel_keeps_its_finality(tmp_path
     real_project, late = loop._project_child_result_dispositions, []
 
     def project(limit_ctx, llm_trace):
-        if (llm_trace.get("acceptance_decision") or {}).get("reason") == "author_stop" and not late:
+        if (getattr(limit_ctx.tools._ctx, "_completion_selected", None) or {}).get("action") == "stop" and not late:
             late.append(True)
             if change == "material":
                 (tmp_path / "repo" / "late.txt").write_text("changed after the stop\n", encoding="utf-8")
@@ -496,14 +512,18 @@ def test_a_local_preparation_stop_after_a_fail_panel_keeps_its_finality(tmp_path
         return real_project(limit_ctx, llm_trace)
 
     monkeypatch.setattr(loop, "_project_child_result_dispositions", project)
-    keep = json.dumps({"delivery_control": "keep"})
     run = _run_stop_loop(tmp_path, monkeypatch, [
         "The export endpoint ships.",                      # reviewed: FAIL, capsule fed back
-        "The export endpoint ships, revised.",             # the host cannot assemble its evidence
+        {"content": None, "tool_calls": [{
+            "id": "nominate-revision", "type": "function",
+            "function": {"name": "task_acceptance_review", "arguments": json.dumps({
+                "claim": "The export endpoint ships, revised.",
+            })},
+        }]},                                              # request a new review; assembly fails
         _stop_tool_call(),                                 # the informed author stops
-        *[step for _ in range(3) for step in (STOP_TEXT, keep)],
     ], stop_services=False)
-    assert late, "the change must land after the stop was honoured"
+    assert len(run.model_inputs) == 3
+    assert late, "the change must land after the stop was selected"
     assert run.panels == ["The export endpoint ships."], "a local-preparation stop must never buy a panel"
     assert len(builds) == 2, "the stopped material is never assembled again"
     assert run.result == STOP_TEXT

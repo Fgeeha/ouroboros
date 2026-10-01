@@ -190,6 +190,18 @@ _SCHEDULE_SUBAGENT_DESCRIPTION = (
 def get_tools() -> List[ToolEntry]:
     from ouroboros.config import EFFORT_SCALE
     return [
+        ToolEntry("finish_task", {"name": "finish_task",
+            "description": "Select the complete answer and request completion of your current task. "
+                "Use finish after considering the observed work, or stop with a rationale naming unfinished work. "
+                "Select exactly one of answer or a host-offered answer_sha256. This grants no success, cancels no children, and retains all configured review and owner controls.",
+            "parameters": {"type": "object", "properties": {
+                "action": {"type": "string", "enum": ["finish", "stop"]}, "answer": {"type": "string", "description": "The complete answer, including a short correction."},
+                "answer_sha256": {"type": "string", "description": "Exact offered retained or whole held response hash."},
+                "rationale": {"type": "string", "description": "For stop, what remains unfinished."}, "acceptance_subject": {"type": "object", "properties": {"owner_source_sha256": {"type": "string"},
+                    "effective_criteria": {"type": "string"}, "material_tool_indices": {"type": "array", "items": {"type": "integer"}},
+                }, "required": ["owner_source_sha256"]},
+                "pending_review": {"type": "string", "enum": ["wait", "finish"], "default": "wait"},
+            }, "required": ["action"]}}, _finish_task),
         ToolEntry("set_tool_timeout", {
             "name": "set_tool_timeout",
             "description": "Update the global tool timeout in settings.json and apply it immediately without restart.",
@@ -508,6 +520,7 @@ from ouroboros.tools.control_runtime import (  # noqa: E402, F401 -- intentional
     _promote_to_stable,
     _request_deep_self_review,
     _request_restart,
+    _finish_task,
     _send_user_message,
     _set_next_wakeup,
     _set_tool_timeout,

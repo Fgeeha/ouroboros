@@ -1,14 +1,29 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import queue
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from tests._delivery_candidate_shared import (
     write_child as _write_child,
     write_confirmed_disposition_fixture as _write_confirmed_disposition,
 )
+
+
+def _finish_response(answer, *, by_hash=False):
+    """A model-authored selection through the real local completion tool."""
+    args = {"action": "finish", "answer_sha256" if by_hash else "answer":
+            hashlib.sha256(answer.encode("utf-8")).hexdigest() if by_hash else answer}
+    return {"content": None, "tool_calls": [{"id": "finish-selection", "type": "function",
+        "function": {"name": "finish_task", "arguments": json.dumps(args)}}]}
+
+
+def _assert_no_repair_round(calls):
+    assert all("DELIVERY_CONTROL_REPAIR" not in str(row) for call in calls for row in call)
 
 
 def _run_loop(
@@ -19,6 +34,7 @@ def _run_loop(
     *,
     child=False,
     bind_child_before_second=False,
+    progress=None,
 ):
     import ouroboros.loop as loop
     from ouroboros.tools.registry import ToolRegistry
@@ -28,6 +44,7 @@ def _run_loop(
         _write_child(tmp_path)
     answers = iter(responses)
     calls = []
+    progress = progress if progress is not None else []
 
     class FakeLLM:
         def default_model(self):
@@ -51,11 +68,8 @@ def _run_loop(
     def fake_acceptance(**kwargs):
         outcome = next(review_states, False)
         if outcome:
-            # v6.71.1: the acceptance path no longer arms delivery-control (an
-            # improvement pass is an ordinary answer round). These tests exercise
-            # the CONTROL MECHANICS (keep/replace/repair/duplicate-key), which
-            # still arm on the services/handoff/evidence-changed lanes — emulate
-            # such a lane by arming through the real helper.
+            # A substantive host continuation retains the first answer and
+            # requires an explicit completion selection through the real door.
             ctx_shim = SimpleNamespace(
                 messages=kwargs["messages"],
                 task_id=kwargs["task_id"],
@@ -80,7 +94,7 @@ def _run_loop(
         tools=registry,
         llm=FakeLLM(),
         drive_logs=tmp_path,
-        emit_progress=lambda _text, *, incident=None: None,
+        emit_progress=lambda text, **facts: progress.append({"text": text, **facts}),
         incoming_messages=queue.Queue(),
         task_id="parent1",
         drive_root=tmp_path,
@@ -92,160 +106,82 @@ def test_handoff_service_notices_cannot_erase_full_candidate(tmp_path, monkeypat
     from ouroboros.outcomes import derive_loop_outcome
 
     original = "Complete original answer with all child conclusions."
-    result, usage, trace, calls = _run_loop(
-        tmp_path,
-        monkeypatch,
-        [
-            original,
-            "service notice: child status refreshed",
-            "service notice again",
-        ],
-        child=True,
-        bind_child_before_second=True,
-    )
-    assert result == original
-    assert len(calls) == 3
-    assert trace["delivery_candidate"]["finalization_control"] == "degraded_preserve"
-    assert trace["delivery_candidate"]["degraded"] is True
+    result, usage, trace, calls = _run_loop(tmp_path, monkeypatch,
+        [original, "service notice: child status refreshed", "service notice again", _finish_response(original, by_hash=True)],
+        child=True, bind_child_before_second=True)
+    assert result == original and len(calls) == 4
+    assert trace["delivery_candidate"]["content_sha256"] == hashlib.sha256(original.encode()).hexdigest()
+    assert trace["delivery_candidate"]["degraded"] is False
     assert trace["delivery_candidate"]["evidence_current"] is True
     assert trace["delivery_candidate"]["acceptance_binding"]["authoritative"] is False
-    outcome = derive_loop_outcome(result, usage, trace)
-    assert outcome["outcome_axes"]["execution"]["status"] == "degraded"
+    assert derive_loop_outcome(result, usage, trace)["outcome_axes"]["execution"]["status"] == "ok"
+    _assert_no_repair_round(calls)
 
 
 def test_mutating_tool_acknowledgements_cannot_erase_full_candidate(tmp_path, monkeypatch):
     original = "Complete original answer with all implementation and verification details."
-    result, _usage, trace, calls = _run_loop(
-        tmp_path,
-        monkeypatch,
-        [
-            original,
-            {
-                "content": None,
-                "tool_calls": [{
-                    "id": "write-1",
-                    "type": "function",
-                    "function": {
-                        "name": "write_file",
-                        "arguments": json.dumps({
-                            "path": "effect.txt",
-                            "content": "durable tool effect",
-                        }),
-                    },
-                }],
-            },
-            "Review completed.",
-            "Everything is done now.",
-        ],
-        acceptance_results=[True, False],
-    )
-
+    write = {"content": None, "tool_calls": [{"id": "write-1", "type": "function", "function": {
+        "name": "write_file", "arguments": json.dumps({"path": "effect.txt", "content": "durable tool effect"})}}]}
+    result, _usage, trace, calls = _run_loop(tmp_path, monkeypatch,
+        [original, write, "Review completed.", "Everything is done now.", _finish_response(original, by_hash=True)],
+        acceptance_results=[True, False])
     assert (tmp_path / "effect.txt").read_text(encoding="utf-8") == "durable tool effect"
-    assert result == original
-    assert len(calls) == 4
-    assert trace["delivery_candidate"]["revision"] == 1
-    assert trace["delivery_candidate"]["finalization_control"] == "degraded_preserve"
-    assert trace["delivery_candidate"]["degraded"] is True
+    assert result == original and len(calls) == 5
+    assert trace["delivery_candidate"]["degraded"] is False
     assert trace["delivery_candidate"]["evidence_current"] is True
     assert trace["delivery_candidate"]["acceptance_binding"]["authoritative"] is False
+    _assert_no_repair_round(calls)
 
 
-def test_replace_control_rejects_non_string_full_answer(tmp_path, monkeypatch):
+def test_completion_tool_rejects_non_string_answer_without_erasing_retained_bytes(tmp_path, monkeypatch):
     original = "Complete original answer."
-    result, _usage, trace, calls = _run_loop(
-        tmp_path,
-        monkeypatch,
-        [
-            original,
-            json.dumps({"delivery_control": "replace", "full_answer": {"text": "not complete"}}),
-            json.dumps({"delivery_control": "keep"}),
-        ],
-        acceptance_results=[True, False],
-    )
-
-    assert result == original
-    assert len(calls) == 3
-    assert trace["delivery_candidate"]["revision"] == 1
-    assert trace["delivery_candidate"]["finalization_control"] == "keep"
+    invalid = _finish_response({"text": "not complete"})
+    result, _usage, trace, calls = _run_loop(tmp_path, monkeypatch,
+        [original, invalid, _finish_response(original, by_hash=True)], acceptance_results=[True, False])
+    assert result == original and len(calls) == 3
+    assert trace["tool_calls"][0]["is_error"] is True
+    assert "COMPLETION_ARGUMENT" in trace["tool_calls"][0]["result"]
+    assert trace["tool_calls"][-1]["completion_control"] is True
+    _assert_no_repair_round(calls)
 
 
-def test_duplicate_delivery_control_key_enters_repair_then_keeps_candidate(
-    tmp_path,
-    monkeypatch,
-):
+def test_duplicate_legacy_control_is_held_privately_until_explicit_selection(tmp_path, monkeypatch):
     original = "Complete original answer."
-    duplicate_control = (
-        '{"delivery_control":"keep","delivery_control":"replace",'
-        '"full_answer":"Ambiguous replacement."}'
-    )
-    result, _usage, trace, calls = _run_loop(
-        tmp_path,
-        monkeypatch,
-        [original, duplicate_control, json.dumps({"delivery_control": "keep"})],
-        acceptance_results=[True, False],
-    )
-
-    assert result == original
-    assert len(calls) == 3
-    assert any(
-        "[DELIVERY_CONTROL_REPAIR]" in str(message.get("content") or "")
-        for message in calls[2]
-    )
-    assert trace["delivery_candidate"]["finalization_control"] == "keep"
+    duplicate = '{"delivery_control":"keep","delivery_control":"replace","full_answer":"Ambiguous replacement."}'
+    progress = []
+    result, _usage, trace, calls = _run_loop(tmp_path, monkeypatch,
+        [original, duplicate, _finish_response(original, by_hash=True)], acceptance_results=[True, False], progress=progress)
+    assert result == original and len(calls) == 3
+    assert any(row.get("role") == "assistant" and row.get("content") == duplicate for row in calls[-1])
+    assert "latest whole held response" not in str(calls[-1][-1]["content"])
     assert trace["delivery_candidate"]["degraded"] is False
+    assert all(duplicate not in row["text"] for row in progress), progress
+    _assert_no_repair_round(calls)
 
 
-def test_duplicate_full_answer_key_twice_preserves_prior_candidate_degraded(
-    tmp_path,
-    monkeypatch,
-):
+def test_repeated_duplicate_legacy_answers_neither_repair_nor_force_termination(tmp_path, monkeypatch):
     original = "Complete original answer."
-    duplicate_answer = (
-        '{"delivery_control":"replace","full_answer":"First answer.",'
-        '"full_answer":"Second answer."}'
-    )
-    result, _usage, trace, calls = _run_loop(
-        tmp_path,
-        monkeypatch,
-        [original, duplicate_answer, duplicate_answer],
-        acceptance_results=[True, False],
-    )
-
-    assert result == original
-    assert len(calls) == 3
-    assert any(
-        "[DELIVERY_CONTROL_REPAIR]" in str(message.get("content") or "")
-        for message in calls[2]
-    )
-    assert trace["delivery_candidate"]["finalization_control"] == "degraded_preserve"
-    assert trace["delivery_candidate"]["degraded"] is True
-    assert trace["delivery_candidate"]["degraded_reason"] == (
-        "invalid_delivery_control_after_repair"
-    )
+    duplicate = '{"delivery_control":"replace","full_answer":"First answer.","full_answer":"Second answer."}'
+    result, _usage, trace, calls = _run_loop(tmp_path, monkeypatch,
+        [original, duplicate, duplicate, duplicate, _finish_response(original, by_hash=True)], acceptance_results=[True, False])
+    assert result == original and len(calls) == 5
+    assert trace["delivery_candidate"]["degraded"] is False
+    for before, after in zip(calls[2:], calls[3:]):
+        assert len(after) > len(before), "each repeated held response is appended with new host input"
+    assert sum(row.get("role") == "assistant" and row.get("content") == duplicate for row in calls[-1]) == 3
+    _assert_no_repair_round(calls)
 
 
-def test_service_round_can_keep_or_replace_complete_candidate(tmp_path, monkeypatch):
-    original = "Complete original answer."
-    result, _usage, trace, _calls = _run_loop(
-        tmp_path,
-        monkeypatch,
-        [original, json.dumps({"delivery_control": "keep"})],
-        acceptance_results=[True, False],
-    )
-    assert result == original
-    assert trace["delivery_candidate"]["revision"] == 1
-    assert trace["delivery_candidate"]["finalization_control"] == "keep"
-
-    replacement = "Complete replacement answer."
-    result2, _usage2, trace2, _calls2 = _run_loop(
-        tmp_path / "replace",
-        monkeypatch,
-        [original, json.dumps({"delivery_control": "replace", "full_answer": replacement})],
-        acceptance_results=[True, False],
-    )
-    assert result2 == replacement
-    assert trace2["delivery_candidate"]["revision"] == 2
-    assert trace2["delivery_candidate"]["finalization_control"] == "replace"
+def test_service_round_explicitly_selects_retained_or_shorter_complete_answer(tmp_path, monkeypatch):
+    original = "Complete original answer with a long explanation and its supporting evidence."
+    result, _usage, trace, _calls = _run_loop(tmp_path, monkeypatch,
+        [original, _finish_response(original, by_hash=True)], acceptance_results=[True, False])
+    assert result == original and trace["delivery_candidate"]["revision"] == 1
+    replacement = "Corrected answer."
+    result2, _usage2, trace2, _calls2 = _run_loop(tmp_path / "replace", monkeypatch,
+        [original, _finish_response(replacement)], acceptance_results=[True, False])
+    assert result2 == replacement and trace2["delivery_candidate"]["revision"] == 2
+    assert trace2["delivery_candidate"]["acceptance_binding"]["authoritative"] is False
 
 
 def test_delivery_evidence_ignores_service_and_read_only_but_tracks_effects(tmp_path):
@@ -350,7 +286,7 @@ def test_service_outputs_finalize_before_acceptance_and_require_replacement(tmp_
         monkeypatch,
         [
             original,
-            json.dumps({"delivery_control": "replace", "full_answer": replacement}),
+            _finish_response(replacement),
         ],
     )
 
@@ -358,10 +294,11 @@ def test_service_outputs_finalize_before_acceptance_and_require_replacement(tmp_
     assert len(model_calls) == 2
     controls = [str(row.get("content") or "") for row in model_calls[1]
                 if "[DELIVERY_FINALIZATION_CONTROL]" in str(row.get("content") or "")]
-    assert any("keep is NOT allowed" in text for text in controls)
+    assert any("completion tool" in text for text in controls)
+    assert trace["tool_calls"][-1]["completion_control"] is True
     # A fresh source observation follows the candidate-control instruction.
     assert trace["delivery_candidate"]["revision"] == 2
-    assert trace["delivery_candidate"]["finalization_control"] == "replace"
+    assert trace["delivery_candidate"]["finalization_control"] == "candidate"
     assert trace["verification_events"][0]["kind"] == "services_stopped"
     outcome = derive_loop_outcome(result, usage, trace)
     assert outcome["outcome_axes"]["execution"]["status"] == "degraded"
@@ -917,6 +854,40 @@ def test_forced_fallback_rejects_stale_delivery_candidate(tmp_path, monkeypatch)
         hashlib.sha256(text.encode("utf-8")).hexdigest()
     )
     assert returned_trace["forced_finalization"]["source"] == "host_fallback"
+
+
+def test_held_complete_prose_can_be_selected_by_its_exact_hash(tmp_path, monkeypatch):
+    """No length classifier promotes prose; explicit selection preserves the whole held row."""
+    from ouroboros.outcomes import derive_loop_outcome
+
+    original = "Original complete answer covering the child conclusions."
+    final_prose = "Implementation complete. " + "Every relevant correction is recorded here. " * 10
+    invalid_json = json.dumps({"delivery_control": "finalize"})
+    result, usage, trace, calls = _run_loop(tmp_path, monkeypatch,
+        [original, invalid_json, final_prose, _finish_response(final_prose, by_hash=True)],
+        child=True, bind_child_before_second=True)
+    assert len(calls) == 4 and result == final_prose
+    assert trace["delivery_candidate"]["degraded"] is False
+    assert any(row.get("role") == "assistant" and row.get("content") == final_prose for row in calls[-1])
+    assert calls[-1][-1]["role"] == "user"
+    execution = derive_loop_outcome(result, usage, trace)["outcome_axes"]["execution"]
+    assert execution["status"] == "ok" and execution["reason_code"] != "delivery_control_degraded"
+    _assert_no_repair_round(calls)
+
+
+@pytest.mark.parametrize("interim", ["OK.", "An interim note with much more text than the retained complete answer. " * 15])
+def test_short_and_long_held_prose_never_select_themselves(tmp_path, monkeypatch, interim):
+    original = "Original complete answer."
+    progress = []
+    result, _usage, trace, calls = _run_loop(tmp_path, monkeypatch,
+        [original, interim, interim, _finish_response(original, by_hash=True)],
+        child=True, bind_child_before_second=True, progress=progress)
+    assert len(calls) == 4 and result == original
+    assert trace["delivery_candidate"]["degraded"] is False
+    assert sum(row.get("role") == "assistant" and row.get("content") == interim for row in calls[-1]) == 2
+    assert calls[-1][-1]["role"] == "user"
+    assert sum(row["text"] == interim.strip() and row.get("narration") is True for row in progress) == 2
+    _assert_no_repair_round(calls)
 
 
 def test_quiz_answer_and_parent_message_supersede_a_paid_acceptance_verdict(tmp_path, monkeypatch):
