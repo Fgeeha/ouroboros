@@ -81,7 +81,7 @@ LOOP_LEAF_OWNERS: dict[str, str] = {
         "_replace_delivery_candidate _ensure_explicit_acceptance_binding "
         "_forced_unaccepted_binding _live_delivery_candidate _current_delivery_candidate "
         "_degrade_retained_delivery_candidate _merge_finalization_trace "
-        "_delivery_control_prompt _delivery_replace_required _delivery_keep_allowed "
+        "_delivery_control_prompt _delivery_replace_required "
         "_arm_delivery_control _hold_delivery_for_skill_action "
         "_parse_delivery_control_object _resolve_delivery_control "
         "_compose_delivery_suffix _no_tool_final_answer"

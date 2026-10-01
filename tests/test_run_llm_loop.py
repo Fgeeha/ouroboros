@@ -429,6 +429,8 @@ def test_run_llm_loop_enforces_swarm_force_plan_before_final(tmp_path, monkeypat
 
     assert result == "done after plan"
     assert calls["count"] == 3
+    assert sum(row.get("role") == "assistant" and row.get("content") == "premature final"
+               for row in seen_second_request["messages"]) == 1
     assert any("Call plan_task" in str(item.get("content") or "") for item in seen_second_request["messages"])
     assert trace["tool_calls"][0]["tool"] == "plan_task"
 
@@ -520,7 +522,8 @@ def test_run_llm_loop_does_not_accept_failed_plan_task_for_swarm_force_plan(tmp_
     assert usage.get("reason_code") != "swarm_force_plan_not_called"
     assert trace["tool_calls"][0]["tool"] == "plan_task"
 
-def test_run_llm_loop_injects_subagent_handoff_before_final_text(tmp_path, monkeypatch):
+@pytest.mark.parametrize("explicit", [False, True])
+def test_run_llm_loop_injects_subagent_handoff_before_final_text(tmp_path, monkeypatch, explicit):
     from ouroboros.task_results import STATUS_COMPLETED, write_task_result
     from ouroboros.tools.registry import ToolRegistry
     from tests._delivery_candidate_shared import write_confirmed_disposition_fixture
@@ -547,7 +550,8 @@ def test_run_llm_loop_injects_subagent_handoff_before_final_text(tmp_path, monke
     def fake_call_llm_with_retry(_llm, request_messages, *_args, **_kwargs):
         calls["count"] += 1
         if calls["count"] == 1:
-            return {"role": "assistant", "content": "premature final"}, 0.0
+            return (finish("premature final") if explicit else
+                    {"role": "assistant", "content": "premature final"}), 0.0
         if calls["count"] == 2:
             write_confirmed_disposition_fixture(
                 tmp_path,
@@ -582,6 +586,9 @@ def test_run_llm_loop_injects_subagent_handoff_before_final_text(tmp_path, monke
     assert "child child1" in second_text
     assert "child handoff" in second_text
     assert "get_task_result" in second_text
+    assert sum(row.get("role") == "assistant" and row.get("content") == "premature final"
+               for row in seen_second_request["messages"]) == 1
+    assert ("Selected completion was held" if explicit else "No completion selection was made") in second_text
 
 def test_run_llm_loop_appends_orphan_note_when_finalizing_with_unhandled_child(tmp_path, monkeypatch):
     """D#7 / P5: the subagent handoff reminder fires once per CHANGE (not every round, not

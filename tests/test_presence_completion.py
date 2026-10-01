@@ -88,6 +88,36 @@ def test_omitted_message_keeps_normal_final_round(turn, outcome):
     assert usage["presence_completion_outcome"] == outcome
 
 
+@pytest.mark.parametrize("outcome,reply_later", [
+    ("message", False), ("message", True), ("deferred", False), ("deferred", True),
+    ("silent", False), ("tool_delivered", False),
+])
+def test_stop_records_selected_bytes_without_an_extra_final_generation(turn, monkeypatch, outcome, reply_later):
+    registry, calls, run = turn
+    registry._ctx._swarm_handoff_attempt = {"status": "scheduled", "task_id": "later-work"}
+    reserves_reply = reply_later and outcome in {"message", "deferred"}
+    text = "The requested work remains unfinished." if outcome in {"message", "deferred"} else ""
+    response = _call(outcome, "" if reserves_reply else text)
+    arguments = json.loads(response["tool_calls"][0]["function"]["arguments"])
+    arguments.update(action="stop", rationale="The requested work remains unfinished.")
+    response["tool_calls"][0]["function"]["arguments"] = json.dumps(arguments)
+    # A reserved future reply is not selected text yet; it retains the ordinary
+    # budget/control tail. Once text exists, no third generation or review is bought.
+    tails = []
+    real_tail = loop._finish_tool_round_budget
+    def tail(*args, **kwargs):
+        tails.append(1)
+        return real_tail(*args, **kwargs)
+    monkeypatch.setattr(loop, "_finish_tool_round_budget", tail)
+    monkeypatch.setattr(loop, "_run_task_acceptance_review_once", lambda **_: pytest.fail("stop bought review"))
+    result, usage, trace = run([response, {"content": text}] if reserves_reply else [response])
+    assert result == text and len(calls) == (2 if reserves_reply else 1)
+    assert len(tails) == int(reserves_reply)
+    assert trace["task_completion"]["action"] == "stop"
+    assert derive_loop_outcome(result, usage, trace)["outcome_axes"]["objective"]["reason"] == "author_stop"
+    assert usage["presence_completion_outcome"] == outcome
+
+
 def test_review_hold_drops_old_outcome_and_uses_replacement(turn, monkeypatch):
     registry, calls, run = turn
     reviews = []

@@ -109,6 +109,7 @@ def _finalize_loop_candidate(content, limit_ctx, tools, emit_progress, *, after_
             return None
         content = ctx._delivery_candidate.full_text
     before = transcript_growth_signature(limit_ctx.messages)
+    response_start = len(limit_ctx.messages)
     ctx._completion_pair_appended = False
     result = _no_tool_final_answer(
         content, limit_ctx, limit_ctx.llm_trace, tools, limit_ctx.incoming_messages,
@@ -129,7 +130,8 @@ def _finalize_loop_candidate(content, limit_ctx, tools, emit_progress, *, after_
         if not plain_followup and not (selected and can_park):
             # The resolver already supplied the exact assistant+host pair on a held prose round.
             if not ctx._completion_pair_appended:
-                hold_completion_response(content, tools, limit_ctx, limit_ctx.llm_trace)
+                hold_completion_response(content, tools, limit_ctx, limit_ctx.llm_trace,
+                                         response_start=response_start, selected=selected)
         if can_park:
             wait_for_acceptance_feedback(tools, limit_ctx, limit_ctx.llm_trace,
                                          limit_ctx.tool_schemas, limit_ctx.owner_msg_seen)
@@ -837,7 +839,6 @@ from ouroboros.loop_delivery import (  # noqa: E402, F401 -- intentional public 
     _merge_finalization_trace,
     _delivery_control_prompt,
     _delivery_replace_required,
-    _delivery_keep_allowed,
     _arm_delivery_control,
     _hold_delivery_for_skill_action,
     _parse_delivery_control_object,

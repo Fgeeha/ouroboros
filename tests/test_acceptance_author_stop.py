@@ -131,6 +131,26 @@ def _finish_tool_call(answer):
     }]}
 
 
+@pytest.mark.parametrize("bookkeeping", [None, "list_available_tools", "enable_tools"])
+def test_informed_advisory_finish_allows_successful_schema_bookkeeping(tmp_path, monkeypatch, bookkeeping):
+    answer = "The available export answer, after considering the criticism."
+    reply = _finish_tool_call(answer)
+    arguments = json.loads(reply["tool_calls"][0]["function"]["arguments"])
+    arguments["rationale"] = "I considered the reviewer feedback and am delivering this available result."
+    reply["tool_calls"][0]["function"]["arguments"] = json.dumps(arguments)
+    if bookkeeping:
+        arguments = {"tools": "finish_task"} if bookkeeping == "enable_tools" else {}
+        reply["tool_calls"].insert(0, {"id": "schema", "type": "function", "function": {
+            "name": bookkeeping, "arguments": json.dumps(arguments)}})
+    run = _run_stop_loop(tmp_path, monkeypatch, ["The export endpoint ships.", reply,
+        _finish_tool_call(answer), _finish_tool_call(answer), _finish_tool_call(answer)], stop_services=False)
+    assert len(run.model_inputs) == 2 and len(run.panels) == 1
+    assert run.result == answer
+    assert run.trace["acceptance_decision"]["reason"] == "author_finish"
+    assert run.trace["acceptance_decision"]["reviewer_signal"] == "FAIL"
+    assert not run.trace.get("completion_refusals")
+
+
 @pytest.mark.parametrize("front_door", ["finish_task", "task_acceptance_review"])
 def test_a_stop_survives_service_teardown_without_another_model_round(tmp_path, monkeypatch, front_door):
     """A selected stop survives teardown without purchasing another author or critic."""

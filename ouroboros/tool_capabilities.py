@@ -377,3 +377,9 @@ def completion_control_call(name: str, args: object = None) -> bool:
 def substantive_tool_calls(calls: object) -> list:
     return [call for call in (calls or []) if isinstance(call, dict)
             and not (call.get("completion_control") and not call.get("is_error"))]
+
+
+def completion_observation_calls(calls: object) -> list:
+    """Results a finish must observe; only successful schema bookkeeping is exempt."""
+    return [call for call in substantive_tool_calls(calls)
+            if call.get("is_error") or call.get("tool") not in {"enable_tools", "list_available_tools"}]

@@ -94,6 +94,24 @@ def test_same_response_work_result_requires_actual_observation(turn, position, f
     assert 'read result' in str(calls[-1]) or 'failed read' in str(calls[-1])
 
 
+@pytest.mark.parametrize('name', ['enable_tools', 'list_available_tools'])
+@pytest.mark.parametrize('failure', [False, True])
+def test_schema_bookkeeping_exempts_only_successful_results(turn, name, failure):
+    registry, calls, notes, run = turn
+    response = finish('Chosen before the result')
+    arguments = {'tools': 'finish_task'} if name == 'enable_tools' else {}
+    response['tool_calls'].insert(0, {'id': 'schema', 'type': 'function', 'function': {
+        'name': name, 'arguments': '{bad json' if failure else json.dumps(arguments)}})
+    text, _, trace = run([response, finish('Now informed')])
+    assert trace['tool_calls'][0]['is_error'] is failure
+    assert len(calls) == (2 if failure else 1)
+    assert text == ('Now informed' if failure else 'Chosen before the result')
+    if failure:
+        assert trace['completion_refusals'][0]['reason'].startswith('unobserved_tool_results')
+    else:
+        assert not trace.get('completion_refusals')
+
+
 def test_stop_avoids_reviews_nudges_and_question_parking(turn, monkeypatch):
     registry, calls, notes, run = turn
     for name in ('_run_task_acceptance_review_once', '_maybe_inject_finalization_nudges', 'wait_after_tools', '_finish_tool_round_budget'):

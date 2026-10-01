@@ -667,8 +667,7 @@ def _merge_finalization_trace(
     return llm_trace
 
 
-def _delivery_control_prompt(candidate: DeliveryCandidate, *, keep_allowed: bool,
-                             pending_review_choice: bool = False) -> str:
+def _delivery_control_prompt(candidate: DeliveryCandidate, *, pending_review_choice: bool = False) -> str:
     """Selection is an author act, never a classifier over prose or its length."""
     return ("[DELIVERY_FINALIZATION_CONTROL]\n[SYSTEM NOTICE] The complete answer is retained as "
             + candidate.content_sha256 + ". Continue useful work or use the available completion tool "
@@ -699,7 +698,8 @@ def completion_schema(tools: ToolRegistry, schemas: list | None = None) -> str:
     return name
 
 
-def hold_completion_response(content: Any, tools: ToolRegistry, ctx: Any, trace: dict) -> None:
+def hold_completion_response(content: Any, tools: ToolRegistry, ctx: Any, trace: dict,
+                             *, response_start: int | None = None, selected: bool = False) -> None:
     """Keep each complete model row followed by host input, even on unchanged facts."""
     raw = _loop()._extract_plain_text_from_content(content)
     candidate = getattr(tools._ctx, "_delivery_candidate", None)
@@ -707,11 +707,14 @@ def hold_completion_response(content: Any, tools: ToolRegistry, ctx: Any, trace:
     private = bool(candidate and candidate.control_episode_seen and
                    (duplicate or embedded or isinstance(parsed, dict) and "delivery_control" in parsed))
     row = {"role": "assistant", "content": raw}
-    if not ctx.messages or ctx.messages[-1] != row:
+    # Older gates may already have recorded this response before their host notice.
+    # Never deduplicate against an earlier model round with identical answer bytes.
+    recorded = row in ctx.messages[response_start:] if response_start is not None else ctx.messages[-1:] == [row]
+    if not recorded:
         ctx.messages.append(row)
     tools._ctx._completion_held_sha256 = "" if private else hashlib.sha256(raw.encode("utf-8")).hexdigest()
     door = completion_schema(tools, getattr(ctx, "tool_schemas", None))
-    notice = ("[SYSTEM NOTICE] No completion selection was made. Use " + door +
+    notice = ("[SYSTEM NOTICE] " + ("Selected completion was held. Use " if selected else "No completion selection was made. Use ") + door +
               " to finish or stop, or continue work. Retained answer_sha256=" +
               str(getattr(candidate, "content_sha256", "")))
     if not private:
@@ -768,7 +771,7 @@ def selected_completion_text(request: dict, candidate: Any, messages: list,
 
 def consume_completion_request(tools: ToolRegistry, ctx: Any, trace: dict, content: Any = None) -> bool:
     """Resolve one staged author act after the full batch, using its original observation."""
-    from ouroboros.tool_capabilities import substantive_tool_calls
+    from ouroboros.tool_capabilities import completion_observation_calls
     from ouroboros.loop_messages import owner_source_sha256
     tool_ctx = tools._ctx
     request = getattr(tool_ctx, "_completion_request", None)
@@ -786,12 +789,11 @@ def consume_completion_request(tools: ToolRegistry, ctx: Any, trace: dict, conte
     if observation.get("owner_source_sha256") != owner_source_sha256(tool_ctx):
         error = "owner_input_changed: consider the new owner input before selecting completion"
     calls = (trace.get("tool_calls") or [])[int(observation.get("tool_count") or 0):]
-    unseen = substantive_tool_calls(calls)
+    unseen = completion_observation_calls(calls)
     # Delivery-only Presence composition relies on actual delivery receipts downstream.
     delivered = (getattr(tool_ctx, "_presence_completion", None) or {}).get("outcome") == "tool_delivered"
     if delivered:
         unseen = [call for call in unseen if not call.get("presence_delivery_confirmed") or call.get("is_error")]
-    unseen = [call for call in unseen if call.get("tool") not in {"enable_tools", "list_available_tools"}]
     decision = request.get("agent_decision") or {"explicit_finish": True, "author_action": request["action"],
         "rationale": request.get("rationale") or ""}
     decision = {**decision, "observation": observation}
@@ -841,18 +843,6 @@ def _delivery_replace_required(candidate: DeliveryCandidate) -> bool:
     )
 
 
-def _delivery_keep_allowed(
-    candidate: DeliveryCandidate,
-    evidence_revision: int,
-    evidence_fingerprint: str,
-) -> bool:
-    return (
-        not _loop()._delivery_replace_required(candidate)
-        and candidate.evidence_revision == evidence_revision
-        and candidate.evidence_fingerprint == evidence_fingerprint
-    )
-
-
 def _arm_delivery_control(
     tools: ToolRegistry,
     ctx: _RoundLimitContext,
@@ -874,14 +864,13 @@ def _arm_delivery_control(
             and not candidate.finalization_control.startswith("acceptance_feedback"))
     ):
         return  # A pending panel never relaxes another gate's existing control.
-    evidence_revision, evidence_fingerprint = _loop()._delivery_evidence_state(tools, ctx, llm_trace)
+    _loop()._delivery_evidence_state(tools, ctx, llm_trace)
     candidate.finalization_control = control
     tools._ctx._delivery_control_required = True
     from ouroboros.acceptance_settlement import acceptance_choice_offered
 
     control_prompt = _delivery_control_prompt(
         candidate,
-        keep_allowed=_delivery_keep_allowed(candidate, evidence_revision, evidence_fingerprint),
         pending_review_choice=bool(getattr(tools._ctx, "_task_acceptance_pending", "")
                                    and acceptance_choice_offered()),
     )

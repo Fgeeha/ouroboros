@@ -335,7 +335,7 @@ def get_tools() -> List[ToolEntry]:
                 "name": "presence_finish",
                 "description": (
                     "Finish the current external presence turn with a typed delivery outcome. "
-                    "Call after the useful work is done. Choose message to return "
+                    "Choose finish after useful work, or stop with a rationale when work remains. Choose message to return "
                     "a conversational reply, silent when no reply is appropriate, tool_delivered "
                     "when an allowed tool already delivered the result, or deferred after long "
                     "work was successfully promoted. With nonblank message text, or silent/tool_delivered, "
@@ -351,7 +351,7 @@ def get_tools() -> List[ToolEntry]:
                         "answer_sha256": {"type": "string", "description": "Select an offered complete answer instead of message or reply-later."},
                         "message": {
                             "type": "string",
-                            "description": "Reply text for message, or an immediate acknowledgement for deferred. Nonblank text enables immediate finalization; omitting it leaves the reply to a subsequent model round.",
+                            "description": "Reply text for message, or an immediate acknowledgement for deferred. Nonblank text or answer_sha256 enables immediate finalization. Omitting both explicitly reserves the next ordinary model reply, subject to normal budget and controls; it is not yet an authored no-spend stop. Use selected bytes or silent/tool_delivered to stop without another reply.",
                         },
                     },
                     "required": ["outcome"],

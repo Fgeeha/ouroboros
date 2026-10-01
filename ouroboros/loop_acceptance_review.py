@@ -645,9 +645,10 @@ def _finish_advisory_author(ctx: _TaskAcceptanceContext) -> bool:
     # advisory author_finish then read as Done over "not ready".
     if action != "stop":
         from ouroboros.loop_delivery import delivery_evidence_fingerprint
+        from ouroboros.tool_capabilities import completion_observation_calls
 
         if (not feedback or intent.get("review_binding_hash") != feedback.get("binding_hash")
-                or any(not (call.get("completion_control") and not call.get("is_error")) for call in (ctx.llm_trace.get("tool_calls") or [])[int(intent.get("tool_count") or 0):])
+                or completion_observation_calls((ctx.llm_trace.get("tool_calls") or [])[int(intent.get("tool_count") or 0):])
                 or intent.get("owner_directives") != len(getattr(ctx.tools._ctx, "_owner_directives", []) or [])
                 or intent.get("evidence_fingerprint") != delivery_evidence_fingerprint(ctx.tools._ctx, ctx.llm_trace)):
             return False
