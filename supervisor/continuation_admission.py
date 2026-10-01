@@ -349,6 +349,20 @@ def admit_continuation(predecessor_task_id: str, *, action_nonce: str) -> Dict[s
                         detail="the interrupted task's own work is not proven settled; this Continue waits",
                         extra={"predecessor_task_id": predecessor, "blockers": blockers[:20],
                                "root_task_id": successor})
+    project_basis = None
+    if task.get("project_id"):
+        # A fresh admission carries its prepared Project basis (the producer seam
+        # schedule_task uses); a basis-less row would be held as legacy forever.
+        from ouroboros.projects_registry import project_admission_view, project_binding_for_task
+
+        try:
+            bound = project_binding_for_task(q.DRIVE_ROOT, predecessor, strict=True) or {}
+            project_basis = project_admission_view(q.DRIVE_ROOT, task["project_id"], frozen=True,
+                                                   allow_unregistered=bound.get("project_id") != task["project_id"])
+        except (OSError, ValueError, RuntimeError) as exc:
+            # The claim stays: the same nonce retries once the authority is readable.
+            return {"ok": False, "error": getattr(exc, "reason", "project_routing_fence_lookup_failed"),
+                    "successor_task_id": successor}
     token = binding["admission_token"]
     reservation = q.reserve_task_admission(successor, token)
     if reservation.get("status") == "existing_same_token":
@@ -359,7 +373,7 @@ def admit_continuation(predecessor_task_id: str, *, action_nonce: str) -> Dict[s
     task["_admission_token"] = token
     task["_continuation_prepared"] = admission["binding_sha256"]
     with q._queue_lock:
-        admitted = q.enqueue_task(task)
+        admitted = q.enqueue_task(task, project_admission=project_basis)
         if isinstance(admitted, dict) and admitted.get("_admission_blocked"):
             q.release_task_admission(successor, token)
             return {"ok": False, "error": str(admitted["_admission_blocked"]), "successor_task_id": successor}
