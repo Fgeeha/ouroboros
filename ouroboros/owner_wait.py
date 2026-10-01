@@ -241,11 +241,11 @@ def load_owner_wait(ctx: Any, handoff: dict | None = None) -> dict:
     return state
 
 
-def restore_owner_wait_allowed(root: Any, task: dict) -> bool:
-    """A snapshot is a locator; current wait and acknowledged restart authorize it."""
+def restore_owner_wait_allowed(root: Any, task: dict, *, strict: bool = False) -> bool:
+    """Current wait and acknowledged restart authorize a locator; strict preserves read failures."""
     from ouroboros.cancel_intents import has_active_intent
     from ouroboros.deadline_utils import parse_deadline_ts, utc_now
-    from ouroboros.delegate_recovery import _ack_direct_exec_successor, _read_restart_transaction
+    from ouroboros.delegate_recovery import _ack_direct_exec_successor, _read_restart_transaction, _restart_transaction_path
     from ouroboros.config import get_task_abs_ceiling_sec
     from ouroboros.model_wait import execution_elapsed_seconds
     import time
@@ -258,8 +258,10 @@ def restore_owner_wait_allowed(root: Any, task: dict) -> bool:
         return False
     _ack_direct_exec_successor(root)
     task_id = str(task.get("id") or "")
-    transaction = _read_restart_transaction(root, str(handoff.get("restart_transaction_id") or ""))
-    if transaction.get("status") != "normal_exit_acknowledged" or task_id not in transaction.get("task_ids", []):
+    transaction_id = str(handoff.get("restart_transaction_id") or "")
+    transaction = {} if strict else _read_restart_transaction(root, transaction_id)
+    if not strict and (transaction.get("status") != "normal_exit_acknowledged"
+                       or task_id not in transaction.get("task_ids", [])):
         return False
     row = load_task_result(root, task_id, strict=True) or {}
     wait = row.get("owner_wait") or {}
@@ -288,6 +290,13 @@ def restore_owner_wait_allowed(root: Any, task: dict) -> bool:
          "model_wait_quota_clock": wait.get("model_wait_quota_clock") or {},
          "budget_paused_sec": paused_carrier}, now)
     if started and ceiling is not None and executed >= ceiling:
+        return False
+    # Independent controls apply even when restart/replay evidence is unreadable.
+    if strict:
+        transaction = json.loads(_restart_transaction_path(root, transaction_id).read_text(encoding="utf-8"))
+    if not isinstance(transaction, dict):
+        raise ValueError("Owner-wait restart transaction is unreadable")
+    if transaction.get("status") != "normal_exit_acknowledged" or task_id not in transaction.get("task_ids", []):
         return False
     read_actor_source_bytes(root, task_id, wait["source_ref"])
     return True

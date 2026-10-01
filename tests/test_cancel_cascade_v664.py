@@ -112,6 +112,7 @@ def test_cascade_resweeps_descendants_admitted_after_the_first_snapshot(monkeypa
 
     monkeypatch.setattr(q, "PENDING", [{"id": "root"}], raising=False)
     monkeypatch.setattr(q, "RUNNING", {}, raising=False)
+    monkeypatch.setattr("supervisor.task_lifecycle.CANCELLED_ROOT_FENCES", {})
     monkeypatch.setattr(q, "cancel_task_custody", lambda tid, **_kw: q.CANCEL_CANCELLED if _fake_single(tid) else q.CANCEL_FAILED)
     monkeypatch.setattr(q, "append_jsonl", lambda *a, **k: None)
 

@@ -2060,7 +2060,8 @@ def test_handle_schedule_task_accepts_unique_subagent_with_lineage_and_constrain
             sent.append((chat_id, text, kwargs))
 
         def enqueue_task(self, task):
-            enqueued.append(task)
+            enqueued.append(dict(task))
+            return enqueued[-1]
 
         def persist_queue_snapshot(self, reason=""):
             self.snapshot_reason = reason
@@ -2176,7 +2177,8 @@ def test_handle_schedule_task_uses_event_chat_id_without_owner(tmp_path, monkeyp
             sent.append((chat_id, text, kwargs))
 
         def enqueue_task(self, task):
-            enqueued.append(task)
+            enqueued.append(dict(task))
+            return enqueued[-1]
 
         def persist_queue_snapshot(self, reason=""):
             self.snapshot_reason = reason
@@ -2327,7 +2329,8 @@ def test_configured_zero_subagent_depth_truly_disables_delegation(tmp_path, monk
             pass
 
         def enqueue_task(self, task):
-            enqueued.append(task)
+            enqueued.append(dict(task))
+            return enqueued[-1]
 
         def persist_queue_snapshot(self, reason=""):
             pass
@@ -2458,7 +2461,8 @@ def test_handle_schedule_task_queues_when_active_subagent_cap_is_full(tmp_path, 
             sent.append((chat_id, text, kwargs))
 
         def enqueue_task(self, task):
-            enqueued.append(task)
+            enqueued.append(dict(task))
+            return enqueued[-1]
 
         def persist_queue_snapshot(self, reason=""):
             pass
@@ -2830,7 +2834,7 @@ def test_assign_tasks_mirrors_running_subagent_status_to_parent_drive(tmp_path, 
     monkeypatch.setattr(workers_module, "WORKERS", {1: SimpleNamespace(wid=1, busy_task_id=None, in_q=FakeWorkerQueue())})
     monkeypatch.setattr(workers_module, "load_state", lambda: {})
     monkeypatch.setattr(state_module, "budget_remaining", lambda _state, **_kwargs: 100.0)
-    monkeypatch.setattr(queue_module, "persist_queue_snapshot", lambda reason="": None)
+    monkeypatch.setattr(queue_module, "persist_queue_snapshot", lambda reason="": True)
 
     workers_module.assign_tasks()
 
@@ -2922,7 +2926,7 @@ def test_assign_tasks_honors_depth_reservation_for_first_grandchild(tmp_path, mo
     monkeypatch.setattr(workers_module, "WORKERS", {1: SimpleNamespace(wid=1, busy_task_id=None, in_q=FakeWorkerQueue())})
     monkeypatch.setattr(workers_module, "load_state", lambda: {})
     monkeypatch.setattr(state_module, "budget_remaining", lambda _state, **_kwargs: 100.0)
-    monkeypatch.setattr(queue_module, "persist_queue_snapshot", lambda reason="": None)
+    monkeypatch.setattr(queue_module, "persist_queue_snapshot", lambda reason="": True)
 
     workers_module.assign_tasks()
 
@@ -2936,11 +2940,7 @@ def test_assignment_depth_fact_reaches_worker_and_survives_child_copyback(tmp_pa
     from supervisor import state as state_module
     from ouroboros.contracts.task_contract import build_task_contract
     from ouroboros.headless import copy_child_task_result
-    from ouroboros.task_results import (
-        STATUS_COMPLETED,
-        load_task_result,
-        write_task_result,
-    )
+    from ouroboros.task_results import STATUS_COMPLETED, load_task_result, write_task_result
 
     delivered = []
 
@@ -2986,7 +2986,7 @@ def test_assignment_depth_fact_reaches_worker_and_survives_child_copyback(tmp_pa
     )
     monkeypatch.setattr(workers_module, "load_state", lambda: {})
     monkeypatch.setattr(state_module, "budget_remaining", lambda _state, **_kwargs: 100.0)
-    monkeypatch.setattr(queue_module, "persist_queue_snapshot", lambda reason="": None)
+    monkeypatch.setattr(queue_module, "persist_queue_snapshot", lambda reason="": True)
 
     workers_module.assign_tasks()
 

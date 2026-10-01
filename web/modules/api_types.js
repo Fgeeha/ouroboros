@@ -85,6 +85,7 @@
 
 /**
  * @typedef {Object} ActiveChatActivity
+ * @property {Object=} project_admission_hold  // accepted unstarted work waiting for original Project authority
  * @property {Object=} required_question  // read-only pointer to the current required Project quiz
  * @property {boolean=} required_question_unavailable  // a recorded owner-question wait whose detail could not be read: possibly blocked, never "no question"
  * @property {Object.<string,Object>=} model_waits
@@ -1197,6 +1198,8 @@
  * @property {string=} stop_policy
  * @property {OwnerHurryProjection=} owner_hurry
  * @property {OwnerHurryProjection[]=} owner_hurry_history
+ * @property {{reason?:string, detail?:string, label?:string}=} project_admission_hold
+ *   While the queue snapshot lists the row: its wait for original Project/scope evidence, or {}.
  * @property {string=} error
  */
 

@@ -18,6 +18,8 @@ from __future__ import annotations
 import json
 import types
 
+import pytest
+
 from ouroboros import cancel_intents as ci
 from ouroboros.contracts.chat_id_policy import project_chat_id
 from ouroboros.project_dialogue import build_owner_message_ref
@@ -222,9 +224,8 @@ def test_first_implicit_promote_from_a_retry_lands_in_the_origins_project(qenv, 
     assert _inherited_project_scope(ctx) == pid
 
 
-def test_a_room_that_stopped_accepting_bindings_discloses_and_admits_the_retry(qenv, monkeypatch):
-    """A refused bind is LOUD but never blocks the retry: the successor is still
-    admitted, and the failure is a typed row on the reaper's OWN drive."""
+def test_a_room_that_stopped_accepting_bindings_refuses_before_retry_enqueue(qenv, monkeypatch):
+    """Recorded room authority must be validated before any successor is runnable."""
     _patch_retry_input_handoff(monkeypatch)
     old_id, new_id, pid = "fenced-old", "fenced-new", "fenced-room"
     ref = _owner_ref("msg-retry-fenced")
@@ -235,12 +236,94 @@ def test_a_room_that_stopped_accepting_bindings_discloses_and_admits_the_retry(q
 
     requeued, _attempt, _reason, suppression = _retry(qenv, root, old_id, new_id)
 
-    assert (requeued, suppression) == (True, {})
-    assert [row["id"] for row in qenv.q.PENDING] == [new_id]
+    assert (requeued, suppression) == (False, {})
+    assert _reason == "idle_timeout_retry_admission_blocked"
+    assert not qenv.q.PENDING
     assert project_binding_for_task(qenv.drive, new_id) is None
-    failures = [
-        row for row in _events(qenv.drive)
-        if row.get("type") == "project_binding_failed" and row.get("task_id") == new_id
-    ]
-    assert [row["bind_path"] for row in failures] == ["timeout_retry_admission"]
-    assert failures[0]["project_id"] == pid
+    from ouroboros.task_results import load_task_result
+    result = load_task_result(qenv.drive, old_id)
+    assert result["status"] == "failed" and "project_routing_fence" in result["result"]
+    assert load_task_result(qenv.drive, new_id) is None
+
+
+@pytest.mark.serial
+def test_prepared_timeout_retry_admits_benign_churn_but_preserves_deletion(qenv, monkeypatch):
+    from ouroboros import projects_registry as registry
+    from ouroboros.task_results import load_task_result
+
+    _patch_retry_input_handoff(monkeypatch)
+    for name in ("ADMISSION_RESERVATIONS", "ACCEPTANCE_FENCES", "BUDGET_ROOT_FENCES"):
+        monkeypatch.setattr(qenv.q, name, {})
+    monkeypatch.setattr(qenv.q, "QUEUE_SEQ_COUNTER_REF", {"value": 0})
+    for deleted in (False, True):
+        qenv.q.PENDING.clear()
+        pid = "deleted" if deleted else "active"
+        registry.create_project(qenv.drive, pid)
+        registry.create_project(qenv.drive, "other")
+        old_id, new_id = f"{pid}-old", f"{pid}-new"
+        prepared = qenv.q.enqueue_task({**_root_task(old_id), "project_id": pid,
+                                       "workspace_root": "/synthetic/frozen-resource"})
+        qenv.q.PENDING.clear()  # simulate the already-executed attempt before reaping
+        registry.bind_task_to_project(qenv.drive, old_id, pid, origin={"absent": "system"})
+        write_task_result(qenv.drive, old_id, STATUS_RUNNING, result="working")
+        real_enqueue = qenv.q.enqueue_task
+        def enqueue(payload, **kwargs):
+            registry.touch_project(qenv.drive, "other")
+            if deleted:
+                registry.begin_project_deletion(qenv.drive, pid)
+            return real_enqueue(payload, **kwargs)
+        with monkeypatch.context() as change:
+            change.setattr(qenv.q, "enqueue_task", enqueue)
+            requeued, attempt, reason, _ = _retry(qenv, prepared, old_id, new_id)
+        assert attempt == (1 if deleted else 2)
+        if deleted:
+            assert not requeued and not qenv.q.PENDING
+            assert reason.endswith("retry_admission_blocked")
+            assert load_task_result(qenv.drive, old_id)["status"] == "failed"
+            assert project_binding_for_task(qenv.drive, new_id) is None
+        else:
+            assert requeued and [row["id"] for row in qenv.q.PENDING] == [new_id]
+            successor = qenv.q.PENDING[0]
+            assert successor["_project_admission"] == prepared["_project_admission"]
+            assert successor["workspace_root"] == "/synthetic/frozen-resource"
+            assert load_task_result(qenv.drive, old_id)["status"] == "interrupted"
+            assert project_id_for_task(qenv.drive, new_id) == pid
+
+
+@pytest.mark.parametrize("evidence", ["own", "root", "origin"])
+@pytest.mark.parametrize("failure", ["missing", "unreadable"])
+def test_legacy_retry_rejects_lost_known_room_before_enqueue(qenv, monkeypatch, evidence, failure):
+    from ouroboros import projects_registry as registry
+    from ouroboros.task_results import load_task_result
+
+    _patch_retry_input_handoff(monkeypatch)
+    old_id, new_id = "legacy-old", "legacy-new"
+    ref = _owner_ref("legacy-origin")
+    root = _root_task(old_id, ref=ref)
+    identity = old_id if evidence == "own" else "earlier"
+    if evidence == "root":
+        root["root_task_id"] = identity
+    _bind_root(qenv.drive, identity, "known", ref=ref if evidence == "origin" else None)
+    write_task_result(qenv.drive, old_id, STATUS_RUNNING, result="working")
+    path = registry._registry_path(qenv.drive)
+    path.write_text('{torn' if failure == "unreadable" else '{"projects": []}', encoding="utf-8")
+    requeued, _attempt, reason, suppression = _retry(qenv, root, old_id, new_id)
+    assert not requeued and not suppression and reason == "idle_timeout_retry_admission_blocked"
+    assert not qenv.q.PENDING and project_binding_for_task(qenv.drive, new_id) is None
+    assert load_task_result(qenv.drive, old_id)["status"] == "failed"
+
+
+def test_unregistered_scope_retry_does_not_create_or_bind_a_room(qenv, monkeypatch):
+    from ouroboros import projects_registry as registry
+
+    _patch_retry_input_handoff(monkeypatch)
+    root = {**_root_task("scope-old"), "project_id": "scope-only", "workspace_root": "/synthetic/frozen"}
+    write_task_result(qenv.drive, "scope-old", STATUS_RUNNING, result="working")
+    requeued, _attempt, _reason, suppression = _retry(qenv, root, "scope-old", "scope-new")
+    assert requeued and not suppression
+    [queued] = qenv.q.PENDING
+    assert queued["project_id"] == "scope-only" and queued["workspace_root"] == root["workspace_root"]
+    assert queued["_project_admission"]["project"] is None
+    assert registry.get_reserved_project(qenv.drive, "scope-only") is None
+    assert project_binding_for_task(qenv.drive, "scope-new") is None
+    assert not any(row.get("type") == "project_binding_failed" for row in _events(qenv.drive))

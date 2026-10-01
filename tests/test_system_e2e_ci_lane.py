@@ -61,7 +61,7 @@ def test_pull_requests_and_ouroboros_pushes_share_one_full_browser_lane():
     steps = {step.get("name"): step for step in shared["jobs"]["ui-smoke"]["steps"] if step.get("name")}
     full = steps["Run complete host UI lane with collection and availability guards"]
     assert full["if"] == "${{ !cancelled() && steps.install_browsers.outcome == 'success' && inputs.diagnostic == 'full' }}"
-    assert "python -m pytest tests/ -m ui_browser --require-ui-browser -q --tb=short" in full["run"]
+    assert "python -m pytest tests/ -m ui_browser --require-ui-browser -vv --tb=short" in full["run"]
     assert full["env"]["OUROBOROS_RUN_UI_SMOKE"] == "1"
     assert full["env"]["OUROBOROS_EXPECT_BROWSER_ENGINES"] == "chromium,webkit"
     assert steps["Run browser tools Chromium/WebKit smoke"]["if"] == (
