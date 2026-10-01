@@ -205,7 +205,7 @@ def make_settings_save(api):
             try:
                 proxy = validate_telegram_proxy(payload["TELEGRAM_PROXY"])
             except ValueError as exc:
-                return JSONResponse({"ok": False, "message": str(exc)}, status_code=400)
+                return JSONResponse({"ok": False, "message": str(exc), "error": str(exc)}, status_code=400)
             if proxy is None:
                 payload.pop("TELEGRAM_PROXY")
             else:

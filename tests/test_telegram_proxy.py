@@ -319,8 +319,7 @@ def test_upgrade_keeps_token_grant_and_local_proxy(
     installed = native / "telegram"
     shutil.copytree(_ROOT, installed)
     manifest = (installed / "SKILL.md").read_text(encoding="utf-8")
-    manifest = manifest.replace("version: 1.2.9", "version: 1.2.8").replace(
-        "env_from_settings: [TELEGRAM_BOT_TOKEN, TELEGRAM_PROXY]", "env_from_settings: [TELEGRAM_BOT_TOKEN]")
+    manifest = manifest.replace("version: 1.2.9", "version: 1.2.8")
     (installed / "SKILL.md").write_text(manifest, encoding="utf-8")
     (installed / ".seed-origin").write_text("seeded_from=test\n", encoding="utf-8")
     settings = {"TELEGRAM_BOT_TOKEN": _TOKEN, **({"TELEGRAM_PROXY": _PROXY} if owner_set_proxy else {})}
@@ -329,7 +328,7 @@ def test_upgrade_keeps_token_grant_and_local_proxy(
     local_state = drive / "state" / "skills" / "telegram"
     local_state.mkdir(parents=True)
     local_settings = local_state / "settings.json"
-    local_settings.write_text(json.dumps({"TELEGRAM_PROXY": _PROXY if owner_set_proxy else ""}))
+    local_settings.write_text(json.dumps({"TELEGRAM_PROXY": _PROXY if owner_set_proxy else ""}), encoding="utf-8")
     settings_before = local_settings.read_bytes()
     old = load_skill(installed, drive)
     assert old is not None and not old.load_error

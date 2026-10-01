@@ -205,7 +205,7 @@ def test_all_telegram_consumers_succeed_through_real_transport(tmp_path, monkeyp
         bot.origin_port = origin.sockets[0].getsockname()[1]
         proxy = await asyncio.start_server(bot.accept(lambda r, w: bot.proxy(r, w, scheme)), "127.0.0.1", 0)
         proxy_url = None if scheme == "direct" else f"{scheme}://owner:proxy-secret@127.0.0.1:{proxy.sockets[0].getsockname()[1]}"
-        (state / "settings.json").write_text(json.dumps({"TELEGRAM_CHAT_ID": "42", "TELEGRAM_PROXY": proxy_url}))
+        (state / "settings.json").write_text(json.dumps({"TELEGRAM_CHAT_ID": "42", "TELEGRAM_PROXY": proxy_url}), encoding="utf-8")
         try:
             poller = asyncio.create_task(plugin._poller(api))
             try:
@@ -231,7 +231,7 @@ def test_all_telegram_consumers_succeed_through_real_transport(tmp_path, monkeyp
             (state / "runtime_config.json").write_text(json.dumps({
                 "schema": 2, "core_port": 8765, "owner_chat_id": 42,
                 "button_text": "Ouroboros", "tunnel": "cloudflare_quick",
-            }))
+            }), encoding="utf-8")
             original_wait = companion._wait_for_owner
             reached = []
             async def verified_owner(*args):
@@ -289,7 +289,7 @@ def test_local_host_and_miniapp_clients_ignore_telegram_proxy(tmp_path, monkeypa
     import platform_support
     (tmp_path / "settings.json").write_text(json.dumps({
         "TELEGRAM_CHAT_ID": "42", "TELEGRAM_PROXY": "socks5://owner:proxy-secret@127.0.0.1:1",
-    }))
+    }), encoding="utf-8")
     monkeypatch.setenv("TELEGRAM_PROXY", "socks5://owner:proxy-secret@127.0.0.1:1")
     monkeypatch.setenv("ALL_PROXY", "http://127.0.0.1:1")
     seen, built = [], []

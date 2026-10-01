@@ -32,7 +32,7 @@ def _install_form_fixture(data):
         permissions: [route, widget, read_settings]
         ---
         # Telegram form fixture
-        """))
+        """), encoding="utf-8")
     # Capture the actual register() consumer and routes; only runtime start hooks
     # are disabled. No bot token, Telegram process or synthetic form schema.
     (target / "plugin.py").write_text(textwrap.dedent("""\
@@ -45,7 +45,7 @@ def _install_form_fixture(data):
             def register_companion_process(self, *args, **kwargs): pass
         def register(api):
             register_telegram(FormOnlyAPI(api))
-        """))
+        """), encoding="utf-8")
     save_review_state(data, name, SkillReviewState(
         status="pass", content_hash=compute_content_hash(target, manifest_entry="plugin.py")))
     return name
@@ -96,7 +96,7 @@ def test_actual_form_configures_edits_keeps_and_clears_proxy(direct_server_with_
             status = current.locator('[data-extension-settings-status]')
             from playwright.sync_api import expect
             expect(status).to_contain_text("Saved Telegram proxy: configured.")
-            assert json.loads(state.read_text())["TELEGRAM_PROXY"] == first
+            assert json.loads(state.read_text(encoding="utf-8"))["TELEGRAM_PROXY"] == first
             current = saved_form()
             assert current.locator('[name="telegram_proxy_status"]').input_value() == "Configured"
             assert current.locator('[name="TELEGRAM_PROXY"]').input_value() == ""
@@ -106,16 +106,22 @@ def test_actual_form_configures_edits_keeps_and_clears_proxy(direct_server_with_
             current.locator('[name="TELEGRAM_LANGUAGE"]').select_option("ru")
             current.get_by_role("button", name="Save Telegram settings").click()
             expect(current.locator('[data-extension-settings-status]')).to_contain_text("Telegram settings saved.")
-            assert json.loads(state.read_text())["TELEGRAM_PROXY"] == first
+            assert json.loads(state.read_text(encoding="utf-8"))["TELEGRAM_PROXY"] == first
+            current.locator('[name="TELEGRAM_PROXY"]').fill("socks5://owner:invalid-secret@proxy")
+            current.get_by_role("button", name="Save Telegram settings").click()
+            expect(current.locator('[data-extension-settings-status]')).to_contain_text("TELEGRAM_PROXY must be")
+            assert json.loads(state.read_text(encoding="utf-8"))["TELEGRAM_PROXY"] == first
+            assert "invalid-secret" not in current.locator('[data-extension-settings-status]').inner_text()
+            current.screenshot(path=str(evidence / "telegram-proxy-invalid.png"))
             current.locator('[name="TELEGRAM_PROXY"]').fill(edited)
             current.get_by_role("button", name="Save Telegram settings").click()
             expect(current.locator('[data-extension-settings-status]')).to_contain_text("Saved Telegram proxy: configured.")
-            assert json.loads(state.read_text())["TELEGRAM_PROXY"] == edited
+            assert json.loads(state.read_text(encoding="utf-8"))["TELEGRAM_PROXY"] == edited
             current = saved_form()
             current.locator('[name="clear_telegram_proxy"]').check()
             current.get_by_role("button", name="Save Telegram settings").click()
             expect(current.locator('[data-extension-settings-status]')).to_contain_text("Saved Telegram proxy: cleared.")
-            assert json.loads(state.read_text())["TELEGRAM_PROXY"] == ""
+            assert json.loads(state.read_text(encoding="utf-8"))["TELEGRAM_PROXY"] == ""
             current = saved_form()
             assert current.locator('[name="telegram_proxy_status"]').input_value() == "Not configured"
             assert current.locator('[name="TELEGRAM_PROXY"]').input_value() == ""

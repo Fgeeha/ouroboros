@@ -337,6 +337,9 @@ def test_proxy_form_is_masked_preserves_empty_and_explicitly_clears(tmp_path, ho
     assert load_settings(tmp_path)["TELEGRAM_LANGUAGE"] == "ru"
     refused = request({"TELEGRAM_PROXY": "socks5://owner:proxy-secret@bad-host"})
     assert refused.status_code == 400
+    failure = json.loads(refused.body)
+    assert failure["error"] == failure["message"]
+    assert "TELEGRAM_PROXY must be" in failure["error"]
     assert b"proxy-secret" not in refused.body and b"bad-host" not in refused.body
     assert load_settings(tmp_path)["TELEGRAM_PROXY"] == proxy
     assert request({"clear_telegram_proxy": True, "TELEGRAM_PROXY": ""}).status_code == 200
