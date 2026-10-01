@@ -154,7 +154,16 @@ def test_skill_finalization_rearms_after_tool_round(monkeypatch, tmp_path):
     assert trace["delivery_candidate"]["finalization_control"] == "candidate"
     assert [row["tool"] for row in trace["tool_calls"]] == ["noop", "finish_task", "finish_task"]
     assert all(row["completion_control"] for row in trace["tool_calls"][1:])
-    assert any(tail[-2:] == ["assistant", "user"] for tail in seen_message_tails)
+    # Multiple host notices can follow one held response; the old last-two-role
+    # assertion accidentally depended on the duplicated assistant row.
+    for held, text in ((seen_messages[1], "done"), (seen_messages[3], "done again")):
+        indices = [index for index, row in enumerate(held)
+                   if row.get("role") == "assistant" and row.get("content") == text]
+        assert len(indices) == 1
+        notices = held[indices[0] + 1:]
+        assert notices and all(row.get("role") == "user" for row in notices)
+        assert any("latest whole held response answer_sha256=" + hashlib.sha256(text.encode()).hexdigest()
+                   in str(row.get("content")) for row in notices)
     assert all(tail[-2:] != ["assistant", "system"] for tail in seen_message_tails)
 
 
