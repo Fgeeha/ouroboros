@@ -2,24 +2,23 @@
 from __future__ import annotations
 
 import copy
-import json
 
 import pytest
 
 from ouroboros import loop
-from tests.test_acceptance_async_loop import ANSWER, call, keep
+from tests.test_acceptance_async_loop import ANSWER, call, keep, select_completion
 from tests.test_acceptance_async_loop import full_loop as _full_loop
 
 full_loop = _full_loop  # noqa: F811 - pytest fixture re-export
 
 
 @pytest.mark.parametrize("owner_followup", [False, True], ids=["same_owner", "owner_followup"])
-def test_prose_after_settlement_needs_control_only_for_unacknowledged_owner_input(
+def test_prose_after_settlement_requires_selection_without_another_review_park(
     full_loop, monkeypatch, owner_followup,
 ):
-    """Complete prose continues directly under N2. A changed owner source still
-    needs its exact acknowledgement, whose repair round must run after settlement.
-    Neither path may park again on the panel whose one wake was already consumed."""
+    """Prose after a review hold stays activity until Main selects its bytes.
+    A changed owner source still needs its exact acknowledgement. Neither path
+    may park again on the panel whose one wake was already consumed."""
     f = full_loop
     f.reviewer_verdict = "FAIL"
     monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "1")
@@ -49,10 +48,9 @@ def test_prose_after_settlement_needs_control_only_for_unacknowledged_owner_inpu
                 assert followup in str(messages)
             return {"content": reauthored}, 0.0
         if f.model_step == 4:
-            assert "[DELIVERY_CONTROL_REPAIR]" in str(messages[-1].get("content"))
-            observation = f.ctx._acceptance_observation
-            return {"content": json.dumps({"delivery_control": "replace", "full_answer": reauthored,
-                                           "acceptance_subject": {"owner_source_sha256": observation["owner_source_sha256"]}})}, 0.0
+            assert "No completion selection was made" in str(messages[-1].get("content"))
+            assert f.ctx._delivery_candidate.full_text == ANSWER
+            return select_completion(f, reauthored), 0.0
         assert f.model_step < 7, f.progress
         return keep(f), 0.0
 
@@ -60,8 +58,8 @@ def test_prose_after_settlement_needs_control_only_for_unacknowledged_owner_inpu
     result, _usage, trace = f.run()
     assert result == reauthored and len(f.review_sends) == 1
     assert [wait.get("reason") for wait in f.waits] == ["review"], f.waits
-    assert f.model_step == (4 if owner_followup else 3), f.progress
-    assert any("[DELIVERY_CONTROL_REPAIR]" in str(messages) for messages in f.model_inputs) is owner_followup
+    assert f.model_step == 4, f.progress
+    assert any("No completion selection was made" in str(messages) for messages in f.model_inputs)
     host = [r for r in trace["review_runs"] if r.get("authority") == "host_root"]
     assert [r.get("aggregate_signal") for r in host] == ["FAIL"], host
     assert trace["acceptance_decision"]["reason"] == "review_cycles_exhausted"

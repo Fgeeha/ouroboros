@@ -93,36 +93,48 @@ def _handle_text_response(
 
 
 def _finalize_loop_candidate(content, limit_ctx, tools, emit_progress, *, after_tools=False):
-    """Consume a current Presence request or ordinary final through the same gates."""
+    """One completion request owner, with ordinary first/direct prose compatibility."""
+    from ouroboros.loop_delivery import consume_completion_request, hold_completion_response
     ctx = tools._ctx
-    completion = getattr(ctx, "_presence_completion", None)
-    if (completion is not None and getattr(ctx, "_presence_completion_owner_revision", -1)
-            != len(getattr(ctx, "_owner_directives", []) or [])):
-        # A finish request cannot decide the response to newer owner input.
-        completion = ctx._presence_completion = None
-    if after_tools:
-        if not isinstance(completion, dict) or not (
-            completion.get("message") or completion.get("outcome") in {"silent", "tool_delivered"}
-        ):
+    selected = bool(getattr(ctx, "_completion_selected", None)) or consume_completion_request(tools, limit_ctx, limit_ctx.llm_trace, content)
+    if after_tools and not selected:
+        return None
+    if selected:
+        from ouroboros.loop_messages import owner_source_sha256
+        observation = ctx._completion_selected.get("observation") or {}
+        if observation.get("owner_source_sha256") != owner_source_sha256(ctx):
+            ctx._completion_selected = ctx._presence_completion = None
+            ctx._delivery_candidate.control_episode_seen = True
+            _arm_delivery_control(tools, limit_ctx, limit_ctx.llm_trace, control="owner_revision_required")
             return None
-        content = completion.get("message") or ""
-    spoken_before = transcript_growth_signature(limit_ctx.messages)
+        content = ctx._delivery_candidate.full_text
+    before = transcript_growth_signature(limit_ctx.messages)
+    response_start = len(limit_ctx.messages)
+    ctx._completion_pair_appended = False
     result = _no_tool_final_answer(
         content, limit_ctx, limit_ctx.llm_trace, tools, limit_ctx.incoming_messages,
-        limit_ctx.owner_msg_seen, emit_progress, **({"explicit_candidate": True} if after_tools else {}),
+        limit_ctx.owner_msg_seen, emit_progress, explicit_candidate=selected,
     )
     if result is None:
+        if ctx._completion_pair_appended and not selected and not ctx._completion_pair_private:
+            _emit_round_progress(content, {"content": content}, emit_progress, limit_ctx.llm_trace)
+        ctx._completion_selected = None
         ctx._presence_completion = None
-        # A turn in which the host has just spoken to Main (a repair, a reminder,
-        # a drained follow-up) owes it a round; only a pass that appended nothing
-        # may park behind the panel (the wait's own re-offer comes after this).
-        if transcript_growth_signature(limit_ctx.messages) == spoken_before:
+        candidate = getattr(ctx, "_delivery_candidate", None)
+        plain_followup = candidate is not None and candidate.finalization_control == "owner_revision_required" and not candidate.control_episode_seen
+        unchanged = transcript_growth_signature(limit_ctx.messages) == before
+        if not plain_followup and candidate is not None:
+            candidate.control_episode_seen = True
+            ctx._delivery_control_required = True
+        can_park = unchanged and bool(getattr(ctx, "_task_acceptance_pending", ""))
+        if not plain_followup and not (selected and can_park):
+            # The resolver already supplied the exact assistant+host pair on a held prose round.
+            if not ctx._completion_pair_appended:
+                hold_completion_response(content, tools, limit_ctx, limit_ctx.llm_trace,
+                                         response_start=response_start, selected=selected)
+        if can_park:
             wait_for_acceptance_feedback(tools, limit_ctx, limit_ctx.llm_trace,
                                          limit_ctx.tool_schemas, limit_ctx.owner_msg_seen)
-        elif isinstance(completion, dict):  # that owed round also learns its finish is void
-            from ouroboros.presence_context import presence_finish_not_accepted_note
-
-            _append_or_merge_user_message(limit_ctx.messages, presence_finish_not_accepted_note(ctx, completion), slot=ctx)
     return result
 
 
@@ -354,6 +366,8 @@ def _reset_turn_state(ctx: Any) -> None:
     """Clear the per-turn state this turn owns; nothing durable is touched."""
     ctx._presence_completion, ctx._presence_completion_accepted = None, False
     ctx._presence_forced_declaration = ctx._presence_forced_pending = None
+    ctx._completion_request = ctx._completion_selected = ctx._completion_observation = None
+    ctx._completion_conflict, ctx._completion_held_sha256 = False, ""
     ctx._delivery_candidate, ctx._delivery_candidate_revision, ctx._delivery_control_required = None, 0, False
     ctx._delivery_evidence_revision, ctx._delivery_evidence_fingerprint = 0, ""
     ctx.model_turn_state, ctx._authoring_handover, ctx._pending_model_wait_handover = ModelTurnState(), None, None
@@ -442,12 +456,8 @@ def run_llm_loop(
         if saved:
             active_model, active_effort, active_use_local, active_context_mode, round_idx, context_fit_plan = resume_native_loop(
                 tools, saved, messages, llm_trace, accumulated_usage, _owner_msg_seen)
-        # Both continuing tool tails and unfinished no-tool rounds owe budget checks.
         pending_tool_budget, pending_tool_calls, pending_no_tool_budget = bool(saved), None, False
         if saved_pause:
-            # Restore cognition under the same ID, closing unanswered calls as
-            # execution-unknown without replay. The shared budget tail checks
-            # the owner-refreshed threshold before any new model call.
             (active_model, active_effort, active_use_local, active_context_mode,
              round_idx, context_fit_plan) = resume_paused_loop(
                 tools, saved_pause, messages, llm_trace, accumulated_usage, _owner_msg_seen,
@@ -455,6 +465,10 @@ def run_llm_loop(
             cost_ceiling = _resolve_task_cost_ceiling(tools._ctx, budget_remaining_usd)
             pending_no_tool_budget = saved_pause.get("resume_point", {}).get("budget_tail") == "no_tool"
             pending_tool_budget, free_redial = not pending_no_tool_budget, pending_no_tool_budget
+        if continuation:
+            from ouroboros.loop_delivery import completion_schema
+            if getattr(ctx, "_delivery_control_required", False):
+                completion_schema(tools, tool_schemas)
         while True:
             if free_redial or pending_tool_budget:
                 free_redial = False  # Tool tails and transport waits retain their logical round.
@@ -630,8 +644,6 @@ def run_llm_loop(
                     continue
                 return final_result
 
-            if getattr(tools._ctx, "_skill_finalization_injected", False):
-                tools._ctx._skill_finalization_injected = False
             assistant_msg = dict(msg, role=msg.get("role", "assistant"))
             messages.append(assistant_msg)
             _emit_round_progress(content, msg, emit_progress, llm_trace)
@@ -640,6 +652,10 @@ def run_llm_loop(
                 tool_calls, tools, drive_logs, task_id, stateful_executor,
                 messages, llm_trace, emit_progress
             )
+            from ouroboros.loop_delivery import finish_completed_stop
+            stopped = finish_completed_stop(tools, limit_ctx, emit_progress, budget_remaining_usd, cost_ceiling)
+            if stopped is not None:
+                return stopped
             advance_explicit_acceptance(tools, limit_ctx, llm_trace, incoming_messages,
                                         _owner_msg_seen, emit_progress)
             wait_after_tools(ctx, messages, llm_trace, accumulated_usage,
@@ -823,7 +839,6 @@ from ouroboros.loop_delivery import (  # noqa: E402, F401 -- intentional public 
     _merge_finalization_trace,
     _delivery_control_prompt,
     _delivery_replace_required,
-    _delivery_keep_allowed,
     _arm_delivery_control,
     _hold_delivery_for_skill_action,
     _parse_delivery_control_object,
@@ -848,7 +863,6 @@ from ouroboros.loop_forced_finalization import (  # noqa: E402, F401 -- intentio
     _undispositioned_children,
     _undecided_children_listing,
     _maybe_enforce_child_absorption_gate,
-    _run_forced_children_acceptance,
     _enforce_swarm_actions,
     _finalize_forced_services,
     _drain_forced_owner_directives,

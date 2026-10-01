@@ -133,7 +133,10 @@ def test_ordinary_toolless_final_without_handover_is_unchanged(tmp_path):
     assert registry._ctx._accumulated_usage == {}
 
 
-def test_production_finalizer_holds_json_control_during_handover_recovery(tmp_path):
+def test_production_finalizer_requires_selection_during_handover_recovery(tmp_path):
+    from copy import deepcopy
+    from ouroboros.loop_delivery import completion_observation, consume_completion_request
+    from ouroboros.tools.control_runtime import _finish_task
     registry, trace = _ctx(tmp_path)
     registry._ctx._authoring_handover = {
         "from_model": "codex=gpt-6-astra",
@@ -166,6 +169,8 @@ def test_production_finalizer_holds_json_control_during_handover_recovery(tmp_pa
         owner_msg_seen=set(),
         tool_schemas=[],
     )
+    # Match run_llm_loop's binding before calling its finalizer in isolation.
+    registry._ctx.task_id, registry._ctx.messages = limit.task_id, messages
 
     first = _no_tool_final_answer(
         "the worktree is clean", limit, trace, registry, queue.Queue(), set(), lambda _text: None,
@@ -174,16 +179,28 @@ def test_production_finalizer_holds_json_control_during_handover_recovery(tmp_pa
     assert first is None
     candidate = registry._ctx._delivery_candidate
     assert candidate.finalization_control == "authoring_handover_recovery_required"
-    assert registry._ctx._delivery_control_required is False
+    assert registry._ctx._delivery_control_required is True
     assert not any("DELIVERY_FINALIZATION_CONTROL" in str(row.get("content") or "") for row in messages)
 
+    before_second = deepcopy(messages)
     second = _no_tool_final_answer(
         "I will continue the requested work", limit, trace, registry, queue.Queue(), set(), lambda _text: None,
     )
 
-    assert second is not None
+    assert second is None
+    assert candidate.full_text == "the worktree is clean"
+    assert messages[:len(before_second)] == before_second
+    assert messages[len(before_second)] == {"role": "assistant", "content": "I will continue the requested work"}
+    assert all(row["role"] == "user" for row in messages[len(before_second) + 1:])
+    assert messages[-1]["role"] == "user" and "No completion selection" in messages[-1]["content"]
+    registry._ctx._completion_observation = completion_observation(registry._ctx, trace)
+    _finish_task(registry._ctx, action="finish", answer="No further work was performed.")
+    assert consume_completion_request(registry, limit, trace)
+    third = _no_tool_final_answer("No further work was performed.", limit, trace, registry,
+                                 queue.Queue(), set(), lambda _text: None, explicit_candidate=True)
+    assert third is not None and third[0] == "No further work was performed."
     assert usage["reason_code"] == "authoring_handover_incomplete"
-    assert second[1]["execution_status"] == "degraded"
+    assert third[1]["execution_status"] == "degraded"
 
 
 def test_handover_incomplete_trace_survives_usage_round_cleanup(tmp_path):

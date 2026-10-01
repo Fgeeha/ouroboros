@@ -152,6 +152,9 @@ def _presence_tool_allowed(ctx: Any, name: str) -> bool:
     )
 
     ceiling = presence_ceiling_from_context(ctx)
+    if name == "finish_task":
+        from ouroboros.dialogue_provenance import is_presence_task
+        return ceiling is None or not is_presence_task({"metadata": getattr(ctx, "task_metadata", {})})
     if name in {"presence_finish", "presence_cancel_work"}:
         return ceiling is not None
     return ceiling is None or presence_ceiling_allows_tool(ceiling, name)
@@ -477,6 +480,9 @@ class ToolRegistry:
 
     def _schema_for_entry(self, entry: ToolEntry) -> Dict[str, Any]:
         schema = entry.schema
+        if entry.name == "finish_task" and (self._is_local_readonly_subagent() or self._is_acting_subagent()):
+            schema = copy.deepcopy(schema)
+            schema["parameters"]["properties"].pop("pending_review", None)
         if self._is_local_readonly_subagent():
             if entry.name == "verify_and_record" and self._readonly_tool_allowed(entry.name):
                 # The read-only actor is allowed to mint exactly one kind of

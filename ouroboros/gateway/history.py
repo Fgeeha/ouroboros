@@ -326,7 +326,7 @@ def _copy_task_summary_metadata(rec: Dict[str, Any], entry: Dict[str, Any]) -> N
             rec[key] = dict(entry[key])
     if entry.get("suggested_name"):
         rec["suggested_name"] = str(entry["suggested_name"])
-    for key in ("tool_calls", "rounds", "tool_errors", "routing_tool_calls"):
+    for key in ("tool_calls", "rounds", "tool_errors", "routing_tool_calls", "completion_tool_calls"):
         if key in entry:
             rec[key] = None if entry[key] is None else int(entry[key])
     if "tool_call_counts" in entry:

@@ -563,7 +563,7 @@ _TRUNCATION_DECISIONS: dict[str, tuple[bool, str]] = {
     "finalization_grace": (True, "loop.py:3146 supervisor finalize_now grace"),
     "deadline_local": (True, "loop.py:3220 loop-local deadline"),
     "provider_unavailable": (True, "loop.py:3185 reroute + fallback exhausted"),
-    "children_unabsorbed": (True, "loop.py:4071 forced terminal, child results unabsorbed"),
+    "children_unabsorbed": (True, "historical forced terminal; retained for old benchmark records, no longer emitted"),
     "llm_api_error": (True, "loop_llm_call.py:630 transport death; never a fair shot"),
     # S3 owner graceful stop ("Wrap up"): the owner ended the attempt, so
     # reward 0 is an owner decision, never a fair-shot capability fact (CF-02:
@@ -772,6 +772,10 @@ def _runtime_reason_code_literals() -> dict[str, str]:
     return found
 
 
+# Historical outcomes remain classified even after their producing rail is retired.
+_RETIRED_TRUNCATION_CODES = {"children_unabsorbed"}
+
+
 def test_truncation_vocabulary_is_derived_from_the_runtime_not_restated():
     """The set must be COMPUTED from `ouroboros.outcomes`, and every member must be real.
 
@@ -789,7 +793,8 @@ def test_truncation_vocabulary_is_derived_from_the_runtime_not_restated():
     assert {"round_limit", "deadline_local"} <= RUNTIME_TRUNCATION_REASON_CODES
 
     emitted = _runtime_reason_code_literals()
-    for code in sorted(RUNTIME_TRUNCATION_REASON_CODES):
+    assert _RETIRED_TRUNCATION_CODES.isdisjoint(emitted)
+    for code in sorted(RUNTIME_TRUNCATION_REASON_CODES - _RETIRED_TRUNCATION_CODES):
         assert code in emitted, f"{code} is published but no line in ouroboros/ emits it"
 
 
@@ -802,7 +807,7 @@ def test_every_runtime_reason_code_has_a_recorded_truncation_decision():
     assert not undecided, "new runtime reason code(s) with no recorded decision in _TRUNCATION_DECISIONS: " + ", ".join(
         f"{code} ({emitted[code]})" for code in undecided
     )
-    stale = sorted(set(_TRUNCATION_DECISIONS) - set(emitted))
+    stale = sorted(set(_TRUNCATION_DECISIONS) - set(emitted) - _RETIRED_TRUNCATION_CODES)
     assert not stale, f"decision recorded for code(s) the runtime no longer emits: {stale}"
 
     decided_truncating = {c for c, (yes, _why) in _TRUNCATION_DECISIONS.items() if yes}

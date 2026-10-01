@@ -623,3 +623,53 @@ def _switch_model(ctx: ToolContext, model: str = "", effort: str = "", primary: 
                 "or primary='return'/'wait' to go back to this turn's primary route.")
 
     return f"OK: switching to {', '.join(changes)} on next round."
+
+
+def _finish_task(ctx: ToolContext, action: str, answer: str | None = None,
+                 answer_sha256: str | None = None, rationale: str = "",
+                 acceptance_subject: dict | None = None, pending_review: str | None = None) -> str:
+    """Stage a local author act; the loop owns answer selection and finalization."""
+    return stage_completion_request(ctx, {
+        "action": action, "answer": answer, "answer_sha256": answer_sha256,
+        "rationale": rationale, "acceptance_subject": acceptance_subject,
+        "pending_review": pending_review,
+    })
+
+
+def stage_completion_request(ctx: ToolContext, request: dict, *, source: str = "finish_task",
+                             allow_empty: bool = False, reply_later: bool = False) -> str:
+    import copy
+    import json
+    from ouroboros.task_results import resolve_task_lineage
+
+    action, answer, selector = request.get("action"), request.get("answer"), request.get("answer_sha256")
+    error = ""
+    if action not in {"finish", "stop"}:
+        error = "action must be finish or stop"
+    elif action == "stop" and not str(request.get("rationale") or "").strip():
+        error = "stop requires a rationale naming unfinished work"
+    elif not reply_later and ((answer is None) == (selector is None)):
+        error = "select exactly one of answer and answer_sha256"
+    elif not reply_later and answer is not None and (not isinstance(answer, str) or (not allow_empty and not answer.strip())):
+        error = "answer must be complete nonempty text"
+    elif selector is not None and (not isinstance(selector, str) or not selector):
+        error = "answer_sha256 must name an offered answer"
+    elif request.get("pending_review") not in {None, "wait", "finish"}:
+        error = "pending_review must be wait or finish"
+    elif request.get("pending_review") is not None and not resolve_task_lineage(
+        getattr(ctx, "task_id", ""), metadata=getattr(ctx, "task_metadata", {}),
+        parent_task_id=getattr(ctx, "parent_task_id", None),
+    )["is_root_task"]:
+        error = "pending_review is available only on root tasks"
+    if error:
+        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text="ERROR: COMPLETION_ARGUMENT: " + error))
+    staged = {key: copy.deepcopy(value) for key, value in request.items() if value is not None}
+    staged.update(source=source, reply_later=reply_later, allow_empty=allow_empty,
+                  observation=copy.deepcopy(getattr(ctx, "_completion_observation", {})))
+    previous = getattr(ctx, "_completion_request", None)
+    if previous is not None and previous.get("observation") == staged["observation"] and previous != staged:
+        ctx._completion_conflict = True
+        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR",
+            text="ERROR: COMPLETION_CONFLICT: contradictory completion requests in one response; select again after seeing all results."))
+    ctx._completion_request = staged
+    return json.dumps({"status": "completion_requested", "completion_control": True, "action": action}, ensure_ascii=False)
