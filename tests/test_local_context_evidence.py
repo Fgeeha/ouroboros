@@ -286,10 +286,23 @@ def test_actual_local_connection_error_is_not_a_synthetic_overflow(manager, monk
 
 _STAND_IN_SERVER = '''
 """Loopback stand-in for ouroboros.local_model_server; it loads no model."""
-import json, os, sys
+import json, os, socket, socketserver, sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from ouroboros.local_model_server import input_fingerprint
+
+
+def no_reverse_dns(*args):
+    raise AssertionError("loopback fixture must not resolve hostnames")
+
+
+socket.getfqdn = no_reverse_dns
+
+
+class LoopbackHTTPServer(ThreadingHTTPServer):
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
 PORT, N_CTX = (int(sys.argv[sys.argv.index(flag) + 1]) for flag in ("--port", "--n_ctx"))
 
@@ -326,7 +339,7 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
-ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+LoopbackHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
 '''
 
 
@@ -460,7 +473,25 @@ def test_actual_pooled_worker_reads_the_serving_instance_its_server_process_owns
         deadline = time.monotonic() + 30
         while not offline_manager.is_running and time.monotonic() < deadline:
             time.sleep(0.05)
-        assert offline_manager.is_running, offline_manager.status_dict()
+        if not offline_manager.is_running:
+            import threading
+            import traceback
+
+            proc = offline_manager._proc
+            frames = sys._current_frames()
+            stacks = {
+                thread.name: "".join(traceback.format_stack(frames[thread.ident], limit=20))
+                for thread in threading.enumerate()
+                if thread.name in {"local-model-health", "local-model-stderr"}
+                and thread.ident in frames
+            }
+            pytest.fail(json.dumps({
+                "status": offline_manager.status_dict(),
+                "child_pid": proc.pid if proc is not None else None,
+                "child_poll": proc.poll() if proc is not None else None,
+                "stderr_tail": offline_manager._stderr_buf[-2000:].decode("utf-8", errors="replace"),
+                "thread_stacks": stacks,
+            }, ensure_ascii=False, default=str))
         return offline_manager.serving_context_evidence()
 
     # The server process exports settings into the environment its pooled workers inherit.

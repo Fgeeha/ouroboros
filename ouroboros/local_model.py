@@ -688,12 +688,11 @@ class LocalModelManager:
         """Query local server health and loaded-model info."""
         import requests
 
-        from ouroboros.utils import in_worker_process
-
         url = f"http://127.0.0.1:{self._port}/v1/models"
         with requests.Session() as session:
-            if in_worker_process():
-                session.trust_env = False  # fork-safe + localhost never needs a proxy
+            # Owned loopback never needs a proxy; host proxy discovery precedes
+            # Requests' socket timeout and can stall even outside a worker.
+            session.trust_env = False
             resp = session.get(url, timeout=5)
         resp.raise_for_status()
         data = resp.json()
