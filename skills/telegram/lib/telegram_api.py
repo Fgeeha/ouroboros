@@ -8,6 +8,8 @@ from typing import Any, BinaryIO, Dict, Optional
 
 import httpx
 
+from ..scripts.telegram_settings import validate_telegram_proxy as _telegram_proxy
+
 # Telegram hard-caps a single sendMessage at 4096 UTF-16 code units.
 _TELEGRAM_TEXT_LIMIT = 4096
 _TABLE_MAX_ROWS = 30
@@ -558,34 +560,6 @@ def markdown_to_telegram_chunks(text: str, limit: int = _TELEGRAM_TEXT_LIMIT) ->
 
 def _telegram_html_to_plain(value: str) -> str:
     return html_lib.unescape(re.sub(r"<[^>]+>", "", value))
-
-
-def _telegram_proxy(value: Any) -> Optional[str]:
-    """The owner's Telegram-only egress proxy, or None for a direct connection.
-
-    httpx parses the value, so exactly what it would dial is accepted; SOCKS has no
-    default port. The refusal never echoes the value: it may carry proxy credentials.
-    """
-    text = str(value or "").strip()
-    if not text:
-        return None
-    try:
-        url = httpx.Proxy(text).url
-        valid = (
-            url.scheme in ("http", "https", "socks5", "socks5h")
-            and bool(url.host)
-            and (url.port is not None or url.scheme in ("http", "https"))
-            and (url.port is None or 0 < url.port <= 65535)
-            and url.raw_path == b"/" and not url.query and not url.fragment
-        )
-    except Exception:
-        valid = False
-    if not valid:
-        raise ValueError(
-            "TELEGRAM_PROXY must be scheme://[user:password@]host[:port] "
-            "with scheme http, https, socks5 or socks5h (SOCKS requires a port)."
-        )
-    return text
 
 
 class TelegramClient:

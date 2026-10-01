@@ -422,6 +422,7 @@ def test_resync_delivers_payload_from_real_previous_seed(
         "lib/miniapp_registration.py", "scripts/platform_support.py",
         "scripts/cloudflare_tunnel.py", "scripts/runtime_status.py",
         "lib/telegram_api.py", "lib/telegram_notifier.py",
+        "scripts/telegram_settings.py", "scripts/telegram_menu.py", "scripts/companion.py",
     ) if name == "telegram" else ()
     for path in changed_payload:
         assert (installed / path).read_bytes() != (repo / "skills" / name / path).read_bytes()

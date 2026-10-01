@@ -8,7 +8,7 @@ plugin_api: "2.0"
 runtime: python3
 os: any
 permissions: [net, read_settings, widget, route, supervised_task, subscribe_event, inject_chat, subprocess, companion_process]
-env_from_settings: [TELEGRAM_BOT_TOKEN, TELEGRAM_PROXY]
+env_from_settings: [TELEGRAM_BOT_TOKEN]
 subscribe_events: [chat.outbound, chat.typing, chat.photo, chat.video, chat.document, chat.links, chat.quiz, chat.quiz_state]
 conflicts: [telegram-bridge, telegram-miniapp-poc]
 when_to_use: The owner wants to communicate with and control Ouroboros through Telegram.
@@ -63,11 +63,10 @@ counts as your message. The card only moves forward — nothing reopens an answe
 An open question (no options) is the same whole card without buttons; it asks for
 a reply in your own words.
 
-Version 1.2.4 routes every Telegram API call (poller, outbound, budget
-notifier) through the skill-local `TELEGRAM_PROXY` setting (e.g.
-`socks5://host:port`), so the bridge keeps working on a host whose only
-ingress/egress is a proxy. No host-wide proxy environment is set; the
-Mini App menu client is a separate, secondary path and is unchanged.
+Version 1.2.9 routes every Telegram API call through the optional skill-local
+`TELEGRAM_PROXY` setting, including polling, sends, downloads, notifications,
+and the companion's menu button lifecycle. The Settings form masks the proxy
+and never reads its stored credentials back into the browser.
 
 The Mini App exposes the unchanged Ouroboros SPA through the established
 owner-authenticated sidecar and a pinned Cloudflare Quick Tunnel. It is enabled
@@ -88,20 +87,20 @@ state is copied or changed. Installations that use `telegram-bridge` or
 `telegram-miniapp-poc` must disable or remove those skills before enabling this
 one.
 
-A host that reaches Telegram only through a proxy adds the secret
-`TELEGRAM_PROXY` in Settings → Secrets as `scheme://[user:password@]host[:port]`
-(`socks5`, `socks5h`, `http` or `https`; SOCKS needs an explicit port) and grants it on
-this skill's card. Polling, every reply, media and quiz send, file downloads
-and the notifier then use that proxy instead of any system proxy; nothing else
-in Ouroboros does. The Bot API stays `https://api.telegram.org` with TLS end to
-end, so the proxy sees the host but not the token, messages or files, and no
-redirect is followed. Credentials reach the proxy as its scheme sends them: in
-clear for `http` and SOCKS, inside TLS for `https`. A malformed value stops the
-bridge with an error naming the key, never its value. Without the secret no
-new grant is requested and the previous direct/ambient-proxy behavior remains;
-adding or removing it asks
-for the grants again. The Mini App companion — its tunnel and menu button —
-keeps direct egress and does not use the proxy.
+If Telegram requires a proxy, open this skill's Telegram settings and enter
+`TELEGRAM_PROXY` as `scheme://[user:password@]host[:port]` (`socks5`, `socks5h`,
+`http` or `https`; SOCKS needs an explicit port). Leave the masked field empty
+to keep a saved value, or use **Clear saved Telegram proxy** to remove it.
+Disable and re-enable the skill after changing the proxy so its poller and
+companion also pick up the change. No additional Secrets grant is needed.
+
+The Bot API stays `https://api.telegram.org` with TLS through the proxy and no
+redirects. Proxy credentials follow the selected protocol: HTTP and SOCKS do
+not encrypt the connection to the proxy; HTTPS does. Invalid proxy settings
+produce an error naming the key without its value. With no skill proxy, the
+bridge retains its existing direct/ambient-proxy behavior and the companion's
+Telegram calls stay direct. This setting does not change the application proxy,
+Cloudflare tunnel, Mini App web traffic, or local host requests.
 
 The Mini App supports macOS arm64/x86_64, Linux arm64/x86_64, and Windows
 x86_64. Only the explicit unsupported OS/architecture case degrades

@@ -244,17 +244,17 @@ def _bridge_events():
     ]
 
 
-@pytest.mark.parametrize("granted_proxy", [None, _PROXY])
-def test_every_bridge_client_carries_exactly_the_granted_proxy(tmp_path, monkeypatch, granted_proxy):
+@pytest.mark.parametrize("local_proxy", [None, _PROXY])
+def test_every_bridge_client_carries_exactly_the_local_proxy(tmp_path, monkeypatch, local_proxy):
     """Poller, each chat event handler, the quiz lifecycle and the notifier: one client
-    factory per path, each built with the granted proxy — or none when not granted."""
+    factory per path, each built with the local proxy, independently of global Secrets."""
     plugin, _telegram_api, notifier = _load()
     _RecordingClient.built = []
     monkeypatch.setattr(plugin, "TelegramClient", _RecordingClient)
     monkeypatch.setattr(notifier, "TelegramClient", _RecordingClient)
     monkeypatch.setattr(plugin, "_HONOR_ENV_PROXIES", False)
-    (tmp_path / "settings.json").write_text(json.dumps({"TELEGRAM_CHAT_ID": "42"}), encoding="utf-8")
-    granted = {"TELEGRAM_BOT_TOKEN": _TOKEN, **({"TELEGRAM_PROXY": granted_proxy} if granted_proxy else {})}
+    (tmp_path / "settings.json").write_text(json.dumps({"TELEGRAM_CHAT_ID": "42", "TELEGRAM_PROXY": local_proxy}), encoding="utf-8")
+    granted = {"TELEGRAM_BOT_TOKEN": _TOKEN, "TELEGRAM_PROXY": "http://ignored.invalid"}
     api = _Api(tmp_path, granted)
 
     asyncio.run(plugin._start_poller(api))
@@ -263,13 +263,13 @@ def test_every_bridge_client_carries_exactly_the_granted_proxy(tmp_path, monkeyp
     assert asyncio.run(notifier._push_notification(api, 42, "done", trust_env=False)) == ("sent", None)
 
     assert [(level, message) for level, message in api.logs if level != "info"] == []
-    assert _RecordingClient.built == [(_TOKEN, {"trust_env": False, "proxy": granted_proxy})] * 10
+    assert _RecordingClient.built == [(_TOKEN, {"trust_env": False, "proxy": local_proxy})] * 10
 
 
 def test_a_malformed_proxy_stops_the_bridge_without_leaking_it(tmp_path):
     plugin, _telegram_api, _nt = _load()
-    (tmp_path / "settings.json").write_text(json.dumps({"TELEGRAM_CHAT_ID": "42"}), encoding="utf-8")
-    api = _Api(tmp_path, {"TELEGRAM_BOT_TOKEN": _TOKEN, "TELEGRAM_PROXY": "socks5://owner:proxy-secret@proxy"})
+    (tmp_path / "settings.json").write_text(json.dumps({"TELEGRAM_CHAT_ID": "42", "TELEGRAM_PROXY": "socks5://owner:proxy-secret@proxy"}), encoding="utf-8")
+    api = _Api(tmp_path, {"TELEGRAM_BOT_TOKEN": _TOKEN})
 
     with pytest.raises(ValueError, match="TELEGRAM_PROXY"):
         asyncio.run(plugin._start_poller(api))
@@ -282,39 +282,29 @@ def test_a_malformed_proxy_stops_the_bridge_without_leaking_it(tmp_path):
     assert not any("proxy-secret" in message or "SECRET-BOT-TOKEN" in message for message in errors)
 
 
-def test_the_proxy_secret_needs_its_own_grant_and_only_once_it_exists(tmp_path, monkeypatch):
-    """Core grant gate: without the secret nothing new is requested; once the owner adds
-    it, the skill receives it only after a grant naming it."""
+def test_global_proxy_secret_is_not_requested_or_exposed(tmp_path, monkeypatch):
     import ouroboros.config as config
     from ouroboros import extension_loader
     from ouroboros.contracts.skill_manifest import parse_skill_manifest_text
     from ouroboros.skill_loader import requested_core_setting_keys
 
     manifest = parse_skill_manifest_text((_ROOT / "SKILL.md").read_text(encoding="utf-8"))
-    settings = {"TELEGRAM_BOT_TOKEN": _TOKEN}
+    settings = {"TELEGRAM_BOT_TOKEN": _TOKEN, "TELEGRAM_PROXY": _PROXY}
     monkeypatch.setattr(config, "load_settings", lambda: dict(settings))
     assert requested_core_setting_keys(manifest.env_from_settings) == ["TELEGRAM_BOT_TOKEN"]
-    settings["TELEGRAM_PROXY"] = _PROXY
-    assert requested_core_setting_keys(manifest.env_from_settings) == ["TELEGRAM_BOT_TOKEN", "TELEGRAM_PROXY"]
-
-    def granted_view(keys):
-        api = extension_loader.PluginAPIImpl(extension_loader._PluginAPIConfig(
-            skill_name="telegram", permissions=list(manifest.permissions),
-            env_allowlist=list(manifest.env_from_settings), state_dir=tmp_path,
-            settings_reader=lambda: dict(settings), granted_keys=keys,
-        ))
-        return api.get_settings(["TELEGRAM_BOT_TOKEN", "TELEGRAM_PROXY"])
-
-    assert granted_view(["TELEGRAM_BOT_TOKEN"]) == {"TELEGRAM_BOT_TOKEN": _TOKEN}
-    assert granted_view(["TELEGRAM_BOT_TOKEN", "TELEGRAM_PROXY"]) == settings
+    api = extension_loader.PluginAPIImpl(extension_loader._PluginAPIConfig(
+        skill_name="telegram", permissions=list(manifest.permissions),
+        env_allowlist=list(manifest.env_from_settings), state_dir=tmp_path,
+        settings_reader=lambda: dict(settings), granted_keys=["TELEGRAM_BOT_TOKEN"],
+    ))
+    assert api.get_settings(["TELEGRAM_BOT_TOKEN", "TELEGRAM_PROXY"]) == {"TELEGRAM_BOT_TOKEN": _TOKEN}
 
 
 @pytest.mark.parametrize("owner_set_proxy", [False, True])
-def test_upgrade_keeps_the_token_grant_unless_the_proxy_secret_changes_the_request(
+def test_upgrade_keeps_token_grant_and_local_proxy(
     tmp_path, monkeypatch, owner_set_proxy,
 ):
-    """1.2.8 -> this seed: an install without the secret keeps its grants across the
-    re-seed; one that already holds TELEGRAM_PROXY is asked to grant again."""
+    """The proxy is skill-local state: reseeding changes payload, not credentials or grants."""
     import ouroboros.config as config
     from ouroboros.launcher_bootstrap import _per_skill_version_resync
     from ouroboros.skill_loader import (
@@ -336,6 +326,11 @@ def test_upgrade_keeps_the_token_grant_unless_the_proxy_secret_changes_the_reque
     settings = {"TELEGRAM_BOT_TOKEN": _TOKEN, **({"TELEGRAM_PROXY": _PROXY} if owner_set_proxy else {})}
     monkeypatch.setattr(config, "load_settings", lambda: dict(settings))
     monkeypatch.setattr(config, "SETTINGS_PATH", drive / "settings.json")
+    local_state = drive / "state" / "skills" / "telegram"
+    local_state.mkdir(parents=True)
+    local_settings = local_state / "settings.json"
+    local_settings.write_text(json.dumps({"TELEGRAM_PROXY": _PROXY if owner_set_proxy else ""}))
+    settings_before = local_settings.read_bytes()
     old = load_skill(installed, drive)
     assert old is not None and not old.load_error
     permissions = requested_skill_permissions(list(old.manifest.permissions), list(old.manifest.subscribe_events))
@@ -348,5 +343,6 @@ def test_upgrade_keeps_the_token_grant_unless_the_proxy_secret_changes_the_reque
     new = load_skill(installed, drive)
     grants = load_skill_grants(drive, "telegram")
     assert new.manifest.version == "1.2.9" and new.content_hash != old.content_hash
-    assert grants["content_hash"] == (old.content_hash if owner_set_proxy else new.content_hash)
+    assert grants["content_hash"] == new.content_hash
+    assert local_settings.read_bytes() == settings_before
     assert grants["granted_keys"] == ["TELEGRAM_BOT_TOKEN"]
