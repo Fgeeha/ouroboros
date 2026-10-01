@@ -75,7 +75,7 @@ def test_ambiguous_command_error_retains_custody(tmp_path, monkeypatch, failure)
     assert any(b['kind'] == 'tool_handoff' for b in conflicting_writers(q, 'root'))
 
 
-@pytest.mark.parametrize('origin', ['review', 'evolution', 'assisted', 'restore'])
+@pytest.mark.parametrize('origin', ['review', 'evolution', 'assisted', 'restore', 'plain'])
 def test_admitted_queued_root_pause_seeds_exact_lifecycle(pool, monkeypatch, origin):  # noqa: F811 - pytest fixture
     from supervisor import queue
     from supervisor.owner_pause_control import request_owner_pause
@@ -90,7 +90,10 @@ def test_admitted_queued_root_pause_seeds_exact_lifecycle(pool, monkeypatch, ori
     assert row['metadata']['billing_group'] == admitted['metadata']['billing_group']
     assert row['owner_pause']['state'] == 'paused'
     assert row['chat_id'] == admitted['chat_id']
-    assert row['description'] == admitted['text']
+    if origin == 'plain':  # only a receipt-less row is seeded from its admitted queue facts
+        assert row['description'] == admitted.get('text', '')
+    else:  # a host producer's own scheduled receipt is kept, never rewritten
+        assert row['host_admission']['status'] == 'accepted'
 
 
 @pytest.mark.parametrize('reason,hard', [('cancelled', True), ('cancelled', False), ('deadline', False)])
@@ -208,7 +211,7 @@ def test_pause_seed_preserves_concurrent_terminal_and_refuses_unadmitted(pool, m
     from supervisor import queue
     from supervisor.owner_pause_control import request_owner_pause
     from ouroboros import task_results as results
-    task_id = _enqueue_origin(pool, monkeypatch, 'review')
+    task_id = _enqueue_origin(pool, monkeypatch, 'plain')  # seeding needs a receipt-less row
     actual = results.write_task_result
     saved = []
     def terminal_race(*args, **kwargs):

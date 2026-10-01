@@ -38,7 +38,8 @@ test('same-ID recovery clears the hold; independent work and budget remain truth
     assert.equal(summarizeProjectActivities([held, sibling]).motion, true);
     assert.match(summarizeProjectActivities([held, sibling]).label, /Waiting for Project/);
     const paused = computeHydratedDirectActivities(new Map(), [{ ...held, phase: 'budget_paused' }], 7);
-    assert.equal(computeDerivedChatStatus(chatStatusCounts(paused, [])).text, 'Paused (budget)');
+    // Batch4: one census phase covers budget pause, owner Pause and Restart hold, so no cause is claimed.
+    assert.equal(computeDerivedChatStatus(chatStatusCounts(paused, [])).text, 'Paused');
 });
 
 test('Main handoff keeps a budget pause beside the Project wait, as the sidebar does', () => {

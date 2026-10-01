@@ -46,7 +46,8 @@ def _row(q, schedule_id="s1", *, intent=None, cron=False, project_id="", chat_id
                                   continuation_of=extra.get("continuation_of"),
                                   host_followup={"followup_relation": {"kind": "independent"},
                                       "followup_origin": {"task_id": meta.get("origin_task_id", ""),
-                                                          "root_task_id": meta.get("origin_task_id", "")}})
+                                                          "root_task_id": meta.get("origin_root_task_id")
+                                                          or meta.get("origin_task_id", "")}})
 
 
 def _rows(q):
