@@ -21,6 +21,7 @@ import os
 import pathlib
 import re
 import shutil
+import stat
 import subprocess
 import tarfile
 import threading
@@ -32,10 +33,8 @@ from typing import Any, Mapping, Optional
 from urllib.parse import urlparse
 
 from ouroboros.utils import replace_atomic
-from ouroboros.verified_download import (
-    fetch_exact_file as _fetch_exact_file,
-    verify_exact_file as _verify_exact_file,
-)
+from ouroboros.verified_download import fetch_exact_file as _fetch_exact_file
+from ouroboros.verified_download import verify_exact_file as _verify_exact_file
 
 log = logging.getLogger(__name__)
 
@@ -379,7 +378,19 @@ def _safe_archive_relative_path(value: str) -> bool:
     if not text or "\\" in text or "\x00" in text:
         return False
     path = pathlib.PurePosixPath(text)
-    return bool(path.parts) and not path.is_absolute() and ".." not in path.parts and ":" not in path.parts[0]
+    # A nested Windows drive-relative path (or alternate data stream) is unsafe
+    # too: npm_root.joinpath("D:entry.js") need not stay beneath npm_root.
+    return bool(path.parts) and not path.is_absolute() and ".." not in path.parts and all(
+        ":" not in part for part in path.parts
+    )
+
+
+def _safe_zip_member_type(info: zipfile.ZipInfo) -> bool:
+    """Accept directories and regular files, including ZIPs without Unix type bits."""
+    file_type = stat.S_IFMT(info.external_attr >> 16)
+    if info.is_dir():
+        return file_type in (0, stat.S_IFDIR)
+    return file_type in (0, stat.S_IFREG)
 
 
 def _explicit_binary() -> tuple[str, str]:
@@ -460,14 +471,14 @@ class ClaudexorRuntimeManager:
         external = _compatibility_binary()
         return [external] if external else []
 
-    def resolve_cli_command(self) -> list[str]:
-        """Read-only exact managed CLI selection; never consult PATH/overrides."""
+    def resolve_cli_command(self, *, require_npm: bool = True) -> list[str]:
+        """Resolve the installed CLI; pure operator commands need Node, not npm."""
         if self._pin_error or self._pin is None or self._pin.cli_entrypoint is None:
             return []
-        return self._managed_cli_command()
+        return self._managed_cli_command(require_npm=require_npm)
 
     def ensure_cli_command(self) -> list[str]:
-        """Provision the pin-bound closure and POSIX Node/npm CLI toolchain."""
+        """Provision the pin-bound closure and managed Node/npm CLI toolchain."""
         with self._lock:
             pin = self._pin
             if self._pin_error:
@@ -902,15 +913,19 @@ class ClaudexorRuntimeManager:
 
     @staticmethod
     def _archive_npm_cli(artifact: NodeRuntimeArtifact, platform_key: str) -> str:
-        if platform_key.startswith("win32-"):
-            return ""
         executable = pathlib.PurePosixPath(artifact.executable)
+        if platform_key.startswith("win32-"):
+            if executable.name != "node.exe":
+                return ""
+            return str(executable.parent / "node_modules/npm/bin/npm-cli.js")
         if executable.parts[-2:] != ("bin", "node"):
             return ""
         return str(executable.parent.parent / "lib/node_modules/npm/bin/npm-cli.js")
 
     @staticmethod
     def _managed_npm_cli(node: pathlib.Path) -> pathlib.Path:
+        if node.suffix.lower() == ".exe":
+            return node.parent / "node_modules/npm/bin/npm-cli.js"
         return node.parent.parent / "lib/node_modules/npm/bin/npm-cli.js"
 
     def _resolve_managed_node(
@@ -960,7 +975,7 @@ class ClaudexorRuntimeManager:
         from ouroboros.platform_layer import node_distribution_platform
 
         platform_key = node_distribution_platform()
-        if not platform_key or platform_key.startswith("win32-"):
+        if not platform_key:
             return ""
         return self._resolve_managed_node(pin, platform_key, require_npm=True)
 
@@ -973,7 +988,6 @@ class ClaudexorRuntimeManager:
         artifact = pin.node_artifacts.get(platform_key)
         if (
             not platform_key
-            or platform_key.startswith("win32-")
             or artifact is None
             or not self._archive_npm_cli(artifact, platform_key)
         ):
@@ -1083,12 +1097,12 @@ class ClaudexorRuntimeManager:
             )
             had_old = root.exists()
             if had_old:
-                os.replace(root, displaced)
+                replace_atomic(root, displaced)
             try:
-                os.replace(staging, root)
+                replace_atomic(staging, root)
             except Exception:
                 if had_old and displaced.exists() and not root.exists():
-                    os.replace(displaced, root)
+                    replace_atomic(displaced, root)
                 raise
             if displaced.exists():
                 shutil.rmtree(displaced, ignore_errors=True)
@@ -1109,21 +1123,59 @@ class ClaudexorRuntimeManager:
         archive: pathlib.Path, artifact: NodeRuntimeArtifact, destination: pathlib.Path,
         *, archive_npm_cli: str = "", npm_root: Optional[pathlib.Path] = None,
     ) -> None:
-        """Copy exact Node and, when requested, a regular-file POSIX npm tree."""
+        """Copy exact Node and, when requested, a regular-file npm tree."""
         try:
             if artifact.archive_name.endswith(".zip"):
-                if archive_npm_cli or npm_root is not None:
+                if bool(archive_npm_cli) != (npm_root is not None):
                     raise ClaudexorRuntimeError(
-                        "runtime_node_archive_invalid", "Windows npm extraction is unsupported"
+                        "runtime_node_archive_invalid", "reviewed npm path is invalid"
                     )
                 with zipfile.ZipFile(archive) as bundle:
                     info = bundle.getinfo(artifact.executable)
-                    if info.is_dir():
+                    if info.is_dir() or not _safe_zip_member_type(info):
                         raise ClaudexorRuntimeError(
                             "runtime_node_archive_invalid", "Node executable is not a regular file"
                         )
                     with bundle.open(info) as source, destination.open("xb") as sink:
                         shutil.copyfileobj(source, sink)
+                    if archive_npm_cli:
+                        if npm_root is None or not _safe_archive_relative_path(archive_npm_cli):
+                            raise ClaudexorRuntimeError(
+                                "runtime_node_archive_invalid", "reviewed npm path is invalid"
+                            )
+                        npm_prefix_path = pathlib.PurePosixPath(archive_npm_cli).parent.parent
+                        npm_prefix = str(npm_prefix_path)
+                        selected, seen = [], set()
+                        for npm_member in bundle.infolist():
+                            name = str(npm_member.filename or "")
+                            if name != npm_prefix and not name.startswith(npm_prefix + "/"):
+                                continue
+                            if name in seen or not _safe_archive_relative_path(name):
+                                raise ClaudexorRuntimeError(
+                                    "runtime_node_archive_invalid",
+                                    "Node archive has a duplicate or unsafe npm path",
+                                )
+                            seen.add(name)
+                            if not _safe_zip_member_type(npm_member):
+                                raise ClaudexorRuntimeError(
+                                    "runtime_node_archive_invalid",
+                                    f"Node npm entry {name!r} is a link or special file",
+                                )
+                            selected.append(npm_member)
+                        if archive_npm_cli not in seen:
+                            raise ClaudexorRuntimeError(
+                                "runtime_node_archive_invalid",
+                                "Node archive lacks the reviewed npm entrypoint",
+                            )
+                        for npm_member in selected:
+                            relative = pathlib.PurePosixPath(npm_member.filename).relative_to(npm_prefix_path)
+                            target = npm_root.joinpath(*relative.parts)
+                            if npm_member.is_dir():
+                                target.mkdir(parents=True, exist_ok=True)
+                                continue
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            with bundle.open(npm_member) as npm_source, target.open("xb") as sink:
+                                shutil.copyfileobj(npm_source, sink)
             else:
                 with tarfile.open(archive, "r:gz") as bundle:
                     member = bundle.getmember(artifact.executable)
@@ -1207,11 +1259,11 @@ class ClaudexorRuntimeManager:
             self._probe(command, pin)
         return command
 
-    def _managed_cli_command(self) -> list[str]:
+    def _managed_cli_command(self, *, require_npm: bool = True) -> list[str]:
         pin = self._pin
         if pin is None or pin.cli_entrypoint is None or not self._managed_metadata():
             return []
-        node = self._resolve_node_toolchain(pin)
+        node = self._resolve_node_toolchain(pin) if require_npm else self._resolve_node(pin)
         cli = managed_runtime_dir(pin) / pathlib.PurePosixPath(pin.cli_entrypoint)
         try:
             return [node, str(cli)] if node and cli.is_file() else []

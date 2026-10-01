@@ -27,6 +27,7 @@ if TYPE_CHECKING:  # pragma: no cover - annotation-only names, lazy under future
     from ouroboros.delegate_custody import RunCustody as _RunCustody
     from ouroboros.subagents import DelegatedRunShape
     from ouroboros.tools.registry import ToolContext
+    from ouroboros.tools.tool_result import ToolResult
 
 
 def _delegate():
@@ -40,6 +41,52 @@ def _delegate():
     from ouroboros.tools import delegate
 
     return delegate
+
+
+def retry_terminal_result(ctx: ToolContext, run_id: str, *, gateway: Any = None) -> ToolResult:
+    """Retrieve proven retry work without entering the nanny's live-control loop."""
+    from ouroboros import delegate_custody as custody
+    from ouroboros.claudexor_daemon import read_owned_gateway
+    from ouroboros.deadline_utils import window_within_deadline
+    from ouroboros.delegate_shared import _fail, _owned_run, delegate_result, retry_result_status
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable, _READ_TIMEOUT_SEC
+    from ouroboros.subagents import DelegatedRunShape
+
+    drive = custody.custody_root(ctx)
+    status, entry, predecessor = retry_result_status(ctx, drive, run_id)
+    if status != custody.OWNED or entry is None or not predecessor:
+        refusal, _ = _owned_run(ctx, "delegate_wait", run_id)
+        return refusal or _fail("delegate_wait", "run_not_owned", "No retry result authority.")
+    borrowed = gateway is not None
+    try:
+        gateway = gateway if borrowed else read_owned_gateway()
+        bound = float(window_within_deadline(ctx, int(_READ_TIMEOUT_SEC)))
+        if not getattr(gateway, "engine_version", ""):
+            gateway.handshake(timeout_sec=bound)
+        detail = gateway.get_run(run_id, timeout_sec=bound)
+        state = str(custody.summary_of(detail).get("state") or "")
+        if state not in custody.TERMINAL_STATES or state != entry.terminal_state:
+            return _fail("delegate_wait", "retry_result_not_terminal",
+                         "The engine did not confirm the recorded terminal result.", run_id=run_id)
+        # A retry admitted while this read was in flight makes this caller stale.
+        status, entry, current_owner = retry_result_status(ctx, drive, run_id)
+        if (status != custody.OWNED or entry is None or current_owner != predecessor
+                or entry.terminal_state != state):
+            return _fail("delegate_wait", "run_not_owned", "Retry result authority changed.", run_id=run_id)
+        authority = DelegatedRunShape(access=entry.access, mode=entry.mode,
+                                      isolation=entry.isolation, delegated=entry.delegated)
+        payload = _delivered_terminal_payload(ctx, run_id, detail, authority, entry, gateway)
+        capture = _delegate()._capture_terminal_patch(ctx, entry, gateway=gateway)
+        if capture is not None:
+            payload["workspace_capture"] = capture
+        return delegate_result({**payload, "owner_task_id": predecessor,
+                                "result_reader_task_id": str(getattr(ctx, "task_id", "") or ""),
+                                "terminal_result_only": True})
+    except ClaudexorUnavailable as exc:
+        return _fail("delegate_wait", exc.code, str(exc), run_id=run_id)
+    finally:
+        if gateway is not None and not borrowed:
+            gateway.close()
 
 
 def _containment_breach(detail: Dict[str, Any], authority: "DelegatedRunShape") -> Optional[_Breach]:
@@ -192,14 +239,23 @@ def _terminal_payload(run_id: str, detail: Dict[str, Any],
         "primary_output": detail.get("primaryOutput"),
         "failure": summary.get("failure"),
         "last_seq": int(detail.get("lastSeq") or 0),
-        "cost": _reported_cost(summary),
+        "cost": _reported_cost(summary, attempt_execution=detail.get("attemptExecution")),
         # The ACCESS half of the same honesty, on EVERY terminal payload — see
         # `_access_evidence`. Both lanes: `readonly` staying `readonly` is the profile
         # that matters most, while `containment` is asked only of marker-carrying runs.
         "access_evidence": _access_evidence(detail, authority.access),
     }
+    if isinstance(detail.get("attemptExecution"), list):
+        payload["attempt_execution"] = detail["attemptExecution"]
     if authority.delegated:
         payload["containment"] = _containment_evidence(detail)
+    # A retry may read already-completed work even when its recorded profile
+    # was breached. Preserve that evidence without entering live cancellation.
+    breach = _containment_breach(detail, authority)
+    if breach is not None:
+        payload["containment_breach"] = {
+            "code": breach.code, "detail": breach.detail, **breach.facts,
+        }
     facts = payload.get("outcome_facts")
     if isinstance(facts, dict) and str(facts.get("reason") or "") == "input_required":
         # The codex-shaped question (B4): that lane has no mid-run channel, so a
@@ -215,6 +271,10 @@ def _terminal_payload(run_id: str, detail: Dict[str, Any],
             "assignment plus the answers; custody of the new run stays with you. "
             "Do not look for a rerun/decision verb — none exists on this surface."
         )
+        # The typed twin of the note (serial addressed turns): this lane's next
+        # turn is a NEW physical run, never a resumed session — the honest
+        # opposite of the waiting_on_user payload's ``same_session``.
+        payload["continuation"] = "new_physical_run"
     return payload
 
 
@@ -223,8 +283,8 @@ def _access_evidence(detail: Dict[str, Any], expected: str) -> Dict[str, Any]:
 
     ``effectiveAccess`` is the only witness: ``summary["access"]`` is computed as
     ``effectiveAccess ?? the client's own request``, so reading it compares the request
-    against itself and always passes. A WIDER profile is already a breach before this
-    runs; an ABSENT one cannot be enforced on a run that is over — cancelling a
+    against itself and always passes. A WIDER profile stays unverified when a retry
+    reads completed work; an ABSENT one cannot be enforced on a run that is over — cancelling a
     succeeded run to punish missing evidence would destroy the result the lane exists
     to fetch (the v6.87.37 lesson) — so it is named here instead.
     """
@@ -233,6 +293,9 @@ def _access_evidence(detail: Dict[str, Any], expected: str) -> Dict[str, Any]:
     state = str(summary.get("state") or "")
     report = {"requested": expected, "effective": effective,
               "verified": bool(effective), "state": state}
+    if _delegate()._widened_access(detail, expected):
+        return {**report, "verified": False,
+                "note": "The engine applied a wider access profile than this run was granted."}
     if effective:
         return report
     if state in _delegate().custody.SUCCEEDED_STATES:
@@ -286,7 +349,7 @@ def _record_containment(ctx: ToolContext, entry: Optional[_RunCustody],
         entry.containment_disclosed = True
 
 
-def _reported_cost(summary: Dict[str, Any]) -> Dict[str, Any]:
+def _reported_cost(summary: Dict[str, Any], *, attempt_execution: Any = None) -> Dict[str, Any]:
     """What this run cost, as the AGENT will read it.
 
     This is the payload the nanny relays to its parent, so it must tell the same story
@@ -294,7 +357,7 @@ def _reported_cost(summary: Dict[str, Any]) -> Dict[str, Any]:
     fix was written to eliminate — so a run that really charged money settled honestly in
     the ledger and then told the reasoning path the work was free.
     """
-    spend, estimated = _delegate().custody.disclosed_spend(summary)
+    spend, estimated = _delegate().custody.disclosed_spend(summary, attempt_execution=attempt_execution)
     if spend is None:
         return {
             "cost_usd": None,
@@ -315,12 +378,12 @@ def _reported_cost(summary: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "cost_usd": spend,
             "cost_final": True,
-            "note": "this run was BILLED — it did not ride the subscription",
+            "note": "The engine reported an incremental cash charge (BILLED); see the attempt evidence for its billing basis.",
         }
     return {
         "cost_usd": 0.0,
         "cost_final": True,
-        "note": "subscription session — already paid; the nanny's own model calls are metered separately",
+        "note": "The engine reported no incremental cash charge.",
     }
 
 
@@ -338,6 +401,8 @@ def _delivered_terminal_payload(ctx: ToolContext, run_id: str, detail: Dict[str,
     preview has been resolved to the verified full artifact, because a payload built on
     a truncated preview delivers 256 KiB wearing the whole result's name.
     """
+    from ouroboros.delegate_output import output_consumed_by_reader
+
     full = _terminal_payload(run_id, detail, authority)
     if entry is not None:
         _delegate().add_terminal_source_verification(full, entry)
@@ -391,5 +456,6 @@ def _delivered_terminal_payload(ctx: ToolContext, run_id: str, detail: Dict[str,
         entry.output_artifact = artifact["path"]
         entry.output_complete = bool(full_ok)
     return _delegate()._preview_payload(full, text, artifact, budget,
-                            consumed=bool(entry is not None and entry.output_consumed),
+                            consumed=bool(entry is not None and output_consumed_by_reader(
+                                entry, str(getattr(ctx, "task_id", "") or ""))),
                             full_ok=full_ok, full_note=full_note)

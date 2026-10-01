@@ -5,8 +5,8 @@ Review Checklist items every actor must answer, the checklist section name and
 the governance artifacts loaded beside it with an explicit omission marker,
 the assembled prompt with its stable cacheable prefix, the optional fail-open
 advisory pre-review whose evidence is folded into that prompt, and the
-per-attempt assembly that binds history and accepted rebuttals to one
-snapshot attempt.
+per-round assembly that binds history and accepted rebuttals to the current
+review round of the group.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import logging
 import pathlib
 from typing import Any, Dict, List
 
-from ouroboros.skill_review_history import count_attempts as _count_attempts_for_content
+from ouroboros.reference_books import BOOK_ENTRYPOINTS, compose_book, load_reference_book
 from ouroboros.skill_review_status import CRITICAL_ITEMS
 from ouroboros.tools.review_helpers import (
     build_rebuttal_section,
@@ -67,6 +67,12 @@ def _load_governance_artifact(
     """Load governance context with an explicit omission marker on failure."""
     from ouroboros.tools.review_helpers import load_governance_doc
 
+    for book_id, entrypoint in BOOK_ENTRYPOINTS.items():
+        if relpath == entrypoint:
+            try:
+                return compose_book(load_reference_book(repo_root, book_id))
+            except (OSError, ValueError) as exc:
+                return f"[⚠️ OMISSION: {relpath} book could not be loaded: {exc}]"
     return load_governance_doc(repo_root, relpath, on_missing="explicit")
 
 
@@ -126,11 +132,11 @@ review enforcement mode.
 
 ## Governance context — docs/ARCHITECTURE.md
 
-Use Section 10 (Key Invariants), Section 12 (Host Service / Companion /
-Chat IDs), and Section 13 (External Skills Layer)
-as the binding description of what the skill is allowed to touch. In
-particular invariant 11 is the authoritative rule: skills must not write
-to the self-modifying repo, and reviewed execution is the primary gate.
+Use the named sections "Key Invariants", "Host Service, Companion Processes,
+and Chat IDs", and "External Skills Layer" as the binding description of what
+the skill is allowed to touch. The "Skill gates do not collapse" criterion
+keeps executable review, owner grants, dependencies, enablement, and execution
+distinct; apply the Skill Review Checklist's `no_repo_mutation` item.
 
 {architecture_text}
 
@@ -152,6 +158,12 @@ skill manipulates release metadata) is grounds for FAIL even when the
 Skill Review Checklist items permit the behaviour in isolation. Treat
 BIBLE.md as the tie-breaker when a skill looks checklist-compliant but
 contradicts the runtime's constitutional commitments.
+
+After the first actual review, the author may finish the advisory dialogue for
+the exact current content hash.
+That author disposition is a separate durable stance beside these raw findings;
+it is never a reviewer PASS, never valid for stale content, and never bypasses
+deterministic preflight or a blocking enforcement gate.
 
 {bible_text}
 
@@ -352,12 +364,11 @@ def _build_review_prompt_for_attempt(
         ctx, skill_name=skill.name, file_pack=file_pack,
     )
     accepted_rebuttals = _load_accepted_rebuttals(drive_root, skill.name)
-    group_id = str(getattr(ctx, "_skill_review_group_id", "") or "")
+    # Coaching follows the series across payload edits, not identical-byte attempts.
+    # Keep _build_review_prompt unchanged: its source binds the free-replay contract.
     attempt_idx = int(
-        getattr(ctx, "_skill_review_snapshot_attempt", 0)
-        or (_count_attempts_for_content(
-            drive_root, skill.name, content_hash, group_id=group_id,
-        ) + 1)
+        getattr(ctx, "_skill_review_round", 0)
+        or (int(history[-1].get("review_round") or 0) + 1 if history else 1)
     )
     review_history_section = (
         _render_accepted_rebuttals_section(accepted_rebuttals)

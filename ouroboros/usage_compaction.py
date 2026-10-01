@@ -1,14 +1,15 @@
-"""Seq-preserving compaction of the monetary usage ledger (CPL4-C6, owner 1A).
+"""Seq-preserving compaction of the monetary usage ledger.
 
-Design contract: docs/v7next/DESIGN_USAGE_COMPACTION.md. Terminal, non-review
+Design contract: docs/USAGE_COMPACTION.md. Terminal, non-review
 ``kind="attempt"`` chains fold into a stamped baseline block (one
 ``usage_baseline`` header + per-attribution ``usage_baseline_group`` rows);
 the raw pre-compaction bytes move verbatim into an append-only
 ``archive/usage_ledger/`` segment referenced (and hash-pinned) by the header.
 Nothing is deleted, in-flight rows never fold, idempotency-bearing kinds
 (subscription/external/legacy) never fold, and the pass commits ONLY after
-proving, on the candidate bytes, that the production aggregation renders
-byte-equal results — otherwise it aborts and the ledger stays byte-identical.
+proving, on the candidate bytes, that the production aggregation renders an
+identical NON-MONEY view and that the money itself is decimal-identical —
+otherwise it aborts and the ledger stays byte-identical.
 
 Monetary exactness rule (fixed by the design note): group sums are computed as
 exact ``Decimal``s of the literals stored in the file and carried on group
@@ -25,7 +26,6 @@ from __future__ import annotations
 
 import base64
 import contextlib
-import decimal
 import hashlib
 import json
 import logging
@@ -35,10 +35,11 @@ import stat
 import threading
 import time
 import uuid
-from decimal import Decimal, DecimalException, InvalidOperation
-from typing import Any, Callable, Dict, Iterator, Optional, Tuple
+from decimal import Decimal, DecimalException
+from typing import Any, Callable, Dict, Optional, Tuple
 
-from ouroboros._usage_rows import _breakdown_bucket, _summary
+from ouroboros._usage_rows import _breakdown_bucket, _summary, _processing_summary, _merge_processing_summary, row_ts_epoch
+from ouroboros.runtime_limits import USAGE_LEDGER_FOLD_MIN_AGE_SEC
 from ouroboros.usage_ledger import (
     ARCHIVE_SEGMENT_DIR_REL,
     LEDGER_REL,
@@ -52,16 +53,23 @@ from ouroboros.usage_ledger import (
     _read_records_locked,
     _validate_records,
     _write_bytes_atomic_fsync,
+    is_abandoned_settlement,
     valid_archive_rel,
 )
 from ouroboros.utils import append_jsonl, utc_now_iso
 
 log = logging.getLogger(__name__)
 
-# States a folded attempt chain may terminate in. In-flight (reserved/
-# dispatched) finals keep their WHOLE chain in the live file.
-_FOLDABLE_FINAL_STATES = frozenset({"settled", "unresolved", "released"})
+# Unresolved and administratively abandoned attempts still accept a late
+# receipt, so their WHOLE chain stays live just like reserved/dispatched work.
+_FOLDABLE_FINAL_STATES = frozenset({"settled", "released"})
 _BASELINE_KINDS = frozenset({"usage_baseline", "usage_baseline_group"})
+# The fold's clock: an attempt whose final row is younger than
+# ``USAGE_LEDGER_FOLD_MIN_AGE_SEC`` stays unfolded so its ``ts`` remains the true
+# spend time the rolling consciousness allowance reads (a group row carries the
+# compaction instant instead). Module-level so a test can age a fixture by
+# moving the clock rather than weakening the money assertions.
+_fold_clock: Callable[[], float] = time.time
 _REVIEW_KEYS = ("review_skill", "review_wave_id", "review_slot_id")
 _TOKEN_SUM_FIELDS = (
     "prompt_tokens", "completion_tokens", "cached_tokens", "cache_write_tokens",
@@ -98,34 +106,8 @@ _CHAIN_UNION_CACHE_MAX = 4
 _CHAIN_UNION_CACHE: Dict[Tuple[Tuple[str, str], ...], frozenset] = {}
 
 
-# Money is summed in an EXPLICIT context, never the ambient one. The default
-# 28-digit precision silently rounds a large-magnitude sum, and both the group
-# row and the self-check that approves it are computed the same way — so a
-# rounded total verifies against itself and the lost cent commits. Sixty
-# digits is far past any real ledger; ``Inexact`` is trapped so that even past
-# it the pass ABORTS instead of writing an approximation.
-MONEY_PRECISION = 60
-
-
-@contextlib.contextmanager
-def _exact_money() -> Iterator[None]:
-    """Decimal arithmetic that cannot silently lose a digit of money."""
-    with decimal.localcontext() as context:
-        context.prec = MONEY_PRECISION
-        context.traps[decimal.Inexact] = True
-        yield
-
-
-def _decimal_of(value: Any) -> Decimal:
-    """Exact decimal of a ledger monetary value (Decimal, int, or string).
-
-    Construction is context-free by language rule, so the literal is captured
-    exactly; only the arithmetic over these values needs ``_exact_money``."""
-    if isinstance(value, bool):
-        raise InvalidOperation
-    if isinstance(value, Decimal):
-        return value
-    return Decimal(str(value))
+# Shared exact arithmetic; the literal-exact compaction self-check stays independent.
+from ouroboros._usage_money import exact_money as _exact_money, decimal_of as _decimal_of
 
 
 class _Abort(Exception):
@@ -149,6 +131,33 @@ NAME_TIER_REFUSAL = (
     "compaction refused; appends continue under the name protocol, the ledger stays uncompacted"
 )
 _NAME_TIER_REFUSED: set = set()  # data roots whose refusal event this process already wrote
+
+# A policy abort leaves the ledger byte-identical and the pass simply runs
+# again later, so the REASON is the only thing that outlives it — and it lived
+# in an INFO log line alone. The health tripwire above the ledger's warn size
+# then names a symptom (the file is large) and predicts this case without
+# being able to say which one it is: broken compaction, an unfoldable residue,
+# or the name tier. So every abort records the same typed row the name-tier
+# refusal does: ONE ``usage_ledger_compaction_skipped`` per process per (data
+# root, reason) — keyed by the reason so a new cause is never hidden behind an
+# old one, and never one row per pass.
+_SKIPPED_REASONS: set = set()  # (data root, reason) pairs this process already wrote
+
+
+def _record_skip(root: pathlib.Path, reason: str) -> None:
+    """Log a policy abort and durably record its typed reason, once per cause."""
+    log.info("usage-ledger compaction skipped: %s", reason)
+    told = (str(root.resolve(strict=False)), reason)  # one data root, however it is spelled
+    if told in _SKIPPED_REASONS:
+        return
+    try:  # only a row that LANDED is "already told": append_jsonl reports its
+        if append_jsonl(root / "logs" / "events.jsonl", {  # exhausted retries as
+            "type": "usage_ledger_compaction_skipped", "ts": utc_now_iso(),  # False
+            "reason": reason,
+        }):
+            _SKIPPED_REASONS.add(told)
+    except Exception:
+        log.exception("Failed to emit usage_ledger_compaction_skipped event")
 
 
 def _fsync_dir(path: pathlib.Path) -> None:
@@ -441,7 +450,7 @@ def _group_key(row: Dict[str, Any]) -> Tuple[Any, ...]:
 
 
 class _Group:
-    __slots__ = ("count", "cost", "bound", "tokens", "root_limit")
+    __slots__ = ("count", "cost", "bound", "tokens", "root_limit", "processing_summary")
 
     def __init__(self) -> None:
         self.count = 0
@@ -449,10 +458,12 @@ class _Group:
         self.bound: Optional[Decimal] = None
         self.tokens: Dict[str, Optional[int]] = {field: None for field in _TOKEN_SUM_FIELDS}
         self.root_limit: Optional[Decimal] = None
+        self.processing_summary: dict = {}
 
     def absorb(self, row: Dict[str, Any]) -> None:
         """Fold one FINAL decimal-parsed row (attempt final or prior group)."""
         self.count += _row_weight(row)
+        _merge_processing_summary(self.processing_summary, _processing_summary([row], decimal_values=True))
         cost = row.get("cost_usd")
         if cost is not None:
             self.cost = (self.cost or Decimal(0)) + _decimal_of(cost)
@@ -474,6 +485,23 @@ class _Group:
             )
 
 
+# Rendered cash intentionally rounds to six places. It is not a proof of
+# monetary equality, even with shared exact accumulation: the independent raw
+# Decimal self-check below remains mandatory alongside NON-MONEY equality.
+_FINGERPRINT_MONEY_KEYS = frozenset({
+    "settled_usd", "confirmed_usd", "estimated_usd", "reserved_usd",
+    "unresolved_upper_bound_usd", "accounted_usd",
+})
+
+
+def _without_money(bucket: Dict[str, Any]) -> Dict[str, Any]:
+    """One summary/bucket as the NON-MONEY view its readers also consume."""
+    return {
+        key: value for key, value in bucket.items()
+        if key not in _FINGERPRINT_MONEY_KEYS
+    }
+
+
 def _render_fingerprint(finals: list) -> Dict[str, Any]:
     """The production-aggregation surfaces budget/display actually consume.
 
@@ -481,8 +509,14 @@ def _render_fingerprint(finals: list) -> Dict[str, Any]:
     summaries + min known ``root_limit_usd``) and ``usage_breakdown`` (global
     bucket, per-axis buckets with the legacy/empty-key unattributed rule),
     built from the SAME ``_summary``/``_breakdown_bucket`` production
-    functions. Compared before/after on the candidate bytes; any inequality
-    aborts the compaction.
+    functions — minus the money keys (see above): the readers' NON-MONEY view
+    must be identical, and money is exact by Decimal in ``decimal_totals``.
+    What still has to match is everything a fold could actually lose: state
+    counts and their folded weights, physical calls, token sums, cache TTLs,
+    ``non_final_rows``/``cost_final``/``unknown_unmetered``, subscription
+    sessions and windows, the per-root minimum ``root_limit_usd``, and the
+    shape of every axis. Compared before/after on the candidate bytes; any
+    inequality aborts the compaction.
     """
     per_root: Dict[str, Any] = {}
     grouped_roots: Dict[str, list] = {}
@@ -497,7 +531,7 @@ def _render_fingerprint(finals: list) -> Dict[str, Any]:
             for value in (_number(row.get("root_limit_usd")) for row in rows)
             if value is not None
         ]
-        per_root[rid] = (_summary(rows), min(known) if known else None)
+        per_root[rid] = (_without_money(_summary(rows)), min(known) if known else None)
 
     def grouped(field: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         groups: Dict[str, list] = {}
@@ -509,14 +543,14 @@ def _render_fingerprint(finals: list) -> Dict[str, Any]:
             else:
                 groups.setdefault(key, []).append(row)
         return (
-            {key: _breakdown_bucket(groups[key]) for key in sorted(groups)},
-            _breakdown_bucket(unattributed),
+            {key: _without_money(_breakdown_bucket(groups[key])) for key in sorted(groups)},
+            _without_money(_breakdown_bucket(unattributed)),
         )
 
     return {
-        "summary": _summary(finals),
+        "summary": _without_money(_summary(finals)),
         "by_root": per_root,
-        "breakdown": _breakdown_bucket(finals),
+        "breakdown": _without_money(_breakdown_bucket(finals)),
         "axes": {
             field: grouped(field)
             for field in ("model", "provider", "category", "task_id", "root_task_id")
@@ -538,28 +572,29 @@ def _parse_ledger_lines(raw: bytes) -> Tuple[list, list]:
     return float_rows, decimal_rows
 
 
-def _foldable_attempt_ids(records: list) -> set:
-    """Attempt ids whose whole chain folds: terminal, plain ``attempt`` kind,
-    no review attribution — plus prior baseline group/header rows (re-folded)."""
-    finals = _final_rows(records)
-    foldable: set = set()
-    for attempt_id, row in finals.items():
-        kind = str(row.get("kind") or "attempt")
-        if kind in _BASELINE_KINDS:
-            foldable.add(attempt_id)
-            continue
-        if kind != "attempt":
-            continue
-        if str(row.get("state") or "") not in _FOLDABLE_FINAL_STATES:
-            continue
-        if any(str(row.get(key) or "") for key in _REVIEW_KEYS):
-            continue
-        if isinstance(row.get("cost_usd"), bool) or isinstance(
-            row.get("reservation_upper_bound_usd"), bool
-        ):
-            continue  # fail-safe: malformed monetary value never folds
-        foldable.add(attempt_id)
-    return foldable
+def fold_eligible_at(row: Dict[str, Any]) -> Optional[float]:
+    """Earliest fold time for a plain closed attempt, or None if retained.
+
+    Shared with the generation-bound writer index: eligibility is maintenance
+    policy only, never an accounting or late-receipt authority.
+    """
+    if (str(row.get("kind") or "attempt") != "attempt"
+            or row.get("state") not in _FOLDABLE_FINAL_STATES
+            or is_abandoned_settlement(row)
+            or any(str(row.get(key) or "") for key in _REVIEW_KEYS)
+            or isinstance(row.get("cost_usd"), bool)
+            or isinstance(row.get("reservation_upper_bound_usd"), bool)):
+        return None
+    ts = row_ts_epoch(row)
+    return float("-inf") if ts is None else ts + USAGE_LEDGER_FOLD_MIN_AGE_SEC
+
+
+def _foldable_attempt_ids(records: list, *, now_ts: Optional[float] = None) -> set:
+    """Closed non-review attempts past the horizon, plus prior baseline rows."""
+    clock = _fold_clock() if now_ts is None else float(now_ts)
+    return {identity for identity, row in _final_rows(records).items()
+            if str(row.get("kind") or "attempt") in _BASELINE_KINDS
+            or ((eligible := fold_eligible_at(row)) is not None and eligible <= clock)}
 
 
 def _build_candidate(
@@ -644,6 +679,11 @@ def _build_candidate(
                 row[field] = group.tokens[field]
         if group.root_limit is not None:
             row["root_limit_usd"] = format(group.root_limit, "f")
+        if group.processing_summary:
+            row["processing_summary"] = {
+                name: format(value, "f") if isinstance(value, Decimal) else value
+                for name, value in group.processing_summary.items()
+            }
         group_rows.append(row)
 
     retained_lines: list = []
@@ -797,7 +837,7 @@ def compact_usage_ledger_locked(
                 raise _Abort("decimal money totals mismatch")
         _beat(heartbeat)
     except _Abort as abort:
-        log.info("usage-ledger compaction skipped: %s", abort.reason)
+        _record_skip(root, abort.reason)
         return None
     except (UsageLedgerCorrupt, DecimalException, ValueError, TypeError, KeyError) as exc:
         # Never let a compaction defect become a monetary failure: abort clean.
@@ -834,7 +874,7 @@ def compact_usage_ledger_locked(
             return None
         _swap_ledger_fsync(ledger_path, candidate, raw, beat)
     except _Abort as abort:
-        log.info("usage-ledger compaction skipped: %s", abort.reason)
+        _record_skip(root, abort.reason)
         return None
     try:
         append_jsonl(
@@ -852,6 +892,39 @@ def compact_usage_ledger_locked(
     return receipt
 
 
+def _durable_growth_floor(root: pathlib.Path) -> Optional[int]:
+    """The size the last committed pass READ, taken from the ledger itself.
+
+    A pass swaps the file, so the moment one process folds, every other
+    process's inode-keyed memo stops matching and re-enters a full pass on its
+    next reservation — and a process that has just started has no memo at all
+    while the residue keeps the file above the trigger for good. The guard
+    therefore cannot live in process memory: it is a property of the ledger,
+    and the pass already stamps it into line 1 as ``source_size_bytes``, so
+    every process reads the same number. Lock-free, one ``readline``: appends
+    never touch line 1 and the swap is atomic, so the row is complete
+    whichever generation answers.
+
+    ``None`` means this ledger states no floor — no stamp, a leading row that
+    cannot be read (the caller's own read reports that, and masking it here
+    would hide it), or a recorded size that is not a positive count. The
+    per-process memo then stays the only guard, exactly as before.
+
+    Disclosed cost: the stamp names the PRE-pass size, so after a high-gain
+    fold the next pass waits until the file outgrows what the last one read.
+    """
+    try:
+        header = _live_baseline_header(root)
+    except (UsageLedgerCorrupt, OSError):
+        return None
+    if not header:
+        return None
+    size = header.get("source_size_bytes")
+    if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+        return None
+    return size
+
+
 def maybe_compact_usage_ledger_locked(
     root: pathlib.Path | str,
     *,
@@ -859,10 +932,22 @@ def maybe_compact_usage_ledger_locked(
 ) -> bool:
     """Opportunistic trigger on the monetary write path (under the held lock).
 
-    ``os.stat`` fast-path below ``config.USAGE_LEDGER_COMPACT_BYTES``; a
-    per-process growth guard throttles re-attempts after an unprofitable or
-    aborted pass. Every failure is contained: this never raises into the
-    caller's reservation (a corrupt ledger still fails in the normal read)."""
+    ``os.stat`` fast-path below ``config.USAGE_LEDGER_COMPACT_BYTES``; above
+    it, TWO growth guards, and a pass runs only past both. The unfoldable
+    residue (group rows, retained idempotent and review-attributed rows, and
+    terminal rows younger than the fold horizon) never shrinks below the
+    trigger, so without a brake every reservation would rewrite the whole
+    authority under the held lock and copy the live file into a new archive
+    segment for a gain of a few kilobytes.
+
+    The durable one is the floor this ledger carries (``_durable_growth_floor``):
+    it is what makes the brake hold ACROSS processes, which a memo cannot.
+    The per-process memo records the size this process's last pass left behind,
+    whatever its outcome, and throttles a pass that aborted — an abort changes
+    no bytes, so the stamp still names the window that let it in.
+
+    Every failure is contained: this never raises into the caller's
+    reservation (a corrupt ledger still fails in the normal read)."""
     try:
         root = pathlib.Path(_drive_root(root))
     except Exception:
@@ -876,28 +961,42 @@ def maybe_compact_usage_ledger_locked(
 
     if stat.st_size < int(config.USAGE_LEDGER_COMPACT_BYTES):
         return False
+    retry_growth = int(config.USAGE_LEDGER_COMPACT_RETRY_GROWTH_BYTES)
     key = str(root.resolve(strict=False))
     with _COMPACT_ATTEMPTS_LOCK:
         prior = _COMPACT_ATTEMPTS.get(key)
     if prior is not None and prior[:2] == (stat.st_ino, stat.st_dev) and (
-        stat.st_size < prior[2] + int(config.USAGE_LEDGER_COMPACT_RETRY_GROWTH_BYTES)
+        stat.st_size < prior[2] + retry_growth
     ):
-        return False
+        return False  # this process already ran a pass on these bytes
+    floor = _durable_growth_floor(root)
+    if floor is not None and stat.st_size < floor + retry_growth:
+        return False  # somebody's pass read this ledger; it has not regrown since
     receipt: Optional[Dict[str, Any]] = None
     try:
         receipt = compact_usage_ledger_locked(root, heartbeat=heartbeat)
     except Exception:
         log.exception("usage-ledger compaction pass raised; the reservation continues on the ledger as it stands")
     if receipt is not None:
+        # The swap replaced the file, so the memo has to name the NEW inode
+        # and the size the pass left behind: keyed on the pre-compaction
+        # identity it would never match again and would throttle nothing.
+        try:
+            swapped = os.stat(ledger_path)
+        except OSError:
+            swapped = None
         with _COMPACT_ATTEMPTS_LOCK:
-            _COMPACT_ATTEMPTS.pop(key, None)
+            if swapped is None:
+                _COMPACT_ATTEMPTS.pop(key, None)
+            else:
+                _COMPACT_ATTEMPTS[key] = (swapped.st_ino, swapped.st_dev, swapped.st_size)
         return True
     with _COMPACT_ATTEMPTS_LOCK:
         _COMPACT_ATTEMPTS[key] = (stat.st_ino, stat.st_dev, stat.st_size)
     return False
 
 
-# --- History readers (CPL-5 reverse-sweep join surface; audits) --------------
+# --- History readers (model-send reverse-sweep join surface; audits) --------------
 
 
 def _live_baseline_header(root: pathlib.Path) -> Optional[Dict[str, Any]]:
@@ -911,7 +1010,7 @@ def _live_baseline_header(root: pathlib.Path) -> Optional[Dict[str, Any]]:
     tell those apart and does not try — the archive does, in the epoch anchor,
     which runs on a stamp-less file too. A row that cannot be read AT ALL is
     corruption and says so: reporting it as "not compacted" would hand the
-    CPL-5 sweep an empty archive and let it call a folded attempt an orphan
+    model-send reconciliation sweep an empty archive and let it call a folded attempt an orphan
     seal.
     """
     try:
@@ -1034,7 +1133,7 @@ def _load_segment(
                 break
             chunks.append(chunk)
         payload = b"".join(chunks)
-    except OSError as exc:  # the CPL-5 sweep maps typed corruption to UNKNOWN; a bare OSError escapes it
+    except OSError as exc:  # the model-send reconciliation sweep maps typed corruption to UNKNOWN; a bare OSError escapes it
         raise UsageLedgerCorrupt(f"usage archive segment unreadable: {path}") from exc
     finally:
         os.close(fd)
@@ -1164,7 +1263,7 @@ def archived_attempt_ids(root: pathlib.Path | str | None = None) -> frozenset:
     Segments are immutable, so per-segment reads and the union over a given
     chain are cached. An unreadable (or not-a-regular-file), hash-mismatched,
     mis-stepped, cyclic or out-anchored chain raises ``UsageLedgerCorrupt`` —
-    the CPL-5 reverse sweep must treat that as its existing UNKNOWN /
+    the model-send reverse sweep must treat that as its existing UNKNOWN /
     skip-pass state, never as evidence of an orphan."""
     root = pathlib.Path(_drive_root(root))
     live_header = _live_baseline_header(root)
@@ -1247,7 +1346,7 @@ def usage_attempt_recorded(
     """Membership of ``attempt_id`` in the live replay ∪ archived segments.
 
     The join primitive for per-attempt history questions on a compacted
-    ledger (CPL-5 reverse sweep: an id absent HERE — not merely absent from
+    ledger (model-send reverse sweep: an id absent HERE — not merely absent from
     the live replay — is what "no attempt row" means)."""
     attempt_id = str(attempt_id or "")
     if not attempt_id:

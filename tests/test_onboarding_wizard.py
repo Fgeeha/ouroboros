@@ -338,7 +338,7 @@ def test_prepare_onboarding_settings_rejects_openai_compatible_key_without_base_
 def test_onboarding_frontend_uses_base_url_first_compatible_validation():
     source = (REPO / "web/modules/onboarding_wizard.js").read_text(encoding="utf-8")
 
-    assert "!['OPENAI_COMPATIBLE_API_KEY', 'MINIMAX_REGION'].includes(field.settingKey)" in source
+    assert "!['OPENAI_COMPATIBLE_API_KEY', 'MINIMAX_REGION', 'ZAI_PLAN'].includes(field.settingKey)" in source
     assert "const hasRemote = keyValues.some(([, value]) => value);" not in source
 
 
@@ -368,6 +368,17 @@ def test_onboarding_bootstrap_cannot_break_out_of_its_inline_script():
 
     assert "</script><b>" not in html
     assert "\\u003c/script>\\u003cb>" in html
+
+
+def test_bootstrap_freshness_is_explicit_display_provenance():
+    from ouroboros.settings_defaults import SETTINGS_DEFAULTS
+
+    settings = {"OUROBOROS_MODEL": SETTINGS_DEFAULTS["OUROBOROS_MODEL"]}
+    assert build_setup_bootstrap(settings)["freshInstall"] is False
+    fresh = build_setup_bootstrap({}, fresh_install=True)
+    assert fresh["freshInstall"] is True
+    assert fresh["initialState"]["mainModel"] == settings["OUROBOROS_MODEL"]
+    assert '"freshInstall": true' in build_onboarding_html({}, fresh_install=True)
 
 
 def test_onboarding_wizard_module_keeps_its_multistep_contract():
@@ -512,12 +523,12 @@ def test_wizard_declares_the_subscription_intent_the_endpoint_expects():
     assert f"{SUBSCRIPTIONS_CONNECTED_FIELD}: state.agentsConnected.length > 0" in source
     assert f"{SKIP_SUBSCRIPTION_PRESETS_FIELD}: state.skipSubscriptionPresets" in source
     assert 'id="skip-presets-btn"' in source
-    assert "Finish without subscription presets" in source
-    assert "saveWizard({ skipPresets: true })" in source
+    assert "Use Main for reviewers" in source
+    recovery = source.split("async function prepareMainReviewers", 1)[1].split("async function saveWizard", 1)[0]
+    assert "await agentsStep?.setSkipPresets(true, { replaceReviewers: true })" in recovery
+    assert "render()" in recovery and "completeOnboardingAtomically" not in recovery
     save = source.split("async function saveWizard", 1)[1]
-    assert save.index("await agentsStep?.setSkipPresets(true)") < save.index(
-        "const providersError = validateProvidersStep()"
-    )
+    assert "setSkipPresets(true)" not in save
 
 
 def test_a_browser_owner_is_told_when_the_saved_runtime_mode_needs_a_restart():
@@ -606,6 +617,8 @@ def test_setup_contract_groups_rarely_used_providers():
         "MINIMAX_API_KEY": "more",
         "MINIMAX_REGION": "more",
         "DEEPSEEK_API_KEY": "more",
+        "ZAI_API_KEY": "more",
+        "ZAI_PLAN": "more",
         "ANTHROPIC_API_KEY": "primary",
         "OPENAI_COMPATIBLE_BASE_URL": "more",
         "OPENAI_COMPATIBLE_API_KEY": "more",
@@ -680,6 +693,7 @@ _SECRET_CANARIES = {
     "CLOUDRU_FOUNDATION_MODELS_API_KEY": "cloudru-SECRETCANARY126",
     "MINIMAX_API_KEY": "minimax-SECRETCANARY127",
     "DEEPSEEK_API_KEY": "sk-ds-SECRETCANARY133",
+    "ZAI_API_KEY": "sk-zai-SECRETCANARY134",
     "ANTHROPIC_API_KEY": "sk-ant-SECRETCANARY128",
     "GIGACHAT_CREDENTIALS": "giga-SECRETCANARY129",
     "GIGACHAT_PASSWORD": "gigapw-SECRETCANARY130",

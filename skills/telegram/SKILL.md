@@ -1,7 +1,7 @@
 ---
 name: telegram
 description: Owner-only Telegram text bridge and Mini App gateway for the existing Ouroboros interface.
-version: 1.2.1
+version: 1.2.9
 type: extension
 entry: plugin.py
 plugin_api: "2.0"
@@ -9,7 +9,7 @@ runtime: python3
 os: any
 permissions: [net, read_settings, widget, route, supervised_task, subscribe_event, inject_chat, subprocess, companion_process]
 env_from_settings: [TELEGRAM_BOT_TOKEN]
-subscribe_events: [chat.outbound, chat.typing, chat.photo, chat.video, chat.document, chat.links, chat.quiz]
+subscribe_events: [chat.outbound, chat.typing, chat.photo, chat.video, chat.document, chat.links, chat.quiz, chat.quiz_state]
 conflicts: [telegram-bridge, telegram-miniapp-poc]
 when_to_use: The owner wants to communicate with and control Ouroboros through Telegram.
 model_experience:
@@ -47,6 +47,26 @@ cancelled).
 
 Version 1.2.1 marks questions that wait for an owner answer and clears the
 waiting line after an answer submitted through Telegram.
+Version 1.2.3 serves the stored settings on GET settings/save so the Settings
+form shows saved values before Save, and shortens the four long option labels.
+Version 1.2.4 always sends one short line when a task does not finish cleanly, with
+the same status word and reason sentence the task card shows; the task-completion
+toggle now only adds the clean finishes.
+Version 1.2.5 shows the whole quiz card: its project, the host's facts about the
+asking task, and every option's detail, with localized field names; a card too
+long for one Telegram message arrives as ordered parts followed by the keyboard
+message, and nothing authored is cut.
+Version 1.2.6 edits a sent question card when the host publishes its lifecycle
+(`chat.quiz_state`): an answer given on the web settles it, a closed wait drops the
+waiting line while the buttons stay, and a finished task says a late answer still
+counts as your message. The card only moves forward — nothing reopens an answer.
+An open question (no options) is the same whole card without buttons; it asks for
+a reply in your own words.
+
+Version 1.2.9 routes every Telegram API call through the optional skill-local
+`TELEGRAM_PROXY` setting, including polling, sends, downloads, notifications,
+and the companion's menu button lifecycle. The Settings form masks the proxy
+and never reads its stored credentials back into the browser.
 
 The Mini App exposes the unchanged Ouroboros SPA through the established
 owner-authenticated sidecar and a pinned Cloudflare Quick Tunnel. It is enabled
@@ -56,11 +76,31 @@ sessions, stops public exposure, and best-effort restores the prior Telegram
 menu button. Rotate the bot token only while the skill is disabled, then
 re-enable it.
 
+Delegated task cards lead with the executor's latest words (marked earlier
+when retained), followed by problems and compact activity counts. These are
+attributed observations, not the supervising task's narration or a completion
+receipt; journal gaps and preview omissions remain visible.
+
 Set `TELEGRAM_BOT_TOKEN` in Settings, grant it to this skill, enable the skill,
 and send the bot a private message to bind the owner. No legacy Telegram skill
 state is copied or changed. Installations that use `telegram-bridge` or
 `telegram-miniapp-poc` must disable or remove those skills before enabling this
 one.
+
+If Telegram requires a proxy, open this skill's Telegram settings and enter
+`TELEGRAM_PROXY` as `scheme://[user:password@]host[:port]` (`socks5`, `socks5h`,
+`http` or `https`; SOCKS needs an explicit port). Leave the masked field empty
+to keep a saved value, or use **Clear saved Telegram proxy** to remove it.
+Disable and re-enable the skill after changing the proxy so its poller and
+companion also pick up the change. No additional Secrets grant is needed.
+
+The Bot API stays `https://api.telegram.org` with TLS through the proxy and no
+redirects. Proxy credentials follow the selected protocol: HTTP and SOCKS do
+not encrypt the connection to the proxy; HTTPS does. Invalid proxy settings
+produce an error naming the key without its value. With no skill proxy, the
+bridge retains its existing direct/ambient-proxy behavior and the companion's
+Telegram calls stay direct. This setting does not change the application proxy,
+Cloudflare tunnel, Mini App web traffic, or local host requests.
 
 The Mini App supports macOS arm64/x86_64, Linux arm64/x86_64, and Windows
 x86_64. Only the explicit unsupported OS/architecture case degrades
@@ -68,6 +108,13 @@ independently: the text bridge remains available while Mini App status reports
 that no pinned cloudflared asset exists. Invalid host runtime, unsafe state, or
 companion registration errors fail the skill load instead of claiming a partial
 healthy installation.
+
+Registration, pinned cloudflared selection, and runtime status share one
+architecture helper. Only when `platform.machine()` is empty on Windows does
+it fall back to `sysconfig.get_platform()`: `win-amd64` selects the pinned
+Windows asset; ARM64, 32-bit, and unknown builds remain unsupported in this
+fallback. A nonempty machine value takes precedence over the interpreter build;
+macOS and Linux use only the machine value.
 
 The Mini App is Beta. Its best-effort Cloudflare Quick Tunnel has no SLA and
 does not support Server-Sent Events (SSE). It targets native Telegram clients;

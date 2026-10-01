@@ -1,6 +1,6 @@
 import { apiFetch } from './api_client.js';
-import { PAGE_ICONS } from './page_icons.js';
 import { escapeHtmlAttr as escapeHtml, normalizeTone } from './ui_primitives.js';
+import { safeExternalUrl } from './utils.js';
 export { renderSafeField, collectSafeFieldValues, normalizeTone, setInlineStatus } from './ui_primitives.js';
 // Cycle note: toast.js imports normalizeTone from this module. Both edges only
 // call the imported function inside function bodies (never at module eval), so
@@ -29,49 +29,14 @@ export function formatRelativeAge(time, freshLabel = 'Just installed') {
     return days < 45 ? `${days}d ago` : new Date(time).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
 }
 
-/**
- * Shared design-system action button for host-stamped system chat rows
- * (Project lifecycle rows and future system-message actions). One semantic
- * button role — `.btn.btn-default.btn-sm` — plus the layout-only
- * `.system-message-action` hook; callers place it inside a
- * `.system-message-actions` container.
- */
-export function createSystemMessageAction({ label, onClick, disabled = false, ariaLabel = '' } = {}) {
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = 'btn btn-default btn-sm system-message-action';
-    btn.textContent = String(label || '');
-    if (disabled) btn.disabled = true;
-    if (ariaLabel) btn.setAttribute('aria-label', ariaLabel);
-    if (typeof onClick === 'function') btn.addEventListener('click', onClick);
-    return btn;
+// The row under a System or routed chat message: the composition owns spacing, wrapping and
+// focus clearance, never the controls inside it.
+export function createSystemMessageActions(...controls) {
+    const row = document.createElement('div');
+    row.className = 'system-message-actions';
+    row.append(...controls);
+    return row;
 }
-
-/**
- * The one project chip: the bound-task footer in Main (`in project ↗`) and the
- * whole converted card (`running in background ↗`) share this exact DOM so the
- * two states of one element cannot drift apart. The icon is the shared Projects
- * vector (never an emoji); the name is written as text, never as HTML.
- */
-export function renderProjectChip({ name, status, onClick, className = '' } = {}) {
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = ['chat-live-project-card-btn', className].filter(Boolean).join(' ');
-    const icon = document.createElement('span');
-    icon.className = 'chat-live-project-icon';
-    icon.setAttribute('aria-hidden', 'true');
-    icon.innerHTML = PAGE_ICONS.projects;
-    const nameEl = document.createElement('span');
-    nameEl.className = 'chat-live-project-name';
-    nameEl.textContent = String(name || '');
-    const statusEl = document.createElement('span');
-    statusEl.className = 'chat-live-project-status';
-    statusEl.textContent = String(status || '');
-    btn.append(icon, nameEl, statusEl);
-    if (typeof onClick === 'function') btn.addEventListener('click', onClick);
-    return btn;
-}
-
 
 /**
  * A list editor's freshly added entry is shown where it landed and takes the
@@ -201,7 +166,7 @@ const BRIDGE_ARTIFACTS_RE = /^\/api\/tasks\/[^/]+\/artifacts\//;
  * from the parent. A cross-origin parent (not our shell) throws and resolves
  * to null.
  */
-function shellBridgeApi(win) {
+export function shellBridgeApi(win) {
     try {
         const host = win.pywebview || (win.parent && win.parent !== win ? win.parent.pywebview : null);
         return host?.api || null;
@@ -377,6 +342,37 @@ async function copyShellLinkWithToast(url, win, doc, toast) {
     toast('Link copied — open it in your browser.', 'info');
 }
 
+/** Open an external link through the active host while the user gesture is live. */
+export async function openExternalViaHostBridge(url, {
+    win = window, doc = document, toast = showToast, api = shellBridgeApi(win),
+} = {}) {
+    const target = safeExternalUrl(url);
+    if (target === '#') throw new Error('Unsupported external link');
+    if (api) {
+        const result = api.open_external_url ? await api.open_external_url(target) : null;
+        if (result?.ok) return { ...result, native: true };
+        await copyShellLinkWithToast(target, win, doc, toast);
+        return { ok: false, native: true, degraded: 'copy-link' };
+    }
+    let telegram = win.Telegram?.WebApp;
+    let telegramHost = doc.documentElement?.dataset?.ouroborosHost === 'telegram' || Boolean(telegram);
+    // The same-origin onboarding frame inherits its host's opener, just like
+    // its pywebview bridge. A foreign parent grants no access here.
+    try {
+        if (!telegram && win.parent && win.parent !== win) {
+            telegram = win.parent.Telegram?.WebApp;
+            telegramHost ||= Boolean(telegram) || win.parent.document?.documentElement?.dataset?.ouroborosHost === 'telegram';
+        }
+    } catch { /* cross-origin parent is not our host */ }
+    if (telegramHost && /^https?:/i.test(target)) {
+        if (typeof telegram?.openLink !== 'function') throw new Error('Telegram link opener is not ready; try the link again');
+        telegram.openLink(target);
+        return { ok: true, native: false, host: 'telegram' };
+    }
+    win.open(target, '_blank', 'noopener');
+    return { ok: true, native: false, host: 'browser' };
+}
+
 async function routeShellUrl(kind, url, deps) {
     const { api, win, doc, toast, openFile, downloadFile, filename = '', wantsDownload = false } = deps;
     try {
@@ -393,12 +389,7 @@ async function routeShellUrl(kind, url, deps) {
             if (wantsDownload) await downloadFile(url, name);
             else await openFile(url, name);
         } else if (kind === 'external') {
-            // Version-skew fallback (no open_external_url on an old packaged
-            // launcher) and an honest bridge failure ({ok:false}: no browser
-            // could be launched) degrade the same way: hand the owner the link
-            // instead of leaving a silently dead control.
-            const result = api?.open_external_url ? await api.open_external_url(url) : null;
-            if (!result?.ok) await copyShellLinkWithToast(url, win, doc, toast);
+            await openExternalViaHostBridge(url, { api, win, doc, toast });
         } else if (kind === 'bytes') {
             const result = await downloadBlobViaHostBridge(url, filename, { win, doc });
             if (result.unavailable) { toast(result.error, 'warn'); return; }

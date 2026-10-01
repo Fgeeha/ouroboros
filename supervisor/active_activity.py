@@ -1,6 +1,6 @@
-"""In-memory, process-local registry for active direct and ephemeral chat activities.
+"""In-memory, process-local registry for active direct chat activities.
 
-Tracks in-flight direct conversational turns and ephemeral decision turns so
+Tracks in-flight direct conversational turns so
 the Gateway (/api/state) and WebSocket activity pipeline have authoritative,
 thread-safe visibility into in-progress work without creating spurious queue records.
 """
@@ -8,7 +8,6 @@ thread-safe visibility into in-progress work without creating spurious queue rec
 from __future__ import annotations
 
 import logging
-import pathlib
 import threading
 import time
 from contextlib import contextmanager
@@ -24,15 +23,66 @@ class DirectActivityEntry:
     chat_id: int
     project_id: str = ""
     client_message_id: str = ""
-    kind: str = "direct_chat"  # "direct_chat" | "ephemeral_decision"
+    kind: str = "direct_chat"
     phase: str = "thinking"
     started_at: float = field(default_factory=time.time)
     origin_message_ref: Dict[str, Any] = field(default_factory=dict)
-    model_wait_owner: Any = field(default=None, repr=False, compare=False)
 
     actor: Any = field(default=None, repr=False, compare=False)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def _live_model_wait_projection(self, *, availability: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Read the direct turn's existing live ``TaskModelWait`` owner.
+
+        Direct turns do not have a queue ``RUNNING`` row to carry the wait
+        projection.  The actor's task-scoped ``ToolContext`` already points at
+        the live owner, so use that authority while it is open instead of
+        replaying a durable result or introducing a second poller/store.
+        """
+        try:
+            actor = self.actor
+            tools = getattr(actor, "tools", None)
+            context = getattr(tools, "_ctx", None)
+            owner = getattr(context, "model_wait_context", None)
+        except Exception:
+            if availability is not None:
+                availability["complete"] = False
+            log.debug("Direct activity owner lookup unavailable: %s", self.activity_id,
+                      exc_info=True)
+            return {}
+        if owner is None or str(getattr(owner, "task_id", "") or "") != self.activity_id:
+            return {}
+        if bool(getattr(owner, "closed", False)):
+            return {}
+        snapshot = getattr(owner, "snapshot", None)
+        if not callable(snapshot):
+            if availability is not None:
+                availability["complete"] = False
+            return {}
+        try:
+            projection = snapshot()
+        except Exception:
+            if availability is not None:
+                availability["complete"] = False
+            log.debug("Direct activity model-wait snapshot unavailable: %s", self.activity_id,
+                      exc_info=True)
+            return {}
+        if not isinstance(projection, dict):
+            if availability is not None:
+                availability["complete"] = False
+            return {}
+        result: Dict[str, Any] = {}
+        waits = projection.get("model_waits")
+        if isinstance(waits, dict) and waits:
+            result["model_waits"] = waits
+        try:
+            attempt = int(getattr(owner, "attempt", 0) or 0)
+        except (TypeError, ValueError):
+            attempt = 0
+        if attempt >= 1:
+            result["task_attempt"] = attempt
+        return result
+
+    def to_dict(self, *, availability: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         row = {
             "activity_id": self.activity_id,
             "chat_id": self.chat_id,
@@ -42,14 +92,20 @@ class DirectActivityEntry:
             "phase": self.phase,
             "started_at": self.started_at,
         }
-        owner = self.model_wait_owner
-        if owner is not None and not owner.closed:
-            row.update(model_waits=owner.snapshot()["model_waits"], task_attempt=owner.attempt)
+        # Keep the historical static shape for an actor that has not entered
+        # its task context yet. Once the direct turn owns a live model wait,
+        # publish the same optional fields as managed/post-task activities.
+        wait_availability: Dict[str, Any] = {}
+        row.update(self._live_model_wait_projection(availability=wait_availability))
+        if wait_availability.get("complete") is False:
+            row["phase"] = "unknown"
+            if availability is not None:
+                availability["complete"] = False
         return row
 
 
 class DirectActivityRegistry:
-    """Thread-safe registry for active direct-chat and ephemeral-decision turns."""
+    """Thread-safe registry for active direct-chat turns."""
 
     def __init__(self) -> None:
         self._lock = threading.Condition()
@@ -95,34 +151,13 @@ class DirectActivityRegistry:
             log.debug("Unregistered direct activity: %s (chat_id=%s)", aid, entry.chat_id)
         return entry
 
-    def snapshot(self, chat_id: Optional[int] = None) -> List[Dict[str, Any]]:
+    def snapshot(
+        self, chat_id: Optional[int] = None, *, availability: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
         with self._lock:
             entries = list(self._activities.values())
-        # Wait snapshots take the owner's lock; never nest it inside this lock.
-        return [e.to_dict() for e in entries if chat_id is None or e.chat_id == int(chat_id)]
-
-    @contextmanager
-    def bind_model_wait(self, owner: Any) -> Iterator[None]:
-        """Attach a turn's existing wait owner without minting another activity."""
-        with self._lock:
-            entry = self._activities.get(owner.task_id)
-            if entry is not None and entry.kind == "ephemeral_decision":
-                entry.model_wait_owner = owner
-        try:
-            yield
-        finally:
-            with self._lock:
-                if entry is not None and entry.model_wait_owner is owner:
-                    entry.model_wait_owner = None
-
-    def ephemeral_model_wait(self, drive_root: Any, task_id: str) -> Any:
-        """A live ephemeral call, not ordinary task/cancel/Project authority."""
-        entry = self.get(task_id)
-        owner = entry.model_wait_owner if entry is not None and entry.kind == "ephemeral_decision" else None
-        if (owner is not None and not owner.closed and owner.task_id == str(task_id)
-                and pathlib.Path(owner.canonical_root).resolve() == pathlib.Path(drive_root).resolve()):
-            return owner
-        return None
+        return [e.to_dict(availability=availability) for e in entries
+                if chat_id is None or e.chat_id == int(chat_id)]
 
     def get(self, activity_id: str) -> Optional[DirectActivityEntry]:
         aid = str(activity_id or "").strip()

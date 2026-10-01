@@ -17,6 +17,7 @@ from ouroboros.llm_attempt import (
     _candidate_before_dispatch,
     _execute_candidate,
     _physical_candidate,
+    attach_processing_receipt,
 )
 
 
@@ -44,6 +45,11 @@ class _GigaChatLaneMixin:
             "scope": str(target.get("scope") or "GIGACHAT_API_PERS"),
             "verify_ssl_certs": bool(target.get("verify_ssl_certs", True)),
         }
+        from ouroboros.net_transport import extra_ca_bundle
+
+        bundle = extra_ca_bundle()
+        if bundle:
+            kwargs["ca_bundle_file"] = bundle
         for source, destination in (
             ("api_key", "credentials"), ("user", "user"), ("password", "password"),
             ("base_url", "base_url"),
@@ -70,7 +76,13 @@ class _GigaChatLaneMixin:
         exchanges these for a short-lived access token and refreshes it
         automatically, so caching the client across calls is safe. Any other
         ``GIGACHAT_*`` setting present in the environment (e.g.
-        ``GIGACHAT_PROFANITY_CHECK``) is picked up by the library itself.
+        ``GIGACHAT_PROFANITY_CHECK``) is picked up by the library itself —
+        except transport retries: ``max_retries=0`` is passed explicitly (an
+        init argument outranks ``GIGACHAT_MAX_RETRIES``), because one
+        ``client.chat`` is one accounted physical attempt and a retry belongs
+        to the host's own ladder, re-prepared and re-measured. The library's
+        re-send after a 401 (token reset, then the same call) has no switch;
+        it repeats the sealed bytes of the same attempt.
         A caller-supplied per-request ``timeout`` becomes part of the cache key
         (the library takes it at construction), so the safety-supervisor timeout
         SSOT bounds this lane too (v6.54.3)."""
@@ -81,10 +93,12 @@ class _GigaChatLaneMixin:
         base_url = str(target.get("base_url") or "")
         verify = bool(target.get("verify_ssl_certs", True))
         timeout_key = float(timeout) if timeout and timeout > 0 else None
-        cache_key = (credentials, user, password, scope, base_url, verify, timeout_key)
+        from ouroboros.net_transport import extra_ca_bundle
+
+        cache_key = (credentials, user, password, scope, base_url, verify, timeout_key, extra_ca_bundle())
 
         if cache_key not in self._gigachat_clients:
-            self._gigachat_clients[cache_key] = self._new_gigachat_client(target, timeout=timeout)
+            self._gigachat_clients[cache_key] = self._new_gigachat_client(target, timeout=timeout, max_retries=0)
         return self._gigachat_clients[cache_key]
 
     @staticmethod
@@ -220,6 +234,7 @@ class _GigaChatLaneMixin:
         # no_proxy (a macOS fork-safety flag for the OpenAI/requests paths) does
         # not apply here.
         del no_proxy
+        target["requested_reasoning_effort"] = reasoning_effort
 
         client = self._get_gigachat_client(target, timeout=timeout)
 
@@ -242,7 +257,13 @@ class _GigaChatLaneMixin:
         # hidden reasoning and return empty content/tool_calls when
         # reasoning_effort is sent. Keep the native path deterministic.
 
-        candidate = _physical_candidate(payload)
+        from ouroboros.send_clock import stamp_clock_note
+
+        # This lane bypasses the wire finalizer, so its Main clock line joins here,
+        # before measurement and sealing. The library's transport retries are off
+        # (``_get_gigachat_client``); its one re-send after a 401 repeats these
+        # sealed bytes inside the same attempt and claims no fresher clock.
+        candidate = _physical_candidate(stamp_clock_note(payload))
         request = _attempt_request(target, candidate, source="llm.gigachat")
         completion = _execute_candidate(
             request,
@@ -303,5 +324,16 @@ class _GigaChatLaneMixin:
             "cost": None,
             "cost_final": False,
         }
+        # The provider's cut marker survives normalization: consolidation refuses
+        # a clipped correction by usage.response_finish_reason on every lane.
+        finish_reason = getattr(first, "finish_reason", None) if first is not None else None
+        if isinstance(finish_reason, str) and finish_reason.strip():
+            usage["response_finish_reason"] = finish_reason.strip()[:64]
 
+        if target.get("processing_preference"):
+            from ouroboros._usage_response import processing_receipt
+
+            usage["processing"] = processing_receipt(
+                "gigachat", usage, requested=target["processing_preference"])
+        attach_processing_receipt(target, usage)
         return message, usage

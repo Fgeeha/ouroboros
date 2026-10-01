@@ -25,6 +25,7 @@ from tests.provider_contract_ci import (
     CANARY_CONTINUATION_MAX_TOKENS,
     CANARY_EMPTY_RESPONSE_MAX_ATTEMPTS,
     CANARY_MAX_TOKENS,
+    CANARY_SUBAGENT_ID,
     CANARY_TIMEOUT_SEC,
     CANARY_TOOL_NAME,
     ProviderCanary,
@@ -35,6 +36,7 @@ from tests.provider_contract_ci import (
     assert_openai_canary_usage,
     classify_provider_failure,
     delegate_start_canary_arguments,
+    delegate_start_canary_context,
     full_registry_canary_tools,
     provider_canary_matrix,
     require_provider_canary_credential,
@@ -147,6 +149,49 @@ def test_disconnect_and_generic_connection_error_are_red():
     assert classify_provider_failure(
         "provider_canary", RuntimeError("APIConnectionError: Connection error."),
     ).kind is ProviderFailureKind.RED
+
+
+def test_stream_loss_before_the_terminal_frame_is_inconclusive_but_a_rejected_body_is_red():
+    """Main streams and so does the canary's first turn: a socket that died before the terminal
+    frame and a provider's own code-less SSE error frame are weather (INCONCLUSIVE); a complete body
+    the host judged unusable is the assembler contract this canary guards (RED)."""
+    from ouroboros.llm_stream import IncompleteProviderStream, ProviderStreamError
+
+    lost = classify_provider_failure(
+        "provider_canary", IncompleteProviderStream("Stream ended without complete terminal framing"))
+    assert (lost.kind, lost.reason) == (ProviderFailureKind.INCONCLUSIVE, "stream_transport_loss")
+    overloaded = classify_provider_failure(
+        "provider_canary", ProviderStreamError({"error": {"type": "overloaded_error", "message": "Overloaded"}}))
+    assert (overloaded.kind, overloaded.reason) == (ProviderFailureKind.INCONCLUSIVE, "stream_provider_error")
+    rejected = RuntimeError("Stream rejected after terminal framing: choice 0: no finish_reason")
+    rejected.stream_incomplete = rejected.stream_rejected = True
+    assert classify_provider_failure("provider_canary", rejected).kind is ProviderFailureKind.RED
+    # The assembler files a numeric ``error.code`` as the frame's status: 429/5xx take the ladder
+    # (INCONCLUSIVE), a 4xx inside the stream is contract (RED).
+    for code, expected in ((429, "rate_limit_429"), (502, "provider_5xx"), (400, "provider_contract_or_unclassified")):
+        frame = ProviderStreamError({"error": {"code": code, "message": "provider said so"}})
+        frame.status_code = code
+        verdict = classify_provider_failure("provider_canary", frame)
+        assert (verdict.kind, verdict.reason) == (
+            ProviderFailureKind.RED if code == 400 else ProviderFailureKind.INCONCLUSIVE, expected)
+
+
+def test_streamed_reply_without_usage_frame_is_a_warning_not_a_contract_violation():
+    """Main streams and so does the canary's first turn; a route may answer completely without a
+    final usage frame (stream_options dropped by wire recovery, include_usage ignored): money is
+    unknown, the contract is not broken — a warning, never RED. The non-stream shape still demands tokens."""
+    import dataclasses
+
+    from ouroboros.provider_models import normalize_model_identity
+    from tests.provider_contract_ci import assert_canary_usage
+
+    canary = dataclasses.replace(next(iter(provider_canary_matrix())), expected_provider="openrouter", reasoning_effort="high")
+    usage = {"provider": "openrouter", "resolved_model": normalize_model_identity(canary.model),
+             "stream_receipt": {"complete": True, "anomalies": {"count": 0, "first": []}}, "canary_warnings": []}
+    assert_canary_usage(usage, canary)
+    assert [warning["code"] for warning in usage["canary_warnings"]] == ["streamed_reply_without_usage_frame"]
+    with pytest.raises(AssertionError):
+        assert_canary_usage({**usage, "stream_receipt": None, "canary_warnings": []}, canary)
 
 
 def test_provider_alarm_output_sanitizes_token_shaped_evidence(capsys):
@@ -659,16 +704,28 @@ def test_reasoning_integrity_canary_rejects_explicit_none_and_clamp():
     assert_openai_canary_usage(neutral_repair, model)
 
 
-def test_normalized_calls_require_unique_schema_valid_delegate_start():
+def _normalized_call_violation(arguments, expected, *, calls=None):
+    with pytest.raises(AssertionError) as caught:
+        assert_normalized_canary_call(
+            {"tool_calls": calls or [_canonical_canary_call("call-violation", arguments)]},
+            full_registry_canary_tools(),
+            expected,
+        )
+    return caught.value.args[0]["provider_contract_violation"]
+
+
+def test_normalized_calls_require_exactly_the_requested_delegate_start():
     tools = full_registry_canary_tools()
     expected = delegate_start_canary_arguments("normalized-call")
-    required = {"prompt": expected["prompt"]}
+    assert set(expected) == {"prompt", "subagent_id"}
     assert assert_normalized_canary_call(
         {"tool_calls": [_canonical_canary_call("call-ok", expected)]},
         tools,
-        required,
+        expected,
     )[0]["id"] == "call-ok"
 
+    # Schema-valid neutral values the prompt never asked for are what a route that
+    # forces optional properties emits (issue #1411): RED, naming declared keys only.
     provider_defaults = {
         **expected,
         "root": "skill_payload",
@@ -677,38 +734,113 @@ def test_normalized_calls_require_unique_schema_valid_delegate_start():
         "retry_of": "",
         "max_seconds": 0,
     }
-    assert assert_normalized_canary_call(
-        {"tool_calls": [_canonical_canary_call("call-defaults", provider_defaults)]},
-        tools,
-        required,
-    )[0]["id"] == "call-defaults"
+    evidence = _normalized_call_violation(provider_defaults, expected)
+    assert evidence["violation"] == "arguments_exact_keys"
+    assert evidence["extra_keys"] == ["bucket", "max_seconds", "retry_of", "root", "skill_name"]
+    assert evidence["missing_keys"] == []
 
     provider_selector = {
         "prompt": expected["prompt"],
-        "retry_of": "provider-contract-canary",
+        "retry_of": expected["subagent_id"],
         "root": "skill_payload",
         "bucket": "external",
     }
-    assert assert_normalized_canary_call(
-        {"tool_calls": [_canonical_canary_call("call-selector", provider_selector)]},
-        tools,
-        required,
-    )[0]["id"] == "call-selector"
+    evidence = _normalized_call_violation(provider_selector, expected)
+    assert evidence["violation"] == "arguments_exact_keys"
+    assert evidence["extra_keys"] == ["bucket", "retry_of", "root"]
+    assert evidence["missing_keys"] == ["subagent_id"]
 
+    wrong_selector = dict(expected, subagent_id="another-subagent")
+    assert _normalized_call_violation(wrong_selector, expected)["violation"] == "arguments_subagent_id"
     wrong = dict(expected, prompt="different nonce-bearing prompt")
-    with pytest.raises(AssertionError):
-        assert_normalized_canary_call(
-            {"tool_calls": [_canonical_canary_call("call-wrong", wrong)]},
-            tools,
-            required,
-        )
+    assert _normalized_call_violation(wrong, expected)["violation"] == "arguments_prompt"
     duplicate = _canonical_canary_call("call-duplicate", expected)
-    with pytest.raises(AssertionError):
-        assert_normalized_canary_call(
-            {"tool_calls": [duplicate, copy.deepcopy(duplicate)]},
-            tools,
-            required,
+    assert _normalized_call_violation(
+        None, expected, calls=[duplicate, copy.deepcopy(duplicate)],
+    )["violation"] == "duplicate_tool_call_id"
+
+
+def test_canary_run_rejects_provider_filled_optional_keys_as_red():
+    canary = next(row for row in provider_canary_matrix() if row.canary_id == "openrouter_gpt")
+    nonce = "forced-optional"
+    forced = {**delegate_start_canary_arguments(nonce), "retry_of": "", "max_seconds": 0}
+
+    class ForcedOptionalClient:
+        def chat(self, **kwargs):
+            return {
+                "content": "",
+                "tool_calls": [_canonical_canary_call("forced-optional", forced)],
+            }, _fake_usage(canary, 1)
+
+    with pytest.raises(AssertionError) as caught:
+        run_provider_contract_canary(
+            ForcedOptionalClient(), canary=canary, tools=full_registry_canary_tools(), nonce=nonce,
         )
+    evidence = caught.value.args[0]["provider_contract_violation"]
+    assert evidence["violation"] == "arguments_exact_keys"
+    assert evidence["extra_keys"] == ["max_seconds", "retry_of"]
+    assert skip_on_provider_environmental_error(canary.canary_id, caught.value) is None
+
+
+def test_canary_roster_offers_the_requested_selector_as_a_direct_fresh_start():
+    from ouroboros.subagent_runtime import model_visible_subagent_catalog
+
+    heading = "## Available subagents\n\n"
+    context = delegate_start_canary_context()
+    assert context.startswith(heading)
+    roster, _end = json.JSONDecoder().raw_decode(context[len(heading):])
+    [row] = roster["rows"]
+    assert row["subagent_id"] == CANARY_SUBAGENT_ID
+    assert row["subagent_id"] == delegate_start_canary_arguments("any-nonce")["subagent_id"]
+    assert "direct fresh start" in context
+    # The synthetic row speaks the vocabulary of the catalog Main actually sees.
+    [production] = model_visible_subagent_catalog({"OUROBOROS_SUBAGENTS": json.dumps({
+        "enabled": True,
+        "items": [{
+            "subagent_id": "session",
+            "name": "Session",
+            "recommended_use": "Owner words.",
+            "route": {
+                "kind": "agent_session",
+                "target_id": "claude=claude-fable-5",
+                "credential_profile_id": "",
+            },
+            "effort": "",
+        }],
+    })})["rows"]
+    assert set(row) <= set(production)
+    assert row["route_class"] == production["route_class"]
+
+
+def test_canary_run_rejects_an_omitted_selector_as_red_not_weather():
+    # The cloudru_direct shape seen in CI: a call carrying only the prompt.
+    canary = next(row for row in provider_canary_matrix() if row.canary_id == "cloudru_direct")
+    nonce = "omitted-selector"
+    prompt_only = {"prompt": delegate_start_canary_arguments(nonce)["prompt"]}
+
+    class PromptOnlyClient:
+        def __init__(self):
+            self.calls = []
+
+        def chat(self, **kwargs):
+            self.calls.append(copy.deepcopy(kwargs))
+            return {
+                "content": "",
+                "tool_calls": [_canonical_canary_call("prompt-only", prompt_only)],
+            }, _fake_usage(canary, 1)
+
+    client = PromptOnlyClient()
+    with pytest.raises(AssertionError) as caught:
+        run_provider_contract_canary(
+            client, canary=canary, tools=full_registry_canary_tools(), nonce=nonce,
+        )
+    evidence = caught.value.args[0]["provider_contract_violation"]
+    assert evidence["violation"] == "arguments_exact_keys"
+    assert (evidence["extra_keys"], evidence["missing_keys"]) == ([], ["subagent_id"])
+    assert skip_on_provider_environmental_error(canary.canary_id, caught.value) is None
+    assert len(client.calls) == 1
+    # An omitted selector remains a contract failure even with the matching roster.
+    assert client.calls[0]["messages"][0]["content"].startswith(delegate_start_canary_context())
 
 
 def test_production_custom_none_text_is_semantic_success(monkeypatch):
@@ -795,6 +927,7 @@ def test_production_custom_none_text_is_semantic_success(monkeypatch):
 def test_public_chat_builds_full_registry_request_for_every_matrix_row():
     tools = full_registry_canary_tools()
     names = [tool["function"]["name"] for tool in tools]
+    context = delegate_start_canary_context()
     for canary in provider_canary_matrix():
         nonce = f"unit-{canary.canary_id}"
         expected = delegate_start_canary_arguments(nonce)
@@ -845,10 +978,15 @@ def test_public_chat_builds_full_registry_request_for_every_matrix_row():
         assert first["model"] == canary.model
         assert first["reasoning_effort"] == canary.reasoning_effort
         assert first["max_tokens"] == CANARY_MAX_TOKENS
+        assert first["stream"] is True  # the transport Main actually sends
         assert first["no_proxy"] is True
         assert first["bypass_response_cache"] is False
         assert first["timeout"] == CANARY_TIMEOUT_SEC
         assert [tool["function"]["name"] for tool in first["tools"]] == names
+        # Every row asks for the same exact object beside the same synthetic roster.
+        assert [message["role"] for message in first["messages"]] == ["user"]
+        assert first["messages"][0]["content"].startswith(context)
+        assert json.dumps(expected, ensure_ascii=False, sort_keys=True) in first["messages"][0]["content"]
         if canary.named_tool_choice:
             assert first["tool_choice"] == {
                 "type": "function", "function": {"name": CANARY_TOOL_NAME},
@@ -860,6 +998,8 @@ def test_public_chat_builds_full_registry_request_for_every_matrix_row():
             assert "expected_final_marker" in first["messages"][0]["content"]
             second = client.calls[1]
             assert second["tool_choice"] == "none"
+            # Non-stream on purpose: continuation rows keep the non-stream transport covered at zero extra sends.
+            assert "stream" not in second
             assert second["bypass_response_cache"] is False
             assert second["max_tokens"] == CANARY_CONTINUATION_MAX_TOKENS
             assert [tool["function"]["name"] for tool in second["tools"]] == [
@@ -868,6 +1008,7 @@ def test_public_chat_builds_full_registry_request_for_every_matrix_row():
             assert [message["role"] for message in second["messages"]] == [
                 "user", "assistant", "tool", "tool",
             ]
+            assert second["messages"][0] == first["messages"][0]
             assert [message["tool_call_id"] for message in second["messages"][2:]] == [
                 f"call-{canary.canary_id}-1",
                 f"call-{canary.canary_id}-2",

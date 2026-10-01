@@ -1,11 +1,12 @@
 """Shared helpers for the review stack (advisory, triad, scope reviews).
 
-No imports from other ouroboros.tools modules to avoid circular deps; the one
-sanctioned exception is the ``release_sync`` compatibility re-export of
-``check_worktree_version_sync`` (moved to its version-sync home).
+Keeps tool-runtime imports out to avoid circular dependencies. The pure result
+vocabulary preserves preflight failures; ``release_sync`` re-exports version sync.
 """
 
 from __future__ import annotations
+
+from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
 
 import json
 import logging
@@ -17,11 +18,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
 from ouroboros.tools.release_sync import check_worktree_version_sync  # noqa: F401 - moved to its version-sync home; compatibility re-export
-from ouroboros.utils import (
-    sanitize_tool_result_for_log,  # noqa: F401 -- facade import surface; leaves read it through the call-time handle
-    truncate_review_artifact as _truncate_review_artifact,
-    utc_now_iso,
-)
+from ouroboros.utils import sanitize_tool_result_for_log, truncate_review_artifact as _truncate_review_artifact, utc_now_iso  # noqa: F401 -- facade import surface; leaves read it through the call-time handle
 
 if TYPE_CHECKING:
     # Avoid runtime registry import; this module stays tool-module independent.
@@ -35,6 +32,15 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 # non-blocking skip gate leaves headroom for default 1M-context reviewer models.
 REVIEW_PROMPT_TOKEN_BUDGET = 920_000
 
+
+def review_enforcement_blocks(enforcement: str | None = None) -> bool:
+    """Project action authority without changing configured policy or review facts."""
+    from ouroboros.config import get_review_enforcement, get_runtime_mode
+    from ouroboros.runtime_mode_policy import runtime_mode_at_least
+
+    selected = get_review_enforcement() if enforcement is None else enforcement
+    return selected == "blocking" and not runtime_mode_at_least(get_runtime_mode(), "cyber_pro")
+
 # Tokenizer-density calibration shared by every review surface (triad, scope, plan,
 # deep self-review). estimate_tokens (chars/4) tracks GPT-style tokenizers, but a
 # real Claude scope pack estimated at 739,508 tokens measured 1,166,914 REAL tokens
@@ -42,6 +48,13 @@ REVIEW_PROMPT_TOKEN_BUDGET = 920_000
 # a hand-set family constant: it is MEASURED per model at the physical send boundary
 # and stored as timestamped raw witnesses in capability_evidence. It sizes the
 # PROMPT, never the reviewer model or a window floor (BIBLE P3).
+
+
+# The cold-start density probe (``capability_evidence.cold_start_density_probe``)
+# measures the exact model's tokenizer on a bounded slice of the triad packet
+# it would otherwise refuse or degrade for size (the rung lives in
+# ``review_admission.density_probe_before_size_refusal``).
+DENSITY_PROBE_SAMPLE_CHARS = 80_000
 
 
 def calibrated_input_token_limit(
@@ -76,43 +89,6 @@ def calibrated_input_token_limit(
         int((context_window - output_reserve) / max(1.0, density)),
         context_window - output_reserve - tokenizer_margin,
     )
-
-
-# The cold-start density probe itself (one bounded send on the exact model that
-# sources a witness) is ``capability_evidence.cold_start_density_probe``, shared
-# by the packed deep self-review and the commit gate; the sample it measures on
-# is a slice of the REAL pack content, built here from the atlas manifest.
-DENSITY_PROBE_SAMPLE_CHARS = 80_000
-
-
-def density_probe_sample(repo_dir: pathlib.Path, manifest: dict) -> str:
-    """A bounded slice of the REAL atlas content (the refused required rows
-    first, then the selected rows) so the probe measures the density of what
-    the pack is made of, not of an unrelated text."""
-    from ouroboros.tool_access_paths import path_is_relative_to
-
-    parts: list[str] = []
-    total = 0
-    manifest = dict(manifest or {})
-    rows = list(manifest.get("unassembled_required") or []) + list(manifest.get("selected") or [])
-    root = pathlib.Path(repo_dir)
-    for row in rows:
-        rel = str((row or {}).get("path") or "")
-        # Containment resolved on the filesystem (not a POSIX-shaped string
-        # test): a drive-absolute or ``..`` row on any platform stays outside.
-        if not rel or not path_is_relative_to(root / rel, root):
-            continue
-        try:
-            text = (root / rel).read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        room = DENSITY_PROBE_SAMPLE_CHARS - total
-        if room <= 0:
-            break
-        chunk = text[:room]
-        parts.append(f"### {rel}\n{chunk}\n")
-        total += len(chunk)
-    return "".join(parts)
 
 
 SKILL_HOST_CONTEXT_FILES = (
@@ -247,11 +223,11 @@ def review_wave_budget_gate(
     extra: dict | None = None,
     categories: str | list = "",
     slot_ids: str | list = "",
+    processing_preferences: str | list = "",
 ) -> Optional[dict]:
     """Shared review-wave budget admission (v6.69.0).
 
-    Returns the admission dict when the wave must be DECLINED (emitting one
-    typed ``review_wave_budget_insufficient`` event), else None. Every paid
+    Returns admission data when the wave must be declined, else None. Every paid
     review wave is admitted here as a whole — skill/plan/acceptance reviewers
     and, since the owner decision of 2026-09-05, the P3 commit gate
     (``surface="commit_gate"``: scope seats first, then the triad, each seat
@@ -262,9 +238,8 @@ def review_wave_budget_gate(
     every fence ``reserve_attempt`` enforces — the global TOTAL_BUDGET remainder
     (the scope's ``global_limit_usd``) and the task's root fence — the event naming
     the binding axis with both remainders. A wave that fits at admission time is
-    dispatched whole; one that does not is refused BEFORE any seat spends (a read-only
-    pre-check without a wave-level hold: the per-seat reservation stays the
-    enforcement). Fail-open on any error/unknown."""
+    dispatched whole; one that does not is refused before any seat spends.
+    Fail-open on any error/unknown."""
     try:
         from ouroboros.usage_accounting import current_usage_scope, review_wave_admission
 
@@ -279,9 +254,11 @@ def review_wave_budget_gate(
             max_completion_tokens=max_completion_tokens,
             task_id=str(scope.task_id or ""),
             root_limit_usd=scope.root_limit_usd,
+            root_limit_source=scope.root_limit_source,
             global_limit_usd=scope.global_limit_usd,
             categories=categories,
             slot_ids=slot_ids,
+            processing_preferences=processing_preferences,
         )
         unpriced = int(admission.get("unpriced_slots") or 0)
         base = {
@@ -378,6 +355,50 @@ def build_skill_host_context(repo_dir: Path | None = None) -> str:
     return "\n\n".join(parts)
 
 
+# The canonical governance corpus a packed review surface owes IN FULL. Two of
+# the five are reference-book entrypoints, so their chapters are canonical too:
+# `is_canonical_governance_path` is the one predicate that answers for both
+# forms, and `canonical_governance_sources` resolves the actual population of a
+# given tree. Four surfaces used to keep their own copy of this list.
+CANONICAL_GOVERNANCE_DOCS = (
+    "BIBLE.md",
+    "docs/DEVELOPMENT.md",
+    "docs/DESIGN.md",
+    "docs/ARCHITECTURE.md",
+    "docs/CHECKLISTS.md",
+)
+
+
+def is_canonical_governance_path(path: str) -> bool:
+    """One of the canonical five, or a chapter of one of the two books."""
+    from ouroboros.reference_books import book_path_role
+
+    normalized = str(path or "").replace("\\", "/").lstrip("./")
+    return normalized in CANONICAL_GOVERNANCE_DOCS or book_path_role(normalized) == "chapter"
+
+
+def canonical_governance_sources(repo_dir: Path) -> tuple[str, ...]:
+    """Every canonical path a packed review inlines in full for THIS tree.
+
+    The five documents plus the chapters each book's entrypoint declares, so a
+    pack that inlined a composed book does not ALSO owe its chapters as
+    separate snapshots. A book that cannot be read contributes its entrypoint
+    alone — the reader that assembles it reports the failure; this resolver
+    must not turn an unreadable book into a claim of wider coverage.
+    """
+    from ouroboros.reference_books import BOOK_ENTRYPOINTS, load_reference_book
+
+    root = Path(repo_dir)
+    resolved = [doc for doc in CANONICAL_GOVERNANCE_DOCS if (root / doc).is_file()]
+    for book_id, entrypoint in BOOK_ENTRYPOINTS.items():
+        if entrypoint in resolved:
+            try:
+                resolved.extend(c.source_path for c in load_reference_book(root, book_id).chapters)
+            except (OSError, ValueError):
+                pass
+    return tuple(dict.fromkeys(resolved))
+
+
 def load_governance_doc(
     repo_dir: Path,
     rel_path: str,
@@ -385,9 +406,22 @@ def load_governance_doc(
     on_missing: str = "explicit",
     fallback: str = "",
 ) -> str:
-    """Load a governance/review document relative to ``repo_dir`` with explicit miss policy."""
+    """Load a governance/review document relative to ``repo_dir`` with explicit miss policy.
+
+    A reference-book entrypoint resolves to the COMPOSED book. The entrypoint
+    alone is an orientation page and a membership list: handing it to a review
+    surface that believes it received the architecture map would deliver zero
+    chapters while every caller's contract says "in full". An unassemblable
+    book takes the SAME miss policy as an unreadable file — one ladder, so a
+    failed book cannot render as a delivered one through a second wording.
+    """
+    from ouroboros.reference_books import BOOK_ENTRYPOINTS, compose_book, load_reference_book
+
     path = Path(repo_dir) / rel_path
+    book_id = next((key for key, entry in BOOK_ENTRYPOINTS.items() if entry == rel_path), None)
     try:
+        if book_id is not None:
+            return compose_book(load_reference_book(Path(repo_dir), book_id))
         if path.is_file():
             return path.read_text(encoding="utf-8")
     except Exception as exc:
@@ -632,6 +666,7 @@ def get_advisory_runtime_diagnostics(model: str, prompt_chars: int,
 def check_worktree_readiness(
     repo_dir: "Path",
     paths: "list[str] | None" = None,
+    *, information: "list[str] | None" = None,
 ) -> "list[str]":
     """Run cheap deterministic pre-advisory checks; never crash."""
     repo_dir = Path(repo_dir)
@@ -709,9 +744,13 @@ def check_worktree_readiness(
     # line rejects the same finding. Cheap since the history replay retired
     # (one live inventory plus a couple of git object reads).
     try:
-        from ouroboros.review import validate_size_ratchet  # local import: ouroboros.review imports this module
+        from ouroboros.review import collect_size_ratchet_inventory, size_headroom_lines, validate_size_ratchet
 
-        for finding in validate_size_ratchet(repo_dir):
+        inventory = collect_size_ratchet_inventory(repo_dir) if information is not None else None
+        if information is not None and inventory is not None:
+            touched = parse_changed_paths_from_porcelain(status_result.stdout or "") if status_result is not None else []
+            information.extend(size_headroom_lines(inventory, paths=touched))
+        for finding in validate_size_ratchet(repo_dir, inventory=inventory):
             warnings.append(f"official CI will enforce: {finding}")
     except Exception as exc:
         # A broken validator must not silently disable the only local surface —
@@ -755,7 +794,7 @@ def _run_review_preflight_tests(ctx: "Any", timeout: Optional[int] = None, *, fo
         return _truncate_review_artifact(output, limit=MAX_OUTPUT) if output else None
     except Exception as exc:
         logger.warning("_run_review_preflight_tests failed: %s", exc, exc_info=True)
-        return f"⚠️ Unexpected error running tests: {exc}"
+        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ERROR", text=(f"⚠️ Unexpected error running tests: {exc}")))
 
 
 def format_advisory_error(prefix: str, result_error: str, stderr_tail: str,
@@ -785,6 +824,7 @@ from ouroboros.tools.review_prompt_text import (  # noqa: E402, F401 -- intentio
     CRITICAL_FINDING_CALIBRATION,
     REPO_ANTI_PATTERN_LOCK_GUARD,
     REVIEW_PREAMBLE,
+    REVIEW_REPAIR_JUDGMENT,
     REVIEW_SEVERITY_THRESHOLDS,
     REVIEW_THOROUGHNESS_BLOCK,
     _ANTI_THRASHING_RULE_ITEM_NAME,
@@ -825,9 +865,6 @@ from ouroboros.tools.review_file_pack import (  # noqa: E402, F401 -- intentiona
     _VENDORED_SUFFIXES,
     _is_probably_binary,
     _raw_bytes_binary,
-    build_advisory_changed_context,
-    build_full_repo_pack,
-    build_head_snapshot_section,
     build_touched_file_pack,
     format_name_status_for_preflight,
     iter_repo_pack_entries,

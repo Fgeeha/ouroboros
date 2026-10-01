@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
+
 import hashlib
 import json
 from typing import Any, List
@@ -11,18 +13,28 @@ from ouroboros.tools.registry import ToolContext, ToolEntry
 PRESENCE_OUTCOMES = ("message", "silent", "tool_delivered", "deferred")
 
 
-def _finish_presence(ctx: ToolContext, outcome: str, message: str = "") -> str:
+def _finish_presence(ctx: ToolContext, outcome: str, message: str = "", action: str = "finish",
+                     rationale: str = "", answer_sha256: str | None = None) -> str:
     contract = getattr(ctx, "task_contract", {})
     if not isinstance(contract, dict) or not isinstance(contract.get("capability_ceiling"), dict):
-        return "ERROR: PRESENCE_COMPLETION_UNAVAILABLE: this is not a host-admitted presence turn."
+        return _publish_tool_result(ctx, ToolResult(status="unavailable", code="CAPABILITY_UNAVAILABLE", text=("ERROR: PRESENCE_COMPLETION_UNAVAILABLE: this is not a host-admitted presence turn.")))
     selected = str(outcome or "").strip()
     if selected not in PRESENCE_OUTCOMES:
-        return "ERROR: PRESENCE_OUTCOME_INVALID: choose message, silent, tool_delivered, or deferred."
+        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=("ERROR: PRESENCE_OUTCOME_INVALID: choose message, silent, tool_delivered, or deferred.")))
+    from ouroboros.tools.control_runtime import stage_completion_request
+    reply_later = not message and answer_sha256 is None and selected in {"message", "deferred"}
+    result = stage_completion_request(ctx, {"action": action, "rationale": rationale,
+        **({"answer_sha256": answer_sha256} if answer_sha256 is not None else {"answer": message})},
+        source="presence_finish", allow_empty=selected in {"silent", "tool_delivered"}, reply_later=reply_later)
+    if not getattr(ctx, "_completion_request", None) or getattr(ctx, "_completion_conflict", False):
+        return result
     ctx._presence_completion = {
         "outcome": selected,
         "message": str(message or "").strip(),
     }
-    return f"PRESENCE_COMPLETION_RECORDED: {selected}. Finish this turn now."
+    ctx._presence_completion_accepted = False
+    ctx._presence_completion_owner_revision = len(getattr(ctx, "_owner_directives", []) or [])
+    return result
 
 
 def _configure_presence(ctx: ToolContext, action: str, **params: Any) -> str:
@@ -37,15 +49,14 @@ def _configure_presence(ctx: ToolContext, action: str, **params: Any) -> str:
 
     root = canonical_data_root(ctx)
     selected = str(action or "").strip()
-    if selected in {"inspect", "select", "runtime"}:
-        from dataclasses import asdict
+    if selected in {"inspect", "select", "runtime", "workspace"}:
+        from dataclasses import asdict, replace
 
         from ouroboros.presence_capabilities import (
             PresenceArgumentBinding,
             PresenceResourceTarget,
             PresenceScriptTarget,
             PresenceSelection,
-            PresenceState,
             PresenceToolTarget,
             load_presence_state,
             presence_state_fingerprint,
@@ -59,7 +70,7 @@ def _configure_presence(ctx: ToolContext, action: str, **params: Any) -> str:
         loaded = find_skill(root, behavior_skill)
         profile = parse_presence_profile(loaded.manifest, loaded.skill_dir) if loaded is not None else None
         if loaded is None or profile is None:
-            return "ERROR: PRESENCE_PROFILE_NOT_FOUND"
+            return _publish_tool_result(ctx, ToolResult(status="unavailable", code="LEGACY_UNAVAILABLE", text=("ERROR: PRESENCE_PROFILE_NOT_FOUND")))
         state = load_presence_state(root, loaded.name)
         requests = {
             request.request_id: (request, presence_request_fingerprint(request))
@@ -81,18 +92,37 @@ def _configure_presence(ctx: ToolContext, action: str, **params: Any) -> str:
                         for request, fingerprint in requests.values()
                     ],
                     "selections": [asdict(item) for item in state.selections],
+                    "workspace_root": state.workspace_root,
                 },
                 ensure_ascii=False,
                 sort_keys=True,
                 default=str,
             )
+        if selected == "workspace":
+            from ouroboros.workspace_admission import validate_workspace_root
+
+            requested = params.get("workspace_root")
+            if not isinstance(requested, str):
+                return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text="ERROR: PRESENCE_WORKSPACE_REQUIRED: supply workspace_root, or an empty string to clear it."))
+            workspace = validate_workspace_root(
+                requested, system_repo_dir=ctx.repo_dir, drive_root=root,
+            )
+            updated = replace(state, workspace_root=str(workspace) if workspace is not None else "")
+            save_presence_state(
+                root, loaded.name, updated,
+                expected_state_fingerprint=presence_state_fingerprint(state),
+            )
+            return json.dumps({
+                "ok": True, "workspace_root": updated.workspace_root,
+                "state_fingerprint": presence_state_fingerprint(updated),
+            }, sort_keys=True)
         if selected == "runtime":
             reset = bool(params.get("reset_runtime"))
             overrides = PresenceRuntimeOverrides() if reset else PresenceRuntimeOverrides(
                 model_slot=(str(params.get("model_slot") or "").strip() or None),
                 inline_max_rounds=params.get("inline_max_rounds"),
             )
-            updated = PresenceState(state.selections, overrides)
+            updated = replace(state, runtime_overrides=overrides)
             save_presence_state(
                 root,
                 loaded.name,
@@ -110,7 +140,7 @@ def _configure_presence(ctx: ToolContext, action: str, **params: Any) -> str:
         request_id = str(params.get("request_id") or "").strip()
         request_row = requests.get(request_id)
         if request_row is None:
-            return "ERROR: PRESENCE_REQUEST_NOT_FOUND"
+            return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=("ERROR: PRESENCE_REQUEST_NOT_FOUND")))
         request, request_fingerprint = request_row
         target_type = str(params.get("target_type") or "").strip()
         if request.kind == "tool" and target_type == "tool":
@@ -134,13 +164,13 @@ def _configure_presence(ctx: ToolContext, action: str, **params: Any) -> str:
                 str(params.get("target_skill") or "").strip(),
             )
         else:
-            return "ERROR: PRESENCE_TARGET_KIND_MISMATCH"
+            return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=("ERROR: PRESENCE_TARGET_KIND_MISMATCH")))
         bindings = []
         for raw in params.get("argument_bindings") or []:
             if not isinstance(raw, dict):
-                return "ERROR: PRESENCE_ARGUMENT_BINDING_INVALID"
+                return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=("ERROR: PRESENCE_ARGUMENT_BINDING_INVALID")))
             if str(raw.get("source") or "").strip() == "resource":
-                return "ERROR: PRESENCE_RESOURCE_ARGUMENT_BINDING_UNSUPPORTED"
+                return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=("ERROR: PRESENCE_RESOURCE_ARGUMENT_BINDING_UNSUPPORTED")))
             resource_request_id = str(raw.get("resource_request_id") or "").strip()
             resource_fp = requests.get(resource_request_id, (None, ""))[1] if resource_request_id else ""
             bindings.append(PresenceArgumentBinding(
@@ -153,7 +183,7 @@ def _configure_presence(ctx: ToolContext, action: str, **params: Any) -> str:
         replacement = PresenceSelection(request_fingerprint, target, tuple(bindings))
         selections = [item for item in state.selections if item.request_fingerprint != request_fingerprint]
         selections.append(replacement)
-        updated = PresenceState(tuple(selections), state.runtime_overrides)
+        updated = replace(state, selections=tuple(selections))
         save_presence_state(
             root,
             loaded.name,
@@ -177,11 +207,11 @@ def _configure_presence(ctx: ToolContext, action: str, **params: Any) -> str:
             None,
         )
         if existing is None:
-            return "ERROR: PRESENCE_BINDING_NOT_FOUND"
+            return _publish_tool_result(ctx, ToolResult(status="unavailable", code="LEGACY_UNAVAILABLE", text=("ERROR: PRESENCE_BINDING_NOT_FOUND")))
         save_presence_binding(root, PresenceBinding(**{**existing.__dict__, "enabled": False}))
         return json.dumps({"ok": True, "binding_id": binding_id, "enabled": False})
     if selected != "create":
-        return "ERROR: PRESENCE_BINDING_ACTION_INVALID"
+        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=("ERROR: PRESENCE_BINDING_ACTION_INVALID")))
     origin = PresenceEndpoint(
         str(params.get("transport") or "").strip(),
         str(params.get("account_id") or "").strip(),
@@ -215,7 +245,7 @@ def _initiate_presence(
 
     from ouroboros.loop import _resolve_loop_max_rounds
     from ouroboros.presence_admission import admit_presence_turn
-    from ouroboros.presence_bindings import list_presence_bindings
+    from ouroboros.presence_bindings import conversation_key, list_presence_bindings
     from ouroboros.presence_runner import PresenceTurnEvent, run_presence_turn
     from ouroboros.tool_access import canonical_data_root
 
@@ -225,10 +255,10 @@ def _initiate_presence(
         None,
     )
     if selected is None or not selected.enabled:
-        return "ERROR: PRESENCE_BINDING_NOT_FOUND"
+        return _publish_tool_result(ctx, ToolResult(status="unavailable", code="LEGACY_UNAVAILABLE", text=("ERROR: PRESENCE_BINDING_NOT_FOUND")))
     prompt = str(message or "").strip()
     if not prompt:
-        return "ERROR: PRESENCE_INITIATION_MESSAGE_REQUIRED"
+        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=("ERROR: PRESENCE_INITIATION_MESSAGE_REQUIRED")))
     admission = admit_presence_turn(
         drive_root=root,
         authenticated_transport_skill=selected.transport_skill,
@@ -251,9 +281,9 @@ def _initiate_presence(
             account_id=endpoint.account_id,
             conversation_id=endpoint.conversation_id,
             thread_id=endpoint.thread_id,
-            conversation_key=":".join(filter(None, (
+            conversation_key=conversation_key(
                 endpoint.transport, endpoint.account_id, endpoint.conversation_id, endpoint.thread_id,
-            ))),
+            ),
             actor={"id": "ouroboros", "display_name": "Ouroboros", "kind": "proactive_initiation"},
             conversation={"kind": "configured_presence_destination"},
             message={"kind": "proactive_initiation"},
@@ -278,31 +308,22 @@ def _initiate_presence(
 
 
 def _cancel_presence_work(ctx: ToolContext, work_ref: str, reason: str = "") -> str:
-    """Cancel only work correlated to this exact presence binding/conversation."""
+    """Cancel work started from this presence binding (any of its conversations) or this turn's own tree."""
 
-    from ouroboros.task_results import load_task_result, validate_task_id
+    from ouroboros.presence_authority import presence_caller_binding, presence_work_refusal
+    from ouroboros.task_results import validate_task_id
     from ouroboros.tool_access import canonical_data_root
     from ouroboros.tools.join_ledger import _cancel_task
 
     try:
         task_id = validate_task_id(work_ref)
     except ValueError as exc:
-        return f"ERROR: PRESENCE_WORK_REF_INVALID: {exc}"
-    current_meta = getattr(ctx, "task_metadata", {})
-    current = current_meta.get("presence") if isinstance(current_meta, dict) else None
-    stored = load_task_result(canonical_data_root(ctx), task_id) or {}
-    target_meta = stored.get("metadata") if isinstance(stored.get("metadata"), dict) else {}
-    target = target_meta.get("presence") if isinstance(target_meta.get("presence"), dict) else None
-    if not isinstance(current, dict) or not isinstance(target, dict):
-        return "ERROR: PRESENCE_WORK_NOT_CORRELATED"
-    current_event = current.get("event") if isinstance(current.get("event"), dict) else {}
-    target_event = target.get("event") if isinstance(target.get("event"), dict) else {}
-    if (
-        str(current.get("binding_id") or "") != str(target.get("binding_id") or "")
-        or str(current_event.get("conversation_key") or "")
-        != str(target_event.get("conversation_key") or "")
-    ):
-        return "ERROR: PRESENCE_WORK_NOT_CORRELATED"
+        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(f"ERROR: PRESENCE_WORK_REF_INVALID: {exc}")))
+    refusal = presence_work_refusal(ctx, task_id, drive_root=canonical_data_root(ctx), same_tree=True)
+    # A speaker, or a root acting only for its binding: the binding authority decides, not speaker metadata.
+    if refusal or presence_caller_binding(ctx) is None:
+        return _publish_tool_result(ctx, ToolResult(status="blocked", code="ACCESS_BLOCKED", text=(
+            "ERROR: PRESENCE_WORK_NOT_CORRELATED: " + (refusal.split(": ", 1)[-1] or "this is not a presence task."))))
     return _cancel_task(ctx, task_id, reason)
 
 
@@ -314,18 +335,23 @@ def get_tools() -> List[ToolEntry]:
                 "name": "presence_finish",
                 "description": (
                     "Finish the current external presence turn with a typed delivery outcome. "
-                    "Call exactly once after the useful work is done. Choose message to return "
+                    "Choose finish after useful work, or stop with a rationale when work remains. Choose message to return "
                     "a conversational reply, silent when no reply is appropriate, tool_delivered "
                     "when an allowed tool already delivered the result, or deferred after long "
-                    "work was successfully promoted."
+                    "work was successfully promoted. With nonblank message text, or silent/tool_delivered, "
+                    "the host can finish after this tool batch without another model round. "
+                    "If finalization requests more work or a revision, complete it before finishing again."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "outcome": {"type": "string", "enum": list(PRESENCE_OUTCOMES)},
+                        "action": {"type": "string", "enum": ["finish", "stop"], "default": "finish"},
+                        "rationale": {"type": "string", "description": "For stop, what remains unfinished. Delivery outcome is independent."},
+                        "answer_sha256": {"type": "string", "description": "Select an offered complete answer instead of message or reply-later."},
                         "message": {
                             "type": "string",
-                            "description": "Reply text for message, or an immediate acknowledgement for deferred.",
+                            "description": "Reply text for message, or an immediate acknowledgement for deferred. Nonblank text or answer_sha256 enables immediate finalization. Omitting both explicitly reserves the next ordinary model reply, subject to normal budget and controls; it is not yet an authored no-spend stop. Use selected bytes or silent/tool_delivered to stop without another reply.",
                         },
                     },
                     "required": ["outcome"],
@@ -341,14 +367,19 @@ def get_tools() -> List[ToolEntry]:
                 "description": (
                     "Create, list, or disable an owner-controlled binding from an authenticated "
                     "transport room to one reviewed behavior skill. Use exact provider account, "
-                    "conversation and optional thread ids supplied by the owner or transport UI."
+                    "conversation and optional thread ids supplied by the owner or transport UI. "
+                    "Use workspace to select an existing working folder for new turns; memory stays shared."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "action": {
                             "type": "string",
-                            "enum": ["create", "list", "disable", "inspect", "select", "runtime"],
+                            "enum": ["create", "list", "disable", "inspect", "select", "runtime", "workspace"],
+                        },
+                        "workspace_root": {
+                            "type": "string",
+                            "description": "Existing external folder for action=workspace; empty clears the selection. Does not change capability grants or shared memory.",
                         },
                         "binding_id": {"type": "string"},
                         "transport_skill": {"type": "string"},
@@ -411,9 +442,10 @@ def get_tools() -> List[ToolEntry]:
             schema={
                 "name": "presence_cancel_work",
                 "description": (
-                    "Request cancellation of long work previously deferred from this exact "
-                    "presence binding and conversation. The opaque work_ref is correlation, "
-                    "not general task authority."
+                    "Request cancellation of independent work started from this presence "
+                    "binding, in this or another of its conversations (or of this turn's own "
+                    "children). The result is a request receipt, not proof the work stopped; "
+                    "work of another binding or the owner's own tasks is refused."
                 ),
                 "parameters": {
                     "type": "object",

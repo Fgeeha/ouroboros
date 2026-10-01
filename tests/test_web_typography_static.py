@@ -162,6 +162,27 @@ def test_type_scale_tokens_are_declared_once_in_the_root_block() -> None:
     )
 
 
+def test_chat_reading_ladder_is_relative_and_read_only_by_chat_headings() -> None:
+    """The one exception to the closed scale (docs/DESIGN.md §1): Markdown
+    headings in a full rich chat answer step up from the bubble's own reading
+    text. The steps are relative, so they cannot become a fifth UI size, and
+    only the rich answer's heading rules may read them: compact Markdown in a
+    bubble (a Skill Review report) keeps its --type-body labels."""
+    root = _root_declarations("web/ui.css")
+    ladder = {"--md-heading-major": "1.25em", "--md-heading-minor": "1.125em"}
+    assert {name: root.get(name) for name in ladder} == ladder
+    css = _decommented(_read("web/style.css"))
+    readers = [
+        " ".join(selector.split())
+        for selector, body in RULE.findall(css)
+        if any(f"var({name})" in body for name in ladder)
+    ]
+    assert readers == [
+        ".chat-bubble .message:where(.ui-rich-content) :is(.md-h1, .md-h2)",
+        ".chat-bubble .message:where(.ui-rich-content) .md-h3",
+    ], readers
+
+
 def _root_declarations(rel: str) -> dict[str, str]:
     """The ``:root`` block of a stylesheet as ``{token: value}``.
 
@@ -369,7 +390,10 @@ def test_every_css_variable_is_declared_somewhere() -> None:
     `--text-link` — each carrying a hardcoded fallback that was the value
     actually rendering, and three of those fallbacks (`#e5534b`, `#b58900`,
     `#16181d`) were colours from no palette in this product."""
-    js = _js_sources()
+    # Only a JS WRITE declares a variable: `setProperty('--x', …)` or an inline `--x: …` in a
+    # style string. A read (`getPropertyValue('--x')`) consumes one, so it must not vouch for it.
+    js_written = set(re.findall(r"""setProperty\(\s*['"`](--[\w-]+)|(?<![\w-])(--[a-z][\w-]*)\s*:""", _js_sources()))
+    js_written = {name for pair in js_written for name in pair if name}
     dangling: list[str] = []
     for document in ("web/index.html", "web/onboarding_template.html"):
         sheets = _document_stylesheets(document)
@@ -377,7 +401,7 @@ def test_every_css_variable_is_declared_somewhere() -> None:
         for rel in sheets:
             for lineno, line in enumerate(_decommented(_read(rel)).splitlines(), 1):
                 for name in VAR_REFERENCE.findall(line):
-                    if name not in declared and name not in js:
+                    if name not in declared and name not in js_written:
                         dangling.append(f"{document}: {rel}:{lineno}: var({name})")
     assert not dangling, (
         "these variables are never declared, in CSS or by a JS setProperty, so "
@@ -452,3 +476,112 @@ def test_every_focus_visible_selector_gets_the_canonical_ring() -> None:
         "focus there is either invisible or a second colour vocabulary "
         "(docs/DESIGN.md 'Focus'):\n" + "\n".join(f"  {s}" for s in unringed)
     )
+
+
+# ---------------------------------------------------------------------------
+# Horizontal overflow: the red scrollbar on Settings -> Advanced
+# ---------------------------------------------------------------------------
+
+
+def test_quiz_question_reads_as_text_with_its_own_emphasis() -> None:
+    """Pins the owner-visible defect "the whole question is one bold block": a
+    real question is a marked title plus several lines, so the question itself
+    is regular weight and only what it marks is semibold (DESIGN "Quiz card")."""
+    css = _decommented(_read("web/style.css"))
+
+    def weights(wanted: str) -> list[str]:
+        return [
+            part.split(":", 1)[1].strip()
+            for selector, body in RULE.findall(css)
+            if selector.strip() == wanted
+            for part in body.split(";")
+            if part.strip() and part.split(":", 1)[0].strip() == "font-weight"
+        ]
+
+    assert weights(".chat-quiz-question") == ["400"]
+    assert weights(".chat-quiz-question strong") == ["600"]
+
+
+def test_select_control_clips_its_value() -> None:
+    """Pins the owner-visible defect "Settings -> Advanced paints a horizontal
+    scrollbar in the desktop app": WebKit computes `overflow: visible` on a
+    native select (Blink's UA sheet clips it), so a long selected option leaks
+    out of the control and into the page scroller."""
+    css = _decommented(_read("web/ui.css"))
+    bodies = [
+        body for selector, body in RULE.findall(css)
+        if selector.strip() == "select.ui-control"
+    ]
+    assert bodies, "no `select.ui-control` rule in web/ui.css"
+    values = [
+        part.split(":", 1)[1].strip().lower()
+        for body in bodies
+        for part in body.split(";")
+        if part.strip() and part.split(":", 1)[0].strip() == "overflow"
+    ]
+    assert values, (
+        "`select.ui-control` declares no `overflow`, so WebKit lets a long "
+        "selected option paint past the control's own box and widen the "
+        "settings scroller"
+    )
+    assert all(value != "visible" for value in values), (
+        f"`select.ui-control` re-opens the clip: overflow {values}"
+    )
+
+
+def test_webkit_scrollbar_recipe_covers_both_axes() -> None:
+    """Pins the owner-visible defect "the scrollbar is thick and red": the
+    global `::-webkit-scrollbar` recipe sized only `width`, which is the
+    VERTICAL bar, so any horizontal bar kept the 16-17px UA thickness while
+    still wearing the accent thumb."""
+    css = _decommented(_read("web/style.css"))
+    bodies = [
+        body for selector, body in RULE.findall(css)
+        if selector.strip() == "::-webkit-scrollbar"
+    ]
+    assert bodies, "no global `::-webkit-scrollbar` rule in web/style.css"
+    declarations: dict[str, str] = {}
+    for body in bodies:
+        for part in body.split(";"):
+            if ":" not in part:
+                continue
+            name, _, value = part.partition(":")
+            declarations[name.strip().lower()] = value.strip().lower()
+    assert "width" in declarations and "height" in declarations, (
+        "the global scrollbar recipe must size both axes; it declares "
+        f"{sorted(declarations)}"
+    )
+    assert declarations["width"] == declarations["height"], (
+        "the horizontal bar must be as thin as the vertical one: "
+        f"width {declarations['width']} vs height {declarations['height']}"
+    )
+
+
+def test_every_mask_keeps_its_webkit_companion() -> None:
+    """A fade is a mask (`.scroll-fade-y`, the sideways table fade): each rule that
+    sets `mask-image` also sets `-webkit-mask-image`, as the file's first fade does,
+    so a WebKit view that reads only the prefixed property still fades and unfades."""
+    css = _decommented(_read("web/style.css"))
+    unpaired = [selector.strip() for selector, body in RULE.findall(css)
+                if re.search(r"(?<![-\w])mask-image\s*:", body) and "-webkit-mask-image" not in body]
+    assert not unpaired, f"mask-image without its -webkit- companion: {unpaired}"
+
+def test_chat_transcript_reserves_composer_space_as_one_flex_spacer():
+    """End space is a flex item; keyboard flow removes it and its extra gap."""
+    css = _decommented(_read("web/style.css"))
+    rules = [(selector.strip(), body) for selector, body in RULE.findall(css)]
+    assert not re.search(r"padding-bottom:\s*(?:calc\()?var\(--chat-input-reserve", css)
+    spacers = [(selector, body) for selector, body in rules if "chat-messages::after" in selector]
+    bases = [body for _, body in spacers if "flex:" in body]
+    assert len(bases) == 1
+    assert "content: '';" in bases[0]
+    assert "flex: 0 0 calc(var(--chat-input-reserve, 108px) - 8px);" in bases[0]
+    mobile = [body for _, body in spacers if "env(safe-area-inset-bottom" in body]
+    assert len(mobile) == 1
+    assert "- 8px" in mobile[0]
+    panel = [body for selector, body in spacers if selector == ".chat-instance-panel .chat-messages::after"]
+    assert len(panel) == 1
+    assert "flex-basis: calc(var(--chat-input-reserve, 108px) - 8px);" in panel[0]
+    keyboard = [body for selector, body in spacers if "body.keyboard-open" in selector]
+    assert len(keyboard) == 1
+    assert "content: none;" in keyboard[0]

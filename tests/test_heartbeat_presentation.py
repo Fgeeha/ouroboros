@@ -187,7 +187,7 @@ def test_owner_visible_incidents_use_canonical_message_seam() -> None:
 
 def test_cancel_failure_is_progress_incident_not_chat_bubble(monkeypatch) -> None:
     import supervisor.queue as q
-    from supervisor.events import _handle_cancel_task
+    from supervisor.events_runtime_controls import _drive_cancel_task_event as _handle_cancel_task
 
     sent = []
     # Phase A: the handler drives the TYPED custody outcome directly (the boolean
@@ -214,6 +214,7 @@ def test_cancel_failure_is_progress_incident_not_chat_bubble(monkeypatch) -> Non
     assert args[1].startswith("❌ cancel cancel-me")
     assert "watchdog" in args[1]  # the intent stays open and is retried
     assert kwargs == {
+        "role": "system", "system_type": "cancellation_notice",
         "is_progress": True,
         "task_id": "cancel-me",
         "progress_meta": {
@@ -225,7 +226,7 @@ def test_cancel_failure_is_progress_incident_not_chat_bubble(monkeypatch) -> Non
 
 def test_cancel_event_keeps_requested_retry_id_for_owner_presentation(monkeypatch) -> None:
     import supervisor.queue as q
-    from supervisor.events import _handle_cancel_task
+    from supervisor.events_runtime_controls import _drive_cancel_task_event as _handle_cancel_task
 
     captured = []
     monkeypatch.setattr(
@@ -273,7 +274,7 @@ def test_routine_cancel_outcomes_publish_nothing_to_the_owner_chat(monkeypatch) 
     causal history. Those three outcomes now publish nothing; only FAILED keeps
     its typed progress incident (the test above)."""
     import supervisor.queue as q
-    from supervisor.events import _handle_cancel_task
+    from supervisor.events_runtime_controls import _drive_cancel_task_event as _handle_cancel_task
 
     for outcome in (q.CANCEL_CANCELLED, q.CANCEL_ALREADY_SETTLED, q.CANCEL_NOT_FOUND):
         sent = []

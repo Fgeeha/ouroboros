@@ -64,7 +64,9 @@ direction-changing proposal. Small, well-understood fixes do not need
 ceremonial design work.
 
 Never commit local settings, credentials, runtime state, logs, caches,
-benchmark runs, generated review runs, or build artifacts.
+benchmark runs, generated review runs, or build artifacts. For tracked material,
+including campaign plans and optional reports, follow the
+[Documentation contract](docs/development/02-naming-and-boundaries.md#documentation-contract).
 
 ## 3. Branch from `ouroboros` and Do Not Bump the Version
 
@@ -105,11 +107,25 @@ base-to-head range, never uncommitted edits.
 ## 4. Verify the Change
 
 Use [`README.md` → Run from Source](README.md#run-from-source) for setup. Run
-focused tests while developing, then the default local suite when practical:
+focused tests while developing — you choose the narrowest targets that exercise
+the change — then the full local battery when practical:
 
 ```bash
-make test
+python scripts/run_tests.py            # or: make test
 ```
+
+That is the one fast recipe (node lane, then every default-lane test in a single
+xdist run); a bare `pytest tests/` runs the same tests in one process and takes
+many times longer. Like CI's default lanes it leaves out the opt-in marker
+lanes (`size_ratchet`, `browser`, `ui_browser`, `portable_detail`,
+`skill_smoke`, `integration`); a change that touches repository size or a
+reference-book chapter also runs `python -m pytest tests/ -m size_ratchet`. `python scripts/run_tests.py tests/test_x.py` forwards a
+focused run. Inside Ouroboros a reviewed commit (`commit_reviewed` /
+`vcs_commit_reviewed`) runs the complete battery in its hermetic gate unless
+`skip_tests` is set, so running it by hand first is optional rather than a
+second requirement; for a pull request, CI is that gate. If the full battery could
+not finish on your machine or within your budget, say so — `NOT_RUN` with the
+reason — and deliver the focused evidence; never report it as green.
 
 Record exact commands, outcomes, and producer exit codes. If a check could not
 run, record `NOT_RUN` and the reason instead of claiming it passed.
@@ -189,19 +205,19 @@ Ouroboros can produce review evidence in a structured SHA-bound packet. Its
 contributor mode uses the reviewer slots actually configured on the machine:
 `api_chat`, `agent_session`, or a mixture.
 
-Treat this command as **maintainer / large-window tooling**, not the default
-contributor path. The scope reviewer's required-artifact pack (protected
-runtime paths, prompts, contracts, canonical docs, the review stack) is
-required regardless of how small the diff is, and on a default install it
-can exceed the configured scope slot's context window even after every
-degradation step — the run then fails closed with `SCOPE_REVIEW_BLOCKED`
-and still preserves the evidence packet (marked incomplete). The documented
-routes past that pack budget are: configure the scope row as an
-`agent_session` reviewer (a different delivery class — it reads the
-repository with its own tools instead of being handed one assembled pack,
-and needs its own confirmed 200K+ window), or configure an API scope slot
-whose confirmed context window fits the pack. The agentic checklist review
-above needs neither.
+Treat this command as **maintainer tooling**, not the default contributor
+path. What a scope reviewer is owed in full is change-relative: the touched
+protected runtime paths, prompts and frozen contracts, with their declared
+families and cross-language twins. Everything else it reaches itself with
+read-only tools, so the run does not depend on a very large reviewer window.
+Reading coverage is diagnostic: incomplete or unobserved ranges are recorded
+beside the received verdict and never remove a responding reviewer from quorum,
+block a commit or automatically buy another review. The author judges whether
+a concrete gap warrants more reading. A scope review that cannot run at
+all — an unreadable repository, an unavailable review subject, a reviewer that
+failed or answered outside the contract — is reported as
+`SCOPE_REVIEW_BLOCKED` with its cause, and the evidence packet is preserved
+and marked incomplete. The agentic checklist review above needs none of this.
 
 Configured API slots need their provider credentials and a positive finite
 `TOTAL_BUDGET`. Agent-session slots need their configured agent route and

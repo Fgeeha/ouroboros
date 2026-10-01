@@ -5,7 +5,6 @@ import base64  # noqa: F401
 import json
 import logging
 import subprocess
-
 import os
 import pathlib
 import sys
@@ -17,13 +16,10 @@ from typing import Any, Dict, Optional
 
 from starlette.applications import Starlette
 from starlette.routing import Route, Mount
-
 import uvicorn
-
-from ouroboros.server_control import (
-    execute_panic_stop as _execute_panic_stop_impl,
-    restart_current_process as _restart_current_process_impl,
-)
+from ouroboros.server_control import (PanicIngress, execute_panic_stop as _execute_panic_stop_impl,
+                                      restart_current_process as _restart_current_process_impl)
+from ouroboros.startup_historical_audit import audit as _historical_audit
 from ouroboros.server_auth import (
     NetworkAuthGate,
     get_network_auth_startup_warning,
@@ -44,11 +40,10 @@ from ouroboros.gateway.ws import (
 )
 
 from ouroboros.server_process import (  # noqa: F401
-    DATA_DIR,
-    _owner_restart_requested,
-    _request_restart_exit,
-    _restart_requested,
-    _supervisor_stop,
+    DATA_DIR, _owner_restart_requested,
+    _request_restart_exit, _restart_requested,
+    _supervisor_stop, _exit_signalled,
+    _SignalStopServer, _embedded_uvicorn_server,
     log,
 )
 from ouroboros.server_routing_context import (  # noqa: F401
@@ -65,6 +60,7 @@ from ouroboros.server_routing_context import (  # noqa: F401
     _scoped_task_metadata,
     _task_belongs_to_chat,
     _task_result_ground_truth,
+    main_lane_routing_metadata,
 )
 from ouroboros.server_owner_routing import (  # noqa: F401
     _owner_evolution_stop,
@@ -78,9 +74,12 @@ from ouroboros.server_liveness import (  # noqa: F401
     _chat_turn_wedged,
     _start_supervisor_liveness_watchdog,
     _supervisor_loop_stalled,
+    drain_worker_events, flush_budget_projection,
 )
 from ouroboros.server_maintenance import (  # noqa: F401
     _LAST_CANCEL_INTENT_SWEEP,
+    _migrate_startup_cancel_latches,
+    _startup_worker_pids,
     _installed_skill_names,
     _periodic_supervisor_maintenance,
     _periodic_zombie_reconcile,
@@ -94,13 +93,10 @@ from ouroboros.server_maintenance import (  # noqa: F401
     _startup_worktree_prune,
 )
 from ouroboros.server_restart import (  # noqa: F401
-    _live_running_task_ids,
-    _managed_update_pending_kwargs,
-    _safe_restart_serialized,
-    _shutdown_supervisor_event_bus,
-    _shutdown_task_cleanup_args,
-    _stop_owned_daemon_for_new_pin,
-    _stop_owned_work,
+    _live_running_task_ids, _managed_update_pending_kwargs,
+    _perform_owner_restart, _safe_restart_serialized,
+    _shutdown_supervisor_event_bus, _shutdown_task_cleanup_args,
+    _stop_owned_daemon_for_new_pin, _stop_owned_work,
 )
 
 REPO_DIR = pathlib.Path(os.environ.get("OUROBOROS_REPO_DIR", pathlib.Path(__file__).parent))
@@ -120,7 +116,9 @@ _pytest_default_real_data_dir = (
     and not os.environ.get("OUROBOROS_DATA_DIR")
     and DATA_DIR == pathlib.Path.home() / "Ouroboros" / "data"
 )
-if _pytest_default_real_data_dir:
+if _pytest_default_real_data_dir or __name__ == "__mp_main__":
+    # A spawn/forkserver worker re-imports this module as ``__mp_main__``: it gets a stream
+    # handler only, so two processes never rotate ``server.log`` against each other.
     logging.basicConfig(level=logging.INFO, format=_LOG_FORMAT, handlers=[logging.StreamHandler()])
 else:
     _log_dir = DATA_DIR / "logs"
@@ -146,6 +144,7 @@ RESTART_EXIT_CODE = 42
 PANIC_EXIT_CODE = 99
 _planned_delegate_restart_transaction_id = ""
 _LAUNCHER_MANAGED = str(os.environ.get("OUROBOROS_MANAGED_BY_LAUNCHER", "") or "").strip() == "1"
+_LAUNCHER_MANAGED_REPO_DIR = str(os.environ.get("OUROBOROS_MANAGED_REPO_DIR", "") or "").strip()
 
 # Captured in main() for Settings LAN-reachability metadata.
 _BIND_HOST = DEFAULT_HOST
@@ -167,13 +166,38 @@ def _has_active_evolution_transaction() -> bool:
         return False
 
 
+def _launcher_managed_repo_matches() -> bool:
+    if not _LAUNCHER_MANAGED: return False
+    if not _LAUNCHER_MANAGED_REPO_DIR: return (REPO_DIR / ".git" / "ouroboros-managed.json").is_file()
+    try:
+        return pathlib.Path(_LAUNCHER_MANAGED_REPO_DIR).resolve(strict=False) == REPO_DIR.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
 def _restart_current_process(host: str, port: int) -> None:
+    # Every direct restart reaches this seam, including an assisted update whose
+    # native waits were already moved to PENDING before its resolver ran.
+    try:
+        from ouroboros.delegate_recovery import PLANNED_RESTART_TRANSACTION_ENV, arm_active_planned_restart_transaction
+        from ouroboros.server_restart import _RESTARTABLE_UPDATE_PHASES
+        from supervisor.update_merge import read_update_tx_strict
+
+        if any((DATA_DIR / "state" / name).exists() for name in ("owner_restart_no_resume.flag", "panic_stop.flag")):
+            os.environ.pop(PLANNED_RESTART_TRANSACTION_ENV, None)
+        else:
+            status, tx = read_update_tx_strict()
+            if status == "valid" and tx.get("phase") in _RESTARTABLE_UPDATE_PHASES:
+                arm_active_planned_restart_transaction(DATA_DIR)
+    except Exception:
+        log.warning("Direct restart transaction could not be armed; continuation remains unconfirmed", exc_info=True)
     _restart_current_process_impl(
         host, port, repo_dir=REPO_DIR, log=log,
         owner_initiated=_owner_restart_requested.is_set(),
     )
 
 from ouroboros.config import (
+    SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_SEC,
     SETTINGS_DEFAULTS,
     SettingsIntegrityError,
     load_settings, save_settings, verify_settings_integrity,
@@ -187,38 +211,56 @@ from ouroboros.server_runtime import (
     ws_heartbeat_loop,
 )
 
-_supervisor_ready = threading.Event()
+_supervisor_ready = threading.Event()  # a live generation finished init: the API's `supervisor_ready`
+_supervisor_init_done = threading.Event()  # init reached an outcome (ready OR `_supervisor_error`): boot waiters
 _supervisor_error: Optional[str] = None
 _event_loop: Optional[asyncio.AbstractEventLoop] = None
 _supervisor_thread: Optional[threading.Thread] = None
 _consciousness: Any = None
 
 
-def _describe_bg_consciousness_state(requested_enabled: bool) -> dict:
-    snapshot = _consciousness.status_snapshot() if _consciousness else {}
-    idle_reason = snapshot.get("last_idle_reason")
-    if not requested_enabled:
-        status, detail = "disabled", "Background consciousness is off."
-    elif not snapshot.get("running"):
-        status, detail = "stopped", "Enabled in state, but the background thread is not running."
-    elif snapshot.get("paused"):
-        status, detail = "paused", "Paused while another foreground task is active."
-    elif any(row.get("state") == "waiting" for row in snapshot.get("model_waits", {}).values()):
-        status, detail = "model_wait", "Model access wait; no worker slot held."
-    elif idle_reason == "thinking":
-        status, detail = "running", "Background consciousness is thinking now."
-    elif idle_reason == "budget_blocked":
-        status, detail = "budget_blocked", "Background consciousness hit its budget allocation and is waiting."
-    else:
-        status, detail = "running", "Background consciousness is idle between wakeups."
-        wakeup = int(snapshot.get("next_wakeup_sec") or 0)
-        if wakeup > 0:
-            detail += f" Next wakeup in {wakeup}s."
-    if idle_reason == "error_backoff" and snapshot.get("last_error"):
-        status = "error_backoff"
-        detail = f"Waiting to retry after an internal error: {snapshot['last_error']}"
+def _clock_of(iso_value: Any) -> str:
+    """``HH:MM`` in the server's local time for an ISO instant (``?`` when absent)."""
+    from ouroboros.deadline_utils import parse_deadline_ts
 
-    return {"enabled": requested_enabled, "status": status, "detail": detail, **snapshot}
+    parsed = parse_deadline_ts(str(iso_value or ""))
+    return parsed.astimezone().strftime("%H:%M") if parsed is not None else "?"
+
+
+def _describe_bg_consciousness_state(requested_enabled: bool | None) -> dict:
+    """Project the alarm clock's snapshot into one honest status + detail line
+    (``None``: the stored control is unknown, never read as off — #1307)."""
+    snapshot = _consciousness.status_snapshot() if _consciousness else {}
+    outcome = str(snapshot.get("last_wake_outcome") or "")
+    next_at = _clock_of(snapshot.get("next_wake_at"))
+    if requested_enabled is None:
+        status, detail = "unknown", "The stored consciousness control is unknown: runtime state is unavailable or recovering."
+    elif not requested_enabled:
+        status, detail = "disabled", "Background consciousness is off."
+    elif not snapshot:
+        status, detail = "stopped", "Enabled in state, but the alarm clock was not constructed (supervisor init failed)."
+    elif snapshot.get("live_wake_task_id"):
+        status, detail = "thinking", f"Wake-up {snapshot['live_wake_task_id']} is running as a Main turn."
+    elif outcome == "skipped:waiting_for_first_conversation":
+        status, detail = "waiting_for_first_conversation", "No owner chat is bound yet; the first conversation binds it."
+    elif outcome == "skipped:allowance_exhausted":
+        spent, daily = snapshot.get("spent_24h_usd"), snapshot.get("daily_usd")
+        status = "allowance_exhausted"
+        at_least = "at least " if int(snapshot.get("unknown_unmetered") or 0) > 0 else ""
+        degraded = "; ledger integrity degraded" if snapshot.get("integrity_degraded") else ""
+        detail = (f"Daily allowance spent ({at_least}${float(spent or 0):.2f} of ${float(daily or 0):.2f} in the last 24 h{degraded}); "
+                  f"next check at {_clock_of(snapshot.get('allowance_resets_at')) if snapshot.get('allowance_resets_at') else next_at}.")
+    elif outcome == "skipped:allowance_unknown":
+        status, detail = "allowance_unknown", f"The usage ledger could not be read ({snapshot.get('last_error') or 'unknown error'}); retry at {next_at}."
+    elif outcome.startswith("rejected:"):
+        status, detail = "wake_rejected", f"The last wake-up was refused ({outcome.split(':', 1)[1]}); next attempt at {next_at}."
+    elif outcome == "failed":
+        status, detail = "wake_failed", f"The last wake-up failed ({snapshot.get('last_error') or 'runner error'}); next attempt at {next_at}, backing off."
+    else:
+        status, detail = "sleeping", f"Sleeping until {next_at}."
+        if snapshot.get("pending_reason"):
+            detail += f" Early wake pending: {snapshot['pending_reason']}."
+    return {**snapshot, "enabled": requested_enabled, "status": status, "detail": detail}
 
 
 def _start_supervisor_if_needed(settings: dict) -> bool:
@@ -228,10 +270,14 @@ def _start_supervisor_if_needed(settings: dict) -> bool:
         return False
     if _supervisor_thread and _supervisor_thread.is_alive():
         return False
+    if _exit_signalled.is_set():
+        return False  # the process is exiting: no revival behind the teardown
     _supervisor_error = None
     _supervisor_stop.clear()  # in-process revival after a teardown-stopped generation
+    _supervisor_ready.clear()  # readiness is THIS generation's: Starting, not a stale Online, until init succeeds
+    _supervisor_init_done.clear()
     _supervisor_thread = threading.Thread(
-        target=_run_supervisor,
+        target=_supervisor_generation,
         args=(settings,),
         daemon=True,
         name="supervisor-main",
@@ -240,15 +286,63 @@ def _start_supervisor_if_needed(settings: dict) -> bool:
     return True
 
 
+def _supervisor_generation(settings: dict) -> None:
+    """Thread body: re-check the exit latch, then run one supervisor generation.
+
+    Admission (`_start_supervisor_if_needed`) and this thread start are separate steps,
+    so a settings save can pass the latch check a moment before SIGTERM; a generation
+    that starts anyway must end here, before its startup kill/spawn would run behind
+    the teardown's `kill_workers` (#1142).
+    """
+    global _supervisor_thread
+    if _exit_signalled.is_set():
+        _supervisor_thread = None
+        return
+    _run_supervisor(settings)
+
+
+def _preserve_unprocessed_updates(bridge, updates, consumed: int) -> int:
+    """Best effort, never raises: hand the tail behind the ``consumed``-th update back to the bridge, ids
+    intact, for this process's next read; what is not kept is logged as lost.
+    Memory only: it dies with process exit; accepted rows outlive it."""
+    tail, requeue, kept = list(updates[consumed:]), getattr(bridge, "requeue_updates", None), 0
+    try:
+        if tail and callable(requeue):
+            kept = int(requeue(tail) or 0)
+    except Exception as exc:
+        log.error("Bridge %s hand-back raised: %s", type(bridge).__name__, exc, exc_info=True)
+    if kept < len(tail):
+        log.error("Bridge %s cannot take back %d unprocessed update(s); they are lost", type(bridge).__name__, len(tail) - kept)
+    return kept
+
+
 def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
+    updates = bridge.get_updates(offset=offset, timeout=1)
+    cursor = [0]  # updates taken up so far, the one in flight included
+    try:
+        return _handle_bridge_update_batch(bridge, updates, offset, ctx, cursor)
+    except Exception as exc:
+        # The failing update is the crash the loop accounts for; the ones behind it were
+        # only dequeued, never handled, and come back next tick (the hand-back never raises).
+        failed = (updates[cursor[0] - 1] if 0 < cursor[0] <= len(updates) else {}).get("update_id")
+        kept = _preserve_unprocessed_updates(bridge, updates, cursor[0])
+        log.error("Bridge update %s failed: %s; %d later update(s) handed back to the bridge", failed, exc, kept)
+        raise
+
+
+def _handle_bridge_update_batch(bridge, updates, offset: int, ctx: Any, cursor: list) -> int:
     from supervisor.message_bus import coerce_chat_identity
 
-    updates = bridge.get_updates(offset=offset, timeout=1)
     for upd in updates:
+        cursor[0] += 1
         offset = int(upd["update_id"]) + 1
         msg = upd.get("message") or {}
         if not msg:
             continue
+        # get_updates may return several already-queued messages. Rebind the
+        # transport per message rather than using the last route in the batch.
+        if hasattr(bridge, "activate_update_transport"):
+            bridge.activate_update_transport(msg)
 
         chat_id = coerce_chat_identity((msg.get("chat") or {}).get("id"), 1)
         user_id = coerce_chat_identity((msg.get("from") or {}).get("id"), chat_id or 1)
@@ -287,16 +381,29 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
             )
             client_message_id = f"host-{uuid.uuid5(uuid.NAMESPACE_URL, identity).hex}"
 
-        st = ctx.load_state()
-        owner_id = st.get("owner_id")
         lowered = text.strip().lower()
         is_slash_command = lowered.startswith("/")
         is_external_transport = source != "web"
         external_identity_present = (not is_external_transport) or (chat_id > 0 and user_id > 0)
-        # Global owner = primary chat for outbound notices (web on desktop, the
-        # first transport on headless Colab). Bound once, on the first message.
-        if owner_id is None and external_identity_present:
-            owner_id = user_id
+        # Emergency Stop Invariant (#1307): the local door stops before any state read,
+        # chat record, state update or reply; an external transport needs a POSITIVELY
+        # bound owner (one lock-free read) and never registers a stranger from an unknown slot.
+        panic = lowered.startswith("/panic")
+        if panic and not is_external_transport:
+            _execute_panic_stop(ctx.consciousness, ctx.kill_workers)
+            return offset  # Never drain another already-queued message after Panic.
+        from supervisor.state import StateUnavailable, control_value
+
+        st = ctx.load_state()
+        if getattr(bridge, "panic", None) is not None:
+            bridge.panic.observe_owner(st)
+        from ouroboros.server_control import external_owner_binding
+
+        ext_known, owner_ext_id, bound_pair = external_owner_binding(st)
+        if panic and external_identity_present and ext_known and owner_ext_id is not None and (
+                bound_pair == (user_id, chat_id)):
+            _execute_panic_stop(ctx.consciousness, ctx.kill_workers)
+            return offset
 
         from supervisor.message_bus import record_inbound_message
 
@@ -312,14 +419,19 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
                 task_metadata["_host_operation"] = True
         reply_source = origin_message_ref if msg.get("accepted_source_ref") else None
         def reply(body: str, status: str = "completed") -> None:
-            ctx.send_with_budget(chat_id, body, **host_operation_reply_kwargs(reply_source, status))
+            ctx.send_with_budget(chat_id, body, **host_operation_reply_kwargs(reply_source, status), role="system", system_type="command_reply")
         def _stamp_owner_activity(live: dict) -> None:
-            if live.get("owner_id") is None and external_identity_present:
+            # Global owner = primary chat for outbound notices (web on desktop, the first
+            # transport on headless Colab), bound once — only into a slot KNOWN to be empty.
+            if control_value(live, "owner_id") == (True, None) and external_identity_present:
                 live["owner_id"] = user_id
                 live["owner_chat_id"] = _owner_binding_chat_id(ctx, chat_id, is_external_transport)
             live["last_owner_message_at"] = now_iso
 
-        ctx.update_state(_stamp_owner_activity)
+        try:
+            ctx.update_state(_stamp_owner_activity)
+        except StateUnavailable as exc:
+            log.warning("Owner activity not stamped: %s", exc)  # the message itself still proceeds
 
         if not text and not image_base64 and not (task_metadata or {}).get("chat_attachment_uploads"):
             continue
@@ -328,64 +440,42 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
             if not external_identity_present:
                 reply("⚠️ Command ignored: this transport did not provide owner identity.", "failed")
                 continue
-            owner_ext_id = st.get("owner_external_id")
-            owner_ext_chat_id = st.get("owner_external_chat_id")
+            if not ext_known:
+                reply("⚠️ Command ignored: the bound owner chat is unknown right now (runtime state "
+                      "is unavailable or recovering), so no command runs and no chat is registered.", "failed")
+                continue
             if owner_ext_id is None:
+                bound = {"ok": False}
+
                 def _bind_external_owner(live: dict) -> None:
-                    if live.get("owner_external_id") is None:
+                    if control_value(live, "owner_external_id") == (True, None):
                         live["owner_external_id"] = user_id
                         live["owner_external_chat_id"] = chat_id
                         live["owner_external_bound_at"] = now_iso
+                        bound["ok"] = True
 
-                ctx.update_state(_bind_external_owner)
-                reply("✅ Owner chat registered. Send the command again to execute it.")
+                try:
+                    saved_owner = ctx.update_state(_bind_external_owner)
+                    if getattr(bridge, "panic", None) is not None:
+                        bridge.panic.observe_owner(saved_owner)
+                except StateUnavailable:
+                    pass
+                reply("✅ Owner chat registered. Send the command again to execute it." if bound["ok"] else
+                      "⚠️ Command ignored: the owner chat could not be registered right now.",
+                      "completed" if bound["ok"] else "failed")
                 continue
-            try:
-                owner_ext_id_int = int(owner_ext_id or 0)
-                owner_ext_chat_id_int = int(owner_ext_chat_id or 0)
-            except (TypeError, ValueError):
-                owner_ext_id_int = 0
-                owner_ext_chat_id_int = 0
-            if owner_ext_id_int != user_id or owner_ext_chat_id_int != chat_id:
+            if bound_pair != (user_id, chat_id):
                 reply("⚠️ Command ignored: this transport is not the bound owner chat.", "failed")
                 continue
 
-        if lowered.startswith("/panic"):
-            reply("🛑 PANIC: killing everything. App will close.", "")
-            _execute_panic_stop(ctx.consciousness, ctx.kill_workers)
-        elif lowered.startswith("/restart"):
+        if lowered.startswith("/restart"):
             reply("♻️ Restarting.", "")
-            ok, restart_msg = _safe_restart_serialized(
-                ctx.safe_restart,
-                reason="owner_restart",
-                unsynced_policy="rescue_and_reset",
-            )
+            ok, restart_msg = _perform_owner_restart(ctx, reply)
             if not ok:
                 reply(f"⚠️ Restart cancelled: {restart_msg}", "failed")
                 continue
-            state_dir = DATA_DIR / "state"
-            owner_restart_flag = state_dir / "owner_restart_no_resume.flag"
-            stable_skip_flag = state_dir / "panic_stop.flag"
-            try:
-                state_dir.mkdir(parents=True, exist_ok=True)
-                owner_restart_flag.write_text("owner_restart", encoding="utf-8")
-                # Pair owner flag with panic_stop for stable-build auto-resume compatibility.
-                stable_skip_flag.write_text("owner_restart_no_resume", encoding="utf-8")
-            except Exception:
-                owner_restart_flag.unlink(missing_ok=True)
-                stable_skip_flag.unlink(missing_ok=True)
-                log.warning("Failed to write owner restart no-resume flag", exc_info=True)
-                reply("⚠️ Restart cancelled: could not write restart state.", "failed")
-                continue
-            # Everything reversible is behind us (checkout landed, no-resume
-            # intent durable): from here the restart always follows, and every
-            # unconfirmed stop is a critical diagnostic, never a deferral.
-            _stop_owned_work(ctx)
-            try:
-                reply("Stopping active task. New settings apply to the next message.", "")
-            except Exception:
-                log.warning("Failed to send owner restart stop notice; continuing restart", exc_info=True)
-            _request_restart_exit(owner=True)
+            _preserve_unprocessed_updates(bridge, updates, cursor[0])  # best effort; this generation handles nothing more
+            return offset  # Remaining accepted rows stay durable; no replay is promised.
         elif lowered == "/review" or lowered.startswith("/review "):
             # Target the requesting chat so the ack and results return to the
             # external transport owner, not the default web owner_chat_id.
@@ -398,69 +488,27 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
             if turn_on and len(parts) > 2:
                 objective = text.split(None, 2)[2].strip()
             if turn_on:
-                from supervisor.evolution_lifecycle import evolution_block_reason, start_evolution_campaign
-                from supervisor.state import update_state as _evo_update_state
+                from supervisor.events_runtime_controls import owner_evolution_start
 
-                block = evolution_block_reason()
-                if block:
-                    reply(block, "failed")
-                    continue
-                # GR4-6: clear the durable owner-stop flag BEFORE the campaign is
-                # minted — the old order (campaign first, flag cleared in the later
-                # save_state below) left a window where the owner-stop backstop,
-                # fired by an old evolution task settling, read flag=True +
-                # campaign=active and closed the FRESH campaign. Owner-authorized
-                # clear (the owner is explicitly starting evolution). GR5-1: the
-                # prior value is captured FIRST so a failed start can restore it.
-                _prior_owner_stop = bool(ctx.load_state().get("evolution_owner_stopped"))
-                _evo_update_state(lambda live: live.__setitem__("evolution_owner_stopped", False))
-                try:
-                    if not start_evolution_campaign(objective, source="owner_chat"):
-                        raise RuntimeError("campaign write was refused")
-                except Exception:
-                    log.warning("Failed to start evolution campaign", exc_info=True)
-                    # GR5-1: the start FAILED, so the pre-mint clear was not an
-                    # owner-authorized state change after all. Restore the CAPTURED
-                    # prior value — leaving it cleared would let the post-task
-                    # promotion pipeline (apply_pending_request reads the flag)
-                    # autonomously re-arm evolution the owner believes is off, and
-                    # an unconditional True would invent a stop that never happened.
-                    _evo_update_state(lambda live, _v=_prior_owner_stop: live.__setitem__(
-                        "evolution_owner_stopped", _v))
-                    reply("⚠️ Evolution stayed OFF: campaign state could not be created.", "failed")
-                    continue
-            st2 = ctx.load_state()
-            st2["evolution_mode_enabled"] = bool(turn_on)
-            if turn_on:
-                st2["evolution_consecutive_failures"] = 0
-            # Owner stop is AUTHORITATIVE against the post-task promotion pipeline: the
-            # durable evolution_owner_stopped flag (read by apply_pending_request) blocks an
-            # autonomous re-arm until the owner /evolve starts again. Set True on stop,
-            # cleared (False) on turn_on — the only owner-authorized clear.
-            st2["evolution_owner_stopped"] = (not turn_on)
-            # Owner-initiated evolution must not inherit a stale post-task one-shot
-            # autostop, which would disable the owner's campaign after one cycle.
-            st2["post_task_autostop"] = False
-            ctx.save_state(st2)
-            reply(f"🧬 Evolution campaign: {'ON' if turn_on else _owner_evolution_stop(ctx, chat_id)}")
+                refusal = owner_evolution_start(objective, source="owner_chat")
+                reply(refusal or "🧬 Evolution campaign: ON", "failed" if refusal else "completed")
+            else:
+                reply(f"🧬 Evolution campaign: {_owner_evolution_stop(ctx, chat_id)}")
         elif lowered.startswith("/bg"):
             parts = lowered.split()
             action = parts[1] if len(parts) > 1 else "status"
-            if action in ("start", "on", "1"):
-                result = ctx.consciousness.start()
-                _bg_s = ctx.load_state()
-                _bg_s["bg_consciousness_enabled"] = True
-                ctx.save_state(_bg_s)
-                reply(f"🧠 {result}")
-            elif action in ("stop", "off", "0"):
-                result = ctx.consciousness.stop()
-                _bg_s = ctx.load_state()
-                _bg_s["bg_consciousness_enabled"] = False
-                ctx.save_state(_bg_s)
-                reply(f"🧠 {result}")
+            if action in ("start", "on", "1", "stop", "off", "0"):
+                from supervisor.events_runtime_controls import persist_consciousness_choice
+
+                on = action in ("start", "on", "1")
+                result = ctx.consciousness.start() if on else ctx.consciousness.stop()
+                reply(f"🧠 {result}{persist_consciousness_choice(on)}")
             else:
-                bg_status = "running" if ctx.consciousness.is_running else "stopped"
-                reply(f"🧠 Background consciousness: {bg_status}")
+                from supervisor.state import control_value
+
+                known, enabled = control_value(ctx.load_state(), "bg_consciousness_enabled")
+                described = _describe_bg_consciousness_state(bool(enabled) if known else None)
+                reply(f"🧠 Background consciousness: {described['status']} — {described['detail']}")
         elif lowered.startswith("/status"):
             from supervisor.state import status_text
 
@@ -480,24 +528,20 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
                     "task_metadata": task_metadata,
                     "log_text": log_text,
                     "origin_message_ref": origin_message_ref,
-                    "source": source,
+                    "source": source, "received_at": str(msg.get("received_at") or ""),
                 },
             )
     return offset
 
 
 def _runtime_branch_defaults() -> tuple[str, str]:
-    branch_dev = "ouroboros"
-    branch_stable = "ouroboros-stable"
-    if not _LAUNCHER_MANAGED:
-        return branch_dev, branch_stable
-    try:
-        from supervisor import git_ops as git_ops_module
-        if hasattr(git_ops_module, "managed_branch_defaults"):
+    if _LAUNCHER_MANAGED:
+        try:
+            from supervisor import git_ops as git_ops_module
             return git_ops_module.managed_branch_defaults(REPO_DIR)
-    except Exception:
-        pass
-    return branch_dev, branch_stable
+        except Exception:
+            pass
+    return "ouroboros", "ouroboros-stable"
 
 
 def _bootstrap_supervisor_repo(settings: dict, git_ops_module=None):
@@ -516,7 +560,7 @@ def _bootstrap_supervisor_repo(settings: dict, git_ops_module=None):
     git_ops_module.ensure_repo_present()
     setup_remote_if_configured(settings, log)
 
-    if _LAUNCHER_MANAGED:
+    if _launcher_managed_repo_matches():
         # An in-flight managed-update assisted merge intentionally leaves MERGE_HEAD + the partly
         # resolved merge in the live worktree (over pre_update_sha). Use the NON-destructive
         # rescue_and_block policy so the bootstrap restart does not reset/clean that merge state
@@ -536,16 +580,16 @@ def _bootstrap_supervisor_repo(settings: dict, git_ops_module=None):
         )
         if not ok and policy == "rescue_and_block":
             try:
-                from supervisor.evolution_lifecycle import pause_evolution_campaign
-                from supervisor.state import load_state, save_state
+                from supervisor.evolution_lifecycle import disable_evolution_projection, pause_evolution_campaign
 
-                st = load_state()
-                st["evolution_mode_enabled"] = False
-                save_state(st)
+                disable_evolution_projection()
                 pause_evolution_campaign(f"bootstrap blocked to protect active evolution transaction: {msg}")
             except Exception:
                 log.debug("Failed to pause evolution after blocked bootstrap", exc_info=True)
         return ok, msg
+
+    if _LAUNCHER_MANAGED:
+        log.warning("Managed marker lacks matching repository identity; skipping destructive bootstrap for %s.", REPO_DIR)
 
     log.info("Local-dev server start detected — skipping bootstrap git reset.")
     deps_ok, deps_msg = git_ops_module.sync_runtime_dependencies(reason="bootstrap_local_dev")
@@ -556,6 +600,19 @@ def _bootstrap_supervisor_repo(settings: dict, git_ops_module=None):
     if import_result.get("ok"):
         return True, "OK: local-dev bootstrap"
     return False, f"Local-dev import test failed (rc={import_result.get('returncode', -1)})"
+
+
+def _initialize_runtime_state(settings: dict) -> None:
+    """The ONE explicit state initializer, run before chat ingress can record or bind
+    anything (#1307). An unavailable state is disclosed loudly and never minted; the
+    supervisor still serves independent work, chat and diagnosis."""
+    from supervisor.state import init as state_init, init_state
+
+    state_init(DATA_DIR, float(settings.get("TOTAL_BUDGET", SETTINGS_DEFAULTS["TOTAL_BUDGET"])))
+    boot_state = init_state()
+    if boot_state.quality not in {"current", "recovered"}:
+        log.critical("Runtime state is %s (%s): owner binding, evolution and consciousness "
+                     "controls stay unknown until it is readable", boot_state.quality, boot_state.reason)
 
 
 def _run_supervisor(settings: dict) -> None:
@@ -571,13 +628,25 @@ def _run_supervisor(settings: dict) -> None:
         except Exception:
             log.debug("Failed to stop previous consciousness instance", exc_info=True)
         _consciousness = None
+    prior_worker_pids: set[int] | None = None
+    _watchdog_stop = threading.Event()  # per-generation: set on EVERY exit of this generation
     try:
+        # Watch startup stalls; even a failed watchdog start publishes an init outcome.
+        from ouroboros.server_liveness import loop_phase_facts
+        _loop_liveness = [time.monotonic(), {}, time.thread_time(), None]  # slots: server_liveness.py
+        _loop_liveness[1], _loop_liveness[0] = loop_phase_facts(_loop_liveness, "startup", new_tick=True), time.monotonic()
+        _start_supervisor_liveness_watchdog(_loop_liveness, _watchdog_stop)
         ensure_legacy_imported(pathlib.Path(DATA_DIR))
+        from supervisor.state import control_is, load_state, save_state, update_state
+        from supervisor.state import append_jsonl, update_budget_from_usage, rotate_chat_log_if_needed, rotate_jsonl_log_if_needed
+        _initialize_runtime_state(settings)
 
-        from supervisor.message_bus import init as bus_init
-        from supervisor.message_bus import LocalChatBridge
+        from supervisor.message_bus import LocalChatBridge, init as bus_init
 
         bridge = LocalChatBridge(settings)
+        bridge.startup_owner_command = _startup_owner_command
+        bridge.panic = PanicIngress(_startup_owner_command("/panic"))
+        bridge.panic.observe_owner(load_state())
         bridge._broadcast_fn = broadcast_ws_sync
 
         from ouroboros.utils import set_log_sink
@@ -586,16 +655,9 @@ def _run_supervisor(settings: dict) -> None:
         set_log_sink(make_server_log_sink(bridge, pathlib.Path(DATA_DIR)))
 
         bus_init(
-            drive_root=DATA_DIR,
+            drive_root=DATA_DIR, budget_report_every=10, chat_bridge=bridge,
             total_budget_limit=float(settings.get("TOTAL_BUDGET", SETTINGS_DEFAULTS["TOTAL_BUDGET"])),
-            budget_report_every=10,
-            chat_bridge=bridge,
         )
-
-        from supervisor.state import init as state_init, init_state, load_state, save_state, update_state
-        from supervisor.state import append_jsonl, update_budget_from_usage, rotate_chat_log_if_needed, rotate_jsonl_log_if_needed
-        state_init(DATA_DIR, float(settings.get("TOTAL_BUDGET", SETTINGS_DEFAULTS["TOTAL_BUDGET"])))
-        init_state()
 
         from supervisor.git_ops import safe_restart
         ok, msg = _bootstrap_supervisor_repo(settings)
@@ -607,10 +669,11 @@ def _run_supervisor(settings: dict) -> None:
             persist_queue_snapshot, restore_pending_from_snapshot,
             cancel_task_by_id, queue_deep_self_review_task, sort_pending,
         )
+        from supervisor.direct_roots import publish_direct_roots
         from supervisor.workers import (
             init as workers_init, get_event_q, WORKERS, PENDING, RUNNING,
             spawn_workers, kill_workers, assign_tasks, ensure_workers_healthy,
-            handle_chat_direct, handle_chat_ephemeral, auto_resume_after_restart,
+            handle_chat_direct, auto_resume_after_restart,
         )
 
         max_workers = int(settings.get("OUROBOROS_MAX_WORKERS", 10))
@@ -622,15 +685,19 @@ def _run_supervisor(settings: dict) -> None:
             branch_dev=_workers_branch_dev, branch_stable=_workers_branch_stable,
         )
 
-        from supervisor.events import dispatch_event
         from supervisor.message_bus import send_with_budget
         from ouroboros.consciousness import BackgroundConsciousness
         import types
-        import queue as _queue_mod
 
-        restored_pending = restore_pending_from_snapshot()
+        _migrate_startup_cancel_latches(DATA_DIR)
+        prior_worker_pids = _startup_worker_pids(DATA_DIR)
+        interrupted_running: list = []
+        restored_pending = restore_pending_from_snapshot(terminalized=interrupted_running)
         kill_workers(preserve_pending=True)
         spawn_workers(max_workers)
+        from ouroboros.server_process import record_applied_restart_settings
+        record_applied_restart_settings({"OUROBOROS_MAX_WORKERS": max_workers,
+                                        "OUROBOROS_SKILLS_REPO_PATH": settings.get("OUROBOROS_SKILLS_REPO_PATH", "")})
         persist_queue_snapshot(reason="startup")
         try:
             from ouroboros.delegate_recovery import pre_adopt_planned_handoffs
@@ -638,65 +705,53 @@ def _run_supervisor(settings: dict) -> None:
             pre_adopt_planned_handoffs(DATA_DIR, list(PENDING))
         except Exception:
             log.debug("Planned delegate pre-adoption failed", exc_info=True)
-        _resume_interrupted_project_deletions()
-        # Original startup order preserved: drive prunes, custody sweep (reap
-        # orphaned processes), THEN worktree prune.
-        _startup_prune_sweeps()
         _startup_custody_sweep()
+        recovered_files = _run_startup_task_recovery(
+            DATA_DIR, REPO_DIR, skip_live_data=_pytest_default_real_data_dir,
+            prior_worker_pids=prior_worker_pids,
+        )
+        _resume_interrupted_project_deletions()
+        _startup_prune_sweeps(preserve_task_sources=bool(
+            recovered_files["unresolved"] or recovered_files["protected"] or recovered_files["errors"]))
         _startup_worktree_prune()
 
         _prune_delegated_snapshots()
 
-        try:
-            from ouroboros.observability import prune_observability_blobs
-            from ouroboros.tools.services import prune_service_logs
-
-            observability_report = prune_observability_blobs(DATA_DIR)
-            service_report = prune_service_logs(DATA_DIR)
-            if (
-                observability_report.get("enabled")
-                or observability_report.get("manifest_count")
-                or observability_report.get("blob_count")
-                or observability_report.get("deleted_manifests")
-                or observability_report.get("deleted_blobs")
-                or observability_report.get("errors")
-                or service_report.get("deleted_dirs")
-                or service_report.get("deleted_files")
-                or service_report.get("errors")
-            ):
-                append_jsonl(DATA_DIR / "logs" / "events.jsonl", {
-                    "ts": utc_now_iso(),
-                    "type": "runtime_artifact_prune",
-                    "observability": observability_report,
-                    "services": service_report,
-                })
-        except Exception:
-            log.debug("Runtime artifact prune failed", exc_info=True)
-
-        if restored_pending > 0:
+        if restored_pending > 0 or interrupted_running:
             st_boot = load_state()
             if st_boot.get("owner_chat_id"):
-                send_with_budget(int(st_boot["owner_chat_id"]),
-                    f"♻️ Restored pending queue from snapshot: {restored_pending} tasks.")
+                # The second clause states an INTENT, not an outcome: restore only
+                # fences an interrupted task with a durable cancel intent, and
+                # cancellation custody writes its terminal result a watchdog
+                # window later (task_lifecycle._INTENT_WATCHDOG_MIN_AGE_SEC).
+                notice = ["♻️"]
+                if restored_pending > 0:
+                    notice.append(f"Restored pending queue from snapshot: {restored_pending} tasks.")
+                if interrupted_running:
+                    count = len(interrupted_running)
+                    notice.append(
+                        f"Cancelling {count} task{'' if count == 1 else 's'} that "
+                        f"{'was' if count == 1 else 'were'} still running when the server stopped."
+                    )
+                send_with_budget(int(st_boot["owner_chat_id"]), " ".join(notice), role="system", system_type="startup_notice")
         _startup_retired_settings_notice(settings)
+        from ouroboros.upgrade_notices import startup_upgrade_notices
+        startup_upgrade_notices(settings)
 
         auto_resume_after_restart()
 
         def _get_owner_chat_id() -> Optional[int]:
             try:
-                st = load_state()
-                cid = st.get("owner_chat_id")
-                return int(cid) if cid else None
+                return int((load_state() or {}).get("owner_chat_id") or 0) or None
             except Exception:
                 return None
 
         _consciousness = BackgroundConsciousness(
-            drive_root=DATA_DIR, repo_dir=REPO_DIR,
-            event_queue=get_event_q(), owner_chat_id_fn=_get_owner_chat_id,
-        )
+            drive_root=DATA_DIR, repo_dir=REPO_DIR, owner_chat_id_fn=_get_owner_chat_id,
+            routing_metadata_fn=lambda cid: main_lane_routing_metadata(_event_ctx, cid))  # _event_ctx is built below
 
-        _bg_st = load_state()
-        if _bg_st.get("bg_consciousness_enabled"):
+        # A boot grant needs a KNOWN True and no unconsumed Panic flag (#1307).
+        if control_is(load_state(), "bg_consciousness_enabled", True) and not (DATA_DIR / "state" / "panic_stop.flag").exists():
             _consciousness.start()
             log.info("Background consciousness auto-restored from saved state.")
 
@@ -714,34 +769,48 @@ def _run_supervisor(settings: dict) -> None:
             safe_restart=safe_restart, kill_workers=kill_workers, spawn_workers=spawn_workers,
             sort_pending=sort_pending, consciousness=_consciousness,
             handle_chat_direct=handle_chat_direct,
-            handle_chat_ephemeral=handle_chat_ephemeral, request_restart=_request_restart_exit,
+            request_restart=_request_restart_exit,
         )
     except Exception as exc:
         _supervisor_error = f"Supervisor init failed: {exc}"
         _consciousness = None
         log.critical("Supervisor initialization failed", exc_info=True)
-        _supervisor_ready.set()
+        try:
+            # Provider-configured lifespan normally relies on this supervisor
+            # owner for boot recovery. If initialization itself fails, keep the
+            # same custody pass instead of serving with orphan RUNNING rows.
+            recovery_pids = prior_worker_pids
+            if recovery_pids is None:
+                try:
+                    recovery_pids = _startup_worker_pids(DATA_DIR)
+                except Exception:
+                    recovery_pids = None
+            _run_startup_task_recovery(
+                DATA_DIR, REPO_DIR, skip_live_data=_pytest_default_real_data_dir,
+                prior_worker_pids=recovery_pids,
+            )
+        except Exception:
+            log.critical("Startup recovery after supervisor initialization failure failed", exc_info=True)
+        _supervisor_ready.clear()  # never reached its loop: the API must not paint Online over the error
+        _supervisor_init_done.set()
         _supervisor_thread = None
+        _watchdog_stop.set()  # a generation that died in init has no loop to watch
         return
 
     _supervisor_ready.set()
+    _supervisor_init_done.set()
     log.info("Supervisor ready.")
+    _historical_audit.start(DATA_DIR, REPO_DIR)
 
     offset = 0
     crash_count = 0
     _last_custody_reap = [time.time()]
     _last_review_job_reconcile = [time.time()]
-    # WS3: a dedicated watchdog thread (outside this loop, so it fires even if the
-    # loop stalls) surfaces a wedge as an observable signal + owner alert instead
-    # of silent hours; the loop publishes a liveness tick each iteration. The tick
-    # is MONOTONIC: it is only ever read as an elapsed gap, so a wall-clock jump
-    # must not turn a healthy loop into a phantom stall (nor hide a real one).
-    _loop_liveness = [time.monotonic()]
-    _watchdog_stop = threading.Event()  # per-generation: stops the watchdog when THIS loop exits
-    _start_supervisor_liveness_watchdog(_loop_liveness, _watchdog_stop)
-    while not _restart_requested.is_set() and not _supervisor_stop.is_set():
+    # The watchdog was started before startup recovery; never start another here.
+
+    while not _restart_requested.is_set() and not _supervisor_stop.is_set() and not _exit_signalled.is_set():
         try:
-            _loop_liveness[0] = time.monotonic()
+            _loop_liveness[1], _loop_liveness[0] = loop_phase_facts(_loop_liveness, "events", new_tick=True), time.monotonic()
             rotate_chat_log_if_needed(DATA_DIR)
             # progress.jsonl rotates on the same supervisor tick (v6.90.x P2); its
             # readers (history backfill, SSE replay, api_logs_tail, TB ATIF) are
@@ -761,18 +830,14 @@ def _run_supervisor(settings: dict) -> None:
             rotate_jsonl_log_if_needed(DATA_DIR, "task_reflections.jsonl", "task_reflections")
             ensure_workers_healthy()
 
-            event_q = get_event_q()
-            while True:
-                try:
-                    evt = event_q.get_nowait()
-                except _queue_mod.Empty:
-                    break
-                if evt.get("type") == "restart_request":
-                    _handle_restart_in_supervisor(evt, _event_ctx)
-                    continue
-                dispatch_event(evt, _event_ctx)
+            # One BOUNDED events batch (count + time; the remainder waits for the next
+            # turn), so a producer that keeps the queue non-empty cannot hide intake.
+            backlog = drain_worker_events(
+                get_event_q(), _event_ctx, _loop_liveness, on_restart=_handle_restart_in_supervisor,
+            )
 
             if _restart_requested.is_set():
+                flush_budget_projection(_event_ctx)  # this turn's drained llm_usage still reaches state.json
                 break
 
             # WS3: intake new bridge messages EARLY — before the heavy steps
@@ -780,14 +845,21 @@ def _run_supervisor(settings: dict) -> None:
             # blocking step can never starve new-message intake (the wedge class
             # where no task_received fired for hours until a full restart).
             offset = _process_bridge_updates(bridge, offset, _event_ctx)
+            # The one budget-projection write of this turn (llm_usage events only mark it dirty).
+            flush_budget_projection(_event_ctx)
 
+            _loop_liveness[1], _loop_liveness[0] = loop_phase_facts(_loop_liveness, "maintenance"), time.monotonic()
             enforce_task_timeouts()
             try:
                 from supervisor.queue import check_scheduled_tasks
                 check_scheduled_tasks()
             except Exception:
                 log.warning("Scheduled task check failed", exc_info=True)
-            _periodic_supervisor_maintenance(_last_custody_reap, _last_review_job_reconcile)
+            _periodic_supervisor_maintenance(
+                _last_custody_reap, _last_review_job_reconcile, stop_event=_watchdog_stop,
+                on_orphans_healed=lambda count: _consciousness and _consciousness.notify(f"orphans_healed:{count}"),
+            )
+            _loop_liveness[1], _loop_liveness[0] = loop_phase_facts(_loop_liveness, "assign"), time.monotonic()
             # Loop-tick restart drain (no sleep, events keep flowing): while
             # draining a deferred restart, skip starting new work the restart
             # deadline would immediately chop (evolution / pending project tasks).
@@ -804,23 +876,26 @@ def _run_supervisor(settings: dict) -> None:
             if _restart_requested.is_set():
                 break  # restart just triggered (drain done) — exit without assigning new work (bridge intake already ran early this iteration)
             persist_queue_snapshot(reason="main_loop")
+            publish_direct_roots(_event_ctx.DRIVE_ROOT)
+            if _consciousness is not None:
+                try:
+                    _consciousness.tick(time.time())
+                except Exception:
+                    log.warning("Consciousness alarm tick failed", exc_info=True)
 
             crash_count = 0
-            time.sleep(0.5)
+            if not backlog:
+                time.sleep(0.5)  # a turn that hit its events bound drains the backlog at full speed
 
         except Exception as exc:
-            if _supervisor_stop.is_set() or _restart_requested.is_set():
-                # The shutdown/restart tore the bus down under this tick (a
-                # Manager proxy raising BrokenPipe/EOF): not a crash, no alarm.
+            if _supervisor_stop.is_set() or _restart_requested.is_set() or _exit_signalled.is_set():
+                # A shutdown-torn Manager proxy is not a supervisor crash.
                 log.info("Supervisor loop exiting on shutdown: %s", exc)
                 break
             crash_count += 1
             log.error("Supervisor loop crash #%d: %s", crash_count, exc, exc_info=True)
             if crash_count >= 3:
-                # Visible death: previously the loop returned with
-                # _supervisor_ready still set and no _supervisor_error, so
-                # tasks silently stopped being assigned with a healthy-looking
-                # /api/state. Record the failure and tell the owner.
+                # Clear readiness and notify: a dead loop must not look healthy.
                 _supervisor_error = f"Supervisor loop died after 3 consecutive crashes: {exc}"
                 _supervisor_ready.clear()
                 log.critical("Supervisor exceeded max retries: %s", _supervisor_error)
@@ -832,7 +907,7 @@ def _run_supervisor(settings: dict) -> None:
                             "🛑 Supervisor loop died after repeated crashes; tasks are no "
                             "longer being assigned. Saving settings or restarting the app "
                             f"will revive it. Last error: {exc}",
-                        )
+                            role="system", system_type="supervisor_failure")
                 except Exception:
                     log.debug("Failed to notify owner about supervisor death", exc_info=True)
                 break  # this generation is dead: the shared exit below stops its watchdog
@@ -858,7 +933,7 @@ def _handle_restart_in_supervisor(evt: Dict[str, Any], ctx: Any) -> None:
         ctx.send_with_budget(
             int(st["owner_chat_id"]),
             f"♻️ Restart requested by agent: {evt.get('reason')}",
-        )
+            role="system", system_type="restart_notice")
     from ouroboros.config import get_restart_drain_max_sec
 
     max_wait = get_restart_drain_max_sec()
@@ -877,7 +952,7 @@ def _handle_restart_in_supervisor(evt: Dict[str, Any], ctx: Any) -> None:
                 int(st["owner_chat_id"]),
                 f"⏳ Restart drain: waiting up to {max_wait}s for running task(s) "
                 f"{', '.join(sorted(live))} to finish.",
-            )
+                role="system", system_type="restart_notice")
         return
     _perform_supervisor_restart(
         ctx, restart_reason=str(evt.get("reason") or "agent_restart_request"),
@@ -927,7 +1002,7 @@ def _perform_supervisor_restart(
             ctx.send_with_budget(
                 int(st["owner_chat_id"]),
                 "🧬 Restart cancelled: the exact evolution restart receipt is missing.",
-            )
+                role="system", system_type="restart_notice")
         return
     if claim:
         from supervisor.evolution_lifecycle import check_evolution_authority
@@ -944,7 +1019,7 @@ def _perform_supervisor_restart(
                     int(st["owner_chat_id"]),
                     "🧬 Restart cancelled: evolution authority changed "
                     f"({authority.get('reason') or 'unknown'}).",
-                )
+                    role="system", system_type="restart_notice")
             return
         expected_sha = str(claim.get("commit_sha") or "")
         try:
@@ -973,7 +1048,7 @@ def _perform_supervisor_restart(
                     int(st["owner_chat_id"]),
                     "🧬 Restart cancelled: the live checkout no longer matches "
                     "the exact reviewed evolution commit.",
-                )
+                    role="system", system_type="restart_notice")
             return
     ok, msg = _safe_restart_serialized(
         ctx.safe_restart,
@@ -982,15 +1057,14 @@ def _perform_supervisor_restart(
     )
     if not ok:
         try:
-            from supervisor.evolution_lifecycle import pause_evolution_campaign
+            from supervisor.evolution_lifecycle import disable_evolution_projection, pause_evolution_campaign
 
-            st["evolution_mode_enabled"] = False
-            ctx.save_state(st)
+            disable_evolution_projection()
             pause_evolution_campaign(f"agent restart blocked to protect local changes: {msg}")
         except Exception:
             log.debug("Failed to pause evolution after blocked agent restart", exc_info=True)
         if st.get("owner_chat_id"):
-            ctx.send_with_budget(int(st["owner_chat_id"]), f"⚠️ Restart skipped: {msg}")
+            ctx.send_with_budget(int(st["owner_chat_id"]), f"⚠️ Restart skipped: {msg}", role="system", system_type="restart_notice")
         return
     cleanup_status, cleanup_reason = _shutdown_task_cleanup_args(restart_requested=True)
     global _planned_delegate_restart_transaction_id
@@ -1020,16 +1094,17 @@ def _perform_supervisor_restart(
         preserve_running_task_ids=planned_handoffs,
         **restart_kill_kwargs,
     )
-    st2 = ctx.load_state()
-    st2["session_id"] = uuid.uuid4().hex
-    ctx.save_state(st2)
+    try:  # a field update: a stale snapshot never erases a control written meanwhile (#1307)
+        ctx.update_state(lambda live: live.__setitem__("session_id", uuid.uuid4().hex))
+    except Exception:
+        log.warning("Restart session id not rotated: runtime state unavailable", exc_info=True)
     ctx.persist_queue_snapshot(reason="pre_restart_exit")
     _request_restart_exit()
 
 
 def _wait_for_supervisor_update_finalize() -> bool:
     """Wait for a real init outcome; slow dependency sync is not a failed boot."""
-    _supervisor_ready.wait()
+    _supervisor_init_done.wait()
     return not bool(_supervisor_error)
 
 
@@ -1053,7 +1128,7 @@ def _boot_managed_update_tasks() -> None:
 
                 owner_chat = int((_load_state() or {}).get("owner_chat_id") or 0)
                 if owner_chat:
-                    send_with_budget(owner_chat, f"📦 Managed update: {stash_note}")
+                    send_with_budget(owner_chat, f"📦 Managed update: {stash_note}", role="system", system_type="managed_update_notice")
             except Exception:
                 log.debug("stash note owner notification failed", exc_info=True)
         if result.get("rolled_back") is True:
@@ -1089,6 +1164,60 @@ def _execute_panic_stop(consciousness, kill_workers_fn) -> None:
         log=log,
         bound_port=_actual_bound_port(),
     )
+
+def _startup_owner_command(command: str, *, send_kwargs=None, source="web", user_id=0, chat_id=0, reply=None):
+    """Bind the emergency owner directly; startup Restart retains normal routing."""
+    verb = str(command).strip().lower()
+    if verb not in {"/panic", "/restart"}:
+        return None
+    from supervisor.message_bus import try_get_bridge
+
+    if (verb == "/restart" and _supervisor_thread and _supervisor_thread.is_alive()
+            and _supervisor_ready.is_set() and try_get_bridge() is not None):
+        return None  # Preserve the ready transport's ordinary metadata/acceptance path.
+
+    def execute():
+        from supervisor import workers
+
+        if verb == "/panic":
+            _execute_panic_stop(_consciousness, workers.kill_workers)
+            return True
+        if source != "web":
+            from ouroboros.server_control import external_owner_binding
+            from supervisor.state import load_state
+
+            known, owner, pair = external_owner_binding(load_state())
+            if not (known and owner is not None and user_id > 0 and chat_id > 0 and pair == (user_id, chat_id)):
+                return False  # Existing intake still owns refusal or first-time binding.
+        # Onboarding may finish after HTTP admission. A newly live consumer
+        # owns the ordinary command rather than two concurrent control paths.
+        bridge = try_get_bridge()
+        if (_supervisor_thread and _supervisor_thread.is_alive()
+                and _supervisor_ready.is_set() and bridge is not None):
+            if source == "web" and not (send_kwargs or {}).get("accepted_source_ref"):
+                bridge.ui_send(command, **({"broadcast": False, **(send_kwargs or {})}))
+            else:
+                bridge.enqueue_local_message(command, source=source, user_id=user_id,
+                                             chat_id=chat_id, **(send_kwargs or {}))
+            return True
+        from supervisor import state, git_ops
+        from types import SimpleNamespace
+        state.init(DATA_DIR)
+        branch_dev, branch_stable = _runtime_branch_defaults()
+        git_ops.init(REPO_DIR, DATA_DIR, "", branch_dev, branch_stable)
+        context = SimpleNamespace(safe_restart=git_ops.safe_restart,
+                                  RUNNING=workers.RUNNING, kill_workers=workers.kill_workers)
+        if reply is not None:
+            reply("♻️ Restarting.", "")
+        ok, message = _perform_owner_restart(context, reply)
+        if not ok:
+            log.error("Startup owner restart cancelled: %s", message)
+            if reply is not None:
+                reply(f"⚠️ Restart cancelled: {message}", "failed")
+        return True
+
+    return execute
+
 
 APP_START = time.time()
 
@@ -1188,13 +1317,14 @@ async def lifespan(app):
     except Exception:
         log.warning("Project registry boot reconcile failed", exc_info=True)
 
-    _supervisor_stop.clear()  # a fresh lifespan owns a fresh generation (symmetric with the teardown set)
+    if not _exit_signalled.is_set():
+        _supervisor_stop.clear()  # a fresh lifespan owns a fresh generation (symmetric with the teardown set)
     if has_startup_ready_provider(settings):
         _start_supervisor_if_needed(settings)
     else:
         _supervisor_ready.set()
+        _supervisor_init_done.set()
         log.info("No supported provider or local routing configured. Supervisor not started.")
-
     # P2: finalize a pending managed merge update (post-boot smoke / boot-loop rollback)
     # and run a one-shot boot-time update check (check-on-restart) so the main-screen
     # Update badge reflects availability. Both run OFF the startup critical path and
@@ -1234,7 +1364,6 @@ async def lifespan(app):
         init_global_event_bus().set_loop(_event_loop)
         init_global_supervisor(lifespan_drive_root)
         host_service_app = create_host_service_app(lifespan_drive_root)
-        host_service_app.state.get_background_model_wait = getattr(app.state, "get_background_model_wait", None)
         host_port = host_service_port()
         # Bind before starting the asyncio task: uvicorn's bind-error SystemExit
         # otherwise escapes run_forever and kills the main server. Keep that
@@ -1247,7 +1376,7 @@ async def lifespan(app):
             port=host_port,
             log_level="warning",
         )
-        host_service_server = uvicorn.Server(host_service_config)
+        host_service_server = _embedded_uvicorn_server(host_service_config)
         host_service_task = asyncio.create_task(
             host_service_server.serve(sockets=[host_socket]),
             name="host-service-api",
@@ -1271,11 +1400,11 @@ async def lifespan(app):
     # Startup-only: after the prior process generation is gone, finalize orphaned
     # RUNNING results and resolve an indeterminate post-task synthesis phase.
     # The periodic zombie sweep intentionally does not perform this recovery.
-    _run_startup_task_recovery(
-        lifespan_drive_root,
-        REPO_DIR,
-        skip_live_data=pytest_default_real_data_dir,
-    )
+    if not has_startup_ready_provider(settings):
+        _run_startup_task_recovery(
+            lifespan_drive_root, REPO_DIR, skip_live_data=pytest_default_real_data_dir,
+            prior_worker_pids=None if pytest_default_real_data_dir else _startup_worker_pids(lifespan_drive_root),
+        )
 
     # Reload enabled+reviewed extensions across restarts.
     try:
@@ -1327,6 +1456,48 @@ async def lifespan(app):
         yield
     finally:
         _supervisor_stop.set()  # first: the loop must know a teardown owns what follows
+        _historical_audit.stop()
+        log.info("Server shutting down...")
+        # Let the loop leave its current tick BEFORE workers are killed and the
+        # bridge/Manager go down: a tick still running would otherwise respawn
+        # a killed worker or meet BrokenPipe/EOF. Bounded well inside the
+        # launcher's force-exit budget; the stop flag already suppresses the
+        # crash counter if the join times out.
+        supervisor_thread = _supervisor_thread
+        if supervisor_thread is not None and supervisor_thread.is_alive():
+            supervisor_thread.join(timeout=2)
+        # Terminal custody FIRST: this is the teardown's one irreversible durable
+        # write and every wait below it is best effort (ARCHITECTURE, Shutdown).
+        try:
+            restart_requested = _restart_requested.is_set()
+            from supervisor.workers import kill_workers
+            cleanup_status, cleanup_reason = _shutdown_task_cleanup_args(restart_requested)
+            kill_workers(
+                force=True,
+                terminal_status=cleanup_status,
+                result_reason=cleanup_reason,
+                **_restart_cleanup_kwargs(),
+                **_managed_update_pending_kwargs(),
+            )
+            # Record an explicit shutdown cause so a task interrupted by the shutdown is
+            # never later read as a worker crash storm. Diagnostic, so it runs AFTER the
+            # custody write: append_jsonl waits up to two seconds for the log lock, and
+            # that wait must never spend the force-exit budget on unterminalized workers.
+            try:
+                from ouroboros.utils import append_jsonl, utc_now_iso
+                append_jsonl(
+                    lifespan_drive_root / "logs" / "supervisor.jsonl",
+                    {
+                        "ts": utc_now_iso(),
+                        "type": "server_shutdown",
+                        "cause": "restart_requested" if restart_requested else "external_signal",
+                        "restart_exit": restart_requested,
+                    },
+                )
+            except Exception:
+                log.debug("Failed to record server_shutdown event", exc_info=True)
+        except Exception:
+            pass
         if extension_reconcile_task is not None:
             extension_reconcile_task.cancel()
             with suppress(asyncio.CancelledError, asyncio.TimeoutError):
@@ -1348,15 +1519,6 @@ async def lifespan(app):
         with suppress(asyncio.CancelledError):
             await ws_heartbeat_task
 
-        log.info("Server shutting down...")
-        # Let the loop leave its current tick BEFORE workers are killed and the
-        # bridge/Manager go down: a tick still running would otherwise respawn
-        # a killed worker or meet BrokenPipe/EOF. Bounded well inside the
-        # launcher's force-exit budget; the stop flag already suppresses the
-        # crash counter if the join times out.
-        supervisor_thread = _supervisor_thread
-        if supervisor_thread is not None and supervisor_thread.is_alive():
-            supervisor_thread.join(timeout=2)
         try:
             from ouroboros.local_model import get_manager
             get_manager().stop_server()
@@ -1384,34 +1546,6 @@ async def lifespan(app):
                 supervisor.stop_all()
         except Exception:
             pass
-        try:
-            restart_requested = _restart_requested.is_set()
-            # Record an explicit shutdown cause so a task interrupted by the
-            # shutdown is never later read as a worker crash storm.
-            try:
-                from ouroboros.utils import append_jsonl, utc_now_iso
-                append_jsonl(
-                    lifespan_drive_root / "logs" / "supervisor.jsonl",
-                    {
-                        "ts": utc_now_iso(),
-                        "type": "server_shutdown",
-                        "cause": "restart_requested" if restart_requested else "external_signal",
-                        "restart_exit": restart_requested,
-                    },
-                )
-            except Exception:
-                log.debug("Failed to record server_shutdown event", exc_info=True)
-            from supervisor.workers import kill_workers
-            cleanup_status, cleanup_reason = _shutdown_task_cleanup_args(restart_requested)
-            kill_workers(
-                force=True,
-                terminal_status=cleanup_status,
-                result_reason=cleanup_reason,
-                **_restart_cleanup_kwargs(),
-                **_managed_update_pending_kwargs(),
-            )
-        except Exception:
-            pass
         if _restart_requested.is_set():
             try:
                 # A planned restart whose landed checkout pins another engine ends
@@ -1436,7 +1570,7 @@ app.app.state.app_start = APP_START  # type: ignore[attr-defined]
 app.app.state.supervisor_ready_event = _supervisor_ready  # type: ignore[attr-defined]
 app.app.state.get_supervisor_error = lambda: _supervisor_error  # type: ignore[attr-defined]
 app.app.state.describe_bg_consciousness_state = _describe_bg_consciousness_state  # type: ignore[attr-defined]
-app.app.state.get_background_model_wait = lambda: _consciousness.live_model_wait() if _consciousness else None
+app.app.state.startup_owner_command = _startup_owner_command
 app.app.state.request_restart = _request_restart_exit  # type: ignore[attr-defined]
 app.app.state.runtime_branch_defaults = _runtime_branch_defaults  # type: ignore[attr-defined]
 app.app.state.bind_host = _BIND_HOST  # type: ignore[attr-defined]
@@ -1462,6 +1596,7 @@ def _restart_cleanup_kwargs() -> dict:
 
 def _emergency_process_cleanup(*, port_sweep: bool = True) -> None:
     """Kill child processes, workers, companions, and runtime port holders."""
+    _historical_audit.stop()  # forced path may skip lifespan's finally; stop never waits
     try:
         from ouroboros.tools.shell import kill_all_tracked_subprocesses
         kill_all_tracked_subprocesses()
@@ -1542,8 +1677,11 @@ def main() -> int:
         saved_host = str(load_settings().get("OUROBOROS_SERVER_HOST") or "").strip()
     except Exception:
         saved_host = ""
-    default_host = os.environ.get("OUROBOROS_SERVER_HOST", "").strip() or saved_host or DEFAULT_HOST
+    env_host = os.environ.get("OUROBOROS_SERVER_HOST", "").strip()
+    default_host = env_host or saved_host or DEFAULT_HOST
     args = parse_server_args(default_host, DEFAULT_PORT)
+    host_source = "cli" if args.host_explicit else (
+        ("launcher" if _LAUNCHER_MANAGED else "environment") if env_host else "settings")
     global _BIND_HOST
     _BIND_HOST = args.host
     app.app.state.bind_host = args.host  # type: ignore[attr-defined]
@@ -1565,8 +1703,11 @@ def main() -> int:
         log_level="warning",
         ws_ping_interval=20,
         ws_ping_timeout=20,
+        # Bound the open HTTP/WS drain so the lifespan teardown (terminal custody) starts inside
+        # the launcher's stop budget instead of leaving terminalization to the next boot (#1142).
+        timeout_graceful_shutdown=SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_SEC,
     )
-    server = uvicorn.Server(config)
+    server = _SignalStopServer(config)
     _uvicorn_exited = threading.Event()
 
     def _check_restart():
@@ -1600,7 +1741,8 @@ def main() -> int:
     threading.Thread(target=_check_restart, daemon=True).start()
 
     try:
-        with bound_service_socket(DATA_DIR, "main", args.host, actual_port) as listener:
+        with bound_service_socket(DATA_DIR, "main", args.host, actual_port,
+                                  server_host_source=host_source) as listener:
             actual_port = _ACTUAL_BOUND_PORT = listener.getsockname()[1]
             write_port_file(PORT_FILE, actual_port)
             log.info("Starting Ouroboros server on %s:%d", args.host, actual_port)

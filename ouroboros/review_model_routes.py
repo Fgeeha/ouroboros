@@ -14,10 +14,11 @@ review family.
 from __future__ import annotations
 
 import dataclasses
-import os
 
 from ouroboros.model_slots import ResolvedModelTarget, _main_model, _parse_model_list
 from ouroboros.provider_models import (
+    _NON_COMPATIBLE_REMOTE_KEYS,
+    compatible_only_main_model,
     compute_direct_review_models_fallback,
     local_only_review_route_env,
     migrate_model_value,
@@ -25,21 +26,22 @@ from ouroboros.provider_models import (
     review_model_uses_local,
 )
 from ouroboros.settings_defaults import OPENROUTER_REVIEW_DEFAULTS, SETTINGS_DEFAULTS
+from ouroboros.settings_integrity import runtime_setting
 
 _DIRECT_PROVIDER_REVIEW_RUNS = 3
 
 
 def _exclusive_direct_remote_provider_env() -> str:
-    has_openrouter = bool(str(os.environ.get("OPENROUTER_API_KEY", "") or "").strip())
-    has_openai = bool(str(os.environ.get("OPENAI_API_KEY", "") or "").strip())
-    has_anthropic = bool(str(os.environ.get("ANTHROPIC_API_KEY", "") or "").strip())
-    has_minimax = bool(str(os.environ.get("MINIMAX_API_KEY", "") or "").strip())
-    has_legacy_base = bool(str(os.environ.get("OPENAI_BASE_URL", "") or "").strip())
-    has_compatible = bool(str(os.environ.get("OPENAI_COMPATIBLE_BASE_URL", "") or "").strip())
-    has_cloudru = bool(str(os.environ.get("CLOUDRU_FOUNDATION_MODELS_API_KEY", "") or "").strip())
-    has_gigachat = bool(str(os.environ.get("GIGACHAT_CREDENTIALS", "") or "").strip()) or (
-        bool(str(os.environ.get("GIGACHAT_USER", "") or "").strip())
-        and bool(str(os.environ.get("GIGACHAT_PASSWORD", "") or "").strip())
+    has_openrouter = bool(str(runtime_setting("OPENROUTER_API_KEY", "") or "").strip())
+    has_openai = bool(str(runtime_setting("OPENAI_API_KEY", "") or "").strip())
+    has_anthropic = bool(str(runtime_setting("ANTHROPIC_API_KEY", "") or "").strip())
+    has_minimax = bool(str(runtime_setting("MINIMAX_API_KEY", "") or "").strip())
+    has_legacy_base = bool(str(runtime_setting("OPENAI_BASE_URL", "") or "").strip())
+    has_compatible = bool(str(runtime_setting("OPENAI_COMPATIBLE_BASE_URL", "") or "").strip())
+    has_cloudru = bool(str(runtime_setting("CLOUDRU_FOUNDATION_MODELS_API_KEY", "") or "").strip())
+    has_gigachat = bool(str(runtime_setting("GIGACHAT_CREDENTIALS", "") or "").strip()) or (
+        bool(str(runtime_setting("GIGACHAT_USER", "") or "").strip())
+        and bool(str(runtime_setting("GIGACHAT_PASSWORD", "") or "").strip())
     )
     # OpenRouter / legacy OpenAI base / OpenAI-compatible all route through the
     # OpenRouter-style stack, so their presence means "not an exclusive direct
@@ -50,20 +52,36 @@ def _exclusive_direct_remote_provider_env() -> str:
     direct = [name for name, present in (
         ("openai", has_openai), ("anthropic", has_anthropic), ("minimax", has_minimax),
         ("cloudru", has_cloudru), ("gigachat", has_gigachat),
-        ("deepseek", bool(str(os.environ.get("DEEPSEEK_API_KEY", "") or "").strip())),
+        ("deepseek", bool(str(runtime_setting("DEEPSEEK_API_KEY", "") or "").strip())),
+        ("zai", bool(str(runtime_setting("ZAI_API_KEY", "") or "").strip())),
     ) if present]
     return direct[0] if len(direct) == 1 else ""
 
 
+def compatible_only_review_model() -> str:
+    """Main's route when the OpenAI-compatible endpoint is the only remote provider (#1116)."""
+    keys = ("OPENAI_COMPATIBLE_BASE_URL", "OUROBOROS_MODEL", "GIGACHAT_USER", "GIGACHAT_PASSWORD",
+            *_NON_COMPATIBLE_REMOTE_KEYS)
+    return compatible_only_main_model({key: runtime_setting(key, "") for key in keys})
+
+
+def _compatible_only_models(models: list[str]) -> list[str]:
+    """An unreachable (non-compatible) list becomes Main repeated; an explicit compatible list stays."""
+    main = compatible_only_review_model()
+    if not main or (models and all(str(m).startswith("openai-compatible::") for m in models)):
+        return models
+    return [main] * max(1, len(models))
+
+
 def direct_provider_review_models_fallback(provider: str) -> list[str]:
     """Return the exact review-models list a direct-provider fallback emits."""
-    if provider not in ("openai", "anthropic", "minimax", "cloudru", "gigachat", "deepseek"):
+    if provider not in ("openai", "anthropic", "minimax", "cloudru", "gigachat", "deepseek", "zai"):
         return []
     main_model = str(
-        os.environ.get("OUROBOROS_MODEL", SETTINGS_DEFAULTS["OUROBOROS_MODEL"]) or ""
+        runtime_setting("OUROBOROS_MODEL", SETTINGS_DEFAULTS["OUROBOROS_MODEL"]) or ""
     ).strip()
     main_model = migrate_model_value(provider, main_model)
-    user_light_raw = str(os.environ.get("OUROBOROS_MODEL_LIGHT", "") or "").strip()
+    user_light_raw = str(runtime_setting("OUROBOROS_MODEL_LIGHT", "") or "").strip()
     return compute_direct_review_models_fallback(
         provider,
         main_model,
@@ -84,14 +102,14 @@ def adaptive_quorum(n_slots: int) -> int:
 def get_review_models() -> list[str]:
     """Return the effective triad model list from the derived env plane."""
     default_str = ",".join(OPENROUTER_REVIEW_DEFAULTS["triad"])
-    models_str = os.environ.get("OUROBOROS_REVIEW_MODELS", default_str) or default_str
+    models_str = runtime_setting("OUROBOROS_REVIEW_MODELS", default_str) or default_str
     models = _parse_model_list(models_str)
     models = [_main_model()] * max(1, len(models)) if local_only_review_route_env() else models
     provider = _exclusive_direct_remote_provider_env()
     if not provider:
-        return models
+        return _compatible_only_models(models)
 
-    main_model = str(os.environ.get("OUROBOROS_MODEL", SETTINGS_DEFAULTS["OUROBOROS_MODEL"]) or "").strip()
+    main_model = str(runtime_setting("OUROBOROS_MODEL", SETTINGS_DEFAULTS["OUROBOROS_MODEL"]) or "").strip()
     main_model = migrate_model_value(provider, main_model)
     provider_prefix = f"{provider}::"
     if not main_model.startswith(provider_prefix):
@@ -143,18 +161,18 @@ def get_scope_review_targets() -> tuple[ResolvedModelTarget, ...]:
 def get_review_enforcement() -> str:
     """Return the configured pre-commit review enforcement mode."""
     default_val = str(SETTINGS_DEFAULTS["OUROBOROS_REVIEW_ENFORCEMENT"])
-    raw = (os.environ.get("OUROBOROS_REVIEW_ENFORCEMENT", default_val) or default_val).strip().lower()
+    raw = (runtime_setting("OUROBOROS_REVIEW_ENFORCEMENT", default_val) or default_val).strip().lower()
     return raw if raw in {"advisory", "blocking"} else default_val
 
 
 def get_scope_review_models() -> list[str]:
     """Return effective scope reviewer models, preserving duplicate model IDs."""
     default_str = ",".join(OPENROUTER_REVIEW_DEFAULTS["scope"])
-    raw = os.environ.get("OUROBOROS_SCOPE_REVIEW_MODELS", "") or ""
+    raw = runtime_setting("OUROBOROS_SCOPE_REVIEW_MODELS", "") or ""
     if not raw.strip():
-        raw = os.environ.get("OUROBOROS_SCOPE_REVIEW_MODEL", default_str) or default_str
+        raw = runtime_setting("OUROBOROS_SCOPE_REVIEW_MODEL", default_str) or default_str
     models = _parse_model_list(raw)
-    singular = str(os.environ.get("OUROBOROS_SCOPE_REVIEW_MODEL", OPENROUTER_REVIEW_DEFAULTS["scope"][0]) or "").strip()
+    singular = str(runtime_setting("OUROBOROS_SCOPE_REVIEW_MODEL", OPENROUTER_REVIEW_DEFAULTS["scope"][0]) or "").strip()
     if not models and singular:
         models = [singular]
     if not models:
@@ -162,7 +180,7 @@ def get_scope_review_models() -> list[str]:
     models = [_main_model()] * max(1, len(models)) if local_only_review_route_env() else models
     provider = _exclusive_direct_remote_provider_env()
     if not provider:
-        return models
+        return _compatible_only_models(models)
     migrated = [migrate_model_value(provider, model) for model in models]
     provider_prefix = f"{provider}::"
     if migrated and all(model.startswith(provider_prefix) for model in migrated):

@@ -404,9 +404,7 @@ def test_supervisor_schedule_path_preserves_admitted_cap_after_live_depth_decrea
     tmp_path, monkeypatch,
 ):
     from supervisor import events
-    from supervisor import events_schedule_task as schedule_module
 
-    monkeypatch.setattr(schedule_module, "_find_duplicate_task", lambda *args, **kwargs: None)
     monkeypatch.setattr(events, "get_max_subagent_depth", lambda: 1)
     contract = build_task_contract({
         "delegation_budget": {
@@ -508,9 +506,7 @@ def test_supervisor_ingress_bounds_legacy_permission_by_admitted_remaining_envel
 
 def test_supervisor_ingress_records_explicit_root_depth_request(tmp_path, monkeypatch):
     from supervisor import events
-    from supervisor import events_schedule_task as schedule_module
 
-    monkeypatch.setattr(schedule_module, "_find_duplicate_task", lambda *args, **kwargs: None)
     contract = build_task_contract({
         "delegation_budget": {"depth_remaining": 3},
     })
@@ -609,6 +605,7 @@ def _fake_ctx(tmp_path, enqueued):
 
         def enqueue_task(self, task):
             enqueued.append(task)
+            return task
 
         def persist_queue_snapshot(self, reason=""):
             return None
@@ -621,9 +618,7 @@ def _fake_ctx(tmp_path, enqueued):
 
 def test_supervisor_admission_enforces_parent_rights_and_allows_one_non_fanout_child(tmp_path, monkeypatch):
     from supervisor import events
-    from supervisor import events_schedule_task as schedule_module
 
-    monkeypatch.setattr(schedule_module, "_find_duplicate_task", lambda *args, **kwargs: None)
     parent_contract = build_task_contract({"delegation_budget": {"may_fan_out": False}})
     write_task_result(tmp_path, "parent", STATUS_RUNNING, parent_task_id="", root_task_id="parent",
                       delegation_role="root", task_contract=parent_contract)
@@ -641,9 +636,7 @@ def test_supervisor_admission_enforces_parent_rights_and_allows_one_non_fanout_c
 
 def test_supervisor_rejects_invalid_depth_before_provisioning_or_enqueue(tmp_path, monkeypatch):
     from supervisor import events
-    from supervisor import events_schedule_task as schedule_module
 
-    monkeypatch.setattr(schedule_module, "_find_duplicate_task", lambda *args, **kwargs: None)
     for index, raw_depth in enumerate((-1, -0.5, "-1", "not-a-depth")):
         task_id = f"invalid-depth-{index}"
         enqueued = []
@@ -661,9 +654,7 @@ def test_supervisor_rolls_back_subagent_when_scheduled_result_write_fails(
     tmp_path, monkeypatch,
 ):
     from supervisor import events, task_admission
-    from supervisor import events_schedule_task as schedule_module
 
-    monkeypatch.setattr(schedule_module, "_find_duplicate_task", lambda *args, **kwargs: None)
     parent_contract = build_task_contract({"delegation_budget": {"may_fan_out": False}})
     write_task_result(
         tmp_path, "parent", STATUS_RUNNING,
@@ -724,9 +715,7 @@ def test_supervisor_receipt_rollback_removes_only_its_enqueue_identity(
     tmp_path, monkeypatch,
 ):
     from supervisor import events, task_admission
-    from supervisor import events_schedule_task as schedule_module
 
-    monkeypatch.setattr(schedule_module, "_find_duplicate_task", lambda *args, **kwargs: None)
     parent_contract = build_task_contract({"delegation_budget": {"may_fan_out": True}})
     write_task_result(
         tmp_path, "parent", STATUS_RUNNING,
@@ -794,7 +783,6 @@ def test_replayed_schedule_event_keeps_one_physical_task_and_transition(
     from supervisor import events, queue, state, workers
     from supervisor import events_schedule_task as schedule_module
 
-    monkeypatch.setattr(schedule_module, "_find_duplicate_task", lambda *args, **kwargs: None)
     write_task_result(
         tmp_path, "parent", STATUS_RUNNING,
         root_task_id="parent", delegation_role="root",
@@ -847,7 +835,7 @@ def test_replayed_schedule_event_keeps_one_physical_task_and_transition(
     monkeypatch.setattr(workers, "WORKERS", worker_map)
     monkeypatch.setattr(workers, "load_state", lambda: {})
     monkeypatch.setattr(state, "budget_remaining", lambda *_args, **_kwargs: 100.0)
-    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": None)
+    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": True)
 
     workers.assign_tasks()
 
@@ -884,7 +872,7 @@ def test_assignment_quarantines_bypassed_invalid_depth_and_normalizes_legacy_row
     monkeypatch.setattr(workers, "WORKERS", {1: worker})
     monkeypatch.setattr(workers, "load_state", lambda: {})
     monkeypatch.setattr(state, "budget_remaining", lambda *_args, **_kwargs: 100.0)
-    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": None)
+    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": True)
     monkeypatch.setattr(
         workers,
         "_emit_task_done_terminal",
@@ -1125,9 +1113,7 @@ def test_supervisor_keeps_admission_when_scheduled_write_raises_after_commit(
     tmp_path, monkeypatch,
 ):
     from supervisor import events, task_admission
-    from supervisor import events_schedule_task as schedule_module
 
-    monkeypatch.setattr(schedule_module, "_find_duplicate_task", lambda *args, **kwargs: None)
     parent_contract = build_task_contract({"delegation_budget": {"may_fan_out": False}})
     write_task_result(
         tmp_path, "parent", STATUS_RUNNING,
@@ -1171,9 +1157,7 @@ def test_supervisor_rolls_back_when_monotonic_writer_returns_old_terminal(
     tmp_path, monkeypatch,
 ):
     from supervisor import events
-    from supervisor import events_schedule_task as schedule_module
 
-    monkeypatch.setattr(schedule_module, "_find_duplicate_task", lambda *args, **kwargs: None)
     parent_contract = build_task_contract({"delegation_budget": {"may_fan_out": True}})
     write_task_result(
         tmp_path, "parent", STATUS_RUNNING,
@@ -1247,9 +1231,7 @@ def test_schedule_exact_id_preserves_unreadable_result_and_does_not_enqueue(
     tmp_path, monkeypatch,
 ):
     from supervisor import events
-    from supervisor import events_schedule_task as schedule_module
 
-    monkeypatch.setattr(schedule_module, "_find_duplicate_task", lambda *args, **kwargs: None)
     result_path = tmp_path / "task_results" / "child-malformed.json"
     result_path.parent.mkdir()
     malformed = b'{"status":"scheduled"'
@@ -1273,9 +1255,7 @@ def test_schedule_exact_id_preserves_unreadable_result_and_does_not_enqueue(
 
 def test_late_schedule_lookup_failure_preserves_exact_result(tmp_path, monkeypatch):
     from supervisor import events, task_admission
-    from supervisor import events_schedule_task as schedule_module
 
-    monkeypatch.setattr(schedule_module, "_find_duplicate_task", lambda *args, **kwargs: None)
     result_path = tmp_path / "task_results" / "late-corrupt.json"
     result_path.parent.mkdir()
     original = b"{late-corrupt"
@@ -1296,9 +1276,7 @@ def test_late_schedule_lookup_failure_preserves_exact_result(tmp_path, monkeypat
 
 def test_generic_late_schedule_lookup_failure_preserves_exact_result(tmp_path, monkeypatch):
     from supervisor import events, queue
-    from supervisor import events_schedule_task as schedule_module
 
-    monkeypatch.setattr(schedule_module, "_find_duplicate_task", lambda *args, **kwargs: None)
     result_path = tmp_path / "task_results" / "generic-late-corrupt.json"
     result_path.parent.mkdir()
     original = b"{generic-late-corrupt"
@@ -1324,9 +1302,7 @@ def test_generic_late_schedule_lookup_failure_preserves_exact_result(tmp_path, m
 
 def test_generic_schedule_replay_preserves_valid_exact_result(tmp_path, monkeypatch):
     from supervisor import events, queue
-    from supervisor import events_schedule_task as schedule_module
 
-    monkeypatch.setattr(schedule_module, "_find_duplicate_task", lambda *args, **kwargs: None)
     write_task_result(
         tmp_path, "generic-existing", "completed",
         root_task_id="generic-existing", delegation_role="root", result="keep me",
@@ -1361,9 +1337,7 @@ def test_generic_malformed_replay_preserves_live_exact_result(
     tmp_path, monkeypatch, status, location,
 ):
     from supervisor import events, queue
-    from supervisor import events_schedule_task as schedule_module
 
-    monkeypatch.setattr(schedule_module, "_find_duplicate_task", lambda *args, **kwargs: None)
     tid = f"generic-live-{location}"
     write_task_result(
         tmp_path,
@@ -1487,9 +1461,7 @@ def test_supervisor_rejects_count_bounded_child_when_count_scan_fails(
     tmp_path, monkeypatch,
 ):
     from supervisor import events
-    from supervisor import events_schedule_task as schedule_module
 
-    monkeypatch.setattr(schedule_module, "_find_duplicate_task", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         "ouroboros.task_results.list_task_results",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("unreadable")),

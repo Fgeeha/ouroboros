@@ -34,6 +34,8 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from ouroboros.platform_layer import (
+    IS_WINDOWS,
+    current_process_group_id,
     kill_process_group_id,
     kill_process_tree,
     pid_is_alive,
@@ -162,6 +164,7 @@ def spawn_supervised(
     scope: str,
     owner_task_id: str = "",
     new_process_group: bool = True,
+    on_spawn: Any = None,
     **popen_kwargs: Any,
 ) -> subprocess.Popen:
     """Popen + durable custody record (the single supervised chokepoint).
@@ -170,6 +173,8 @@ def spawn_supervised(
     any time later cannot orphan the child invisibly (the reaper finds it in the
     ledger); a hard kill INSIDE that spawn-to-record window is the disclosed
     residual — such a child is unledgered and the reaper cannot see it.
+    ``on_spawn`` publishes the Popen into its existing owner before custody I/O;
+    it must not wait or persist. Callback failure follows normal spawn cleanup.
     """
     if new_process_group:
         merged = dict(subprocess_new_group_kwargs())
@@ -177,6 +182,8 @@ def spawn_supervised(
         popen_kwargs = merged
     proc = subprocess.Popen(cmd, **popen_kwargs)  # noqa: S603 — callers pass vetted argv lists
     try:
+        if on_spawn is not None:
+            on_spawn(proc)
         record_process(
             drive_root,
             pid=proc.pid,
@@ -251,6 +258,11 @@ def _fingerprint_matches(entry: Dict[str, Any], *, require_measured: bool = Fals
     recorded_cmd = str(fp.get("cmd_sha256") or "")
     if require_measured and not ((recorded_boot or recorded_start) and recorded_cmd):
         return False
+    if IS_WINDOWS and not (recorded_boot or recorded_start):
+        # Before native Windows observations this hash came from submitted argv,
+        # not the live command spelling. Keep its old liveness-only retention;
+        # it never supplies the measured identity required to signal a process.
+        return not require_measured
     if recorded_boot or recorded_start:
         live_start = process_start_time(pid)
         if require_measured and not live_start:
@@ -429,7 +441,7 @@ def _multiprocessing_parent_sentinel() -> Optional[int]:
         return None
 
 
-def start_parent_lifeline(*, poll_sec: float = 5.0, label: str = "") -> None:
+def start_parent_lifeline(*, poll_sec: float = 5.0, label: str = "", stop_socket=None, before_exit=None) -> None:
     """Daemon watchdog: group-suicide when the spawning parent dies (POSIX).
 
     For OUR python entrypoints only (workers, extension runner, claude child):
@@ -443,58 +455,68 @@ def start_parent_lifeline(*, poll_sec: float = 5.0, label: str = "") -> None:
     worker's exit 255. Arbitrary-argv services and skills cannot get a watchdog
     injected -- they are covered by the ledger + reaper instead.
     """
-    if os.name == "nt":
-        return  # Windows children are covered by Job Objects
+    if os.name == "nt" and stop_socket is None:
+        return  # ordinary Windows children are covered by Job Objects
 
     import threading
     import time as _time
     from multiprocessing.connection import wait as _mp_wait
 
-    def _suicide() -> None:
-        log.warning("parent process died — lifeline group-suicide (%s)", label or "child")
+    def _suicide(ready=()) -> None:
         try:
-            from ouroboros.platform_layer import current_process_group_id
-
-            pgid = current_process_group_id()
-            # Kill the whole group ONLY when we lead it (worker/runner
-            # entrypoints setsid/new-group first). A non-leader sharing the
-            # spawner's group must not take unrelated siblings down with it.
-            if pgid == os.getpid():
-                kill_process_group_id(pgid)
-        except Exception:
-            pass
-        os._exit(1)
-
-    def _sentinel_hung_up(sentinel: int, timeout: float) -> bool:
-        return bool(_mp_wait([sentinel], timeout=timeout))
+            # EOF/parent death is ordinary lifetime cleanup, not owner Panic:
+            # it must preserve installation daemons in their separate groups.
+            emergency = stop_socket is not None and stop_socket in ready and stop_socket.recv(1) == b"!"
+            if emergency and before_exit is not None:
+                # Callback imports, locks and even a stuck Popen cannot hold
+                # this watchdog. All local owners get a bounded request chance.
+                request = threading.Thread(target=before_exit, daemon=True)
+                request.start()
+                request.join(timeout=0.5)
+        finally:
+            try:
+                # No imports, logging handlers, descendant scans or persistence
+                # between the callback deadline and hard exit. Our own live
+                # session leader is positive identity, not a guessed PID/group.
+                if current_process_group_id() == os.getpid():
+                    kill_process_group_id(os.getpid())
+            finally:
+                os._exit(1)
 
     initial_ppid = os.getppid()
     sentinel = _multiprocessing_parent_sentinel()
+    watched = ([sentinel] if sentinel is not None else []) + ([stop_socket] if stop_socket is not None else [])
+    ready = []
     try:
-        died_early = initial_ppid <= 1 or (sentinel is not None and _sentinel_hung_up(sentinel, 0))
+        ready = _mp_wait(watched, timeout=0) if watched else []
+        died_early = initial_ppid <= 1 or bool(ready)
     except Exception:
         sentinel, died_early = None, initial_ppid <= 1
     if died_early:
         # The parent died before we even got here (import-delay race after an
         # abrupt supervisor kill). These entrypoints are always spawned by a
         # live Ouroboros parent, so an orphan at startup is already a leak.
-        _suicide()
+        _suicide(ready)
         return
 
     def _watch() -> None:
         nonlocal sentinel
         while True:
             if sentinel is None:
-                _time.sleep(poll_sec)
+                ready = _mp_wait([stop_socket], timeout=poll_sec) if stop_socket is not None else []
+                if ready:
+                    _suicide(ready)
+                else:
+                    _time.sleep(poll_sec)
             else:
                 try:
-                    hung_up = _sentinel_hung_up(sentinel, poll_sec)
+                    ready = _mp_wait(watched, timeout=poll_sec)
                 except Exception:
                     # An unusable sentinel (closed fd) must not kill a live
                     # task: degrade to the ppid watch rather than guess.
-                    sentinel, hung_up = None, False
-                if hung_up:
-                    _suicide()
+                    sentinel, ready = None, []
+                if ready:
+                    _suicide(ready)
             if os.getppid() != initial_ppid:
                 _suicide()
 
@@ -586,9 +608,18 @@ def pending_process_stops(drive_root: pathlib.Path, purposes: "set[str]") -> Lis
     return pending
 
 
+def process_stop_snapshot(drive_root: pathlib.Path, purposes: "set[str]") -> List[Dict[str, Any]]:
+    """Capture this stop's ledger rows before an asynchronous shutdown request."""
+    readable, entries = _read_ledger_strict(pathlib.Path(drive_root))
+    if not readable:
+        raise OSError("process custody ledger is unreadable or corrupt")
+    return [entry for entry in entries if entry.get("purpose") in purposes and _fingerprint_matches(entry)]
+
+
 def stop_ledgered_processes(
     drive_root: pathlib.Path, purposes: "set[str]", *, timeout_sec: float = 5.0,
     unconfirmed: Optional[List[str]] = None,
+    expected_entries: Optional[List[Dict[str, Any]]] = None,
 ) -> List[int]:
     """Kill the installation's own processes of the named purposes, any scope.
 
@@ -609,7 +640,9 @@ def stop_ledgered_processes(
     failures = unconfirmed if unconfirmed is not None else []
     for entry in entries:
         purpose = str(entry.get("purpose") or "")
-        if purpose not in purposes or not _fingerprint_matches(entry, require_measured=True):
+        if (purpose not in purposes
+                or (expected_entries is not None and entry not in expected_entries)
+                or not _fingerprint_matches(entry, require_measured=True)):
             survivors.append(entry)
             continue
         pid = int(entry.get("pid") or 0)
@@ -718,12 +751,16 @@ def quiesce_custodied_services(
 def reap_orphaned_processes(
     drive_root: pathlib.Path,
     *,
-    running_task_ids: Optional[set] = None,
+    running_task_ids: Optional[Any] = None,
     live_owner_skills: Optional[set] = None,
     enforce_companion_reap: bool = False,
     retained_purposes: Optional[set[str]] = None,
 ) -> List[int]:
     """Kill ledgered processes whose owning generation/task is gone.
+
+    ``running_task_ids`` is the live-owner set, or a zero-arg callable that
+    produces it — read AFTER the ledger, never before (see below). ``None``
+    still means UNKNOWN: no task-owner decision is taken at all.
 
     Rules:
       - dead pid / fingerprint mismatch → prune the entry, never kill;
@@ -763,6 +800,18 @@ def reap_orphaned_processes(
     _, entries, previous = _read_ledger_records(drive_root, strict=False)
     if not entries:
         return []
+    # CANDIDATES FIRST, LIVENESS SECOND. A candidate exists ⇒ its owner was registered
+    # earlier (admission takes ``_queue_lock`` before any spawn), so an owner absent
+    # from this LATER snapshot is really gone — while a set read BEFORE the ledger
+    # reaps a task admitted during the read (the sweep runs off the loop thread).
+    if callable(running_task_ids):
+        running_task_ids = running_task_ids()
+    retained_roots = {
+        int(entry["pid"]) for entry in entries
+        if ((entry.get("scope") == "daemon" and not str(entry.get("purpose") or "").startswith("companion:"))
+            or entry.get("purpose") in (retained_purposes or set()))
+        and _fingerprint_matches(entry)
+    }
     reaped: List[int] = []
     survivors: List[Dict[str, Any]] = []
     for entry in entries:
@@ -854,11 +903,11 @@ def reap_orphaned_processes(
         try:
             pgid = int(entry.get("pgid") or 0)
             if pgid > 0:
-                kill_process_group_id(pgid)
-            else:
+                kill_process_group_id(pgid, **({"exclude_pids": retained_roots} if retained_roots else {}))
+            if pgid <= 0 or (retained_roots and pid_is_alive(pid)):
                 from ouroboros.platform_layer import kill_pid_tree
 
-                kill_pid_tree(pid)
+                kill_pid_tree(pid, exclude_pids=retained_roots)
             reaped.append(pid)
             append_jsonl(drive_root / "logs" / "supervisor.jsonl", {
                 "ts": utc_now_iso(),

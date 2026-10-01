@@ -59,10 +59,12 @@ def _deliverables_root() -> pathlib.Path:
     instead of escaping to the real ``~/Ouroboros/Deliverables`` (which the outside-home
     check would then reject). Otherwise the global config default applies.
     """
+    from ouroboros.config import runtime_setting
+
     from ouroboros.config import get_deliverables_root
 
     jail = (os.environ.get("OUROBOROS_USER_FILES_ROOT") or "").strip()
-    explicit = (os.environ.get("OUROBOROS_DELIVERABLES_ROOT") or "").strip()
+    explicit = (runtime_setting("OUROBOROS_DELIVERABLES_ROOT") or "").strip()
     if explicit:
         return pathlib.Path(explicit).expanduser().resolve(strict=False)
     if jail and not explicit:
@@ -161,6 +163,15 @@ def workspace_mode_block_reason(ctx: Any) -> str:
         workspace = pathlib.Path(workspace_root).resolve(strict=False)
     except (OSError, TypeError, ValueError):
         return "workspace_root is invalid"
+    # A readonly child's selected folder is a focus, never a write workspace.
+    # Keep its role/tool ceiling while allowing source/data subdirectories.
+    constraint = _tool_access().normalize_task_constraint(getattr(ctx, "task_constraint", None))
+    readonly = constraint is not None and constraint.mode == _tool_access().LOCAL_READONLY_SUBAGENT_MODE
+    child = _tool_access()._is_subagent_ctx(ctx)
+    acting = (constraint is not None and constraint.mode == _tool_access().ACTING_SUBAGENT_MODE
+              and constraint.surface in _tool_access().VALID_WRITE_SURFACES)
+    if readonly or (child and not acting):
+        return ""
     protected_values = (
         ("Ouroboros system repo", getattr(ctx, "system_repo_dir", None) or getattr(ctx, "repo_dir", None)),
         ("Ouroboros repo", getattr(ctx, "repo_dir", None)),

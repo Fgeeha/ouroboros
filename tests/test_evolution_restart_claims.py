@@ -236,6 +236,7 @@ def test_new_campaign_is_stamped_for_same_generation_worker_respawns(tmp_path, m
 
     monkeypatch.setattr(process_custody, "current_custody_session_id", lambda: "same-server")
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     queue.init(tmp_path)
     queue.init_queue_refs([], {}, {"value": 0})
     campaign = evolution_lifecycle.start_evolution_campaign("Improve", source="test")
@@ -512,7 +513,7 @@ def test_supervisor_rechecks_evolution_claim_immediately_before_restart(tmp_path
         DRIVE_ROOT=tmp_path,
         load_state=state.load_state,
         safe_restart=lambda **k: restarted.append(k) or (True, "ok"),
-        send_with_budget=lambda *a: messages.append(a),
+        send_with_budget=lambda *a, **kw: messages.append(a),
     )
 
     server._perform_supervisor_restart(
@@ -532,7 +533,7 @@ def test_supervisor_blocks_evolution_restart_if_marker_disappears_during_drain(t
         DRIVE_ROOT=tmp_path,
         load_state=lambda: {"owner_chat_id": 1},
         safe_restart=lambda **k: restarted.append(k) or (True, "ok"),
-        send_with_budget=lambda *a: messages.append(a),
+        send_with_budget=lambda *a, **kw: messages.append(a),
     )
 
     server._perform_supervisor_restart(
@@ -609,7 +610,7 @@ def test_supervisor_blocks_restart_when_head_moved_after_receipt(tmp_path):
         REPO_DIR=repo,
         load_state=lambda: {"owner_chat_id": 1},
         safe_restart=lambda **k: restarted.append(k) or (True, "ok"),
-        send_with_budget=lambda *a: messages.append(a),
+        send_with_budget=lambda *a, **kw: messages.append(a),
     )
 
     server._perform_supervisor_restart(
@@ -928,3 +929,44 @@ def test_containment_disowns_the_commit_intent_so_boot_cannot_adopt_it(
     current = evolution_lifecycle._read_evolution_campaign()
     assert str(current["active_transaction"].get("commit_sha") or "") == ""
     assert int(current.get("absorbed_cycles_done") or 0) == 0
+
+
+@pytest.mark.parametrize('has_marker', [False, True])
+@pytest.mark.parametrize('native_status', ['unconfigured', 'verified', 'failed', 'missing', 'stale'])
+def test_native_host_adoption_is_required_for_restart_success(
+    tmp_path, monkeypatch, has_marker, native_status,
+):
+    from ouroboros import agent_startup_checks, process_custody
+    from supervisor import evolution_lifecycle
+
+    monkeypatch.setattr(process_custody, 'current_custody_session_id', lambda: 'before-native')
+    campaign, tx = _active_transaction(tmp_path)
+    sha = 'e' * 40
+    claim = {'campaign_id': campaign['id'], 'transaction_id': tx['transaction_id'],
+             'task_id': tx['task_id'], 'commit_sha': sha}
+    assert evolution_lifecycle.record_evolution_commit(**claim)['ok']
+    if has_marker:
+        (tmp_path / 'state' / 'pending_restart_verify.json').write_text(
+            json.dumps({'expected_sha': sha, 'evolution_claim': claim}))
+    monkeypatch.setattr(process_custody, 'current_custody_session_id', lambda: 'after-native')
+    monkeypatch.delenv('OUROBOROS_EXTERNAL_HOST_UPDATE', raising=False)
+    monkeypatch.delenv('OUROBOROS_EXTERNAL_HOST_RESULT', raising=False)
+    if native_status != 'unconfigured':
+        monkeypatch.setenv('OUROBOROS_EXTERNAL_HOST_UPDATE', '/native/update-host')
+    if native_status != 'missing':
+        monkeypatch.setenv('OUROBOROS_EXTERNAL_HOST_RESULT', json.dumps({
+            'status': 'verified' if native_status in {'verified', 'stale'} else native_status,
+            'source_commit': 'f' * 40 if native_status == 'stale' else sha,
+            'input_sha256': '1' * 64, 'apk_sha256': '2' * 64, 'signer_sha256': '3' * 64}))
+    env = SimpleNamespace(drive_path=lambda name: tmp_path / name,
+                          drive_root=tmp_path, repo_dir=tmp_path)
+    agent_startup_checks.verify_restart(env, sha)
+    stored = evolution_lifecycle._read_evolution_campaign()
+    if native_status in {'unconfigured', 'verified'}:
+        assert 'active_transaction' not in stored
+        assert stored['transaction_history'][-1]['cycle_outcome'] == 'absorbed'
+    else:
+        pending = stored['active_transaction']
+        assert pending['restart_required'] and not pending['restart_verified']
+        assert pending['restart_authority_error'] == 'native_update_failed_or_unverified'
+        assert int(stored.get('absorbed_cycles_done') or 0) == 0

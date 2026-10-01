@@ -3,19 +3,27 @@
 Every non-native route — OpenRouter, direct OpenAI, cloud.ru, MiniMax, a vLLM
 server — speaks the OpenAI chat-completions shape, and the differences between
 them are request options: which token-limit key, which reasoning carrier, which
-cache affinity, which provider routing block. This module owns building that
-payload and reading the response back into the normalized ``(message, usage)``
-every caller consumes.
+cache affinity, which provider routing block — and, for OpenAI's public API, which
+part of the leading system message its whole-section prompt cache may see
+(``_project_openai_family_system``). This module owns building that payload and
+reading the response back into the normalized ``(message, usage)`` every caller
+consumes.
 """
 
 
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from ouroboros.llm_attempt import supports_message_cache_control
+
+from ouroboros.llm_attempt import (
+    apply_processing_preference, attach_processing_receipt, openai_family_route,
+    supports_message_cache_control,
+)
+from ouroboros.llm_messages import project_declared_system_prefix
+from ouroboros.usage_accounting import UsageScope, usage_scope
+from ouroboros.openrouter_attribution import OPENROUTER_APP_HEADERS
 from ouroboros.llm_capability_policy import (
     _EFFORT_CLAMP_CVAR,
     _OPTIONAL_DROPPABLE_PARAMS,
@@ -23,12 +31,14 @@ from ouroboros.llm_capability_policy import (
 )
 from ouroboros.reasoning_artifacts import transcript_has_sealed_reasoning
 from ouroboros.llm_routing import _resolve_or_provider
-from ouroboros.provider_models import normalize_deepseek_reasoning_effort
+from ouroboros.provider_models import normalize_deepseek_reasoning_effort, normalize_zai_reasoning_effort
 from ouroboros.request_wire_recovery import (
     finalize_wire_response,
     note_provider_metadata_drop_fields,
 )
 from ouroboros.utils import sanitize_tool_result_for_log
+from ouroboros.config import runtime_setting
+from ouroboros._usage_response import observed_processing_mode
 
 
 # The moved warnings keep the logger identity they were emitted under.
@@ -40,6 +50,21 @@ _FALSE_LIKE_ENV_VALUES = {"", "0", "false", "no", "off"}
 # Response-only labels are diagnostic facts, not canonical assistant fields. Keep
 # provider-supplied values bounded and printable before they enter usage custody.
 _RESPONSE_METADATA_LABEL_MAX_CHARS = 160
+
+
+def _project_openai_family_system(target: Dict[str, Any], messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The OpenAI-family send copy of a declared leading system message.
+
+    OpenAI's public API caches the whole leading system section plus tools as ONE unit
+    (``llm_attempt.openai_family_model``): keep only the builder-declared stable governance
+    blocks there and carry the mutable context as a host notice before the task, so a new
+    conversation is served the prefix its predecessors already cached. Runs before the
+    direct/OpenRouter branch split and the marker strip, so direct OpenAI, OpenRouter and
+    the prospective wrap-up candidate project the same copy; the canonical transcript keeps
+    its single system message. The shape that was sent rides ``target["wire_layout"]``
+    (per-call, never a thread-local) into ``usage`` in ``_normalize_remote_response``.
+    """
+    return project_declared_system_prefix(target, messages) if openai_family_route(target) else messages
 
 
 def _bounded_response_metadata_label(value: Any) -> Optional[str]:
@@ -61,15 +86,15 @@ class _OpenAICompatibleLaneMixin:
 
     @staticmethod
     def _openrouter_main_web_search_tool() -> Optional[Dict[str, Any]]:
-        mode = str(os.environ.get("OUROBOROS_MAIN_WEB_SEARCH") or "off").strip().lower()
+        mode = str(runtime_setting("OUROBOROS_MAIN_WEB_SEARCH") or "off").strip().lower()
         if mode not in {"openrouter", "openrouter_server", "server", "on", "true", "1"}:
             return None
-        engine = str(os.environ.get("OUROBOROS_MAIN_WEB_SEARCH_ENGINE") or "auto").strip() or "auto"
+        engine = str(runtime_setting("OUROBOROS_MAIN_WEB_SEARCH_ENGINE") or "auto").strip() or "auto"
         parameters: Dict[str, Any] = {}
         if engine != "auto":
             parameters["engine"] = engine
         try:
-            max_total = int(os.environ.get("OUROBOROS_MAIN_WEB_SEARCH_MAX_TOTAL_RESULTS", "") or 0)
+            max_total = int(runtime_setting("OUROBOROS_MAIN_WEB_SEARCH_MAX_TOTAL_RESULTS", "") or 0)
         except ValueError:
             max_total = 0
         if max_total > 0:
@@ -93,7 +118,9 @@ class _OpenAICompatibleLaneMixin:
         response_format: Optional[Dict[str, Any]] = None,
         cache_affinity: str = "",
         bypass_response_cache: bool = False,
+        stream: bool = False,
     ) -> Dict[str, Any]:
+        target["requested_reasoning_effort"] = normalize_reasoning_effort(reasoning_effort)
         messages = self._normalize_system_message_placement(messages)
         resolved_model = str(target.get("resolved_model") or "")
         provider = str(target.get("provider") or "")
@@ -124,6 +151,7 @@ class _OpenAICompatibleLaneMixin:
             or supports_vision(resolved_model)
         ):
             messages = self._replace_image_blocks_with_placeholder(messages)
+        messages = _project_openai_family_system(target, messages)
         # Official direct OpenAI Chat uses the current completion-token carrier:
         # provider-wide; model names are not capability authority across routes.
         direct_openai = provider == "openai"
@@ -159,6 +187,8 @@ class _OpenAICompatibleLaneMixin:
                 "messages": clean_messages,
                 token_limit_key: max_tokens,
             }
+            if stream:
+                kwargs.update(stream=True, stream_options={"include_usage": True})
             if provider == "openai":
                 cache_identity = self._prompt_cache_identity(
                     str(target.get("usage_model") or resolved_model),
@@ -197,6 +227,26 @@ class _OpenAICompatibleLaneMixin:
                         "reason": "provider_forced_tool_choice" if forced_tool else "provider_wire_mapping",
                         "model": resolved_model,
                     })
+            elif provider == "zai":
+                # Same carriage family, Z.ai's OWN projection table (NOT
+                # DeepSeek's: medium does not exist at Z.ai and xhigh maps to
+                # max, not high). GLM reasoning cannot be disabled — the
+                # DeepSeek ``thinking={"type":"disabled"}`` arm answers
+                # 400 code 1210 ("please use low, high or max") on PAYG — and
+                # forced tool_choice WORKS with thinking enabled (measured
+                # 2026-09-21), so there is no forced-tool exception either.
+                # An absent parameter is served at MAX: dropping the tier
+                # silently billed every call at max. Any tier change is
+                # disclosed on usage as ``reasoning_effort_clamped``.
+                applied = normalize_zai_reasoning_effort(requested_effort)
+                kwargs["reasoning_effort"] = applied
+                _EFFORT_CLAMP_CVAR.set(None)  # never inherit a stale note
+                if applied != requested_effort:
+                    _EFFORT_CLAMP_CVAR.set({
+                        "requested": requested_effort, "applied": applied,
+                        "reason": "provider_wire_mapping",
+                        "model": resolved_model,
+                    })
             if temperature is not None:
                 kwargs["temperature"] = temperature
             if response_format:
@@ -211,6 +261,7 @@ class _OpenAICompatibleLaneMixin:
                 _eb = kwargs.setdefault("extra_body", {})
                 if isinstance(_eb, dict):
                     _eb["cache"] = {"no-cache": True}
+            apply_processing_preference(target, kwargs)
             return kwargs
 
         if any(isinstance(m, dict) and "reasoning_content" in m for m in messages):
@@ -232,7 +283,7 @@ class _OpenAICompatibleLaneMixin:
                 for m in messages
             ]
         effort = normalize_reasoning_effort(reasoning_effort)
-        raw_return_reasoning = os.environ.get("OUROBOROS_RETURN_REASONING")
+        raw_return_reasoning = runtime_setting("OUROBOROS_RETURN_REASONING")
         return_reasoning = (
             True if raw_return_reasoning is None
             else str(raw_return_reasoning).strip().lower() not in _FALSE_LIKE_ENV_VALUES
@@ -298,6 +349,8 @@ class _OpenAICompatibleLaneMixin:
             "max_tokens": max_tokens,
             "extra_body": extra_body,
         }
+        if stream:
+            kwargs.update(stream=True, stream_options={"include_usage": True})
         if temperature is not None:
             kwargs["temperature"] = temperature
         if response_format:
@@ -312,6 +365,10 @@ class _OpenAICompatibleLaneMixin:
                 {k: v for k, v in tool.items() if k != "cache_control"}
                 for tool in self._sanitize_chat_completion_tools(tools)
             ]
+            for tool in prepared_tools:  # each "function" is the sanitizer's own copy
+                # The Responses API serving OpenAI models here tries strict mode for a
+                # tool WITHOUT `strict`, requiring every property; a set value stays.
+                tool["function"].setdefault("strict", False)
             if server_web_tool:
                 prepared_tools.append(server_web_tool)
             # Tool cache markers are placed once, at the send-time payload finalizer
@@ -326,9 +383,11 @@ class _OpenAICompatibleLaneMixin:
         # Unknown capabilities mean no stripping.
         if skip_capability_fetch:
             # "Skip" means skip the NETWORK fetch (no_proxy fork-safety), not
-            # ignore an already-warm capability cache: a worker forked after the
-            # one-shot /models fetch still proactively strips unsupported params
-            # instead of paying a reactive 404 + retry on every reviewer call.
+            # ignore an already-warm capability cache. The cache is per-process:
+            # a process that already ran its one-shot /models fetch keeps
+            # stripping unsupported params proactively instead of paying a
+            # reactive 404 + retry on every reviewer call, while a freshly
+            # spawned worker starts cold and strips nothing until its own fetch.
             supported = (
                 self._SUPPORTED_PARAMS_CACHE.get(resolved_model)
                 if self._SUPPORTED_PARAMS_FETCHED
@@ -342,6 +401,7 @@ class _OpenAICompatibleLaneMixin:
                 if optional_param not in supported and optional_param in kwargs
             ]
             note_provider_metadata_drop_fields(unsupported)
+        apply_processing_preference(target, kwargs)
         return kwargs
 
     def _normalize_remote_response(
@@ -354,6 +414,11 @@ class _OpenAICompatibleLaneMixin:
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Normalize an OpenAI-compatible response; skip_cost_fetch keeps no_proxy pure."""
         usage = resp_dict.get("usage") or {}
+        if "service_tier" in resp_dict:
+            usage["service_tier"] = resp_dict["service_tier"]
+        attach_processing_receipt(target, usage)
+        if isinstance(resp_dict.get("_stream_receipt"), dict):
+            usage["stream_receipt"] = dict(resp_dict["_stream_receipt"])
         if isinstance(usage, dict):
             # These keys are host-owned projections of designated outer fields;
             # provider usage extensions must not spoof their provenance.
@@ -362,6 +427,12 @@ class _OpenAICompatibleLaneMixin:
             usage.pop("reasoning_pin", None)
             usage.pop("reasoning_effort_clamped", None)
             usage.pop("provider_error", None)
+            usage.pop("wire_layout", None)
+            # The projected wire shape of THIS call's candidate (per-call target, never a
+            # thread-local): the request blob keeps the canonical messages, the sealed
+            # physical candidate keeps the exact wire, this fact says which one was sent.
+            if isinstance(target.get("wire_layout"), dict):
+                usage["wire_layout"] = dict(target["wire_layout"])
         # An HTTP-200 that carried a provider body-error (OpenRouter passes
         # 429/5xx through the body) reaches here only when a same-model reroute
         # was unavailable or also errored. Surface it as a typed marker so the
@@ -369,10 +440,13 @@ class _OpenAICompatibleLaneMixin:
         # a blank finish_reason=null "incomplete response".
         _body_err = self._provider_body_error(resp_dict)
         if _body_err:
+            _body_message = str(_body_err.get("message") or "")
             usage["provider_error"] = {
                 "code": _body_err.get("code"),
                 "type": _body_err.get("type"),
-                "message": str(_body_err.get("message") or "")[:300],
+                "message": _body_message[:300],
+                # A cut sentence says so: the owner's quote must not read this prefix as whole.
+                **({"message_truncated": True} if len(_body_message) > 300 else {}),
                 "kind": "rate_limit" if self._is_transient_body_error(_body_err) and str(_body_err.get("code")) == "429"
                 else ("provider_transient" if self._is_transient_body_error(_body_err) else "provider_error"),
             }
@@ -505,6 +579,8 @@ class _OpenAICompatibleLaneMixin:
                 },
                 allow_live_fetch=not skip_cost_fetch,
                 provider=usage["provider"],
+                **({"processing_mode": observed_processing_mode(usage["provider"], usage)}
+                   if usage.get("processing") else {}),
             )
             if estimated_cost is not None:
                 usage["cost"] = estimated_cost
@@ -594,3 +670,48 @@ class _OpenAICompatibleLaneMixin:
                 seen.add(p)
                 deduped.append(p)
         return "\n".join(deduped).strip()
+
+
+
+def openrouter_web_search_server_tool(
+    *,
+    api_key: str,
+    model: str,
+    query: str,
+    search_context_size: str,
+    accounting_scope: Optional[UsageScope] = None,
+    timeout: Optional[float] = None,
+    processing_preference: str | None = None,
+    _recovery: Any,
+) -> Any:
+    """Run OpenRouter's provider-owned web_search server tool."""
+
+    from ouroboros.net_transport import web_search_openai_client
+    from ouroboros.model_slots import resolve_processing_preference
+    from ouroboros.usage_accounting import current_usage_scope
+    from dataclasses import replace
+
+    target = {"provider": "openrouter", "usage_model": model, "resolved_model": model,
+              "processing_preference": resolve_processing_preference("websearch", override=processing_preference)}
+
+    client = web_search_openai_client(
+        api_key=api_key,
+        base_url="https://openrouter.ai/api/v1",
+        timeout=timeout,
+        default_headers=dict(OPENROUTER_APP_HEADERS),
+    )
+    payload = dict(
+        model=model,
+        messages=[{"role": "user", "content": query}],
+        tools=[{
+            "type": "openrouter:web_search",
+            "parameters": {
+                "search_context_size": search_context_size,
+                "max_total_results": 10,
+            },
+        }],
+    )
+    apply_processing_preference(target, payload)
+    scope = replace(accounting_scope or current_usage_scope() or UsageScope(), source="web_search.openrouter")
+    with usage_scope(scope):
+        return _recovery(client.chat.completions.create, payload, target)

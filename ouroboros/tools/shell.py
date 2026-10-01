@@ -10,6 +10,8 @@ import os
 import pathlib
 import re
 import shlex
+import shutil
+import tempfile
 import signal  # noqa: F401
 import stat  # noqa: F401
 import subprocess
@@ -30,7 +32,7 @@ from ouroboros.runtime_mode_policy import (
     is_protected_runtime_path,  # noqa: F401
 )
 from ouroboros.tools.commit_gate import _invalidate_advisory
-from ouroboros.shell_parse import is_absolute_path_text, recover_stringified_argv  # noqa: F401
+from ouroboros.shell_parse import POSIX_SHELL_HEADS, is_absolute_path_text, recover_stringified_argv  # noqa: F401
 from ouroboros.tools.tool_result import _publish_process_result, _wrap_run_script_process_result
 from ouroboros.tools.verify import check_exit_masking  # noqa: F401 -- ONE exit-masking sensor shared with verify_and_record (pinned here); its disclosure lives in shell_audit
 from ouroboros.tools.registry import (
@@ -41,6 +43,7 @@ from ouroboros.tools import shell_audit as _shell_audit
 from ouroboros.tools.deliverables_shell import lexical_user_files_block_reason  # noqa: F401
 from ouroboros.tools.shell_audit import (
     _UNDECLARED_OUTPUTS_MARKER,
+    _disclose_output_audit_failure,
     _masked_green_disclosure,
     _mentioned_user_file_outputs_without_declaration,
     _presence_allows_user_output,  # noqa: F401
@@ -74,10 +77,6 @@ from ouroboros.tools.shell_effects import (  # noqa: F401
     _user_files_run_had_effect,
 )
 from ouroboros.tools.shell_outputs import (  # noqa: F401
-    _SENSITIVE_OUTPUT_COMPONENT_NAMES,
-    _SENSITIVE_OUTPUT_MARKERS,
-    _SENSITIVE_OUTPUT_NAMES,
-    _SENSITIVE_OUTPUT_SUFFIXES,
     _directory_fingerprint,
     _changed_path_covers,
     _directory_fingerprint_from_entries,
@@ -126,6 +125,7 @@ _CONTROL_DIR_BACKUP_MAX_BYTES = 5 * 1024 * 1024
 # Historical private spellings stay as aliases for call sites and tests.
 from ouroboros.tools.process_facts import (  # noqa: E402
     active_resolved_runtime as _active_resolved_runtime,
+    process_environment_tool, record_runtime_selection, selected_process_environment,
     publish_process_facts as _publish_process_facts,  # noqa: F401 — historical private spelling for call sites and tests
 )
 from ouroboros.tools.shell_process import (  # noqa: E402
@@ -164,7 +164,7 @@ _SHELL_OPERATORS = frozenset(["&&", "||", "|", ";", ">", ">>", "<", "<<"])
 _GLUED_REDIRECT_RE = re.compile(
     r'^(?:(?:\d+>>?|>>?&?\d*|\d*>&\d*|&>>?)(?:\S.*)?|\d+<\S*|<<\S*|<)$'
 )
-_SHELL_INTERPRETERS = frozenset({"sh", "bash", "zsh", "fish", "cmd", "cmd.exe", "powershell", "powershell.exe", "pwsh", "pwsh.exe"})
+_SHELL_INTERPRETERS = POSIX_SHELL_HEADS | frozenset({"fish", "cmd", "cmd.exe", "powershell", "powershell.exe", "pwsh", "pwsh.exe"})
 _ENV_REF_PATTERN = re.compile(r'\$(?:\{[A-Z][A-Z0-9_]*\}|[A-Z][A-Z0-9_]*)')
 
 
@@ -268,6 +268,7 @@ def _literal_argv_notes(cmd: List[str]) -> str:
     return "".join(notes)
 
 
+@process_environment_tool
 def _run_shell(
     ctx: ToolContext,
     cmd,
@@ -405,16 +406,20 @@ def _run_shell(
     bootstrap_process_path()
     # Emergency bundled-node PATH prepend; None on every healthy path (env stays byte-identical).
     node_resolution = active_node_resolution(ctx)
+    from ouroboros.workspace_executor import overlay_env
+    selected_env = selected_process_environment()
+    run_env = apply_env_path_prepend(overlay_env(_shell_env_for_cwd(ctx, pathlib.Path(work_dir)), selected_env), node_resolution)
+    record_runtime_selection(ctx, cmd, work_dir, run_env)
     # Two clocks (D2-1): EPOCH feeds the st_mtime audit; MONOTONIC feeds durations.
     _command_start_epoch = time.time()
     _command_start_ts = time.monotonic()
+    res = None
     try:
         if _executor_can_run_cwd(ctx, pathlib.Path(work_dir)):
             res = executor_execute(ctx, cmd, pathlib.Path(work_dir), timeout_sec,
-                                   env_overlay=interpreter_path_overlay(node_resolution))
+                                   env_overlay=interpreter_path_overlay(node_resolution),
+                                   **({"target_env": selected_env} if selected_env else {}))
         else:
-            run_env = apply_env_path_prepend(
-                _shell_env_for_cwd(ctx, pathlib.Path(work_dir)), node_resolution)
             res = _tracked_subprocess_run(
                 cmd, cwd=str(work_dir),
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -446,14 +451,16 @@ def _run_shell(
                 mutation_root=repo_root,
                 source_tool="run_command",
             )
-        undeclared_user_outputs = _mentioned_user_file_outputs_without_declaration(
-            ctx,
-            cmd,
-            outputs,
-            scratch_abs=scratch_abs,
-            command_start_ts=_command_start_epoch,
-            cwd=work_dir,
-        )
+        audit_error = ""
+        try:
+            undeclared_user_outputs = _mentioned_user_file_outputs_without_declaration(
+                ctx, cmd, outputs, scratch_abs=scratch_abs,
+                command_start_ts=_command_start_epoch, cwd=work_dir,
+            )
+        except Exception as exc:
+            # The child already finished. This observational failure must not
+            # reach the spawn-error handler and overwrite its measured facts.
+            undeclared_user_outputs, audit_error = [], type(exc).__name__
         if undeclared_user_outputs:
             # Declaration NUDGE, not a failure — see _UNDECLARED_OUTPUTS_MARKER.
             text = (
@@ -511,28 +518,31 @@ def _run_shell(
                 + f"{_format_process_output(res.stdout or '', res.stderr or '')}"
                 + artifact_note
             )
-            return _masked_green_disclosure(ctx, _publish_process_result(ctx, "ARTIFACT_OUTPUT_ERROR", text, exit_code=0, shell_regex_auto_corrected=regex_autocorrected), cmd)
+            result = _masked_green_disclosure(ctx, _publish_process_result(ctx, "ARTIFACT_OUTPUT_ERROR", text, exit_code=0, shell_regex_auto_corrected=regex_autocorrected), cmd)
+            return _disclose_output_audit_failure(ctx, result, audit_error)
         executor_note = ""
         if getattr(res, "backend_trace", None):
             executor_note = "\n\nEXECUTOR_TRACE:\n" + json.dumps(res.backend_trace, ensure_ascii=False, indent=2)
         text = autocorrect_note + f"{_describe_returncode(0, cwd=work_dir, binding=binding)}\n{_format_process_output(res.stdout or '', res.stderr or '')}{artifact_note}{audit_note}{scratch_note}{executor_note}"
-        return _masked_green_disclosure(ctx, _publish_process_result(ctx, "SHELL_REGEX_AUTO_CORRECTED" if regex_autocorrected else "OK", text, exit_code=0, artifact_registered=bool(artifact_registered and not artifact_failed), shell_regex_auto_corrected=regex_autocorrected), cmd)
+        result = _masked_green_disclosure(ctx, _publish_process_result(ctx, "SHELL_REGEX_AUTO_CORRECTED" if regex_autocorrected else "OK", text, exit_code=0, artifact_registered=bool(artifact_registered and not artifact_failed), shell_regex_auto_corrected=regex_autocorrected), cmd)
+        return _disclose_output_audit_failure(ctx, result, audit_error)
     except subprocess.TimeoutExpired:
         _publish_unfinished_process_facts(ctx, _command_start_ts, timed_out=True)
         # Timeout-created scratch still needs its exclusion fingerprint.
         _record_scratch_fingerprints(ctx, scratch_abs)
         return (
             f"⚠️ TOOL_TIMEOUT (run_command): command exceeded the per-command timeout of {timeout_sec}s "
-            f"and its subprocess tree was terminated (root={binding.root}, cwd={work_dir}). NOTE: this is the per-command "
+            f"and the host killed what it could still reach of its process tree; a background child may survive untracked (root={binding.root}, cwd={work_dir}). NOTE: this is the per-command "
             f"FOREGROUND timeout, NOT the task deadline. For genuinely long-running compute (training, "
             f"sampling, large builds/downloads), start it with start_service and poll "
             f"service_status/service_logs while you do other work, or pass an explicit timeout_sec=<seconds> "
             f"(up to the per-call ceiling) — and preserve a best-effort deliverable before the task deadline."
         )
     except Exception as e:
-        _publish_unfinished_process_facts(ctx, _command_start_ts, spawn_error=e)
+        if res is None:
+            _publish_unfinished_process_facts(ctx, _command_start_ts, spawn_error=e)
         _record_scratch_fingerprints(ctx, scratch_abs)
-        if isinstance(e, FileNotFoundError) and len(cmd) == 1:
+        if res is None and isinstance(e, FileNotFoundError) and len(cmd) == 1:
             return (
                 "⚠️ SHELL_ARG_ERROR: the sole cmd element was treated as ONE executable name, "
                 "and that executable was not found. Pass the program and each argument as "
@@ -543,14 +553,7 @@ def _run_shell(
         return f"⚠️ SHELL_ERROR: {e}. root={binding.root}, cwd={work_dir}"
 
 
-# The run_script interpreter VALIDATOR (SSOT; the schema enum below is the
-# advertised subset — Windows launcher spellings are accepted, not advertised).
-RUN_SCRIPT_INTERPRETER_ALLOWLIST = frozenset({
-    "python", "python3", "python.exe", "python3.exe",
-    "bash", "sh", "node", "node.exe", "ruby",
-})
-
-
+@process_environment_tool
 def _run_script(
     ctx: ToolContext,
     script: str,
@@ -572,30 +575,6 @@ def _run_script(
     bucket = str(kwargs.get("bucket") or "")
     skill_name = str(kwargs.get("skill_name") or "")
     interp = str(interpreter or "python3").strip()
-    allowed = RUN_SCRIPT_INTERPRETER_ALLOWLIST
-    resolver_attested = False
-    try:
-        from ouroboros.process_interpreters import InterpreterResolutionTrace
-
-        resolution = getattr(ctx, "_active_interpreter_resolution", None)
-        resolver_attested = bool(
-            isinstance(resolution, InterpreterResolutionTrace)
-            and resolution.verified
-            and resolution.tool == "run_script"
-            and (
-                resolution.requested_interpreter in {"python", "python3"}
-                if resolution.family == "python"
-                # A node attestation admits only an actual SUBSTITUTION (emergency
-                # rewrite); healthy paths have changed=False, so bare spellings
-                # still hit the allowlist (A-F1).
-                else (resolution.family == "node" and resolution.changed)
-            )
-            and resolution.resolved_interpreter == interp
-        )
-    except Exception:
-        resolver_attested = False
-    if pathlib.PurePath(interp).name not in allowed and not resolver_attested:
-        return f"⚠️ RUN_SCRIPT_BLOCKED: interpreter must be one of {sorted(allowed)}."
     body = str(script or "")
     if not body.strip():
         return "⚠️ TOOL_ARG_ERROR (run_script): script is required."
@@ -625,35 +604,47 @@ def _run_script(
             root = pathlib.Path(ctx.drive_root) / "tmp_scripts"
     root.mkdir(parents=True, exist_ok=True)
     suffix = ".py" if "python" in pathlib.PurePath(interp).name else ".sh"
+    run_dir = None
     script_path = root / f"script_{uuid.uuid4().hex}{suffix}"
-    script_path.write_text(body, encoding="utf-8")
     try:
-        os.chmod(script_path, 0o600)
-    except OSError:
-        pass
-    script_arg = str(script_path)
-    if executor_active:
-        executor = executor_ref_from_ctx(ctx)
-        if executor is not None and executor.kind != "local":
-            try:
-                script_arg = executor_map_host_path(executor, script_path)
-            except Exception as exc:
-                script_path.unlink(missing_ok=True)
-                return f"⚠️ RUN_SCRIPT_BLOCKED: executor-backed run_script could not map temp script path: {type(exc).__name__}: {exc}"
-    argv = [interp, script_arg, *[str(item) for item in (args or [])]]
-    try:
+        if active_workspace_script:
+            run_dir = pathlib.Path(tempfile.mkdtemp(prefix="script_", dir=root))
+            # Ignore only this invocation's files, not neighbouring user work.
+            (run_dir / ".gitignore").write_text("*\n", encoding="utf-8")
+            script_path = run_dir / f"script{suffix}"
+        script_path.write_text(body, encoding="utf-8")
+        try:
+            os.chmod(script_path, 0o600)
+        except OSError:
+            pass
+        script_arg = str(script_path)
+        if executor_active:
+            executor = executor_ref_from_ctx(ctx)
+            if executor is not None and executor.kind != "local":
+                try:
+                    script_arg = executor_map_host_path(executor, script_path)
+                except Exception as exc:
+                    return f"⚠️ RUN_SCRIPT_BLOCKED: executor-backed run_script could not map temp script path: {type(exc).__name__}: {exc}"
+        argv = [interp, script_arg, *[str(item) for item in (args or [])]]
         result = _run_shell(
             ctx, argv, cwd=cwd, outputs=outputs, scratch=scratch,
             _resolved_binding=binding, timeout_sec=timeout_sec, timeout=timeout,
+            env_from_settings=kwargs.get("env_from_settings"),
         )
     finally:
         try:
-            script_path.unlink(missing_ok=True)
-            script_path.parent.rmdir()
-            if active_workspace_script:
-                script_path.parent.parent.rmdir()
-        except OSError:
-            pass
+            if run_dir is not None:
+                shutil.rmtree(run_dir)
+            else:
+                script_path.unlink(missing_ok=True)
+        except OSError as exc:
+            log.warning("Could not remove run_script scratch %s (%s)", run_dir or script_path, type(exc).__name__)
+        # These shared parents may contain another run or a user's file.
+        for parent in (root, root.parent) if active_workspace_script else (root,):
+            try:
+                parent.rmdir()
+            except OSError:
+                pass
     if pathlib.PurePath(interp).name in {"sh", "bash"}:
         result = _masked_green_disclosure(ctx, result, [interp, "-c", body])
     # POST-exec body audit: stat-confirmed user_files writes performed by the script
@@ -661,14 +652,14 @@ def _run_script(
     # a script that writes an undeclared deliverable and then FAILS (raise/SystemExit/
     # timeout) still leaves that file on disk, so a `⚠️` result does NOT mean "no
     # deliverable to declare" — surface both the error and the output-guard note.
-    undeclared_user_outputs = _mentioned_user_file_outputs_without_declaration(
-        ctx,
-        [interp, "-c", body],
-        outputs,
-        scratch_abs=_scratch_abs_body,
-        command_start_ts=_body_start_epoch,
-        cwd=resolved_workdir,
-    )
+    audit_error = ""
+    try:
+        undeclared_user_outputs = _mentioned_user_file_outputs_without_declaration(
+            ctx, [interp, "-c", body], outputs, scratch_abs=_scratch_abs_body,
+            command_start_ts=_body_start_epoch, cwd=resolved_workdir,
+        )
+    except Exception as exc:
+        undeclared_user_outputs, audit_error = [], type(exc).__name__
     audit_note = ""
     if undeclared_user_outputs:
         # Same declaration NUDGE class as run_command's — see _UNDECLARED_OUTPUTS_MARKER.
@@ -677,7 +668,8 @@ def _run_script(
             + ", ".join(undeclared_user_outputs)
             + ". Re-run with outputs=[...] or write the canonical deliverable via root=artifact_store."
         )
-    return _wrap_run_script_process_result(ctx, result, audit_note, script_path)
+    result = _wrap_run_script_process_result(ctx, result, audit_note, script_path)
+    return _disclose_output_audit_failure(ctx, result, audit_error)
 
 
 def get_tools() -> List[ToolEntry]:
@@ -685,13 +677,12 @@ def get_tools() -> List[ToolEntry]:
         ToolEntry("run_command", {
             "name": "run_command",
             "description": (
-                "Run a foreground bounded command in an allowed resource-root cwd. Returns stdout+stderr. "
-                "Every result header echoes the resolved cwd. "
-                "cmd MUST be an array of strings, never a single shell-style "
-                "string. Use cwd= for working directory; cd is rejected. "
-                "For pipes/chaining use [\"sh\", \"-c\", \"cmd1 && cmd2\"]. "
-                "Prefer the dedicated tools where one fits: read_file (not cat/head/sed-as-reader), "
-                "search_code/query_code (not grep/find-as-search), write_file/edit_text (not sed/echo-redirect)."
+                "Run a bounded foreground command in an allowed cwd; returns stdout+stderr and the resolved cwd. "
+                "cmd MUST be an array of strings, never one shell string. A builtin as cmd[0] (cd, export, ...) "
+                "is refused: use cwd= or [\"sh\", \"-c\", \"cd x && a | b\"] (also for pipes/chaining). "
+                "A background child (&, nohup) is no service: holding stdout/stderr it stalls the call until "
+                "timeout_sec, and once the call returns nothing tracks it (use start_service). "
+                "Prefer read_file, search_code/query_code, write_file/edit_text to cat/head/sed, grep/find, redirects."
             ),
             "parameters": {"type": "object", "properties": {
                 "cmd": {
@@ -704,14 +695,15 @@ def get_tools() -> List[ToolEntry]:
                         "stringified array like '[\"git\", \"log\"]'."
                     ),
                 },
-	                "cwd": {"type": "string", "default": "", "description": "Omit for active_workspace; use system_repo[/subdir] for Ouroboros or skill_payload[/subdir] with bucket+skill_name for a skill. Existing task_drive, artifact_store, user_files and authorized absolute cwd forms remain available; use cwd instead of the rejected cd builtin."},
+	                "cwd": {"type": "string", "default": "", "description": "Omit for active_workspace; use system_repo[/subdir] for Ouroboros or skill_payload[/subdir] with bucket+skill_name for a skill. task_drive, artifact_store, user_files and authorized absolute cwd forms are also accepted."},
+	                "env_from_settings": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Explicit environment variable → saved setting key mapping. Uses existing Settings-selection authority; secret values are masked in diagnostics."},
 	                "bucket": {"type": "string", "enum": ["external", "clawhub", "ouroboroshub", "user_repo"], "description": "Physical skill location for cwd=skill_payload[/subdir]."},
 	                "skill_name": {"type": "string", "description": "Exact skill identity for cwd=skill_payload[/subdir]."},
 	                "outputs": {
 	                    "type": "array",
 	                    "items": {"type": "string"},
 	                    "default": [],
-	                    "description": "Generated file paths to copy/register into the task artifact store after success.",
+	                    "description": "Generated paths copied/registered after success, e.g. outputs=['report.txt']. The managed artifact directory is created lazily; do not move files into an assumed physical store.",
 	                },
 	                "scratch": {
 	                    "type": "array",
@@ -740,21 +732,22 @@ def get_tools() -> List[ToolEntry]:
             "name": "run_script",
             "description": (
                 "Run a short task-scoped temporary script with a declared interpreter. "
-                "Use for multi-line diagnostics or harness helpers; generated script files live under the task drive. "
+                "Use for multi-line diagnostics or harness helpers; generated scripts use a private run directory inside the mapped workspace or the task drive. "
                 "The underlying command result echoes the resolved cwd."
             ),
             "parameters": {"type": "object", "properties": {
                 "script": {"type": "string"},
-	                "interpreter": {"type": "string", "enum": ["python", "python3", "bash", "sh", "node", "ruby"], "default": "python3"},
+	                "interpreter": {"type": "string", "default": "python3", "description": "Installed executable name or path that accepts a script filename, such as python3, node, perl, zsh or lua. Receives the temporary script path followed by args. Use run_command for compiler or launcher subcommands."},
 	                "args": {"type": "array", "items": {"type": "string"}, "default": []},
 	                "cwd": {"type": "string", "default": "", "description": "Omit for active_workspace; use system_repo[/subdir] for Ouroboros or skill_payload[/subdir] with bucket+skill_name for a skill."},
+	                "env_from_settings": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Explicit environment variable → saved setting key mapping. Uses existing Settings-selection authority; secret values are masked in diagnostics."},
 	                "bucket": {"type": "string", "enum": ["external", "clawhub", "ouroboroshub", "user_repo"], "description": "Physical skill location for cwd=skill_payload[/subdir]."},
 	                "skill_name": {"type": "string", "description": "Exact skill identity for cwd=skill_payload[/subdir]."},
 	                "outputs": {
 	                    "type": "array",
 	                    "items": {"type": "string"},
 	                    "default": [],
-	                    "description": "Generated file paths to copy/register into the task artifact store after success.",
+	                    "description": "Generated paths copied/registered after success, e.g. outputs=['report.txt']. The managed artifact directory is created lazily; do not move files into an assumed physical store.",
 	                },
 	                "scratch": {
 	                    "type": "array",

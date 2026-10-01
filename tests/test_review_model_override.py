@@ -93,11 +93,11 @@ def test_native_wait_switch_rechecks_bound_before_send_and_never_replays_read(li
         with pytest.raises(ReviewRouteUnavailable) as raised:
             executor.execute()
         assert raised.value.code == "native_transcript_cap_exceeded"
-        assert len(gateway.operations) == 2
+        assert len(gateway.accepted_operations) == 2
         assert executor.failure_custody()["native_transcript_bound"] == 0
         with pytest.raises(ReviewRouteUnavailable):
             executor.execute()
-        assert len(gateway.operations) == 2
+        assert len(gateway.accepted_operations) == 2
     else:
         answer = executor.execute()
         assert answer.raw_text == final["message"]["content"]
@@ -106,7 +106,7 @@ def test_native_wait_switch_rechecks_bound_before_send_and_never_replays_read(li
         sent = gateway.uploads[-1][0]
         assert sent["account"] == {"mode": "pin", "profileId": "account-b"}
         assert any(message.get("role") == "tool" and "completed original read" in message["content"] for message in sent["messages"])
-        assert answer.usage["native_rounds"] == 2 and len(gateway.operations) == 3
+        assert answer.usage["native_rounds"] == 2 and len(gateway.accepted_operations) == 3
     assert len(reads) == len(decisions) == 1
     assert controller.overrides.keys() == {"reviewer:critic"}
     assert [row["state"] for row in ledger(root)].count("settled") == (1 if narrow else 2)
@@ -267,8 +267,8 @@ def test_scope_reservation_and_send_use_prepared_profile_not_original_slot(setup
 
     monkeypatch.setattr(LLMClient, "claudexor_model_catalog", staticmethod(catalog))
     original = ReviewSlot("scope-one", MODEL, session_profile="account-a")
-    prepared = {"scope_model_id": MODEL, "prompt": "Review", "stable_prefix_len": 0,
-                "context_manifest": {}, "session_task": "", "repo_dir": root,
+    prepared = {"scope_model_id": MODEL, "prompt": "", "stable_prefix_len": 0,
+                "context_manifest": {}, "session_task": "Review the staged change", "repo_dir": root,
                 "slot_id": "scope-one", "route": ReviewRouteKind.API_CHAT, "slot_effort": "high",
                 "session_target": "", "session_profile": "account-b", "delegated": False,
                 "subagent_id": "", "use_local": False,
@@ -290,7 +290,9 @@ def test_scope_reservation_and_send_use_prepared_profile_not_original_slot(setup
     monkeypatch.setattr(scope, "_call_scope_llm", observe_call)
     actual = scope.run_scope_review(ToolContext(repo_dir=root, drive_root=root, task_id="task-one"), "Review", prepared=prepared,
                                     session_profile="ignored-original")
-    assert actual.status == "sub_floor"  # The actual 200K account cannot acquire a 1M verdict.
+    # Window size no longer decides authority: the row answers on the account it
+    # was PREPARED with, and that account's profile is what gets pinned.
+    assert actual.status == "responded"
     assert gateway.uploads[0][0]["account"] == {"mode": "pin", "profileId": "account-b"}
     assert catalog_profiles and set(catalog_profiles) == {"account-b"}
     assert actual.tokens_in == 20 and ledger(root)[-1]["state"] == "settled"

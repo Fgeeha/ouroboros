@@ -11,6 +11,7 @@ import {
     createAvailableSubagentsEditor,
 } from './subagents_settings.js';
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
+import { PROCESSING_PREFERENCE_KEY, MODEL_PROCESSING_PREFERENCES_KEY } from './route_editor_primitives.js';
 
 // Every supported task harness in the linear Available-subagents compiler.
 // Reviewer policy remains a separate core-only projection: Agy is task-only and
@@ -148,6 +149,8 @@ export function onboardingSettingsDraft({
         )),
         OUROBOROS_MODEL_ACCOUNTS: state.modelAccounts || {},
         OUROBOROS_MODEL_CONTEXT_WINDOWS: state.modelContextWindows || {},
+        ...(state.processingPreference !== undefined ? { [PROCESSING_PREFERENCE_KEY]: clean(state.processingPreference) } : {}),
+        ...(state.modelProcessingPreferences !== undefined ? { [MODEL_PROCESSING_PREFERENCES_KEY]: state.modelProcessingPreferences } : {}),
         OUROBOROS_RUNTIME_MODE: clean(state.runtimeMode) || 'advanced',
     };
 }
@@ -506,6 +509,7 @@ export function agentsStepHtml({ compact = false, showRoster = true } = {}) {
  * @param {Function} [options.previewPayload] current open provider/local draft
  * @param {Function} [options.previewTransport] injectable preview request
  * @param {Function} [options.onSubagentsChange] receives the editable canonical list
+ * @param {object}   [options.providerProfiles] setup-contract provider names
  * @returns {object} controller
  */
 export function createAgentsStep({
@@ -517,7 +521,9 @@ export function createAgentsStep({
     previewPayload = () => ({}),
     previewTransport = (payload) => apiClient.previewOnboardingSubagents(payload),
     onSubagentsChange = () => {},
+    providerProfiles = {},
     onSetupPreview = () => {},
+    onPreviewStatus = () => {},
     onStatus = () => {},
 } = {}) {
     const getDoc = typeof doc === 'function' ? doc : () => doc;
@@ -532,7 +538,7 @@ export function createAgentsStep({
         previewGeneration: 0,
         previewAppliedSignature: '',
         previewPending: false,
-        previewError: '',
+        previewFailure: null,
         previewStatusSignature: '',
     };
 
@@ -571,10 +577,10 @@ export function createAgentsStep({
         baseline: 'generated',
     });
 
-    function previewRequest() {
+    function previewRequest({ includeVisibleRoster = false } = {}) {
         return {
             ...(previewPayload() || {}),
-            ...(subagents.dirty ? { OUROBOROS_SUBAGENTS: subagents.setting } : {}),
+            ...(subagents.dirty || (includeVisibleRoster && subagents.loaded) ? { OUROBOROS_SUBAGENTS: subagents.setting } : {}),
             ...subscriptionDeclaration({
                 connected: state.connected,
                 skipPresets: state.skipPresets,
@@ -586,34 +592,40 @@ export function createAgentsStep({
         return JSON.stringify(previewRequest());
     }
 
-    async function refreshSubagentsPreview({ force = false } = {}) {
+    async function refreshSubagentsPreview({ force = false, replaceReviewers = false } = {}) {
         if (state.disposed) return false;
-        const payload = previewRequest();
+        const payload = previewRequest({ includeVisibleRoster: replaceReviewers });
         const signature = JSON.stringify(payload);
         if (!force && signature === state.previewAppliedSignature && subagents.loaded) return true;
         state.previewPending = true;
-        state.previewError = '';
+        state.previewFailure = null;
         const generation = ++state.previewGeneration;
+        onPreviewStatus();
         try {
             const response = await previewTransport(payload);
             if (state.disposed || generation !== state.previewGeneration) return false;
-            const result = subagents.dirty ? { applied: true } : subagents.applyGeneratedPreview(response);
+            const result = replaceReviewers ? subagents.applyOwnerPreview(response)
+                : subagents.dirty ? { applied: true } : subagents.applyGeneratedPreview(response);
             if (!result.applied) {
-                state.previewError = result.error || 'Available subagents preview was not applied.';
+                state.previewFailure = { detail: result.error || 'Available subagents preview was not applied.' };
                 return false;
             }
             state.previewAppliedSignature = signature;
             onSubagentsChange(subagents.setting);
-            onSetupPreview(response);
+            onSetupPreview(response, { replaceReviewers });
             state.previewAppliedSignature = currentPreviewSignature();
             return true;
         } catch (error) {
             if (state.disposed || generation !== state.previewGeneration) return false;
-            state.previewError = String(error?.message || error);
+            state.previewFailure = { code: error?.body?.code || '', canSkip: Boolean(error?.body?.can_skip),
+                detail: String(error?.body?.detail || error?.message || error) };
             subagents.setPreviewFailure(error);
             return false;
         } finally {
-            if (generation === state.previewGeneration) state.previewPending = false;
+            if (generation === state.previewGeneration) {
+                state.previewPending = false;
+                if (!state.disposed) onPreviewStatus();
+            }
         }
     }
 
@@ -621,7 +633,8 @@ export function createAgentsStep({
         state.previewGeneration += 1;
         state.previewAppliedSignature = '';
         state.previewPending = false;
-        state.previewError = '';
+        state.previewFailure = null;
+        onPreviewStatus();
     }
 
     function ensureLogin() {
@@ -715,8 +728,20 @@ export function createAgentsStep({
         state.listHtml = null;
         paint();
         subagents.mount();
+        // The wizard's API keys are typed on the Accounts step, so the provider
+        // list is re-derived on every entry into a step that shows these rows —
+        // never once at construction, when no key exists yet.
+        applySourceContext();
         refreshSubagentsPreview();
         store.refresh();
+    }
+
+    /** The roster editor offers the providers the current draft has keys for. */
+    function applySourceContext() {
+        subagents.setSourceContext({
+            settings: previewPayload() || {},
+            providerProfiles,
+        });
     }
 
     /**
@@ -793,31 +818,38 @@ export function createAgentsStep({
         get reads() { return store.reads; },
         refreshStatus() { return store.refresh(); },
         get availableSubagents() { return subagents.setting; },
+        setProcessingPreference(value) { subagents.setProcessingPreference(value); },
+        /** Re-derive the provider list after the owner edits Accounts. */
+        setSourceContext(context) {
+            if (context) subagents.setSourceContext(context);
+            else applySourceContext();
+        },
         get generatedPreviewReady() {
             if (subagents.dirty) return true;
             try {
-                return subagents.loaded && !state.previewPending && !state.previewError
+                return subagents.loaded && !state.previewPending && !state.previewFailure
                     && state.previewAppliedSignature === currentPreviewSignature();
             } catch (error) {
                 return false;
             }
         },
         get previewPending() { return state.previewPending; },
-        get previewError() { return state.previewError; },
+        get previewError() { return state.previewFailure?.detail || ''; },
+        get previewFailure() { return state.previewFailure; },
         validateSubagents() { return subagents.validate(); },
         // Finish is the wizard's commit: the roster then shows its own errors
         // beside the rows they name when the owner steps back here.
         noteSaveAttempt() { subagents.noteSaveAttempt(); },
         refreshSubagentsPreview,
         invalidateGeneratedPreview,
-        setSkipPresets(value) {
+        setSkipPresets(value, { replaceReviewers = false } = {}) {
             const next = Boolean(value);
             let refreshed = Promise.resolve(true);
             if (next !== state.skipPresets) {
                 state.skipPresets = next;
-                refreshed = refreshSubagentsPreview({ force: true });
-            } else if (!subagents.dirty && !state.previewPending) {
-                refreshed = refreshSubagentsPreview({ force: true });
+                refreshed = refreshSubagentsPreview({ force: true, replaceReviewers });
+            } else if (replaceReviewers || (!subagents.dirty && !state.previewPending)) {
+                refreshed = refreshSubagentsPreview({ force: true, replaceReviewers });
             }
             paint();
             return refreshed;

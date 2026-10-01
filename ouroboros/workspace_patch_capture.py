@@ -3,7 +3,8 @@
 Owns the streamed `workspace.patch` and `workspace_patch.json` pair — patch
 baseline resolution (including the unborn-HEAD empty-tree case and the acting
 subagent `base_sha` binding), the bounded git process helpers the capture runs
-on, the declared-scratch and untracked eligibility filtering, the moved-HEAD
+on, the declared-scratch and untracked eligibility filtering (git's binary
+verdict for a whole inventory in one process), the moved-HEAD
 tripwire for a private self worktree, and the empty manifest a failed
 finalization falls back to. The static eligibility rules live in
 ``workspace_patch_rules``; the task-drive, child-result and artifact
@@ -16,6 +17,7 @@ import json
 import os
 import pathlib
 import re
+import stat
 import subprocess
 import tempfile
 import threading
@@ -95,6 +97,18 @@ def write_workspace_patch_artifacts(
         errors,
         expected_base_sha=task_base_sha or preflight_head,
     )
+    metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    workspace_copy = metadata.get("workspace_copy") or task.get("workspace_copy") or {}
+    file_baseline = metadata.get("file_baseline") or workspace_copy.get("file_baseline") or {}
+    file_input_paths: List[str] = []
+    try:
+        from ouroboros.workspace_file_outputs import changed_file_inputs
+        if not isinstance(file_baseline, dict):
+            raise ValueError("snapshot file baseline is not a path map")
+        file_input_paths = changed_file_inputs(root, file_baseline)
+    except (OSError, ValueError) as exc:
+        errors.append({"type": "file_capture_failed", "message": f"{type(exc).__name__}: {exc}"})
+        file_baseline = {}
     changed_tracked = _git_path_list(
         ["git", "diff", "--name-only", "--no-renames", "-z", "--no-ext-diff", "--no-color", base_ref, "--"],
         root,
@@ -102,6 +116,9 @@ def write_workspace_patch_artifacts(
     )
     diffstat = ""
     untracked = _git_path_list(["git", "ls-files", "-z", "--others", "--exclude-standard"], root, errors)
+    # Copied inputs were deliberately never Git additions. Their exact baseline
+    # owns unchanged/modified/deleted detection even if the child stages them.
+    untracked = [rel for rel in untracked if rel not in file_baseline]
     # v6.52.2: exclude declared ephemeral scratch (run_command/run_script `scratch=[...]`) so a
     # throwaway verification file the agent forgot to delete never leaks into the workspace patch.
     # The manifest stores {abs_path: sha256}; a file is excluded ONLY while its CURRENT content
@@ -122,6 +139,10 @@ def write_workspace_patch_artifacts(
     except Exception:
         scratch_sha_by_rel = {}
         scratch_sha_by_abs = {}
+    # git's binary verdict for the whole inventory in one process (two when empty
+    # files need their attribute verdict; #1241); the loop below keeps its per-file
+    # order and reads the verdict instead of spawning ``git diff --numstat`` per file.
+    binary_verdicts = untracked_binary_verdicts(root, binary_verdict_candidates(root, untracked), warnings=diagnostics)
     for rel in untracked:
         _want_sha = scratch_sha_by_rel.get(rel) or scratch_sha_by_abs.get(os.path.normcase(str((root / rel).resolve(strict=False))))
         if _want_sha:
@@ -140,11 +161,24 @@ def write_workspace_patch_artifacts(
         if reason:
             excluded.append({"path": rel, "reason": reason})
             continue
-        blob_reason = _untracked_blob_exclude_reason(root, rel, file_outputs=file_output_paths)
+        blob_reason = _untracked_blob_exclude_reason(
+            root, rel, file_outputs=file_output_paths, warnings=diagnostics, binary_verdicts=binary_verdicts)
         if blob_reason:
             excluded.append({"path": rel, "reason": blob_reason})
             continue
         included_untracked.append(rel)
+    captured_inputs: List[str] = []
+    for rel in file_input_paths:
+        sensitive_reason = _sensitive_untracked_reason(rel) or pem_capture_refusal(root, rel, warnings=diagnostics)
+        if sensitive_reason:
+            sensitive.append({"path": rel, "reason": sensitive_reason})
+            continue
+        if reason := _patch_exclude_reason(rel):
+            excluded.append({"path": rel, "reason": reason})
+            continue
+        captured_inputs.append(rel)
+        if (root / rel).is_file() and not (root / rel).is_symlink():
+            file_output_paths.append(rel)
     incidental_lock_excludes = _incidental_lockfile_excludes([*changed_tracked, *included_untracked])
     if incidental_lock_excludes:
         kept_untracked: List[str] = []
@@ -170,6 +204,8 @@ def write_workspace_patch_artifacts(
             base_sizes[raw_path.decode("utf-8", errors="replace")] = int(fields[3])
     large_tracked = []
     for rel in changed_tracked:
+        if rel in file_baseline:
+            continue
         path = root / rel
         present = path.is_file() and not path.is_symlink()
         size = path.stat().st_size if present else 0
@@ -192,14 +228,24 @@ def write_workspace_patch_artifacts(
             )
         except (OSError, ValueError) as exc:
             errors.append({"type": "file_capture_failed", "message": f"{type(exc).__name__}: {exc}"})
+    file_changes: List[Dict[str, Any]] = []
+    if (file_output_paths or large_tracked or captured_inputs) and not errors:
+        from ouroboros.workspace_file_outputs import capture_file_output_changes
+        try:
+            file_changes = capture_file_output_changes(
+                root, base_ref, [*file_output_paths, *large_tracked, *captured_inputs], file_outputs, artifact_dir,
+                file_baseline=file_baseline,
+            )
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            errors.append({"type": "file_capture_failed", "message": f"{type(exc).__name__}: {exc}"})
     hasher = sha256()
     total_size = 0
     with patch_path.open("wb") as fh:
         if not errors:
             tracked_lock_excludes = sorted(set(changed_tracked) & incidental_lock_excludes)
             tracked_pathspec = ["--"]
-            if tracked_lock_excludes or large_tracked:
-                tracked_pathspec += ["."] + [f":(exclude,literal){rel}" for rel in [*tracked_lock_excludes, *large_tracked]]
+            if tracked_lock_excludes or large_tracked or file_baseline:
+                tracked_pathspec += ["."] + [f":(exclude,literal){rel}" for rel in [*tracked_lock_excludes, *large_tracked, *file_baseline]]
             for rel in tracked_lock_excludes:
                 tracked_excluded.append({"path": rel, "reason": "incidental lockfile without sibling manifest change"})
             diffstat = _git_stdout(
@@ -229,59 +275,31 @@ def write_workspace_patch_artifacts(
                     errors=errors,
                     diagnostics=diagnostics,
                 )
-    if errors:
-        try:
-            patch_path.unlink()
-        except OSError:
-            pass
-        total_size = 0
-        digest = ""
-    else:
-        digest = hasher.hexdigest()
-
-    head_error: Dict[str, Any] | None = None
+    digest = hasher.hexdigest()
     head_errors: List[Dict[str, Any]] = []
     current_head = _git_stdout(["git", "rev-parse", "--verify", "HEAD"], root, allow_rc={0}, errors=head_errors).strip()
-    # Q11: the moved-HEAD fail-closed tripwire applies ONLY to a child's private
-    # self_worktree, where a moved HEAD can only mean the worktree itself
-    # rewrote history under the patch (its base is always a real provisioned
-    # commit, never unborn). In a SHARED tree (external_workspace/genesis) the
-    # parent's own legitimate commits move HEAD too — enforcing it there failed
-    # every innocent in-flight sibling; shared-tree integrity is verified by the
-    # reverse-patch check in tools/subagent_integration (verified_shared_workspace),
-    # and base_sha stays the patch BASE so parent-committed work is still captured.
-    if task_base_sha and acting_constraint is not None and acting_constraint.surface == "self_worktree":
+    # Only isolated copies keep HEAD fixed to their provisioned baseline.
+    # Shared external/genesis trees may receive legitimate parent commits;
+    # integration verifies their postimages instead of calling that drift.
+    if (task_base_sha and acting_constraint is not None
+            and acting_constraint.surface == "self_worktree" and current_head != base_head):
         if not current_head:
             errors.extend(head_errors)
-            head_error = {
-                "type": "workspace_head_unverified",
-                "message": "workspace HEAD could not be verified at artifact finalization",
-                "expected_head": base_head,
-                "current_head": "",
-            }
-            errors.append(head_error)
-        elif current_head != base_head:
-            head_error = {
-                "type": "workspace_head_changed",
-                "message": "workspace HEAD changed during task execution; patch artifact is invalid",
-                "expected_head": base_head,
-                "current_head": current_head,
-            }
-            errors.append(head_error)
-    if head_error:
-        try:
-            patch_path.unlink()
-        except OSError:
-            pass
-        total_size = 0
-        digest = ""
-
+        errors.append({
+            "type": "workspace_head_changed" if current_head else "workspace_head_unverified",
+            "message": ("workspace HEAD changed during task execution; patch artifact is invalid"
+                        if current_head else "workspace HEAD could not be verified at artifact finalization"),
+            "expected_head": base_head,
+            "current_head": current_head or "",
+        })
     if errors:
+        total_size, digest = 0, ""
         status = ARTIFACT_STATUS_FAILED
-    elif total_size > 0:
+    elif total_size > 0 or file_changes:
         status = ARTIFACT_STATUS_READY_WITH_CHANGES
     else:
         status = ARTIFACT_STATUS_READY_NO_CHANGES
+    if not total_size:
         try:
             patch_path.unlink()
         except OSError:
@@ -292,8 +310,15 @@ def write_workspace_patch_artifacts(
         "created_at": utc_now_iso(),
         "status": status,
         "workspace_root": str(root),
+        **({"workspace_copy": workspace_copy} if workspace_copy else {}),
         "patch_name": "workspace.patch",
         "manifest_name": "workspace_patch.json",
+        "base_provenance": ("task_constraint" if task_base_sha else "admission_head" if preflight_head
+                            else "empty_tree" if base_is_empty_tree else "capture_head"),
+        "base_explanation": "Application patch relative to the recorded base; includes eligible workspace changes and may include branch differences. It does not attribute authorship.",
+        "comparison_note": "No auxiliary comparison target was selected. Use vcs_diff(base=..., head=...) for two trees, or base only for the current worktree.",
+        "current_branch": _git_stdout(["git", "symbolic-ref", "--quiet", "--short", "HEAD"], root, allow_rc={0, 1}, errors=diagnostics).strip(),
+        "tracking_upstream": _git_stdout(["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"], root, allow_rc={0, 128}, errors=diagnostics).strip(),
         "base_ref": base_ref,
         "base_head": base_head,
         "base_is_empty_tree": base_is_empty_tree,
@@ -309,6 +334,7 @@ def write_workspace_patch_artifacts(
             "sensitive_blocked": len(sensitive),
         },
         "file_outputs": file_outputs,
+        "file_output_changes": file_changes,
         "tracked_changed": changed_tracked,
         "tracked_excluded": tracked_excluded,
         "untracked_included": included_untracked,
@@ -328,7 +354,7 @@ def write_workspace_patch_artifacts(
             "workspace_root": str(root),
         }
     ]
-    if status == ARTIFACT_STATUS_READY_WITH_CHANGES:
+    if status == ARTIFACT_STATUS_READY_WITH_CHANGES and total_size:
         artifacts.insert(0, {
             "kind": "workspace_patch",
             "name": "workspace.patch",
@@ -603,53 +629,197 @@ _PEM_PRIVATE_KEY_RE = re.compile(rb"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
 _PEM_HEAD_READ_BYTES = 4096
 
 
-def _untracked_blob_exclude_reason(root: pathlib.Path, rel: str, *, file_outputs: Optional[List[str]] = None) -> str:
+def pem_private_key_reason(root: pathlib.Path, rel: str) -> str:
+    """Reason a file carries private-key CONTENT, or ``""`` when it does not.
+
+    The bounded head read is the evidence every git lane shares: the patch,
+    the cooperative checkpoint and the attached-folder snapshot. Unreadable
+    heads are treated as ordinary content (fail-soft: git still decides).
+    """
+    try:
+        with (root / rel).open("rb") as fh:
+            head = fh.read(_PEM_HEAD_READ_BYTES)
+    except OSError:
+        return ""
+    return "private key material (PEM private-key header)" if _PEM_PRIVATE_KEY_RE.search(head) else ""
+
+
+def pem_capture_refusal(root: pathlib.Path, rel: str, *, warnings=None) -> str:
+    """Keep the observed PEM finding while the shared effective mode decides its effect."""
+    from ouroboros.config import get_runtime_mode
+    from ouroboros.runtime_mode_policy import mode_has_unrestricted_agency
+
+    reason = pem_private_key_reason(root, rel)
+    if reason and mode_has_unrestricted_agency(get_runtime_mode()):
+        finding = {"path": rel, "reason": reason, "advisory": True}
+        if warnings is not None:
+            warnings.append(finding)
+        else:
+            import logging
+            logging.getLogger(__name__).warning("PEM capture finding retained as advisory: %s", finding)
+        return ""
+    return reason
+
+
+def _untracked_blob_exclude_reason(root: pathlib.Path, rel: str, *, file_outputs: Optional[List[str]] = None,
+                                   warnings=None, binary_verdicts: Optional[Dict[str, bool]] = None) -> str:
     """Reason to drop an untracked file from the workspace patch when it is a
     build/runtime BINARY, exceeds the per-file size cap, or carries a PEM
     private-key header in its head bytes. Keeps real-usage patches
     source-shaped without losing data (the file stays in the workspace
     and is recorded under ``untracked_excluded``). On any git/stat failure the
-    file is INCLUDED (conservative — the main binary diff still applies)."""
+    file is INCLUDED (conservative — the main binary diff still applies).
+
+    ``binary_verdicts`` is one :func:`untracked_binary_verdicts` batch over the whole
+    inventory; ``None`` keeps git's per-file ``--numstat`` verdict (one subprocess per
+    file) for a caller that did not batch."""
 
     try:
         size = (root / rel).lstat().st_size
     except OSError:
         return ""  # unreadable/symlink races: include and let git decide
-    try:
-        with (root / rel).open("rb") as fh:
-            head = fh.read(_PEM_HEAD_READ_BYTES)
-    except OSError:
-        head = b""
-    if _PEM_PRIVATE_KEY_RE.search(head):
-        return "private key material (PEM private-key header)"
+    if reason := pem_capture_refusal(root, rel, warnings=warnings):
+        return reason
     if size > _PATCH_MAX_UNTRACKED_FILE_BYTES:
         if file_outputs is not None:
             file_outputs.append(rel)
         return f"untracked file exceeds size cap ({size}B > {_PATCH_MAX_UNTRACKED_FILE_BYTES}B)"
-    numstat = _git_stdout(
-        ["git", "diff", "--no-index", "--numstat", "--no-ext-diff", "--no-color", "--", os.devnull, rel],
-        root,
-        allow_rc={0, 1},
-        errors=None,
-    )
-    first = numstat.strip().splitlines()[0] if numstat.strip() else ""
-    if first.startswith("-\t-"):
+    if binary_verdicts is None:
+        numstat = _git_stdout(
+            ["git", "diff", "--no-index", "--numstat", "--no-ext-diff", "--no-color", "--", os.devnull, rel],
+            root,
+            allow_rc={0, 1},
+            errors=None,
+        )
+        first = numstat.strip().splitlines()[0] if numstat.strip() else ""
+        binary = first.startswith("-\t-")
+    else:
+        binary = bool(binary_verdicts.get(rel, False))
+    if binary:
         if file_outputs is not None:
             file_outputs.append(rel)
         return "binary file"
     return ""
 
 
-def untracked_capture_veto_reason(root: pathlib.Path, rel: str) -> str:
-    """Why an untracked file must NOT ride into a workspace snapshot or patch.
+def binary_verdict_candidates(root: pathlib.Path, rels: Sequence[str]) -> List[str]:
+    """The untracked paths that still need git's binary verdict.
+
+    The per-file predicate decides the dotenv policy, the name rules, the PEM head
+    and the size cap BEFORE it ever asks git; the batch keeps that order, so a
+    vetoed or oversized file is never handed to git — its clean filters and
+    encodings run only over files that may become Git inputs, exactly as before."""
+    from ouroboros.config import get_runtime_mode
+    from ouroboros.runtime_mode_policy import mode_has_unrestricted_agency
+
+    unrestricted = mode_has_unrestricted_agency(get_runtime_mode())
+    out: List[str] = []
+    for rel in rels:
+        if not rel or _sensitive_untracked_reason(rel) or _patch_exclude_reason(rel):
+            continue
+        try:
+            info = os.lstat(root / rel)
+        except OSError:
+            continue
+        if not stat.S_ISREG(info.st_mode):
+            continue
+        if not unrestricted and pem_private_key_reason(root, rel):  # PEM before the size cap, as the predicate orders them
+            continue
+        if info.st_size > _PATCH_MAX_UNTRACKED_FILE_BYTES:
+            continue
+        out.append(rel)
+    return out
+
+
+def untracked_binary_verdicts(root: pathlib.Path, rels: Sequence[str], *, warnings=None) -> Optional[Dict[str, bool]]:
+    """git's own binary verdict for every path in ``rels`` from ONE ``git diff``.
+
+    Every REGULAR file is staged as the empty blob into a scratch index
+    (``update-index --index-info`` touches no file and writes no content object), and
+    one index-versus-worktree ``git diff --numstat -z`` then runs exactly the machinery
+    a per-file ``git diff --no-index --numstat`` ran — attributes, diff drivers, clean
+    filters and working-tree encodings included — so the answer is git's, not a
+    re-implementation (parity probed on git 2.53 for 19 path classes). ``-\\t-`` is
+    binary; a text file and a file that vanished meanwhile (``0\\t0``) are text, exactly
+    as the per-file verdict reads them. A path the diff OMITS is identical to the staged
+    blob — an empty file — which git still classifies by attribute (an empty ``*.dat``
+    under ``-diff`` is binary): those are asked once more, staged as a one-byte blob, so
+    the empty-file set costs a second process, never one per file. Symlinks and other
+    non-regular paths are text (git diffs the link text). One inventory of tens of
+    thousands of files therefore costs one or two processes (#1241). ``None`` — the
+    "did not batch" signal — when git cannot answer, after an advisory warning: the
+    callers keep the per-file verdict (the same answer, one process per file), never a
+    new refusal."""
+    regular: List[str] = []
+    for rel in rels:
+        try:
+            if rel and stat.S_ISREG(os.lstat(root / rel).st_mode):
+                regular.append(rel)
+        except OSError:
+            continue
+    if not regular:
+        return {}
+    env = dict(os.environ)
+    scratch = ""
+
+    def _git(*args: str, data: bytes = b"") -> bytes:
+        return subprocess.run(["git", *args], cwd=str(root), capture_output=True, input=data,
+                              env=env, timeout=300, check=True).stdout
+
+    def _diff_against(staged: bytes, paths: List[str]) -> Dict[str, bool]:
+        """One index-versus-worktree diff with every path staged as ``staged``: the
+        verdict of each path that produced a row (absent = identical to ``staged``)."""
+        blob = _git("hash-object", "-w", "--stdin", data=staged).strip()
+        _git("read-tree", "--empty")
+        _git("update-index", "-z", "--index-info",
+             data=b"".join(b"100644 " + blob + b"\t" + os.fsencode(rel) + b"\0" for rel in paths))
+        seen: Dict[str, bool] = {}
+        for row in _git("diff", "--numstat", "-z", "--no-renames", "--no-ext-diff", "--no-color").split(b"\0"):
+            added, sep, rest = row.partition(b"\t")
+            deleted, sep2, path = rest.partition(b"\t")
+            if sep and sep2:
+                seen[os.fsdecode(path)] = added == b"-" and deleted == b"-"
+        return seen
+
+    try:
+        fd, scratch = tempfile.mkstemp(prefix="ouroboros-binary-verdict-", suffix=".index")
+        os.close(fd)
+        env["GIT_INDEX_FILE"] = scratch
+        verdicts = _diff_against(b"", regular)
+        omitted = [rel for rel in regular if rel not in verdicts]
+        if omitted:  # empty files: a second batch, staged as a one-byte blob
+            verdicts.update(_diff_against(b"\n", omitted))
+    except Exception as exc:
+        if warnings is not None:
+            warnings.append({"reason": "binary_verdict_batch_unavailable", "advisory": True,
+                             "detail": f"{type(exc).__name__}: {exc}"[:300]})
+        return None
+    finally:
+        if scratch:
+            try:
+                os.unlink(scratch)
+            except OSError:
+                pass
+    return {rel: verdicts.get(rel, False) for rel in regular}
+
+
+def untracked_capture_veto_reason(root: pathlib.Path, rel: str, *, file_outputs: Optional[List[str]] = None,
+                                  warnings=None, binary_verdicts: Optional[Dict[str, bool]] = None) -> str:
+    """Classify an untracked file for Git, file-reference transfer, or exclusion.
 
     The delegated-run baseline snapshot
     (``subagent_worktrees.provision_execution_snapshot``) asks the SAME three
     checks, in the SAME order, that ``write_workspace_patch_artifacts`` applies
-    to untracked files: sensitive/credential-shaped names first, then the
-    static junk rules, then the binary/size veto. One combined predicate here so
-    the snapshot and the patch cannot drift apart about eligibility.
-    Returns the human-readable reason, or "" when the file is eligible.
+    to untracked files: the dotenv spellings and exact credential leaves first,
+    then the static junk rules, then the blob veto, which reads the head bytes
+    for a PEM private-key header before the size cap and the binary check. One
+    combined predicate here so the snapshot and the patch cannot drift apart
+    about eligibility.
+    Returns the human-readable patch exclusion reason, or "" for a Git input.
+    ``file_outputs`` receives eligible binary/large files which use file
+    artifacts rather than Git blobs; credential/junk exclusions never enter it.
+    ``binary_verdicts`` comes from one :func:`untracked_binary_verdicts` batch over
+    the whole inventory (``None`` = per-file git verdict, see the blob check).
     """
     reason = _sensitive_untracked_reason(rel)
     if reason:
@@ -657,7 +827,8 @@ def untracked_capture_veto_reason(root: pathlib.Path, rel: str) -> str:
     reason = _patch_exclude_reason(rel)
     if reason:
         return reason
-    return _untracked_blob_exclude_reason(root, rel)
+    return _untracked_blob_exclude_reason(root, rel, file_outputs=file_outputs, warnings=warnings,
+                                          binary_verdicts=binary_verdicts)
 
 
 def _preflight_head_from_task(task: Dict[str, Any]) -> str:

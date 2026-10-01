@@ -1,9 +1,7 @@
 """Argument normalization and physical target binding for tool dispatch.
 
-Every span is extracted VERBATIM from the parent's tip bytes by
-scripts/v7next_transplant.py (D18/D33 module-handle split, proof-checked);
-the parent re-exports every moved name, so historical imports and
-monkeypatch targets keep working unchanged.
+The facade re-exports these definitions so existing imports and monkeypatch
+targets retain the same bindings.
 """
 
 from __future__ import annotations
@@ -36,7 +34,7 @@ def _registry():
     The parent owns the rebindable module state and the members tests
     monkeypatch there; reading them through the module at each call keeps
     one binding, where a from-import would freeze the value this leaf saw
-    at import time (the owner-approved D18/D33 mechanical exception).
+    at import time.
     """
     from ouroboros.tools import registry
 
@@ -68,12 +66,12 @@ def active_repo_dir_for(ctx: Any) -> pathlib.Path:
         if workspace_mode:
             return workspace_path
 
-    from ouroboros.tool_access import project_room_lens_dir
+    from ouroboros.tool_access import folderless_scratch_dir, project_room_lens_dir
 
     room = project_room_lens_dir(ctx)
     if room is not None:
         return room
-    return pathlib.Path(getattr(ctx, "repo_dir"))
+    return folderless_scratch_dir(ctx) or pathlib.Path(getattr(ctx, "repo_dir"))
 
 
 def system_repo_dir_for(ctx: Any) -> pathlib.Path:
@@ -84,6 +82,7 @@ def system_repo_dir_for(ctx: Any) -> pathlib.Path:
 
 _PATH_NORMALIZED_TOOLS = frozenset({"read_file", "write_file", "edit_text", "list_files", "search_code", "query_code"})
 _TOP_LEVEL_PATH_WRITE_TOOLS = frozenset({"write_file", "edit_text"})
+_ROOT_SELECTED_READ_TOOLS = frozenset({"read_file", "list_files", "search_code"})
 
 
 _ROOT_ARG_REPO_WRITE_TOOLS = frozenset({"write_file", "edit_text", "apply_patch", "edit_batch"})
@@ -133,6 +132,36 @@ def _payload_write_paths(name: str, args: Dict[str, Any]) -> List[str]:
     return [p for p in paths if str(p or "").strip()]
 
 
+def _root_containing_absolute_path(ctx: Any, name: str, text: str) -> str:
+    """Owner 7A: the root that physically contains an absolute path given WITHOUT
+    a root — among the roots THIS profile may use for the tool's operation plus
+    the actor's lineage task roots — or "" when none holds it. The deepest
+    containing base wins (``runtime_data`` holds the task roots, the owner home
+    holds Deliverables); the path itself is never rewritten, so the `01aea0663`
+    mirror stays closed. The file-tool twin of ``tool_access._select_process_target``."""
+    if not _registry().is_absolute_path_text(text):
+        return ""
+    from ouroboros.tool_access import (
+        active_tool_profile, decide_tool_access, lineage_read_base,
+        path_is_relative_to, profile_readable_root_paths,
+    )
+
+    operation = _TARGET_BINDING_OPERATIONS[name]
+    try:
+        target = pathlib.Path(text).expanduser().resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        return ""
+    holders = [(label, base) for label, base in profile_readable_root_paths(ctx, operation=operation)
+               if path_is_relative_to(target, base)]
+    profile = active_tool_profile(ctx)
+    for label in ("task_drive", "artifact_store"):
+        if decide_tool_access(profile=profile, root=label, operation=operation).allow:
+            base = lineage_read_base(ctx, label, target)
+            if base is not None:
+                holders.append((label, base))
+    return max(holders, key=lambda item: len(str(item[1])), default=("", None))[0]
+
+
 def _normalize_dispatch_path_args_result(
     ctx: Any,
     name: str,
@@ -155,10 +184,18 @@ def _normalize_dispatch_path_args_result(
     The destination root still passes every downstream gate (profile access
     decision, protected-path guards, subagent filters) — only the label is
     corrected, never the authority. ``query_code`` is excluded: its
-    root=user_files external-target contract handles absolute paths natively."""
+    root=user_files external-target contract handles absolute paths natively.
+    Owner 7A: an absolute path with NO ``root`` runs under the permitted root
+    that physically contains it (``_root_containing_absolute_path``), the path
+    itself untouched; a NAMED root is never re-rooted."""
     if name not in _PATH_NORMALIZED_TOOLS:
         return _DispatchPathNormalization()
-    root_arg = str(args.get("root") or "active_workspace")
+    root_arg = str(args.get("root") or "")
+    if not root_arg and name in _ROOT_SELECTED_READ_TOOLS:
+        selected = _root_containing_absolute_path(ctx, name, str(args.get("path") or ""))
+        if selected and selected != "active_workspace":
+            args["root"] = root_arg = selected
+    root_arg = root_arg or "active_workspace"
     if root_arg in ("active_workspace", "system_repo"):
         try:
             norm_root = active_repo_dir_for(ctx) if root_arg == "active_workspace" else system_repo_dir_for(ctx)
@@ -298,11 +335,13 @@ def _target_binding_operation(name: str, args: dict[str, Any]) -> str | None:
     # CONDITIONAL, never a static map entry (R1 item 1): delegate_start becomes
     # target-bound only when it explicitly selects an exact skill payload; a
     # plain or retry call keeps its current active-workspace behavior untouched.
-    # ONLY the known selector value binds here — any other root value falls
-    # through to the handler's TYPED unsupported_root refusal instead of an
-    # untyped ValueError from binding construction (gate fix 9).
+    # ONLY a COMPLETE known selector binds here — any other root value or an
+    # incomplete selector falls through to the handler's TYPED unsupported_root /
+    # payload_selector_incomplete refusal instead of an untyped ValueError from
+    # binding construction (gate fix 9, #1304).
     if (name == "delegate_start"
             and str(args.get("root") or "").strip() == "skill_payload"
+            and str(args.get("bucket") or "").strip() and str(args.get("skill_name") or "").strip()
             and not str(args.get("retry_of") or "").strip()):
         return "write"
     return None
@@ -346,6 +385,10 @@ def _normalize_tool_call_args(entry: "ToolEntry", args: dict[str, Any]) -> None:
             args[canonical] = args.pop(alias)
     if tool_name in _IGNORE_ROOT_ARG_TOOLS and "root" in args and "root" not in accepted:
         args.pop("root", None)
+    if tool_name == "delegate_start" and str(args.get("root") or "").strip() == "active_workspace":
+        # #1304: the schema's documented default IS omission (the #882 rule), removed
+        # before the configured-session selector check and the payload binder read it.
+        args.pop("root")
 
 
 def _prepare_public_builtin_args(entry: "ToolEntry", args: dict[str, Any]) -> str:
@@ -465,6 +508,27 @@ def _binding_set_targets_system_repo(ctx: Any, binding: Any) -> bool:
     return bool(items) and all(_registry().binding_targets_system_repo(ctx, item) for item in items)
 
 
+def _user_files_binding_reaches_repo(ctx: Any, binding: Any) -> bool:
+    """Whether a ``user_files`` target physically lands inside the Ouroboros repo.
+
+    ``binding_targets_system_repo`` compares the SELECTED ROOT's base, and
+    ``user_files`` resolves to the owner's home (the whole host on a cyber_pro
+    install), which can CONTAIN the repo. A repository path reached under that
+    name therefore answers no there while still being self-repo mutation, so the
+    light gate reads the resolved target instead of the root name. Only
+    ``user_files`` needs this: every other root's base is a data/payload
+    location the gate already classifies correctly.
+    """
+    from ouroboros.tool_access import path_is_relative_to
+
+    repo = system_repo_dir_for(ctx)
+    return any(
+        item.root == "user_files" and item.target_path is not None
+        and path_is_relative_to(pathlib.Path(item.target_path), repo)
+        for item in _binding_items(binding)
+    )
+
+
 def _binding_set_is_light_restricted(ctx: Any, binding: Any) -> bool:
     """Whether light mode must treat this file/VCS target as internal state."""
     items = _binding_items(binding)
@@ -511,6 +575,20 @@ def _light_binding_failure_result(
             text=redirect,
         )
     return redirect
+
+
+def delegate_payload_binding_refusal(ctx: Any, exc: Exception) -> ToolResult:
+    """A complete skill-payload selector the binder could not resolve (#1304): a typed,
+    definite no-run that names the selector and its repair, plus the one durable
+    START_BLOCKED attempt row a pre-custody refusal owes (D5)."""
+    from ouroboros.delegate_evidence import record_start_blocked
+    from ouroboros.delegate_shared import _fail
+
+    record_start_blocked(ctx, str(getattr(ctx, "task_id", "") or ""), "payload_selector_unresolved")
+    return _fail("delegate_start", "payload_selector_unresolved",
+                 f"root='skill_payload' with this bucket/skill_name selects no payload you can write: {exc}. "
+                 "Name an installed skill exactly, or omit root (root='active_workspace') for ordinary "
+                 "workspace delegation.", definitely_unrun=True)
 
 
 def _binding_error_text(name: str, root: str, exc: Exception) -> str | ToolResult:
@@ -566,9 +644,11 @@ def _format_tool_arg_error(entry: "ToolEntry", *, rejected: tuple[str, ...] = ()
     # signature-bind refusal cannot name one, and a PRIVATE dispatch carrier is
     # never echoed back.
     named = f"unsupported argument(s): {', '.join(rejected)}. " if rejected else ""
+    hint = (" Use cwd=system_repo or cwd=system_repo/subdir, not root."
+            if "root" in rejected and entry.name in {"run_command", "run_script", "start_service"} else "")
     return (
         f"⚠️ TOOL_ARG_ERROR ({entry.name}): invalid arguments for {entry.name}. "
-        f"{named}Accepted parameters: {accepted}."
+        f"{named}Accepted parameters: {accepted}.{hint}"
     )
 
 

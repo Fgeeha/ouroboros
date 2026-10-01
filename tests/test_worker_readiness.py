@@ -8,7 +8,7 @@ What is pinned, on fake process objects (no child is ever forked here):
   booted SHA in the same step; a foreign pid's row does not open it;
 * no ``worker_ready`` inside the window -> the child is torn down (process tree), the slot is
   replaced through ``respawn_worker`` and a typed ``worker_ready_timeout`` row names slot, pid,
-  wait and reason;
+  wait and reason; its own entry progress permits one extension to the birth-relative ceiling;
 * the replacement loop is bounded: at ``WORKER_READY_MAX_ATTEMPTS`` the slot is parked (kept
   ``reaping``, no further respawn) and the owner is told;
 * a child that DIED during boot is released to the crash detector, which already owns death;
@@ -159,6 +159,7 @@ def test_respawn_installs_the_fresh_slot_booting_through_the_same_seam_with_its_
     assert handed[0][0] == {3: fresh} and handed[0][2][0] == 1 and 0 < handed[0][2][1] <= time.time()
 
     assert workers.respawn_worker(3, ready_attempt=2) is True
+    assert fresh.proc._ouroboros_stop_socket.fileno() == -1  # old Process is still retained here
     assert _wait_for(lambda: len(handed) == 2)
     assert handed[1][0] == {3: workers.WORKERS[3]} and handed[1][2][0] == 2
 
@@ -224,6 +225,107 @@ def test_a_foreign_pid_row_does_not_open_the_slot(pool, seam):
     assert seam.killed == [5001] and seam.respawned == [(0, {"ready_attempt": 2})]
 
 
+@pytest.fixture
+def boot_clock(pool, monkeypatch):
+    """Advance only the readiness clock; no real wait or fabricated ready signal."""
+    clock = SimpleNamespace(now=1000.0, on_tick=lambda: None)
+
+    def sleep(seconds):
+        clock.now += seconds
+        clock.on_tick()
+
+    monkeypatch.setattr(pool.lifecycle, "time", SimpleNamespace(time=lambda: clock.now, sleep=sleep))
+    monkeypatch.setattr(pool.lifecycle, "WORKER_READY_WINDOW_SEC", 1.0)
+    monkeypatch.setattr(pool.lifecycle, "WORKER_READY_CEILING_SEC", 3.0)
+    return clock
+
+
+def test_own_entry_progress_allows_ready_after_the_initial_window(pool, seam, boot_clock):
+    slot = _booting_slot(pool, 0, 5001)
+    append_jsonl(seam.events, {"type": "worker_starting", "worker_id": 0, "pid": 5001})
+
+    def ready_later():
+        if boot_clock.now == 1002.0:
+            append_jsonl(seam.events, _READY_ROW)
+
+    boot_clock.on_tick = ready_later
+    seam.run({0: slot}, seam.cursor, 1, 1000.0)
+
+    assert not slot.reaping and boot_clock.now == 1002.0
+    assert seam.killed == [] and seam.respawned == []
+    extension = _rows(seam.supervisor, "worker_ready_window_extended")
+    assert len(extension) == 1 and extension[0]["worker_ids"] == [0]
+    assert extension[0]["ceiling_sec"] == 3.0
+    assert _rows(seam.supervisor, "worker_sha_verify")[0]["ok"] is True
+
+
+def test_progress_extends_once_and_never_moves_the_birth_relative_ceiling(pool, seam, boot_clock):
+    slot = _booting_slot(pool, 0, 5001)
+    row = {"type": "worker_starting", "worker_id": 0, "pid": 5001}
+    append_jsonl(seam.events, row)
+    boot_clock.on_tick = lambda: append_jsonl(seam.events, row)
+
+    seam.run({0: slot}, seam.cursor, 1, 1000.0)
+
+    assert boot_clock.now == 1003.0
+    assert seam.killed == [5001] and seam.respawned == [(0, {"ready_attempt": 2})]
+    assert len(_rows(seam.supervisor, "worker_ready_window_extended")) == 1
+    timeout = _rows(seam.supervisor, "worker_ready_timeout")[0]
+    assert timeout["window_sec"] == timeout["waited_sec"] == 3.0
+
+
+@pytest.mark.parametrize("progress", ["absent", "foreign_pid", "before_cursor", "dead_child"])
+def test_only_current_own_progress_from_a_live_child_extends(pool, seam, boot_clock, progress):
+    slot = _booting_slot(pool, 0, 5001, alive=progress != "dead_child")
+    cursor = seam.cursor
+    if progress != "absent":
+        append_jsonl(seam.events, {"type": "worker_starting", "worker_id": 0,
+                                  "pid": 9999 if progress == "foreign_pid" else 5001})
+    if progress == "before_cursor":
+        cursor = pool.lifecycle.events_log_cursor()
+
+    seam.run({0: slot}, cursor, 1, 1000.0)
+
+    assert _rows(seam.supervisor, "worker_ready_window_extended") == []
+    if progress == "dead_child":
+        assert boot_clock.now == 1000.0 and not slot.reaping
+        assert seam.killed == [] and seam.respawned == []
+        assert _rows(seam.supervisor, "worker_ready_released")[0]["reason"] == "died_during_boot"
+    else:
+        assert boot_clock.now == 1001.0 and seam.killed == [5001]
+        assert _rows(seam.supervisor, "worker_ready_timeout")[0]["window_sec"] == 1.0
+
+
+def test_one_childs_progress_does_not_extend_a_silent_peer_in_the_same_wave(pool, seam, boot_clock):
+    first, second = _booting_slot(pool, 0, 5001), _booting_slot(pool, 1, 5002)
+    append_jsonl(seam.events, {"type": "worker_starting", "worker_id": 0, "pid": 5001})
+
+    def ready_later():
+        if boot_clock.now == 1002.0:
+            append_jsonl(seam.events, _READY_ROW)
+
+    boot_clock.on_tick = ready_later
+    seam.run({0: first, 1: second}, seam.cursor, 1, 1000.0)
+
+    assert not first.reaping and second.reaping
+    assert seam.killed == [5002] and seam.respawned == [(1, {"ready_attempt": 2})]
+    timeout = _rows(seam.supervisor, "worker_ready_timeout")[0]
+    assert timeout["waited_sec"] == 1.0 and timeout["pid"] == 5002
+    assert _rows(seam.supervisor, "worker_ready_window_extended")[0]["worker_ids"] == [0]
+
+
+def test_a_late_watcher_cannot_grant_a_fresh_window_after_the_ceiling(pool, seam, boot_clock):
+    slot = _booting_slot(pool, 0, 5001)
+    append_jsonl(seam.events, {"type": "worker_starting", "worker_id": 0, "pid": 5001})
+    boot_clock.now = 1004.0
+
+    seam.run({0: slot}, seam.cursor, 1, 1000.0)
+
+    assert boot_clock.now == 1004.0 and seam.killed == [5001]
+    assert _rows(seam.supervisor, "worker_ready_window_extended") == []
+    assert _rows(seam.supervisor, "worker_ready_timeout")[0]["waited_sec"] == 4.0
+
+
 def test_sha_mismatch_on_the_ready_row_opens_the_slot_and_tells_the_owner(pool, seam, monkeypatch):
     monkeypatch.setattr(pool.workers, "load_state", lambda: {"current_sha": "abc123", "owner_chat_id": 7})
     slot = _booting_slot(pool, 0, 5001)
@@ -272,6 +374,8 @@ def test_the_window_and_the_reported_wait_count_from_the_spawn_instant(pool, sea
 
 
 def test_the_replacement_loop_is_bounded_then_parked_and_reported(pool, seam, monkeypatch):
+    disabled = []
+    monkeypatch.setattr(pool.workers, "disable_exhausted_worker_pool", lambda: disabled.append(True))
     monkeypatch.setattr(pool.lifecycle, "WORKER_READY_MAX_ATTEMPTS", 2)
     monkeypatch.setattr(pool.workers, "load_state", lambda: {"current_sha": "abc123", "owner_chat_id": 7})
     first = _booting_slot(pool, 1, 5011)
@@ -284,6 +388,7 @@ def test_the_replacement_loop_is_bounded_then_parked_and_reported(pool, seam, mo
     assert seam.respawned == [(1, {"ready_attempt": 2})], "no respawn at the bound"
     assert seam.killed == [5011, 5012]
     assert last.reaping is True, "parked: never assignable, never respawned again"
+    assert last.readiness_exhausted and disabled == [True]
     rows = _rows(seam.supervisor, "worker_ready_timeout")
     assert [row["action"] for row in rows] == ["respawn", "parked"]
     assert rows[1]["attempt"] == 2 and rows[1]["max_attempts"] == 2
@@ -565,6 +670,51 @@ def test_assignment_skips_a_booting_slot_and_dispatches_to_an_open_one_unchanged
     workers.assign_tasks()
     assert [t["id"] for t in sent[0]] == ["second"]
     assert workers.RUNNING["second"]["worker_id"] == 0
+    workers.PENDING[:] = []
+    workers.RUNNING.clear()
+    workers.WORKERS.clear()
+
+
+def test_assignment_mirrors_the_running_status_for_a_root_not_only_a_subagent(tmp_path, monkeypatch):
+    """Both orphan healers key on the STORED status, so a root that exists only in
+    memory and the snapshot is a ghost. The root twin of the subagent mirror pinned
+    in tests/test_task_status_flow.py: same status, its OWN sentence, and none of
+    the delegation-only keys — a None there would erase what admission recorded."""
+    from ouroboros.task_results import STATUS_RUNNING, load_task_result, write_task_result
+    from supervisor import queue, state, workers
+
+    state.init(tmp_path, total_budget_limit=10.0)
+    queue.init(tmp_path)
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
+    workers.PENDING[:] = []
+    workers.RUNNING.clear()
+    workers.WORKERS.clear()
+    queue.BUDGET_ROOT_FENCES.clear()
+    queue.init_queue_refs(workers.PENDING, workers.RUNNING, workers.QUEUE_SEQ_COUNTER_REF)
+    monkeypatch.setattr(workers, "load_state", lambda: {"owner_chat_id": 0})
+    monkeypatch.setattr(state, "budget_remaining", lambda _st, **_kwargs: 10.0)
+
+    write_task_result(tmp_path, "root-1", "scheduled", description="Draft the release note",
+                      chat_id=4, expected_output="one paragraph")
+    workers.WORKERS[0] = SimpleNamespace(wid=0, busy_task_id=None, reaping=False,
+                                         in_q=SimpleNamespace(put=lambda _t: None))
+    workers.PENDING.append({
+        "id": "root-1", "type": "task", "chat_id": 4, "priority": 1,
+        "delegation_role": "root", "root_task_id": "root-1", "drive_root": str(tmp_path),
+        "description": "Draft the release note", "objective": "Draft the release note",
+    })
+
+    workers.assign_tasks()
+
+    stored = load_task_result(tmp_path, "root-1")
+    assert stored["status"] == STATUS_RUNNING
+    assert stored["result"] == "Assigned to a worker."
+    assert stored["chat_id"] == 4 and stored["root_task_id"] == "root-1"
+    assert "child_drive_root" not in stored and "parent_task_id" not in stored
+    # Merge, not overwrite: what admission recorded and this mirror does not carry
+    # must survive it.
+    assert stored["expected_output"] == "one paragraph"
     workers.PENDING[:] = []
     workers.RUNNING.clear()
     workers.WORKERS.clear()

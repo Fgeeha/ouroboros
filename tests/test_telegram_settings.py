@@ -50,8 +50,9 @@ def _load_plugin():
 
 
 class _RouteRequest:
-    def __init__(self, payload, *, host=None, marker="") -> None:
+    def __init__(self, payload, *, host=None, marker="", method="POST") -> None:
         self.payload = payload
+        self.method = method
         self.headers = {MINIAPP_MARKER_HEADER: marker}
         self.client = None if host is None else SimpleNamespace(host=host)
 
@@ -192,6 +193,55 @@ def test_unmarked_loopback_route_may_change_and_reset_owner(tmp_path: Path) -> N
     assert gateway._lookup_session(token) is None
 
 
+def test_settings_route_get_hydrates_only_stored_form_keys(tmp_path: Path) -> None:
+    """The Settings form is rendered from THIS read, so it must carry exactly
+    the form's own stored keys — never the token, never a foreign key, and
+    never an absent key (whose runtime default is the schema's first option)."""
+    plugin = _load_plugin()
+    merge_settings(tmp_path, {
+        "TELEGRAM_CHAT_ID": "42",
+        "TELEGRAM_COMMAND_MODE": "strict",
+        "TELEGRAM_MAX_UPDATES_PER_POLL": 20,
+        "TELEGRAM_BOT_TOKEN": "12345678:" + "A" * 35,
+        "UNRELATED_KEY": "keep-private",
+    })
+    handler = plugin._make_settings_save(_RouteApi(tmp_path))
+    response = asyncio.run(handler(_RouteRequest(None, method="GET")))
+
+    assert response.status_code == 200
+    assert json.loads(response.body) == {
+        "TELEGRAM_CHAT_ID": "42",
+        "TELEGRAM_MAX_UPDATES_PER_POLL": "20",
+        "TELEGRAM_COMMAND_MODE": "strict",
+    }
+    assert b"TELEGRAM_BOT_TOKEN" not in response.body
+    assert b"keep-private" not in response.body
+    # A read is a read: the stored document is untouched and the owner binding
+    # survives, exactly as before any form is submitted.
+    assert load_settings(tmp_path)["TELEGRAM_CHAT_ID"] == "42"
+    assert load_settings(tmp_path)["UNRELATED_KEY"] == "keep-private"
+
+
+def test_settings_route_get_on_empty_store_is_an_empty_document(tmp_path: Path) -> None:
+    plugin = _load_plugin()
+    response = asyncio.run(
+        plugin._make_settings_save(_RouteApi(tmp_path))(_RouteRequest(None, method="GET"))
+    )
+    assert response.status_code == 200
+    assert json.loads(response.body) == {}
+    assert not (tmp_path / "settings.json").exists()
+
+
+def test_settings_route_get_reports_an_unreadable_store(tmp_path: Path) -> None:
+    (tmp_path / "settings.json").write_text("{", encoding="utf-8")
+    plugin = _load_plugin()
+    response = asyncio.run(
+        plugin._make_settings_save(_RouteApi(tmp_path))(_RouteRequest(None, method="GET"))
+    )
+    assert response.status_code == 409
+    assert json.loads(response.body)["ok"] is False
+
+
 @pytest.mark.parametrize("route_request", [_InvalidJsonRequest({}), _RouteRequest([])])
 def test_settings_route_rejects_invalid_payload(tmp_path: Path, route_request) -> None:
     plugin = _load_plugin()
@@ -209,7 +259,7 @@ def test_settings_route_returns_bounded_conflict_for_busy_store(tmp_path: Path, 
     def busy(_state_dir, _payload):
         raise plugin.TelegramSettingsError("Telegram settings are busy.")
 
-    monkeypatch.setattr(plugin, "merge_settings", busy)
+    monkeypatch.setattr(sys.modules[plugin._make_settings_save.__module__], "merge_settings", busy)
     response = asyncio.run(
         plugin._make_settings_save(_RouteApi(tmp_path))(
             _RouteRequest({"TELEGRAM_LANGUAGE": "ru"})
@@ -269,3 +319,29 @@ def test_combined_status_has_only_bounded_bridge_and_mini_app_sections(tmp_path:
         "platform", "reason_code", "updated_at_epoch", "last_ready_at_epoch",
         "attempt", "next_retry_at_epoch", "security",
     }
+
+
+@pytest.mark.parametrize("host,marker", [("127.0.0.1", ""), ("127.0.0.1", "1"), ("203.0.113.7", "")])
+def test_proxy_form_is_masked_preserves_empty_and_explicitly_clears(tmp_path, host, marker):
+    plugin = _load_plugin()
+    handler = plugin._make_settings_save(_RouteApi(tmp_path))
+    proxy = "socks5h://owner:proxy-secret@127.0.0.1:1080"
+    def request(payload=None, method="POST"):
+        return asyncio.run(handler(_RouteRequest(payload, host=host, marker=marker, method=method)))
+    assert request({"TELEGRAM_PROXY": proxy}).status_code == 200
+    assert load_settings(tmp_path)["TELEGRAM_PROXY"] == proxy
+    hydrated = request(method="GET")
+    assert b"TELEGRAM_PROXY" not in hydrated.body and b"proxy-secret" not in hydrated.body
+    assert request({"TELEGRAM_PROXY": "", "TELEGRAM_LANGUAGE": "ru"}).status_code == 200
+    assert load_settings(tmp_path)["TELEGRAM_PROXY"] == proxy
+    assert load_settings(tmp_path)["TELEGRAM_LANGUAGE"] == "ru"
+    refused = request({"TELEGRAM_PROXY": "socks5://owner:proxy-secret@bad-host"})
+    assert refused.status_code == 400
+    failure = json.loads(refused.body)
+    assert failure["error"] == failure["message"]
+    assert "TELEGRAM_PROXY must be" in failure["error"]
+    assert b"proxy-secret" not in refused.body and b"bad-host" not in refused.body
+    assert load_settings(tmp_path)["TELEGRAM_PROXY"] == proxy
+    assert request({"clear_telegram_proxy": True, "TELEGRAM_PROXY": ""}).status_code == 200
+    assert load_settings(tmp_path)["TELEGRAM_PROXY"] == ""
+    assert "clear_telegram_proxy" not in load_settings(tmp_path)

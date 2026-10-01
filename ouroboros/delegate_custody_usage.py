@@ -36,13 +36,30 @@ def summary_of(detail: Dict[str, Any]) -> Dict[str, Any]:
     return detail.get("summary") if isinstance(detail.get("summary"), dict) else {}
 
 
-def disclosed_spend(summary: Dict[str, Any]) -> Tuple[Optional[float], bool]:
+def disclosed_spend(summary: Dict[str, Any], *, attempt_execution: Any = None) -> Tuple[Optional[float], bool]:
     """The cash the harness reported AND whether it is settled — never one without both.
 
     ``spendUsd`` is only half the disclosure: the engine populates the sibling
     ``spendEstimated``. Reading the amount alone makes an estimate
     indistinguishable from settled cash, so callers receive the pair atomically.
     """
+    if isinstance(attempt_execution, list) and attempt_execution:
+        from ouroboros._usage_response import provider_cost_value
+
+        cash, complete, exact = 0.0, True, True
+        for attempt in attempt_execution:
+            cost = attempt.get("usageCost") if isinstance(attempt, dict) else None
+            cost = cost if isinstance(cost, dict) else {}
+            amount = provider_cost_value(cost.get("cashUsd"))
+            knowledge = cost.get("cashKnowledge")
+            if amount is None or knowledge not in {"exact", "estimated"}:
+                complete = exact = False
+            else:
+                cash += amount
+                exact = exact and knowledge == "exact"
+        # Keep a proven positive partial debit in the budget, with its missing
+        # remainder disclosed by the original attempt evidence. Unknown zero is not free.
+        return (cash, not exact) if complete or cash > 0 else (None, False)
     raw = summary.get("spendUsd")
     if raw is None:
         return None, False
@@ -147,8 +164,7 @@ def observe_review_usage(observer: Any, usage: Optional[Dict[str, Any]]) -> None
 def observe_failed_review_send(observer: Any, exc: BaseException) -> None:
     """Rows for every physically dispatched attempt behind a failed reviewer send."""
     from ouroboros.usage_accounting import (
-        POSITIVE_PHYSICAL_ATTEMPT_STATES, _drive_root, _final_rows, _locked,
-        _read_records_locked_cached, current_usage_scope,
+        POSITIVE_PHYSICAL_ATTEMPT_STATES, _drive_root, read_usage_records, current_usage_scope,
     )
 
     capture = getattr(exc, "physical_attempt_capture", None)
@@ -160,8 +176,7 @@ def observe_failed_review_send(observer: Any, exc: BaseException) -> None:
     try:
         scope = current_usage_scope()
         root = _drive_root(getattr(scope, "drive_root", None))
-        with _locked(root):
-            finals = _final_rows(_read_records_locked_cached(root))
+        finals = {str(row["attempt_id"]): row for row in read_usage_records(root, final_only=True)}
         rows = {attempt_id: finals[attempt_id] for attempt_id in attempt_ids if attempt_id in finals}
     except Exception:
         log.debug("failed to resolve review attempt states", exc_info=True)

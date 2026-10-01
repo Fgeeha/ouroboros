@@ -132,7 +132,7 @@ def test_onboarding_compact_access_step_keeps_default_width_two_column():
 
 
 def test_settings_more_providers_collapse_keeps_inputs_mounted():
-    """Rarely used provider cards (Cloud.ru, MiniMax, DeepSeek, GigaChat) collapse under a
+    """Rarely used provider cards (Cloud.ru, MiniMax, DeepSeek, Z.ai, GigaChat) collapse under a
     "More providers" details wrapper, but their inputs must stay mounted:
     settings.js applyInputValue has no null guard, so a missing input id
     breaks settings load. The wrapper auto-opens when configured."""
@@ -141,7 +141,7 @@ def test_settings_more_providers_collapse_keeps_inputs_mounted():
     css = _read("web/settings.css")
 
     assert 'id="settings-more-providers"' in ui
-    assert ui.count("advanced: true") == 4
+    assert ui.count("advanced: true") == 5
     assert "PROVIDER_CARDS.filter((card) => !card.advanced)" in ui
     assert "PROVIDER_CARDS.filter((card) => card.advanced)" in ui
     assert "syncMoreProvidersDisclosure" in settings
@@ -150,13 +150,17 @@ def test_settings_more_providers_collapse_keeps_inputs_mounted():
     assert "Joi Lab" not in ui
 
 
-def test_subagent_write_surface_badge_in_both_card_paths():
-    """The write=<surface> badge must render on BOTH the Logs path
-    (summarizeLogEvent) and the Chat live-card path (summarizeChatLiveEvent),
-    not just one — the surface field is plumbed through history/contracts."""
+def test_subagent_write_surface_stays_in_logs_not_compact_chat():
+    """Compact Chat omits internal mode/status duplicates while Logs and the
+    wire keep the original facts. Executor and model identity stay visible."""
     log_events = _read("web/modules/log_events.js")
-    # both summarize functions reference the badge
-    assert log_events.count("write=${evt.write_surface}") >= 2
+    logs = log_events[log_events.index("export function summarizeLogEvent"):log_events.index("function chatView")]
+    chat = log_events[log_events.index("export function summarizeChatLiveEvent"):log_events.index("export function duplicateLogEventKey")]
+    assert "write=${evt.write_surface}" in logs
+    assert "write=${evt.write_surface}" not in chat
+    assert "status=${status}" not in chat
+    assert "chip: executorChip(evt)" in chat
+    assert "model: evt.model" in chat
     api_types = _read("web/modules/api_types.js")
     assert "write_surface" in api_types
 
@@ -169,6 +173,13 @@ def test_skills_and_widgets_use_inner_scroll_regions():
     assert 'class="widgets-scroll scroll-fade-y"' in widgets
     assert ".skills-scroll" in css and "overflow-y: auto" in css
     assert ".widgets-scroll" in css and "overflow-y: auto" in css
+
+
+def test_sidebar_projects_list_is_a_bounded_scroll_region():
+    """The sidebar's one variable-length collection owns a bounded window with
+    its own scroll, so the navigation column cannot grow with the project count."""
+    rule = _read("web/style.css").split(".nav-projects-list {", 1)[1].split("}", 1)[0]
+    assert "max-height: var(--nav-projects-list-max-height)" in rule and "overflow-y: auto" in rule, rule
 
 
 # ---------------------------------------------------------------------------
@@ -202,7 +213,7 @@ def test_server_navigation_and_chat_static_contracts():
     settings = _read("web/modules/settings.js")
     costs = _read("web/modules/costs.js")
 
-    assert "def _describe_bg_consciousness_state(requested_enabled: bool) -> dict:" in server_source
+    assert "def _describe_bg_consciousness_state(requested_enabled: bool | None) -> dict:" in server_source
     assert '"evolution_state": evolution_state,' in state_source
     assert '"bg_consciousness_state": bg_state,' in state_source
     assert 'request.query_params.get("force")' in control_source

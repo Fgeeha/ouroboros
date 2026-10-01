@@ -4,6 +4,8 @@ import threading
 import time
 from types import SimpleNamespace
 
+import pytest
+
 _TEST_SUBAGENTS = '{"enabled":true,"items":[{"subagent_id":"api-scout","name":"API scout","recommended_use":"Tests","route":{"kind":"api_model","target_id":"openai/gpt-5.6-sol"},"effort":"high"}]}'
 
 
@@ -33,7 +35,10 @@ def test_schedule_task_live_emits_strict_contract_and_requested_status(tmp_path,
 
     _configure_test_subagent(monkeypatch)
     event_queue = _FakeEventQueue(status_root=tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
     ctx = SimpleNamespace(
+        repo_dir=repo,
         task_depth=0,
         pending_events=[],
         event_queue=event_queue,
@@ -55,9 +60,14 @@ def test_schedule_task_live_emits_strict_contract_and_requested_status(tmp_path,
     )
 
     assert "Subagent request queued" in result
+    # The result names the engine by its handle; the stored key stays in the
+    # durable snapshot and never reaches the model.
+    assert "(subagent_id=openai/gpt-5.6-sol/high, route=api_model" in result
+    assert "api-scout" not in result
     assert ctx.pending_events == []
     assert len(event_queue.events) == 1
     evt = event_queue.events[0]
+    assert evt["configured_subagent"]["selected_subagent_id"] == "api-scout"
     task_id = evt["task_id"]
     assert evt["description"] == "Do the thing"
     assert evt["expected_output"] == "A concise handoff"
@@ -89,7 +99,10 @@ def test_schedule_task_falls_back_to_pending_events_when_live_queue_unavailable(
     from ouroboros.tools.control import _schedule_task
 
     _configure_test_subagent(monkeypatch)
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
     ctx = SimpleNamespace(
+        repo_dir=repo,
         task_depth=0,
         pending_events=[],
         event_queue=_FakeEventQueue(fail=True),
@@ -316,7 +329,10 @@ def test_schedule_task_memory_modes_prepare_declared_drive_shape(tmp_path, monke
     (parent_memory / "knowledge" / "pattern.md").write_text("stable pattern", encoding="utf-8")
 
     event_queue = _FakeEventQueue()
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
     ctx = SimpleNamespace(
+        repo_dir=repo,
         task_depth=0,
         pending_events=[],
         event_queue=event_queue,
@@ -375,7 +391,10 @@ def test_configured_session_child_materializes_initial_and_steered_attachments(t
         attachment_manifest=steered_manifest,
     )
     event_queue = _FakeEventQueue()
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
     ctx = SimpleNamespace(
+        repo_dir=repo,
         task_depth=0, pending_events=[], event_queue=event_queue,
         drive_root=tmp_path, task_id="parent-attachments",
         task_contract={"attachment_manifest": [dict(row) for row in parent_manifest]},
@@ -415,7 +434,10 @@ def test_schedule_task_rejects_legacy_description_schema(tmp_path, monkeypatch):
     from ouroboros.tools.control import _schedule_task
 
     _configure_test_subagent(monkeypatch)
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
     ctx = SimpleNamespace(
+        repo_dir=repo,
         task_depth=0,
         pending_events=[],
         event_queue=None,
@@ -773,13 +795,14 @@ def test_materializing_child_read_cannot_overwrite_canonical_zero_run_receipt(tm
         "ts": "2026-01-01T00:00:02+00:00",
     })
 
-    # Repeated polling must preserve the canonical-only row.  Final copy-back
-    # then unions the ordinary child check into that same authority file.
+    # Repeated polling must preserve the canonical-only row, and a read writes no
+    # receipt (TZ-1 A: reads are pure). Final copy-back then unions the ordinary
+    # child check into that same authority file.
     effective_task_result(tmp_path, load_task_result(tmp_path, tid) or {})
     assert [
         row.get("contract_kind")
         for row in read_verification_receipts(tmp_path, tid)
-    ] == [None, "delegation_zero_run"]
+    ] == ["delegation_zero_run"]
 
     copied = copy_child_task_result(
         tmp_path, {"id": tid, "drive_root": str(child_drive)},
@@ -1364,12 +1387,12 @@ def test_wait_for_tasks_flags_unknown_ids_and_attaches_children_roster(tmp_path)
     assert real["status"] == STATUS_COMPLETED
     assert "unknown_task_id" not in real
 
-    # The repair surface: the ACTUAL direct children, compact v6.71.2 field set
-    # only — no result/trace envelope fields, absent accounting projects null.
+    # Actual children stay compact, with execution evidence and honest accounting.
     roster = payload["children_roster"]
     assert [row["task_id"] for row in roster] == ["realchild1"]
     assert set(roster[0]) == {"task_id", "status", "accounted_upper_bound_usd",
-                              "child_result_sha256", "outcome_axes"}
+                              "child_result_sha256", "outcome_axes", "execution_observation"}
+    assert roster[0]["execution_observation"]["state"] == "terminal"
     assert roster[0]["accounted_upper_bound_usd"] == 0.55
     # Nothing was capped away, and the projection SAYS so (BIBLE P1).
     assert payload["children_roster_omitted"] == 0
@@ -1406,8 +1429,8 @@ def test_children_roster_projection_discloses_the_capped_tail(tmp_path):
     assert projected["children_roster_omitted"] == total - 30  # …and is disclosed
     assert all(
         set(row) == {"task_id", "status", "accounted_upper_bound_usd",
-                     "child_result_sha256", "outcome_axes"}
-        for row in roster
+                     "child_result_sha256", "outcome_axes", "execution_observation"}
+        and row["execution_observation"]["state"] == "terminal" for row in roster
     )
 
 
@@ -1439,6 +1462,9 @@ def test_wait_for_tasks_phantom_only_set_short_circuits_the_window(tmp_path, mon
     assert short["reason"] == "all_task_ids_unminted"
     assert short["requested_timeout_sec"] == 600.0
     assert sorted(payload["unknown_task_ids"]) == ["phantomid7", "phantomid8"]
+    # An id this tree never minted is disclosed as unknown, never counted as a
+    # live child of an expired window.
+    assert "wait_expired_with_live_children" not in payload
 
 
 def test_wait_for_tasks_id_minted_during_grace_keeps_waiting(tmp_path, monkeypatch):
@@ -1607,7 +1633,10 @@ def test_effective_status_repairs_stale_running_infra_failure_when_queue_empty(t
         },
     )
     (tmp_path / "state").mkdir(exist_ok=True)
-    (tmp_path / "state" / "queue_snapshot.json").write_text('{"pending": [], "running": []}', encoding="utf-8")
+    (tmp_path / "state" / "queue_snapshot.json").write_text(
+        '{"ts": "2027-01-15T08:00:00+00:00", "pending": [], "running": []}',
+        encoding="utf-8",
+    )
 
     effective = load_effective_task_result(tmp_path, "providerfail")
 
@@ -1660,7 +1689,10 @@ def test_effective_status_repairs_orphan_running_after_worker_restart(tmp_path, 
         },
     )
     (tmp_path / "state").mkdir(exist_ok=True)
-    (tmp_path / "state" / "queue_snapshot.json").write_text('{"pending": [], "running": []}', encoding="utf-8")
+    (tmp_path / "state" / "queue_snapshot.json").write_text(
+        '{"ts": "2027-01-15T08:00:00+00:00", "pending": [], "running": []}',
+        encoding="utf-8",
+    )
     events = tmp_path / "logs" / "events.jsonl"
     append_jsonl(events, {"ts": "2026-05-28T00:00:01+00:00", "type": "llm_round", "task_id": "cc4db6fa"})
     append_jsonl(events, {"ts": "2026-05-28T00:00:02+00:00", "type": "worker_boot"})
@@ -1696,7 +1728,10 @@ def test_reconcile_durably_finalizes_orphaned_running_task(tmp_path, monkeypatch
         result="Task is running.", ts="2026-05-28T00:00:00+00:00",
     )
     (tmp_path / "state").mkdir(exist_ok=True)
-    (tmp_path / "state" / "queue_snapshot.json").write_text('{"pending": [], "running": []}', encoding="utf-8")
+    (tmp_path / "state" / "queue_snapshot.json").write_text(
+        '{"ts": "2027-01-15T08:00:00+00:00", "pending": [], "running": []}',
+        encoding="utf-8",
+    )
     events = tmp_path / "logs" / "events.jsonl"
     append_jsonl(events, {"ts": "2026-05-28T00:00:01+00:00", "type": "llm_round", "task_id": "orphan1"})
     append_jsonl(events, {"ts": "2026-05-28T00:00:02+00:00", "type": "worker_boot"})
@@ -1915,26 +1950,38 @@ def test_wait_for_task_reports_rejected_duplicate(tmp_path):
     assert "duplicate_of=orig999" in output
 
 
-def test_handle_schedule_task_duplicate_writes_rejected_status(tmp_path, monkeypatch):
+def test_handle_schedule_task_admits_identical_siblings_without_semantic_veto(tmp_path, monkeypatch):
+    """No semantic duplicate judge stands between a parent and its siblings.
+
+    Exact task-id fencing, the active-child cap and cost ceilings are the floor;
+    identical objectives under one parent are the parent's call, so every sibling
+    is admitted as ``scheduled`` and none is stamped ``duplicate_of``.
+    """
     from supervisor import events as ev_module
-    from supervisor import events_schedule_task as schedule_module
-    from ouroboros.task_results import STATUS_REJECTED_DUPLICATE
+    import ouroboros.llm as llm_module
+    from ouroboros.task_results import STATUS_SCHEDULED
 
-    captured_identity = {}
+    # Admission must not consult any model: a judge that merely failed open
+    # (provider unreachable in a keyless run) would make this test pass on a
+    # tree that still carries the veto, so constructing a client is the failure.
+    constructed = []
 
-    def _duplicate(*args, **kwargs):
-        captured_identity.update(kwargs.get("dedupe_identity") or {})
-        return "orig111"
+    def _no_client(*args, **kwargs):
+        constructed.append((args, kwargs))
+        raise AssertionError("admission constructed an LLM client")
 
-    monkeypatch.setattr(schedule_module, "_find_duplicate_task", _duplicate)
+    monkeypatch.setattr(llm_module, "LLMClient", _no_client)
 
     sent = []
+    enqueued = []
 
     class FakeCtx:
         DRIVE_ROOT = tmp_path
-        PENDING = []
-        RUNNING = {}
         WORKERS = {0: SimpleNamespace(busy_task_id=None)}
+
+        def __init__(self):
+            self.PENDING = []
+            self.RUNNING = {}
 
         def load_state(self):
             return {"owner_chat_id": 1}
@@ -1942,302 +1989,61 @@ def test_handle_schedule_task_duplicate_writes_rejected_status(tmp_path, monkeyp
         def send_with_budget(self, chat_id, text, **kwargs):
             sent.append((chat_id, text, kwargs))
 
-    ev_module._handle_schedule_task(
-        {
-            "type": "schedule_subagent",
-            "task_id": "dup222",
-            "objective": "Do the thing",
-            "expected_output": "Duplicate verdict",
-            "context": "Model focus B",
-            "depth": 1,
-            "memory_mode": "forked",
-            "parent_task_id": "parent111",
-            "root_task_id": "root111",
-            "drive_root": str(tmp_path / "state" / "headless_tasks" / "dup222" / "data"),
-            "child_drive_root": str(tmp_path / "state" / "headless_tasks" / "dup222" / "data"),
-            "budget_drive_root": str(tmp_path),
-        },
-        FakeCtx(),
-    )
+        def enqueue_task(self, task):
+            enqueued.append(task)
+            self.PENDING.append(task)
+            return task
 
-    path = tmp_path / "task_results" / "dup222.json"
-    data = json.loads(path.read_text(encoding="utf-8"))
-    assert data["status"] == STATUS_REJECTED_DUPLICATE
-    assert data["duplicate_of"] == "orig111"
-    assert sent and "semantically similar" in sent[0][1]
-    assert sent[0][2]["is_progress"] is True
-    assert sent[0][2]["progress_meta"]["delegation_role"] == "subagent"
-    assert sent[0][2]["progress_meta"]["parent_task_id"] == "parent111"
-    assert sent[0][2]["progress_meta"]["status"] == STATUS_REJECTED_DUPLICATE
-    assert captured_identity == {
-        "delegation_role": "subagent",
-        "task_id": "dup222",
-        "parent_task_id": "parent111",
-        "root_task_id": "root111",
-        "budget_drive_root": str(tmp_path),
-    }
+        def persist_queue_snapshot(self, reason=""):
+            self.snapshot_reason = reason
 
+    ctx = FakeCtx()
 
-def test_find_duplicate_task_includes_subagent_handoff_fields(monkeypatch):
-    from supervisor import events as ev_module
-    import ouroboros.config as config_module
-    import ouroboros.llm as llm_module
-
-    captured = {}
-
-    class FakeClient:
-        def chat(self, messages, **kwargs):
-            captured["prompt"] = messages[0]["content"]
-            return {"content": "NONE"}, {}
-
-    monkeypatch.setattr(config_module, "get_light_model", lambda: "test-light")
-    monkeypatch.setattr(llm_module, "LLMClient", lambda: FakeClient())
-
-    result = ev_module._find_duplicate_task(
-        "Review shared surface",
-        "same context",
-        [
+    def _dispatch(tid, configured_subagent):
+        ev_module._handle_schedule_task(
             {
-                "id": "pending1",
-                "description": "Review shared surface",
-                "context": "same context",
-                "expected_output": "Docs table",
-                "constraints": "docs only",
-                "role": "docs reviewer",
-            }
-        ],
-        {},
-        expected_output="Security table",
-        constraints="security only",
-        role="security reviewer",
-    )
+                "type": "schedule_subagent",
+                "task_id": tid,
+                "objective": "Do the thing",
+                "expected_output": "Duplicate verdict",
+                "context": "Model focus B",
+                "depth": 1,
+                "memory_mode": "forked",
+                "parent_task_id": "parent111",
+                "root_task_id": "root111",
+                "drive_root": str(tmp_path / "state" / "headless_tasks" / tid / "data"),
+                "child_drive_root": str(tmp_path / "state" / "headless_tasks" / tid / "data"),
+                "budget_drive_root": str(tmp_path),
+                "configured_subagent": configured_subagent,
+            },
+            ctx,
+        )
 
-    assert result is None
-    prompt = captured["prompt"]
-    assert "Expected output:\nSecurity table" in prompt
-    assert "Expected output:\nDocs table" in prompt
-    assert "Constraints:\nsecurity only" in prompt
-    assert "Constraints:\ndocs only" in prompt
-    assert "Role:\nsecurity reviewer" in prompt
-    assert "Role:\ndocs reviewer" in prompt
+    # Same objective, same lineage, same (default) role; only the selected
+    # configured subagent differs.
+    _dispatch("sib1", {"selected_subagent_id": "primary-builder"})
+    _dispatch("sib2", {"selected_subagent_id": "fast-scout"})
+    # ... and a pair whose configured subagent is identical too.
+    _dispatch("sib3", {"selected_subagent_id": "primary-builder"})
+    _dispatch("sib4", {"selected_subagent_id": "primary-builder"})
 
-
-def test_find_duplicate_task_allows_distinct_subagent_roles(monkeypatch):
-    from supervisor import events as ev_module
-    import ouroboros.config as config_module
-    import ouroboros.llm as llm_module
-
-    calls = []
-
-    class FakeClient:
-        def chat(self, messages, **kwargs):
-            calls.append(messages[0]["content"])
-            return {"content": "pending1"}, {}
-
-    monkeypatch.setattr(config_module, "get_light_model", lambda: "test-light")
-    monkeypatch.setattr(llm_module, "LLMClient", lambda: FakeClient())
-
-    result = ev_module._find_duplicate_task(
-        "Run nested smoke slot",
-        "",
-        [
-            {
-                "id": "pending1",
-                "description": "Run nested smoke slot",
-                "expected_output": "Smoke handoff",
-                "role": "l1-alpha-coordinator",
-                "delegation_role": "subagent",
-                "parent_task_id": "root1",
-                "root_task_id": "root1",
-            }
-        ],
-        {},
-        expected_output="Smoke handoff",
-        role="l1-beta-coordinator",
-        dedupe_identity={
-            "delegation_role": "subagent",
-            "parent_task_id": "root1",
-            "root_task_id": "root1",
-        },
-    )
-
-    assert result is None
-    assert calls == []
-
-
-def test_find_duplicate_task_keeps_same_role_subagent_dedupe(monkeypatch):
-    from supervisor import events as ev_module
-    import ouroboros.config as config_module
-    import ouroboros.llm as llm_module
-
-    class FakeClient:
-        def chat(self, messages, **kwargs):
-            return {"content": "pending1"}, {}
-
-    monkeypatch.setattr(config_module, "get_light_model", lambda: "test-light")
-    monkeypatch.setattr(llm_module, "LLMClient", lambda: FakeClient())
-
-    result = ev_module._find_duplicate_task(
-        "Run nested smoke slot",
-        "",
-        [
-            {
-                "id": "pending1",
-                "description": "Run nested smoke slot",
-                "expected_output": "Smoke handoff",
-                "role": "l1-alpha-coordinator",
-                "delegation_role": "subagent",
-                "parent_task_id": "root1",
-                "root_task_id": "root1",
-            }
-        ],
-        {},
-        expected_output="Smoke handoff",
-        role="l1-alpha-coordinator",
-        dedupe_identity={
-            "delegation_role": "subagent",
-            "parent_task_id": "root1",
-            "root_task_id": "root1",
-        },
-    )
-
-    assert result == "pending1"
-
-
-def test_find_duplicate_task_allows_distinct_subagent_parent_branches(monkeypatch):
-    from supervisor import events as ev_module
-    import ouroboros.config as config_module
-    import ouroboros.llm as llm_module
-
-    calls = []
-
-    class FakeClient:
-        def chat(self, messages, **kwargs):
-            calls.append(messages[0]["content"])
-            return {"content": "pending1"}, {}
-
-    monkeypatch.setattr(config_module, "get_light_model", lambda: "test-light")
-    monkeypatch.setattr(llm_module, "LLMClient", lambda: FakeClient())
-
-    result = ev_module._find_duplicate_task(
-        "Run nested branch smoke slot",
-        "",
-        [
-            {
-                "id": "pending1",
-                "description": "Run nested branch smoke slot",
-                "expected_output": "Smoke handoff",
-                "role": "shared-l2-role",
-                "delegation_role": "subagent",
-                "parent_task_id": "l1-alpha",
-                "root_task_id": "root1",
-            }
-        ],
-        {},
-        expected_output="Smoke handoff",
-        role="shared-l2-role",
-        dedupe_identity={
-            "delegation_role": "subagent",
-            "parent_task_id": "l1-beta",
-            "root_task_id": "root1",
-        },
-    )
-
-    assert result is None
-    assert calls == []
-
-
-def test_find_duplicate_task_allows_subagent_against_running_root_ancestor(monkeypatch):
-    from supervisor import events as ev_module
-    import ouroboros.config as config_module
-    import ouroboros.llm as llm_module
-
-    calls = []
-
-    class FakeClient:
-        def chat(self, messages, **kwargs):
-            calls.append(messages[0]["content"])
-            return {"content": "root1"}, {}
-
-    monkeypatch.setattr(config_module, "get_light_model", lambda: "test-light")
-    monkeypatch.setattr(llm_module, "LLMClient", lambda: FakeClient())
-
-    result = ev_module._find_duplicate_task(
-        "You are l1-alpha-coordinator; schedule L2 smoke agents",
-        "",
-        [],
-        {
-            "root1": {
-                "task": {
-                    "id": "root1",
-                    "description": "Root coordinator: schedule l1-alpha, l1-beta, l1-gamma subagents",
-                    "delegation_role": "root",
-                    "parent_task_id": "",
-                    "root_task_id": "root1",
-                }
-            }
-        },
-        expected_output="L1 handoff",
-        role="l1-alpha-coordinator",
-        dedupe_identity={
-            "delegation_role": "subagent",
-            "parent_task_id": "root1",
-            "root_task_id": "root1",
-        },
-    )
-
-    assert result is None
-    assert calls == []
-
-
-def test_find_duplicate_task_allows_subagent_against_pending_parent_ancestor(monkeypatch):
-    from supervisor import events as ev_module
-    import ouroboros.config as config_module
-    import ouroboros.llm as llm_module
-
-    calls = []
-
-    class FakeClient:
-        def chat(self, messages, **kwargs):
-            calls.append(messages[0]["content"])
-            return {"content": "parent1"}, {}
-
-    monkeypatch.setattr(config_module, "get_light_model", lambda: "test-light")
-    monkeypatch.setattr(llm_module, "LLMClient", lambda: FakeClient())
-
-    result = ev_module._find_duplicate_task(
-        "You are l1-alpha-coordinator-l2-1; return a smoke handoff",
-        "",
-        [
-            {
-                "id": "parent1",
-                "description": "You are l1-alpha-coordinator; schedule three L2 smoke subagents",
-                "role": "l1-alpha-coordinator",
-                "delegation_role": "subagent",
-                "parent_task_id": "root1",
-                "root_task_id": "root1",
-            }
-        ],
-        {},
-        expected_output="L2 handoff",
-        role="l1-alpha-coordinator-l2-1",
-        dedupe_identity={
-            "delegation_role": "subagent",
-            "parent_task_id": "parent1",
-            "root_task_id": "root1",
-        },
-    )
-
-    assert result is None
-    assert calls == []
+    assert [task["id"] for task in enqueued] == ["sib1", "sib2", "sib3", "sib4"]
+    for tid in ("sib1", "sib2", "sib3", "sib4"):
+        path = tmp_path / "task_results" / f"{tid}.json"
+        assert path.exists(), f"{tid} was not admitted"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert data["status"] == STATUS_SCHEDULED
+        assert "duplicate_of" not in data
+    assert not [text for _chat, text, _kw in sent if "semantically similar" in text]
+    # The judge caught every exception and failed open, so a raise alone would
+    # not distinguish a tree that still consults a model: the record does.
+    assert constructed == []
 
 
 def test_handle_schedule_task_accepts_unique_subagent_with_lineage_and_constraint(tmp_path, monkeypatch):
     from supervisor import events as ev_module
-    from supervisor import events_schedule_task as schedule_module
     from ouroboros.task_results import STATUS_SCHEDULED
 
-    monkeypatch.setattr(schedule_module, "_find_duplicate_task", lambda *args, **kwargs: None)
     enqueued = []
     sent = []
 
@@ -2254,7 +2060,8 @@ def test_handle_schedule_task_accepts_unique_subagent_with_lineage_and_constrain
             sent.append((chat_id, text, kwargs))
 
         def enqueue_task(self, task):
-            enqueued.append(task)
+            enqueued.append(dict(task))
+            return enqueued[-1]
 
         def persist_queue_snapshot(self, reason=""):
             self.snapshot_reason = reason
@@ -2309,10 +2116,8 @@ def test_handle_schedule_task_accepts_unique_subagent_with_lineage_and_constrain
 
 def test_handle_schedule_task_rejects_internal_subagent_without_child_drive_contract(tmp_path, monkeypatch):
     from supervisor import events as ev_module
-    from supervisor import events_schedule_task as schedule_module
     from ouroboros.task_results import STATUS_FAILED
 
-    monkeypatch.setattr(schedule_module, "_find_duplicate_task", lambda *args, **kwargs: None)
     sent = []
 
     class FakeCtx:
@@ -2354,10 +2159,8 @@ def test_handle_schedule_task_rejects_internal_subagent_without_child_drive_cont
 
 def test_handle_schedule_task_uses_event_chat_id_without_owner(tmp_path, monkeypatch):
     from supervisor import events as ev_module
-    from supervisor import events_schedule_task as schedule_module
     from ouroboros.task_results import STATUS_SCHEDULED
 
-    monkeypatch.setattr(schedule_module, "_find_duplicate_task", lambda *args, **kwargs: None)
     enqueued = []
     sent = []
 
@@ -2374,7 +2177,8 @@ def test_handle_schedule_task_uses_event_chat_id_without_owner(tmp_path, monkeyp
             sent.append((chat_id, text, kwargs))
 
         def enqueue_task(self, task):
-            enqueued.append(task)
+            enqueued.append(dict(task))
+            return enqueued[-1]
 
         def persist_queue_snapshot(self, reason=""):
             self.snapshot_reason = reason
@@ -2433,11 +2237,9 @@ def test_handle_schedule_task_uses_event_chat_id_without_owner(tmp_path, monkeyp
 
 def test_handle_schedule_task_depth_rejection_writes_failed_status(tmp_path, monkeypatch):
     from supervisor import events as ev_module
-    from supervisor import events_schedule_task as schedule_module
     from ouroboros.config import get_max_subagent_depth
     from ouroboros.task_results import STATUS_FAILED
 
-    monkeypatch.setattr(schedule_module, "_find_duplicate_task", lambda *args, **kwargs: None)
     sent = []
 
     class FakeCtx:
@@ -2482,7 +2284,6 @@ def test_handle_schedule_task_depth_rejection_writes_failed_status(tmp_path, mon
 def test_configured_zero_subagent_depth_truly_disables_delegation(tmp_path, monkeypatch):
     """A configured depth of zero disables child delegation, not the root task."""
     from supervisor import events as ev_module
-    from supervisor import events_schedule_task as schedule_module
     from ouroboros.config import get_max_subagent_depth
     from ouroboros.task_results import STATUS_FAILED
 
@@ -2513,7 +2314,6 @@ def test_configured_zero_subagent_depth_truly_disables_delegation(tmp_path, monk
         "achieved_depth": None,
     }
 
-    monkeypatch.setattr(schedule_module, "_find_duplicate_task", lambda *args, **kwargs: None)
     enqueued = []
 
     class FakeCtx:
@@ -2529,7 +2329,8 @@ def test_configured_zero_subagent_depth_truly_disables_delegation(tmp_path, monk
             pass
 
         def enqueue_task(self, task):
-            enqueued.append(task)
+            enqueued.append(dict(task))
+            return enqueued[-1]
 
         def persist_queue_snapshot(self, reason=""):
             pass
@@ -2593,10 +2394,8 @@ def test_settings_ui_carries_a_configured_zero_subagent_depth():
 
 def test_handle_schedule_task_rejects_legacy_subagent_event_schema(tmp_path, monkeypatch):
     from supervisor import events as ev_module
-    from supervisor import events_schedule_task as schedule_module
     from ouroboros.task_results import STATUS_FAILED
 
-    monkeypatch.setattr(schedule_module, "_find_duplicate_task", lambda *args, **kwargs: None)
     enqueued = []
     sent = []
 
@@ -2643,10 +2442,8 @@ def test_handle_schedule_task_rejects_legacy_subagent_event_schema(tmp_path, mon
 
 def test_handle_schedule_task_queues_when_active_subagent_cap_is_full(tmp_path, monkeypatch):
     from supervisor import events as ev_module
-    from supervisor import events_schedule_task as schedule_module
     from ouroboros.task_results import STATUS_COMPLETED, STATUS_FAILED, STATUS_SCHEDULED, load_task_result, write_task_result
 
-    monkeypatch.setattr(schedule_module, "_find_duplicate_task", lambda *args, **kwargs: None)
     monkeypatch.setenv("OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT", "3")  # pin cap (v6.20.0 raised default to 6)
     sent = []
     enqueued = []
@@ -2664,7 +2461,8 @@ def test_handle_schedule_task_queues_when_active_subagent_cap_is_full(tmp_path, 
             sent.append((chat_id, text, kwargs))
 
         def enqueue_task(self, task):
-            enqueued.append(task)
+            enqueued.append(dict(task))
+            return enqueued[-1]
 
         def persist_queue_snapshot(self, reason=""):
             pass
@@ -2763,7 +2561,11 @@ def test_handle_schedule_task_queues_when_active_subagent_cap_is_full(tmp_path, 
         persist_queue_snapshot=lambda reason="": None,
     )
 
-    ev_module._handle_task_done({"task_id": "childdone", "worker_id": 7, "task_type": "task"}, ctx)
+    from ouroboros.headless import prepare_terminal_task_files
+
+    prepare_terminal_task_files(tmp_path, ctx.RUNNING["childdone"]["task"])
+    ev_module._handle_task_done({"task_id": "childdone", "worker_id": 7, "task_type": "task",
+                                "_files_prepared_attempt": 1}, ctx)
 
     assert load_task_result(tmp_path, "childdone")["result"] == "summary"
     assert not (tmp_path / "task_results" / "artifacts" / "childdone" / "memory_export.json").exists()
@@ -2800,7 +2602,9 @@ def test_handle_schedule_task_queues_when_active_subagent_cap_is_full(tmp_path, 
         persist_queue_snapshot=lambda reason="": None,
     )
 
-    ev_module._handle_task_done({"task_id": "childfail", "worker_id": 8, "task_type": "task"}, ctx)
+    prepare_terminal_task_files(tmp_path, ctx.RUNNING["childfail"]["task"])
+    ev_module._handle_task_done({"task_id": "childfail", "worker_id": 8, "task_type": "task",
+                                "_files_prepared_attempt": 1}, ctx)
 
     assert load_task_result(tmp_path, "childfail")["status"] == STATUS_FAILED
     assert sent and "failed" in sent[-1][1]
@@ -2812,10 +2616,8 @@ def test_handle_schedule_task_fails_fast_when_worker_pool_unavailable(tmp_path, 
     schedule must NOT be left as a 'scheduled' ghost — it gets a terminal
     workers_unavailable result so the parent can act."""
     from supervisor import events as ev_module
-    from supervisor import events_schedule_task as schedule_module
     from ouroboros.task_results import STATUS_FAILED
 
-    monkeypatch.setattr(schedule_module, "_find_duplicate_task", lambda *args, **kwargs: None)
     sent = []
 
     class FakeCtx:
@@ -2862,26 +2664,8 @@ def test_handle_task_done_skips_workspace_readonly_subagent_artifacts(tmp_path, 
     import ouroboros.headless as headless
     from ouroboros.task_results import STATUS_COMPLETED, write_task_result
 
-    calls = []
-
-    def fake_copy(root, task):
-        calls.append(("copy", task["id"]))
-        return write_task_result(pathlib.Path(root), task["id"], STATUS_COMPLETED, result="child handoff")
-
-    monkeypatch.setattr(headless, "copy_child_task_result", fake_copy)
-
-    def fake_finalize(root, task):
-        calls.append(("finalize", task["id"]))
-        write_task_result(
-            pathlib.Path(root),
-            task["id"],
-            STATUS_COMPLETED,
-            result="done",
-            artifact_status="failed",
-            artifact_bundle={"status": "failed", "artifacts": []},
-        )
-
-    monkeypatch.setattr(headless, "finalize_task_artifacts", fake_finalize)
+    for name in ("copy_child_task_result", "finalize_task_artifacts"):
+        monkeypatch.setattr(headless, name, lambda *_a: pytest.fail("canonical readonly task needs no file work"))
     pushed = []
 
     worker = SimpleNamespace(busy_task_id="workspace-child")
@@ -2907,10 +2691,11 @@ def test_handle_task_done_skips_workspace_readonly_subagent_artifacts(tmp_path, 
         persist_queue_snapshot=lambda reason="": None,
     )
 
-    ev_module._handle_task_done({"task_id": "workspace-child", "worker_id": 3, "task_type": "task"}, ctx)
+    write_task_result(tmp_path, "workspace-child", STATUS_COMPLETED, result="child handoff")
+    headless.prepare_terminal_task_files(tmp_path, ctx.RUNNING["workspace-child"]["task"])
+    ev_module._handle_task_done({"task_id": "workspace-child", "worker_id": 3, "task_type": "task",
+                                "_files_prepared_attempt": 1}, ctx)
 
-    assert ("copy", "workspace-child") in calls
-    assert ("finalize", "workspace-child") not in calls
     assert pushed[-1]["status"] == STATUS_COMPLETED
     assert pushed[-1]["artifact_status"] is None
 
@@ -3049,7 +2834,7 @@ def test_assign_tasks_mirrors_running_subagent_status_to_parent_drive(tmp_path, 
     monkeypatch.setattr(workers_module, "WORKERS", {1: SimpleNamespace(wid=1, busy_task_id=None, in_q=FakeWorkerQueue())})
     monkeypatch.setattr(workers_module, "load_state", lambda: {})
     monkeypatch.setattr(state_module, "budget_remaining", lambda _state, **_kwargs: 100.0)
-    monkeypatch.setattr(queue_module, "persist_queue_snapshot", lambda reason="": None)
+    monkeypatch.setattr(queue_module, "persist_queue_snapshot", lambda reason="": True)
 
     workers_module.assign_tasks()
 
@@ -3141,7 +2926,7 @@ def test_assign_tasks_honors_depth_reservation_for_first_grandchild(tmp_path, mo
     monkeypatch.setattr(workers_module, "WORKERS", {1: SimpleNamespace(wid=1, busy_task_id=None, in_q=FakeWorkerQueue())})
     monkeypatch.setattr(workers_module, "load_state", lambda: {})
     monkeypatch.setattr(state_module, "budget_remaining", lambda _state, **_kwargs: 100.0)
-    monkeypatch.setattr(queue_module, "persist_queue_snapshot", lambda reason="": None)
+    monkeypatch.setattr(queue_module, "persist_queue_snapshot", lambda reason="": True)
 
     workers_module.assign_tasks()
 
@@ -3155,11 +2940,7 @@ def test_assignment_depth_fact_reaches_worker_and_survives_child_copyback(tmp_pa
     from supervisor import state as state_module
     from ouroboros.contracts.task_contract import build_task_contract
     from ouroboros.headless import copy_child_task_result
-    from ouroboros.task_results import (
-        STATUS_COMPLETED,
-        load_task_result,
-        write_task_result,
-    )
+    from ouroboros.task_results import STATUS_COMPLETED, load_task_result, write_task_result
 
     delivered = []
 
@@ -3205,7 +2986,7 @@ def test_assignment_depth_fact_reaches_worker_and_survives_child_copyback(tmp_pa
     )
     monkeypatch.setattr(workers_module, "load_state", lambda: {})
     monkeypatch.setattr(state_module, "budget_remaining", lambda _state, **_kwargs: 100.0)
-    monkeypatch.setattr(queue_module, "persist_queue_snapshot", lambda reason="": None)
+    monkeypatch.setattr(queue_module, "persist_queue_snapshot", lambda reason="": True)
 
     workers_module.assign_tasks()
 
@@ -3407,6 +3188,81 @@ def test_handle_text_response_keeps_full_reasoning_note():
     assert updated["reasoning_notes"] == [content]
 
 
+def _orphan_shaped_running_task(tmp_path, task_id, *, snapshot_ts):
+    """The exact fixture the pooled orphan reconciler accepts as proof of death:
+    an aged ``running`` row, an empty queue snapshot and a LATER worker boot."""
+    from ouroboros.task_results import STATUS_RUNNING, write_task_result
+    from ouroboros.utils import append_jsonl
+
+    write_task_result(
+        tmp_path, task_id, STATUS_RUNNING,
+        result="Task is running.", ts="2026-05-28T00:00:00+00:00",
+    )
+    (tmp_path / "state").mkdir(exist_ok=True)
+    (tmp_path / "state" / "queue_snapshot.json").write_text(
+        json.dumps({"ts": snapshot_ts, "pending": [], "running": []}), encoding="utf-8",
+    )
+    events = tmp_path / "logs" / "events.jsonl"
+    append_jsonl(events, {"ts": "2026-05-28T00:00:01+00:00", "type": "llm_round", "task_id": task_id})
+    append_jsonl(events, {"ts": "2026-05-28T00:00:02+00:00", "type": "worker_boot"})
+
+
+def test_orphan_reconcile_never_terminalizes_a_live_direct_activity(tmp_path, monkeypatch):
+    """A direct-chat actor is deliberately absent from PENDING/RUNNING, so a
+    FOREIGN ``worker_boot`` plus a fresh empty snapshot cannot prove it dead."""
+    from ouroboros.task_results import STATUS_RUNNING, load_task_result
+    from ouroboros.task_status import (
+        load_effective_task_result, reconcile_orphaned_running_tasks,
+    )
+    from supervisor import active_activity
+    from supervisor.active_activity import (
+        DirectActivityRegistry, get_direct_activity_registry,
+    )
+
+    monkeypatch.setattr(time, "time", lambda: 1_800_000_000.0)
+    # Reliable fixture isolation for a process-global (DEVELOPMENT.md, parallel
+    # pass): monkeypatch reverses exactly this singleton, so the real
+    # ``get_direct_activity_registry`` seam is still the one under test.
+    monkeypatch.setattr(active_activity, "_DIRECT_ACTIVITY_REGISTRY", DirectActivityRegistry())
+    _orphan_shaped_running_task(tmp_path, "direct-live", snapshot_ts="2027-01-15T08:00:00+00:00")
+
+    registry = get_direct_activity_registry()
+    from types import SimpleNamespace
+    registry.register("direct-live", chat_id=1, actor=SimpleNamespace(env=SimpleNamespace(drive_root=tmp_path)))
+    assert reconcile_orphaned_running_tasks(tmp_path) == 0
+    assert load_effective_task_result(tmp_path, "direct-live")["status"] == STATUS_RUNNING
+    assert load_task_result(tmp_path, "direct-live")["status"] == STATUS_RUNNING
+
+    # Non-vacuous: the SAME evidence is an ordinary orphan once the actor is gone,
+    # so the guard — not the fixture — is what kept the live row alive.
+    registry.unregister("direct-live")
+    assert reconcile_orphaned_running_tasks(tmp_path) == 1
+    healed = load_task_result(tmp_path, "direct-live")
+    assert healed["reason_code"] == "orphaned_running_after_worker_restart"
+
+
+def test_orphan_reconcile_does_not_use_a_stale_snapshot_as_death_proof(tmp_path, monkeypatch):
+    """GR7-1a polarity for the DESTRUCTIVE reconciler: an out-of-date snapshot
+    cannot prove a pooled owner is gone, but a fresh one still can."""
+    from ouroboros.task_results import STATUS_RUNNING, load_task_result
+    from ouroboros.task_status import reconcile_orphaned_running_tasks
+
+    monkeypatch.setattr(time, "time", lambda: 1_800_000_000.0)
+    _orphan_shaped_running_task(tmp_path, "pooled-live", snapshot_ts="2026-05-28T00:00:03+00:00")
+
+    assert reconcile_orphaned_running_tasks(tmp_path) == 0
+    assert load_task_result(tmp_path, "pooled-live")["status"] == STATUS_RUNNING
+
+    (tmp_path / "state" / "queue_snapshot.json").write_text(
+        json.dumps({"ts": "2027-01-15T08:00:00+00:00", "pending": [], "running": []}),
+        encoding="utf-8",
+    )
+    assert reconcile_orphaned_running_tasks(tmp_path) == 1
+    assert load_task_result(tmp_path, "pooled-live")["reason_code"] == (
+        "orphaned_running_after_worker_restart"
+    )
+
+
 def test_request_restart_latches_reason_until_task_end(tmp_path, monkeypatch):
     from ouroboros.tools import control as control_module
     from ouroboros.tools import control_runtime
@@ -3441,3 +3297,94 @@ def test_request_restart_latches_reason_until_task_end(tmp_path, monkeypatch):
     assert ctx.pending_events == []
     assert ctx.pending_restart_reason == "reload runtime"
     assert written
+
+
+def test_expired_batch_wait_discloses_live_children_as_facts(tmp_path):
+    """I10: an expired batch wait names the still-live children and the ceiling.
+
+    Facts only. How wide a window to ask for next is the mind's call, so the
+    block carries no advisory note and the host imposes no floor; the long-term
+    orientation lives in the schema description read BEFORE the window is
+    chosen.
+    """
+    from ouroboros.task_results import STATUS_COMPLETED, STATUS_SCHEDULED, write_task_result
+    from ouroboros.tools.control import _WAIT_TASKS_CLAMP_SEC, _wait_for_tasks
+
+    write_task_result(tmp_path, "donechild", STATUS_COMPLETED, result="done")
+    write_task_result(tmp_path, "livechild", STATUS_SCHEDULED, result="")
+    ctx = SimpleNamespace(drive_root=tmp_path)
+
+    payload = json.loads(_wait_for_tasks(ctx, ["donechild", "livechild"], timeout_sec=0))
+
+    assert payload["timed_out"] is True and payload["all_terminal"] is False
+    assert payload["wait_expired_with_live_children"] == {
+        "reason": "timeout_expired_before_terminal",
+        "requested_timeout_sec": 0.0,
+        "max_timeout_sec": float(_WAIT_TASKS_CLAMP_SEC),
+        "live_task_ids": ["livechild"],
+    }
+
+    write_task_result(tmp_path, "livechild", STATUS_COMPLETED, result="done too")
+    settled = json.loads(_wait_for_tasks(ctx, ["donechild", "livechild"], timeout_sec=0))
+    assert settled["all_terminal"] is True
+    assert "wait_expired_with_live_children" not in settled
+
+
+def test_expired_batch_wait_reports_the_asked_for_window_not_the_clamp(tmp_path, monkeypatch):
+    """A request above the ceiling is disclosed as asked, beside the ceiling.
+
+    Reporting the clamp as requested_timeout_sec would hide the fact the model
+    most needs from the expiry: that the window it asked for was cut down.
+    """
+    from ouroboros.task_results import STATUS_SCHEDULED, write_task_result
+    from ouroboros.tools.control import _WAIT_TASKS_CLAMP_SEC, _wait_for_tasks
+    from ouroboros.tools import control_task_results
+
+    write_task_result(tmp_path, "livechild", STATUS_SCHEDULED, result="")
+    ctx = SimpleNamespace(drive_root=tmp_path)
+    # The clamp itself is unchanged; the wait returns at once on a spent window.
+    monkeypatch.setattr(
+        control_task_results, "wait_for_effective_tasks",
+        lambda root, ids, **kw: {
+            "mode": kw.get("mode"), "timeout_sec": float(kw.get("timeout_sec") or 0),
+            "elapsed_sec": 0.0, "timed_out": True, "all_terminal": False,
+            "tasks": {tid: {"task_id": tid, "status": STATUS_SCHEDULED} for tid in ids},
+        },
+    )
+
+    payload = json.loads(_wait_for_tasks(ctx, ["livechild"], timeout_sec=10000))
+
+    block = payload["wait_expired_with_live_children"]
+    assert block["requested_timeout_sec"] == 10000.0
+    assert block["max_timeout_sec"] == float(_WAIT_TASKS_CLAMP_SEC) == 7200.0
+    assert payload["timeout_sec"] == 7200.0, "the clamp still bounds the real wait"
+
+
+def test_wait_clamp_constants_are_the_windows_the_waits_use(tmp_path, monkeypatch):
+    """The schema text's number and the real wait window are one fact (A10)."""
+    from ouroboros.tools import control_task_results as mod
+
+    seen = []
+    monkeypatch.setattr(mod, "wait_for_effective_tasks", lambda root, ids, **kw: seen.append(
+        kw["timeout_sec"]) or {"all_terminal": True, "elapsed_sec": 0.0, "tasks": {}})
+    ctx = SimpleNamespace(drive_root=tmp_path)
+    mod._wait_for_task(ctx, "anychild", timeout_sec=10**6)
+    mod._wait_for_tasks(ctx, ["anychild"], timeout_sec=10**6)
+    assert seen == [mod._WAIT_TASK_CLAMP_SEC, mod._WAIT_TASKS_CLAMP_SEC]
+
+
+def test_wait_schemas_name_the_real_clamp(tmp_path):
+    """The model reads the real ceiling before it picks a window, not after."""
+    import pathlib
+
+    from ouroboros.tools.control import _WAIT_TASK_CLAMP_SEC, _WAIT_TASKS_CLAMP_SEC
+    from ouroboros.tools.registry import ToolRegistry
+
+    registry = ToolRegistry(
+        repo_dir=pathlib.Path(__file__).resolve().parents[1], drive_root=tmp_path,
+    )
+    by_name = {t["function"]["name"]: t["function"] for t in registry.schemas()}
+    one = by_name["wait_task"]["parameters"]["properties"]["timeout_sec"]["description"]
+    many = by_name["wait_tasks"]["parameters"]["properties"]["timeout_sec"]["description"]
+    assert str(_WAIT_TASK_CLAMP_SEC) in one and "expected life" in one
+    assert str(_WAIT_TASKS_CLAMP_SEC) in many and "expected life" in many

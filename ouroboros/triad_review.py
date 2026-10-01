@@ -33,11 +33,13 @@ class ReviewActorRecord:
     reset_at: str = ""
     http_status: Optional[int] = None
     transport_status: str = ""
+    reported_cause: str = ""  # the engine's reported words for a failed run; opaque, "" = none
     operation_id: str = ""
     operation_state: str = "settled"
     late_result_pending: bool = False
     pending_invocation_id: str = ""
     delegated_run_id: str = ""
+    recovery_binding: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         # The durable id is the one the review substrate actually ran this row
@@ -67,11 +69,13 @@ class ReviewActorRecord:
             "reset_at": self.reset_at,
             "http_status": self.http_status,
             "transport_status": self.transport_status,
+            **({"reported_cause": self.reported_cause} if self.reported_cause else {}),
             "operation_id": self.operation_id,
             "operation_state": self.operation_state,
             "late_result_pending": self.late_result_pending,
             "pending_invocation_id": self.pending_invocation_id,
             "delegated_run_id": self.delegated_run_id,
+            "recovery_binding": dict(self.recovery_binding),
         }
 
 
@@ -124,11 +128,13 @@ def _actor_record(
         reset_at=str(actor.get("reset_at") or ""),
         http_status=(int(actor["http_status"]) if isinstance(actor.get("http_status"), int) else None),
         transport_status=str(actor.get("transport_status") or ""),
+        reported_cause=str(actor.get("reported_cause") or ""),
         operation_id=str(actor.get("operation_id") or ""),
         operation_state=str(actor.get("operation_state") or "settled"),
         late_result_pending=bool(actor.get("late_result_pending")),
         pending_invocation_id=str(actor.get("pending_invocation_id") or ""),
         delegated_run_id=str(actor.get("delegated_run_id") or ""),
+        recovery_binding=dict(actor.get("recovery_binding") or {}),
     )
 
 

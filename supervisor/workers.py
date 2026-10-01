@@ -21,7 +21,7 @@ from supervisor.message_bus import coerce_chat_identity  # noqa: F401 -- worker_
 from ouroboros.config import DATA_DIR, REPO_DIR as CONFIG_REPO_DIR, WORKER_SPAWN_GRACE_SEC
 from ouroboros.depth_evidence import parse_task_depth
 from ouroboros.review_owner_custody import (
-    reconcile_confirmed_dead_review_owner as _reconcile_confirmed_dead_review_owner_for_root,
+    reconcile_confirmed_dead_review_owners as _reconcile_review_owners,
 )
 from ouroboros.utils import utc_now_iso
 
@@ -88,6 +88,8 @@ class Worker:
     reaping: bool = False
     # A required owner wait keeps this process and task, lending only dispatch capacity.
     active_capacity: bool = True
+    # Unlike temporary reaping, the readiness owner exhausted its bounded attempts.
+    readiness_exhausted: bool = False
 
 
 _EVENT_Q = None
@@ -102,7 +104,7 @@ def get_event_q():
     """Return the process-lifetime supervisor event bus, creating it lazily.
 
     Worker-pool generations are replaceable; the producers that publish onto
-    this bus (direct chat, consciousness, active turns, and workers) are not.
+    this bus (direct chat, active turns, and workers) are not.
     Rotating the queue during a pool respawn strands those producers on an
     undrained queue, so only a new server process creates a new bus.
     """
@@ -184,24 +186,16 @@ from supervisor.queue import _queue_lock
 
 
 def worker_pool_admission_state(ctx: Any = None) -> Dict[str, Any]:
-    """Return the user-facing managed-task executor admission state.
-
-    A busy or reaping pool is still a valid queue target.  Only an explicitly
-    disabled pool, or a genuinely absent pool after supervisor readiness, is
-    unavailable.  Internal boot/update recovery may enqueue before an initial
-    spawn and therefore does not use this user-ingress predicate.
-    """
-    pool = getattr(ctx, "WORKERS", WORKERS) if ctx is not None else WORKERS
-    with _queue_lock:
-        disabled_reason = str(_WORKER_POOL_DISABLED_REASON or "")
-        worker_count = len(pool)
+    """Busy/booting pools and live owner waits can queue work; exhausted pools cannot."""
+    state = _worker_pool_execution_state(
+        getattr(ctx, "WORKERS", None), running=getattr(ctx, "RUNNING", None),
+    )
     update_reason = repo_writer_admission_closed()
-    available = worker_count > 0 and not disabled_reason and not update_reason
+    available = state["available"] and not update_reason
     return {
-        "available": available,
+        **state, "available": available,
         "reason_code": "" if available else "worker_pool_unavailable",
-        "disabled_reason": disabled_reason or update_reason or ("no_workers" if not worker_count else ""),
-        "worker_count": worker_count,
+        "disabled_reason": state["disabled_reason"] or update_reason,
     }
 
 
@@ -211,7 +205,7 @@ def ensure_worker_pool_started(n: int = 0, *, allow_disabled_restart: bool = Fal
         # Update admission can be closed while the one authorized assisted
         # resolver is already running. That does not make an existing healthy
         # pool absent and must never trigger a second full-pool spawn.
-        if WORKERS and not _WORKER_POOL_DISABLED_REASON:
+        if _worker_pool_execution_state()["available"]:
             return True
     state = worker_pool_admission_state()
     if state["available"]:
@@ -294,7 +288,7 @@ def _repo_writer_turn_allowed(chat_id: int) -> bool:
         send_with_budget(
             chat_id,
             "🔒 An update is using the repository. Try this message again when it finishes.",
-        )
+            role="system", system_type="managed_update_notice")
     except Exception:
         log.debug("Could not report managed-update writer gate", exc_info=True)
     return False
@@ -306,11 +300,11 @@ def _get_chat_agent():
         sys.path.insert(0, str(REPO_DIR))
     from ouroboros.agent import make_agent
     from ouroboros.owner_wait import direct_owner_wait
+    from supervisor.queue import transition_acceptance_fence
 
-    agent = make_agent(
-        repo_dir=str(REPO_DIR), drive_root=str(DRIVE_ROOT), event_queue=get_event_q(),
-    )
+    agent = make_agent(repo_dir=str(REPO_DIR), drive_root=str(DRIVE_ROOT), event_queue=get_event_q())
     agent.owner_wait_callback = direct_owner_wait
+    agent.fence_transition = transition_acceptance_fence  # in-process fence: no event, no ack file, no wait
     return agent
 
 
@@ -368,6 +362,9 @@ def direct_chat_turn(task_id: str = "") -> Optional[Dict[str, Any]]:
         "_is_direct_chat": True,
         "_started_at": float(getattr(agent, "_task_started_ts", 0.0) or 0.0),
     }
+    current_focus = metadata.get("focus")
+    if current_focus is not None:
+        record["focus"] = current_focus
     stamps = getattr(agent, "_direct_turn_stamps", None)
     if isinstance(stamps, dict) and str(stamps.get("_task_id") or "") == current:
         record.update({key: value for key, value in stamps.items() if key != "_task_id"})
@@ -491,8 +488,9 @@ def _stage_promoted_initial_attachments(
         if attachment_manifest_all_rejected(manifest):
             remove_staged_attachments(manifest)
             from ouroboros.headless import remove_subagent_task_drive
-
-            remove_subagent_task_drive(DRIVE_ROOT, tid)
+            from supervisor.queue import task_settlement_interlock, task_settlement_liveness
+            remove_subagent_task_drive(DRIVE_ROOT, tid, live=task_settlement_liveness,
+                                       guard=task_settlement_interlock, admission_rollback=True)
             return manifest, {
                 "status": "needs_manual_target",
                 "reason": "attachment_admission_rejected",
@@ -542,30 +540,36 @@ def _stage_promoted_initial_attachments(
 def _reject_promoted_after_attachment_stage(
     outcome: dict, manifest: list[dict],
 ) -> dict:
-    """Central idempotent cleanup for every non-scheduled post-stage exit."""
+    """Carry cleanup ownership to the producer's exact refusal settlement."""
 
-    if manifest:
-        try:
-            from ouroboros.artifacts import remove_staged_attachments
-
-            remove_staged_attachments(manifest)
-        except Exception:
-            log.debug("promote: staged attachment cleanup failed", exc_info=True)
+    if outcome.get("admission_started"):
+        return outcome
+    outcome["never_admitted"] = True
+    # Keep the staging list itself: its private owned-path set is not serialized.
+    # Queue refusal may already have released this id's reservation.
+    outcome["_admission_cleanup_manifest"] = manifest
     return outcome
 
 
 def _apply_presence_promotion_authority(
     evt: dict, task: dict, *, objective: str, expected_output: str,
 ) -> list[dict] | dict:
-    """Preserve inherited Presence authority while rebinding the new root."""
+    """Preserve inherited Presence authority while rebinding the new root.
 
-    presence = evt.get("presence") if isinstance(evt.get("presence"), dict) else None
-    if not presence:
-        return []
-    task["_presence_origin"] = True
-    task["source"] = "presence_promote"
-    task.setdefault("metadata", {})["presence"] = dict(presence)
+    A speaker's promote makes the root answer its conversation; a delegated
+    descendant's carries only the binding it acts for, so its root is that
+    binding's related work under the same ceiling and never a speaker.
+    """
+    from ouroboros.dialogue_provenance import presence_root_carrier
+
     contract = evt.get("task_contract") if isinstance(evt.get("task_contract"), dict) else {}
+    carrier = presence_root_carrier(evt, task_contract=contract)
+    if not carrier:
+        return []
+    if "presence" in carrier:
+        task["_presence_origin"] = True
+    task["source"] = "presence_promote"
+    task.setdefault("metadata", {}).update(carrier)
     inherited_manifest = [
         dict(row) for row in (contract.get("attachment_manifest") or [])
         if isinstance(row, dict)
@@ -576,6 +580,9 @@ def _apply_presence_promotion_authority(
         "objective": objective,
         "expected_output": expected_output,
         "attachment_manifest": [],
+        # The new root owns its objective: a delegated promoter's claims are not its premise.
+        "acceptance_claims": [],
+        "success_criteria": [],
     })
     promoted_contract.pop("lineage", None)
     promoted_contract.pop("attachment_manifest_ref", None)
@@ -621,6 +628,7 @@ def _promoted_scheduled_outcome(task: dict, admitted: Any, tid: str) -> dict:
         "status": "scheduled",
         "task_id": tid,
         "_admitted_task_contract": dict(admitted_contract or {}),
+        **{k: v for k, v in (admitted if isinstance(admitted, dict) else task).items() if k == "_project_admission"},
     }
 
 
@@ -657,8 +665,8 @@ from supervisor.log_addressing import TurnEventQueue as _TurnEventQueue  # noqa:
 # sink copy would be the second delivery of the same event. This is the
 # exactly-once contract test_log_forwarding pins with the production sink
 # installed. The set is a superset of the worker list because the direct-chat
-# agent and Background Consciousness run inside the server process and append
-# the same worker-shaped rows there.
+# agent (an owner's turn and a consciousness wake-up alike) runs inside the
+# server process and appends the same worker-shaped rows there.
 from supervisor.worker_process import WORKER_LOG_SINK_SUPPRESSED_TYPES  # noqa: E402 -- moved span, needed at import time below
 
 SERVER_LOG_SINK_SUPPRESSED_TYPES = WORKER_LOG_SINK_SUPPRESSED_TYPES | frozenset({
@@ -1086,7 +1094,7 @@ _WORKER_PIDS_FILENAME = "worker_pids.json"
 
 
 def _reconcile_confirmed_dead_review_owner(owner_pid: int) -> None:
-    _reconcile_confirmed_dead_review_owner_for_root(DRIVE_ROOT, owner_pid)
+    _reconcile_review_owners(DRIVE_ROOT, {owner_pid})
 
 
 from supervisor.worker_pool_lifecycle import _serialized_worker_lifecycle  # noqa: E402 -- moved span, decorator read at import time below
@@ -1122,15 +1130,13 @@ def spawn_workers(n: int = 0) -> None:
             "event_queue_transport": "manager",
         },
     )
+    from supervisor.worker_process import close_worker_stop_channel, spawn_worker_process
+
     new_workers: Dict[int, Worker] = {}
     try:
         for i in range(count):
             in_q = _CTX.Queue()
-            proc = _CTX.Process(target=worker_main,
-                               args=(i, in_q, event_q, str(REPO_DIR), str(DRIVE_ROOT),
-                                     _current_custody_session_id()))
-            proc.daemon = True
-            proc.start()
+            proc = spawn_worker_process(_CTX, i, in_q, event_q, REPO_DIR, DRIVE_ROOT)
             # Unassignable until the readiness seam observes this child's worker_ready row.
             new_workers[i] = Worker(wid=i, proc=proc, in_q=in_q, busy_task_id=None, reaping=True)
     except Exception:
@@ -1140,6 +1146,8 @@ def spawn_workers(n: int = 0) -> None:
                 worker.proc.join(timeout=2)
             except Exception:
                 pass
+            finally:
+                close_worker_stop_channel(worker.proc)
         raise
     with _queue_lock:
         if WORKERS:
@@ -1149,6 +1157,8 @@ def spawn_workers(n: int = 0) -> None:
                     worker.proc.join(timeout=2)
                 except Exception:
                     pass
+                finally:
+                    close_worker_stop_channel(worker.proc)
             raise RuntimeError("worker pool appeared during serialized startup")
         WORKERS.update(new_workers)
         _WORKER_POOL_DISABLED_REASON = ""
@@ -1169,9 +1179,11 @@ def kill_workers(
     preserve_pending: bool = False,
     preserve_running_task_ids: Optional[set[str]] = None,
     reconcile_delegate_custody: bool = True,
+    reconcile_review_custody: bool = True,
 ) -> bool:
     global _WORKER_POOL_DISABLED_REASON
     from supervisor import queue
+    from supervisor.queue_snapshot import _exact_pause_row
     with _queue_lock:
         if disable_reason:
             _WORKER_POOL_DISABLED_REASON = str(disable_reason)
@@ -1198,20 +1210,26 @@ def kill_workers(
         for w in WORKERS.values():
             w.proc.join(timeout=3)
         _kill_survivors()
+        dead_pids: set[int] = set()
         for w in WORKERS.values():
             try:
                 if w.proc.pid and not w.proc.is_alive():
-                    _reconcile_confirmed_dead_review_owner(int(w.proc.pid))
+                    dead_pids.add(int(w.proc.pid))
             except Exception:
-                log.debug(
-                    "Could not prove worker %s dead for review reconciliation",
-                    w.wid,
-                    exc_info=True,
-                )
+                log.debug("Cannot confirm worker %s dead", w.wid, exc_info=True)
+        from supervisor.worker_process import close_worker_stop_channel
+        for w in WORKERS.values():
+            close_worker_stop_channel(w.proc)
         WORKERS.clear()
         orphaned_ids = []
         drained_ids = []
         terminalization_retry_ids = []
+        # #1196: an exact mid-run budget pause survives the physical epoch. Its
+        # PENDING carrier and its durable ``paused`` row are left exactly as they
+        # are — never cancelled here, never ``pending_parent_interrupted`` — so the
+        # next boot's ``restore_pending_from_snapshot`` re-validates the durable
+        # authority and parks the same task id again (or holds it, typed).
+        retained_paused_ids = []
         cleanup_ok = True
         try:
             done_status = terminal_status or "failed"
@@ -1355,6 +1373,10 @@ def kill_workers(
                     if str(task.get("id") or "") in preserve_running:
                         kept.append(task)
                         continue
+                    if _exact_pause_row(task):
+                        retained_paused_ids.append(str(task.get("id") or ""))
+                        kept.append(task)
+                        continue
                     parent_id = str(task.get("parent_task_id") or "")
                     root_id = str(task.get("root_task_id") or "")
                     if parent_id and (parent_id in running_task_ids or root_id in interrupted_roots):
@@ -1389,6 +1411,10 @@ def kill_workers(
                         else:
                             PENDING.append(task)
                         continue
+                    if _exact_pause_row(task):
+                        retained_paused_ids.append(tid)
+                        PENDING.append(task)
+                        continue
                     if _settle_killed_pending(
                         task,
                         reason=result_reason,
@@ -1406,7 +1432,7 @@ def kill_workers(
                             status=done_status,
                             trigger="pending_pool_kill",
                         ))
-            if orphaned_ids or drained_ids or terminalization_retry_ids:
+            if orphaned_ids or drained_ids or terminalization_retry_ids or retained_paused_ids:
                 append_jsonl(
                     DRIVE_ROOT / "logs" / "supervisor.jsonl",
                     {
@@ -1415,6 +1441,7 @@ def kill_workers(
                         "orphaned_running": orphaned_ids,
                         "drained_pending": drained_ids,
                         "terminalization_retry": terminalization_retry_ids,
+                        **({"retained_budget_paused": retained_paused_ids} if retained_paused_ids else {}),
                     },
                 )
         except Exception:
@@ -1422,6 +1449,8 @@ def kill_workers(
             log.warning("Zombie prevention cleanup failed", exc_info=True)
         for terminal_id in orphaned_ids:
             RUNNING.pop(str(terminal_id), None)
+    if reconcile_review_custody:
+        _reconcile_review_owners(DRIVE_ROOT, dead_pids)
     try:
         snapshot_ok = queue.persist_queue_snapshot(reason="kill_workers") is not False
     except Exception:
@@ -1750,6 +1779,7 @@ def _drop_cancelled_pending() -> bool:
     if not PENDING:
         return True
     try:
+        from ouroboros.project_admission import hold_unreadable_result
         from ouroboros.task_results import (
             STATUS_CANCEL_REQUESTED, STATUS_CANCELLED, _TRULY_TERMINAL_STATUSES,
             load_task_result, write_task_result,
@@ -1810,6 +1840,11 @@ def _drop_cancelled_pending() -> bool:
             except Exception:
                 authority_error = True
         if authority_error:
+            if t.get("_project_admission_restore_hold"):
+                # Project conservation is independent of result readability;
+                # an unknown old dispatch is retained, never replayed or failed.
+                survivors.append(t)
+                continue
             if authority_hold:
                 assignment["safe"] = False
                 log.error(
@@ -1819,7 +1854,9 @@ def _drop_cancelled_pending() -> bool:
                 )
                 survivors.extend(pending_rows[index:])
                 break
-            if marker is not None or not tid:
+            if marker is not None or not tid or hold_unreadable_result(t):
+                # Accepted Project work first losing its result keeps the same row;
+                # this pass's hold revalidation persists it (restore's rule).
                 survivors.append(t)
             else:
                 survivors.append(_make_terminalization_retry_task(
@@ -2123,7 +2160,7 @@ def _worker_crash_storm_detected(
                 "task_incident": "worker_crash_storm",
                 "toast_once": f"worker-crash-storm:{int(min(CRASH_TS) if CRASH_TS else now)}",
             },
-        )
+            role="system", system_type="worker_failure")
     return True
 
 
@@ -2140,7 +2177,7 @@ from supervisor.worker_chat_lane import (  # noqa: E402, F401 -- intentional pub
     _run_chat_task,
     auto_resume_after_restart,
     handle_chat_direct,
-    handle_chat_ephemeral,
+    handle_wake_direct,
 )
 from supervisor.worker_health import (  # noqa: E402, F401 -- intentional public re-exports
     _emit_task_done_terminal,
@@ -2150,6 +2187,8 @@ from supervisor.worker_health import (  # noqa: E402, F401 -- intentional public
 )
 from supervisor.worker_pool_lifecycle import (  # noqa: E402, F401 -- intentional public re-exports
     _WORKER_LIFECYCLE_LOCK,
+    _worker_pool_execution_state,
+    disable_exhausted_worker_pool,
     _first_worker_event_since,
     _kill_survivors,
     _record_worker_pids,
@@ -2174,7 +2213,6 @@ from supervisor.worker_process import (  # noqa: E402, F401 -- intentional publi
 from supervisor.worker_promotion import (  # noqa: E402, F401 -- intentional public re-exports
     _admit_promoted_workspace,
     _canonical_promoted_repair_constraint,
-    _fail_promoted_task_loudly,
     _origin_from_mapping,
     _origin_from_task_record,
     _promote_duplicate_reason,

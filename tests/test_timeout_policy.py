@@ -236,6 +236,9 @@ def test_plan_task_outer_envelope_covers_agent_session_lifetime(monkeypatch):
 
     # max(transport + 2*grace, task ceiling + grace), not a short API-only
     # wrapper that can return while an agent-session worker is still paid/live.
+    # The envelope bounds a caller that WAITS (an identical envelope resuming an
+    # in-flight wave); a fresh dispatch returns at the dispatch barrier by design
+    # (ReviewRequest.drain_deadline) with its workers in process-local custody.
     assert plan_review._plan_task_tool_timeout_sec() == 21_720.0
     entry = next(item for item in plan_review.get_tools() if item.name == "plan_task")
     assert entry.timeout_sec == 21_720.0
@@ -596,6 +599,7 @@ def test_exact_pending_commit_retry_reconciles_before_cycle_cap(tmp_path, monkey
 
 
 def test_commit_pending_retry_reconciles_same_paid_attempt(tmp_path, monkeypatch):
+    monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "blocking")
     import subprocess
     from types import SimpleNamespace
 
@@ -986,8 +990,8 @@ def test_forced_finalization_does_not_rebase_existing_grace(monkeypatch, tmp_pat
     )
     monkeypatch.setattr(loop_mod, "_finalize_forced_services", lambda *_args: None)
     monkeypatch.setattr(
-        loop_mod, "_forced_swarm_router_result",
-        lambda *_args: ("routed", {}, {}),
+        loop_mod, "_call_forced_model_once",
+        lambda *_args: "The final answer.",
     )
     loop_mod._forced_final_answer(
         ctx, prompt="finish", fallback_text="fallback",
@@ -1021,7 +1025,7 @@ def test_expired_supervisor_grace_does_not_dispatch_a_paid_final_call(monkeypatc
 
     monkeypatch.setattr(loop_mod, "_forced_fallback_result", fake_fallback)
     result = loop_mod._handle_forced_finalization(ctx, "idle_timeout")
-    assert result[0].startswith("⚠️ Task reached idle_timeout")
+    assert result[0].startswith("⚠️ The task made no progress for too long; finalization grace produced no answer.")
     assert observed["source"] == "finalization_grace_window_elapsed"
     assert ctx.accumulated_usage == {
         "execution_status": "failed",

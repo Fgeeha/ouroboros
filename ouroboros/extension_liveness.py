@@ -17,13 +17,14 @@ from ouroboros.extension_registry_state import _extensions, _load_failures, _loc
 from ouroboros.skill_loader import (
     LoadedSkill,
     _sanitize_skill_name,
-    discover_skills,
+    discover_skill_identity,
     grant_status_for_skill,
     skill_conflict_status,
-    skill_review_gate,
 )
+from ouroboros.skill_peer_inventory import discover_skill_peers
 
 log = logging.getLogger(__name__)
+
 
 def _extension_runtime_state(
     skill: LoadedSkill,
@@ -54,12 +55,12 @@ def _extension_runtime_state(
             and load_failure.skill_dir == skill_dir_now
         )
 
-    review_gate = skill_review_gate(skill.review.status, stale=review_stale)
+    review_gate = skill.review.gate_for(hash_now)
     if drive_root is None:
         drive_root = pathlib.Path(skill.skill_dir).parent.parent.parent
-    peers = list(skills) if skills is not None else discover_skills(
+    peers = list(skills) if skills is not None else list(discover_skill_peers(
         pathlib.Path(drive_root), repo_path=repo_path
-    )
+    ))
     if not any(peer.name == skill.name for peer in peers):
         peers.append(skill)
     conflict = skill_conflict_status(skill, peers)
@@ -180,15 +181,22 @@ def runtime_state_for_skill_name(
     *,
     repo_path: str | None = None,
     skills: Optional[List[LoadedSkill]] = None,
+    selected_skill: LoadedSkill | None = None,
 ) -> Dict[str, Any]:
     from ouroboros.config import get_skills_repo_path
 
     resolved_repo_path = get_skills_repo_path() if repo_path is None else repo_path
-    peers = list(skills) if skills is not None else discover_skills(
-        drive_root, repo_path=resolved_repo_path
+    if selected_skill is not None:
+        selected = [selected_skill]
+    elif skills is not None:
+        selected = list(skills)
+    else:
+        selected = discover_skill_identity(drive_root, skill_name, repo_path=resolved_repo_path)
+    peer_projection = list(skills) if skills is not None else list(
+        discover_skill_peers(drive_root, repo_path=resolved_repo_path)
     )
     safe_name = _sanitize_skill_name(skill_name)
-    skill = next((item for item in peers if item.name == safe_name), None)
+    skill = next((item for item in selected if item.name == safe_name), None)
     if skill is None:
         with _lock:
             live_loaded = skill_name in _extensions
@@ -212,7 +220,7 @@ def runtime_state_for_skill_name(
                 _extension_runtime_state(
                     skill,
                     drive_root=pathlib.Path(drive_root),
-                    skills=peers,
+                    skills=peer_projection,
                     repo_path=resolved_repo_path,
                 ),
                 pathlib.Path(drive_root),

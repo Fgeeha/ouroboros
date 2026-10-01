@@ -1,15 +1,21 @@
-"""Descriptive HTTP + WebSocket Gateway Boundary contracts (v1).
+"""Gateway HTTP/WebSocket contracts (v1): descriptive, not runtime validation.
 
-TypedDicts document payloads, not runtime validation. Keep discriminating
-``type`` keys required; mark genuinely optional fields with ``NotRequired``.
-"""
+Keep discriminating ``type`` keys required; optional fields use ``NotRequired``."""
 
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
+from ouroboros.cost_projection import CostPresentation
 
+from ouroboros.gateway.history_contracts import ChatHistoryResponse  # noqa: F401 -- public re-export
 from ouroboros.gateway.widgets import ExtensionLiveSnapshot, WidgetTab, WidgetsResponse
 from ouroboros.gateway.decision_contracts import DecisionRequest, DecisionResponse  # noqa: F401 -- public re-exports
+from ouroboros.gateway.schedule_contracts import (  # noqa: F401 -- public re-exports
+    ScheduleActionResponse,
+    ScheduledTasksResponse,
+    ScheduleDeleteResponse,
+    ScheduleUpsertResponse,
+)
 
 try:  # Python 3.11+
     from typing import Literal, NotRequired, Required, TypedDict  # type: ignore[attr-defined]
@@ -18,10 +24,9 @@ except ImportError:  # pragma: no cover - CI supports Python 3.10.
 
 
 class ChatAttachmentInbound(TypedDict, total=False):
-    """One uploaded chat attachment reference (file already stored by
-    /api/chat/upload under data/uploads/; ``filename`` is the stored
-    basename). Image attachments are delivered to vision models as native
-    image blocks (v6.26.0)."""
+    """Reference to a file stored by /api/chat/upload under data/uploads/.
+    ``filename`` is its stored basename. Images reach vision models as
+    native image blocks."""
 
     filename: str
     display_name: str
@@ -58,11 +63,9 @@ class ChatInbound(TypedDict):
     # stays user_id 1; chat_id selects the thread, project_id scopes memory.
     chat_id: NotRequired[int]
     project_id: NotRequired[str]
-    # Per-message sending-surface observables (additive-optional): raw facts the
-    # SPA measures at send time (pywebview bridge presence, ua, viewport,
-    # matchMedia booleans, captured_at). The gateway normalizes through the
-    # closed-key bounded `client_surface.normalize_client_surface`; absence is an
-    # honest gap, never defaulted.
+    # Per-message sending-surface observables (additive-optional): raw facts the SPA measures at send
+    # time (pywebview bridge presence, ua, viewport, matchMedia booleans, captured_at), normalized by
+    # the closed-key `client_surface.normalize_client_surface`; absence is an honest gap, never defaulted.
     client_surface: NotRequired[dict]
 
 
@@ -108,31 +111,47 @@ class ChatOutbound(TypedDict):
     role: Literal["user", "assistant", "system"]
     content: str
     ts: str
+    ingress_accepted: NotRequired[bool]  # Canonical inbound row saved; not processing/start proof.
     markdown: NotRequired[bool]
     is_progress: NotRequired[bool]
     task_id: NotRequired[str]
     origin_message_ref: NotRequired[Dict[str, Any]]
-    # X3: a repair receipt whose managed task id does not exist yet (the router
-    # mints it at promotion). Typed truth instead of an invented id.
+    # X3: a repair receipt whose managed task id the router mints only at promotion (typed truth, no invented id).
     task_id_pending: NotRequired[bool]
-    # "finalizing" on a root's early final answer: the answer is delivered
-    # while post-task synthesis still runs, so the frame is NOT the task's
-    # terminal conclusion — task_done settles the card/turn.
+    # "finalizing": early answer during synthesis, NOT terminal; task_done settles the card/turn.
     task_phase: NotRequired[str]
-    # Typed terminal fact on a frame that IS the turn's conclusion: stamped on
-    # direct/ephemeral finals (and the direct error branch) so the client's
-    # live gate settles the activity without waiting for a snapshot. One of
-    # completed/failed/cancelled/rejected_duplicate.
+    # Direct/ephemeral completed/failed/cancelled/rejected_duplicate settles activity, not early answers.
     task_terminal_status: NotRequired[str]
     ephemeral_decision: NotRequired[bool]
+    tool_calls: NotRequired[int]
+    rounds: NotRequired[int]
+    suggested_name: NotRequired[str]
+    model_execution: NotRequired[Dict[str, Any]]
+    # Project question mirrored into Main as the Project's own form; the durable question stays in Project.
+    quiz_id: NotRequired[str]
+    quiz_state: NotRequired[str]
+    project_chat_id: NotRequired[int]
+    source_status: NotRequired[str]
+    owner_wait_state: NotRequired[str]
+    owner_wait_resume_reason: NotRequired[str]
+    wait_for_answer: NotRequired[bool]
+    wait_ended_at: NotRequired[str]
+    question: NotRequired[str]
+    options: NotRequired[List[str]]
+    option_details: NotRequired[List[str]]  # aligned with options; absent for a legacy label-only ask
+    stake: NotRequired[str]
+    assumption: NotRequired[str]
+    recommended_index: NotRequired[int]
+    answered_index: NotRequired[int]
+    comment: NotRequired[str]
+    host_facts: NotRequired[str]  # the mirrored card's host sentence (QuizOutbound.host_facts)
     task_incident: NotRequired[str]
-    # A cancellation fault names the PHYSICAL task it could not settle when that
-    # differs from the displayed (logical) task id.
+    # A cancellation fault names the PHYSICAL task it could not settle when it differs from the logical task id.
     cancel_physical_task_id: NotRequired[str]
     toast_once: NotRequired[str]
-    # #628: the incident's valence for the one-shot toast (warn/ok/error),
-    # stamped by the producer that knows whether the boundary is a wait, a
-    # recovery or an exhaustion; absent = the browser keeps its alarm tone.
+    # #628: the one-shot toast's valence (warn/ok/error; the reaper's rail ``warning``
+    # is normalizeTone's existing ``warn`` alias, no new tone), stamped by the producer
+    # that knows wait/recovery/exhaustion; absent = the browser keeps its alarm tone.
     toast_tone: NotRequired[str]
     lifecycle: NotRequired[Dict[str, Any]]
     # C4 multi-chat dedupe: a duplicate lifecycle initiator's typed pointer to
@@ -154,48 +173,41 @@ class ChatOutbound(TypedDict):
     model_lane: NotRequired[str]
     requested_model_lane: NotRequired[str]
     effective_model_lane: NotRequired[str]
-    # Phase 6: the OPAQUE harness route RESOLVED AT DISPATCH for this
-    # bubble/subagent (`resolve_subagent_dispatch`, stamped once) — a delegated
-    # route only; absent/empty means the ordinary native path and the UI draws
-    # no chip. It is the route the run was sent to, not a receipt from the
-    # engine saying where it landed: a landing below the ask is disclosed on
-    # `capability_delta`, not by rewriting this field.
+    # Opaque delegated route stamped once by resolve_subagent_dispatch; absent/empty = native/no chip.
+    # Dispatch intent is not a landing receipt: a reduction belongs in capability_delta, never rewrites this route.
     executor_route: NotRequired[str]
-    # Latest observed progress actor, NOT terminal evidence or current liveness.
-    # Own task_id/task_attempt/run_id/attempt_id, harness_id, phase, revision;
-    # optional model has explicit model_source (requested or observed).
+    # Latest observed progress actor, NOT terminal evidence or current liveness. Own task_id/task_attempt/run_id/
+    # attempt_id, harness_id, phase, revision; optional model has explicit model_source (requested or observed).
     executor_observation: NotRequired[Dict[str, Any]]
-    # The completion-seam EVIDENCE the route decision is reconciled against
-    # (subagents.envelope_from_task): delegated runs started/settled/succeeded,
-    # terminal failure states, disclosed subscription spend (+estimated flag),
-    # engine-reported models, the additive `nanny_nudge_recorded` flag (a
-    # non-empty finalization nudge was durably stamped), and the additive
-    # `delegate_start_attempted` flag (any durable delegate_start attempt,
-    # refused or started). Terminal frames only; its absence means "no
-    # evidence yet", never "ran natively".
+    # Host observation: v/task_id/run_id/after_seq/through_seq, source (run_events|timeline_window,
+    # read_through/ref/provisional), typed parts/technical/gaps/omitted/latest_message. Part cuts count
+    # Unicode code points. (run_id, seq) is identity; cuts_truncated/seqs_truncated disclose its preview loss.
+    # source.ref = redacted JSONL via confined task-file ?source= (503 if unsupported). Never narration,
+    # terminal evidence or a complete-journal claim; full shape is mirrored in web/modules/api_types.js.
+    delegated_activity: NotRequired[Dict[str, Any]]
+    # Terminal evidence from subagents.envelope_from_task: run started/settled/succeeded counts, failure states,
+    # disclosed spend/estimated flag, engine models, nanny_nudge_recorded (durable nonempty finalization nudge),
+    # delegate_start_attempted (durable start or refusal). Absence = no evidence yet, never native execution.
     execution_evidence: NotRequired[Dict[str, Any]]
-    # The FACT beside the executor_route plan, from the same custody evidence:
-    # "harness_used" | "harness_attempted" | "native_only". Terminal frames only; absent =
+    # Custody fact beside executor_route: "harness_used" | "harness_attempted" | "native_only". Terminal only; absent =
     # no substrate claim.
     actual_substrate: NotRequired[str]
     model: NotRequired[str]
     task_group_id: NotRequired[str]
     task_event: NotRequired[str]
     status: NotRequired[str]
-    # v6.82 (P5): host-attested marker, stamped by the supervisor's delivery
-    # seam ONLY for a task POST /api/tasks/{id}/cancel will actually stop — a
-    # lineage-resolved pooled ROOT (its RUNNING row) or the live in-process
-    # direct-chat turn (resolved through the same ownership reader the
-    # endpoint uses, supervisor.workers.direct_chat_turn); never a subagent
-    # frame, never an ephemeral decision turn. Gates the UI "Cancel run" action.
+    # v6.82 (P5): host-attested marker, stamped by the supervisor's delivery seam ONLY for a task POST /api/tasks/{id}/cancel
+    # will actually stop — a lineage-resolved pooled ROOT (its RUNNING row) or the live in-process direct-chat turn (resolved
+    # through the same ownership reader the endpoint uses, supervisor.workers.direct_chat_turn); never a subagent frame, never
+    # an ephemeral decision turn. Gates the UI "Cancel run" action.
     cancelable: NotRequired[bool]
-    # Monetary projections are nullable when the physical-attempt ledger cannot
-    # be read.  ``None`` is deliberately distinct from a confirmed $0 result.
-    # C2 (owner 10=B) named these the HONEST names — accounted upper bounds,
-    # not settled receipts; ABI 7.0 (ABI-3) removed the deprecated
-    # ``cost_usd[_with_children]`` wire aliases, so these are the only outbound
-    # spellings (ouroboros/cost_projection.py is the one author). Stored legacy
-    # records keep both spellings readable via ``resolve_cost_pair``.
+    _is_direct_chat: NotRequired[bool]  # lane fact stamped on a direct turn's own frames
+    narration: NotRequired[bool]  # progress VOICE: the model's own round narration (true) vs a host note (false); absent = legacy
+    initiator: NotRequired[str]  # origin label: "consciousness" on a wake-up's frames/rows (and its roots); absent on an owner's turn
+    # Monetary projections are nullable when the physical-attempt ledger cannot be read: ``None`` is
+    # distinct from a confirmed $0. These are the honest names (accounted upper bounds, not settled
+    # receipts) and the only outbound spellings since ABI 7.0 dropped the ``cost_usd[_with_children]``
+    # aliases; ouroboros/cost_projection.py is the one author, ``resolve_cost_pair`` reads legacy records.
     accounted_upper_bound_usd: NotRequired[Optional[float]]
     accounted_upper_bound_usd_with_children: NotRequired[Optional[float]]
     cost_accounting_status: NotRequired[Literal["available", "unavailable"]]
@@ -208,11 +220,11 @@ class ChatOutbound(TypedDict):
     # v6.87.48: count of OPEN ledger rows — the disclosed cause of
     # ``cost_final: false``, which can hold with every dollar bucket at zero.
     non_final_rows: NotRequired[Optional[int]]
-    # C12: the ledger's own INTEGRITY marker. The cost authority has always
-    # produced it (`reconstruct_task_cost`), but no carry list named it, so an
-    # amount computed over a degraded ledger reached every surface looking exactly
-    # like one computed over a sound ledger.
+    # C12: the ledger's own INTEGRITY marker from the cost authority (`reconstruct_task_cost`), carried so an
+    # amount computed over a degraded ledger never reaches a surface looking like one over a sound ledger.
     ledger_integrity_degraded: NotRequired[Optional[bool]]
+    # Closed shape owned by the cost producer; null means ledger unavailable.
+    cost_presentation: NotRequired[Optional[CostPresentation]]
     result: NotRequired[str]
     result_truncated: NotRequired[bool]  # P3: WS preview was capped; fetch full via task id
     trace_summary: NotRequired[str]
@@ -231,14 +243,21 @@ class ChatOutbound(TypedDict):
     sender_session_id: NotRequired[str]
     client_message_id: NotRequired[str]
     transport: NotRequired[TransportMetadata]
-    # UI-only system annotation emitted by skill-repair visible commands.
+    # Typed message kind; role alone selects authorship (DESIGN: Chat authorship and System rows).
     system_type: NotRequired[str]
+    # Host placement of a task's System row: timeline or Reviews; absent = ordinary. card_row_id is stable.
+    card_row: NotRequired[Literal["timeline", "reviews"]]
+    card_row_id: NotRequired[str]
+    card_row_revision: NotRequired[int]  # canonical source order, independent of delivery timestamp
+    late_evidence: NotRequired[Dict[str, Any]]  # late review identity/revision + exact applied source; no transcript
     # Event-time human presentation; raw task/project ids remain machine keys.
     target_label: NotRequired[str]
     project_id: NotRequired[str]
     project_name: NotRequired[str]
-    # Present on some transport re-broadcast paths.
-    chat_id: NotRequired[int]
+    handoff_id: NotRequired[str]  # immutable origin/destination receipt identity
+    terminal_time: NotRequired[Dict[str, Any]]  # host-owned occurrence, separate from publication ts
+    completion_answer: NotRequired[str]  # a Project root's model-authored final answer, mirrored into Main (DESIGN)
+    chat_id: NotRequired[int]  # present on some transport re-broadcast paths
     # Server-stamped when chat_id is a reserved Project thread: Main never
     # adopts it, even before the browser has learned the project.
     project_thread: NotRequired[bool]
@@ -355,6 +374,7 @@ class QuizOption(TypedDict):
 
     label: str
     detail: NotRequired[str]
+    recommended: NotRequired[bool]
 
 
 class QuizOutbound(TypedDict):
@@ -363,8 +383,7 @@ class QuizOutbound(TypedDict):
     Optional questions continue under ``assumption``; ``wait_for_answer`` marks
     required waiting without an implied answer. ``state`` carries lifecycle.
     Replay merges the stored ``answered_index`` and verbatim ``comment``; a
-    comment without an index is the owner's whole answer, not an option choice.
-    """
+    comment without an index is the owner's whole answer, not an option choice."""
 
     type: Literal["quiz"]
     role: Literal["assistant"]
@@ -378,6 +397,7 @@ class QuizOutbound(TypedDict):
     ts: str
     answered_index: NotRequired[int]
     comment: NotRequired[str]
+    host_facts: NotRequired[str]  # host-written, never the model's: asking task, run start, owner's last message
     chat_id: NotRequired[int]
     task_id: NotRequired[str]
     project_thread: NotRequired[bool]
@@ -387,10 +407,9 @@ class QuizOutbound(TypedDict):
 class QuizStateOutbound(TypedDict):
     """Outbound WS lifecycle update for an already-rendered quiz card.
 
-    A separate discriminator (not a second ``quiz`` frame): the display path
-    dedupes quiz frames by ``quiz:{quiz_id}:{ts}``, so a state change must
-    never look like a new card. ``answered_index`` rides only with the
-    ``answered`` state.
+    A separate discriminator (not a second ``quiz`` frame): the display path dedupes
+    quiz frames by ``quiz:{quiz_id}:{ts}``, so a state change must never look like a
+    new card. ``answered_index`` rides only with the ``answered`` state.
     """
 
     type: Literal["quiz_state"]
@@ -399,6 +418,7 @@ class QuizStateOutbound(TypedDict):
     state: str
     ts: str
     answered_index: NotRequired[int]
+    wait_for_answer: NotRequired[bool]  # additive: False once a bounded wait closed (the card stays open)
     # #471: the owner's recorded free-text answer rides the live frame (absent
     # when empty) so the open card renders `Owner's answer:` as replay does.
     comment: NotRequired[str]
@@ -419,9 +439,9 @@ class TypingOutbound(TypedDict):
     activity_id: NotRequired[str]
     client_message_id: NotRequired[str]
     phase: NotRequired[str]
-    # Stamped only for direct-registry-tracked turns ("direct_chat" /
-    # "ephemeral_decision"); queued managed tasks emit typing without it, so the
-    # client exempts their entries from /api/state snapshot deletion authority.
+    # Stamped for a registry-tracked turn ("direct_chat") or a RUNNING queue
+    # root ("managed_task"); empty for children. No in-repo client reads it
+    # (wire compatibility): only the census inserts into the header live-set.
     kind: NotRequired[str]
 
 
@@ -468,7 +488,7 @@ class ProjectsChangedOutbound(TypedDict):
 
 
 class MessageAnnotationOutbound(TypedDict):
-    """Bubble-free presentation update for one canonical owner message."""
+    """Bubble-free presentation update for one owner message; ``cause``: the host's sentence for a refused act."""
 
     type: Literal["message_annotation"]
     annotation_type: Literal["routing_ack"]
@@ -479,12 +499,14 @@ class MessageAnnotationOutbound(TypedDict):
     chat_id: NotRequired[int]
     target: NotRequired[str]
     target_label: NotRequired[str]
+    project_id: NotRequired[str]
+    project_chat_id: NotRequired[int]
     options: NotRequired[List[Dict[str, Any]]]
     attachment_manifest: NotRequired[List[AttachmentManifestEntry]]
-    # #198: the exact refusal-attempt identity — the picker card composes its
-    # decision_id (routing:{client_message_id}:{routing_token}) from it; a
-    # presentation frame without it renders text, never a clickable card.
+    # #198: the exact refusal-attempt identity — the picker card composes its decision_id
+    # (routing:{client_message_id}:{routing_token}) from it; a frame without it renders text, never a card.
     routing_token: NotRequired[str]
+    cause: NotRequired[str]
     ts: NotRequired[str]
 
 
@@ -549,6 +571,11 @@ class UpdateApplyErrorResponse(TypedDict):
     stash_note: NotRequired[str]
     estimated_wave_usd: NotRequired[Optional[float]]
     remaining_usd: NotRequired[Optional[float]]
+
+
+class UpdateProgressChangedOutbound(TypedDict):
+    """Invalidation only; never proof that boot finalization completed."""
+    type: Literal["update_progress_changed"]
 
 
 class UpdateStatusReadyOutbound(TypedDict):
@@ -622,10 +649,10 @@ class FsDirsResponse(TypedDict):
 
 
 class TaskNamedOutbound(TypedDict):
-    """Outbound notice that the proactive card namer coined a project name for a fresh
-    main-chat task (v6.40). The client sets the live card's title to ``suggested_name``;
-    turn-into-project later reuses the same name. Not chat-scoped — carries only
-    ``task_id`` and is a no-op unless a thread already holds that card."""
+    """Outbound notice that a project name was coined for a task's card (inline naming of
+    a turn-into-project conversion; direct turns are not named in the background). The
+    client sets the live card's title to ``suggested_name``. Not chat-scoped — carries
+    only ``task_id`` and is a no-op unless a thread already holds that card."""
 
     type: Literal["task_named"]
     task_id: str
@@ -652,7 +679,7 @@ class HealthResponse(TypedDict):
 class EvolutionStateSnapshot(TypedDict):
     """Nested ``evolution_state`` block inside ``StateResponse``."""
 
-    enabled: bool
+    enabled: Optional[bool]  # None: unknown control (state unavailable/recovering, #1307)
     status: str
     detail: str
     cycle: int
@@ -673,10 +700,9 @@ class EvolutionStateSnapshot(TypedDict):
 class ActiveDirectTurn(TypedDict):
     """An active in-process direct chat or ephemeral decision turn.
 
-    Snapshot rows in ``StateResponse.active_direct_turns``; the seven identity
-    and activity fields are always emitted by ``DirectActivityRegistry.snapshot()``
-    (empty-string for absent values), so the mirror marks them required.
-    A model_waits projection is optional and must be supplied by its live owner.
+    Rows of ``StateResponse.active_direct_turns``: ``DirectActivityRegistry.snapshot()``
+    always emits the seven identity/activity fields (empty string for absent values),
+    so the mirror marks them required; ``model_waits`` comes only from its live owner.
     """
 
     activity_id: str
@@ -693,15 +719,21 @@ class ActiveDirectTurn(TypedDict):
 class ActiveChatActivity(ActiveDirectTurn):
     """One in-flight chat activity in ``StateResponse.active_chat_activities``.
 
-    The combined snapshot: direct/ephemeral registry turns (same rows as
-    ``active_direct_turns``) plus ROOT managed queue tasks projected as
-    ``kind="managed_task"`` with ``phase`` ``queued`` | ``budget_paused``
-    (zero-dispatch member awaiting an explicit resume — never plain
-    "queued") | ``working`` | ``finalizing`` (final answer stored, post-task
-    synthesis still open).
-    Field shape mirrors ``ActiveDirectTurn`` so one client reducer hydrates
-    both; managed rows carry an empty ``client_message_id``.
+    Direct/ephemeral registry turns (the ``active_direct_turns`` rows) plus ROOT
+    managed queue tasks as ``kind="managed_task"`` with ``phase`` ``queued`` |
+    ``budget_paused`` (awaiting an explicit owner Resume; never plain "queued") |
+    ``budget_pausing`` (RUNNING, writing its exact pause record; #1196) | ``working`` |
+    ``finalizing`` (answer stored, post-task
+    synthesis open); a direct row whose live wait owner could not be read is
+    ``phase="unknown"``; a budget-paused direct turn (#1196) keeps its SAME id and
+    reports the managed phases as ``kind="direct_chat"``. Same shape as ``ActiveDirectTurn`` so one reducer hydrates
+    both (managed rows: empty ``client_message_id``). ``required_question_unavailable``:
+    a recorded owner-question wait whose detail could not be resolved — possibly blocked.
     """
+
+    required_question: NotRequired[Dict[str, Any]]
+    required_question_unavailable: NotRequired[bool]
+    project_admission_hold: NotRequired[Dict[str, Any]]
 
 
 class StateResponse(TypedDict):
@@ -717,8 +749,9 @@ class StateResponse(TypedDict):
     budget_pct: Optional[float]
     branch: str
     sha: str
-    evolution_enabled: bool
-    bg_consciousness_enabled: bool
+    evolution_enabled: Optional[bool]  # None: an unknown control (state unavailable/recovering), never "off"
+    bg_consciousness_enabled: Optional[bool]
+    state_quality: Dict[str, Any]  # state.json read quality: {quality, source, unconfirmed}
     evolution_cycle: int
     evolution_state: EvolutionStateSnapshot
     bg_consciousness_state: Dict[str, Any]
@@ -727,9 +760,7 @@ class StateResponse(TypedDict):
     supervisor_error: Optional[str]
     runtime_mode: str
     context_mode: str
-    # True when the EFFECTIVE `low` is a system auto-downgrade rather than an owner
-    # selection: the owner control needs it to offer "confirm Low" on a no-op click.
-    context_mode_auto_low: bool
+    context_mode_auto_low: bool  # frozen compatibility field, always False (persistent auto-Low is retired)
     safety_mode: str
     skills_repo_configured: bool
     github_token_configured: bool
@@ -750,6 +781,7 @@ class StateResponse(TypedDict):
     # tasks). Additive beside active_direct_turns, which stays unchanged for
     # compatibility; new clients hydrate from this field.
     active_chat_activities: NotRequired[List[ActiveChatActivity]]
+    active_chat_activities_complete: NotRequired[bool]
 
 
 class SettingsNetworkMeta(TypedDict):
@@ -776,12 +808,31 @@ class AvailableSubagentsSettingsMeta(TypedDict, total=False):
     candidate: Optional[Dict[str, Any]]
 
 
+class SettingsPolicyAxis(TypedDict, total=False):
+    """Configured/effective owner policy values shown by Settings."""
+
+    configured: str
+    effective: str
+    restart_required: bool
+    pending: bool
+    applies: Literal["restart", "next_task"]
+
+
+class SettingsPolicyState(TypedDict):
+    access: SettingsPolicyAxis
+    supervisor: SettingsPolicyAxis
+    review: SettingsPolicyAxis
+    running_task_snapshot: bool
+
+
 class SettingsMeta(SettingsNetworkMeta, total=False):
     """Complete ``GET /api/settings`` ``_meta`` block."""
 
     custom_secret_keys: list[str]
     setup_contract: Dict[str, Any]
     available_subagents: AvailableSubagentsSettingsMeta
+    policy_state: SettingsPolicyState
+    restart_state: Dict[str, Any]
 
 
 class SettingsSaveResponse(TypedDict, total=False):
@@ -789,6 +840,7 @@ class SettingsSaveResponse(TypedDict, total=False):
     no_changes: bool
     restart_required: bool
     restart_keys: list[str]
+    restart_state: Dict[str, Any]
     immediate_changed: bool
     next_task_changed: bool
     warnings: list[str]
@@ -822,6 +874,7 @@ class OwnerSafetyModeResponse(TypedDict):
 class OwnerSkillPresenceRuntimeRequest(TypedDict):
     expected_state_fingerprint: str
     runtime_overrides: Dict[str, Any]
+    workspace_root: NotRequired[str]
 
 
 class OwnerSkillPresenceRuntimeResponse(TypedDict):
@@ -861,13 +914,13 @@ class UiPreferencesResponse(TypedDict):
     sidebar_width: int  # px; 0 = CSS default (resizable side sections, v6.33.0)
     project_panel_width: int  # px; 0 = CSS default
     project_seen_revision: dict[str, int]  # monotonic paint ACK per active Project
+    welcome: dict[str, str]  # install-wide empty-Main UI copy: mode default|hidden|custom and plain text
 
 
 class GitLogResponse(TypedDict):
     commits: list[Dict[str, Any]]
-    # Tag rows: {tag, date, sha (peeled commit), message} — the mirror said
-    # ``list[str]`` while ``list_versions`` has always emitted dicts; corrected
-    # (behavioural documentation) in the 2026-08-31 updates redesign.
+    # Tag rows: {tag, date, sha (peeled commit), message} — the mirror said ``list[str]`` while ``list_versions``
+    # has always emitted dicts; corrected (behavioural documentation) in the 2026-08-31 updates redesign.
     tags: list[Dict[str, Any]]
     branch: str
     sha: str
@@ -878,20 +931,6 @@ class EvolutionDataResponse(TypedDict):
     checkpoints: NotRequired[list[Dict[str, Any]]]
     generated_at: str
     cached: bool
-
-
-class ScheduledTasksResponse(TypedDict):
-    schema_version: int
-    tasks: list[Dict[str, Any]]
-
-
-class ScheduleUpsertResponse(TypedDict):
-    ok: bool
-    schedule: Dict[str, Any]
-
-
-class ScheduleDeleteResponse(TypedDict):
-    ok: bool
 
 
 class UploadResponse(TypedDict):
@@ -959,6 +998,7 @@ class LocalModelStatusResponse(TypedDict, total=False):
     port: int
     message: str
     error: str
+    settings_application: Dict[str, Any]
 
 
 class McpStatusResponse(TypedDict, total=False):
@@ -988,13 +1028,6 @@ class FileBrowserListResponse(TypedDict, total=False):
     root: str
     path: str
     entries: list[Dict[str, Any]]
-    error: str
-
-
-class ChatHistoryResponse(TypedDict, total=False):
-    messages: list[Dict[str, Any]]
-    has_more: bool
-    next_before_ts: str
     error: str
 
 
@@ -1070,19 +1103,15 @@ class TaskListResponse(TypedDict, total=False):
 
 
 class TaskCostBreakdown(TypedDict):
-    """Read-time "where did the money go" projection on ``GET /api/tasks/{task_id}``
-    (ROOT tasks only). Computed from the physical-attempt ledger at read time and
-    never persisted; ``own + children + unattributed == subtree``. When the object
-    is present every key is present; the WHOLE object is absent — never a confident
-    $0 — when accounting is unavailable or holds no attributable row for the
-    subtree, and on non-root task details."""
+    """Root-only task-detail ledger projection, computed on read, never persisted.
+    All keys appear together; ``own + children + unattributed == subtree``. Omit
+    the object for non-roots, unavailable accounting or no attributable subtree rows; never invent $0."""
 
     own_usd: float
     children_usd: float
     unattributed_usd: float
     delegated_disclosed_usd: float
-    # C2: the explicit subtree total under its honest name —
-    # own + children + unattributed, an accounted UPPER BOUND, not a receipt.
+    # C2: own + children + unattributed is an accounted UPPER BOUND, not a receipt.
     accounted_upper_bound_usd: float
     subscription_sessions: int
     unknown_unmetered: int
@@ -1091,31 +1120,37 @@ class TaskCostBreakdown(TypedDict):
     authority: Literal["physical_attempt_ledger"]
 
 
-class TaskDetailResponse(TypedDict, total=False):
-    """``GET /api/tasks/{task_id}`` — the public task-result envelope (open shape;
-    stored task-result keys pass through) plus additive typed projections."""
+class HistoryRetentionProjection(TypedDict):
+    """Storage placement facts, independent of task outcome or review authority."""
 
+    status: Literal["pending", "problem", "complete"]
+    pending_count: int
+    problem_count: int
+    promoted_ref_count: int
+    promoted_source_handle_count: int
+    problem_reasons: NotRequired[List[Dict[str, Any]]]  # Optional grouped {reason: str, count: int} rows.
+
+
+class TaskDetailResponse(TypedDict, total=False):
+    """Open ``GET /api/tasks/{task_id}`` result: stored keys pass through beside typed projections."""
+
+    artifacts: List[Dict[str, Any]]  # Open result rows; a nested file carries additive ``relpath``.
+    # Per result directory: {name, files, size, excluded, available} for its ``?archive=`` ZIP.
+    artifact_archives: Dict[str, Dict[str, Any]]
     cost_breakdown: TaskCostBreakdown
+    history_retention: HistoryRetentionProjection
     model_waits: Dict[str, Any]
-    # Poltergeist phase A cancel projection (additive-optional): ``"pending"``
-    # while a durable cancel intent is open and the supervisor teardown has not
-    # settled — the status itself honestly stays running/scheduled. Absent on
-    # settled results and on tasks nobody asked to cancel. The UI renders the
-    # interim "Cancelling…" from this field, never from a status value.
+    # Open cancel intent/teardown: "pending" drives "Cancelling…", not lifecycle status.
+    # Absent for settled or unrequested cancellation; running/scheduled status stays truthful.
     cancel_state: str
-    # Rides beside ``cancel_state`` when the intent carries a reason (GR2-11):
-    # the WHY of the pending cancellation (owner text, "subtree cancellation of
-    # <root>", "evolution stopped", …). Absent when no reason was recorded.
+    # Pending intent's recorded reason (owner text or subtree cause); absent if none (GR2-11).
     cancel_reason: str
-    # S3 (Q1, additive-optional): rides beside a pending ``cancel_state`` when
-    # the open intent is the SOFT stop ("finalize_then_cancel") — the UI shows
-    # "Finalizing…" and offers the hard escalation. Absent on immediate intents.
+    # Soft finalize_then_cancel: "Finalizing…" plus hard escalation; absent on immediate intents (S3/Q1).
     stop_policy: str
-    # S3 (HQ1, additive-optional): the typed owner-hurry observability — the
-    # current block plus the archived history of prior same-id attempts.
-    # Absent on tasks nobody hurried. Task-detail data only, never chat.
+    # Current hurry plus prior same-id attempts; detail-only, absent if never hurried (S3/HQ1).
     owner_hurry: OwnerHurryProjection
     owner_hurry_history: list[OwnerHurryProjection]
+    project_admission_hold: Dict[str, Any]  # While the queue snapshot lists the row: its hold {reason, detail, label} or {}.
     error: str
 
 
@@ -1159,13 +1194,11 @@ class ClaudexorStatusResponse(TypedDict, total=False):
     quota: List[Dict[str, Any]]
     quota_absences: List[Dict[str, Any]]
     reads: ClaudexorStatusReads
-    # UNIFIED ACCOUNT MODEL feature fact (additive-optional): True only when
-    # the engine's own /v2/operations catalog was read and advertises
-    # `GET /v2/account-pools` — the engine change that migrates every default
-    # CLI login into a named registry row, empties `harnessAccounts` and
-    # carries pool routing in the additive `profiles.accountPools` key. False
-    # (or absent, on an older backend) means the legacy native-pseudo-row
-    # rendering; an unreadable catalog fails closed to False.
+    # UNIFIED ACCOUNT MODEL feature fact (additive-optional): True only when the engine's own
+    # /v2/operations catalog was read and advertises `GET /v2/account-pools` (every default CLI login
+    # becomes a named registry row, `harnessAccounts` empties, pool routing rides `profiles.accountPools`).
+    # False, or absent on an older backend, means the legacy native-pseudo-row rendering; an unreadable
+    # catalog fails closed to False.
     unified_accounts: bool
     subagent_last_delegation: Dict[str, Any]
     error: str
@@ -1279,13 +1312,10 @@ class TaskCancelResponse(TypedDict, total=False):
     # for the subtree cancel, which is COMPLETE by the time this answer is sent;
     # the plain envelope is unchanged.
     cascade: bool
-    # S3 (Q1/Q2, additive): present on the 202 acknowledgement of a
-    # ``{"stop_policy": "finalize_then_cancel"}`` request — the durable intent
-    # is open ("pending") while the bounded finalization attempt runs;
-    # ``stop_policy`` echoes the EFFECTIVE policy of the durable intent
-    # ("immediate" | "finalize_then_cancel"): a graceful request over an
-    # already-hard intent never softens it, and the answer says so. Absent on
-    # the legacy immediate path, which stays byte-identical.
+    # Additive on the 202 acknowledgement of a ``{"stop_policy": "finalize_then_cancel"}`` request: the
+    # durable intent is open ("pending") while the bounded finalization attempt runs, and ``stop_policy``
+    # echoes the EFFECTIVE policy of the durable intent ("immediate" | "finalize_then_cancel") — a graceful
+    # request over an already-hard intent never softens it, and the answer says so. Absent on the legacy immediate path.
     cancel_state: str
     stop_policy: str
     error: str
@@ -1450,10 +1480,12 @@ WS_MESSAGE_TYPES: tuple[str, ...] = (
     "projects_changed",
     "task_named",
     "update_status_ready",
+    "update_progress_changed",
 )
 
 
 __all__ = [
+    "CostPresentation",
     "ChatInbound",
     "TaskConstraintInbound",
     "CommandInbound",
@@ -1483,6 +1515,7 @@ __all__ = [
     "UpdateApplySuccessResponse",
     "UpdateApplyErrorResponse",
     "UpdateStatusReadyOutbound",
+    "UpdateProgressChangedOutbound",
     "ProjectCreateRequest",
     "ProjectEntry",
     "ProjectDeleteResponse",
@@ -1498,6 +1531,8 @@ __all__ = [
     "EvolutionStateSnapshot",
     "SettingsNetworkMeta",
     "AvailableSubagentsSettingsMeta",
+    "SettingsPolicyAxis",
+    "SettingsPolicyState",
     "SettingsMeta",
     "SettingsSaveResponse",
     "OwnerRuntimeModeResponse",
@@ -1520,6 +1555,7 @@ __all__ = [
     "ScheduledTasksResponse",
     "ScheduleUpsertResponse",
     "ScheduleDeleteResponse",
+    "ScheduleActionResponse",
     "UploadResponse",
     "ExtensionsIndexResponse",
     "ExtensionLiveSnapshot",

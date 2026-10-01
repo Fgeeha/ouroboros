@@ -22,6 +22,13 @@ from tests._git_review_pipeline_shared import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _packet_default_panel(monkeypatch):
+    """This module pins the PACKET assembly of the default panel; the shipped
+    default triad reads the work itself since #1334, so pin packet explicitly."""
+    monkeypatch.setattr("ouroboros.reviewer_slot_config.DEFAULT_TRIAD_DELIVERY", "")
+
+
 @pytest.fixture
 def review_ctx(tmp_path):
     """Yield ``(review_module, ToolContext)``."""
@@ -178,7 +185,7 @@ class TestReviewEnforcementModes:
         result = review._run_unified_review(ctx, "test commit", repo_dir=ctx.repo_dir)
         assert result is None
         assert any(
-            isinstance(w, str) and "critical review findings did not block commit" in w.lower()
+            isinstance(w, str) and "critical findings require an explicit author decision" in w.lower()
             for w in ctx._review_advisory
         )
         assert any(
@@ -189,6 +196,24 @@ class TestReviewEnforcementModes:
         # Anti-thrashing state survives an advisory pass-through of critical
         # findings: repeats on the next attempt must still be recognized.
         assert ctx._review_iteration_count == 1
+
+    def test_mixed_critical_minor_and_prior_warnings_survive(self, review_ctx, monkeypatch):
+        review, ctx = review_ctx
+        self._mock_staged(monkeypatch, review, changed_files="x.py")
+        monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "advisory")
+        ctx._review_advisory = ["prior deterministic/preflight warning"]
+        response = json.loads(self._fake_result(
+            '[{"item":"contract","verdict":"FAIL","severity":"critical","reason":"material original finding"}]',
+            '[{"item":"style","verdict":"FAIL","severity":"advisory","reason":"minor original finding"}]'))
+        response["results"].append({"model": "failed-critic", "error": "Transport unavailable"})
+        monkeypatch.setattr(review, "_handle_multi_model_review", lambda *a, **kw: json.dumps(response))
+        assert review._run_unified_review(ctx, "candidate", repo_dir=ctx.repo_dir) is None
+        saved = json.dumps(ctx._review_advisory)
+        assert "prior deterministic/preflight warning" in saved
+        assert saved.count("material original finding") == 1
+        assert saved.count("minor original finding") == 1
+        assert saved.count("prior deterministic/preflight warning") == 1
+        assert saved.count("Note: 1 of 3 review models") == 1
 
     @pytest.mark.parametrize("failure", ["nonzero_rc", "non_utf8_rc"])
     def test_uncapturable_staged_diff_blocks_instead_of_reviewing_a_placeholder(
@@ -256,6 +281,31 @@ class TestReviewEnforcementModes:
             isinstance(w, str) and "staged diff capture failed" in w.lower()
             for w in ctx._review_advisory
         )
+
+    @pytest.mark.parametrize("message,expected", [
+        ("⚠️ PREFLIGHT_BLOCKED: Release metadata diagnostics (index).\n"
+         "  - Missing from staged: README.md (badge + changelog).\n", "preflight"),
+        ("⚠️ PREFLIGHT_UNAVAILABLE: Release metadata diagnostics (index).\n"
+         "  - Unavailable: index:README.md could not be read (CalledProcessError).\n",
+         "infra_failure"),
+    ])
+    def test_preflight_block_reason_separates_unavailable_evidence_from_a_defect(
+        self, review_ctx, monkeypatch, message, expected
+    ):
+        """A release source the gate could not read is an infra failure, not the
+        candidate's own defect. The split is read off the one tool-result
+        classifier, so this gate cannot drift from the code the agent is shown."""
+        review, ctx = review_ctx
+        self._mock_staged(monkeypatch, review, changed_files="VERSION")
+        monkeypatch.setattr(review, "_preflight_check", lambda *a, **kw: message)
+        monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "blocking")
+        monkeypatch.setattr(
+            review, "_handle_multi_model_review",
+            lambda *a, **k: (_ for _ in ()).throw(AssertionError("no reviewer may run")),
+        )
+        result = review._run_unified_review(ctx, "v1.0.0: bump version", repo_dir=ctx.repo_dir)
+        assert result is not None and message in result
+        assert ctx._last_review_block_reason == expected
 
     def test_triad_one_pass_fit_removes_only_duplicated_context(self, review_ctx, monkeypatch):
         """Oversized triad evidence is compacted before its single dispatch."""
@@ -504,14 +554,33 @@ class TestReviewEnforcementModes:
         # No version-ref in commit message, so no preflight block expected
         assert result is None
 
+    @staticmethod
+    def _mock_indexed_release(monkeypatch, review, *, readme: bool, version: str = "3.24.0"):
+        """Give the name-status checks an index of their own.
+
+        ``_preflight_check`` reads its release carriers out of the real Git
+        index, and an index it cannot read is honestly reported as unavailable
+        evidence. These cases pin the lexical name-status handling, so they
+        supply the indexed carriers instead of leaving admission to fail on a
+        directory that is not a repository.
+        """
+        indexed = {"VERSION": f"{version}\n"}
+        if readme:
+            indexed["README.md"] = (
+                f"[![Version {version}](https://img.shields.io/badge/version-{version}-green.svg)]\n"
+                f"| {version} | release |\n"
+            )
+        monkeypatch.setattr(review, "_git_show_staged", lambda repo_dir, path: indexed.get(path))
+
     def test_rename_of_readme_counts_as_present(self, tmp_path, monkeypatch):
         """If README.md appears as a rename destination, preflight sees it as staged."""
         review = _get_review_module()
+        self._mock_indexed_release(monkeypatch, review, readme=True)
         # Simulate: VERSION staged + README.md arrived via rename
         result = review._preflight_check(
             "v1.0.0: rename readme",
             "M  VERSION\nR  README.md",
-            "/tmp",
+            tmp_path,
         )
         # Both VERSION and README.md present → no check 1 block
         # No ouroboros .py → no check 3 block
@@ -575,17 +644,21 @@ class TestReviewEnforcementModes:
         assert "PREFLIGHT_BLOCKED" in result
         assert "ARCHITECTURE.md" in result
 
-    def test_deleted_readme_does_not_satisfy_check1(self):
+    def test_deleted_readme_does_not_satisfy_check1(self, tmp_path, monkeypatch):
         """Deleting README.md while VERSION is staged triggers check 1."""
         review = _get_review_module()
+        self._mock_indexed_release(monkeypatch, review, readme=False)
         result = review._preflight_check(
             "v1.0.0: bump version",
             "M  VERSION\nD  README.md",
-            "/tmp",
+            tmp_path,
         )
         assert result is not None
-        assert "PREFLIGHT_BLOCKED" in result
-        assert "README.md" in result
+        assert "Missing from staged: README.md" in result
+        # The deleted README is also the release source the carrier checks need,
+        # so its absence is reported as unavailable evidence beside the finding
+        # rather than collapsing the two into one candidate defect.
+        assert "PREFLIGHT_UNAVAILABLE" in result
 
     def test_copied_module_triggers_via_run_unified_review(self, tmp_path, monkeypatch):
         """Check 4 fires for C-status copy via _run_unified_review, but source NOT treated as deleted."""
@@ -652,7 +725,13 @@ def test_triad_pack_exclusions_reach_the_pack_and_the_prompt(review_ctx, monkeyp
     """The call site computes the two disclosed exclusion classes from the
     touched paths and the SAME prefix texts it inlines, hands them to the
     touched pack through the advisory seam's ``exclude_paths`` shape, and
-    appends the disclosure note AFTER the builder's OMISSION NOTE."""
+    appends the disclosure note AFTER the builder's OMISSION NOTE.
+
+    Since the governance tiers landed, the prefix texts are exactly what the
+    packet inlined IN FULL (`governance_context.inline_whole_documents`): a book
+    delivered as navigation is not a duplicate of anything, so a touched chapter
+    keeps its full text in the pack. Here the change touches nothing governance
+    activates, so there is nothing to deduplicate."""
     review, ctx = review_ctx
     captured = _mock_triad_gates(review, monkeypatch)
     seen = {}
@@ -672,16 +751,53 @@ def test_triad_pack_exclusions_reach_the_pack_and_the_prompt(review_ctx, monkeyp
     review._run_unified_review(ctx, "release: 1.0.1", repo_dir=ctx.repo_dir)
 
     assert seen["paths"] == ["uv.lock", "VERSION"]
-    assert seen["prefix_texts"] == {
-        "docs/DEVELOPMENT.md": "docs/DEVELOPMENT.md PREFIX TEXT",
-        "docs/DESIGN.md": "docs/DESIGN.md PREFIX TEXT",
-        "docs/ARCHITECTURE.md": "docs/ARCHITECTURE.md PREFIX TEXT",
-    }
+    assert seen["prefix_texts"] == {}
     assert seen["exclude_paths"] == {"uv.lock"}
     prompt = captured["prompt"]
     omission = prompt.index("⚠️ OMISSION NOTE: 1 file(s) omitted from direct context: uv.lock")
     assert prompt.index("PACK-EXCLUSION-NOTE-SENTINEL") > omission
     assert prompt.index("## Staged diff") > prompt.index("PACK-EXCLUSION-NOTE-SENTINEL")
+
+
+def test_the_prepared_packet_carries_the_governance_disclosure_record(review_ctx, monkeypatch):
+    """What the packet inlined and what it delivered as navigation is recorded
+    on the prepared packet, so the durable prompt record and the packet rows'
+    actor records can disclose it (BIBLE P1)."""
+    review, ctx = review_ctx
+    _mock_triad_gates(review, monkeypatch, changed=("web/modules/chat.js",))
+
+    prepared, early, exited = review._prepare_unified_review(ctx, "ui: chat")
+
+    assert not exited and early is None
+    manifest = prepared["governance_manifest"]
+    assert manifest and all(
+        set(row) == {"path", "tier", "disposition", "chars", "reason"} for row in manifest)
+    assert {row["tier"] for row in manifest} <= {1, 2, 3}
+    assert prepared["governance_packet_slots"] == list(prepared["row_plan"]["slot_ids"])
+    assert ctx._last_triad_governance_manifest == manifest
+
+
+def test_a_document_the_packet_inlines_is_the_duplicate_the_pack_withholds(review_ctx, monkeypatch):
+    """The dedup seam receives the exact text of each document the packet
+    inlined in full, so a touched DESIGN.md on a `web/` change is withheld from
+    the touched pack instead of travelling twice."""
+    review, ctx = review_ctx
+    _mock_triad_gates(review, monkeypatch, changed=("web/modules/chat.js", "docs/DESIGN.md"))
+    design = "# Design\n\nThe design system.\n"
+    (ctx.repo_dir / "docs").mkdir(parents=True, exist_ok=True)
+    (ctx.repo_dir / "docs" / "DESIGN.md").write_text(design, encoding="utf-8")
+    seen = {}
+
+    def _exclusions(repo_dir, paths, *, prefix_texts):
+        seen["prefix_texts"] = dict(prefix_texts)
+        return set(), ""
+
+    monkeypatch.setattr(review, "triad_pack_exclusions", _exclusions)
+    monkeypatch.setattr(review, "build_touched_file_pack", lambda *a, **k: ("(pack)", []))
+
+    review._run_unified_review(ctx, "ui: chat", repo_dir=ctx.repo_dir)
+
+    assert seen["prefix_texts"] == {"docs/DESIGN.md": design}
 
 
 def test_a_managed_subject_keeps_every_full_text(review_ctx, monkeypatch):

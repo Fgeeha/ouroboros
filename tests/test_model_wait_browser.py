@@ -13,12 +13,15 @@ capture = setup_browser.capture
 
 pytestmark = [pytest.mark.ui_browser, pytest.mark.serial]
 TASK = "analysis-task"
+# The wait picker offers an API lane per provider whose credential is stored.
+API_LANE = "api:openai"
 
 
 @pytest.fixture
 def waiting_ui(subscription_ui):
     ui = subscription_ui
     page = ui["page"]
+    ui["settings"]["OPENAI_API_KEY"] = "***set***"
     rows = {
         key: {"wait_id": key, "revision": 1, "task_attempt": 1, "role": role,
               "model": "claudexor::codex=gpt-test", "source": "codex",
@@ -162,7 +165,7 @@ def test_multiple_waits_toggle_and_exact_role_switch_wait_for_application(waitin
     page.wait_for_selector('[data-wait-id="light-wait"] [data-wait-change]:not([disabled])')
     assert not light.locator('[data-wait-auto]').is_checked()
     light.locator('[data-wait-change]').click()
-    light.locator('[data-model-role-source]').select_option('openai')
+    light.locator('[data-model-role-source]').select_option(API_LANE)
     light.locator('[data-model-role-model]').fill('owner-model')
     assert not light.locator('[data-wait-persist]').is_checked()
     light.locator('[data-wait-apply]').click()
@@ -270,8 +273,15 @@ def test_wait_updates_preserve_reading_position_away_from_the_live_edge(waiting_
     page.reload()
     page.wait_for_selector('.chat-bubble.user')
     page.wait_for_selector('[data-wait-id="light-wait"]')
+    page.wait_for_selector('#chat-messages[data-history-hydrated="true"]')
     scroll = page.locator('#chat-messages')
-    scroll.evaluate('(el) => { el.style.overflowAnchor = "none"; el.scrollTop = 300; }')
+    scroll.evaluate('(el) => { el.style.overflowAnchor = "none"; }')
+    # A real upward gesture cancels the initial history-follow frames and
+    # establishes reading intent; assigning scrollTop alone does neither.
+    page.wait_for_function("() => document.querySelector('#chat-messages').scrollTop > 0")
+    scroll.hover()
+    page.mouse.wheel(0, 300 - scroll.evaluate('(el) => el.scrollTop'))
+    page.wait_for_function("() => Math.abs(document.querySelector('#chat-messages').scrollTop - 300) <= 1")
     assert scroll.evaluate('(el) => el.scrollHeight - el.clientHeight - el.scrollTop > 48')
     anchor = page.locator('.chat-bubble.user').nth(2)
     before = anchor.bounding_box()['y']
@@ -309,6 +319,54 @@ def test_mixed_access_wait_replays_and_opens_accounts_without_automatic_login(wa
     assert ui['logins'] == []
 
 
+def test_dated_unavailable_pool_waits_visibly_without_a_sign_in_prompt(waiting_ui):
+    """An engine-dated pool refusal is neither quota nor sign-in: the card says so, names the
+    engine's reset, keeps automatic continuation and never offers a login."""
+    ui, page = waiting_ui, waiting_ui['page']
+    ui['rows']['light-wait'].update(revision=2, reason='unavailable', credential_profile_id='',
+                                    reset_at='2026-09-07T01:00:00Z')
+    ui['emit'](ui['rows']['light-wait'])
+    pool = page.locator('[data-wait-id="light-wait"]')
+    page.wait_for_function("() => document.querySelector('[data-wait-id=light-wait] [data-wait-reason]').textContent === 'Waiting for an account'")
+    assert pool.locator('[data-wait-login]').is_hidden()
+    assert pool.locator('[data-wait-auto]').is_checked()
+    assert pool.locator('[data-wait-auto-label]').inner_text() == 'Continue automatically when access is restored'
+    reset = pool.locator('[data-wait-reset]').inner_text()
+    assert 'No account can serve this model now.' in reset and 'availability is unconfirmed' in reset
+    assert 'Quota' not in reset and 'sign-in' not in pool.inner_text().lower()
+    capture(page, 'waiting-unavailable-pool')
+    page.set_viewport_size({'width': 390, 'height': 844})
+    assert page.evaluate('document.documentElement.scrollWidth <= window.innerWidth')
+    capture(page, 'waiting-unavailable-pool-narrow')
+    ui['rows']['light-wait'].update(revision=3, reset_at=None)
+    ui['emit'](ui['rows']['light-wait'])
+    page.wait_for_function("() => document.querySelector('[data-wait-id=light-wait] [data-wait-reset]').textContent.includes('The reset time is not known.')")
+    page.reload()
+    page.wait_for_selector('[data-wait-id="light-wait"]')
+    assert pool.locator('[data-wait-reason]').inner_text() == 'Waiting for an account'
+    assert ui['logins'] == []
+
+
+def test_direct_api_wait_never_offers_subscription_login_or_auto_rotation(waiting_ui):
+    ui, page = waiting_ui, waiting_ui['page']
+    ui['rows']['light-wait'].update(revision=2, reason='auth', model='openai::primary-test', source='',
+        credential_profile_id='', credential_harness='', auto_continue=False, availability_observation='unavailable')
+    ui['emit'](ui['rows']['light-wait'])
+    card = page.locator('[data-wait-id="light-wait"]')
+    page.wait_for_function("() => document.querySelector('[data-wait-id=light-wait] [data-wait-reason]').textContent === 'Waiting for provider access'")
+    assert card.locator('[data-wait-login]').is_hidden() and card.locator('[data-wait-auto]').is_hidden()
+    assert 'Configured API access' in card.inner_text() and 'Auto rotation' not in card.inner_text()
+    assert 'Automatic access checks are unavailable.' in card.inner_text()
+    capture(page, 'waiting-direct-api-access')
+    page.set_viewport_size({'width': 390, 'height': 844})
+    assert page.evaluate('document.documentElement.scrollWidth <= window.innerWidth')
+    capture(page, 'waiting-direct-api-access-narrow')
+    page.reload()
+    page.wait_for_selector('[data-wait-id="light-wait"]')
+    assert card.locator('[data-wait-login]').is_hidden()
+    assert ui['logins'] == []
+
+
 def test_wait_reconnect_preserves_unsubmitted_form_without_context_or_animation(waiting_ui):
     ui, page = waiting_ui, waiting_ui["page"]
     row = page.locator('[data-wait-id="main-wait"]')
@@ -320,7 +378,7 @@ def test_wait_reconnect_preserves_unsubmitted_form_without_context_or_animation(
     field = row.locator('[data-model-role-model]')
     field.wait_for()
     assert row.locator('.model-role-details').count() == 0
-    row.locator('[data-model-role-source]').select_option('openai')
+    row.locator('[data-model-role-source]').select_option(API_LANE)
     assert row.locator('.model-role-details').count() == 0
     field.fill('unfinished-owner-model')
     row.locator('[data-wait-persist]').check()
@@ -348,9 +406,9 @@ def test_wait_reconnect_preserves_unsubmitted_form_without_context_or_animation(
     capture(page, "waiting-reconnected-draft-preserved")
 
 
-def test_ephemeral_progress_keeps_its_wait_card_and_settles_only_its_controls(waiting_ui):
+def test_native_progress_keeps_its_wait_card_and_settles_only_its_controls(waiting_ui):
     ui, page = waiting_ui, waiting_ui["page"]
-    task = "ephemeral-choice"
+    task = "native-choice"
 
     def emit(frame):
         before = page.evaluate("window.waitFrames")
@@ -358,24 +416,24 @@ def test_ephemeral_progress_keeps_its_wait_card_and_settles_only_its_controls(wa
         page.wait_for_function("before => window.waitFrames > before", arg=before)
 
     progress = {"type": "chat", "role": "assistant", "chat_id": 1, "task_id": task,
-                "ephemeral_decision": True, "is_progress": True, "content": "Checking the request",
+                "is_progress": True, "content": "Checking the request",
                 "ts": "2026-09-06T22:02:00Z"}
     emit(progress)
     card = page.locator(f'.chat-live-card[data-task-id="{task}"]')
     card.wait_for(state="visible")
-    card.evaluate("el => { window.ephemeralWaitCard = el; }")
-    wait = {**ui["rows"]["light-wait"], "wait_id": "ephemeral-wait", "worker_slot_held": False}
+    card.evaluate("el => { window.nativeWaitCard = el; }")
+    wait = {**ui["rows"]["light-wait"], "wait_id": "native-wait", "worker_slot_held": False}
     event = {"type": "task_model_wait", "task_id": task, "chat_id": 1,
-             "ephemeral_decision": True, "ts": "2026-09-06T22:02:01Z", **wait}
+             "ts": "2026-09-06T22:02:01Z", **wait}
     emit({"type": "log", "chat_id": 1, "data": event})
-    card.locator('[data-wait-id="ephemeral-wait"]').wait_for()
+    card.locator('[data-wait-id="native-wait"]').wait_for()
     emit({**progress, "content": "The same request is still waiting", "ts": "2026-09-06T22:02:02Z"})
-    assert card.evaluate("el => el === window.ephemeralWaitCard")
-    assert card.locator('[data-wait-id="ephemeral-wait"]').is_visible()
-    assert card.locator('[data-turn-into-project], [data-cancel-run]').count() == 0
+    assert card.evaluate("el => el === window.nativeWaitCard")
+    assert card.locator('[data-wait-id="native-wait"]').is_visible()
+    assert card.locator('.model-wait-row').count() == 1
     assert page.locator(f'.chat-live-card[data-task-id="{TASK}"] .model-wait-row').count() == 2
-    capture(page, "ephemeral-with-model-wait")
-    terminal = {"type": "task_done", "task_id": task, "ephemeral_decision": True,
+    capture(page, "native-with-model-wait")
+    terminal = {"type": "task_done", "task_id": task, "status": "completed",
                 "ts": "2026-09-06T22:02:03Z"}
     emit({"type": "log", "chat_id": 1, "data": terminal})
     page.wait_for_selector(f'.chat-live-card[data-task-id="{task}"][data-finished="1"]')
@@ -383,4 +441,57 @@ def test_ephemeral_progress_keeps_its_wait_card_and_settles_only_its_controls(wa
     emit({"type": "log", "chat_id": 1, "data": {**event, "revision": 99}})
     assert card.locator('.model-wait-row').count() == 0
     assert page.locator(f'.chat-live-card[data-task-id="{TASK}"] .model-wait-row').count() == 2
-    capture(page, "ephemeral-settled-sibling-waits-retained")
+    capture(page, "native-settled-sibling-waits-retained")
+
+
+@pytest.mark.parametrize('action', ['switch', 'retry'])
+def test_paid_review_controls_survive_author_terminal_and_reload(waiting_ui, tmp_path, monkeypatch, action):
+    ui, page = waiting_ui, waiting_ui['page']
+    monkeypatch.setenv('OUROBOROS_UI_EVIDENCE_DIR', str(tmp_path))
+    print(f'PAID_REVIEW_UI_EVIDENCE {tmp_path}')
+    row = ui['rows']['light-wait']
+    row.update(revision=2, role='reviewer:one', worker_slot_held=False,
+               model_wait_owner_id='review-operation-one',
+               review_operation={'owner_id': 'review-operation-one', 'surface': 'task_acceptance',
+                                 'retry_key': 'paid-panel', 'slot_id': 'one'})
+    ui['emit'](row)
+    waiter = page.locator('[data-wait-id="light-wait"]')
+    waiter.locator('[data-wait-role]').filter(has_text='Reviewer').wait_for()
+    capture(page, 'paid-review-before-author-terminal')
+    terminal = {'type': 'task_done', 'task_id': TASK, 'status': 'completed',
+                'artifact_status': 'ready', 'ts': '2026-09-06T22:02:00Z'}
+    ui['wait_status']['terminal'] = True
+    ui['history'].append(terminal)
+    ui['sockets'][-1].send(json.dumps({'type': 'log', 'chat_id': 1, 'data': terminal}))
+    card = page.locator(f'.chat-live-card[data-task-id="{TASK}"][data-finished="1"]')
+    card.wait_for()
+    assert waiter.is_visible(), 'paid review outlives the terminal author'
+    assert page.locator('[data-wait-id="main-wait"]').count() == 0
+    assert not card.locator('[data-live-typing]').is_visible()
+    waiter.locator('[data-wait-auto]').uncheck()
+    waiter.locator('[data-wait-notice]').filter(has_text='Request accepted').wait_for()
+    assert ui['controls'][-1]['decision_id'] == f'model_wait:{TASK}:light-wait'
+    ui['apply']('light-wait')
+    page.reload()
+    card.wait_for()
+    waiter.wait_for()
+    assert not waiter.locator('[data-wait-auto]').is_checked()
+    assert card.locator('[data-live-phase]').inner_text() == 'Done'
+    capture(page, 'paid-review-after-author-terminal-reload')
+    if action == 'switch':
+        waiter.locator('[data-wait-change]').click()
+        waiter.locator('[data-model-role-source]').select_option(API_LANE)
+        waiter.locator('[data-model-role-model]').fill('replacement-reviewer')
+        waiter.locator('[data-wait-apply]').click()
+    else:
+        waiter.locator('[data-wait-retry]').click()
+    waiter.locator('[data-wait-notice]').filter(has_text='Request accepted').wait_for()
+    assert ui['controls'][-1]['action'] == action
+    assert ui['controls'][-1]['decision_id'] == f'model_wait:{TASK}:light-wait'
+    if action == 'switch':
+        assert ui['controls'][-1]['model'] == 'openai::replacement-reviewer'
+    ui['apply']('light-wait')
+    waiter.wait_for(state='detached')
+    ui['emit']({**row, 'revision': 99, 'state': 'waiting'})
+    assert waiter.count() == 0, 'resolved operation cannot be revived by a stale waiting row'
+    assert card.get_attribute('data-finished') == '1'

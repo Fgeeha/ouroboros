@@ -4,6 +4,8 @@ import json
 
 import pytest
 
+from tests.ui_chat_viewport_smoke import _OBSERVE_STATE_READS, _wait_state_reads_quiescent
+
 pytest_plugins = ("tests.test_ui_smoke_playwright",)
 
 
@@ -291,9 +293,11 @@ def test_task_status_stays_factual_in_main_and_project_chat(
         ).last
         child_line_toggle.focus()
         child_line_toggle.press("Enter")
-        assert "Reason: delegated_route_unavailable" in child.locator(
-            ":scope > [data-live-timeline]"
-        ).inner_text()
+        # The card says the cause in the owner's words; the machine code stays on
+        # the record half, never behind a `Reason:` label (PR #970).
+        child_timeline = child.locator(":scope > [data-live-timeline]").inner_text()
+        assert "The selected tool route was unavailable; the parent can continue." in child_timeline
+        assert "Reason:" not in child_timeline
         assert "delegated_route_unavailable" not in child_summary.inner_text()
         child_line_toggle.press("Space")
         child_summary.press("Space")
@@ -322,8 +326,13 @@ def test_task_status_stays_factual_in_main_and_project_chat(
         assert failed.get_attribute("data-finished") == "1"
         assert phase_text(failed) == "Failed"
         assert_phase_accessibility(failed, "Task", "Failed")
+        # This synthetic code has no producer phrase. Unknown reasons remain
+        # visible verbatim; hiding them would discard the only available cause.
+        assert "provider_route_failed" in failed.locator(
+            ":scope > [data-live-summary-button] [data-live-activity]"
+        ).inner_text()
         assert "provider_route_failed" not in failed.locator(
-            ":scope > [data-live-summary-button]"
+            ":scope > [data-live-summary-button] [data-live-title]"
         ).inner_text()
 
         status = scope.locator(status_selector)
@@ -356,6 +365,7 @@ def test_task_status_stays_factual_in_main_and_project_chat(
             page = browser.new_page(viewport={"width": width, "height": height})
             try:
                 page.add_init_script(f"({capture_socket})()")
+                page.add_init_script(f"({_OBSERVE_STATE_READS})()")
                 # The initial rebuildAll replay wipes and rebuilds the feed
                 # from durable history (chat.js syncHistory). Frames emitted
                 # on the test socket exist nowhere durable, so one emitted
@@ -377,6 +387,11 @@ def test_task_status_stays_factual_in_main_and_project_chat(
                 page.evaluate(
                     "() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))"
                 )
+                # The frames below exist only on the test socket. Let the
+                # socket-open census land before emitting them: a complete
+                # census whose request starts after a frame concludes that card
+                # by absence, exactly as it would a task the queue really lost.
+                _wait_state_reads_quiescent(page)
 
                 run_thread_flow(
                     page,
@@ -415,6 +430,10 @@ def test_task_status_stays_factual_in_main_and_project_chat(
                 page.evaluate(
                     "() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))"
                 )
+                # The panel's own hydrating census read (forced on mount) may
+                # start behind an in-flight page read; let it land before the
+                # panel's synthetic frames, for the same reason as in Main.
+                _wait_state_reads_quiescent(page)
                 run_thread_flow(
                     page,
                     project_scope,
@@ -439,7 +458,12 @@ def test_task_status_stays_factual_in_main_and_project_chat(
 def test_history_replay_keeps_finalizing_and_finishes_bare_final(
     direct_server_with_data,
 ):
-    """Open summaries stay live; a keyed final without summary falls back to Done."""
+    """Open summaries stay live; a keyed final without summary falls back to Done.
+
+    #1110: a finalizing task whose lifecycle already settled paints that KNOWN
+    outcome as the chip and holds "Finalizing…" as the secondary fact — the card
+    stays unfinished until the settled task_done lands.
+    """
     pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
     from playwright.sync_api import Error as PlaywrightError
     from playwright.sync_api import sync_playwright
@@ -501,9 +525,15 @@ def test_history_replay_keeps_finalizing_and_finishes_bare_final(
                 done_card.wait_for(state="visible", timeout=10_000)
 
                 assert open_card.get_attribute("data-finished") == "0"
-                assert open_card.locator(".chat-live-phase").inner_text().strip() == "Finalizing…"
+                assert open_card.locator(".chat-live-phase").inner_text().strip() == "Done"
+                # The hold is the SECONDARY fact beside the outcome; the chip's accessible
+                # name states both (task_phase_chip.setLiveCardPhase). This replay card has
+                # no work rows, so its chip is hidden and the visible secondary is proven by
+                # tests/test_ui_failed_finalizing_browser.py on a real card with work.
+                assert open_card.locator(".chat-live-phase").get_attribute("aria-label") == "Task status: Done, Finalizing…"
                 assert done_card.get_attribute("data-finished") == "1"
                 assert done_card.locator(".chat-live-phase").inner_text().strip() == "Done"
+                assert "Finalizing" not in (done_card.locator(".chat-live-phase").get_attribute("aria-label") or "")
             finally:
                 browser.close()
     except PlaywrightError as exc:

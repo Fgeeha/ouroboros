@@ -14,11 +14,12 @@ from pathlib import Path
 from typing import Any
 
 from ouroboros.contracts.task_constraint import normalize_task_constraint
+from ouroboros.owner_source import resolve_owner_source as resolve_skill_owner_source
 from ouroboros.skill_lifecycle_queue import LifecycleJobOptions, run_lifecycle_job_blocking
 from ouroboros.skill_loader import (
     discover_skills, find_skill, grant_status_for_skill, requested_core_setting_keys,
     requested_skill_permissions, save_enabled, save_skill_grants, skill_conflict_status,
-    skill_review_gate, skill_state_dir,
+    skill_state_dir,
 )
 from ouroboros.tool_access import active_tool_profile, canonical_data_root
 from ouroboros.utils import append_jsonl, read_json_dict, utc_now_iso
@@ -32,7 +33,7 @@ def _refusal(message: str, status_code: int = 409, **facts: Any) -> dict[str, An
 
 def _review_facts(skill: Any, drive_root: Path) -> dict[str, Any]:
     stale = skill.review.is_stale_for(skill.content_hash)
-    gate = skill_review_gate(skill.review.status, stale=stale, findings=skill.review.findings)
+    gate = skill.review.gate_for(skill.content_hash)
     return {
         "skill": skill.name, "source": skill.source, "content_hash": skill.content_hash,
         "review_status": skill.review.status, "review_stale": stale,
@@ -40,59 +41,6 @@ def _review_facts(skill: Any, drive_root: Path) -> dict[str, Any]:
         "grants": grant_status_for_skill(drive_root, skill),
     }
 
-
-def resolve_skill_owner_source(ctx: Any, source: Any) -> dict[str, Any]:
-    """Resolve an actual owner source belonging to this task's conversation."""
-    if not isinstance(source, dict):
-        return {}
-    drive = canonical_data_root(ctx)
-    task_id = str(getattr(ctx, "task_id", "") or "")
-    kind = source.get("kind")
-    if kind == "chat":
-        from ouroboros.project_dialogue import owner_message_ref_is_valid, resolve_owner_message_source
-        from ouroboros.task_status import load_effective_task_result
-
-        ref = source.get("ref")
-        if not owner_message_ref_is_valid(ref):
-            return {}
-        task = load_effective_task_result(drive, task_id, materialize_artifacts=False) if task_id else {}
-        chat_id = getattr(ctx, "current_chat_id", None)
-        if ref.get("chat_id") != chat_id and ref != (task or {}).get("origin_message_ref"):
-            return {}
-        row = resolve_owner_message_source(drive, ref)
-        if not row or row.get("direction") != "in" or not str(row.get("text") or "").strip():
-            return {}
-        # System/skill injections cannot become owner authority merely by
-        # retaining an inbound-looking row or a copied owner reference.
-        if row.get("system_type") or row.get("presence") or row.get("source") == "skill_repair":
-            return {}
-        return {"kind": kind, "ref": dict(ref), "ts": row["ts"], "text": row["text"]}
-    if not task_id or source.get("task_id") != task_id:
-        return {}
-    if kind == "quiz":
-        from ouroboros.owner_quiz import STATE_ANSWERED, quiz_states
-
-        row = quiz_states(drive, task_id).get(str(source.get("quiz_id") or ""), {})
-        if row.get("state") != STATE_ANSWERED or not row.get("request_id"):
-            return {}
-        index = row.get("answered_index")
-        options = row.get("options") or []
-        label = options[index] if type(index) is int and 0 <= index < len(options) else ""
-        text = "\n".join(str(value) for value in (row.get("question"), label, row.get("comment")) if value)
-        if not label and not str(row.get("comment") or "").strip():
-            return {}
-        return {"kind": kind, "task_id": task_id, "quiz_id": row["quiz_id"],
-                "request_id": row["request_id"], "ts": row.get("answered_at"), "text": text}
-    if kind == "mailbox":
-        from ouroboros.owner_mailbox import KIND_OWNER_TEXT, drain_owner_entries
-
-        roots = dict.fromkeys((Path(ctx.drive_root), drive))
-        for root in roots:
-            for row in drain_owner_entries(root, task_id, include_acknowledged=True):
-                if row.get("msg_id") == source.get("msg_id") and row.get("kind") == KIND_OWNER_TEXT:
-                    return {"kind": kind, "task_id": task_id, "msg_id": row["msg_id"],
-                            "ts": row["ts"], "text": row["text"]}
-    return {}
 
 
 def _caller_action_error(ctx: Any, action: str, owner_actor: str, owner_source: Any) -> tuple[str, dict]:

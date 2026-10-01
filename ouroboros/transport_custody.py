@@ -112,6 +112,20 @@ def is_pre_dispatch_transport_failure(exc: BaseException) -> bool:
     return False
 
 
+def transport_exception_cause(error: BaseException) -> Any:
+    """Explicit causes, plus asyncio's same-cancellation wrapper on Python 3.10.
+
+    Task boundaries can replace CancelledError while retaining the original as
+    another CancelledError in __context__. Only this typed chain belongs to the
+    same cancellation; ordinary implicit fallback exceptions remain unrelated.
+    """
+    import asyncio
+    cause = error.__cause__
+    if cause is None and isinstance(error, asyncio.CancelledError) and isinstance(error.__context__, asyncio.CancelledError):
+        cause = error.__context__
+    return cause
+
+
 def _capture_on_chain(error: BaseException) -> Any:
     """The physical-attempt capture riding ``error`` or its explicit causes.
 
@@ -123,12 +137,21 @@ def _capture_on_chain(error: BaseException) -> Any:
     """
     capture = getattr(error, "physical_attempt_capture", None)
     seen: set = set()
-    walker = getattr(error, "__cause__", None)
+    walker = transport_exception_cause(error)
     while capture is None and isinstance(walker, BaseException) and id(walker) not in seen:
         seen.add(id(walker))
         capture = getattr(walker, "physical_attempt_capture", None)
-        walker = walker.__cause__
+        walker = transport_exception_cause(walker)
     return capture
+
+
+def outcome_unknown_on_chain(error: BaseException) -> bool:
+    """Whether ``error``'s chain carries a dispatched attempt without a terminal provider fact.
+
+    Provider-independent: a generic API exception, or a wrapper whose explicit
+    cause carries the capture, reads exactly like the typed Claudexor error.
+    """
+    return getattr(_capture_on_chain(error), "state", None) in {"dispatched", "unresolved"}
 
 
 def _requests_protocol_death(exc: BaseException) -> Any:

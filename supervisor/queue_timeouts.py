@@ -9,6 +9,8 @@ teardown it decides on is handed to the off-loop reaper.
 from __future__ import annotations
 
 import datetime
+from supervisor.state import control_is
+
 import logging
 import pathlib
 import time
@@ -16,7 +18,8 @@ import uuid
 from typing import Any, Dict
 
 from supervisor.cognitive_operations import _active_operation_progressing
-from supervisor.task_model_wait import model_waiting, quota_waited_seconds
+from ouroboros.model_wait import execution_elapsed_seconds
+from supervisor.task_model_wait import model_waiting
 from supervisor.task_reaper import (
     resolve_grace_episode_for_spared_task as _resolve_grace_episode_for_spared_task,
 )
@@ -37,6 +40,14 @@ def _queue():
 
 
 log = logging.getLogger(__name__)
+
+# The supervisor's timeout rails in priority order: the typed ``terminal_reason``
+# the reaper stamps as the task_done ``reason_code`` and the ``task_incident`` key.
+# ``project_dialogue.TASK_CAUSE_PHRASES`` carries one owner sentence per member;
+# the code itself never reaches a chat.
+REASON_ABSOLUTE_CEILING, REASON_DEADLINE, REASON_IDLE_TIMEOUT = TIMEOUT_TERMINAL_REASONS = (
+    "absolute_ceiling", "deadline", "idle_timeout",
+)
 
 
 def _task_deadline_ts(task: Dict[str, Any]) -> float:
@@ -168,7 +179,7 @@ def _has_live_descendant(task_id: str) -> bool:
 def _has_pending_descendant(task_id: str) -> bool:
     """True if any PENDING (queued, not yet assigned) task is a descendant of task_id. A
     parent whose children are merely WAITING for worker capacity (saturation / project lease)
-    is not idle/stuck — keep it alive (bounded by the absolute ceiling) so it can integrate
+    is not idle/stuck — keep it alive (bounded by Stop, deadline, budget and any absolute ceiling) so it can integrate
     them once they run, instead of killing it and orphaning the queued subtree."""
     if not task_id:
         return False
@@ -203,7 +214,9 @@ def _enforce_task_timeouts_locked(
         if started_at <= 0:
             continue
         last_hb = float(meta.get("last_heartbeat_at") or started_at)
-        runtime_sec = max(0.0, now - started_at - quota_waited_seconds(meta, now))
+        # Execution time = wall clock minus quota waits minus the SEPARATE
+        # budget-paused interval (#1196); started_at itself is never moved.
+        runtime_sec = execution_elapsed_seconds(meta, now)
         hb_lag_sec = max(0.0, now - last_hb)
         hb_stale = hb_lag_sec >= _queue().HEARTBEAT_STALE_SEC
         _wid = meta.get("worker_id")
@@ -221,12 +234,12 @@ def _enforce_task_timeouts_locked(
             float(_queue().get_task_idle_timeout_sec()),
             float(_queue().get_per_call_timeout_ceiling_sec()) + 120.0,
         )
-        # deep_self_review runs a single long 1M-context LLM call with NO intermediate
-        # progress events (no tool loop), so the idle timer governs it from started_at;
-        # its prior ~60min tolerance is preserved so it is not idle-killed mid-call.
+        # Deep review can spend a long interval reasoning between tool calls.
+        # Preserve its one-hour idle tolerance; episode deadlines and absolute
+        # ceilings still apply independently.
         if task_type == "deep_self_review":
             idle_timeout = max(idle_timeout, 3600.0)
-        abs_ceiling = float(_queue().get_task_abs_ceiling_sec())
+        abs_ceiling = _queue().get_task_abs_ceiling_sec()  # None = no lifetime bound
         last_progress_at = float(meta.get("last_progress_at") or started_at)
         idle_sec = max(0.0, now - last_progress_at)
         subtree_progressing = _queue()._subtree_progressing(task_id, now, idle_timeout)
@@ -245,7 +258,28 @@ def _enforce_task_timeouts_locked(
                        or llm_call_in_flight
                        or model_waiting(meta) or waiting_on_owner
                        or _active_operation_progressing(meta, now))
-        ceiling_reached = runtime_sec >= abs_ceiling
+        ceiling_reached = abs_ceiling is not None and runtime_sec >= float(abs_ceiling)
+        if (ceiling_reached and not task.get("parent_task_id")
+                and task_id == str(task.get("root_task_id") or task_id)):
+            # A settled answer may still own post-task memory work in this
+            # RUNNING worker. The solve ceiling cannot turn that work into a
+            # failed answer; idle, per-call, deadline and cancellation remain.
+            from ouroboros.task_results import load_task_result
+            from ouroboros.task_status import SETTLED_STATUSES
+
+            try:
+                # Solve settlement lives on the actor's own drive (a split root
+                # settles there first; canonical copyback lags); the post-work
+                # phase lives on the canonical checkpoint authority.
+                settled = load_task_result(
+                    _queue()._task_drive_for_task(task, str(task_id)), str(task_id)) or {}
+                stored = load_task_result(_queue().DRIVE_ROOT, str(task_id)) or {}
+            except Exception:
+                settled, stored = {}, {}  # unreadable terminal proof never widens the ceiling
+            checkpoint = stored.get("root_phase_checkpoint") or {}
+            if (settled.get("status") in SETTLED_STATUSES and isinstance(checkpoint, dict)
+                    and checkpoint.get("post_task_synthesis") == "running"):
+                ceiling_reached = False
 
         if (
             str(task_id) in owner_stop_held
@@ -276,11 +310,11 @@ def _enforce_task_timeouts_locked(
             continue
 
         if ceiling_reached:
-            terminal_reason = "absolute_ceiling"
+            terminal_reason = REASON_ABSOLUTE_CEILING
         elif deadline_reached:
-            terminal_reason = "deadline"
+            terminal_reason = REASON_DEADLINE
         else:
-            terminal_reason = "idle_timeout"
+            terminal_reason = REASON_IDLE_TIMEOUT
         finalization_requested_at = float(meta.get("finalization_requested_at") or 0.0)
         if finalization_requested_at <= 0 and _queue().FINALIZATION_GRACE_SEC > 0:
             meta["finalization_requested_at"] = now
@@ -350,10 +384,15 @@ def _enforce_task_timeouts_locked(
             if not update_evolution_transaction(task_id, dispatch_status="reaping"):
                 log.warning("Evolution timeout teardown deferred: reaping state was not durable for %s", task_id)
                 continue
+        current_worker = workers.WORKERS.get(worker_id)
+        if current_worker is not None and current_worker.busy_task_id != task_id:
+            continue  # A stale queue row cannot hand a newer worker to teardown.
         _queue().RUNNING.pop(task_id, None)
         proc_handle = None
+        captured_worker = None
         if worker_id in workers.WORKERS:
             w = workers.WORKERS[worker_id]
+            captured_worker = w
             if w.busy_task_id == task_id:
                 w.busy_task_id = None
             # Mark reaping under the lock so assign_tasks and the crash detector both skip
@@ -377,7 +416,7 @@ def _enforce_task_timeouts_locked(
         )
         # A stopped evolution campaign breaks the auto-retry chain. `st` is the live state
         # loaded this tick, so this reflects the current owner decision.
-        if will_retry and task_type == "evolution" and not bool(st.get("evolution_mode_enabled")):
+        if will_retry and task_type == "evolution" and not control_is(st, "evolution_mode_enabled", True):
             will_retry = False
         # An unreadable projection/lineage cannot authorize a new dispatch.
         # Readable active intents already yielded the timeout rail above.
@@ -391,9 +430,12 @@ def _enforce_task_timeouts_locked(
         _queue()._ensure_reaper_started()
         _queue()._reap_queue.put({
             "worker_id": worker_id,
+            "worker": captured_worker,
+            "drive_root": str(_queue().DRIVE_ROOT),
+            "meta": meta,
             "proc": proc_handle,
             "task_id": str(task_id),
-            "task": task,
+            "task": dict(task),
             "task_type": task_type,
             "terminal_reason": terminal_reason,
             "attempt": attempt,

@@ -3,7 +3,8 @@
 Covers: typed classification of released pre-dispatch transport failures
 (remote vs local provider), the one-physical-attempt-per-call contract, the
 round-level wait episode (free redials, recovery, deterministic no-resend
-terminal, the interactive turns' idle-timeout bound, local-only fallback pass),
+terminal, the interactive turns' idle-timeout bound, the one configured-route
+walk tried BEFORE the wait opens and never inside it),
 the owner-signal-interruptible sleep, and durable ``network_wait`` evidence.
 Interactive-episode contracts continue in ``test_loop_transport_wait_interactive.py``.
 """
@@ -208,6 +209,27 @@ def _transport_failing_call(fail_times: int, final_content: str = "done"):
     return fake_call, calls
 
 
+def _counting_chain(kind=None, answer_on=None):
+    """A configured-route walk that answers on call ``answer_on`` or fails, optionally
+    overwriting the mutable kind with a candidate's own failure class."""
+    calls = {"n": 0, "kinds": []}
+
+    def chain(**kwargs):
+        calls["n"] += 1
+        usage = kwargs["accumulated_usage"]
+        calls["kinds"].append(usage.get("_last_llm_error_kind"))
+        if answer_on is not None and calls["n"] == answer_on:
+            usage.pop("_last_llm_error_kind", None)
+            return ({"role": "assistant", "content": "fallback-ok"}, "other/model", False,
+                    kwargs["context_fit_plan"], kwargs["active_context_mode"])
+        if kind is not None:
+            usage["_last_llm_error_kind"] = kind
+        return (None, kwargs["active_model"], kwargs["active_use_local"],
+                kwargs["context_fit_plan"], kwargs["active_context_mode"])
+
+    return chain, calls
+
+
 def test_transport_outage_waits_redials_free_rounds_and_recovers(tmp_path, monkeypatch):
     fake_call, calls = _transport_failing_call(fail_times=3)
     sleeps = []
@@ -237,9 +259,9 @@ def test_transport_outage_waits_redials_free_rounds_and_recovers(tmp_path, monke
     assert any("restored" in note for note in notes)  # mandatory recovery note
 
 
-@pytest.mark.parametrize("flag", ["is_direct_chat", "is_ephemeral_turn"])
+@pytest.mark.parametrize("flag", ["is_direct_chat"])
 def test_interactive_turns_wait_redial_free_and_terminalize_at_the_idle_bound(tmp_path, monkeypatch, flag):
-    """Direct-chat and ephemeral decision turns are wait-eligible: they redial
+    """Direct-chat turns are wait-eligible: they redial
     for free until the RAW configured task idle timeout — their only rail, as
     they carry no deadline and no queue rails — is spent, then take the
     deterministic no-resend terminal whose detail names that bound and whose
@@ -272,16 +294,13 @@ def test_interactive_turns_wait_redial_free_and_terminalize_at_the_idle_bound(tm
 
 
 def test_deadline_bounds_wait_with_one_last_free_redial_then_no_resend(tmp_path, monkeypatch):
+    """One provider's outage proves no dead egress: the configured routes are tried
+    once BEFORE the wait (remote included), never again inside it."""
     fake_call, calls = _transport_failing_call(fail_times=99)
-    sleeps = []
-    monkeypatch.setattr(loop_transport, "interruptible_wait_sleep",
-                        lambda sec, _wake: (sleeps.append(sec), False)[1])
+    clock = _FakeClock(monkeypatch)
     monkeypatch.setattr(loop_mod, "call_llm_with_retry", fake_call)
-
-    def _chain_must_not_run(**_kwargs):
-        raise AssertionError("remote fallback chain must not dial during a transport outage")
-
-    monkeypatch.setattr(loop_mod, "_run_cross_model_fallback_chain", _chain_must_not_run)
+    chain, chain_calls = _counting_chain()
+    monkeypatch.setattr(loop_mod, "_run_cross_model_fallback_chain", chain)
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
     monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", "other/model")
     monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
@@ -297,13 +316,14 @@ def test_deadline_bounds_wait_with_one_last_free_redial_then_no_resend(tmp_path,
     # before the admission window closes, then the deterministic no-resend
     # terminal — never a forced-final provider call, never deadline_local.
     assert calls["n"] >= 2
-    assert calls["n"] == len(sleeps) + 1  # every dispatch after the first followed a wait
+    assert calls["n"] == len(clock.sleeps) + 1  # every dispatch after the first followed a wait
     assert usage.get("execution_status") == "infra_failed"
     assert usage.get("reason_code") == "provider_unavailable"
     assert trace.get("forced_finalization", {}).get("source") == "transport_unavailable_no_resend"
     assert "waited and redialed" in result  # honest waited-out terminal text
     phases = [row["phase"] for row in _read_network_wait_events(tmp_path)]
     assert phases[-1] == "ended"
+    assert chain_calls["kinds"] == ["transport_unavailable"] * calls["n"]  # alternatives follow every paced failure
 
 
 def test_deadline_refusal_during_episode_takes_transport_no_resend_terminal(tmp_path, monkeypatch):
@@ -334,54 +354,51 @@ def test_deadline_refusal_during_episode_takes_transport_no_resend_terminal(tmp_
     assert trace.get("forced_finalization", {}).get("source") == "transport_unavailable_no_resend"
 
 
-def test_scheduled_swarm_handoff_stays_truthful_on_transport_terminal(tmp_path, monkeypatch):
-    """An ephemeral router turn waits out its idle bound on an outage, but the
-    requested managed work was already durably admitted: the no-resend terminal
-    stamp must not clobber the router's deliberate execution_status/reason_code
-    clear — the successful handoff stays truthful."""
-    calls = {"n": 0}
+
+
+def test_presence_handoff_retains_work_ref_when_transport_terminal_fails(tmp_path, monkeypatch):
+    """A Presence handoff remains available while the current turn reports its outage."""
+    from ouroboros import agent_task_pipeline as pipeline
+    from ouroboros.task_results import load_task_result
+
     _FakeClock(monkeypatch)
     monkeypatch.setattr(loop_transport, "get_task_idle_timeout_sec", lambda: 60)
-
-    def fake_call(_llm, _messages, _model, _tools, _effort, _max_retries, _drive_logs,
-                  _task_id, _round_idx, _event_queue, accumulated_usage, *_a, **_k):
-        calls["n"] += 1
-        accumulated_usage["_last_llm_error_kind"] = "transport_unavailable"
-        accumulated_usage["_last_llm_error"] = "Connection error."
-        # Mirror _record_llm_call_error's stamps so the test proves the router
-        # pop clears them rather than them never having been set.
-        accumulated_usage.update(execution_status="infra_failed", reason_code="llm_api_error")
-        return None, 0.0
-
+    fake_call, calls = _transport_failing_call(fail_times=99)
     monkeypatch.setattr(loop_mod, "call_llm_with_retry", fake_call)
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
     monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
+    monkeypatch.setattr(pipeline, "_run_post_task_processing_async",
+                        lambda *_a, **_k: pytest.fail("Presence fixture must not buy post-task work"))
     registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
-    registry._ctx.is_ephemeral_turn = True
-    registry._ctx.task_metadata = {"force_plan": True, "force_plan_source": "swarm"}
-    registry._ctx._swarm_handoff_attempt = {
-        "task_id": "swarm-task-1",
-        "routing_token": "route-token",
-        "status": "scheduled",
-        "reason": "",
-        "response": "OK: task swarm-task-1 accepted and durably scheduled",
-    }
-    notes = []
-    result, usage, _trace = run_llm_loop(**_loop_kwargs(tmp_path, registry, notes))
+    registry._ctx.is_direct_chat = True
+    registry._ctx.task_metadata = {"presence": {"binding_id": "presence-binding"}}
+    registry._ctx._swarm_handoff_attempt = {"status": "scheduled", "task_id": "presence-work"}
+    registry._ctx._presence_completion = {"outcome": "deferred", "message": "Work is continuing."}
+    result, usage, trace = run_llm_loop(**_loop_kwargs(tmp_path, registry, []))
+    assert calls["n"] >= 2
+    assert usage["execution_status"] == "infra_failed" and usage["reason_code"] == "provider_unavailable"
+    task = {"id": "presence-turn", "type": "task", "chat_id": 7, "text": "Investigate",
+            "_is_direct_chat": True, "_presence_turn": True, "_skip_post_task_synthesis": True,
+            "metadata": dict(registry._ctx.task_metadata)}
+    events = []
+    pipeline.emit_task_results(SimpleNamespace(drive_root=tmp_path, repo_dir=tmp_path), None, None,
+        events, task, result, usage, trace, 0.0, tmp_path / "logs", ctx=registry._ctx)
+    delivery = next(row for row in events if row["type"] == "presence_result")
+    assert delivery["outcome"] == "deferred" and delivery["work_ref"] == "presence-work"
+    assert delivery["text"] == ""
+    stored = load_task_result(tmp_path, task["id"])
+    assert stored["status"] == "failed" and stored["reason_code"] == "provider_unavailable"
+    assert stored["metadata"]["presence_work_ref"] == "presence-work"
+    assert stored["result"] == result and stored["terminal_provider_notice"]
 
-    assert "Swarm admitted managed task swarm-task-1" in result
-    assert calls["n"] >= 2  # the ephemeral turn waited and redialed before the terminal
-    assert usage.get("execution_status") is None
-    assert usage.get("reason_code") is None
 
-
-@pytest.mark.parametrize("turn_flag", [None, "is_direct_chat", "is_ephemeral_turn"])
+@pytest.mark.parametrize("turn_flag", [None, "is_direct_chat"])
 def test_outage_first_observed_mid_chain_latches_episode_and_recovers(tmp_path, monkeypatch, turn_flag):
     """Primary fails generically (429-class), the chain walks, and a REMOTE
     candidate dies pre-dispatch: the post-chain reconcile must latch an episode
     from the FRESH kind — wait, redial, recover — instead of the generic
     terminal dialing a forced-final call over the proven-dead egress. The latch
-    is turn-kind independent: a direct-chat or ephemeral turn waits and
+    is turn-kind independent: a direct-chat turn waits and
     recovers the same way, and never remote-fallbacks over the dead egress."""
     calls = {"n": 0}
 
@@ -410,6 +427,7 @@ def test_outage_first_observed_mid_chain_latches_episode_and_recovers(tmp_path, 
     monkeypatch.setattr(loop_mod, "call_llm_with_retry", fake_call)
     monkeypatch.setattr(loop_mod, "_run_cross_model_fallback_chain", chain_breaks_on_transport)
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
+    monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", "other/model")  # the walk needs a configured route
     monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
     registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
     if turn_flag:
@@ -427,7 +445,7 @@ def test_outage_first_observed_mid_chain_latches_episode_and_recovers(tmp_path, 
     assert phases[-1] == "recovered"
 
 
-@pytest.mark.parametrize("turn_flag", [None, "is_direct_chat", "is_ephemeral_turn"])
+@pytest.mark.parametrize("turn_flag", [None, "is_direct_chat"])
 def test_mid_chain_latch_that_never_recovers_takes_the_no_resend_terminal(tmp_path, monkeypatch, turn_flag):
     """The mid-chain latch drives the same terminal as a primary-first outage:
     free redials until the binding window (a managed task's deadline, an
@@ -458,6 +476,7 @@ def test_mid_chain_latch_that_never_recovers_takes_the_no_resend_terminal(tmp_pa
     monkeypatch.setattr(loop_mod, "call_llm_with_retry", fake_call)
     monkeypatch.setattr(loop_mod, "_run_cross_model_fallback_chain", chain_breaks_on_transport)
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
+    monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", "other/model")  # the walk needs a configured route
     monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
     registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
     if turn_flag:
@@ -470,7 +489,7 @@ def test_mid_chain_latch_that_never_recovers_takes_the_no_resend_terminal(tmp_pa
     notes = []
     _result, usage, trace = run_llm_loop(**_loop_kwargs(tmp_path, registry, notes))
 
-    assert chain_calls["n"] == 1  # the chain never re-dials over the dead egress
+    assert chain_calls["n"] == calls["n"]  # one failed provider does not exclude the other routes
     assert calls["n"] >= 2
     assert calls["n"] == len(clock.sleeps) + 1  # every dispatch after the first followed a wait
     assert usage.get("execution_status") == "infra_failed"
@@ -512,118 +531,67 @@ def test_exact_model_route_waits_and_redials_its_own_pin(tmp_path, monkeypatch):
     assert {route[0] for route in calls["routes"]} == {"test-model"}  # only the pin dialed
 
 
-def test_local_fallback_pass_adopts_local_route_when_configured(tmp_path, monkeypatch):
+@pytest.mark.parametrize("local", [False, True])
+def test_configured_route_answers_before_any_wait_opens(tmp_path, monkeypatch, local):
+    """#1409 case 4: a provider that cannot be reached is not a dead network. Any
+    configured route (remote or local) answers before a wait opens: no episode rows."""
     fake_call, calls = _transport_failing_call(fail_times=99)
-    chain_calls = {"n": 0}
-
-    def fake_chain(**kwargs):
-        chain_calls["n"] += 1
-        return (
-            {"role": "assistant", "content": "local-ok"}, "local/candidate", True,
-            kwargs["context_fit_plan"], kwargs["active_context_mode"],
-        )
-
+    chain, chain_calls = _counting_chain(answer_on=1)
     monkeypatch.setattr(loop_mod, "call_llm_with_retry", fake_call)
-    monkeypatch.setattr(loop_mod, "_run_cross_model_fallback_chain", fake_chain)
+    monkeypatch.setattr(loop_mod, "_run_cross_model_fallback_chain", chain)
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
-    monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", "local/candidate")
-    monkeypatch.setenv("USE_LOCAL_FALLBACK", "true")
+    monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", "other/model")
+    monkeypatch.setenv("USE_LOCAL_FALLBACK", "true" if local else "false")
     notes = []
     result, _usage, _trace = run_llm_loop(**_loop_kwargs(tmp_path, ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path), notes))
 
-    assert result == "local-ok"
-    assert chain_calls["n"] == 1  # Q4: the LOCAL chain dialed, exactly once
-    events = _read_network_wait_events(tmp_path)
-    assert [row["phase"] for row in events] == ["entered", "ended"]
-    assert events[-1].get("detail") == "local_fallback_adopted"
+    assert result == "fallback-ok"
+    assert calls["n"] == 1 and chain_calls["n"] == 1
+    assert _read_network_wait_events(tmp_path) == []
+    assert not any("provider connection" in note.lower() for note in notes)
 
 
-def test_failed_local_pass_keeps_remote_cause_and_runs_at_most_once(tmp_path, monkeypatch):
-    """A failed local walk overwrites the mutable error kind, but the latched
-    remote cause keeps the episode waiting — and the local pass never re-dials."""
+@pytest.mark.parametrize("candidate_kind", ["provider_error", "provider_outcome_unknown"])
+def test_failed_route_walk_keeps_the_rounds_outage_across_paced_recovery(
+        tmp_path, monkeypatch, candidate_kind):
+    """A failed walk overwrites the mutable kind with a candidate's class (even an
+    eligible unknown one), but the round's own outage keeps the episode waiting on its
+    own route and clock while configured alternatives remain eligible."""
     fake_call, calls = _transport_failing_call(fail_times=3)
-    chain_calls = {"n": 0}
-
-    def failing_chain(**kwargs):
-        chain_calls["n"] += 1
-        kwargs["accumulated_usage"]["_last_llm_error_kind"] = "provider_error"
-        return (
-            None, kwargs["active_model"], kwargs["active_use_local"],
-            kwargs["context_fit_plan"], kwargs["active_context_mode"],
-        )
-
+    chain, chain_calls = _counting_chain(kind=candidate_kind)
     sleeps = []
     monkeypatch.setattr(loop_transport, "interruptible_wait_sleep",
                         lambda sec, _wake: (sleeps.append(sec), False)[1])
     monkeypatch.setattr(loop_mod, "call_llm_with_retry", fake_call)
-    monkeypatch.setattr(loop_mod, "_run_cross_model_fallback_chain", failing_chain)
+    monkeypatch.setattr(loop_mod, "_run_cross_model_fallback_chain", chain)
+    monkeypatch.setattr(loop_transport, "upstream_transport_reachable",
+                        lambda *_a, **_kw: pytest.fail("an outage episode redials; it probes nothing"))
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
-    monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", "local/candidate")
-    monkeypatch.setenv("USE_LOCAL_FALLBACK", "true")
+    monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", "other/model")
     notes = []
     result, _usage, _trace = run_llm_loop(**_loop_kwargs(tmp_path, ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path), notes))
 
     assert result == "done"  # the episode kept waiting and recovered
-    assert chain_calls["n"] == 1  # one local pass per episode
+    assert chain_calls["n"] == 3  # each failed primary round offers the alternatives
     assert calls["n"] == 4
     assert len(sleeps) == 3
     phases = [row["phase"] for row in _read_network_wait_events(tmp_path)]
-    assert phases[-1] == "recovered"
+    assert phases[0] == "entered" and phases[-1] == "recovered"
 
 
-def _unknown_outcome_chain():
-    chain_calls = {"n": 0}
-
-    def failing_chain(**kwargs):
-        chain_calls["n"] += 1
-        kwargs["accumulated_usage"]["_last_llm_error_kind"] = "provider_outcome_unknown"
-        return (
-            None, kwargs["active_model"], kwargs["active_use_local"],
-            kwargs["context_fit_plan"], kwargs["active_context_mode"],
-        )
-
-    return failing_chain, chain_calls
-
-
-def test_failed_local_pass_with_unknown_outcome_keeps_episode_waiting(tmp_path, monkeypatch):
-    """Hardening for the refuted local-pass finding: a local pass that dies
-    with provider_outcome_unknown overwrites the mutable kind, but the latched
-    remote cause keeps the episode waiting until the egress recovers."""
-    fake_call, calls = _transport_failing_call(fail_times=3)
-    failing_chain, chain_calls = _unknown_outcome_chain()
-    sleeps = []
-    monkeypatch.setattr(loop_transport, "interruptible_wait_sleep",
-                        lambda sec, _wake: (sleeps.append(sec), False)[1])
-    monkeypatch.setattr(loop_mod, "call_llm_with_retry", fake_call)
-    monkeypatch.setattr(loop_mod, "_run_cross_model_fallback_chain", failing_chain)
-    monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
-    monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", "local/candidate")
-    monkeypatch.setenv("USE_LOCAL_FALLBACK", "true")
-    notes = []
-    result, _usage, _trace = run_llm_loop(**_loop_kwargs(tmp_path, ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path), notes))
-
-    assert result == "done"  # the episode kept waiting and recovered
-    assert chain_calls["n"] == 1  # one local pass per episode
-    assert calls["n"] == 4
-    assert len(sleeps) == 3
-    phases = [row["phase"] for row in _read_network_wait_events(tmp_path)]
-    assert phases[-1] == "recovered"
-
-
-def test_unknown_outcome_local_pass_then_deadline_takes_transport_no_resend(tmp_path, monkeypatch):
-    """Same shape, but the deadline expires while the egress stays dead: the
-    terminal must key on the episode's latched cause — transport no-resend —
-    not on the local pass's provider_outcome_unknown overwrite."""
+def test_unknown_candidate_then_deadline_takes_the_rounds_transport_no_resend(tmp_path, monkeypatch):
+    """Same shape, but the deadline expires while the provider stays unreachable: the
+    terminal keys on the episode's latched cause — transport no-resend — not on the
+    candidate's provider_outcome_unknown overwrite."""
     fake_call, calls = _transport_failing_call(fail_times=99)
-    failing_chain, chain_calls = _unknown_outcome_chain()
+    chain, chain_calls = _counting_chain(kind="provider_outcome_unknown")
     sleeps = []
     monkeypatch.setattr(loop_transport, "interruptible_wait_sleep",
                         lambda sec, _wake: (sleeps.append(sec), False)[1])
     monkeypatch.setattr(loop_mod, "call_llm_with_retry", fake_call)
-    monkeypatch.setattr(loop_mod, "_run_cross_model_fallback_chain", failing_chain)
+    monkeypatch.setattr(loop_mod, "_run_cross_model_fallback_chain", chain)
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
-    monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", "local/candidate")
-    monkeypatch.setenv("USE_LOCAL_FALLBACK", "true")
+    monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", "other/model")
     from ouroboros.config import get_finalization_grace_sec
 
     registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
@@ -632,7 +600,7 @@ def test_unknown_outcome_local_pass_then_deadline_takes_transport_no_resend(tmp_
     notes = []
     _result, usage, trace = run_llm_loop(**_loop_kwargs(tmp_path, registry, notes))
 
-    assert chain_calls["n"] == 1
+    assert chain_calls["n"] == calls["n"]
     assert calls["n"] >= 2
     assert usage.get("execution_status") == "infra_failed"
     assert usage.get("reason_code") == "provider_unavailable"
@@ -836,37 +804,31 @@ def test_redial_failing_with_different_kind_ends_episode_and_resumes_fallback(tm
         )
         return None, 0.0
 
-    chain_calls = {"n": 0}
-
-    def fake_chain(**kwargs):
-        chain_calls["n"] += 1
-        kwargs["accumulated_usage"].pop("_last_llm_error_kind", None)
-        return (
-            {"role": "assistant", "content": "fallback-ok"}, "other/model", False,
-            kwargs["context_fit_plan"], kwargs["active_context_mode"],
-        )
+    # The walk before the wait finds no route; after the episode ends the ordinary
+    # walk runs again for the redial's own failure and a route answers.
+    fake_chain, chain_calls = _counting_chain(answer_on=2)
 
     monkeypatch.setattr(loop_transport, "interruptible_wait_sleep", lambda _sec, _wake: False)
     monkeypatch.setattr(loop_mod, "call_llm_with_retry", fake_call)
     monkeypatch.setattr(loop_mod, "_run_cross_model_fallback_chain", fake_chain)
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
+    monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", "other/model")
     monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
     notes = []
     result, usage, _trace = run_llm_loop(**_loop_kwargs(tmp_path, ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path), notes))
 
     assert result == "fallback-ok"
     assert calls["n"] == 2  # primary, then the one free redial
-    assert chain_calls["n"] == 1  # ordinary policy resumed after the episode ended
+    assert chain_calls["kinds"] == ["transport_unavailable", "provider_transient"]  # before the wait, then ordinary policy
     assert usage.get("reason_code") is None
     events = _read_network_wait_events(tmp_path)
     assert events[-1]["phase"] == "ended"
     assert events[-1].get("detail") == "error_kind_changed:provider_transient"
 
 
-def test_redial_with_unknown_outcome_takes_unknown_no_resend_terminal(tmp_path, monkeypatch):
-    """A main-dispatch redial whose socket outcome is unknown ends the episode
-    AND the round: provider_outcome_unknown keeps its own no-resend terminal —
-    zero further dials of any kind."""
+def test_redial_unknown_waits_without_unproved_paid_continuation(tmp_path, monkeypatch):
+    """A formerly free redial needs upstream proof after it crosses dispatch.
+    Its owner deadline can close that unknown wait without another paid call."""
     calls = {"n": 0}
 
     def fake_call(_llm, _messages, _model, _tools, _effort, _max_retries, _drive_logs,
@@ -879,24 +841,33 @@ def test_redial_with_unknown_outcome_takes_unknown_no_resend_terminal(tmp_path, 
         accumulated_usage.update(execution_status="infra_failed", reason_code="llm_api_error")
         return None, 0.0
 
-    def _chain_must_not_run(**_kwargs):
-        raise AssertionError("no fallback chain after an unknown-outcome redial")
+    chain, chain_calls = _counting_chain()
 
     monkeypatch.setattr(loop_transport, "interruptible_wait_sleep", lambda _sec, _wake: False)
     monkeypatch.setattr(loop_mod, "call_llm_with_retry", fake_call)
-    monkeypatch.setattr(loop_mod, "_run_cross_model_fallback_chain", _chain_must_not_run)
+    monkeypatch.setattr(loop_mod, "_run_cross_model_fallback_chain", chain)
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
     monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", "other/model")
     monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
     notes = []
-    _result, usage, trace = run_llm_loop(**_loop_kwargs(tmp_path, ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path), notes))
+    registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
+    probes = []
+    def still_offline(*args, **kwargs):
+        probes.append(1)
+        registry._ctx.task_metadata = {"deadline_at": "2000-01-01T00:00:00Z"}
+        return {}
+    monkeypatch.setattr(loop_transport, "upstream_transport_reachable", still_offline)
+    _result, usage, trace = run_llm_loop(**_loop_kwargs(tmp_path, registry, notes))
+    assert probes == [1]
 
     assert calls["n"] == 2  # zero dials after the unknown outcome
+    assert chain_calls["kinds"][0] == "transport_unavailable"
+    assert set(chain_calls["kinds"][1:]) == {"provider_outcome_unknown"}  # configured recovery stays available
     assert usage.get("execution_status") == "infra_failed"
     assert trace.get("forced_finalization", {}).get("source") == "provider_outcome_unknown_no_resend"
     events = _read_network_wait_events(tmp_path)
     assert events[-1]["phase"] == "ended"
-    assert events[-1].get("detail") == "error_kind_changed:provider_outcome_unknown"
+    assert events[-1].get("detail") == "deadline_exhausted"
 
 
 def test_episode_ledger_evidence_has_zero_dispatched_paid_attempts(tmp_path, monkeypatch):

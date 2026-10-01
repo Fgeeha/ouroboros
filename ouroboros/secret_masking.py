@@ -1,11 +1,10 @@
-"""Wire placeholders for Settings/MCP secrets and secret-byte egress masking.
+"""Settings/MCP placeholders and secret redaction for diagnostic projections.
 
 Each placeholder reader recognizes only a shape emitted by its matching
 producer. Keeping the small mechanical contract here prevents a display
 placeholder from being persisted without treating arbitrary values ending in
-``...`` as secrets to erase. This module is also the SSOT for well-known
-secret BYTE shapes (entropy token formats, PEM private keys) masked on the
-tool-output egress before model context/history.
+``...`` as secrets to erase. Known token and PEM patterns belong to stored
+diagnostic projections; file-tool results preserve their source content.
 """
 
 from __future__ import annotations
@@ -29,6 +28,7 @@ MASKED_SECRET_SETTING_KEYS = frozenset(
         "ANTHROPIC_API_KEY",
         "MINIMAX_API_KEY",
         "DEEPSEEK_API_KEY",
+        "ZAI_API_KEY",
         "GITHUB_TOKEN",
         "OUROBOROS_NETWORK_PASSWORD",
     }
@@ -130,6 +130,44 @@ def looks_masked_mcp_secret(value: Any) -> bool:
     return text == "***" or _looks_prefixed_mask(text, visible_chars=4) or _looks_prefixed_mask(text, visible_chars=8)
 
 
+
+def mask_mcp_url(value: Any) -> str:
+    """Mask URL userinfo for the editable Settings surface, preserving its address."""
+    from urllib.parse import urlsplit
+
+    text = str(value or "")
+    try:
+        authority = urlsplit(text).netloc
+    except ValueError:
+        # A malformed saved address remains editable without exposing credentials.
+        return CONFIGURED_SECRET_PLACEHOLDER if "@" in text else text
+    _userinfo, separator, host = authority.rpartition("@")
+    return text.replace(authority, "***@" + host, 1) if separator else text
+
+
+def rehydrate_mcp_url(value: Any, current_value: Any) -> str:
+    """Restore only the exact mask of this server's current URL.
+
+    A changed address with a placeholder has no newly supplied credentials;
+    remove the placeholder, never carry the old userinfo to a different target.
+    A real new userinfo or an explicit URL without it is kept as supplied.
+    """
+    from urllib.parse import urlsplit
+
+    text, current = str(value or ""), str(current_value or "")
+    if text == CONFIGURED_SECRET_PLACEHOLDER:
+        return current if current and mask_mcp_url(current) == text else ""
+    try:
+        authority = urlsplit(text).netloc
+    except ValueError:
+        return text  # a new invalid address is the ordinary config validator's input
+    userinfo, separator, host = authority.rpartition("@")
+    if not separator or userinfo != "***":
+        return text
+    if current and mask_mcp_url(current) == text:
+        return current
+    return text.replace(authority, host, 1)
+
 def looks_masked_secret(value: Any) -> bool:
     """Compatibility union of the exact placeholder shapes this module emits."""
     text = str(value or "").strip()
@@ -137,9 +175,7 @@ def looks_masked_secret(value: Any) -> bool:
 
 
 # Well-known entropy token formats (SSOT; ``observability`` reuses this list
-# for forensic redaction). Each pattern names a provider/protocol shape whose
-# match is a credential with high precision — never a generic "looks random"
-# heuristic, so ordinary file content survives masking.
+# for forensic redaction). File-tool results do not apply these patterns.
 SECRET_TOKEN_PATTERNS: Tuple[Tuple[str, re.Pattern[str]], ...] = (
     ("bearer_token", re.compile(r"(?i)\bBearer\s+[A-Za-z0-9_\-./+=]{16,}")),
     ("basic_auth", re.compile(r"(?i)\bBasic\s+[A-Za-z0-9+/=]{16,}")),
@@ -163,68 +199,13 @@ SECRET_TOKEN_PATTERNS: Tuple[Tuple[str, re.Pattern[str]], ...] = (
     ),
 )
 
-# A PEM private-key block, masked whole. When a read slice cuts the file before
-# the END marker the tail is still key material, so an unterminated block masks
-# through end-of-text (raw key bytes must never survive on a truncation edge).
+# A PEM private-key block for retained diff projections, including an
+# unterminated final block. Source file reads never apply this expression.
 _PEM_PRIVATE_KEY_RE = re.compile(
     r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY[A-Z0-9 ]*-----"
     r"(?:.*?-----END [A-Z0-9 ]*PRIVATE KEY[A-Z0-9 ]*-----|.*\Z)",
     re.DOTALL,
 )
-
-# EGRESS-ONLY long-opaque-run rule (never used by observability redaction — a
-# different false-positive budget). Line-oriented egresses (search match lines,
-# a read slice that starts past the PEM header) surface key MATERIAL without
-# the block markers or provider prefixes the patterns above key on: a PEM body
-# line is 64 unbroken base64 chars, an AWS secret key is 40. Any unbroken run
-# of 40+ base64/hex-ish chars in owner-home output is treated as opaque
-# credential material. Known accepted FP: long hashes/data-URI fragments in
-# owner files get masked too — the disclosure note tells the agent to
-# reference them by location.
-_LONG_OPAQUE_RUN_RE = re.compile(r"[A-Za-z0-9+/=_\-]{40,}")
-
-
-def mask_secret_bytes(
-    text: str, *, mask_opaque: bool = True, preserve_layout: bool = False,
-) -> Tuple[str, int]:
-    """Mask secret-shaped byte spans in final tool output; return (text, count).
-
-    Egress seam for owner-home (``user_files``) content: the root agent may
-    read the file, but raw credential bytes never enter model context/history —
-    the masked form (``***``) may (#447 X1/В23). Coverage: the known entropy
-    formats above, PEM private-key blocks, and any unbroken 40+ char opaque run
-    (closes line-oriented egresses — search match lines, mid-file read slices).
-    Repository source callers disable only the opaque fallback: ordinary long
-    identifiers, hashes and source bodies must remain readable. Known token
-    formats and PEM private-key blocks are masked in either scope.
-    Readers that mask before selecting a line/character window set
-    ``preserve_layout``: replacement keeps character positions and line breaks,
-    so a window inside a key cannot lose its header or shift later source.
-    Disclosed residual: a dictionary-word password has no shape to match.
-    """
-    out = str(text or "")
-    count = 0
-
-    def _replacement(value: str) -> str:
-        return "".join(char if char.isspace() else "*" for char in value) if preserve_layout else "***"
-
-    def _mask(_match: re.Match[str]) -> str:
-        nonlocal count
-        count += 1
-        return _replacement(_match.group())
-
-    def _mask_url(match: re.Match[str]) -> str:
-        nonlocal count
-        count += 1
-        return f"{match.group(1)}{_replacement(match.group(2))}:{_replacement(match.group(3))}@"
-
-    out = _PEM_PRIVATE_KEY_RE.sub(_mask, out)
-    for rule, pattern in SECRET_TOKEN_PATTERNS:
-        out = pattern.sub(_mask_url if rule == "url_credentials" else _mask, out)
-    if mask_opaque:
-        out = _LONG_OPAQUE_RUN_RE.sub(_mask, out)
-    return out, count
-
 
 def strip_masked_secrets(settings: Dict[str, Any], *, known_setting_keys: Collection[str]) -> Dict[str, Any]:
     """Blank recognized top-level placeholders before read or persistence.

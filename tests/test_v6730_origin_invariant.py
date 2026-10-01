@@ -190,7 +190,7 @@ def test_ensure_scope_tool_attaches_task_origin(tmp_path):
     ctx.task_id = "t-run"
     ctx.task_contract = {}
     out = _ensure_project_scope(ctx, project_name="Robot City")
-    assert out.startswith("OK: created/attached")
+    assert out.startswith("⚠️ SCOPE_UNCONFIRMED")  # deferred transport: no bind landed yet
     evt = [e for e in events if e.get("type") == "ensure_project_scope"][0]
     assert evt["source_ref"] == _ref()
     assert evt["source_text"] == OWNER_TEXT
@@ -343,9 +343,6 @@ def test_ingress_captures_origin_and_threads_it_into_turn_metadata(tmp_path, mon
 
     captured = {}
 
-    def _ephemeral(chat_id, text, image_data=None, *, task_constraint=None, task_metadata=None):
-        captured["metadata"] = task_metadata
-
     def _direct(chat_id, text, image_data=None, *, task_constraint=None, task_metadata=None):
         captured["metadata"] = task_metadata
 
@@ -359,7 +356,6 @@ def test_ingress_captures_origin_and_threads_it_into_turn_metadata(tmp_path, mon
             inject_observation=lambda _t: None, pause=lambda: None, resume=lambda: None,
         ),
         get_chat_agent=lambda: SimpleNamespace(_busy=False),
-        handle_chat_ephemeral=_ephemeral,
         handle_chat_direct=_direct,
         send_with_budget=lambda *_a, **_k: None,
     )
@@ -516,7 +512,7 @@ def test_ensure_worker_reads_origin_from_running_map(tmp_path, monkeypatch):
 
 def test_early_origin_stub_persists_before_card_exposure(tmp_path):
     """Triad r7: a direct-chat task's origin is DURABLE before task_started can
-    expose a convertible card; ephemeral turns and origin-less tasks write nothing."""
+    expose a convertible card; origin-less tasks write nothing."""
     import inspect
 
     from ouroboros.agent import OuroborosAgent, _persist_early_origin_stub
@@ -529,10 +525,6 @@ def test_early_origin_stub_persists_before_card_exposure(tmp_path):
     record = load_task_result(tmp_path, "direct-1")
     assert record["origin_message_ref"] == _ref()
     assert record["origin_message_text"] == OWNER_TEXT
-    _persist_early_origin_stub(tmp_path, {
-        "id": "eph-1", "_ephemeral_turn": True, "origin_message_ref": _ref(),
-    })
-    assert load_task_result(tmp_path, "eph-1") is None
     _persist_early_origin_stub(tmp_path, {"id": "no-origin-1", "chat_id": 1})
     assert load_task_result(tmp_path, "no-origin-1") is None
     # And the stub runs BEFORE the task_started emission in the task handler.
@@ -885,7 +877,9 @@ def test_era_compression_preserves_gap_markers(tmp_path):
     chat, blocks, meta = _chat_layout(tmp_path)
     old_blocks = [
         {"ts": "2026-07-01T00:00:00Z", "type": "summary", "range": "r",
-         "message_count": 100, "content": "old block A"},
+         "message_count": 100, "content": "old block A1 " + "detail " * 40},
+        {"ts": "2026-07-01T06:00:00Z", "type": "summary", "range": "r",
+         "message_count": 100, "content": "old block A2 " + "detail " * 40},
         {"ts": "2026-07-01T12:00:00Z", "type": "summary", "range": "unknown",
          "message_count": 0, "gap_id": "gap:test", "content": "[MEMORY GAP] test"},
         {"ts": "2026-07-02T00:00:00Z", "type": "summary", "range": "r",
@@ -908,12 +902,13 @@ def test_era_compression_preserves_gap_markers(tmp_path):
     blocks_after = json.loads(blocks.read_text(encoding="utf-8"))
     gap_positions = [i for i, b in enumerate(blocks_after) if b.get("gap_id") == "gap:test"]
     assert len(gap_positions) == 1
-    # The era compressed ONLY the pre-gap run ("old block A"); the gap keeps its
+    # The era compressed ONLY the pre-gap run (A1+A2); the gap keeps its
     # chronological slot right after it, and post-gap blocks B/C stay intact.
     assert gap_positions[0] == 1
     texts = [b.get("content", "") for b in blocks_after]
     assert "old block B" in texts and "old block C" in texts
-    assert "old block A" not in texts  # compressed into the era
+    assert not any(t.startswith("old block A") for t in texts)  # compressed into the era
+    assert "Era or block summary." in texts[0]  # the era is shorter than the run it replaced
 
 
 def test_consolidator_rotation_between_resolve_and_first_capture(tmp_path, monkeypatch):

@@ -8,11 +8,11 @@ reviewer slots.
 
 from __future__ import annotations
 
+from ouroboros.config import runtime_setting
 from ouroboros.model_wait import monotonic_now
 
 from dataclasses import asdict, replace
 import logging
-import os
 import pathlib
 import time
 from typing import Any, Dict, List, Optional
@@ -49,7 +49,7 @@ from ouroboros.review_execution import (  # noqa: F401  (compat re-exports)
 )
 from ouroboros.review_custody import (
     _ReviewAttemptHistory, _review_exception_projection,
-    review_retry_cancelled,
+    review_retry_cancelled, finalize_review_actor,
 )
 # Reviewer-output JSON extraction lives in ONE place beside the array
 # extractor it falls back to (the fenced-object and verdict parsers were
@@ -133,6 +133,7 @@ from ouroboros.review_dispatch import (  # noqa: E402,F401 — re-exports
     SLOT_ID_PREFIX,
     slot_id_for_row,
     stamp_review_paid_on_dispatch,
+    task_acceptance_row_refusal,
     task_acceptance_zero_physical_refusal,
 )
 
@@ -163,6 +164,13 @@ def scope_reviewer_slots(
     legacy path used to take this parameter's old literal default instead,
     silently running the BLOCKING reviewer below configured strength (the
     downgrade class the owner forbade).
+
+    Every scope row delivers by RETRIEVAL (owner decision 2026-09-17): an
+    ``api_chat`` row on this surface means a bounded native inspection episode
+    on that model, an ``agent_session`` row a delegated read-only session.
+    ``scope_delivery_rows`` states that on the row itself, so the transport
+    seam reads one fact instead of inferring delivery from an actor id the
+    scope surface does not require.
     """
     if effort is None:
         from ouroboros.config import resolve_effort
@@ -173,14 +181,30 @@ def scope_reviewer_slots(
 
         structured = structured_scope_review_slots()
         if structured is not None:
-            return structured
+            return scope_delivery_rows(structured)
         # Resolved at call time so the configured list stays the live authority.
         from ouroboros.config import get_scope_review_models
 
         models = get_scope_review_models()
-    return reviewer_slots(
+    return scope_delivery_rows(reviewer_slots(
         models, effort=effort, role_hint=SCOPE_ROLE_HINT, id_prefix=SCOPE_SLOT_ID_PREFIX,
-    )
+    ))
+
+
+def scope_delivery_rows(slots: List[ReviewSlot]) -> List[ReviewSlot]:
+    """Mark every ``api_chat`` scope row as a native retrieving reviewer.
+
+    The scope surface owns the delivery of its own rows, so the fact rides the
+    row rather than a synthesized ``subagent_id``: identity, route, model,
+    credential pin, effort, processing preference and local-route flag stay
+    exactly as configured.
+    """
+    return [
+        replace(slot, native_retrieval_override=True)
+        if str(getattr(slot.route, "value", slot.route) or "") == ReviewRouteKind.API_CHAT.value
+        else slot
+        for slot in slots
+    ]
 
 
 def review_usage_category(surface: str) -> str:
@@ -282,12 +306,12 @@ class ReviewCoordinator:
                 global_limit = resolve_total_budget_usd()
             except Exception:
                 global_limit = None
-        if base_scope.root_limit_usd is not None:
+        if base_scope.root_limit_source or base_scope.root_limit_usd is not None:
             root_limit = base_scope.root_limit_usd
         else:
             try:
                 configured_root_limit = float(
-                    os.environ.get("OUROBOROS_PER_TASK_COST_USD", "0") or 0
+                    runtime_setting("OUROBOROS_PER_TASK_COST_USD", "0") or 0
                 )
                 root_limit = configured_root_limit if configured_root_limit > 0 else None
             except (TypeError, ValueError):
@@ -302,10 +326,19 @@ class ReviewCoordinator:
             review_skill=str(review_meta.get("review_skill") or base_scope.review_skill or ""),
             review_wave_id=str(review_meta.get("review_wave_id") or base_scope.review_wave_id or ""),
             global_limit_usd=global_limit,
+            global_limit_source=(base_scope.global_limit_source if base_scope.global_limit_usd is not None
+                                 else "settings_budget_resolver"),
+            global_limit_revision=(base_scope.global_limit_revision if base_scope.global_limit_usd is not None else None),
             root_limit_usd=root_limit,
+            root_limit_source=base_scope.root_limit_source,
         )
 
         from ouroboros.review_custody import run_custodied_review_slots
+        from ouroboros.review_dispatch import review_reconciliation_identity
+
+        request.reconciliation_identity = review_reconciliation_identity(
+            request, slots, root_task_id=root_task_id,
+            contract=getattr(self.usage_ctx, "_current_review_contract_fingerprint", ""))
 
         def _run_slot_with_usage(
             slot: ReviewSlot,
@@ -353,7 +386,23 @@ class ReviewCoordinator:
             )
             else self.usage_ctx
         )
-        actors = run_custodied_review_slots(
+        source_error = ''
+        if request.surface == 'task_acceptance' and request.policy.get('native_data_root') and not request.reconcile_only:
+            try:
+                from ouroboros.review_source_closure import retain_review_request_sources
+                from ouroboros.acceptance_retrieving import acceptance_retrieving_work_order, retain_review_source
+
+                retain_review_request_sources(request, source_root=request.policy['native_data_root'],
+                                              custody_root=self._custody_drive_root())
+                acceptance_retrieving_work_order(request, [slot for slot in slots if slot.retrieves],
+                    session_root=request.session_root, data_root=pathlib.Path(request.policy['native_data_root']))
+                for slot in slots:
+                    if slot.retrieves:
+                        retain_review_source(request, slot.slot_id, self._custody_drive_root())
+            except Exception as exc:
+                source_error = f'review_source_closure_unavailable: {type(exc).__name__}: {exc}'
+        actors = [self._error_actor(request, slot, source_error, operation_state='not_dispatched')
+                  for slot in slots] if source_error else run_custodied_review_slots(
             request=request, slots=slots,
             usage_ctx=custody_usage_ctx,
             task_id=task_id,
@@ -393,6 +442,7 @@ class ReviewCoordinator:
             actors=[asdict(actor) for actor in actors],
             **aggregate,
             panel_id=_review_panel_id(request, actors),
+            slot_roster=[asdict(slot) for slot in slots],
         )
 
     def _custody_drive_root(self) -> pathlib.Path:
@@ -420,6 +470,8 @@ class ReviewCoordinator:
         actor_status = "not_dispatched" if operation_state == "not_dispatched" else "error"
         call_id = new_call_id(f"review_{request.surface}_{slot.slot_id}_error")
         base_call_type = request.call_type or f"{request.surface}_review"
+        from ouroboros.review_dispatch import review_operation_binding
+        binding = review_operation_binding(request, slot, str(operation_id or call_id))
         assignment = ReviewAssignment(
             request=request, slot=slot, call_id=call_id, call_type=base_call_type,
             custody_root=self._custody_drive_root(),
@@ -465,6 +517,7 @@ class ReviewCoordinator:
             operation_id=str(operation_id or ""),
             operation_state=str(operation_state or "settled"),
             late_result_pending=str(operation_state or "") in {"in_flight", "custody_lost"},
+            recovery_binding=binding,
         )
 
     def _run_slot(
@@ -479,6 +532,10 @@ class ReviewCoordinator:
     ) -> ReviewActorRecord:
         call_id = str(operation_id or new_call_id(f"review_{request.surface}_{slot.slot_id}"))
         base_call_type = request.call_type or f"{request.surface}_review"
+        from ouroboros.review_dispatch import review_operation_binding
+        binding = review_operation_binding(request, slot, str(operation_id or call_id))
+        from ouroboros.acceptance_retrieving import retain_review_source
+        retain_review_source(request, slot.slot_id, self._custody_drive_root())
         assignment = ReviewAssignment(
             request=request, slot=slot, call_id=call_id, call_type=base_call_type,
             custody_root=self._custody_drive_root(),
@@ -494,7 +551,12 @@ class ReviewCoordinator:
         executor.restore_custody(
             retry_state if retry_state is not None else {}
         )
-        executor.set_pending_invocation_checkpoint(pending_invocation_checkpoint)
+        invocation = {"id": str((retry_state or {}).get("pending_invocation_id") or "")}
+        def checkpoint(invocation_id):
+            invocation["id"] = str(invocation_id)
+            if callable(pending_invocation_checkpoint):
+                pending_invocation_checkpoint(invocation_id)
+        executor.set_pending_invocation_checkpoint(checkpoint)
         prompt_projection = executor.prompt_payload()
         prompt_ref: Dict[str, Any] = {}
         response_ref: Dict[str, Any] = {}
@@ -502,17 +564,22 @@ class ReviewCoordinator:
         attempt_history = _ReviewAttemptHistory()
         try:
             prompt_ref = persist_call(
-                self.drive_root,
+                self._custody_drive_root(),
                 task_id=request.task_id or "review",
                 call_id=f"{call_id}_prompt",
                 call_type=f"{base_call_type}_prompt",
                 payload={"request": asdict(request), "slot": asdict(slot), **prompt_projection},
-                manifest={"surface": request.surface, "slot_id": slot.slot_id, "model": slot.model},
+                manifest={"surface": request.surface, "slot_id": slot.slot_id, "model": slot.model,
+                          "review_operation_binding": binding},
             )
         except Exception:
+            if request.slot_source_delivery.get(slot.slot_id):
+                # A sourced review must retain its canonical identity before
+                # dispatch, not only in a post-run result or a worker buffer.
+                raise
             prompt_ref = {}
         free_refusal = (
-            task_acceptance_zero_physical_refusal(request.evidence, retrieving=bool(slot.retrieves))
+            task_acceptance_row_refusal(request, slot)
             if request.surface == "task_acceptance"
             else {}
         )
@@ -649,7 +716,7 @@ class ReviewCoordinator:
                                 # P1 forensics: a successful repair must not make the
                                 # malformed first answer unreconstructible.
                                 persist_call(
-                                    self.drive_root,
+                                    self._custody_drive_root(),
                                     task_id=request.task_id or "review",
                                     call_id=f"{call_id}_attempt1_response",
                                     call_type=f"{base_call_type}_attempt1_response",
@@ -675,50 +742,26 @@ class ReviewCoordinator:
                         break
                     if actor_attempt + 1 >= actor_attempts:
                         break
-            try:
-                response_ref = persist_call(
-                    self.drive_root,
-                    task_id=request.task_id or "review",
-                    call_id=f"{call_id}_response",
-                    call_type=f"{base_call_type}_response",
-                    payload={"message": msg, "usage": usage},
-                    manifest={"surface": request.surface, "slot_id": slot.slot_id, "model": slot.model},
-                )
-            except Exception:
-                response_ref = {}
-            return ReviewActorRecord(
-                slot_id=slot.slot_id,
-                model=slot.model,
-                status="ok" if raw_text.strip() else "empty",
-                raw_text=raw_text,
-                usage=usage,
-                prompt_ref=prompt_ref,
-                response_ref=response_ref,
+            actor = ReviewActorRecord(
+                slot_id=slot.slot_id, model=slot.model,
+                status="ok" if raw_text.strip() else "empty", raw_text=raw_text,
+                usage=usage, prompt_ref=prompt_ref,
                 duration_sec=round(time.time() - start, 3),
+                recovery_binding={**binding, "pending_invocation_id": invocation["id"]},
             )
+            finalize_review_actor(actor, operation_id=call_id)
+            actor.response_ref = self._persist_producer_outcome(
+                request, actor, call_id, base_call_type, {"message": msg, "usage": usage})
+            return actor
         except Exception as exc:
             error_msg = truncate_review_artifact(str(exc), limit=4000)
-            try:
-                response_ref = persist_call(
-                    self.drive_root,
-                    task_id=request.task_id or "review",
-                    call_id=f"{call_id}_error",
-                    call_type=f"{base_call_type}_error",
-                    payload={
-                        "error_type": type(exc).__name__,
-                        "error": sanitize_tool_result_for_log(error_msg),
-                    },
-                    manifest={"surface": request.surface, "slot_id": slot.slot_id, "model": slot.model, "status": "error"},
-                )
-            except Exception:
-                response_ref = {}
             (
                 failure_custody, _capture_state, http_status,
                 operation_state, failure_code,
             ) = _review_exception_projection(
                 exc, executor.failure_custody(), attempt_history, retry_state,
             )
-            return ReviewActorRecord(
+            actor = ReviewActorRecord(
                 slot_id=slot.slot_id,
                 model=slot.model,
                 status="error",
@@ -726,13 +769,39 @@ class ReviewCoordinator:
                 transport_status=_transport_error_status(exc),
                 failure_code=failure_code,
                 reset_at=str(getattr(exc, "reset_at", "") or ""),
+                reported_cause=str(getattr(exc, "reported_cause", "") or ""),
                 http_status=http_status if isinstance(http_status, int) and http_status else None,
                 usage=failure_custody,
                 prompt_ref=prompt_ref,
                 response_ref=response_ref,
                 duration_sec=round(time.time() - start, 3),
                 operation_state=operation_state,
+                recovery_binding={**binding, "pending_invocation_id": invocation["id"]},
             )
+            finalize_review_actor(actor, operation_id=call_id)
+            actor.response_ref = self._persist_producer_outcome(
+                request, actor, call_id, base_call_type,
+                {"error_type": type(exc).__name__, "error": actor.error})
+            return actor
+
+    def _persist_producer_outcome(self, request, actor, call_id, call_type, payload):
+        """Stamp the completed producer beside its existing full response body."""
+        outcome = {key: value for key, value in asdict(actor).items()
+                   if key not in {"raw_text", "usage", "prompt_ref", "response_ref"}}
+        try:
+            return persist_call(
+                self._custody_drive_root(), task_id=request.task_id or "review",
+                call_id=f"{call_id}_{'error' if actor.status == 'error' else 'response'}",
+                call_type=f"{call_type}_{'error' if actor.status == 'error' else 'response'}",
+                payload={**payload, "usage": actor.usage, "producer_outcome": outcome},
+                manifest={"surface": request.surface, "slot_id": actor.slot_id,
+                          "model": actor.model, "producer_complete": True,
+                          **({"status": "error"} if actor.status == "error" else {}),
+                          "review_operation_binding": actor.recovery_binding},
+            )
+        except Exception:
+            log.warning("Review producer outcome could not be retained: %s", call_id, exc_info=True)
+            return {}
 
     def _emit_usage(
         self,

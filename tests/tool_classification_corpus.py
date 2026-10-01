@@ -40,6 +40,11 @@ commit, this reproduces that commit's fixture byte for byte.
 this module in the current tree never touches it. The composers it calls live in the
 old tree too, and their composed bytes are identical in both, which is what makes one
 corpus definition legitimate across the two checkouts.
+
+Native cases use the exact plain-identifier input, varying only the typed code.
+The retired pair ignores that code, so a new native key can reuse the existing
+plain case's recorded answer after verifying identical tool/text inputs. This
+does not recapture or replace any old answer and still needs an approved delta.
 """
 
 from __future__ import annotations
@@ -88,6 +93,7 @@ _CODE_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _INTERPOLATED_IDENTIFIERS = (
     "APPLY_PATCH_BLOCKED",   # tools/edit_ops.py::apply_patch error_tag
     "EDIT_BATCH_BLOCKED",    # tools/edit_ops.py::edit_batch error_tag
+    "PREFLIGHT_UNAVAILABLE", # commit_admission.py::format_release_metadata_preflight code
     "READ_FILE_BLOCKED",     # tools/core_file_tools.py::_local_readonly_resource_block action
     "SCRIPT_CWD_BLOCKED",    # tools/tool_resolution.py::_binding_error_text prefixes
     "SEARCH_BLOCKED",        # tools/core.py search_code, same action argument
@@ -283,6 +289,7 @@ _STRUCTURED_TOOLS = ("read_file", "ext_1_demo_screenshot", "mcp_demo__ping", "ru
 # fails if a producer publishes a code no shape below (and no harvested pair)
 # exercises, which is the assertion that closes that blind spot.
 _PRODUCER_SHAPES = (
+    ("safety_violation", "run_command", "⚠️ SAFETY_VIOLATION: independent assessment refused", "SAFETY_VIOLATION", ()),
     ("shell_ok", "run_command", "exit_code=0\nSTDOUT:\nfine", "OK", (("exit_code", 0),)),
     ("shell_autocorrected", "run_command", "⚠️ SHELL_REGEX_AUTO_CORRECTED: corrected\nexit_code=0\nSTDOUT:\nfine", "SHELL_REGEX_AUTO_CORRECTED", (("exit_code", 0), ("shell_regex_auto_corrected", True))),
     ("shell_no_match", "run_command", "exit_code=1 (no matches)\nSTDOUT:\n", "SHELL_NO_MATCH", (("exit_code", 1),)),
@@ -302,6 +309,13 @@ _PRODUCER_SHAPES = (
     ("review_blocked_untyped_text", "commit_reviewed", "review rejection text without any marker", "REVIEW_BLOCKED", ()),
     ("executor_crash", "write_file", "⚠️ TOOL_ERROR (write_file): RuntimeError: boom", "EXECUTOR_ERROR", ()),
     ("outer_timeout", "read_file", "⚠️ TOOL_TIMEOUT (read_file): exceeded 120s limit.", "TOOL_TIMEOUT", (("timeout_sec", 120),)),
+    # tools/core_file_tools.py, owner item I27. The discovery miss interpolates
+    # the exception into its text and publishes it under `list_files`, so the
+    # sentence the owner actually reads is exercised by no other case: the
+    # identifier rows carry a synthetic detail under `read_file`, and the
+    # harvested (code, first line) pair reuses that same input by construction.
+    ("list_files_not_found", "list_files",
+     "⚠️ LIST_FILES_NOT_FOUND: Directory not found: notes/ML Conf 2", "LEGACY_WARNING", ()),
     # tools/extension_dispatch.py — every terminal interpolates the tool name, so
     # all four were outside the harvest while carrying real status changes.
     ("extension_handler_error", "ext_1_demo_screenshot", "⚠️ TOOL_ERROR (ext_1_demo_screenshot): extension tool failed: RuntimeError: boom", "EXTENSION_ERROR", (("dynamic_provider", True),)),
@@ -311,12 +325,14 @@ _PRODUCER_SHAPES = (
     # tools/registry_core.py — an extension surface that exists but is not live
     # gets the host's unknown-tool sentence typed as unavailable, which is more
     # precise than "unknown" and is NOT the adapter's answer for the same text.
-    ("unknown_tool_extension_down", "ext_1_demo_screenshot", "⚠️ Unknown tool: ext_1_demo_screenshot. Available: read_file, run_command", "EXTENSION_UNAVAILABLE", (("dynamic_provider", True),)),
+    ("unknown_tool_extension_down", "ext_1_demo_screenshot", "⚠️ Unknown tool: 'ext_1_demo_screenshot': its extension is not live for this task right now. Nothing was executed.\nNo tool in ext_1_demo is currently callable in this task.", "EXTENSION_UNAVAILABLE", (("dynamic_provider", True),)),
     ("protected_write", "write_file", "⚠️ CORE_PROTECTION_BLOCKED: runtime_mode='advanced' refuses to write protected core path: ouroboros/safety.py. Switch to runtime_mode='pro' and let the normal triad + scope review cover the protected core/contract/release change before commit.", "CORE_PROTECTION_BLOCKED", ()),
-    # ouroboros/mcp_client.py — both unavailable terminals publish one code from
-    # two different first lines, which only a shape can express.
+    # ouroboros/mcp_client.py (MCPNameResolution.refusal) — the unavailable facts
+    # publish one code from different first lines, which only a shape can express;
+    # a catalog miss is the caller's unknown tool (#1262), the registry's own
+    # unknown-tool code published under the MCP marker.
     ("mcp_disabled", "mcp_svc__ping", "⚠️ MCP_DISABLED: enable MCP in Settings → Advanced to use this tool.", "MCP_UNAVAILABLE", ()),
-    ("mcp_tool_not_found", "mcp_svc__ping", "⚠️ MCP_TOOL_NOT_FOUND: 'mcp_svc__ping'. Refresh the server in Settings → Advanced or check the allowed_tools allowlist.", "MCP_UNAVAILABLE", ()),
+    ("mcp_tool_not_found", "mcp_svc__ping", "⚠️ MCP_TOOL_NOT_FOUND: 'mcp_svc__ping' is not in the current tool catalog of MCP server 'svc'. Nothing was executed.", "UNKNOWN_TOOL", ()),
     ("mcp_transport_timeout", "mcp_svc__ping", "⚠️ MCP_TOOL_TIMEOUT: server 'svc' did not respond in 60s", "MCP_TIMEOUT", ()),
     # tool_access.shell_cwd_block_message, published by both process guards.
     ("shell_cwd_block", "run_command", "⚠️ SHELL_CWD_BLOCKED: CWD_BLOCKED: cwd /etc is outside allowed roots for shell. Allowed cwd roots for this tool/profile: active_workspace=/w. Use one of those exact paths as cwd (or root=task_drive/artifact_store/user_files in file tools).", "SHELL_CWD_BLOCKED", ()),
@@ -336,26 +352,27 @@ _PRODUCER_SHAPES = (
     ("send_photo_empty_payload", "send_photo", "⚠️ Image data is empty or too short.", "LEGACY_TOOL_ERROR", ()),
     ("send_video_missing_file", "send_video", "⚠️ File not found: /x/clip.mp4", "LEGACY_TOOL_ERROR", ()),
     ("send_file_missing_argument", "send_file", "⚠️ Provide a file_path.", "LEGACY_TOOL_ERROR", ()),
-    # tools/control_routing.py — owner item A.21. The promotion receipts carry no
-    # warning marker at all, and the two project-routing receipts reach their
-    # result through the swarm-handoff latch, so neither the identifier harvest
-    # nor the (code, first line) harvest can see any of the four. Without a shape
-    # the differential is blind to the whole family: a promotion that was refused
-    # could go on reporting ok and no case would move.
+    # tools/control_routing.py — owner item A.21. All four receipts are PLAIN
+    # STRINGS the host adapts, so they carry no declared code: the codes they used
+    # to declare were invented, and the differential compared each against itself
+    # while the classifier read the markerless promotion sentences as successes
+    # (the 14.09 receipt incident). The two promotion receipts now carry the
+    # warning marker their identifier needs to be read at all.
     ("promote_rejected", "promote_chat_to_task",
-     "PROMOTE_REJECTED: task 4f2a1c was not scheduled (admission_rejected). "
-     "Do not report this task as created.", "LEGACY_BLOCKED", ()),
+     "⚠️ PROMOTE_REJECTED: task 4f2a1c was not scheduled (admission_rejected). "
+     "Do not report this task as created.", "", ()),
     ("promote_unconfirmed", "promote_chat_to_task",
-     "PROMOTE_UNCONFIRMED: task 4f2a1c admission was not confirmed within 30 seconds. "
-     "Do not report this task as created and do not retry automatically; keep this task "
-     "id for reconciliation.", "LEGACY_UNAVAILABLE", ()),
+     "⚠️ PROMOTE_UNCONFIRMED: task 4f2a1c admission was not confirmed within 30 seconds; "
+     "the requested destination was new project 'Dinosaurs' and the effective one is "
+     "unknown until the admission is reconciled. Do not report this task as created and "
+     "do not retry automatically; keep this task id for reconciliation.", "", ()),
     ("route_rejected", "route_to_project",
      "⚠️ ROUTE_REJECTED: task 4f2a1c was not routed to project 'dinosaurs' "
-     "(target_not_steerable).", "LEGACY_BLOCKED", ()),
+     "(target_not_steerable).", "", ()),
     ("route_unconfirmed", "route_to_project",
      "⚠️ ROUTE_UNCONFIRMED: task 4f2a1c routing to project 'dinosaurs' was not durably "
      "confirmed. Do not report it as routed and do not retry automatically.",
-     "LEGACY_UNAVAILABLE", ()),
+     "", ()),
     # tools/control_runtime.py, control_scheduling.py, control_task_results.py —
     # owner item A.21 again. Every sentence below is either markerless (the deep
     # self-review notice, the depth-limit refusal, the unknown-task read, both
@@ -494,7 +511,7 @@ def build_corpus(root: pathlib.Path | None = None) -> tuple[Case, ...]:
             key=f"native:{code}:{identifier}",
             subject=f"native:{code}:{identifier}",
             tool="read_file",
-            text=f"⚠️ {identifier}: detail line",
+            text=f"⚠️ {identifier}{_DETAIL_SHAPES[0][1]}",
             code=code,
         ))
 
@@ -516,7 +533,17 @@ def build_corpus(root: pathlib.Path | None = None) -> tuple[Case, ...]:
 
 def typed_result(case: Case) -> ToolResult:
     """The typed result the runtime carries for one case: the producer's own when
-    it publishes a code, otherwise the single adapter's."""
+    it publishes a ``ToolResult``, otherwise the single adapter's reading of the
+    producer's actual string.
+
+    ``code`` is therefore a claim about the PRODUCER, never the expected answer —
+    a case may declare one only where the tool really publishes it. The four
+    control_routing receipts declared ``LEGACY_BLOCKED``/``LEGACY_UNAVAILABLE``
+    while their producers return plain strings, so the differential compared that
+    invented code against itself and passed while the classifier read a refused
+    promotion as SUCCESS. Their rows now carry no code, which puts the producer's
+    own sentence in front of the one classifier — the only thing that can fail.
+    """
     if not case.code:
         return LegacyTextResultAdapter.from_text(case.tool, case.text)
     from ouroboros.tools.tool_result import TOOL_CODE_SPECS

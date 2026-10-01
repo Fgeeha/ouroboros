@@ -1,7 +1,7 @@
-"""CPL4-C6 pins: the seq-preserving compaction pass over the monetary ledger.
+"""Pins the seq-preserving compaction pass over the monetary ledger.
 
-Design contract: docs/v7next/DESIGN_USAGE_COMPACTION.md. The invariants
-pinned here are monetary-authority invariants (owner sanction 1A):
+Design contract: docs/USAGE_COMPACTION.md. The invariants
+pinned here are monetary-authority invariants:
 
 1. decimal-exact money before/after; the production projections render EQUAL;
 2. in-flight (unsettled) rows never fold and stay transitionable;
@@ -10,7 +10,7 @@ pinned here are monetary-authority invariants (owner sanction 1A):
 6. idempotent kinds (subscription/external/legacy) never fold, so their replay dedup keeps working;
 7. trigger policy: config SSOT threshold, thrash guard, verify-abort = no-op.
 
-The reader side of the same organ — invariant 5 (the CPL-5 join across
+The reader side of the same organ — invariant 5 (the model-send join across
 chained compactions) and invariant 8 (baseline rows are legal only as the
 leading block) — lives in ``tests/test_usage_compaction_archive.py``; the
 fixtures both modules share live in ``tests/fixtures_usage_compaction.py``.
@@ -113,13 +113,21 @@ def _snapshot_looks(monkeypatch, on_look=lambda looks: None):
 
 
 def _projection_snapshot(data_root):
+    def breakdown(**kwargs):
+        result = ua.usage_breakdown(data_root, **kwargs)
+        # The compatibility writer's freshness marker advances across a real
+        # compaction; monetary/non-money projection equality intentionally
+        # excludes that ordering fact.
+        result.pop("_ledger_high_water_seq", None)
+        return result
+
     return (
         ua.usage_projection(data_root),
         ua.usage_projection(data_root, root_task_id="root"),
         ua.usage_projection(data_root, root_task_id="root2"),
-        ua.usage_breakdown(data_root),
-        ua.usage_breakdown(data_root, root_task_id="root"),
-        ua.usage_breakdown(data_root, task_id="t2"),
+        breakdown(),
+        breakdown(root_task_id="root"),
+        breakdown(task_id="t2"),
     )
 
 
@@ -161,6 +169,36 @@ def test_compaction_preserves_money_and_projections_exactly(data_root):
     assert groups
     assert all(isinstance(row.get("cost_usd"), str)
                for row in groups if row.get("cost_usd") is not None)
+
+
+def test_processing_components_survive_compaction_without_becoming_cash(data_root):
+    _seed_mixed_ledger(data_root)
+    receipt = {"requested": "fast", "submitted": "fast", "submittedNative": "fast",
+               "observed": "mixed", "observedNative": ["fast", "standard"],
+               "source": "native_telemetry", "reason": None}
+    for index, knowledge in enumerate(("exact", "unknown")):
+        request = ua.AttemptRequest("claudexor::test=model", "claudexor", drive_root=data_root,
+                                    task_id=f"mode-{index}", root_task_id="root", reservation_usd=1,
+                                    processing_preference="fast")
+        hold = ua.reserve_attempt(request)
+        ua.mark_dispatched(hold)
+        ua.settle_attempt(hold, {"processing": receipt, "cost_evidence": {
+            "knowledge": knowledge, "cashUsd": 0 if knowledge == "exact" else None,
+            "valuationUsd": 5.25, "valuationKnowledge": "exact",
+            "processing": {"nativeMode": "fast", "kind": "paid_credits", "source": "native_policy"}}},
+            cost_usd=0 if knowledge == "exact" else None, cost_final=knowledge == "exact")
+    ua.record_subscription_session("session-modes", drive_root=data_root, route="claude",
+        attempt_execution=[{"attemptId": "one", "harnessId": "claude", "processing": receipt,
+                            "usageCost": {"cashUsd": 0, "cashKnowledge": "unknown",
+                                          "valuationUsd": 10, "valuationKnowledge": "exact", "unknownUsd": 2}}])
+    before = _projection_snapshot(data_root)
+    component = before[0]["processing_summary"]
+    assert component["valuation_usd"] == 20.5 and component["unclassified_usd"] == 2
+    assert component["unknown_cash_rows"] == 2 and component["observed_modes"] == {"mixed": 3}
+    assert _compact(data_root) is not None
+    assert _projection_snapshot(data_root) == before
+    assert _compact(data_root) is not None
+    assert _projection_snapshot(data_root) == before
 
 
 def test_group_sums_survive_beyond_the_default_decimal_precision(data_root, monkeypatch):
@@ -898,3 +936,22 @@ def test_verify_abort_on_foreign_noncanonical_literal(data_root):
     before_bytes = path.read_bytes()
     assert _compact(data_root) is None
     assert path.read_bytes() == before_bytes
+
+
+def test_a_session_row_carrying_normalized_counters_survives_compaction(data_root):
+    """The optional input split rides an idempotency-bearing row, so the pass
+    retains its content rather than folding it into a baseline group."""
+    counters = {"total_tokens": 270, "cache_read_tokens": 130, "cache_write_tokens": None}
+    _seed_mixed_ledger(data_root)
+    ua.record_subscription_session("sess-counters", drive_root=data_root, route="claudexor:codex",
+                                   model="fable", task_id="t7", root_task_id="root", spend_usd=0.25,
+                                   input_token_usage=counters)
+    before = next(row for row in _ledger_rows(data_root) if row.get("session_id_sha256")
+                  and row.get("input_token_usage"))
+    assert _compact(data_root) is not None
+    after = next(row for row in _ledger_rows(data_root)
+                 if row.get("attempt_id") == before["attempt_id"])
+    resequenced = ("seq", "pre_compaction_seq")  # the pass renumbers, never rewrites
+    assert {key: value for key, value in after.items() if key not in resequenced} == \
+           {key: value for key, value in before.items() if key not in resequenced}
+    assert after["input_token_usage"] == counters

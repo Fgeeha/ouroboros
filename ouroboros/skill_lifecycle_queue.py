@@ -17,6 +17,9 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Deque, Dict, Optional
 
 from ouroboros.utils import utc_now_iso as _now_iso
+from ouroboros.config import runtime_setting
+import contextvars
+from ouroboros.settings_integrity import copy_task_settings_context
 
 log = logging.getLogger(__name__)
 
@@ -169,7 +172,7 @@ def _notify_chat_progress(job: LifecycleJob, phase: str) -> None:
             is_progress=True,
             task_id=_chat_task_id(job),
             progress_meta={"lifecycle": lifecycle},
-        )
+            role="system", system_type="skill_lifecycle")
     except Exception:
         return
 
@@ -211,7 +214,7 @@ def _notify_duplicate_pointer(requested: LifecycleJob, existing: LifecycleJob) -
                 "presentation_owner_task_id": existing.presentation_owner_task_id,
                 "source": existing.source,
             }},
-        )
+            role="system", system_type="skill_lifecycle_pointer")
     except Exception:
         return
 
@@ -226,7 +229,7 @@ def _lifecycle_deadline_sec() -> float:
     """
     from ouroboros.config import SETTINGS_DEFAULTS
 
-    raw = os.environ.get("OUROBOROS_SKILL_LIFECYCLE_TIMEOUT_SEC", "")
+    raw = runtime_setting("OUROBOROS_SKILL_LIFECYCLE_TIMEOUT_SEC", "")
     try:
         parsed = float(raw)
         if parsed > 0:
@@ -275,21 +278,6 @@ def _release_dedupe(job: LifecycleJob) -> None:
     with _state_lock:
         if _dedupe_jobs.get(job.dedupe_key) is job:
             _dedupe_jobs.pop(job.dedupe_key, None)
-
-
-@contextlib.contextmanager
-def skill_lifecycle_file_lock(drive_root: pathlib.Path):
-    from ouroboros.platform_layer import file_lock_exclusive, file_unlock
-
-    lock_dir = pathlib.Path(drive_root) / "state"
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = lock_dir / "skill_lifecycle.lock"
-    with lock_path.open("a+") as fh:
-        file_lock_exclusive(fh.fileno())
-        try:
-            yield
-        finally:
-            file_unlock(fh.fileno())
 
 
 @contextlib.asynccontextmanager
@@ -545,7 +533,9 @@ def run_lifecycle_job_blocking(
         except BaseException as exc:
             box["error"] = exc
 
-    thread = threading.Thread(target=_thread_main, name=f"skill-lifecycle-{kind}", daemon=False)
+    settings_context = contextvars.Context()
+    copy_task_settings_context(settings_context)
+    thread = threading.Thread(target=settings_context.run, args=(_thread_main,), name=f"skill-lifecycle-{kind}", daemon=False)
     thread.start()
     thread.join(timeout=_lifecycle_deadline_sec())
     if thread.is_alive():

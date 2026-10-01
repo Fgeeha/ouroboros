@@ -34,6 +34,9 @@ import logging
 import pathlib
 from typing import Any, Callable, Dict, List, Optional
 
+from ouroboros.review_projection import (
+    PLAN_REVIEW_ANSWERED_OPEN, PLAN_REVIEW_NONE_ANSWERED, PLAN_REVIEW_UNANSWERED,
+)
 from ouroboros.utils import update_json_locked, utc_now_iso
 
 log = logging.getLogger(__name__)
@@ -433,6 +436,8 @@ def acceptance_skip_applied(
         {"trigger": "owner_hurry", "skipped": "owner_hurry"},
     )
     set_decision(llm_trace, skip)
+    from ouroboros.acceptance_history import seed_acceptance_history
+    seed_acceptance_history(ctx, llm_trace, REASON_OWNER_HURRY)
     root = getattr(ctx, "budget_drive_root", "") or drive_root
     if root:
         record_effect(
@@ -454,6 +459,62 @@ def _plan_review_engaged(state: Any) -> bool:
                 or legacy.get("status") not in (None, "", "absent"))
 
 
+def plan_wave_only_awaited(wave: Any) -> bool:
+    """Whether the wave is open ONLY because reviewers had not answered yet.
+
+    Typed facts alone: every unanswered slot is a planned wait that carries no answer
+    (the census names no unresolved, uncollected, refused or failed slot), and the
+    recorded answers hold no verdict of their own beneath the stored placeholder. A
+    collected blocking or ``need_evidence`` finding keeps the wave open whatever the
+    awaited slots answer, so it never reads as a mere wait; notes are neutral (they
+    never move the verdict), so a quorum whose only findings are notes is still a mere
+    wait. A roster or a quorum the typed facts cannot vouch for is never a mere wait."""
+    from ouroboros.tools.plan_review_runtime import plan_wave_slot_census
+
+    if not isinstance(wave, dict) or not wave.get("custody_pending"):
+        return False
+    roster, findings = wave.get("actors"), wave.get("findings") or []
+    census = plan_wave_slot_census(wave)
+    if (not isinstance(roster, list) or len(roster) != census["configured"] or not census["awaiting"]
+            or any(census[name] for name in ("unresolved", "uncollected", "skipped", "failed"))
+            or any(row.get("ok") or row.get("parsed") is not None or str(row.get("raw_text") or "").strip()
+                   for row in census["awaiting"])):
+        return False
+    counts = wave.get("counts") if isinstance(wave.get("counts"), dict) else {}
+    quorum = counts.get("quorum")
+    return not (type(quorum) is not int or quorum <= 0 or not isinstance(findings, list)
+                or any(not isinstance(item, dict) or item.get("class") != "note" for item in findings))
+
+
+def plan_review_class_facts(wave: Any, *, awaited: bool) -> Dict[str, Any]:
+    """The typed outcome CLASS of an OPEN plan wave at delivery, with its answer counts.
+
+    Closed vocabulary (``review_projection``): ``answered_open`` — every slot
+    answered and the verdict was not closed; ``unanswered`` — at least one slot
+    answered and at least one failed, was refused at $0, expired or was never
+    collected; ``none_answered`` — nobody answered and at least one slot failed, was refused
+    or is unresolved (an awaited sibling does not hide that). The
+    awaited case is ``review_only_awaited`` and carries no class; the counts ride in
+    every case for the mind's own reading of the gate."""
+    from ouroboros.tools.plan_review_runtime import plan_wave_slot_census
+
+    census = plan_wave_slot_census(wave)
+    answered, configured = len(census["answered"]), int(census["configured"])
+    facts: Dict[str, Any] = {"reviewers_answered": answered, "reviewers_configured": configured}
+    silent = any(census[name] for name in ("failed", "skipped", "unresolved", "uncollected"))
+    if awaited or not configured:
+        return facts
+    if answered == configured:
+        facts["plan_review_class"] = PLAN_REVIEW_ANSWERED_OPEN
+    elif answered and silent:
+        facts["plan_review_class"] = PLAN_REVIEW_UNANSWERED
+    elif not answered and silent:
+        # Nobody answered and at least one reviewer failed, was refused or is unresolved:
+        # an awaited sibling does not turn that into "work went on with what they said".
+        facts["plan_review_class"] = PLAN_REVIEW_NONE_ANSWERED
+    return facts
+
+
 def force_plan_decision(
     ctx: Any, llm_trace: Dict[str, Any], *,
     hard_rail: str = "", enforcement: Optional[str] = None,
@@ -467,18 +528,17 @@ def force_plan_decision(
     blocking enforcement whoever opened it). While the hurry latch is armed, the
     projection is computed under a TASK-LOCAL advisory enforcement (§19.7.2 item
     9): ``reviewed``/``open``/``unavailable`` states may proceed locally while
-    ``absent``/``pending`` remain hold — durable review state, reviewer calls, and
-    the configured global enforcement are untouched, and the attribution rides the
-    decision for the task detail.
+    ``absent``/``pending`` remain hold. Free collection may update the recorded
+    wave feedback; paid dispatch and configured global enforcement are unchanged,
+    and the attribution rides the decision for the task detail.
 
     ``enforcement`` is supplied by the loop wrapper from ITS module namespace so
     the existing ``loop.get_review_enforcement`` test/monkeypatch seam holds.
     """
+    reconcile_transferred_obligation(ctx)
     metadata = getattr(ctx, "task_metadata", {})
     metadata = metadata if isinstance(metadata, dict) else {}
     not_required = {"required": False, "allow": True, "status": "not_required"}
-    if bool(getattr(ctx, "is_ephemeral_turn", False)):
-        return not_required
     from ouroboros.task_results import (
         current_plan_review_wave, load_plan_review_state, plan_review_gate_projection,
     )
@@ -502,23 +562,119 @@ def force_plan_decision(
         enforcement = get_review_enforcement()
     hurry_armed = latched(ctx) is not None
     effective = "advisory" if hurry_armed else enforcement
+    # Already-paid feedback belongs in every verdict, including advisory/hurry.
+    # Collection reads the current wave at zero wait and never starts a panel.
+    if isinstance(state, dict):
+        from ouroboros.tools.plan_review_collect import collect_before_gate
+
+        state = collect_before_gate(ctx, state)
     decision = {
         "required": True,
         "self_opened": not bool(metadata.get("force_plan")),
         **plan_review_gate_projection(state, effective, hard_rail=hard_rail),
     }
+    wave = {} if decision.get("closed") else (current_plan_review_wave(state) or {})
     if decision.get("reviewer_slots_degraded"):
         # The reminder's replay promise is conditional on the recorded wave's
         # structural health epoch (empty epoch = a re-dispatch is PAID), so the
         # epoch fact rides the decision for plan_review_reminder.
-        decision["degraded_health_epoch"] = (
-            (current_plan_review_wave(state) or {}).get("health_epoch") or "")
+        decision["degraded_health_epoch"] = wave.get("health_epoch") or ""
+    if wave.get("custody_pending"):
+        # A paid reviewer slot can still settle (plan_review_runtime records the
+        # wave DEGRADED and open for exactly that reason), so the disclosure must
+        # say a result is still owed instead of implying the panel is over.
+        decision["review_late_result_pending"] = True
+        # An advisory release over a wave that is merely awaited is a gap, not a
+        # degradation: the disclosure stays loud and the task is not stamped for it.
+        # A rail, a spent cap and every blocking exit keep their own outcome.
+        if (decision.get("status") == "advisory_open" and not hard_rail
+                and not decision.get("review_capacity_reason") and plan_wave_only_awaited(wave)):
+            decision["review_only_awaited"] = True
+    if wave:
+        # The open wave's typed outcome class and its answer counts ride the decision
+        # into the delivery record (outcomes.derive_loop_outcome) and the forced prompt.
+        decision.update(plan_review_class_facts(wave, awaited=bool(decision.get("review_only_awaited"))))
     if hurry_armed and str(enforcement or "").lower() == "blocking":
-        # Attribution only (task detail); the durable state and the configured
-        # global enforcement are byte-identical before/after.
+        # Attribution only (task detail); this changes no global enforcement.
         decision["owner_hurry_local_advisory"] = True
         decision["configured_enforcement"] = "blocking"
     return decision
+
+
+def reconcile_transferred_obligation(ctx: Any) -> str:
+    """Release the worker's copy of an obligation the supervisor already moved.
+
+    A promote/route admitted AFTER the tool's wait returned unconfirmed still
+    records the transfer durably (the promoter's task result carries
+    ``force_plan_transfer.to``); without this read the worker's metadata kept
+    ``force_plan`` and its finalization held for a plan the new root owes.
+    Returns the task id the obligation moved to, or '' when nothing moved."""
+    metadata = getattr(ctx, "task_metadata", {})
+    metadata = metadata if isinstance(metadata, dict) else {}
+    if metadata.get("force_plan") is not True:
+        return ""
+    task_id = str(getattr(ctx, "task_id", "") or "").strip()
+    root = _canonical_root(ctx)
+    if not task_id or root is None:
+        return ""
+    try:
+        from ouroboros.task_results import load_task_result
+
+        transfer = (load_task_result(root, task_id) or {}).get("force_plan_transfer")
+    except Exception:
+        log.debug("force_plan transfer read failed for %s", task_id, exc_info=True)
+        return ""
+    moved_to = str((transfer or {}).get("to") or "").strip() if isinstance(transfer, dict) else ""
+    if moved_to:
+        release_force_plan_obligation(ctx, moved_to)
+    return moved_to
+
+
+def unmet_force_plan_obligation(ctx: Any) -> Dict[str, Any]:
+    """Does THIS task still owe a plan review nobody has started (owner 3=A)?
+
+    A Swarm-admitted root carries ``force_plan`` in its metadata; the obligation
+    is MET once the task entered the plan-review gate (a wave recorded for it --
+    ``_plan_review_engaged`` on the same durable state ``force_plan_decision``
+    projects), because from then on the gate binds the task itself. Only an
+    UNMET obligation follows the work a promote moves elsewhere. An unreadable
+    state is not proof of anything and transfers nothing (I-17: a gate that
+    cannot read its authority is engaged, not absent).
+    """
+    if reconcile_transferred_obligation(ctx):
+        return {"unmet": False, "reason": "transferred"}
+    metadata = getattr(ctx, "task_metadata", {})
+    metadata = metadata if isinstance(metadata, dict) else {}
+    if metadata.get("force_plan") is not True:
+        return {"unmet": False, "reason": "not_required"}
+    task_id = str(getattr(ctx, "task_id", "") or "").strip()
+    root = _canonical_root(ctx)
+    if not task_id or root is None:
+        return {"unmet": False, "reason": "no_task_identity"}
+    from ouroboros.task_results import load_plan_review_state
+
+    try:
+        state = load_plan_review_state(root, task_id)
+    except (OSError, TimeoutError, ValueError):
+        log.warning("Unable to read durable force-plan review state", exc_info=True)
+        return {"unmet": False, "reason": "plan_review_state_unreadable"}
+    if _plan_review_engaged(state):
+        return {"unmet": False, "reason": "plan_review_engaged"}
+    return {
+        "unmet": True,
+        "source": str(metadata.get("force_plan_source") or "operator").strip() or "operator",
+    }
+
+
+def release_force_plan_obligation(ctx: Any, transferred_to: str) -> None:
+    """The worker's copy of the fact the supervisor released in the promote
+    transaction: ``force_plan_decision`` reads this metadata, so the promoter's
+    own finalization stops requiring a plan the new root now owes."""
+    metadata = getattr(ctx, "task_metadata", None)
+    if not isinstance(metadata, dict):
+        return
+    metadata["force_plan"] = False
+    metadata["force_plan_transferred_to"] = str(transferred_to or "")
 
 
 def plan_review_reminder(decision: Dict[str, Any]) -> str:
@@ -530,7 +686,35 @@ def plan_review_reminder(decision: Dict[str, Any]) -> str:
     if status == "legacy_open_requires_resubmission":
         return (
             f"{tag} An open plan review from a previous schema cannot be honored. Re-call "
-            "plan_task with your goal, plan and spec to start a fresh review before finalizing."
+            "plan_task with your goal, plan and spec — including affected_paths, the files the "
+            "work will change ([] when none) — to start a fresh review before finalizing."
+        )
+    from ouroboros.review_cycles import review_max_cycles
+
+    cap = review_max_cycles()
+    if cap is not None and int(decision.get("cycles_paid") or 0) >= cap:
+        return (
+            f"{tag} The paid plan-review cycle cap is reached; the task cannot dispatch another paid panel "
+            "for either an unchanged or revised request. The recorded findings and lawful free "
+            "dispositions remain available; a disposition does not close blocking findings "
+            "or a degraded wave. Existing in-flight custody can still settle."
+        )
+    if decision.get("historical_critic"):
+        # The aggregate and its custody/degraded facts belong to the plan this author
+        # REVISED, so none of the outcome-keyed advice below applies to the current one:
+        # telling the agent to dispose "the latest fingerprint" would point it at a wave
+        # that cannot approve these bytes.
+        return (
+            f"{tag} Plan review is OPEN: the referenced critic reviewed the EARLIER plan "
+            f"({outcome or 'unavailable'}); the revised plan has no verdict of its own. Call "
+            "plan_task with the current goal, plan and spec to have it reviewed — a disposition "
+            "on the earlier wave cannot approve the revised plan. Implementation stays held."
+        )
+    if decision.get("custody_pending"):
+        return (
+            f"{tag} Plan review is OPEN: reviewer work is still running or awaiting collection. "
+            "The recorded wave retains those results; no final reviewer quorum is established yet. "
+            "Implementation stays held while the review is open."
         )
     if decision.get("reviewer_slots_degraded"):
         # B2: facts, never a retry coach (P5). The replay promise is CONDITIONAL —
@@ -549,21 +733,25 @@ def plan_review_reminder(decision: Dict[str, Any]) -> str:
         )
     if outcome == "REVIEW_REQUIRED":
         return (
-            f"{tag} Blocking plan review remains REVIEW_REQUIRED. Re-call plan_task with a "
-            "complete review_disposition as the only field, naming the latest fingerprint, "
-            "then continue; do not rerun reviewers."
+            f"{tag} Blocking plan review remains REVIEW_REQUIRED. Open need_evidence requests close "
+            "with a $0 review_disposition naming the latest fingerprint; a blocking finding below quorum "
+            "stays open until its slot no longer raises it in a later paid cycle (the unchanged envelope "
+            "with your items asks only that slot) or a changed spec is reviewed without it. "
+            "Implementation stays held while the review is open."
         )
     if outcome == "REVISE_PLAN":
         return (
-            f"{tag} Blocking plan review requires a revised spec. Change the spec and call "
-            "plan_task again (or reject the blocking findings with a rationale via "
-            "review_disposition). Continue analysis and non-mutating preparation, but do not "
-            "begin the work before the review closes or a real task-wide rail fires."
+            f"{tag} Blocking plan review is REVISE_PLAN. A changed spec — with affected_paths, the files "
+            "the work will change ([] when none) — is a new envelope every slot reviews; the unchanged "
+            "envelope with review_disposition items asks only the slots those items name. Analysis and "
+            "non-mutating preparation remain open; the work starts after the review closes — a task-wide "
+            "rail releases finalization, never implementation."
         )
     return (
-        f"{tag} Call plan_task with a concrete goal, plan and spec. If review infrastructure "
+        f"{tag} Call plan_task with a concrete goal, plan and spec, whose affected_paths lists "
+        "the files the work will change ([] when none). If review infrastructure "
         "is unavailable, continue analysis and non-mutating preparation, but do not begin the "
-        "work before the review closes or a real task-wide rail fires."
+        "work before the review closes; a task-wide rail releases finalization, never implementation."
     )
 
 
@@ -574,21 +762,53 @@ def plan_review_disclosure(decision: Dict[str, Any], forced_reason: str = "") ->
     if not decision.get("required") or decision.get("status") == "closed":
         return ""
     outcome = str(decision.get("outcome") or "")
-    if decision.get("reviewer_slots_degraded"):
+    if decision.get("custody_pending") or decision.get("review_late_result_pending"):
+        # No verdict exists yet: the stored aggregate only keeps the wave open, so its token is not shown as one.
+        outcome = "reviewer work is running or awaiting collection"
+    elif decision.get("reviewer_slots_degraded"):
         outcome = f"{outcome or 'open'}; no parseable reviewer quorum"
+    # A historical critic's aggregate is EVIDENCE about the plan the author corrected,
+    # never this plan's own verdict: unlabelled, "(GREEN)" reads to the owner as
+    # approval of bytes no reviewer ever saw.
+    if decision.get("historical_critic") and outcome:
+        outcome = (f"referenced critic review of the earlier plan: {outcome}; "
+                   "the current plan has no verdict of its own")
     subject = "Blocking plan review" if decision.get("enforcement") == "blocking" else "Plan review"
+    # The wave is still OPEN at finalization, so the verb says so: "remained"
+    # told the owner a panel had ended that nobody had closed. When a slot can
+    # still settle, the same sentence carries that typed fact — never as "paid":
+    # a slot released at the barrier is $0 until its settled row proves the send.
+    late = (
+        " A reviewer slot can still settle, so a late result is still owed."
+        if decision.get("review_late_result_pending") else ""
+    )
+    # The author's decision and the rail that forced finalization are BOTH true, and
+    # the rail is what explains why the task ended. Returning the author sentence first
+    # dropped "the cap is spent; the task ends blocked" whenever both applied, so the
+    # author clause now rides the rail's own sentence instead of replacing it.
+    author_note = ""
+    if decision.get("author_action"):
+        action = str(decision["author_action"])
+        result = ("the author stopped with unfinished work" if action == "stop" else
+                  "the current plan was accepted by its author under advisory enforcement"
+                  if decision.get("allow") and decision.get("enforcement") == "advisory" else
+                  "the revised author plan has no current critic approval")
+        author_note = (f" Plan author decision: {action}; {result}. "
+                       "The author decision does not close or replace the critic review.")
     if decision.get("status") == "rail_degraded":
-        rail_reason = str(forced_reason or decision.get("reason") or "task_rail")
+        rail_reason = str(forced_reason or decision.get("reason") or "")
         detail = f" ({outcome})" if outcome else ""
+        # An absent rail reason renders as absence, never as an internal token.
+        rail = f"the task-wide rail `{rail_reason}`" if rail_reason else "a task-wide rail"
         return (
-            f"\n\n⚠️ {subject} remained open{detail} when the task-wide rail "
-            f"`{rail_reason}` required best-effort finalization."
+            f"\n\n⚠️ {subject} is open{detail}; {rail} required best-effort "
+            f"finalization.{author_note}{late}"
         )
     if decision.get("status") == "cycles_exhausted" and decision.get("enforcement") == "blocking":
         return (
             f"\n\n⚠️ Blocking plan review stayed open ({outcome or 'open'}) with the review-cycle "
-            f"cap spent ({decision.get('cycles_paid')} paid cycle(s)); the task is finalized as "
-            "blocked_with_evidence — the planned work must not be treated as done."
+            f"cap spent ({decision.get('cycles_paid')} paid cycle(s)); the task ends blocked "
+            f"with its evidence recorded; the planned work must not be treated as done.{author_note}"
         )
     if decision.get("quorum_unreachable") and decision.get("enforcement") == "blocking":
         # B2b: the agent chose the honest blocked terminal while the reviewer quorum
@@ -598,14 +818,21 @@ def plan_review_disclosure(decision: Dict[str, Any], forced_reason: str = "") ->
             f"\n\n⚠️ Blocking plan review stayed open ({outcome or 'open'}) with its reviewer "
             "quorum structurally unreachable (typed window-exhausted reviewer lanes"
             + (f"; earliest recorded reset {reset}" if reset else "")
-            + "); the task is finalized as blocked_with_evidence — the planned work must "
-            "not be treated as done."
+            + "); the task ends blocked with its evidence recorded; the planned work "
+            f"must not be treated as done.{author_note}"
         )
-    if decision.get("allow"):
+    # An author stop carries allow=True in EVERY enforcement, so the generic branch
+    # below would tell the owner "work proceeded under advisory enforcement" about a
+    # blocking stop that finished nothing. It falls to the author fallback instead.
+    if decision.get("allow") and decision.get("status") != "author_stopped":
         return (
-            f"\n\n⚠️ Plan review remained {outcome or 'unavailable'}; work proceeded under the "
-            "owner-selected advisory enforcement."
+            f"\n\n⚠️ Plan review is still open ({outcome or 'unavailable'}); work proceeded "
+            f"under the owner-selected advisory enforcement.{author_note}{late}"
         )
+    # Blocking, no rail, an author decision recorded: the decision is the only thing
+    # that happened and the owner still has to hear it, with the review's own state.
+    if author_note:
+        return f"\n\n⚠️ {subject} is open ({outcome or 'unavailable'}).{author_note}{late}"
     return ""
 
 

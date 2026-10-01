@@ -8,12 +8,26 @@ import threading
 import time
 import types
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
+from tests.test_swarm_host_admission import host  # noqa: F401
+
 
 pytestmark = pytest.mark.serial
+
+
+def _owner_stamp(client_message_id, text="owner text"):
+    """The owner door's stamp on a direct turn (ref + retained text, written together
+    at ingress): the one fact that makes it an owner turn."""
+    from ouroboros.project_dialogue import build_owner_message_ref
+
+    ref = build_owner_message_ref(
+        chat_id=1, client_message_id=client_message_id, ts="2026-09-24T00:00:00+00:00", text=text,
+    )
+    return {"origin_message_ref": ref, "origin_message_text": text}
 
 
 @pytest.fixture(autouse=True)
@@ -271,7 +285,7 @@ def test_tool_snapshot_precheck_skips_source_side_effects(monkeypatch, tmp_path)
         source="/tmp/must-not-attach",
         predecessor_task_id="",
     )
-    assert out.startswith("PROMOTE_REJECTED:")
+    assert out.startswith("⚠️ PROMOTE_REJECTED:")
     assert "worker_crash_storm" in out
     assert ctx.pending_events == []
 
@@ -403,7 +417,9 @@ def test_route_to_project_waits_for_same_durable_admission(monkeypatch, tmp_path
         pending_events=[],
         current_chat_id=1,
         drive_root=tmp_path,
-        task_metadata={"client_message_id": "route-owner-1"},
+        is_direct_chat=True,
+        task_metadata={"client_message_id": "route-owner-1",
+                       **_owner_stamp("route-owner-1")},
     )
     try:
         with ThreadPoolExecutor(max_workers=1) as executor:
@@ -469,8 +485,10 @@ def test_manual_target_tool_waits_for_durable_handler_receipt(monkeypatch, tmp_p
         pending_events=[],
         current_chat_id=1,
         drive_root=tmp_path,
+        is_direct_chat=True,
         task_metadata={
             "client_message_id": "manual-owner-1",
+            **_owner_stamp("manual-owner-1"),
             "routing_contract": {"manual_options": [{"kind": "new_task"}]},
         },
     )
@@ -513,7 +531,10 @@ def test_steer_tool_reports_delivery_only_after_mailbox_receipt(
         pending_events=[],
         current_chat_id=1,
         drive_root=tmp_path,
-        task_metadata={"client_message_id": "steer-owner-1"},
+        is_direct_chat=True,
+        task_metadata={"client_message_id": "steer-owner-1",
+                       # The turn's first act relays the owner's own bytes: the steer IS them.
+                       **_owner_stamp("steer-owner-1", text="Use the new data")},
     )
     handler_ctx = types.SimpleNamespace(
         DRIVE_ROOT=tmp_path,
@@ -538,6 +559,7 @@ def test_steer_tool_reports_delivery_only_after_mailbox_receipt(
 
 
 def test_stale_live_transport_returns_unconfirmed_not_ok(monkeypatch, tmp_path):
+    from ouroboros.task_results import STATUS_REQUESTED, load_task_result
     from ouroboros.tools import control, control_events
 
     monkeypatch.setattr(control_events, "_PROMOTE_CONFIRM_TIMEOUT_SEC", 0.05)
@@ -554,9 +576,14 @@ def test_stale_live_transport_returns_unconfirmed_not_ok(monkeypatch, tmp_path):
         out = control._promote_chat_to_task(ctx, "Never drained", predecessor_task_id="")
         event = stale_queue.get(timeout=10)
         assert event["type"] == "promote_chat_to_task"
-        assert out.startswith("PROMOTE_UNCONFIRMED:")
+        assert out.startswith("⚠️ PROMOTE_UNCONFIRMED:")
         assert "Do not report this task as created" in out
-        assert not (tmp_path / "task_results" / f"{event['task_id']}.json").exists()
+        # #1160: the id is durably PENDING, never scheduled - the emitted stub is
+        # exactly the reconciliation read the refusal names, and it grants nothing.
+        stored = load_task_result(tmp_path, event["task_id"])
+        assert stored["status"] == STATUS_REQUESTED
+        assert stored["promotion_admission"]["status"] == "emitted"
+        assert stored["promotion_admission"]["routing_token"] == event["routing_token"]
     finally:
         stale_queue.close()
         stale_queue.cancel_join_thread()
@@ -609,41 +636,40 @@ def test_unpicklable_control_event_fails_before_feeder_thread(tmp_path):
         ctx.event_queue.cancel_join_thread()
 
 
-def test_snapshot_persistence_failure_rolls_back_pending(monkeypatch, tmp_path):
-    import supervisor.workers as workers
+def test_snapshot_persistence_failure_preserves_pending_and_inputs(host, monkeypatch, tmp_path):  # noqa: F811
+    from ouroboros.projects_registry import create_project
     from ouroboros.task_results import load_task_result
+    from supervisor import queue
     from supervisor.events import _handle_promote_chat_to_task
 
-    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
-    pending = []
-
-    def enqueue(task):
-        pending.append(dict(task))
-        return task
-
-    ctx = types.SimpleNamespace(
-        DRIVE_ROOT=tmp_path,
-        WORKERS={0: types.SimpleNamespace()},
-        PENDING=pending,
-        bridge=None,
-        enqueue_task=enqueue,
-        persist_queue_snapshot=lambda **_kwargs: False,
-        load_state=lambda: {"owner_chat_id": 1},
-        append_jsonl=lambda *_args, **_kwargs: None,
-    )
+    create_project(host.root, "target")
+    source = tmp_path / "input.txt"
+    source.write_text("retain this input after ambiguous admission", encoding="utf-8")
+    monkeypatch.setattr(host.ctx, "persist_queue_snapshot", lambda **_kwargs: False)
     outcome = _handle_promote_chat_to_task(
         {
             "type": "promote_chat_to_task",
             "task_id": "snapfail",
             "routing_token": "snapfail-token",
             "objective": "Build",
+            "project_id": "target",
+            "workspace": "none",
+            "chat_id": 1,
+            "attachment_uploads": [{"path": str(source)}],
         },
-        ctx,
+        host.ctx,
     )
-    assert outcome["reason"] == "queue_snapshot_persist_failed"
-    assert pending == []
-    stored = load_task_result(tmp_path, "snapfail")
-    assert stored["promotion_admission"]["status"] == "rejected"
+    assert (outcome["status"], outcome["task_id"], outcome["reason"], bool(outcome.get("never_admitted"))) == (
+        "unconfirmed", "snapfail", "queue_snapshot_persist_failed", False)
+    [admitted] = host.pending
+    assert (admitted["id"], admitted["root_task_id"], admitted["admitted_dispatch"]) == ("snapfail", "snapfail", "none")
+    assert "snapfail" not in queue.ADMISSION_RESERVATIONS
+    assert len(admitted["attachments"]) == 1
+    staged = Path(admitted["attachments"][0]["abs_path"])
+    assert staged != source and staged.read_bytes() == source.read_bytes()
+    assert source.read_text(encoding="utf-8") == "retain this input after ambiguous admission"
+    # No definite refusal receipt may be forged after the real queue accepted it.
+    assert load_task_result(host.root, "snapfail") is None
 
 
 def test_missing_snapshot_persister_fails_closed(monkeypatch, tmp_path):
@@ -780,7 +806,7 @@ def test_exact_id_ingress_fails_closed_on_unreadable_result(monkeypatch, tmp_pat
     duplicate_reason = workers._promote_duplicate_reason(
         "malformed-id", types.SimpleNamespace(
             DRIVE_ROOT=tmp_path, PENDING=[], RUNNING={},
-        ),
+        ), admission_token="",
     )
 
     assert reservation == {"status": "blocked", "reason": "task_id_lookup_failed"}
@@ -820,7 +846,7 @@ def test_project_registry_lookup_failure_prevents_clone(monkeypatch, tmp_path):
     from ouroboros.promotion_source import resolve_promote_source
 
     monkeypatch.setattr(
-        "ouroboros.projects_registry.get_reserved_project",
+        "ouroboros.projects_registry.project_admission_view",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("registry unreadable")),
     )
     monkeypatch.setattr(
@@ -914,7 +940,10 @@ def test_source_resolution_runs_off_supervisor_loop_and_continues_once(
     release = threading.Event()
     continuation_bus = thread_queue.Queue()
 
-    def slow_resolve(_ctx, _source, project_id):
+    seen_names = []
+
+    def slow_resolve(_ctx, _source, project_id, *, project_name="", admission_basis_out=None):
+        seen_names.append(project_name)
         started.set()
         assert release.wait(2)
         return "", "source checked", "", project_id, False
@@ -946,6 +975,7 @@ def test_source_resolution_runs_off_supervisor_loop_and_continues_once(
         "routing_token": "source-token",
         "objective": "Inspect source",
         "source": "https://github.com/example/project.git",
+        "project_name": "Исходники проекта",
         "chat_id": 1,
     }
 
@@ -965,3 +995,6 @@ def test_source_resolution_runs_off_supervisor_loop_and_continues_once(
     assert load_task_result(tmp_path, "source-task")["promotion_admission"][
         "routing_token"
     ] == "source-token"
+    # The off-loop half registers the Project row first, so the model's display
+    # name has to reach it: the later named create finds the row and changes nothing.
+    assert seen_names == ["Исходники проекта"]

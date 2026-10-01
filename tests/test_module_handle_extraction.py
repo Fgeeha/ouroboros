@@ -57,9 +57,12 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
     "supervisor/events_schedule_task.py": ("supervisor/events.py", "_events", frozenset({
         "_parent_delegation_budget", "get_max_subagent_depth",
     })),
+    "supervisor/schedule_occurrence.py": ("supervisor/queue.py", "_queue", frozenset({
+        "DRIVE_ROOT",
+    })),
     "supervisor/queue_schedules.py": ("supervisor/queue.py", "_queue", frozenset({
         "DRIVE_ROOT", "PENDING", "RUNNING", "SCHEDULED_TASKS_FILE", "_queue_lock",
-        "enqueue_task", "load_state", "persist_queue_snapshot",
+        "load_state", "persist_queue_snapshot",  # admission enqueues in schedule_occurrence
     })),
     "supervisor/worker_chat_lane.py": ("supervisor/workers.py", "_pool", frozenset({
         "DRIVE_ROOT", "REPO_DIR", "_repo_writer_gate_lock", "chat_turn_liveness",
@@ -68,9 +71,11 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
         "repo_writer_admission_closed", "send_with_budget",
     })),
     "supervisor/worker_pool_lifecycle.py": ("supervisor/workers.py", "_pool", frozenset({
-        "DRIVE_ROOT", "MAX_WORKERS", "REPO_DIR", "WORKERS", "Worker", "_WORKER_PIDS_FILENAME",
-        "_WORKER_POOL_DISABLED_REASON",
-        "_get_ctx", "_reconcile_confirmed_dead_review_owner",
+        # Runtime676: execution reader/disable moved from the facade; RUNNING
+        # and patched sibling calls must remain late-bound through that facade.
+        "DRIVE_ROOT", "MAX_WORKERS", "REPO_DIR", "RUNNING", "WORKERS", "Worker", "_WORKER_PIDS_FILENAME",
+        "_WORKER_POOL_DISABLED_REASON", "_worker_pool_execution_state", "disable_exhausted_worker_pool",
+        "_get_ctx",
         "_verify_worker_sha_after_spawn", "get_event_q", "kill_workers", "load_state",
         "reconstruct_task_cost", "send_with_budget",
     })),
@@ -89,7 +94,7 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
     # tree did not bear it out, so the three invariants below were not running on
     # them. Sets are the tool-derived exact read sets on these bytes.
     "supervisor/queue_snapshot.py": ("supervisor/queue.py", "_queue", frozenset({
-        "ACCEPTANCE_FENCES", "BUDGET_ROOT_FENCES", "DRIVE_ROOT", "PENDING",
+        "ACCEPTANCE_FENCES", "BUDGET_ROOT_FENCES", "DRIVE_ROOT", "PENDING", "PRIOR_DIRECT_ROOTS",
         "QUEUE_SEQ_COUNTER_REF", "QUEUE_SNAPSHOT_PATH", "RUNNING", "_queue_lock",
         "append_jsonl", "atomic_write_text", "enqueue_task", "parse_iso_to_ts",
         "persist_queue_snapshot", "restore_invalid_depth_admission", "sort_pending",
@@ -117,12 +122,16 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
         "utc_now_iso",
     })),
     "supervisor/worker_health.py": ("supervisor/workers.py", "_pool", frozenset({
-        "CRASH_TS", "DRIVE_ROOT", "QUEUE_MAX_RETRIES", "RUNNING", "WORKERS",
+        # Runtime707: health hands off recovery; the reaper owns storm/respawn.
+        "DRIVE_ROOT", "QUEUE_MAX_RETRIES", "RUNNING", "WORKERS",
         "_LAST_SPAWN_TIME", "_SPAWN_GRACE_SEC", "_emit_task_done_terminal",
+        # #1196: completing a saved exact budget pause after a worker death re-parks
+        # the row into the pool's PENDING through the same handle.
+        "PENDING",
         "_ensure_workers_healthy_locked", "_reconcile_confirmed_dead_review_owner",
         "_worker_crash_storm_detected", "append_jsonl", "coerce_chat_identity",
-        "get_event_q", "kill_workers", "load_state", "reconstruct_task_cost",
-        "respawn_worker", "send_with_budget", "terminal_task_metadata",
+        "disable_exhausted_worker_pool", "get_event_q", "load_state", "reconstruct_task_cost",
+        "send_with_budget", "terminal_task_metadata",
         "utc_now_iso",
     })),
     # D10 lane rows (oracle ouroboros_v7_wip @ 9f691656). git_ops leaves carry
@@ -161,7 +170,7 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
         "write_text",
     })),
     "ouroboros/tools/git_review_cycle.py": ("ouroboros/tools/git.py", "_git", frozenset({
-        "IDENTICAL_DIFF_BLOCK_REASON", "_DOC_ONLY_EXTENSIONS", "_acquire_git_lock",
+        "_DOC_ONLY_EXTENSIONS", "_acquire_git_lock",
         "_advisory_and_tests_gate", "_aggregate_review_verdict",
         "_authorized_managed_update_resolver", "_check_overlapping_review_attempt",
         "_current_runtime_mode", "_ensure_gitignore", "_finalize_blocked_review",
@@ -202,6 +211,7 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
     })),
     "supervisor/git_ops_reset.py": ("supervisor/git_ops.py", "_go", frozenset({
         "BRANCH_DEV", "BRANCH_STABLE", "DRIVE_ROOT", "REPO_DIR",
+        "_git_network_bounded",
         "_admission_gate_for_unsynced_tree",
         "_clear_bootstrap_pin_marker", "_clear_update_intent",
         "_collect_repo_sync_state", "_compute_ref_ahead_count",
@@ -210,8 +220,8 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
         "_preserve_branch_for_official_reset", "_read_managed_repo_meta",
         "_read_update_intent", "_ref_points_at_ref", "_rescue_untracked_incomplete",
         "_run_git_resilient", "_update_source", "append_jsonl", "git_capture",
-        "checkout_and_reset", "current_drive_root", "import_test", "load_state",
-        "preserve_local_ref_branch", "rescue_git_capture", "save_state",
+        "checkout_and_reset", "current_drive_root", "import_test",
+        "preserve_local_ref_branch", "rescue_git_capture", "update_state",
         "sync_runtime_dependencies", "utc_now_iso",
     })),
     "supervisor/git_ops_updates.py": ("supervisor/git_ops.py", "_go", frozenset({
@@ -238,7 +248,8 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
         "cancel_and_verify", "close_absent_run", "daemon_says_absent", "emit",
         "is_terminal", "open_runs", "output_disposition", "pending_invocations",
         "record_containment_fault", "record_settled_unread", "record_started",
-        "replay", "retire_settled_registrations", "settle_run",
+        "replay", "retire_settled_registrations", "review_owned_source",
+        "settle_run", "summary_of",
     })),
     "ouroboros/tools/delegate_payload_patch.py": ("ouroboros/tools/delegate_integration.py", "_di", frozenset({
         "_rebind_payload_reference", "_resolved", "payload_content_hash",
@@ -259,7 +270,7 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
     # call time goes through `_delegate()` (the reference cut this leaf with
     # plain preamble imports and declared only _emit).
     "ouroboros/tools/delegate_terminal_evidence.py": ("ouroboros/tools/delegate.py", "_delegate", frozenset({
-        "_Breach", "_PAYLOAD_ENVELOPE_HEADROOM", "_emit", "_home_isolation_breach",
+        "_Breach", "_PAYLOAD_ENVELOPE_HEADROOM", "_capture_terminal_patch", "_emit", "_home_isolation_breach",
         "_preview_payload", "_resolve_full_primary_output", "_stage_full_output",
         "_widened_access", "add_terminal_source_verification", "custody",
         "home_nested_under_operator_home", "tool_result_limit",
@@ -278,15 +289,15 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
     })),
     "ouroboros/loop_acceptance.py": ("ouroboros/loop.py", "_loop", frozenset({
         "_append_or_merge_user_message", "_end_task_acceptance_fence",
-        "_set_acceptance_decision", "_task_acceptance_eligible", "get_task_review_mode",
+        "_set_acceptance_decision", "_task_acceptance_eligible", "get_task_review_mode", "get_review_enforcement",
     })),
     "ouroboros/loop_acceptance_review.py": ("ouroboros/loop.py", "_loop", frozenset({
-        "_append_or_merge_user_message", "_begin_task_acceptance_fence",
+        "_append_or_merge_user_message", "_arm_delivery_control", "_begin_task_acceptance_fence",
         "_collect_acceptance_obligations", "_dispose_obligations_on_clean_pass",
         "_end_task_acceptance_fence", "_execute_task_acceptance_panel",
         "_extract_plain_text_from_content", "_format_obligations_clause",
         "_latch_final_answer_marker", "_mark_root_acceptance_checkpoint",
-        "_open_acceptance_obligations", "_set_acceptance_decision",
+        "_no_tool_final_answer", "_open_acceptance_obligations", "_replace_delivery_candidate", "_set_acceptance_decision",
         "_supersede_task_acceptance_for_evidence_change",
         "_supersede_task_acceptance_for_owner_followup", "_task_acceptance_eligible",
         "_task_acceptance_owner_generation_changed", "_task_acceptance_subtree_snapshot",
@@ -305,7 +316,7 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
         "_delivery_evidence_state", "_emit_checkpoint_event",
         "_finalize_forced_services", "_finalize_task_services",
         "_force_plan_disclosure", "_forced_fallback_result",
-        "_forced_final_answer", "_forced_swarm_router_result",
+        "_forced_final_answer",
         "_hold_delivery_for_skill_action", "_live_delivery_candidate",
         "_loop_tree_accounting", "_merge_finalization_trace", "_note_nanny_delegate_activity",
         "_prepare_forced_prompt", "_prepare_post_tool_budget_context",
@@ -314,60 +325,44 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
         "_undispositioned_children",
     })),
     "ouroboros/loop_delivery.py": ("ouroboros/loop.py", "_loop", frozenset({
-        "DeliveryCandidate", "_LoopExitContext",
-        "_append_or_merge_user_message", "_arm_delivery_control",
-        "_child_disposition_state", "_current_delivery_candidate",
-        "_compute_subagent_handoff", "_delivery_evidence_state",
-        "_delivery_replace_required", "_direct_child_results",
-        "_drain_incoming_messages", "_enforce_swarm_actions",
-        "_extract_plain_text_from_content", "_finalize_task_services",
-        "_force_plan_disclosure", "_forced_orphan_note",
-        "_handle_text_response", "_live_delivery_candidate",
-        "_load_direct_child_results", "_maybe_early_finalize",
-        "_maybe_enforce_child_absorption_gate",
-        "_maybe_inject_finalization_nudges", "_merge_finalization_trace",
-        "_project_child_result_dispositions", "_publish_delivery_candidate",
-        "_replace_delivery_candidate", "_resolve_delivery_control",
-        "_run_task_acceptance_review_once", "_service_finalization_evidence",
-        "_supersede_delivery_acceptance_binding",
-        "_supersede_task_acceptance_for_evidence_change",
-        "_supersede_task_acceptance_for_owner_followup",
-        "_task_acceptance_owner_generation_changed",
+        'DeliveryCandidate', 'TERMINAL_ORIGIN_MODEL_FINAL', '_LoopExitContext',
+        '_append_or_merge_user_message', '_arm_delivery_control', '_begin_task_acceptance_fence',
+        '_child_disposition_state', '_compute_subagent_handoff', '_current_delivery_candidate',
+        '_delivery_evidence_state', '_delivery_replace_required', '_drain_incoming_messages',
+        '_end_task_acceptance_fence', '_enforce_swarm_actions', '_extract_plain_text_from_content',
+        '_finalize_forced_services', '_finalize_task_services', '_force_plan_disclosure',
+        '_forced_fallback_result', '_forced_orphan_note', '_handle_text_response',
+        '_latch_final_answer_marker', '_live_delivery_candidate', '_load_direct_child_results',
+        '_maybe_early_finalize', '_maybe_enforce_child_absorption_gate', '_maybe_inject_finalization_nudges',
+        '_merge_finalization_trace', '_no_tool_final_answer', '_project_child_result_dispositions',
+        '_publish_delivery_candidate', '_replace_delivery_candidate', '_resolve_delivery_control',
+        '_run_task_acceptance_review_once', '_service_finalization_evidence', '_set_acceptance_decision',
+        '_supersede_delivery_acceptance_binding', '_supersede_task_acceptance_for_evidence_change', '_supersede_task_acceptance_for_owner_followup',
+        '_task_acceptance_eligible', '_task_acceptance_owner_generation_changed', 'get_review_enforcement',
+        'get_task_review_mode',
     })),
     "ouroboros/loop_forced_finalization.py": ("ouroboros/loop.py", "_loop", frozenset({
-        "DeliveryCandidate", "_LoopExitContext",
-        "_append_or_merge_user_message", "_call_forced_model_once",
-        "_child_disposition_state", "_claimed_child_dispositions",
-        "_compose_delivery_suffix", "_current_delivery_candidate",
-        "_degrade_retained_delivery_candidate", "_delivery_evidence_state",
-        "_delivery_replace_required", "_direct_child_results",
-        "_drain_forced_owner_directives", "_drain_incoming_messages",
-        "_end_task_acceptance_fence", "_finalize_forced_services",
-        "_finalize_task_services", "_force_plan_decision",
-        "_force_plan_disclosure", "_force_plan_reminder",
-        "_forced_delegation_note", "_forced_fallback_result",
-        "_forced_final_answer", "_forced_orphan_note",
-        "_forced_swarm_router_result", "_forced_unaccepted_binding",
-        "_live_delivery_candidate", "_load_direct_child_results",
-        "_merge_finalization_trace", "_resolve_forced_delivery_control_body",
-        "_project_child_result_dispositions", "_publish_delivery_candidate",
-        "_prepare_forced_prompt",
-        "_record_forced_acceptance_bypass", "_record_forced_finalization",
-        "_replace_delivery_candidate", "_run_task_acceptance_review_once",
-        "_server_web_allowed_by_task",
-        "_service_finalization_evidence",
-        "_supersede_task_acceptance_for_owner_followup",
-        "_swarm_handoff_attempt", "call_llm_with_retry",
-        # Upstream e10b3cf3 replaced this leaf's inline dangling-revision write
-        # with the acceptance leaf's `terminalize_dangling_revision`, so the raw
-        # decision writer is no longer read here.
-        "terminalize_dangling_revision",
+        'DeliveryCandidate', '_LoopExitContext', '_append_or_merge_user_message',
+        '_call_forced_model_once', '_child_disposition_state', '_claimed_child_dispositions',
+        '_current_delivery_candidate', '_degrade_retained_delivery_candidate', '_delivery_evidence_state',
+        '_delivery_replace_required', '_direct_child_results', '_drain_forced_owner_directives',
+        '_drain_incoming_messages', '_emit_checkpoint_event', '_finalize_forced_services',
+        '_finalize_task_services', '_force_plan_decision', '_force_plan_disclosure',
+        '_force_plan_reminder', '_forced_delegation_note', '_forced_fallback_result',
+        '_forced_orphan_note', '_forced_unaccepted_binding', '_live_delivery_candidate',
+        '_load_direct_child_results', '_prepare_forced_prompt', '_project_child_result_dispositions',
+        '_publish_delivery_candidate', '_record_forced_acceptance_bypass', '_record_forced_finalization',
+        '_replace_delivery_candidate', '_resolve_forced_delivery_control_body', '_server_web_allowed_by_task',
+        '_service_finalization_evidence', '_set_acceptance_decision', '_supersede_task_acceptance_for_owner_followup',
+        'call_llm_with_retry',
     })),
     "ouroboros/loop_messages.py": ("ouroboros/loop.py", "_loop", frozenset({
         "_record_owner_directive",
     })),
     "ouroboros/loop_model_call.py": ("ouroboros/loop.py", "_loop", frozenset({
-        "_RoundModelCallContext", "_account_compaction_usage", "_call_round_model",
+        "_RoundModelCallContext", "_account_compaction_usage", "_append_or_merge_user_message",
+        "_apply_runtime_overrides", "_call_round_model", "_fallback_chain_allowed",
+        "_reconcile_transport_wait", "_run_cross_model_fallback_chain",
         "_context_overflow_retries", "_context_reclaim_materializations",
         "_context_reclaim_passes", "_dispatch_round_model", "_emit_checkpoint_event",
         "_measure_round_main_fit", "_rebind_context_fit_plan", "_run_main_reclaim",
@@ -428,45 +423,28 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
     "ouroboros/tools/review_prompt_text.py": ("ouroboros/tools/review_helpers.py", "_rh", frozenset({
         "sanitize_tool_result_for_log",
     })),
-    "ouroboros/tools/scope_review_pack.py": ("ouroboros/tools/scope_review.py", "_sr", frozenset({
-        "BINARY_EXTENSIONS", "CRITICAL_FINDING_CALIBRATION", "ReviewContextAtlasRequest",
-        "StagedDiffUnavailable", "_SCOPE_FAILCLOSED_WINDOW", "_SCOPE_MODEL_CONTEXT_WINDOW",
-        "_SENSITIVE_EXTENSIONS", "_SENSITIVE_NAMES", "_TouchedContextStatus",
-        "_compute_touched_status", "_effective_scope_input_limit", "_get_scope_model",
-        "_load_canonical_context_docs", "_scope_window", "_shared_build_rebuttal_section",
-        "_shared_review_history_section", "atlas_assembly_failed",
-        "atlas_assembly_failure_reason", "atlas_hard_budget_overflowed",
-        "atlas_required_beyond_diff", "atlas_unassembled_required", "build_goal_section",
-        "build_scope_review_prompt", "build_scope_section", "build_touched_file_pack",
-        "capture_staged_diff", "compile_review_context_atlas", "estimate_tokens",
-        "load_checklist_section", "parse_git_name_status", "run_cmd",
-        "staged_path_is_binary",
-    })),
-    # F2.3b D06 lane rows (advisory re-derive on the native-episode form; the
-    # scope budget re-derive after PR #383). Same-leaf members that tests
-    # monkeypatch on the facades are declared too, so the patch points keep
-    # binding through the handle.
+    # F2.3b D06 lane rows (advisory re-derive on the native-episode form).
+    # Same-leaf members that tests monkeypatch on the facades are declared too,
+    # so the patch points keep binding through the handle.
     "ouroboros/tools/preflight_review_prompt.py": ("ouroboros/tools/claude_advisory_review.py", "_car", frozenset({
         "CRITICAL_FINDING_CALIBRATION", "_build_blocking_history_section",
-        "_get_changed_file_list", "_get_staged_diff", "_mandatory_read_pointer",
+        "_get_changed_file_list", "_get_staged_diff",
         "build_blocking_findings_json_section", "build_goal_section",
         "build_scope_section", "build_skill_host_context", "load_checklist_section",
         "load_governance_doc", "load_state", "make_repo_key",
     })),
     "ouroboros/tools/preflight_review_run.py": ("ouroboros/tools/claude_advisory_review.py", "_car", frozenset({
         "SEVERITY_DRIVEN_ITEMS", "_advisory_native_model", "_advisory_review_diff",
+        "_api_window_skip_warning",
         "_build_advisory_prompt", "_format_advisory_error", "_get_changed_file_list",
         "_get_runtime_diagnostics", "_llm_extract_advisory_items",
         "_mandatory_read_corpus_chars", "_maybe_overflow_skip", "_predispatch_size_skip", "_persist_preflight_record",
         "_run_advisory_delegated",
         "_run_advisory_native", "_syntax_preflight_staged_py_files",
-        "advisory_gate_unavailability_reason", "build_advisory_changed_context",
+        "advisory_gate_unavailability_reason",
         "emit_review_event", "emit_review_usage", "empty_array_is_verified_clean",
         "extract_json_array", "get_finalization_grace_sec",
         "owner_deadline_exhausted_for_context",
-    })),
-    "ouroboros/tools/scope_review_budget.py": ("ouroboros/tools/scope_review.py", "_sr", frozenset({
-        "_effective_scope_input_limit", "_get_scope_model", "_scope_window",
     })),
     "ouroboros/loop_round_limits.py": ("ouroboros/loop.py", "_loop", frozenset({
         "DeliveryCandidate", "_append_or_merge_user_content",
@@ -474,9 +452,13 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
         "_emit_checkpoint_event", "_finalize_forced_services",
         "_forced_fallback_result", "_forced_final_answer",
         "_handle_forced_finalization", "_last_assistant_text", "_owner_marked_content",
+        "_measure_main_context_view",
         "_provider_unavailable_result", "_record_owner_directive",
         "_soft_land_exhausted_ceiling", "_task_deadline_epoch", "compact_tool_history_llm",
         "provider_no_call_source", "utc_now",
+        # #1196: a budget-pause HOLD ended by control rejoins the model-wait rails and
+        # merges its forced trace like every other controlled exit.
+        "_merge_finalization_trace",
     })),
 }
 

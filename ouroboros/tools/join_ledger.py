@@ -14,6 +14,8 @@ upgraded with a recorded reason + lineage gate) live here too.
 
 from __future__ import annotations
 
+from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
+
 import hashlib
 import json
 import logging
@@ -22,6 +24,7 @@ from typing import Any, Dict
 
 from ouroboros.task_results import validate_task_id
 from ouroboros.task_status import load_effective_task_result, observe_cancellation_target
+from ouroboros.tool_access_paths import canonical_data_root as _status_drive_root
 from ouroboros.task_tree_ledger import (
     CHILD_RESULT_DISPOSITIONS,
     CHILD_RESULT_DISPOSITION_TYPE,
@@ -46,13 +49,26 @@ _ARTIFACT_IDENTITY_FIELDS = (
 )
 
 
-def _stable_artifact_identities(result: Dict[str, Any]) -> list[Dict[str, Any]]:
-    """Return stable artifact identities without volatile paths/timestamps."""
+def _child_result_sha256(result: Dict[str, Any]) -> str:
+    """Hash the exact semantic child result consumed by a parent decision.
 
+    Cost, timestamps, queue diagnostics, and parent-decision fields are omitted by
+    construction. A content/status/artifact change therefore invalidates a prior
+    disposition, while accounting or coordination telemetry does not. The host
+    notice is part of the parent's consumed result, separate from model-answer
+    identity; its absence preserves the historical hash exactly.
+    """
+
+    semantic_result = result
+    bundle = (
+        semantic_result.get("artifact_bundle")
+        if isinstance(semantic_result.get("artifact_bundle"), dict)
+        else {}
+    )
+    # Stable artifact identities without volatile paths/timestamps.
     candidates: list[Any] = []
-    if isinstance(result.get("artifacts"), list):
-        candidates.extend(result.get("artifacts") or [])
-    bundle = result.get("artifact_bundle") if isinstance(result.get("artifact_bundle"), dict) else {}
+    if isinstance(semantic_result.get("artifacts"), list):
+        candidates.extend(semantic_result.get("artifacts") or [])
     if isinstance(bundle.get("artifacts"), list):
         candidates.extend(bundle.get("artifacts") or [])
     identities: list[Dict[str, Any]] = []
@@ -76,42 +92,26 @@ def _stable_artifact_identities(result: Dict[str, Any]) -> list[Dict[str, Any]]:
                 identity["name"] = Path(raw_path).name
         if not identity:
             continue
-        encoded = json.dumps(identity, ensure_ascii=False, sort_keys=True, default=str)
-        if encoded in seen:
+        encoded_identity = json.dumps(identity, ensure_ascii=False, sort_keys=True, default=str)
+        if encoded_identity in seen:
             continue
-        seen.add(encoded)
+        seen.add(encoded_identity)
         identities.append(identity)
-    return sorted(
-        identities,
-        key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True, default=str),
-    )
-
-
-def _child_result_sha256(result: Dict[str, Any]) -> str:
-    """Hash the exact semantic child result consumed by a parent decision.
-
-    Cost, timestamps, queue diagnostics, and parent-decision fields are omitted by
-    construction. A content/status/artifact change therefore invalidates a prior
-    disposition, while accounting or coordination telemetry does not. The host
-    notice is part of the parent's consumed result, separate from model-answer
-    identity; its absence preserves the historical hash exactly.
-    """
-
-    semantic_result = result
-    bundle = (
-        semantic_result.get("artifact_bundle")
-        if isinstance(semantic_result.get("artifact_bundle"), dict)
-        else {}
-    )
     payload = {
         "status": str(semantic_result.get("status") or ""),
         "result": semantic_result.get("result"),
         "trace_summary": semantic_result.get("trace_summary"),
         "artifact_status": str(semantic_result.get("artifact_status") or bundle.get("status") or ""),
-        "artifacts": _stable_artifact_identities(semantic_result),
+        "artifacts": sorted(
+            identities,
+            key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True, default=str),
+        ),
     }
-    if "terminal_host_notice" in semantic_result:
-        payload["terminal_host_notice"] = semantic_result["terminal_host_notice"]
+    from ouroboros.task_finalization import terminal_host_notice_text
+
+    notice = terminal_host_notice_text(semantic_result)
+    if "terminal_host_notice" in semantic_result or notice:
+        payload["terminal_host_notice"] = notice
     encoded = json.dumps(
         payload,
         ensure_ascii=False,
@@ -167,17 +167,18 @@ def _record_child_result_disposition(
             "shorten it yourself — it is never truncated for you)"
         )
     if problems:
-        return (
-            "⚠️ CHILD_RESULT_DISPOSITION_INVALID: " + "; ".join(problems) + ". "
+        return _publish_tool_result(ctx, ToolResult(
+            status="error", code="TOOL_ARG_ERROR",
+            text=("⚠️ CHILD_RESULT_DISPOSITION_INVALID: " + "; ".join(problems) + ". "
             "Correct example: tree_note(kind='decision', text='<short why, ≤500 chars>', "
             "payload={'type': 'child_result_disposition', 'child_task_id': '<id>', "
             "'disposition': 'integrated'|'irrelevant'|'deferred', "
             "'child_result_sha256': '<the 64-hex sha from [SUBTASK_OUTCOME]/get_task_result>'})."
-            " Nothing was recorded (atomic no-op)."
-        )
+            " Nothing was recorded (atomic no-op).")
+        ))
     normalized = normalize_child_result_disposition_payload(payload)
     if normalized is None:  # unreachable: violations above are the same authority
-        return "⚠️ CHILD_RESULT_DISPOSITION_INVALID: payload failed normalization."
+        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=("⚠️ CHILD_RESULT_DISPOSITION_INVALID: payload failed normalization.")))
     tid = normalized["child_task_id"]
     disposition = normalized["disposition"]
     expected = normalized["child_result_sha256"]
@@ -190,12 +191,12 @@ def _record_child_result_disposition(
         )
     data = load_effective_task_result(status_drive_root, tid) or {}
     if not data:
-        return f"⚠️ CHILD_RESULT_STALE: {tid} has no current result to bind."
+        return _publish_tool_result(ctx, ToolResult(status="unavailable", code="LEGACY_UNAVAILABLE", text=(f"⚠️ CHILD_RESULT_STALE: {tid} has no current result to bind.")))
     actual = _child_result_sha256(data)
     if actual != expected:
         return (
-            f"⚠️ CHILD_RESULT_STALE: {tid} changed (expected {expected[:12]}, current "
-            f"{actual[:12]}); inspect it again and submit the current hash."
+            _publish_tool_result(ctx, ToolResult(status="blocked", code="LEGACY_BLOCKED", text=(f"⚠️ CHILD_RESULT_STALE: {tid} changed (expected {expected[:12]}, current "
+            f"{actual[:12]}); inspect it again and submit the current hash.")))
         )
 
     from ouroboros.tools.task_tree import tree_root_id
@@ -250,8 +251,8 @@ def _record_child_result_disposition(
     current = load_effective_task_result(status_drive_root, tid) or {}
     if _child_result_sha256(current) != expected:
         return (
-            f"⚠️ CHILD_RESULT_STALE: {tid} changed while its disposition was recorded; "
-            "the old row remains audit evidence but does not close the new result."
+            _publish_tool_result(ctx, ToolResult(status="blocked", code="LEGACY_BLOCKED", text=(f"⚠️ CHILD_RESULT_STALE: {tid} changed while its disposition was recorded; "
+            "the old row remains audit evidence but does not close the new result.")))
         )
     if _child_disposition_lineage(current) != (root_task_id, parent_task_id, tid):
         return (
@@ -294,13 +295,19 @@ def _record_child_result_disposition_batch(
     envelope_extra = sorted(set(payload) - {"type", "children"})
     children = payload.get("children")
     if envelope_extra or not isinstance(children, list) or not children:
-        return (
-            "⚠️ CHILD_RESULT_DISPOSITION_INVALID: the batch form is exactly "
-            "{'type': 'child_result_disposition', 'children': [{'child_task_id', "
-            "'disposition', 'child_result_sha256'}, ...]} with a non-empty array"
-            + (f" (unknown key(s): {', '.join(envelope_extra)})" if envelope_extra else "")
-            + ". Nothing was recorded (atomic no-op)."
-        )
+        # An ALL-OR-NOTHING argument error is published exactly like the single
+        # form's (same code, same identifier), so it reads as an argument error
+        # instead of LEGACY_WARNING. The text is byte-identical to the returned
+        # string on purpose: the registry counts a typed publication only while
+        # `published.text == result`, so rewording here silently untypes it.
+        return _publish_tool_result(ctx, ToolResult(
+            status="error", code="TOOL_ARG_ERROR", text=(
+                "⚠️ CHILD_RESULT_DISPOSITION_INVALID: the batch form is exactly "
+                "{'type': 'child_result_disposition', 'children': [{'child_task_id', "
+                "'disposition', 'child_result_sha256'}, ...]} with a non-empty array"
+                + (f" (unknown key(s): {', '.join(envelope_extra)})" if envelope_extra else "")
+                + ". Nothing was recorded (atomic no-op)."
+            )))
     lines: list[str] = []
     recorded = 0
     for index, entry in enumerate(children):
@@ -323,9 +330,18 @@ def _record_child_result_disposition_batch(
             "the failed entries below were rejected individually and must be corrected."
         )
     else:
+        # Zero recorded is the other all-or-nothing argument error. It publishes
+        # the WHOLE returned string, per-entry lines included: publishing only
+        # the header would break the `published.text == result` equality and drop
+        # this back to LEGACY_WARNING.
         header = (
             f"⚠️ CHILD_RESULT_DISPOSITION_INVALID: 0/{total} batch entries were recorded."
         )
+        return _publish_tool_result(ctx, ToolResult(
+            status="error", code="TOOL_ARG_ERROR", text=header + "\n" + "\n".join(lines)))
+    # The MIXED case stays an untyped warning: its text already names the exact
+    # counts, and a new identifier would need an APPROVED_DELTAS row plus a
+    # sanctioned regeneration of a golden pinned to another SHA.
     return header + "\n" + "\n".join(lines)
 
 
@@ -340,10 +356,10 @@ def _record_current_child_result_disposition(
     try:
         tid = validate_task_id(child_task_id)
     except ValueError as exc:
-        return f"⚠️ CHILD_RESULT_DISPOSITION_INVALID: {exc}"
+        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(f"⚠️ CHILD_RESULT_DISPOSITION_INVALID: {exc}")))
     data = load_effective_task_result(_status_drive_root(ctx), tid) or {}
     if not data:
-        return f"⚠️ CHILD_RESULT_STALE: {tid} has no current result to bind."
+        return _publish_tool_result(ctx, ToolResult(status="unavailable", code="LEGACY_UNAVAILABLE", text=(f"⚠️ CHILD_RESULT_STALE: {tid} has no current result to bind.")))
     return _record_child_result_disposition(
         ctx,
         {
@@ -374,15 +390,11 @@ def _record_child_decision_beacon(ctx: ToolContext, task_id: str, text: str) -> 
         log.debug("Failed to record child decision beacon for %s", task_id, exc_info=True)
 
 
-def _status_drive_root(ctx: ToolContext) -> Path:
-    metadata = getattr(ctx, "task_metadata", {}) if isinstance(getattr(ctx, "task_metadata", {}), dict) else {}
-    return Path(str(metadata.get("budget_drive_root") or getattr(ctx, "budget_drive_root", "") or ctx.drive_root))
-
-
-def _is_own_child(ctx: ToolContext, status_drive_root: Path, tid: str) -> bool:
+def _is_own_child(ctx: ToolContext, status_drive_root: Path, tid: str, *, root_tree: bool = False) -> bool:
     """True if ``tid`` is a DIRECT child of the CURRENT task (D#7 safety): a parent
     decision may only describe the caller's OWN children, never an unrelated parent's
-    join ledger. Fail-CLOSED — any error returns False."""
+    join ledger. Resume alone may also select the caller's root tree, using
+    stored lineage rather than a supplied root id. Fail-CLOSED on any error."""
     try:
         from ouroboros.task_status import find_child_tasks
 
@@ -391,7 +403,8 @@ def _is_own_child(ctx: ToolContext, status_drive_root: Path, tid: str) -> bool:
         if not my_id or not tid:
             return False
         children = find_child_tasks(
-            Path(status_drive_root), parent_task_id=my_id, root_task_id="", exclude_task_id=my_id
+            Path(status_drive_root), parent_task_id=my_id, root_task_id=my_id if root_tree else "",
+            exclude_task_id=my_id, materialize_artifacts=False,
         )
         return any(str(c.get("task_id") or c.get("id") or "") == tid for c in children)
     except Exception:
@@ -453,8 +466,8 @@ def _peek_task(ctx: ToolContext, task_id: str, view: str = "summary") -> str:
     status_drive_root = _status_drive_root(ctx)
     if _is_delegated_task(ctx) and not _is_own_child(ctx, status_drive_root, tid):
         return (
-            f"⚠️ peek_task: {tid} is not a child of this task — a delegated task "
-            "may inspect only its own children."
+            _publish_tool_result(ctx, ToolResult(status="blocked", code="ACCESS_BLOCKED", text=(f"⚠️ peek_task: {tid} is not a child of this task — a delegated task "
+            "may inspect only its own children.")))
         )
     data = load_effective_task_result(status_drive_root, tid) or {}
     status = str(data.get("status") or "unknown")
@@ -524,7 +537,7 @@ def _discard_child_result(ctx: ToolContext, task_id: str, reason: str) -> str:
     status_drive_root = _status_drive_root(ctx)
     # D#7 safety: a parent may abandon only its OWN child's result.
     if not _is_own_child(ctx, status_drive_root, tid):
-        return f"⚠️ discard_child_result: {tid} is not a child of this task — refusing to discard."
+        return _publish_tool_result(ctx, ToolResult(status="blocked", code="ACCESS_BLOCKED", text=(f"⚠️ discard_child_result: {tid} is not a child of this task — refusing to discard.")))
     recorded = _record_current_child_result_disposition(
         ctx,
         tid,
@@ -551,7 +564,7 @@ def _override_delegation_constraint(ctx: ToolContext, constraint_id: str, reason
 
         rid = tree_root_id(ctx)
         if not rid:
-            return "⚠️ override_delegation_constraint: no task-tree scope."
+            return _publish_tool_result(ctx, ToolResult(status="unavailable", code="CAPABILITY_UNAVAILABLE", text=("⚠️ override_delegation_constraint: no task-tree scope.")))
         open_rows = open_delegation_constraints(rid)
         target_row = next((
             row for row in open_rows
@@ -559,14 +572,14 @@ def _override_delegation_constraint(ctx: ToolContext, constraint_id: str, reason
             and str(row["payload"].get("constraint_id") or "") == cid
         ), None)
         if target_row is None:
-            return f"⚠️ override_delegation_constraint: constraint {cid!r} is not open in this task tree."
+            return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(f"⚠️ override_delegation_constraint: constraint {cid!r} is not open in this task tree.")))
         emitter_task_id = str(target_row.get("task_id") or "").strip()
         if emitter_task_id:
             status_drive_root = _status_drive_root(ctx)
             if not _is_own_child(ctx, status_drive_root, emitter_task_id):
                 return (
-                    "⚠️ override_delegation_constraint: only the parent of the task that raised "
-                    f"constraint {cid!r} may override it."
+                    _publish_tool_result(ctx, ToolResult(status="blocked", code="ACCESS_BLOCKED", text=("⚠️ override_delegation_constraint: only the parent of the task that raised "
+                    f"constraint {cid!r} may override it.")))
                 )
         meta = getattr(ctx, "task_metadata", {}) if isinstance(getattr(ctx, "task_metadata", {}), dict) else {}
         role = str(meta.get("role") or getattr(ctx, "role", "") or "")
@@ -586,7 +599,50 @@ def _override_delegation_constraint(ctx: ToolContext, constraint_id: str, reason
         )
     except Exception:
         log.debug("Failed to override delegation constraint %s", cid, exc_info=True)
-        return f"⚠️ override_delegation_constraint: failed to record override for {cid}."
+        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ERROR", text=(f"⚠️ override_delegation_constraint: failed to record override for {cid}.")))
+
+
+def _resume_child_task(ctx: ToolContext, task_id: str, reason: str = "") -> str:
+    """Owner Q9: select ONE paused root descendant or intermediate parent's direct child.
+
+    The request rides the existing worker->supervisor control channel; the
+    supervisor validates lineage and grants through the ONE resume seam, and
+    records the typed outcome as a ``budget_resume_child_outcome`` event. This
+    tool therefore reports a REQUEST, never a completed resume.
+    """
+    try:
+        tid = validate_task_id(task_id)
+    except ValueError as exc:
+        return f"⚠️ TOOL_ARG_ERROR (resume_child_task): {exc}"
+    reason_text = _clip(" ".join(str(reason or "").split()), 500)
+    status_drive_root = _status_drive_root(ctx)
+    own = _is_own_child(ctx, status_drive_root, tid, root_tree=True)
+    requester = str(getattr(ctx, "task_id", "") or "")
+    if not own:
+        return _publish_tool_result(ctx, ToolResult(status="blocked", code="ACCESS_BLOCKED", text=(
+            f"⚠️ resume_child_task: {tid} is not a child of this task — only your own "
+            "budget-paused descendants can be selected for continuation.")))
+    from ouroboros.tools.control import _emit_control_event
+
+    emitted = _emit_control_event(ctx, {
+        "type": "budget_resume_child",
+        "task_id": tid,
+        "requested_by": requester,
+        "reason": reason_text,
+        "ts": utc_now_iso(),
+    })
+    _record_child_decision_beacon(
+        ctx, tid, f"selected budget-paused child {tid} for continuation" + (f": {reason_text}" if reason_text else ""),
+    )
+    note = " (live)" if emitted == "live" else " (deferred to round end)"
+    return (
+        f"Resume requested for {tid}{note}. This is a REQUEST: the supervisor validates money, "
+        "Stop/cancel intent, deadline, finite lifetime and the child's checkpoint through the same "
+        "seam the owner's Resume uses, then records a budget_resume_child_outcome event. When granted, "
+        "the child's status changes from paused to scheduled under its SAME task id; a refusal "
+        "(budget_still_exhausted, cancel_intent_active, deadline_passed, lifetime_exhausted, "
+        "root_still_paused, pause_record_missing, ...) leaves it paused. Check with peek_task."
+    )
 
 
 def _cancel_task(ctx: ToolContext, task_id: str, reason: str = "") -> str:
@@ -594,7 +650,11 @@ def _cancel_task(ctx: ToolContext, task_id: str, reason: str = "") -> str:
         tid = validate_task_id(task_id)
     except ValueError as exc:
         return f"⚠️ TOOL_ARG_ERROR (cancel_task): {exc}"
-    reason_text = _clip(" ".join(str(reason or "").split()), 500)
+    # The whole stated cause is the record: it rides the intent into custody,
+    # the settled ``cancel_origin`` and the receipt. The tree-ledger note and
+    # this reply only preview it, and ``_clip`` marks what they leave out.
+    reason_text = " ".join(str(reason or "").split())
+    reason_preview = _clip(reason_text, 500)
     status_drive_root = _status_drive_root(ctx)
     # Only stamp the join-ledger parent_decision (+ post to the tree ledger) when the
     # target is THIS task's own child — a cancel must not rewrite an unrelated task's
@@ -603,8 +663,30 @@ def _cancel_task(ctx: ToolContext, task_id: str, reason: str = "") -> str:
     # Subagent isolation: a delegated child may cancel only its own children.
     # Project focus does not narrow an ordinary top-level principal; workspace
     # parents keep the same task-control authority as other top-level tasks.
-    if not own and _is_delegated_task(ctx):
-        return f"⚠️ cancel_task: {tid} is not a child of this task — a delegated task may only cancel its own children."
+    # A consciousness wake at Observe is narrowed the same way for the same
+    # reason: it may stop the work it started, which is the other half of being
+    # allowed to start read-only children, but not the owner's own running work.
+    from ouroboros.consciousness_authority import is_observe_origin
+
+    if not own and (_is_delegated_task(ctx) or is_observe_origin(getattr(ctx, "task_metadata", {}))):
+        return _publish_tool_result(ctx, ToolResult(status="blocked", code="ACCESS_BLOCKED", text=(f"⚠️ cancel_task: {tid} is not a child of this task — a delegated task may only cancel its own children, and a consciousness wake at the Observe level is held to the same rule.")))
+    from ouroboros.presence_authority import presence_caller_binding, presence_work_refusal
+
+    if not own and presence_caller_binding(ctx) is not None:
+        # A Presence caller stops only its own binding's work or its own tree, and
+        # a redirected retry is judged at its effective target too — before any intent.
+        from ouroboros.cancel_intents import _validated_single_cancel_target
+
+        refusal = presence_work_refusal(ctx, tid, drive_root=status_drive_root, same_tree=True)
+        if not refusal:
+            try:
+                effective = _validated_single_cancel_target(status_drive_root, tid)
+            except Exception:
+                effective = tid
+            if effective != tid:
+                refusal = presence_work_refusal(ctx, effective, drive_root=status_drive_root, same_tree=True)
+        if refusal:
+            return _publish_tool_result(ctx, ToolResult(status="blocked", code="ACCESS_BLOCKED", text=refusal))
     # Durable cancel intent — the ONE ingress (phase A, owner batch-4 1=A). The
     # canonical status never carries intent: the supervisor's cancellation
     # custody claims this intent, tears the task down, and settles the terminal
@@ -681,7 +763,7 @@ def _cancel_task(ctx: ToolContext, task_id: str, reason: str = "") -> str:
     if own:
         _record_child_decision_beacon(
             ctx, tid,
-            f"requested cancellation of child {tid}" + (f": {reason_text}" if reason_text else ""),
+            f"requested cancellation of child {tid}" + (f": {reason_preview}" if reason_preview else ""),
         )
     # Emit live so the supervisor processes the cancellation within one loop tick;
     # the durable intent survives a lost event (the supervisor watchdog re-feeds it).
@@ -698,7 +780,7 @@ def _cancel_task(ctx: ToolContext, task_id: str, reason: str = "") -> str:
     note = " (live)" if emitted == "live" else " (deferred to round end)"
     already = " (already requested earlier — idempotent)" if intent.get("already_requested") else ""
     return (
-        f"Cancel requested: {tid}{(' — ' + reason_text) if reason_text else ''}{note}{already}. "
+        f"Cancel requested: {tid}{(' — ' + reason_preview) if reason_preview else ''}{note}{already}. "
         "cancel_state=pending until the supervisor confirms teardown; a child that "
         "already finished keeps its completed result (use discard_child_result to drop it)." + observed_note
     )
@@ -706,6 +788,22 @@ def _cancel_task(ctx: ToolContext, task_id: str, reason: str = "") -> str:
 
 def get_tools() -> list[ToolEntry]:
     return [
+        ToolEntry("resume_child_task", {
+            "name": "resume_child_task",
+            "description": "After the owner resumes your root from a budget pause, select ONE paused task: "
+                           "a root may select any of its descendants; an intermediate parent may select its "
+                           "own direct children. Continuation keeps the same task id. "
+                           "Nothing resumes automatically and no fan-out happens: you name each child you still "
+                           "need, with a reason. The supervisor validates money, Stop/cancel intent, deadline and "
+                           "finite lifetime through the same seam the owner's Resume uses; the typed outcome is "
+                           "recorded as a budget_resume_child_outcome event and the child's status changes from "
+                           "paused to scheduled when granted. Cancelled, completed or otherwise-stopped children "
+                           "are never revived; a child under a root that is itself still paused is refused.",
+            "parameters": {"type": "object", "properties": {
+                "task_id": {"type": "string"},
+                "reason": {"type": "string", "default": "", "description": "Why this child is still needed (recorded)."},
+            }, "required": ["task_id"]},
+        }, _resume_child_task),
         ToolEntry("cancel_task", {
             "name": "cancel_task",
             "description": "Request cancellation of a running/scheduled task by ID (durable intent; "

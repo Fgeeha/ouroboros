@@ -8,22 +8,37 @@ falls back to the shipped value instead of disabling a rail.
 
 from __future__ import annotations
 
-import os
 from typing import Optional
 
 from ouroboros.settings_defaults import (
+    FINALIZATION_GRACE_DEFAULT_SEC,
     PACING_INTERVAL_DEFAULT_SEC,
     SETTINGS_DEFAULTS,
     SUPERVISOR_LIVENESS_DEADLINE_DEFAULT_SEC,
 )
+from ouroboros.settings_integrity import runtime_setting
+from ouroboros.settings_scales import optional_bound_value
 
 # Local model-operation status polling; not a provider deadline or quota timer.
 CLAUDEXOR_MODEL_POLL_INTERVAL_SEC = 0.25
+# Existing CLI RPC (10s), termination confirmation (20s), and process startup slack.
+CLAUDEXOR_OPERATOR_STOP_TIMEOUT_SEC = 35.0
+# Physical exit observation after a clean operator-stop receipt, not a task deadline.
+CLAUDEXOR_STOP_EXIT_WAIT_SEC = 5.0
+# Phone-native source compilation exceeds ten minutes; one contained platform
+# preparation may run for an hour, independently of ordinary tool/harness calls.
+EXTERNAL_PLATFORM_UPDATE_TIMEOUT_SEC = 3600.0
 
 
 EXTENSION_STREAM_CHUNK_BYTES = 64 * 1024
 # Exit/pipe-drain grace after a response ends; never a response lifetime timer.
 EXTENSION_CHILD_CLEANUP_GRACE_SEC = 2
+# Ordinary close (#1142): the launcher waits this long for the server to exit before the group SIGKILL
+# fallback; uvicorn's graceful drain of open HTTP/WS tasks is bounded to the second value so the lifespan
+# teardown — the terminal-custody write `kill_workers` — starts well inside the first. The pair is one
+# budget, not two knobs: raise the drain only with the launcher wait (which ships with a release).
+LAUNCHER_STOP_GRACE_SEC = 10.0
+SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_SEC = 3.0
 NESTED_SETTLEMENT_MARGIN_SEC = 30  # Structural ordering margin, not a cognition timeout.
 # Owner-note cadence while a task waits out a provider-connection outage; the effective interval is min(this, idle_timeout/2) so the notes also keep the idle rail alive.
 NETWORK_WAIT_NOTE_INTERVAL_SEC = 300
@@ -46,13 +61,27 @@ WS_RELAY_REFILL_PER_SEC = 1.0
 # detector counts dead workers (up to ~60s to init: spawn + pip); workers.py binds it as `_SPAWN_GRACE_SEC`, the extension import-staging sweep reads it too.
 WORKER_SPAWN_GRACE_SEC = 90.0
 # Readiness window for ONE spawned/respawned slot: unassignable until the child's own `worker_ready` row lands; alive
-# but silent past this = torn down and replaced. Sized to the spawn grace (the pool's existing init budget): a warm
-# forkserver child boots in ~3-4s (G13 mock lane: 3.5-4.9s startup, 2.5-3.2s respawn), a cold 4-vCPU CI runner well under 60s (its 21-scenario mock lane runs in ~80s), and the E2E
-# scenarios wait 240s per task, so a wedged child is a fast, named failure. A contract distinct from process liveness
+# but silent past this = torn down and replaced. A child's own entry progress permits one longer window for
+# expensive extension loading; an empty mock install does not establish production startup latency.
+# Readiness is a contract distinct from process liveness
 # (`proc.is_alive`, worker_health.py) and from the task idle rail (queue_timeouts.py): a deadlocked child is alive.
 WORKER_READY_WINDOW_SEC = 90.0
 # Consecutive readiness failures of one slot before it is parked and reported (three strikes, like the crash-storm fence).
 WORKER_READY_MAX_ATTEMPTS = 3
+# One extension for a child that wrote its own entry progress, measured from birth, never from the last poll.
+WORKER_READY_CEILING_SEC = 300.0
+
+# Supervisor loop events phase (structural constants, not env knobs). One pass drains at most
+# this many worker events, and stops once this many seconds have passed (checked between
+# handlers, so a running handler can overrun it), before bridge intake runs, so a producer that
+# keeps the queue non-empty can never hide an owner message; the remainder waits for the next
+# turn and a turn that hit its bound skips the idle sleep, so a backlog still drains at full speed.
+SUPERVISOR_EVENT_BATCH_MAX_EVENTS = 100
+SUPERVISOR_EVENT_BATCH_MAX_SEC = 2.0
+# After a compatibility budget-projection write returned False or raised (unknown or stale ledger
+# marker, corrupt ledger), the loop keeps the projection dirty and retries no more often than this,
+# so a frozen-marker install cannot render the ledger every turn forever.
+BUDGET_PROJECTION_RETRY_SEC = 30.0
 
 
 def _clamped_number_setting(key: str, *, low, high=float("inf"), cast=float):
@@ -60,7 +89,7 @@ def _clamped_number_setting(key: str, *, low, high=float("inf"), cast=float):
     shipped default. SSOT for the clamped scalar getters below — the seven of them were
     byte-identical except for key, caster and bounds (P7 DRY)."""
     try:
-        value = cast(os.environ.get(key, "") or SETTINGS_DEFAULTS[key])
+        value = cast(runtime_setting(key, "") or SETTINGS_DEFAULTS[key])
     except (TypeError, ValueError):
         value = cast(SETTINGS_DEFAULTS[key])
     return max(low, min(value, high))
@@ -69,7 +98,7 @@ def _clamped_number_setting(key: str, *, low, high=float("inf"), cast=float):
 def _bounded_positive_int_setting(key: str, *, default: int, hard_max: int, min_value: int = 1) -> int:
     """Bounded int setting; below ``min_value`` it is a typo and falls back to ``default``. Only
     subagent depth passes 0 — there an explicit 0 is a real owner choice, not unset (owner Q26)."""
-    raw = os.environ.get(key, SETTINGS_DEFAULTS.get(key, default))
+    raw = runtime_setting(key, SETTINGS_DEFAULTS.get(key, default))
     try:
         parsed = int(raw)
     except (TypeError, ValueError):
@@ -90,17 +119,55 @@ def get_task_idle_timeout_sec() -> int:
     return _clamped_number_setting("OUROBOROS_TASK_IDLE_TIMEOUT_SEC", low=60, cast=int)
 
 
-def get_task_abs_ceiling_sec() -> int:
-    """Absolute wall-clock backstop per task, independent of activity — the only hard
-    time axis (budget/cost is the other, separate hard axis). A productively-waiting
-    orchestrator survives to this ceiling instead of a flat 1800s wall-clock kill."""
-    return _clamped_number_setting("OUROBOROS_TASK_ABS_CEILING_SEC", low=300, cast=int)
+def _optional_bound_setting(key: str, *, low: int) -> Optional[int]:
+    """Env-or-default optional bound (``settings_scales.optional_bound_value``): ``None`` = no
+    bound, else at least ``low``. An absent variable is the shipped default; an explicitly empty
+    or malformed one is a typo and takes the finite legacy fallback, never "no bound"."""
+    raw = runtime_setting(key)
+    value = optional_bound_value(key, SETTINGS_DEFAULTS[key] if raw is None else raw)
+    return None if value is None else max(low, value)
+
+
+def get_max_rounds() -> Optional[int]:
+    """The total round limit of one task loop; ``None`` = no limit (the shipped default).
+    Presence turns add their own finite inline cap (``loop._resolve_loop_max_rounds``)."""
+    return _optional_bound_setting("OUROBOROS_MAX_ROUNDS", low=1)
+
+
+def get_task_abs_ceiling_sec() -> Optional[int]:
+    """Absolute wall-clock backstop per task, independent of activity; ``None`` = no lifetime
+    bound (the shipped default). Budget/cost and an explicit deadline stay separate hard axes,
+    and a productively-waiting orchestrator is never killed by a flat wall-clock timer. A set
+    value is floored at 300 s so a typo cannot end every task at birth."""
+    return _optional_bound_setting("OUROBOROS_TASK_ABS_CEILING_SEC", low=300)
+
+
+# The finite window ONE physical operation that inherits the task lifetime keeps when the task
+# has none: a delegated agent-session run, a retrieving review session, a VLM child, the
+# plan/preflight tool envelopes, an active-operation idle lease. It is the former shipped task
+# ceiling, so an unlimited task never turns a wedged operation into an unbounded one and never
+# shrinks those operations to a transport bound; a finite lifetime and every deadline still
+# narrow it. Structural, not a settings key.
+OPERATION_WINDOW_FALLBACK_SEC = 21600
+
+
+def operation_window_sec(task_lifetime_sec: Optional[float]) -> float:
+    """The outer window of an operation bounded by the task lifetime: that lifetime when it
+    is finite (``get_task_abs_ceiling_sec()``), else ``OPERATION_WINDOW_FALLBACK_SEC``."""
+    return float(OPERATION_WINDOW_FALLBACK_SEC if task_lifetime_sec is None else task_lifetime_sec)
 
 
 def get_per_call_timeout_ceiling_sec() -> int:
     """SSOT ceiling for an explicit per-call run_command/run_script timeout_sec
     (and the outer tool-execution cap that accommodates it)."""
     return _clamped_number_setting("OUROBOROS_PER_CALL_TIMEOUT_CEILING_SEC", low=1, cast=int)
+
+
+def get_model_substitution_redos() -> int:
+    """How many times one round may be asked again after the route served ANOTHER
+    model. Each redo is a new operation, so the ceiling is small on purpose: the
+    configured model fallback chain owns the case where the whole pool substitutes."""
+    return _clamped_number_setting("OUROBOROS_SERVED_MODEL_REDOS", low=0, high=5, cast=int)
 
 
 def get_restart_drain_max_sec() -> int:
@@ -173,13 +240,46 @@ def get_direct_turn_stop_wait_sec() -> float:
     return _clamped_number_setting("OUROBOROS_DIRECT_TURN_STOP_WAIT_SEC", low=0, high=10, cast=float)
 
 
+# How long a pooled worker waits for ONE answer to an acceptance-fence request; it re-sends
+# the same request once and waits this long again, then the outcome is a typed unknown. Short
+# by design: the idle rail does not count heartbeats as progress, so this wait is never
+# lengthened to ride out a stalled supervisor. Structural, not a settings key.
+ACCEPTANCE_FENCE_ACK_WAIT_SEC = 10.0
+
+
+def get_acceptance_fence_ack_wait_sec() -> float:
+    return ACCEPTANCE_FENCE_ACK_WAIT_SEC
+
+
+# How long a routing verb waits for the supervisor's DURABLE admission receipt before it
+# reports an unconfirmed promote/route. Short by design: the cure for a busy supervisor is
+# the reconciliation read of the emitted admission, never a longer wait. Structural, not a
+# settings key; the tool layer and the gateway dispatcher share this one bound.
+PROMOTE_CONFIRM_WAIT_SEC = 15.0
+
+
+def get_promote_confirm_wait_sec() -> float:
+    return PROMOTE_CONFIRM_WAIT_SEC
+
+
+# How many of a lane's newest ROOT results one routing manifest offers as continuation
+# candidates. A HINT window: what promote ACCEPTS is a predicate (same project, a root, a
+# readable result, not live), so a root older than this window stays addressable in its own
+# room. Structural, not a settings key.
+ROUTING_MANIFEST_RESULT_ROWS = 16
+
+
+def get_routing_manifest_result_rows() -> int:
+    return ROUTING_MANIFEST_RESULT_ROWS
+
+
 def get_vision_caption_timeout_sec() -> int:
     return _clamped_number_setting("OUROBOROS_VISION_CAPTION_TIMEOUT_SEC", low=1, cast=int)
 
 
 def get_pacing_interval_sec(settings: Optional[dict] = None) -> int:
     """Intrinsic self-pacing checkpoint cadence in seconds (0 disables)."""
-    raw = os.environ.get("OUROBOROS_PACING_INTERVAL_SEC")
+    raw = runtime_setting("OUROBOROS_PACING_INTERVAL_SEC")
     if raw is None and isinstance(settings, dict):
         raw = settings.get("OUROBOROS_PACING_INTERVAL_SEC")
     try:
@@ -191,7 +291,7 @@ def get_pacing_interval_sec(settings: Optional[dict] = None) -> int:
 
 def get_supervisor_liveness_deadline_sec(settings: Optional[dict] = None) -> int:
     """Supervisor-loop stall deadline in seconds (0 disables the watchdog)."""
-    raw = os.environ.get("OUROBOROS_SUPERVISOR_LIVENESS_DEADLINE_SEC")
+    raw = runtime_setting("OUROBOROS_SUPERVISOR_LIVENESS_DEADLINE_SEC")
     if raw is None and isinstance(settings, dict):
         raw = settings.get("OUROBOROS_SUPERVISOR_LIVENESS_DEADLINE_SEC")
     try:
@@ -205,6 +305,15 @@ def get_post_task_evolution_budget_usd() -> float:
     """Optional per-window USD budget for post-task evolution (0 = use the
     existing EVOLUTION_BUDGET_RESERVE / TOTAL_BUDGET gating only)."""
     return _clamped_number_setting("OUROBOROS_POST_TASK_EVOLUTION_BUDGET_USD", low=0.0)
+
+
+# Share of a reviewer's USABLE window that CHANGE-CLASS governance may occupy
+# inline (`tools/governance_context.py` tiers 2 and 3 together): the handbook
+# chapters the change activates and, for a packet row, the architecture sections
+# that name a touched file. The rest of both books arrives as navigation the
+# reviewer reads on demand, so a 272K-token governance corpus can never crowd
+# out the change itself. Structural, not a settings key.
+REVIEW_GOVERNANCE_INLINE_SHARE = 0.20
 
 
 # Per-root active-child ceiling (v6.82: 50->500) and absolute host-visible nesting ceiling, used by supervisor gates and ARCHITECTURE §7.
@@ -250,8 +359,89 @@ def get_delegate_wait_sec() -> int:
         "OUROBOROS_DELEGATE_WAIT_SEC", low=1, high=get_delegate_wait_max_sec(), cast=int)
 
 
+# Consciousness wake-ups. The interval between wakes is the MODEL's choice (``set_next_wakeup``),
+# clamped to [``get_bg_wakeup_min_sec``, ``get_bg_wakeup_max_sec``]; WAKE_DEFAULT_SEC is the interval
+# used when it has chosen none — 55 minutes, just under the default ``OUROBOROS_PROMPT_CACHE_TTL``
+# of 1 h, so the shared prefix is still warm on TTL-metered routes when the next wake lands. SSOT
+# for the alarm; ``consciousness.py`` adopts these readers in P2.
+WAKE_DEFAULT_SEC = 3300
+CONSCIOUSNESS_AUTONOMY_LEVELS = ("observe", "act", "full")
+# The usage ledger keeps every attempt younger than this UNFOLDED (``usage_compaction``
+# ``_foldable_attempt_ids``): a folded group row is stamped with the compaction instant,
+# so only unfolded rows keep the true spend time the rolling consciousness allowance
+# (``consciousness_allowance``, a 24 h window) reads. Twice the window, so a root that
+# spent inside the window is still attributable when the window closes.
+USAGE_LEDGER_FOLD_MIN_AGE_SEC = 48 * 3600
+# A DISPLAY reader of the usage ledger (heartbeat cost fields, the ``llm_usage`` budget
+# refresh, loop-thread budget pre-checks, ``/api/state``, the cost views) waits at most
+# this long for the monetary lock, then serves the last validated snapshot: a 45 s wait on
+# the supervisor loop or a gateway thread starves every worker behind it. Money never
+# reads through this bound — ``reserve_attempt`` keeps the full monetary timeout.
+USAGE_DISPLAY_LOCK_TIMEOUT_SEC = 0.25
+# After one contended display read, further display reads of that ledger serve the
+# snapshot without touching the lock for this long, so a sustained write convoy costs a
+# display thread about one bounded attempt per second instead of one per read.
+USAGE_DISPLAY_REVALIDATE_AFTER_SEC = 1.0
+
+
+def get_consciousness_autonomy() -> str:
+    """What a consciousness wake may do: ``observe`` | ``act`` | ``full``. A closed enum read the
+    ``resolve_effort`` way — an unknown value is a typo, not a new level, and falls back to the
+    shipped default rather than widening or silently disabling what consciousness may do."""
+    value = str(runtime_setting("OUROBOROS_CONSCIOUSNESS_AUTONOMY", "") or "").strip().lower()
+    if value in CONSCIOUSNESS_AUTONOMY_LEVELS:
+        return value
+    return str(SETTINGS_DEFAULTS["OUROBOROS_CONSCIOUSNESS_AUTONOMY"])
+
+
+def get_consciousness_daily_usd() -> float:
+    """Rolling-24h USD ceiling on consciousness spend — its wakes plus the tasks they start.
+    ``0`` is a real owner choice, not unset: consciousness may not spend at all."""
+    return _clamped_number_setting("OUROBOROS_CONSCIOUSNESS_DAILY_USD", low=0.0)
+
+
+def get_consciousness_max_tasks() -> int:
+    """How many consciousness-started tasks may run at once; ``0`` = never start tasks (the explicit
+    zero of ``get_max_subagent_depth``). The hard max is a sanity ceiling — the real bounds are the
+    daily allowance and the worker pool, not this number."""
+    return _bounded_positive_int_setting(
+        "OUROBOROS_CONSCIOUSNESS_MAX_TASKS",
+        default=int(SETTINGS_DEFAULTS["OUROBOROS_CONSCIOUSNESS_MAX_TASKS"]),
+        hard_max=32,
+        min_value=0,
+    )
+
+
+def get_bg_wakeup_min_sec() -> int:
+    """Lower bound of the wake-up interval, floored at 60s so a typo cannot busy-wake the tick."""
+    return _clamped_number_setting("OUROBOROS_BG_WAKEUP_MIN", low=60, cast=int)
+
+
+def get_bg_wakeup_max_sec() -> int:
+    """Upper bound of the wake-up interval; never below the lower bound, so an inverted pair
+    collapses to a fixed interval instead of an empty range."""
+    return _clamped_number_setting(
+        "OUROBOROS_BG_WAKEUP_MAX", low=get_bg_wakeup_min_sec(), cast=int)
+
+
 def get_search_code_wall_sec() -> float:
     """Total wall-clock budget (seconds) for ONE search_code call — bounds both the rg
     directory walk and the batched rg loop so a scan over a very large root cannot run
     unbounded. Env/setting: ``OUROBOROS_SEARCH_CODE_WALL_SEC`` (floored at 5s)."""
     return _clamped_number_setting("OUROBOROS_SEARCH_CODE_WALL_SEC", low=5.0)
+
+
+def get_finalization_grace_sec(settings: Optional[dict] = None) -> int:
+    """Grace window in seconds: env, else the ``settings`` argument, else the
+    shipped default — the ``_clamped_number_setting`` shape. Deliberately NO
+    ``load_settings()`` fallback: a READ must never persist settings, and that
+    call runs the context-mode compatibility migration, which can WRITE a
+    normalized file under read-only observers (``task_pacing._reserve_sec``)."""
+    raw = runtime_setting("OUROBOROS_FINALIZATION_GRACE_SEC")
+    if raw is None and isinstance(settings, dict):
+        raw = settings.get("OUROBOROS_FINALIZATION_GRACE_SEC")
+    try:
+        parsed = int(raw)
+    except (TypeError, ValueError):
+        parsed = int(FINALIZATION_GRACE_DEFAULT_SEC)
+    return max(0, min(parsed, 300))

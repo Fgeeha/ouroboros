@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import httpx
+from ouroboros.effort_evidence import validated_effort_resolution
 
 from ouroboros.config import (
     CLAUDEXOR_MIN_VERSION,
@@ -60,6 +61,29 @@ _READ_TIMEOUT_SEC = 60.0
 # their total wall-clock bound outside this phase-local adapter.
 # Passed per request via ``_request(timeout_sec=...)``; it never changes the default.
 SHORT_POLL_TIMEOUT_SEC = 5.0
+# The httpx failures a READ-ONLY observer may retry as the same unresolved read: the
+# socket delivered no daemon answer, so nothing is known about the run and nothing
+# was claimed. Classified by exception TYPE plus received status, never by prose; a
+# received 4xx/5xx still wins (see ``_request``).
+_OBSERVATION_RETRYABLE_ERRORS = (
+    httpx.ReadTimeout, httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout,
+    httpx.ReadError, httpx.WriteError, httpx.RemoteProtocolError,
+)
+# ...and WHICH hole it was, for the observer that has to tell the owner apart a
+# daemon that is merely slow from one that is not there. Our own read bound
+# expiring says nothing about the daemon; a socket that could not be opened or
+# that broke mid-exchange says it did not answer. Classified by exception TYPE,
+# never by prose, and carried beside ``code`` rather than replacing it: the
+# model-control retry loop, the daemon liveness probe and the definite-unrun set
+# all key on ``daemon_unreachable`` for reasons that have nothing to do with an
+# observation.
+_OBSERVATION_READ_TIMEOUT = "observation_read_timeout"
+
+
+def _observation_reason(exc: BaseException) -> str:
+    """The typed reason for a read-only observation hole."""
+    return (_OBSERVATION_READ_TIMEOUT if isinstance(exc, httpx.ReadTimeout)
+            else "daemon_unreachable")
 _ATTEMPTS_REL = "attempts"
 _ATTEMPT_RECORD = "attempt.yaml"
 
@@ -77,18 +101,34 @@ class ClaudexorUnavailable(RuntimeError):
     a preserved fact for the typed error seam, not a client action framework.
     """
 
+    # What the engine REPORTED about a failed run ("" = nothing reported); set only by
+    # ``run_failure_error``. An opaque fact: carried and shown, never branched on.
+    reported_cause = ""
+
     def __init__(self, code: str, message: str, *, status_code: int = 0,
-                 required_actions: tuple[str, ...] = ()) -> None:
+                 required_actions: tuple[str, ...] = (), observation_timeout: bool = False,
+                 observation_reason: str = "") -> None:
         super().__init__(message)
         self.code = str(code or "claudexor_unavailable")
         self.status_code = int(status_code or 0)
         self.required_actions = tuple(required_actions or ())
+        # Read-only observers may retry this exact HTTP read without claiming
+        # anything about the worker. A received HTTP refusal still wins.
+        self.observation_timeout = bool(observation_timeout)
+        # Which hole it was, for the observer only (``_observation_reason``):
+        # a read bound that expired against a live daemon is not the same fact
+        # as a socket that never carried an answer, and only the second is
+        # worth an owner-facing outage line.
+        self.observation_reason = str(observation_reason or "")
 
 
 # Cross-repo contract (B1): the engine's window-exhausted RunFailure codes. A
 # newer engine (rotation PR-A) reports a spent credential POOL under its own
-# code; both heal on a timer, so both map onto the exhausted class below — with
-# the ORIGINAL code preserved. Any other code stays a generic
+# code. A spent subscription window always heals on a timer (the engine always
+# dates it); a pool heals on a timer only when the engine DATED it (`resetsAt`),
+# an undated pool (every enabled account refused the model, every account
+# disabled) is structural. `_window_exhausted_refusal` is the one reader; the
+# ORIGINAL code is preserved either way. Any other code stays a generic
 # ClaudexorUnavailable: fail-open, old engines emitting code:null included.
 WINDOW_EXHAUSTED_CODES = ("subscription_window_exhausted", "credential_pool_exhausted")
 
@@ -100,6 +140,63 @@ class ClaudexorSubscriptionWindowExhausted(ClaudexorUnavailable):
                  code: str = "subscription_window_exhausted") -> None:
         super().__init__(code, message, status_code=status_code)
         self.reset_at = str(reset_at or "")
+
+
+def _window_exhausted_refusal(code: str, message: str, resets_at: Any, *,
+                              status_code: int = 0) -> Optional[ClaudexorSubscriptionWindowExhausted]:
+    """The timer-healing class for a window-exhausted code, or None for the caller's
+    plain refusal. Keyed on the structured ``resetsAt`` field only, never on prose: a
+    pool maps only when the engine dated it (a non-empty string), so an undated pool
+    never masquerades as a quota timer."""
+    dated = isinstance(resets_at, str) and bool(resets_at.strip())
+    if code not in WINDOW_EXHAUSTED_CODES or (
+            code != "subscription_window_exhausted" and not dated):
+        return None
+    return ClaudexorSubscriptionWindowExhausted(
+        message, reset_at=str(resets_at or ""), status_code=status_code, code=code)
+
+
+REPORTED_CAUSE_CHARS = 512  # strict bound of the record field, omission marker included
+
+
+def run_failure_cause(failure: Any) -> str:
+    """What the engine REPORTED about a failed run (``failure.safeMessage``), whitespace-
+    collapsed, secret-redacted and strictly bounded; "" when it reported nothing. An OPAQUE
+    fact: stored and displayed, never parsed or branched on (BIBLE P5) — presence is the
+    only test a caller may make; a person's quote separates the host's own cut from the
+    engine's words through ``reported_cause_words``."""
+    from ouroboros.utils import sanitize_tool_result_for_log, truncate_within_limit
+
+    words = (failure if isinstance(failure, dict) else {}).get("safeMessage")
+    return truncate_within_limit(
+        sanitize_tool_result_for_log(" ".join(str(words or "").split())), REPORTED_CAUSE_CHARS)
+
+
+def reported_cause_words(cause: Any) -> tuple[str, bool]:
+    """``(words, shortened)`` of a stored ``run_failure_cause``: the engine's words
+    without the bound's own omission marker (``truncate_within_limit``), and whether
+    that bound cut them. The words were whitespace-collapsed before the bound, so a
+    newline can only open the host's marker; the engine's words are never read."""
+    text = str(cause or "")
+    words, marker, length = text.rpartition(
+        f"\n⚠️ OMISSION NOTE: truncated at {REPORTED_CAUSE_CHARS} chars; original length ")
+    if marker and "\n" not in words and length.isdigit() and int(length) > len(text) == REPORTED_CAUSE_CHARS:
+        return words, True
+    return text, False
+
+
+def run_failure_error(run_id: str, run_state: str, failure: Any) -> ClaudexorUnavailable:
+    """The typed refusal for a delegated review run that did not succeed. A null engine code
+    keeps the host-derived ``run_<state>`` code: a STATE fact, never a cause — the cause the
+    engine reported rides beside it as ``reported_cause``."""
+    failure = failure if isinstance(failure, dict) else {}
+    message = (f"delegated review session {run_id} ended {run_state or 'unknown'}"
+               + (f": {json.dumps(failure, ensure_ascii=False)}" if failure else ""))
+    code = str(failure.get("code") or "")
+    exc = (_window_exhausted_refusal(code, message, failure.get("resetsAt"))
+           or ClaudexorUnavailable(code or f"run_{run_state or 'unknown'}", message))
+    exc.reported_cause = run_failure_cause(failure)
+    return exc
 
 
 @dataclass(frozen=True)
@@ -254,6 +351,53 @@ def _is_loopback(host: str) -> bool:
         return False
 
 
+def operation_query_supported(operations: list[dict], *, method: str, path: str,
+                              name: str, value: str) -> bool:
+    """Negotiate an exact query value from the serving operation's descriptor."""
+    return any(
+        operation.get("method") == method and operation.get("path") == path
+        and any(parameter.get("name") == name and parameter.get("location") == "query"
+                and isinstance(parameter.get("enum"), list) and value in parameter["enum"]
+                for parameter in (operation.get("parameters") or []) if isinstance(parameter, dict))
+        for operation in operations if isinstance(operation, dict)
+    )
+
+
+def account_catalog_supported(operations: list[dict], path: str) -> bool:
+    """Opt in only when this exact operation declares the accounts query view."""
+    return operation_query_supported(operations, method="GET", path=path, name="view", value="accounts")
+
+
+def model_failure_evidence_supported(operations: list[dict]) -> bool:
+    return operation_query_supported(operations, method="POST", path="/v2/model-operations",
+                                     name="captureFailureEvidence", value="true")
+
+
+# The engine's typed live-message outcomes (``LiveMessageOutcome``): the two
+# positive boundaries plus the four typed non-deliveries. Mirrored 1:1 by
+# ``delegate_message``; the host adds only its own ``not_found`` vocabulary.
+LIVE_MESSAGE_OUTCOMES = frozenset({
+    "delivered", "accepted", "rejected", "not_active", "unsupported", "delivery_unknown",
+})
+# The catalog spelling of the live-message route (Express-style template, the
+# same shape as ``/v2/runs/:id/control`` and the interaction-answer row).
+RUN_MESSAGE_OPERATION = ("POST", "/v2/runs/:id/messages")
+
+
+def run_message_supported(operations: list[dict]) -> bool:
+    """Does this engine's own route catalog list ``POST /v2/runs/:id/messages``?
+
+    Presence is negotiated structurally, like every other route here: an engine
+    older than the live-message release answers a route 404, which the verb must
+    never reach (a 404 is otherwise the daemon's "no such run").
+    """
+    method, path = RUN_MESSAGE_OPERATION
+    return any(
+        operation.get("method") == method and operation.get("path") == path
+        for operation in operations if isinstance(operation, dict)
+    )
+
+
 class ClaudexorGateway:
     """Thin typed client over the Claudexor ``/v2`` control API."""
 
@@ -330,10 +474,14 @@ class ClaudexorGateway:
                                      headers=headers or None, **bound) as response:
                 response.read()
         except httpx.HTTPError as exc:
+            retryable = (isinstance(exc, _OBSERVATION_RETRYABLE_ERRORS)
+                         and (response is None or response.status_code < 400))
             raise ClaudexorUnavailable(
                 "daemon_unreachable",
                 f"Claudexor daemon unreachable: {type(exc).__name__}: {exc}",
                 status_code=response.status_code if response is not None else 0,
+                observation_timeout=retryable,
+                observation_reason=_observation_reason(exc) if retryable else "",
             ) from exc
         if response.status_code >= 400:
             raise self._problem(response)
@@ -378,19 +526,17 @@ class ClaudexorGateway:
                     if isinstance(item, str) and item
                 )
         # The CODE decides, exactly as every other classification on this seam does.
-        # Sniffing `context` for a reset key instead had it both ways: no producer puts
-        # `resetsAt`/`resets_at`/`cooldownUntil` in a ControlProblem context (a spent
-        # window is reported as a run-detail RunFailure, and `cooldown_until` lives in a
-        # quota snapshot), so the transient class was unreachable — while any unrelated
-        # refusal that happened to carry one, an `idempotency_conflict` say, would have
-        # been announced as a spent subscription window and retried on a timer.
-        if code in WINDOW_EXHAUSTED_CODES:
-            return ClaudexorSubscriptionWindowExhausted(
-                message, reset_at=str(context.get("resetsAt") or ""),
-                status_code=response.status_code, code=code,
-            )
-        return ClaudexorUnavailable(code, message, status_code=response.status_code,
-                                    required_actions=required_actions)
+        # Sniffing `context` for a reset key on ANY code had it both ways: an unrelated
+        # refusal that happened to carry one, an `idempotency_conflict` say, was announced
+        # as a spent subscription window and retried on a timer. So a reset key is read
+        # only inside a window code, and there only the pool's own `resetsAt` says whether
+        # it is a timer at all. At engine 3.14.0 the daemon serializes no `resetsAt` into a
+        # pool ControlProblem context (the dated producer is the run-detail RunFailure, and
+        # `cooldown_until` lives in a quota snapshot), so this seam yields the plain class.
+        return (_window_exhausted_refusal(code, message, context.get("resetsAt"),
+                                          status_code=response.status_code)
+                or ClaudexorUnavailable(code, message, status_code=response.status_code,
+                                        required_actions=required_actions))
 
     # -- operations ------------------------------------------------------------
 
@@ -423,8 +569,9 @@ class ClaudexorGateway:
         self._engine_build_sha = str(engine.get("sha") or "")
         return body
 
-    def agent_capabilities(self) -> Dict[str, Any]:
-        body = self._request("GET", "/v2/agent-capabilities")
+    def agent_capabilities(self, *, timeout_sec: Optional[float] = None) -> Dict[str, Any]:
+        body = self._request("GET", "/v2/agent-capabilities",
+                             **({"timeout_sec": timeout_sec} if timeout_sec is not None else {}))
         return body if isinstance(body, dict) else {}
 
     # Model operations use the same private control transport, not Agent runs
@@ -432,25 +579,34 @@ class ClaudexorGateway:
     # waiting, billing and explicit acknowledgement. The engine owns account
     # choice; this client preserves the caller's Auto/pin request verbatim.
 
-    def list_model_sources(self) -> Dict[str, Any]:
+    def list_model_sources(self, *, view: Optional[str] = None) -> Dict[str, Any]:
         """Return the engine's opaque source ids and credential-harness bindings."""
-        return _model_object(self._request("GET", "/v2/model-sources"))
+        from urllib.parse import urlencode
+
+        path = "/v2/model-sources"
+        if view is not None:
+            path += "?" + urlencode({"view": view})
+        return _model_object(self._request("GET", path))
 
     def list_source_models(self, source: str,
                            credential_profile_id: Optional[str] = None, *,
-                           requested_model: Optional[str] = None) -> Dict[str, Any]:
+                           requested_model: Optional[str] = None,
+                           timeout_sec: Optional[float] = None,
+                           view: Optional[str] = None) -> Dict[str, Any]:
         """Preserve the exact-profile catalog envelope; an omitted pin means engine Auto."""
         from urllib.parse import quote, urlencode
 
         path = f"/v2/model-sources/{quote(str(source), safe='')}/models"
         query = {}
+        if view is not None:
+            query["view"] = view
         if credential_profile_id is not None:
             query["credentialProfileId"] = credential_profile_id
         if requested_model is not None:
             query["requestedModel"] = requested_model
         if query:
             path += "?" + urlencode(query)
-        return _model_object(self._request("GET", path))
+        return _model_object(self._request("GET", path, **({"timeout_sec": timeout_sec} if timeout_sec is not None else {})))
 
     def upload_model_request(self, request: Dict[str, Any], *,
                              idempotency_key: str) -> Dict[str, Any]:
@@ -512,11 +668,16 @@ class ClaudexorGateway:
         return ref
 
     def create_model_operation(self, request_ref: Dict[str, Any], *,
-                               idempotency_key: str) -> Dict[str, Any]:
+                               idempotency_key: str, capture_failure_evidence: bool = False,
+                               capture_effort_evidence: bool = False) -> Dict[str, Any]:
         """Create or rejoin exactly one caller-identified generation; never mint a retry key."""
         key = _model_idempotency_key(idempotency_key)
+        query = "&".join(f"{name}=true" for name, enabled in (
+            ("captureFailureEvidence", capture_failure_evidence),
+            ("captureEffortEvidence", capture_effort_evidence)) if enabled)
+        path = "/v2/model-operations" + (f"?{query}" if query else "")
         return _model_operation(self._request(
-            "POST", "/v2/model-operations", json_body={"request": _model_payload_ref(request_ref)},
+            "POST", path, json_body={"request": _model_payload_ref(request_ref)},
             headers={"Idempotency-Key": key},
         ))
 
@@ -532,14 +693,10 @@ class ClaudexorGateway:
     def get_model_result(self, operation_id: str, *, expected_ref: Dict[str, Any],
                          timeout_sec: Optional[float] = None,
                          raw_bytes: bool = False) -> Dict[str, Any] | bytes:
-        """Read and verify the complete result, without ACK, redaction or artifact caps.
-
-        The expected reference comes from this operation's ready custody record.
-        Failure preserves that handle: only another read of the same operation is
-        appropriate here, never a new generation. The caller acknowledges after
-        it has retained the returned result under its own custody contract.
-        ``raw_bytes`` retains the exact verified JSON encoding for that custody;
-        it never skips the size, digest, UTF-8 or object validation below.
+        """Verify the complete result against ready custody; no ACK, redaction or caps.
+        Failure preserves the handle: re-read this operation, never regenerate.
+        The caller ACKs after retaining the result under its own custody contract.
+        ``raw_bytes`` keeps exact JSON encoding; size, digest, UTF-8 and object checks apply.
         """
         from urllib.parse import quote
 
@@ -650,6 +807,47 @@ class ClaudexorGateway:
                 return str(row.get("id") or "")
         return ""
 
+    def ensure_full_access(self, root: str) -> Dict[str, Any]:
+        """Create a missing scoped full grant; the caller owns when to request it.
+
+        Scoped GET also returns default false for an absent trust file. The
+        actual-file list distinguishes absence from an explicit refusal; its
+        path remains authoritative when a legacy record has no repoRoot.
+        """
+        from urllib.parse import quote
+
+        target = str(root)
+        body = self._request("GET", f"/v2/trust?repoRoot={quote(target, safe='')}")
+        entries = body.get("entries") if isinstance(body, dict) else None
+        if not isinstance(entries, list) or len(entries) != 1:
+            raise ClaudexorUnavailable("malformed_response", "Scoped trust lookup returned no unique state")
+        state = _trust_state(entries[0])
+        if state["repoRoot"] != target:
+            raise ClaudexorUnavailable("malformed_response", "Scoped trust lookup returned a different root")
+        if state["allowFullAccess"]:
+            return state
+        body = self._request("GET", "/v2/trust")
+        entries = body.get("entries") if isinstance(body, dict) else None
+        if not isinstance(entries, list):
+            raise ClaudexorUnavailable("malformed_response", "Trust listing returned no entries")
+        for entry in entries:
+            entry = _trust_state(entry)
+            if entry["path"] == state["path"]:
+                if entry["allowFullAccess"]:
+                    return entry
+                raise ClaudexorUnavailable(
+                    "trust_full_access_required", "Full access is disabled for this scope; its existing choice was preserved. "
+                    "Lower this call with access=workspace_write or select Working files on the actor row.",
+                    status_code=403,
+                )
+        granted = _trust_state(self._request(
+            "POST", "/v2/trust", json_body={"repoRoot": target, "allowFullAccess": True},
+        ))
+        if (granted["repoRoot"] != target or granted["path"] != state["path"]
+                or not granted["allowFullAccess"]):
+            raise ClaudexorUnavailable("malformed_response", "Trust update did not confirm full access for this scope")
+        return granted
+
     def start_run(self, request: Dict[str, Any], *, idempotency_key: str = "") -> Dict[str, Any]:
         """POST /v2/runs with a caller-built, schema-valid request body.
 
@@ -712,6 +910,10 @@ class ClaudexorGateway:
         body = self._request("GET", f"/v2/runs/{run_id}", timeout_sec=timeout_sec)
         return body if isinstance(body, dict) else {}
 
+    def open_run_events(self, run_id: str, after_seq: int, timeout_sec: float) -> Any:
+        """``GET /v2/runs/:id/events`` resumed after ``after_seq``: an open SSE stream (``gateways.claudexor_run_events`` reads it)."""
+        return self._client.stream("GET", f"/v2/runs/{run_id}/events", headers={"Last-Event-ID": str(int(after_seq))}, timeout=httpx.Timeout(timeout_sec, connect=min(_CONNECT_TIMEOUT_SEC, timeout_sec)))
+
     def get_run_artifact(self, run_id: str, path: str) -> bytes:
         """GET /v2/runs/:id/artifacts/<path> — the FULL artifact body, raw bytes.
 
@@ -737,6 +939,65 @@ class ClaudexorGateway:
         if response.status_code >= 400:
             raise self._problem(response)
         return response.content
+
+    def stream_run_artifact(self, run_id: str, path: str, sink: Any,
+                            *, expected: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Stream exact run bytes into a caller-owned temporary file.
+
+        The caller publishes only after this read verifies the manifest identity.
+        HTTP refusals and partial streams never become an empty successful file;
+        the existing small diagnostic-artifact reader keeps its bytes contract.
+        """
+        from urllib.parse import quote
+
+        digest, size = hashlib.sha256(), 0
+        response = None
+        try:
+            with self._client.stream(
+                "GET", f"/v2/runs/{quote(str(run_id), safe='')}/artifacts/{quote(str(path), safe='/')}",
+            ) as response:
+                if response.status_code >= 400:
+                    response.read()
+                    raise self._problem(response)
+                for chunk in response.iter_bytes(chunk_size=1024 * 1024):
+                    sink.write(chunk)
+                    digest.update(chunk)
+                    size += len(chunk)
+        except httpx.HTTPError as exc:
+            retryable = (isinstance(exc, _OBSERVATION_RETRYABLE_ERRORS)
+                         and (response is None or response.status_code < 400))
+            raise ClaudexorUnavailable(
+                "daemon_unreachable", f"Claudexor artifact read failed: {type(exc).__name__}",
+                status_code=response.status_code if response is not None else 0,
+                observation_timeout=retryable,
+                observation_reason=_observation_reason(exc) if retryable else "",
+            ) from exc
+        measured = {"size": size, "sha256": digest.hexdigest()}
+        if expected is not None:
+            want_size = expected.get("sizeBytes", expected.get("size"))
+            want_hash = str(expected.get("sha256") or "").removeprefix("sha256:")
+            if (want_size is not None and want_size != size) or want_hash != measured["sha256"]:
+                raise ClaudexorUnavailable("artifact_integrity_error", "Run artifact differs from its captured manifest")
+        return measured
+
+    def apply_run(self, run_id: str, request: Dict[str, Any], *, idempotency_key: str) -> Dict[str, Any]:
+        """Apply the existing run product; the caller retains intent and custody."""
+        from urllib.parse import quote
+
+        return _model_object(self._request(
+            "POST", f"/v2/runs/{quote(str(run_id), safe='')}/apply", json_body=request,
+            headers={"Idempotency-Key": idempotency_key},
+        ))
+
+    def decide_run(self, run_id: str, request: Dict[str, Any], *, idempotency_key: str) -> Dict[str, Any]:
+        """Submit an explicit disposition through the existing engine decision route."""
+        from urllib.parse import quote
+
+        body = self._request("POST", f"/v2/runs/{quote(str(run_id), safe='')}/decision", json_body=request,
+                             headers={"Idempotency-Key": idempotency_key})
+        if not isinstance(body, dict):
+            raise ClaudexorUnavailable("malformed_response", "Run decision returned a non-object response")
+        return body
 
     def answer_interaction(self, run_id: str, interaction_id: str,
                            answers: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -782,6 +1043,63 @@ class ClaudexorGateway:
         raise ClaudexorUnavailable(
             "malformed_response",
             f"interaction answer returned no typed status (HTTP {response.status_code})",
+        )
+
+    def send_run_message(self, run_id: str, text: str, *, idempotency_key: str,
+                         expected_attempt_id: str = "",
+                         timeout_sec: Optional[float] = None) -> Dict[str, Any]:
+        """POST /v2/runs/:id/messages — one live message into a running run.
+
+        ``idempotency_key`` is REQUIRED and is the caller's message identity: the
+        engine serves the route through its idempotent-delivery store, so a replay
+        under the same key returns the stored receipt instead of delivering twice
+        (``delegate_message`` mints it as ``message_id`` and hands it back).
+        ``expected_attempt_id`` pins the live attempt when a caller holds one.
+
+        Like ``answer_interaction`` this is transport, not translation, and it never
+        goes through ``_request`` (which raises on every status >= 400): any body
+        carrying a typed ``outcome`` (``LIVE_MESSAGE_OUTCOMES``) is returned as the
+        ANSWER it is, whatever the HTTP status. What raises ``ClaudexorUnavailable``:
+        transport failures (``daemon_unreachable``), and every refusal without a
+        typed outcome — the daemon's 404 ``no such run``, the 409 idempotency
+        problems (``idempotency_conflict`` / ``delivery_in_progress`` /
+        ``delivery_interrupted``), 400 (malformed, secret, too long), 501 (no
+        service), 5xx — each typed through ``_problem`` with its status code, so the
+        verb classifies by code AND status. A 2xx without a typed outcome is
+        ``malformed_response``.
+        """
+        from urllib.parse import quote
+
+        path = f"/v2/runs/{quote(str(run_id), safe='')}/messages"
+        payload: Dict[str, Any] = {"text": str(text)}
+        if expected_attempt_id:
+            payload["expectedAttemptId"] = str(expected_attempt_id)
+        bound: Dict[str, Any] = {}
+        if timeout_sec is not None:
+            bounded = max(0.000001, float(timeout_sec))
+            bound = {"timeout": httpx.Timeout(bounded, connect=min(_CONNECT_TIMEOUT_SEC, bounded))}
+        try:
+            response = self._client.request(
+                "POST", path, json=payload,
+                headers={"Idempotency-Key": str(idempotency_key)}, **bound)
+        except httpx.HTTPError as exc:
+            raise ClaudexorUnavailable(
+                "daemon_unreachable",
+                f"Claudexor daemon unreachable: {type(exc).__name__}: {exc}",
+            ) from exc
+        body: Any = None
+        if response.content:
+            try:
+                body = response.json()
+            except ValueError:
+                body = None
+        if isinstance(body, dict) and str(body.get("outcome") or "") in LIVE_MESSAGE_OUTCOMES:
+            return body
+        if response.status_code >= 400:
+            raise self._problem(response)
+        raise ClaudexorUnavailable(
+            "malformed_response",
+            f"run message returned no typed outcome (HTTP {response.status_code})",
         )
 
     def cancel_run(self, run_id: str, *, reason: str = "") -> Dict[str, Any]:
@@ -864,6 +1182,22 @@ class ClaudexorGateway:
         models = body.get("models") if isinstance(body, dict) else None
         return [row for row in (models or []) if isinstance(row, dict)]
 
+    def harness_model_catalog(self, harness_id: str, *,
+                              credential_profile_id: Optional[str] = None,
+                              view: Optional[str] = None) -> Dict[str, Any]:
+        """Retain the catalog envelope for an explicitly negotiated view."""
+        from urllib.parse import quote, urlencode
+
+        path = f"/v2/harnesses/{quote(str(harness_id), safe='')}/models"
+        query = {}
+        if view is not None:
+            query["view"] = view
+        if credential_profile_id is not None:
+            query["credentialProfileId"] = credential_profile_id
+        if query:
+            path += "?" + urlencode(query)
+        return _model_object(self._request("GET", path))
+
     def setup_job_create(self, request: Dict[str, Any], *, idempotency_key: str = "") -> Dict[str, Any]:
         body = self._request(
             "POST", "/v2/setup/jobs", json_body=dict(request),
@@ -901,7 +1235,7 @@ class ClaudexorGateway:
             raise ValueError(f"unknown setup job op: {op!r}")
         return body if isinstance(body, dict) else {}
 
-    def operations(self) -> List[Dict[str, Any]]:
+    def operations(self, *, timeout_sec: Optional[float] = None) -> List[Dict[str, Any]]:
         """GET /v2/operations — the engine's own implemented-route catalog.
 
         The handshake advertises this path (``operationsPath``); the catalog is
@@ -909,7 +1243,7 @@ class ClaudexorGateway:
         on version folklore (verified live: ``{protocolMajor, operations:[{id,
         method, path, ...}]}``).
         """
-        body = self._request("GET", "/v2/operations")
+        body = self._request("GET", "/v2/operations", timeout_sec=timeout_sec)
         ops = body.get("operations") if isinstance(body, dict) else None
         return [row for row in (ops or []) if isinstance(row, dict)]
 
@@ -943,6 +1277,16 @@ class ClaudexorGateway:
             json_body={"name": str(name), "value": str(value)},
         )
         return body if isinstance(body, dict) else {}
+
+
+def _trust_state(body: Any) -> Dict[str, Any]:
+    if (not isinstance(body, dict) or "repoRoot" not in body
+            or (body["repoRoot"] is not None and not isinstance(body["repoRoot"], str))
+            or not isinstance(body.get("path"), str) or not body["path"]
+            or type(body.get("allowFullAccess")) is not bool
+            or not isinstance(body.get("accessDefault"), str) or not body["accessDefault"]):
+        raise ClaudexorUnavailable("malformed_response", "Trust lookup returned an invalid state")
+    return body
 
 
 def _model_object(body: Any) -> Dict[str, Any]:
@@ -1113,8 +1457,8 @@ def attempt_containment(run_dir: str) -> List[AttemptContainment]:
     return applied
 
 
-def final_attempt_facts(detail: Dict[str, Any], run_id: str) -> Dict[str, str]:
-    """Read the final attempt's route facts from engine-owned telemetry.
+def final_attempt_facts(detail: Dict[str, Any], run_id: str) -> Dict[str, Any]:
+    """Read the final attempt's route and effort facts from engine-owned telemetry.
 
     The summary's model and harnesses echo the request; its route/authRoute
     projections may borrow facts from earlier attempts. Only the unique row
@@ -1143,13 +1487,16 @@ def final_attempt_facts(detail: Dict[str, Any], run_id: str) -> Dict[str, str]:
     if len(matching) != 1:
         return {}
     row = matching[0]
-    return {
+    facts = {
         target: row.get(source) if isinstance(row.get(source), str) else ""
         for target, source in (
             ("attempt_id", "attempt_id"), ("harness_id", "harness_id"),
             ("model", "observed_model"), ("profile_id", "profile_id"),
         )
     }
+    if "effort_resolution" in row:
+        facts["effort_resolution"] = validated_effort_resolution(row["effort_resolution"])
+    return facts
 
 
 __all__ = [
@@ -1166,4 +1513,6 @@ __all__ = [
     "final_attempt_facts",
     "operator_home",
     "pending_interactions",
+    "run_failure_cause",
+    "run_failure_error",
 ]

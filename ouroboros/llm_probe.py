@@ -5,6 +5,8 @@ reasoning, cache, or capability-learning paths.  Target resolution and client
 construction remain owned by the routing leaf the client composes
 (:mod:`ouroboros.llm_routing`); this module only builds the final probe candidate
 and dispatches it through the existing physical-attempt accounting seam.
+Transport reachability is a separate non-generating metadata observation; it
+never reserves a paid attempt or claims the prior generation completed.
 """
 
 from __future__ import annotations
@@ -42,9 +44,13 @@ def _accounted_send(
         _candidate_before_dispatch,
         _execute_candidate,
         _physical_candidate,
+        apply_processing_preference,
     )
+    from ouroboros.model_slots import resolve_processing_preference
 
+    target = {**target, "processing_preference": resolve_processing_preference(override=target.get("processing_preference"))}
     final_candidate = _physical_candidate(candidate)
+    apply_processing_preference(target, final_candidate)
     request = _attempt_request(target, final_candidate, source=source)
     return _execute_candidate(
         request,
@@ -202,6 +208,10 @@ def controlled_probe_error(exc: BaseException) -> dict[str, Any]:
     """Map typed transport facts to one bounded, provider-neutral reason."""
     status, code, error_type = _error_facts(exc)
     credit_codes = {
+        # Z.ai answers plan exhaustion as HTTP 429 code 1113 "Insufficient
+        # balance" (billing, not rate limiting; a Coding Plan key on the
+        # pay-as-you-go endpoint lands here too).
+        "1113",
         "billing_hard_limit_reached",
         "credit_balance_too_low",
         "credits_exhausted",
@@ -246,7 +256,11 @@ def controlled_probe_error(exc: BaseException) -> dict[str, Any]:
             connect_types += (openai.APIConnectionError,)
         except Exception:  # pragma: no cover - dependency is shipped
             pass
-        if isinstance(exc, timeout_types):
+        from ouroboros.net_transport import ExtraCaBundleError
+
+        if isinstance(exc, ExtraCaBundleError):
+            reason = str(exc)  # the owner's trust bundle, not the provider, is what failed
+        elif isinstance(exc, timeout_types):
             reason = "Timed out"
         elif isinstance(exc, connect_types):
             reason = "Could not reach provider"
@@ -305,6 +319,8 @@ def probe_provider_readiness(
     remote_client = None
     try:
         target = client._resolve_remote_target(model, settings=settings)
+        from ouroboros.model_slots import resolve_processing_preference
+        target["processing_preference"] = resolve_processing_preference(settings=dict(settings))
         if not _target_is_configured(target):
             return {
                 "ok": False,
@@ -317,7 +333,7 @@ def probe_provider_readiness(
 
         if provider in {
             "openrouter", "openai", "openai-compatible", "minimax", "cloudru",
-            "deepseek",
+            "deepseek", "zai",
         }:
             remote_client = client._new_remote_client(target)
 
@@ -338,8 +354,11 @@ def probe_provider_readiness(
             }
 
             def send_anthropic(payload):
+                from ouroboros.llm_attempt import processing_contract_headers
+                from ouroboros.net_transport import requests_verify_kwargs
                 response = requests.post(
-                    url, headers=headers, json=payload, timeout=float(timeout),
+                    url, headers={**headers, **processing_contract_headers(target, payload)}, json=payload, timeout=float(timeout),
+                    **requests_verify_kwargs(),
                 )
                 response.raise_for_status()
                 return response
@@ -396,3 +415,65 @@ __all__ = [
     "probe_oversized_context",
     "probe_provider_readiness",
 ]
+
+
+def upstream_transport_reachable(llm: Any, model: str, *, timeout: float,
+                                 model_role: str = "main", account_override: Optional[str] = None,
+                                 observed_after: Optional[float] = None, expected_route: Optional[dict] = None) -> dict:
+    """Non-generating observation of the selected upstream, never a paid probe."""
+    import logging
+    import time
+    from ouroboros.deadline_utils import parse_deadline_ts
+    from ouroboros.utils import utc_now_iso
+    from ouroboros.provider_models import parse_claudexor_model, provider_for_model
+    from ouroboros.transport_custody import is_loopback_base_url
+    try:
+        if provider_for_model(model) == "claudexor":
+            from ouroboros.llm_claudexor import model_catalog
+            from ouroboros.model_slots import MODEL_ACCOUNTS_KEY, model_role_option
+            source, native_model = parse_claudexor_model(model)
+            account = (model_role_option(MODEL_ACCOUNTS_KEY, model_role)
+                       if account_override is None else account_override)
+            effective = expected_route or {}
+            effective_profile = effective.get("credentialProfileId")
+            if (effective.get("source", source) != source
+                    or effective.get("model") not in (None, native_model)
+                    or (account and effective_profile and account != effective_profile)):
+                return {}
+            account = account or effective_profile
+            started = time.time() if observed_after is None else observed_after
+            catalog = model_catalog(source, account or None, requested_model=native_model,
+                                    timeout_sec=timeout)
+            observed = parse_deadline_ts(catalog.get("observedAt"))
+            # The existing model catalog owner performs fresh upstream discovery.
+            # Old/cache-only metadata cannot establish recovery from this outage.
+            if (catalog.get("source") == source and catalog.get("provenance") == "provider_http"
+                    and observed and observed.timestamp() >= started
+                    and (not account or catalog.get("credentialProfileId") == account)
+                    and (not effective.get("accountFingerprint")
+                         or catalog.get("accountFingerprint") == effective["accountFingerprint"])
+                    and any(item.get("id") == native_model for item in catalog.get("models", []))):
+                return {"kind": "upstream_catalog", "source": source,
+                        "observed_at": catalog["observedAt"], "provenance": catalog["provenance"],
+                        "credential_profile_id": catalog.get("credentialProfileId"),
+                        "account_fingerprint": catalog.get("accountFingerprint")}
+            return {}
+        target = llm._resolve_remote_target(model)
+        url = str(target.get("base_url") or "")
+        if not url or is_loopback_base_url(url):
+            return {}
+        import httpx
+        # Metadata carries no cognitive in-flight lease. Reuse the ordinary
+        # connection allowance for every HEAD phase, not the LLM read window.
+        timeout = min(float(timeout), float(llm._no_proxy_timeout(timeout).connect))
+        from ouroboros.net_transport import verify_kwargs
+        with httpx.Client(trust_env=False, timeout=timeout, follow_redirects=False, **verify_kwargs()) as client:
+            response = client.head(url)
+        # An upstream HTTP refusal still proves connectivity. A gateway/server
+        # outage does not. This says nothing about the old generation's outcome.
+        if 200 <= response.status_code < 500:
+            return {"kind": "upstream_http", "status_code": response.status_code,
+                    "observed_at": utc_now_iso()}
+    except Exception:
+        logging.getLogger(__name__).debug("upstream transport still unavailable", exc_info=True)
+    return {}

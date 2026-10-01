@@ -6,6 +6,7 @@ Covers:
 - kill_workers() writes failure results for RUNNING + PENDING tasks
 """
 import json
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -492,6 +493,92 @@ def test_kill_workers_can_record_owner_restart_cancellation(tmp_path):
         assert data["result"] == "Owner restart stopped this task before process restart."
 
 
+def test_owner_restart_teardown_keeps_the_recorded_cancel_origin_and_invents_none(tmp_path):
+    """#1317: Restart mints its intent, then kills the pool. The pool's terminal
+    write carries THAT recorded origin (the custody helper's fields), so the
+    owner line names the recorded cause instead of repeating the status word; a
+    row with no intent gets no origin. The full stated reason stays durable."""
+    import supervisor.queue as queue
+    import supervisor.workers as workers
+    from ouroboros.cancel_intents import request_cancel
+    from ouroboros.project_dialogue import _completion_verdict
+
+    orig = (workers.DRIVE_ROOT, dict(workers.WORKERS), dict(workers.RUNNING), list(workers.PENDING),
+            queue.DRIVE_ROOT, queue.PENDING, queue.RUNNING)
+    workers.DRIVE_ROOT = tmp_path
+    queue.DRIVE_ROOT = tmp_path
+    workers.WORKERS.clear()
+    workers.RUNNING.clear()
+    workers.RUNNING["run1"] = {"task": {"id": "run1", "type": "task"}, "worker_id": 0}
+    workers.PENDING[:] = [{"id": "pend1", "type": "task"}]
+    queue.PENDING = workers.PENDING
+    long_reason = "Owner restart " + "because the migration plan changed " * 20
+    request_cancel(tmp_path, "run1", reason=long_reason, source="owner_restart", requested_by="owner",
+                   requested_stop_policy="immediate", allow_settled_target=True)
+    try:
+        with mock.patch.object(queue, "persist_queue_snapshot"):
+            workers.kill_workers(terminal_status="cancelled",
+                                 result_reason="Owner restart stopped this task before process restart.")
+    finally:
+        workers.DRIVE_ROOT = orig[0]
+        workers.WORKERS.clear()
+        workers.WORKERS.update(orig[1])
+        workers.RUNNING.clear()
+        workers.RUNNING.update(orig[2])
+        workers.PENDING[:] = orig[3]
+        queue.DRIVE_ROOT, queue.PENDING, queue.RUNNING = orig[4], orig[5], orig[6]
+
+    run = json.loads((tmp_path / "task_results" / "run1.json").read_text(encoding="utf-8"))
+    assert run["status"] == "cancelled"
+    assert run["cancel_origin"]["source"] == "owner_restart" and run["cancel_origin"]["requested_by"] == "owner"
+    assert run["cancel_origin"]["reason"] == " ".join(long_reason.split()) and len(run["cancel_origin"]["reason"]) > 500
+    line = _completion_verdict(run, {})
+    # Reason text other than the producer's own label is shown (as a preview).
+    assert line.startswith("Stopped by the Restart command · Owner restart because")
+    assert "owner_restart" not in line and "cancelled" not in line.lower()
+    assert "(preview; the full reason is kept with the task)" in line
+    pend = json.loads((tmp_path / "task_results" / "pend1.json").read_text(encoding="utf-8"))
+    assert pend["status"] == "cancelled" and "cancel_origin" not in pend
+
+
+def test_the_real_restart_producer_reaches_the_owner_line_as_one_sentence(tmp_path, monkeypatch):
+    """#1317 end to end: ``server_restart._stop_owned_work`` mints its intent and
+    kills the real pool; the running row's result carries that origin and the
+    owner line is the Restart sentence alone -- not the raw source, not the
+    producer's own label repeated beside it."""
+    import supervisor.queue as queue
+    import supervisor.workers as workers
+    from ouroboros import delegate_custody, server_restart
+    from ouroboros.project_dialogue import _completion_verdict
+
+    monkeypatch.setattr(server_restart, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(delegate_custody, "reconcile_orphaned_runs", lambda *_a, **_kw: None)
+    monkeypatch.setattr(server_restart, "_stop_owned_daemon", lambda _label: None)
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda *_a, **_kw: None)
+    saved =(dict(workers.WORKERS), dict(workers.RUNNING), list(workers.PENDING))
+    workers.WORKERS.clear()
+    workers.RUNNING.clear()
+    workers.RUNNING["run1"] = {"task": {"id": "run1", "type": "task"}, "worker_id": 0}
+    workers.PENDING[:] = []
+    try:
+        ctx = SimpleNamespace(RUNNING=workers.RUNNING, kill_workers=workers.kill_workers)
+        assert server_restart._stop_owned_work(ctx) == ["run1"]
+    finally:
+        workers.WORKERS.clear()
+        workers.WORKERS.update(saved[0])
+        workers.RUNNING.clear()
+        workers.RUNNING.update(saved[1])
+        workers.PENDING[:] = saved[2]
+
+    run = json.loads((tmp_path / "task_results" / "run1.json").read_text(encoding="utf-8"))
+    assert run["status"] == "cancelled"
+    assert {key: run["cancel_origin"].get(key) for key in ("source", "reason", "requested_by")} == {
+        "source": "owner_restart", "reason": "Owner restart", "requested_by": "owner"}
+    assert _completion_verdict(run, {}) == "Stopped by the Restart command."
+
+
 def test_managed_update_preserves_pending_tasks_for_the_new_process(tmp_path):
     import supervisor.queue as queue
     import supervisor.workers as workers
@@ -534,10 +621,15 @@ def test_managed_update_preserves_pending_tasks_for_the_new_process(tmp_path):
         workers._WORKER_POOL_DISABLED_REASON = orig_disabled
 
 
-def test_managed_update_drops_children_of_interrupted_roots(tmp_path):
+def test_managed_update_drops_children_of_interrupted_roots(tmp_path, monkeypatch):
     import supervisor.queue as queue
     import supervisor.workers as workers
 
+    # A TestClient lifespan earlier in the same xdist worker latches
+    # `_EVENT_Q_SHUTDOWN`; the terminal `task_done` emission below then raises and
+    # the children are never dropped (order-dependent flake, seen once on CI-shape
+    # runs). Reset the process-global latch like the other bus-dependent tests do.
+    monkeypatch.setattr(workers, "_EVENT_Q_SHUTDOWN", False)
     orig_drive = workers.DRIVE_ROOT
     orig_workers = dict(workers.WORKERS)
     orig_running = dict(workers.RUNNING)

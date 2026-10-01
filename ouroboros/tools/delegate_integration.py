@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import pathlib
+from copy import deepcopy
 from typing import TYPE_CHECKING, Any, Dict, NamedTuple, Optional, Tuple
 
 from ouroboros import delegate_custody as custody
@@ -21,9 +22,14 @@ from ouroboros.delegate_custody import RunCustody as _RunCustody
 # ONE refusal author for the whole delegate surface: the neutral leaf
 # `delegate_shared` (phase B's facade split), never a local twin that could drift.
 from ouroboros.delegate_registration_policy import record_persistent as _record_persistent
-from ouroboros.delegate_shared import _fail
+from ouroboros.delegate_shared import _fail, lock_busy_facts
+from ouroboros.configured_subagents import SESSION_ACCESS_PROFILES
+from ouroboros.tools.tool_result import ToolResult
 from ouroboros.tools.registry import ToolContext, active_repo_dir_for
 from ouroboros.utils import resolve_path_allow_missing
+from ouroboros.delegate_target_drift import (
+    _persist_target_drift, _target_drift_evidence, _target_drift_paths,  # noqa: F401
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ouroboros.subagents import DelegatedRunShape
@@ -46,7 +52,7 @@ def _resolved(path: Any) -> Optional[pathlib.Path]:
 _CAPTURE_DELEGATED_SNAPSHOT = "delegated_snapshot"
 
 
-def _mutation_authority(ctx: ToolContext, authority: "DelegatedRunShape") -> tuple[Dict[str, str], str]:
+def _mutation_authority(ctx: ToolContext, authority: "DelegatedRunShape") -> tuple[Dict[str, str], Optional[ToolResult]]:
     """The UNIFIED host-derived authority record for one delegated run (B5).
 
     ``{"target_root", "source", "capture_mode"}``. Two sources, one shape:
@@ -59,8 +65,8 @@ def _mutation_authority(ctx: ToolContext, authority: "DelegatedRunShape") -> tup
     Disagreement anywhere is a typed refusal, never a best-effort guess.
     """
     root = str(active_repo_dir_for(ctx))
-    if authority.access != "workspace_write":
-        return {"target_root": root, "source": "readonly", "capture_mode": "none"}, ""
+    if authority.access not in SESSION_ACCESS_PROFILES:
+        return {"target_root": root, "source": "readonly", "capture_mode": "none"}, None
     constraint = getattr(ctx, "task_constraint", None)
     mode = str(
         (constraint.get("mode") if isinstance(constraint, dict)
@@ -108,7 +114,7 @@ def _mutation_authority(ctx: ToolContext, authority: "DelegatedRunShape") -> tup
                 active_root=root, granted_write_root=granted,
             )
         return {"target_root": root, "source": "acting_constraint",
-                "capture_mode": _CAPTURE_DELEGATED_SNAPSHOT}, ""
+                "capture_mode": _CAPTURE_DELEGATED_SNAPSHOT}, None
     # An ordinary room uses the same selected-target authority without becoming
     # a pooled workspace task or requiring Git merely for native file operations.
     from ouroboros.tool_access import _TOP_LEVEL_PRINCIPAL_PROFILES, active_tool_profile, project_room_lens_dir
@@ -140,22 +146,26 @@ def _mutation_authority(ctx: ToolContext, authority: "DelegatedRunShape") -> tup
             active_root=root, declared_workspace_root=str(selected_root or ""),
         )
     return {"target_root": root, "source": "external_workspace_root",
-            "capture_mode": _CAPTURE_DELEGATED_SNAPSHOT}, ""
+            "capture_mode": _CAPTURE_DELEGATED_SNAPSHOT}, None
 
 
-def _retry_binding_refusal(record: Dict[str, Any], retry_token: str) -> str:
+def _retry_binding_refusal(record: Dict[str, Any], retry_token: str) -> Optional[ToolResult]:
     """Refuse a MUTATING retry whose stored row carries no C1 isolation binding.
 
     A PRE-C1 row's recorded body scopes the run at the LIVE target tree, and the
     body is replayed byte-identically — so the binding cannot be minted
     retroactively and replaying would write straight into the shared tree, in the
-    in-place regime C1 retired. Returns "" when the full binding is present.
+    in-place regime C1 retired. Returns ``None`` when the full binding is present.
     """
+    reference = record.get("resource_ref") or {}
+    request = record.get("request") or {}
+    if reference.get("workspace_kind") == "directory" and (request.get("execution") or {}).get("workspaceKind") == "directory" and record.get("target_root"):
+        return None
     snapshot_id = str(record.get("snapshot_id") or "")
     baseline_sha = str(record.get("baseline_sha") or "")
     target_root = str(record.get("target_root") or "")
     if snapshot_id and str(record.get("execution_root") or "") and baseline_sha and target_root:
-        return ""
+        return None
     return _fail(
         "delegate_start", "retry_binding_absent",
         "This retry replays a MUTATING invocation recorded BEFORE private "
@@ -169,7 +179,7 @@ def _retry_binding_refusal(record: Dict[str, Any], retry_token: str) -> str:
 
 
 def _validated_invocation(drive: Any, retry_token: str, task_id: str,
-                          text: str) -> Tuple[Optional[Dict[str, Any]], str]:
+                          text: str) -> Tuple[Optional[Dict[str, Any]], Optional[ToolResult]]:
     """The stored invocation a retry may replay, or the typed refusal that stops it.
 
     Six ways a token is not replayable, each answered by name: no record, another
@@ -203,9 +213,9 @@ def _validated_invocation(drive: Any, retry_token: str, task_id: str,
     if not isinstance(body, dict) or not body:
         return None, _fail("delegate_start", "invocation_request_unrecorded",
                            "That invocation's durable row carries no canonical request "
-                           "body, so it cannot be replayed byte-identically. Start a "
-                           "new run with a plain "
-                           "delegate_start(subagent_id=..., prompt=...).",
+                           "body, so it cannot be replayed byte-identically. Its outcome "
+                           "remains unknown; restore the recorded request or reconcile "
+                           "the original invocation before starting a replacement.",
                            retry_of=retry_token)
     if str(body.get("prompt") or "") != text:
         return None, _fail("delegate_start", "retry_prompt_mismatch",
@@ -213,7 +223,7 @@ def _validated_invocation(drive: Any, retry_token: str, task_id: str,
                            "you passed differs from the one it sent. Pass the original "
                            "prompt to retry, or drop retry_of to start a new run.",
                            retry_of=retry_token)
-    return record, ""
+    return record, None
 
 
 class _RetryBinding(NamedTuple):
@@ -233,10 +243,12 @@ class _RetryBinding(NamedTuple):
     baseline_sha: str
     authority_source: str
     resource_ref: Dict[str, Any]
+    processing: Dict[str, Any]
+    execution_binding_fingerprint: str
 
 
 def _resolve_retry_invocation(ctx: ToolContext, drive: pathlib.Path, retry_token: str,
-                              text: str) -> Tuple[Optional[_RetryBinding], str]:
+                              text: str) -> Tuple[Optional[_RetryBinding], Optional[ToolResult]]:
     """Rebuild a retried start from its stored invocation, or refuse it typed.
 
     The stored invocation is the SINGLE SOURCE of EVERY retry fact (route, shape,
@@ -279,7 +291,7 @@ def _resolve_retry_invocation(ctx: ToolContext, drive: pathlib.Path, retry_token
     # carry none; their scope.root IS the authority target (in-place regime).
     snapshot_id = str(record.get("snapshot_id") or "")
     target_root = str(record.get("target_root") or "") or scope_root
-    if authority.access == "workspace_write":
+    if authority.access in SESSION_ACCESS_PROFILES:
         binding_refusal = _retry_binding_refusal(record, retry_token)
         if binding_refusal:
             return None, binding_refusal
@@ -341,17 +353,19 @@ def _resolve_retry_invocation(ctx: ToolContext, drive: pathlib.Path, retry_token
         authority_source=str(record.get("authority_source") or ""),
         resource_ref=(record.get("resource_ref")
                       if isinstance(record.get("resource_ref"), dict) else {}),
-    ), ""
+        processing=deepcopy(record.get("processing") if isinstance(record.get("processing"), dict) else {}),
+        execution_binding_fingerprint=str(record.get("execution_binding_fingerprint") or ""),
+    ), None
 
 
 def _provision_snapshot(ctx: ToolContext, drive: pathlib.Path, target_root: str,
-                        invocation_id: str) -> Tuple[Optional[Any], str]:
+                        invocation_id: str) -> Tuple[Optional[Any], Optional[ToolResult]]:
     """Provision the C1 private execution snapshot for one mutating run.
 
     Registered durably (worktree registry) and described durably (baseline manifest
     artifact) BEFORE the caller records any start intent, so a worker death at any
     later point leaves a nameable, GC-reconcilable root — never an orphan directory.
-    Returns ``(handle, "")`` or ``(None, typed_refusal)``.
+    Returns ``(handle, None)`` or ``(None, typed_refusal)``.
     """
     from ouroboros.subagent_worktrees import provision_execution_snapshot
 
@@ -365,9 +379,9 @@ def _provision_snapshot(ctx: ToolContext, drive: pathlib.Path, target_root: str,
             "A private execution snapshot of the write root could not be provisioned "
             f"({type(exc).__name__}: {exc}). The run was NOT started: a mutating "
             "delegated run executes only in its own snapshot, never in the shared tree.",
-            target_root=target_root)
+            target_root=target_root, definitely_unrun=True, **lock_busy_facts(exc))
     _record_baseline_manifest(drive, task_id, invocation_id, handle)
-    return handle, ""
+    return handle, None
 
 
 def _record_baseline_manifest(drive: pathlib.Path, task_id: str, invocation_id: str,
@@ -389,10 +403,14 @@ def _record_baseline_manifest(drive: pathlib.Path, task_id: str, invocation_id: 
             "baseline_tree": handle.baseline_tree,
             "manifest_digest": handle.manifest_digest,
             "entry_count": handle.entry_count,
+            "file_input_count": len(getattr(handle, "file_baseline", {})),
+            "file_input_bytes": sum(item.get("size", 0) for item in getattr(handle, "file_baseline", {}).values()),
+            "provisioning_sec": float(getattr(handle, "provisioning_sec", 0.0) or 0.0),
             "target_root": handle.target_root,
             "target_head": handle.target_head,
             "execution_root": handle.path,
             "excluded_untracked": list(handle.excluded_untracked),
+            "capture_warnings": list(getattr(handle, "capture_warnings", ())),
             **extra,
         }, trailing_newline=True)
     except Exception:
@@ -401,7 +419,7 @@ def _record_baseline_manifest(drive: pathlib.Path, task_id: str, invocation_id: 
 
 
 def _capture_block(entry: _RunCustody, cap_dir: pathlib.Path,
-                   manifest: Dict[str, Any]) -> Dict[str, Any]:
+                   manifest: Dict[str, Any], target_drift: Optional[Any] = None) -> Dict[str, Any]:
     """The terminal-payload projection of one captured run patch (C1)."""
     from ouroboros.headless import (
         ARTIFACT_STATUS_READY_NO_CHANGES,
@@ -428,14 +446,49 @@ def _capture_block(entry: _RunCustody, cap_dir: pathlib.Path,
         "manifest_read": {"root": "artifact_store", "path": f"{read_prefix}/workspace_patch.json"},
         "sha256": str(manifest.get("sha256") or ""),
         "diffstat": str(manifest.get("diffstat") or ""),
+        "file_outputs": list(manifest.get("file_outputs") or []),
+        "file_output_count": len(manifest.get("file_output_changes") or []),
         "note": (
             "NOT APPLIED: the run edited its private execution snapshot only. Nothing "
             "reaches the shared tree until you explicitly call "
             "integrate_delegated_patch(run_id=...) with decision='apply' or 'reject'. "
-            "The snapshot and this patch persist until that disposition. Read the "
-            "captured diff via read_file(root='artifact_store', path=patch_read.path)."
+            "The snapshot and complete file results persist until that disposition. "
+            "Read manifest_read, its file artifacts, and patch_read when present; "
+            "the text patch alone need not contain the complete result."
         ),
     }
+    drift = target_drift if isinstance(target_drift, dict) else {
+        "checked": target_drift is not None,
+        "paths": list(target_drift or []),
+        "error": "",
+    }
+    drift_paths = [str(path) for path in (drift.get("paths") or []) if str(path)]
+    drift_error = str(drift.get("error") or "")
+    if drift.get("checked") is True:
+        block["target_drift_checked"] = True
+    if drift_paths:
+        block["target_mutated_during_run"] = drift_paths
+        block["note"] = (
+            "The private execution snapshot has no captured file changes, but the "
+            "authority tree changed while the run was open. The author is unknown: "
+            "the child, a neighbor, or another process may have written there. "
+            "The drift is diagnostic evidence; it is not attributed to this child."
+            if status == ARTIFACT_STATUS_READY_NO_CHANGES else
+            "NOT APPLIED: the private execution snapshot contains captured changes, "
+            "and authority-tree drift was also observed; "
+            "the author of that drift is unknown. "
+            "the existing locked baseline check will decide whether integration "
+            "is safe. Nothing reaches the shared tree until explicit disposition."
+        )
+    if drift_error:
+        block["target_drift_unknown"] = drift_error
+        if status == ARTIFACT_STATUS_READY_NO_CHANGES:
+            block["note"] = (
+                "The private execution snapshot has no captured file changes, but "
+                f"authority-tree drift could not be verified ({drift_error}). "
+                "The author is unknown; preserve this diagnostic fact and use the "
+                "normal no-change disposition."
+            )
     if status not in {ARTIFACT_STATUS_READY_WITH_CHANGES, ARTIFACT_STATUS_READY_NO_CHANGES}:
         # A failed manifest's own typed note (unreviewable_metadata_change,
         # non-UTF-8, …) is the actionable fact — never hide it in boilerplate.
@@ -453,7 +506,8 @@ def _capture_block(entry: _RunCustody, cap_dir: pathlib.Path,
     return block
 
 
-def _capture_terminal_patch(ctx: ToolContext, entry: Optional[_RunCustody]) -> Optional[Dict[str, Any]]:
+
+def _capture_terminal_patch(ctx: ToolContext, entry: Optional[_RunCustody], *, gateway=None) -> Optional[Dict[str, Any]]:
     """Capture a terminal mutating run's diff from its execution snapshot, durably.
 
     Idempotent: the durable ``patch_captured`` flag (replayed) plus the manifest on
@@ -462,12 +516,20 @@ def _capture_terminal_patch(ctx: ToolContext, entry: Optional[_RunCustody]) -> O
     in-place runs return None. Capture failure is disclosed in the block, never
     raised — the settlement and delivery around it must not die on a diff error.
     """
-    if entry is None or not entry.execution_root:
+    if entry is None:
         return None
-    return capture_terminal_patch_for_drive(custody.custody_root(ctx), entry)
+    block = capture_terminal_patch_for_drive(custody.custody_root(ctx), entry, gateway=gateway)
+    if block and entry.task_id != str(getattr(ctx, "task_id", "") or ""):
+        # Relative handles name the starter's prefix, not the successor's.
+        # The capture reader validates this exact canonical product, also after
+        # disposition and from a split execution drive.
+        for kind in ("patch", "manifest"):
+            if block.get(f"{kind}_read") and block.get(f"{kind}_artifact"):
+                block[f"{kind}_read"] = {"root": "artifact_store", "path": block[f"{kind}_artifact"]}
+    return block
 
 
-def capture_terminal_patch_for_drive(drive: Any, entry: _RunCustody) -> Optional[Dict[str, Any]]:
+def capture_terminal_patch_for_drive(drive: Any, entry: _RunCustody, *, gateway=None) -> Optional[Dict[str, Any]]:
     """The drive-rooted core of the terminal capture — same contract, no ToolContext.
 
     One capture author for both the nanny flow and the RECONCILIATION path
@@ -479,6 +541,21 @@ def capture_terminal_patch_for_drive(drive: Any, entry: _RunCustody) -> Optional
     but leaves the row uncaptured (every retry point stays open), and a pre-R3
     row over a failed manifest falls through to a fresh capture.
     """
+    from ouroboros.delegate_directory import is_directory_run, capture_directory_result, directory_capture_block
+
+    if is_directory_run(entry):
+        owned_gateway = None
+        try:
+            if gateway is None:
+                from ouroboros.claudexor_daemon import read_owned_gateway
+                owned_gateway = gateway = read_owned_gateway()
+            return directory_capture_block(drive, entry, capture_directory_result(drive, entry, gateway))
+        except Exception as exc:
+            return {"status": "failed", "capture_kind": "engine_directory", "authority_target_root": entry.target_root,
+                    "note": f"Directory capture unavailable: {type(exc).__name__}: {exc}. The engine result is retained; no new run was started."}
+        finally:
+            if owned_gateway is not None:
+                owned_gateway.close()
     if entry is None or not entry.execution_root:
         return None
     from ouroboros.headless import (
@@ -489,14 +566,21 @@ def capture_terminal_patch_for_drive(drive: Any, entry: _RunCustody) -> Optional
     ready = {ARTIFACT_STATUS_READY_WITH_CHANGES, ARTIFACT_STATUS_READY_NO_CHANGES}
     cap_dir = custody.delegated_capture_dir(drive, entry.task_id, entry.snapshot_id or entry.run_id)
     manifest_path = cap_dir / "workspace_patch.json"
-    if entry.patch_captured and manifest_path.exists():
+    if manifest_path.exists():
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError, ValueError):
             manifest = {}
         manifest = manifest if isinstance(manifest, dict) else {}
-        if str(manifest.get("status") or "") in ready:
-            return _capture_block(entry, cap_dir, manifest)
+        if isinstance(manifest.get("authority_drift"), dict) and str(manifest.get("status") or "") == "failed":
+            # A failed no-change capture is durable forensic custody even though
+            # it intentionally never minted PATCH_CAPTURED. Do not recapture it
+            # after a neighbor happens to revert and erase the observation.
+            return _capture_block(entry, cap_dir, manifest, manifest["authority_drift"])
+        if entry.patch_captured and str(manifest.get("status") or "") in ready:
+            stored_drift = manifest.get("authority_drift")
+            evidence = stored_drift if isinstance(stored_drift, dict) else _target_drift_evidence(entry)
+            return _capture_block(entry, cap_dir, manifest, evidence)
     exec_root = pathlib.Path(entry.execution_root)
     if not exec_root.exists():
         return {
@@ -522,9 +606,12 @@ def capture_terminal_patch_for_drive(drive: Any, entry: _RunCustody) -> Optional
             # The preflight-head shape pins the capture BASE to the snapshot's baseline
             # commit (never a moved HEAD), reusing the one existing capture primitive —
             # sensitive veto, binary handling, sha256 manifest and all.
+            from ouroboros.subagent_worktrees import find_execution_snapshot
+            snapshot = find_execution_snapshot(entry.snapshot_id) or {}
             _, manifest = write_workspace_patch_artifacts(
                 exec_root, cap_dir,
-                task={"metadata": {"workspace_preflight": {"git": {"head": entry.baseline_sha}}}},
+                task={"metadata": {"workspace_preflight": {"git": {"head": entry.baseline_sha}},
+                                   "file_baseline": snapshot.get("file_baseline") or {}}},
             )
     except Exception as exc:
         log.warning("Delegated run patch capture failed for %s", entry.run_id, exc_info=True)
@@ -538,6 +625,20 @@ def capture_terminal_patch_for_drive(drive: Any, entry: _RunCustody) -> Optional
             "note": f"patch capture failed ({type(exc).__name__}: {exc}); the execution "
                     "snapshot is preserved — inspect it directly.",
         }
+    drift_evidence = _target_drift_evidence(entry)
+    if str(manifest.get("status") or "") in ready:
+        try:
+            manifest = _persist_target_drift(manifest_path, manifest, drift_evidence)
+        except Exception as exc:
+            drift_evidence = {
+                "checked": False, "paths": [],
+                "error": f"authority drift record failed: {type(exc).__name__}: {exc}",
+            }
+            manifest = dict(manifest)
+            manifest["status"] = "failed"
+            manifest["authority_drift"] = drift_evidence
+            manifest["note"] = "Authority drift could not be durably recorded; snapshot preserved."
+            return _capture_block(entry, cap_dir, manifest, drift_evidence)
     if str(manifest.get("status") or "") in ready:
         custody.record_patch_captured(
             drive, entry,
@@ -546,13 +647,14 @@ def capture_terminal_patch_for_drive(drive: Any, entry: _RunCustody) -> Optional
             patch_size=manifest.get("patch_size"),
             capture_dir=str(cap_dir),
         )
-    return _capture_block(entry, cap_dir, manifest)
+    return _capture_block(entry, cap_dir, manifest, drift_evidence)
 
 
 def capture_stranded_patch(drive_root: Any, run: _RunCustody) -> Dict[str, Any]:
     """Capture a reconciled dead-owner run without deciding its disposition."""
 
-    if not (run.execution_root and run.settled and not run.patch_disposed):
+    from ouroboros.delegate_directory import is_directory_run
+    if not ((run.execution_root or is_directory_run(run)) and run.settled and not run.patch_disposed):
         return {}
     try:
         block = capture_terminal_patch_for_drive(drive_root, run) or {}
@@ -610,7 +712,7 @@ def _payload_delegation_busy(drive: pathlib.Path, target: pathlib.Path) -> str:
     from ouroboros.delegate_terminal import _task_is_terminal
 
     resolved = _resolved(target)
-    rows = list(custody._iter_rows(custody.event_log_path(drive)))
+    rows = list(custody.custody_rows(drive))
     for run in custody.replay(drive, rows=rows).values():
         if (run.authority_source == "skill_payload"
                 and _resolved(run.target_root) == resolved
@@ -626,7 +728,7 @@ def _payload_delegation_busy(drive: pathlib.Path, target: pathlib.Path) -> str:
 
 
 def _payload_selector_refusal(selector_root: str, retry_of: Any, bucket: Any,
-                              skill_name: Any) -> str:
+                              skill_name: Any) -> Optional[ToolResult]:
     """Argument-shape validation for delegate_start's exact-resource selector."""
     if selector_root and selector_root != "skill_payload":
         return _fail("delegate_start", "unsupported_root",
@@ -644,7 +746,7 @@ def _payload_selector_refusal(selector_root: str, retry_of: Any, bucket: Any,
         return _fail("delegate_start", "payload_selector_incomplete",
                      "bucket/skill_name select a skill payload only together with "
                      "root='skill_payload'.")
-    return ""
+    return None
 
 
 def payload_host_instructions(text: str, skill_name: str) -> str:
@@ -684,11 +786,11 @@ def claimed_start_request(
 
 def _payload_mutation_authority(
     ctx: ToolContext, drive: pathlib.Path, bucket: str, skill_name: str,
-    binding: Any,
-) -> Tuple[Optional[Any], Optional[Dict[str, Any]], str]:
+    binding: Any, access: str = "workspace_write",
+) -> Tuple[Optional[Any], Optional[Dict[str, Any]], Optional[ToolResult]]:
     """The payload counterpart of ``_mutation_authority`` (R1 item 1).
 
-    Returns ``(run_shape, authority_record, refusal)``. The authority is a FRESH
+    Returns ``(run_shape, authority_record, refusal)``; the refusal is ``None`` on success. The authority is a FRESH
     ``ResolvedResourceBinding`` for ``skill_payload.write`` through the same one
     authorizer the registry uses; the record carries the host-minted semantic
     ``resource_ref`` that custody stores durably and retry/apply re-resolve.
@@ -696,6 +798,11 @@ def _payload_mutation_authority(
     from ouroboros.subagents import delegated_run_shape
     from ouroboros.tool_access import active_tool_profile, build_resolved_resource_binding
 
+    if access == "readonly":
+        return None, None, _fail(
+            "delegate_start", "payload_delegation_forbidden",
+            "The skill-payload selector requires write access; omit the selector for a readonly run.",
+            definitely_unrun=True)
     b, s = str(bucket or "").strip(), str(skill_name or "").strip()
     if binding is None:
         # Policy BEFORE lookup (Fable F4): a caller whose profile cannot hold
@@ -779,12 +886,12 @@ def _payload_mutation_authority(
             "payload_hash": "",
         },
     }
-    return delegated_run_shape(True), record, ""
+    return delegated_run_shape(True, access), record, None
 
 
 def _provision_payload_snapshot(
     ctx: ToolContext, drive: pathlib.Path, record: Dict[str, Any], invocation_id: str,
-) -> Tuple[Optional[Any], str]:
+) -> Tuple[Optional[Any], Optional[ToolResult]]:
     """Provision the standalone private Git snapshot for one payload run (R1 §9.2).
 
     Same durability contract as ``_provision_snapshot``: registered in the
@@ -806,23 +913,23 @@ def _provision_payload_snapshot(
             f"provisioned ({type(exc).__name__}: {exc}). The run was NOT started: "
             "a mutating delegated run executes only in its own snapshot, never "
             "in the live payload.",
-            target_root=record["target_root"])
+            target_root=record["target_root"], definitely_unrun=True, **lock_busy_facts(exc))
     record["resource_ref"]["payload_hash"] = handle.payload_hash
     _record_baseline_manifest(drive, task_id, invocation_id, handle,
                               payload_hash=handle.payload_hash,
                               capture_kind="skill_payload")
-    return handle, ""
+    return handle, None
 
 
 def _rebind_payload_reference(
     ctx: ToolContext, resource_ref: Dict[str, Any], recorded_target: str, *,
     tool: str, context: str,
-) -> Tuple[Optional[pathlib.Path], Optional[Any], str]:
+) -> Tuple[Optional[pathlib.Path], Optional[Any], Optional[ToolResult]]:
     """Re-resolve a recorded semantic payload reference against CURRENT authority.
     Retry and the owned apply (R1 item 3) require the fresh binding path to
     equal the recorded target — a moved/collided/removed skill is a typed
     refusal, never a write through a stale physical path. Returns
-    ``(live_target, fresh_binding, refusal)``."""
+    ``(live_target, fresh_binding, refusal)``, the refusal ``None`` when it rebinds."""
     from ouroboros.tool_access import build_resolved_resource_binding
 
     ref = resource_ref if isinstance(resource_ref, dict) else {}
@@ -855,7 +962,7 @@ def _rebind_payload_reference(
             "physical path.",
             recorded_target=str(recorded), current_target=str(fresh or ""),
             context=context)
-    return fresh, binding, ""
+    return fresh, binding, None
 
 
 __all__ = [

@@ -20,7 +20,7 @@ from ouroboros.task_results import (
     write_task_result,
 )
 
-from tests._cancel_intents_shared import _CaptureQueue, _LiveProc, _live_split_drive_task, _seed_llm_response
+from tests._cancel_intents_shared import _CaptureQueue, _LiveProc, _live_split_drive_task, _seed_llm_response, settled_off_loop
 from tests._cancel_intents_shared import (  # noqa: F401  (autouse fixture applies on import)
     _reap_spawned_live_procs,
 )
@@ -77,12 +77,16 @@ def test_e2e_tool_cancel_kills_live_worker_and_settles_with_cost(qenv, monkeypat
     assert stored["parent_decision"] == "cancelled"          # stamped at OUTCOME
     assert stored.get("cost_accounting_status") == "available"  # reconstructed
     assert ci.active_intent(qenv.drive, task_id) is None
-    assert not child_drive.exists(), "cancelled subagent drive is cleaned up"
+    assert not settled_off_loop(qenv.drive, task_id, child_drive), "unretained call history still owns the drive"
     # task_done carries the reconstructed accounting — never a fabricated final $0
     # (an empty ledger reconstructs to a CONFIRMED zero, which is fine).
     (done,) = done_events
     assert done["status"] == STATUS_CANCELLED
     assert done["cost_accounting_status"] == "available"
+    from ouroboros.headless import retry_child_task_refs
+
+    retry_child_task_refs(qenv.drive, child_drive, task_id)
+    assert settled_off_loop(qenv.drive, task_id, child_drive), "background retention releases the cancelled drive"
 
 @pytest.mark.serial
 def test_e2e_child_finishing_before_the_kill_keeps_its_completed_result(qenv, monkeypatch):
@@ -215,9 +219,14 @@ def test_e2e_cancel_of_inflight_run_command_child_never_reads_as_tool_failure(
     tree.pid = tree._proc.pid
     _LiveProc._SPAWNED.append(tree._proc)
     deadline = time.time() + 10
-    while not pid_file.exists() and time.time() < deadline:
+    child_pid_text = ""
+    while time.time() < deadline:
+        # Opening the fixture file precedes publishing its PID bytes.
+        child_pid_text = pid_file.read_text(encoding="utf-8") if pid_file.exists() else ""
+        if child_pid_text:
+            break
         time.sleep(0.05)
-    child_pid = int(pid_file.read_text())
+    child_pid = int(child_pid_text)
 
     worker = types.SimpleNamespace(wid=0, proc=tree, busy_task_id=task_id, reaping=False)
     qenv.workers.WORKERS[0] = worker

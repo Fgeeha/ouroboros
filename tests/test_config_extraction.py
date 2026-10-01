@@ -23,15 +23,73 @@ _LEAVES = (settings_defaults, settings_scales, model_slots, review_model_routes,
 # New subscription capabilities belong to the same leaves, but did not exist on
 # the historical extraction's facade and need not add compatibility re-exports.
 _ADDED_OWNERS = {
+    # Compatible-only review routing belongs to the existing model-route leaf.
+    "compatible_only_review_model": review_model_routes,
+    "_compatible_only_models": review_model_routes,
+    "WORKER_READY_CEILING_SEC": runtime_limits,
+    # The supervisor loop's bounded events pass and the budget-projection retry interval.
+    "SUPERVISOR_EVENT_BATCH_MAX_EVENTS": runtime_limits,
+    "SUPERVISOR_EVENT_BATCH_MAX_SEC": runtime_limits,
+    "BUDGET_PROJECTION_RETRY_SEC": runtime_limits,
+    # The two bounds of the usage ledger's display (stale-while-revalidate) read path.
+    "USAGE_DISPLAY_LOCK_TIMEOUT_SEC": runtime_limits,
+    "USAGE_DISPLAY_REVALIDATE_AFTER_SEC": runtime_limits,
+    "IMMEDIATE_SETTINGS": settings_scales,
+    "RESTART_REQUIRED_SETTINGS": settings_scales,
+    "get_finalization_grace_sec": runtime_limits,
+    "PROMOTE_CONFIRM_WAIT_SEC": runtime_limits,
+    "get_promote_confirm_wait_sec": runtime_limits,
+    "ROUTING_MANIFEST_RESULT_ROWS": runtime_limits,
+    "get_routing_manifest_result_rows": runtime_limits,
+    "get_model_substitution_redos": runtime_limits,
     "NETWORK_WAIT_BACKOFF_MAX_SEC": runtime_limits,
     "MODEL_ACCOUNTS_KEY": model_slots,
     "MODEL_CONTEXT_WINDOWS_KEY": model_slots,
+    "MODEL_PROCESSING_PREFERENCES_KEY": model_slots,
+    "PROCESSING_PREFERENCE_KEY": model_slots,
+    "PROCESSING_PREFERENCES": model_slots,
+    "task_processing_preference": model_slots,
+    "normalize_processing_preference": model_slots,
+    "resolve_processing_preference": model_slots,
     "MODEL_ROLE_SETTINGS": model_slots,
     "normalize_model_role_options": model_slots,
     "model_role_option": model_slots,
     "task_model_binding": model_slots,
+    "route_binding": model_slots,
     "apply_model_role_override": model_slots,
     "CLAUDEXOR_MODEL_POLL_INTERVAL_SEC": runtime_limits,
+    "CLAUDEXOR_OPERATOR_STOP_TIMEOUT_SEC": runtime_limits,
+    "CLAUDEXOR_STOP_EXIT_WAIT_SEC": runtime_limits,
+    # The native platform build envelope is owned by the common runtime-limits leaf.
+    "EXTERNAL_PLATFORM_UPDATE_TIMEOUT_SEC": runtime_limits,
+    # Consciousness settings scaffolding: the alarm's SSOT default interval, the closed
+    # autonomy enum and the readers for the three consciousness keys.
+    "WAKE_DEFAULT_SEC": runtime_limits,
+    "USAGE_LEDGER_FOLD_MIN_AGE_SEC": runtime_limits,
+    "CONSCIOUSNESS_AUTONOMY_LEVELS": runtime_limits,
+    "get_consciousness_autonomy": runtime_limits,
+    "get_consciousness_daily_usd": runtime_limits,
+    "get_consciousness_max_tasks": runtime_limits,
+    "get_bg_wakeup_min_sec": runtime_limits,
+    "get_bg_wakeup_max_sec": runtime_limits,
+    # Governance tiers: the share of a reviewer's usable window tier-2 documents may take inline.
+    "REVIEW_GOVERNANCE_INLINE_SHARE": runtime_limits,
+    # The pooled worker's short acceptance-fence ack wait (one wait, one re-send, then a typed unknown).
+    "ACCEPTANCE_FENCE_ACK_WAIT_SEC": runtime_limits,
+    "get_acceptance_fence_ack_wait_sec": runtime_limits,
+    # #1196 optional bounds: the shared positive-or-unlimited vocabulary (also the review-cycle
+    # cap's), the legacy finite values of documents that predate it, and their readers.
+    "UNLIMITED": settings_scales,
+    "UNLIMITED_ALIASES": settings_scales,
+    "parse_positive_or_unlimited": settings_scales,
+    "OPTIONAL_BOUND_LEGACY": settings_scales,
+    "_WARNED_OPTIONAL_BOUNDS": settings_scales,
+    "optional_bound_value": settings_scales,
+    "defaults_for_settings_document": settings_scales,
+    "_optional_bound_setting": runtime_limits,
+    "get_max_rounds": runtime_limits,
+    "OPERATION_WINDOW_FALLBACK_SEC": runtime_limits,
+    "operation_window_sec": runtime_limits,
 }
 
 _MOVED_OWNERS = {
@@ -40,6 +98,8 @@ _MOVED_OWNERS = {
     "WORKER_READY_MAX_ATTEMPTS": runtime_limits,
     "EXTENSION_STREAM_CHUNK_BYTES": runtime_limits,
     "EXTENSION_CHILD_CLEANUP_GRACE_SEC": runtime_limits,
+    "LAUNCHER_STOP_GRACE_SEC": runtime_limits,
+    "SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_SEC": runtime_limits,
     "NESTED_SETTLEMENT_MARGIN_SEC": runtime_limits,
     "NETWORK_WAIT_NOTE_INTERVAL_SEC": runtime_limits,
     "NETWORK_WAIT_BACKOFF_START_SEC": runtime_limits,
@@ -230,6 +290,7 @@ def test_config_facade_reexports_every_moved_identity():
         assert getattr(config, name) is getattr(owner, name), name
     owned = {name for module in _LEAVES for name in vars(module)}
     assert set(_MOVED_OWNERS) <= owned
+    assert config.EXTERNAL_PLATFORM_UPDATE_TIMEOUT_SEC is runtime_limits.EXTERNAL_PLATFORM_UPDATE_TIMEOUT_SEC
 
 
 def test_settings_file_lifecycle_and_path_roots_stay_with_the_parent():
@@ -261,5 +322,6 @@ def test_settings_extraction_size_bounds_have_meaningful_headroom():
     }
     assert counts["ouroboros.config"] <= 1000
     assert all(count <= 1000 for count in counts.values())
-    assert 250 <= counts["ouroboros.settings_defaults"] <= 500
+    # 500 -> 520: the Z.ai direct provider adds its key and plan rows to the leaf (PR #1207).
+    assert counts["ouroboros.settings_defaults"] <= 520
     assert (PACKAGE / "config.py").is_file()

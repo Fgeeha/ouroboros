@@ -10,6 +10,7 @@ free-form provider prose.
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import logging
 import pathlib
@@ -44,6 +45,7 @@ OPTIONAL_REQUEST_FIELDS = OPTIONAL_SAMPLING_FIELDS + (
     "output_config",
     "thinking",
     "parallel_tool_calls",
+    "stream", "stream_options",
 )
 NESTED_REASONING_FIELD = "extra_body.reasoning"
 NESTED_THINKING_FIELD = "extra_body.thinking"
@@ -60,7 +62,15 @@ TOOL_DIALECTS = frozenset({
 TOOL_CHOICE_FAMILIES = frozenset({
     "omitted", "auto", "none", "required", "any", "allowed_tools", "named", "other",
 })
-FUNCTION_STRICTNESS_VALUES = frozenset({"none", "plain", "strict", "mixed"})
+# Per-tool `strict` states in canonical order; a profile names the set its function tools
+# carry, or "none". Historical schema-1 "plain"/"strict"/"mixed" (absent, false and
+# malformed collapsed) stay legal to decode, but no payload produces them, so exact
+# profile equality keeps their stored evidence from authorizing any current profile.
+FUNCTION_STRICT_STATES = ("absent", "false", "true", "malformed")
+LEGACY_FUNCTION_STRICTNESS_VALUES = frozenset({"plain", "strict", "mixed"})
+FUNCTION_STRICTNESS_VALUES = LEGACY_FUNCTION_STRICTNESS_VALUES | {"none", *(
+    "+".join(combo) for size in range(1, len(FUNCTION_STRICT_STATES) + 1)
+    for combo in itertools.combinations(FUNCTION_STRICT_STATES, size))}
 _REGISTERED_DIALECT_TRANSITIONS = frozenset({
     ("tool", "function", "openai_chat_custom"),
     ("tool", "openai_chat_custom", "function"),
@@ -297,18 +307,10 @@ def tool_choice_names(choice: Any) -> Tuple[str, ...]:
 
 
 def tool_choice_requires_call(choice: Any) -> bool:
-    family = tool_choice_family(choice)
-    if family in {"required", "any", "named"}:
-        return True
-    if family != "allowed_tools" or not isinstance(choice, Mapping):
-        return False
-    allowed = choice.get("allowed_tools")
-    mode = str(
-        (allowed.get("mode") if isinstance(allowed, Mapping) else None)
-        or choice.get("mode")
-        or "auto"
-    ).strip().lower()
-    return mode == "required"
+    return (
+        tool_choice_family(choice) in {"required", "any", "named"}
+        or tool_choice_allowed_mode(choice) == "required"
+    )
 
 
 def tool_choice_allowed_mode(choice: Any) -> str:
@@ -378,18 +380,16 @@ def _tool_choice_digest(choice: Any) -> str:
 
 
 def function_strictness(payload: Mapping[str, Any]) -> str:
-    strict_values = []
+    """Name the exact `strict` states of the function tools: a Responses-backed route
+    tries strict mode for an ABSENT key, so absent is not an explicit ``false``."""
+    states = set()
     for tool in payload.get("tools") or []:
-        if not isinstance(tool, Mapping):
-            continue
-        function = tool.get("function")
+        function = tool.get("function") if isinstance(tool, Mapping) else None
         if isinstance(function, Mapping):
-            strict_values.append(bool(function.get("strict")))
-    if not strict_values:
-        return "none"
-    if all(strict_values):
-        return "strict"
-    return "mixed" if any(strict_values) else "plain"
+            value = function.get("strict")
+            states.add("absent" if "strict" not in function else "true" if value is True
+                       else "false" if value is False else "malformed")
+    return "+".join(state for state in FUNCTION_STRICT_STATES if state in states) or "none"
 
 
 def _routing_digest(payload: Mapping[str, Any]) -> str:

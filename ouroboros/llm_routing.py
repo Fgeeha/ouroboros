@@ -18,15 +18,18 @@ import os
 from typing import Any, Dict, List, Optional, Tuple
 
 from ouroboros.request_wire_recovery import request_wire_scoped
+from ouroboros.model_wait import dispatch_deadline_remaining_sec
 from ouroboros.openrouter_attribution import OPENROUTER_APP_HEADERS
 from ouroboros.provider_models import (
     DEEPSEEK_BASE_URL,
+    resolve_zai_base_url,
     PROVIDER_PREFIXES,
     normalize_anthropic_model_id,
     normalize_model_identity,
     parse_claudexor_model,
     resolve_minimax_base_url,
 )
+from ouroboros.config import runtime_setting
 
 
 _OR_PROVIDER_PRESETS = {
@@ -39,7 +42,7 @@ _OR_PROVIDER_PRESETS = {
 def _resolve_or_provider() -> Dict[str, Any]:
     """Resolve ``OUROBOROS_OR_PROVIDER`` (a preset name or a raw JSON object) into an
     OpenRouter ``provider`` routing dict. Empty/unset/invalid -> ``{}`` (no routing)."""
-    raw = (os.environ.get("OUROBOROS_OR_PROVIDER") or "").strip()
+    raw = (runtime_setting("OUROBOROS_OR_PROVIDER") or "").strip()
     if not raw:
         return {}
     preset = _OR_PROVIDER_PRESETS.get(raw.lower())
@@ -100,8 +103,13 @@ class _ProviderRoutingMixin:
         model_poll_control: Any = None,
         model_operation_observer: Any = None,
         model_account_override: str | None = None,
+        model_turn_state: Any = None,
+        stream: bool = False,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        """Send remote chat; no_proxy uses a one-shot client and skips OS proxy lookup."""
+        """Send remote chat; no_proxy uses a one-shot client and skips OS proxy lookup.
+
+        ``model_turn_state`` arrives route-resolved: only the subscription
+        transport below ever receives a live active-turn slot."""
         if target.get("provider") == "claudexor":
             from ouroboros.llm_claudexor import chat_claudexor
 
@@ -114,12 +122,14 @@ class _ProviderRoutingMixin:
                 model_poll_control=model_poll_control,
                 model_operation_observer=model_operation_observer,
                 model_account_override=model_account_override,
+                model_turn_state=model_turn_state,
             )
         if target.get("provider") == "anthropic":
             return self._chat_anthropic(
                 target, messages, tools, reasoning_effort, max_tokens, tool_choice, temperature,
                 no_proxy=no_proxy,
                 timeout=timeout,
+                **({"stream": True} if stream else {}),
             )
 
         if target.get("provider") == "gigachat":
@@ -139,7 +149,10 @@ class _ProviderRoutingMixin:
                     response_format=response_format,
                     cache_affinity=cache_affinity,
                     bypass_response_cache=bypass_response_cache,
+                    **({"stream": True} if stream else {}),
                 )
+                if dispatch_deadline_remaining_sec() is not None:
+                    kwargs["timeout"] = self._no_proxy_timeout(timeout)
                 prompt_cache_ttl = self._normalize_payload_cache_ttl(target, kwargs)
                 resp = self._create_chat_completion_with_retries(
                     _oa_client.chat.completions.create,
@@ -167,11 +180,14 @@ class _ProviderRoutingMixin:
             response_format=response_format,
             cache_affinity=cache_affinity,
             bypass_response_cache=bypass_response_cache,
+            **({"stream": True} if stream else {}),
         )
         if timeout and timeout > 0:
             # Cached clients are built without a timeout; honor the caller's
             # per-request timeout instead of silently using the SDK default.
             kwargs["timeout"] = float(timeout)
+        elif dispatch_deadline_remaining_sec() is not None:
+            kwargs["timeout"] = getattr(client, "timeout", None)
         prompt_cache_ttl = self._normalize_payload_cache_ttl(target, kwargs)
         resp = self._create_chat_completion_with_retries(
             client.chat.completions.create,
@@ -193,7 +209,10 @@ class _ProviderRoutingMixin:
         system text block and dynamic evidence last.  Hash only that stable
         prefix plus the normalized model identity, so changing task evidence
         does not fragment the provider cache while different policies cannot
-        collide.  Routes without a leading system prefix simply opt out.
+        collide.  Routes without a leading system prefix simply opt out. For
+        the OpenAI family this prefix is also the whole OpenRouter session
+        identity (``_openrouter_session_identity``) and the block its send copy
+        keeps in the leading system message.
         """
         if not messages or str(messages[0].get("role") or "") != "system":
             return ""
@@ -240,14 +259,30 @@ class _ProviderRoutingMixin:
         model_id: str,
         messages: List[Dict[str, Any]],
     ) -> str:
-        """Conversation-stable OpenRouter affinity, bounded well below 256 chars."""
+        """Sticky OpenRouter affinity, bounded well below 256 chars.
+
+        Conversation-stable for every family but OpenAI's, whose public API reuses a
+        prompt cache only under one routing key and only for the whole leading system
+        section (measured 2026-09-25): there the session is one per model and governance
+        prefix, so a new task, child or wake is served the prefix its predecessors cached.
+        """
+        from ouroboros.llm_attempt import openai_family_model
+
         prefix_identity = cls._prompt_cache_identity(model_id, messages)
         if not prefix_identity:
             return ""
+        if openai_family_model(model_id):
+            digest = hashlib.sha256(f"{prefix_identity}\0openai-family".encode("utf-8")).hexdigest()[:32]
+            return f"ouroboros-session-{digest}"
         first_user: Any = ""
         for message in messages:
             if str(message.get("role") or "") == "user":
-                first_user = message.get("content")
+                # Cache boundaries migrate during a task. Their markers and
+                # host-only block metadata must not rotate its routing key.
+                first_user = cls._copy_messages_with_cache_policy(
+                    [message], allow_message_cache_control=False,
+                    flatten_tool_content_blocks=False,
+                )[0].get("content")
                 break
         serialized_user = json.dumps(
             first_user,
@@ -284,6 +319,8 @@ class _ProviderRoutingMixin:
             return f"minimax/{resolved_model}"
         if provider == "deepseek":
             return f"deepseek/{resolved_model}"
+        if provider == "zai":
+            return f"zai/{resolved_model}"
         if provider == "claudexor":
             return f"claudexor::{resolved_model}"
         return f"openai-compatible/{resolved_model}"
@@ -298,7 +335,7 @@ class _ProviderRoutingMixin:
         def configured(key: str, default: Any = "") -> Any:
             if explicit_settings:
                 return settings.get(key, default)  # type: ignore[union-attr]
-            return os.environ.get(key, default)
+            return runtime_setting(key, default)
 
         provider, resolved_model = self._parse_provider_model(model)
         usage_model = self._qualified_model_name(provider, resolved_model)
@@ -371,6 +408,20 @@ class _ProviderRoutingMixin:
                 "supports_generation_cost": False,
             }
 
+        if provider == "zai":
+            return {
+                "provider": provider,
+                "resolved_model": resolved_model,
+                "usage_model": usage_model,
+                "api_key": configured("ZAI_API_KEY", ""),
+                # Plan-selected official endpoint (PAYG default; the Coding
+                # Plan endpoint is intended for supported tools only).
+                "base_url": resolve_zai_base_url(configured("ZAI_PLAN", "")),
+                "default_headers": {},
+                "supports_openrouter_extensions": False,
+                "supports_generation_cost": False,
+            }
+
         if provider == "cloudru":
             return {
                 "provider": provider,
@@ -437,7 +488,7 @@ class _ProviderRoutingMixin:
 
         current_api_key = configured("OPENROUTER_API_KEY", "") if explicit_settings else self._api_key_override
         if current_api_key is None:
-            current_api_key = os.environ.get("OPENROUTER_API_KEY", "")
+            current_api_key = runtime_setting("OPENROUTER_API_KEY", "")
         return {
             "provider": "openrouter",
             "resolved_model": resolved_model,
@@ -483,7 +534,9 @@ class _ProviderRoutingMixin:
         headers = tuple(sorted(
             (str(k), str(v)) for k, v in dict(target.get("default_headers") or {}).items()
         ))
-        cache_key = (str(target.get("provider") or ""), base_url, api_key, headers)
+        from ouroboros.net_transport import extra_ca_bundle
+
+        cache_key = (str(target.get("provider") or ""), base_url, api_key, headers, extra_ca_bundle())
         if cache_key not in self._remote_clients:
             self._remote_clients[cache_key] = self._new_remote_client(target)
         return self._remote_clients[cache_key]
@@ -528,7 +581,9 @@ class _ProviderRoutingMixin:
         api_key = str(target.get("api_key") or "")
         headers_dict = dict(target.get("default_headers") or {})
         headers = tuple(sorted((str(k), str(v)) for k, v in headers_dict.items()))
-        cache_key = (str(target.get("provider") or ""), base_url, api_key, headers)
+        from ouroboros.net_transport import extra_ca_bundle
+
+        cache_key = (str(target.get("provider") or ""), base_url, api_key, headers, extra_ca_bundle())
 
         client = self._async_remote_clients.get(cache_key)
         if client is None:

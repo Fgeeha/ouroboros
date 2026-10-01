@@ -355,11 +355,10 @@ def test_depth3_control_plane_reaches_root_acceptance(tmp_path, monkeypatch):
             return {}
 
         def enqueue_task(self, task):
-            pending.append(task)
-            return task
+            return queue_module.enqueue_task(task)
 
         def persist_queue_snapshot(self, reason=""):
-            return None
+            return queue_module.persist_queue_snapshot(reason=reason)
 
         def send_with_budget(self, *_args, **_kwargs):
             return None
@@ -378,11 +377,6 @@ def test_depth3_control_plane_reaches_root_acceptance(tmp_path, monkeypatch):
     monkeypatch.setenv("OUROBOROS_MAX_SUBAGENT_DEPTH", "3")
     monkeypatch.setenv("OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT", "6")
     monkeypatch.setattr(control, "load_settings", lambda: settings)
-    monkeypatch.setattr(
-        events,
-        "_find_duplicate_task",
-        lambda *_args, **_kwargs: None,
-    )
     monkeypatch.setattr(task_tree_ledger, "DATA_DIR", tmp_path)
 
     monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
@@ -396,11 +390,11 @@ def test_depth3_control_plane_reaches_root_acceptance(tmp_path, monkeypatch):
         "budget_remaining",
         lambda *_args, **_kwargs: 100.0,
     )
-    monkeypatch.setattr(
-        queue_module,
-        "persist_queue_snapshot",
-        lambda reason="": None,
-    )
+    for key, value in {"DRIVE_ROOT": tmp_path, "PENDING": pending, "RUNNING": running,
+                       "QUEUE_SNAPSHOT_PATH": tmp_path / "state/queue_snapshot.json",
+                       "QUEUE_SEQ_COUNTER_REF": {"value": 0}, "ADMISSION_RESERVATIONS": {},
+                       "ACCEPTANCE_FENCES": {}}.items():
+        monkeypatch.setattr(queue_module, key, value)
     monkeypatch.setattr(queue_module, "BUDGET_ROOT_FENCES", {})
 
     root_contract = build_task_contract(
@@ -806,9 +800,8 @@ def test_depth3_waits_for_worker_slot_then_uses_active_cap_reservation(
     monkeypatch.setattr(queue_module, "PENDING", pending)
     monkeypatch.setattr(queue_module, "RUNNING", running)
     monkeypatch.setattr(queue_module, "BUDGET_ROOT_FENCES", {})
-    monkeypatch.setattr(
-        queue_module, "persist_queue_snapshot", lambda reason="": None,
-    )
+    monkeypatch.setattr(queue_module, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(queue_module, "QUEUE_SNAPSHOT_PATH", tmp_path / "state/queue_snapshot.json")
 
     # Saturation preserves attempted-but-not-achieved evidence.
     workers.assign_tasks()

@@ -1,8 +1,7 @@
 """Single source of truth for AGENT-context size budgets.
 
 These govern the size of Ouroboros's OWN working context: the main-loop
-assembled prompt, the typed context-reclaim request/receipt contract, and
-the background consciousness context guards.
+assembled prompt and the typed context-reclaim request/receipt contract.
 
 They are deliberately SEPARATE from the REVIEW-prompt budget family
 (``ouroboros.tools.review_helpers.REVIEW_PROMPT_TOKEN_BUDGET`` and the
@@ -30,6 +29,30 @@ from typing import Any, Dict, Literal, Optional, Tuple
 # route capacity W, requests at most one useful reclaim pass, then sends best
 # effort. Crossing T never creates a task failure.
 OWNER_LOW_TARGET_TOKENS = 200_000
+
+# Nano's owner-selected total window and free input headroom. The send boundary
+# chooses the largest output allowance up to the caller's existing ceiling;
+# the headroom is a minimum, never a fixed generation cap.
+OWNER_NANO_TARGET_TOKENS = 81_920
+NANO_MIN_HEADROOM_TOKENS = 8_192
+
+# Low-water sizing of the automatic context-reclaim pass. The TRIGGER is
+# unchanged: a positive deficit against the binding boundary (the smaller known
+# of the owner target T and the route capacity W), one pass per route+round.
+# Only the SIZE of the requested pass changes: goal = deficit +
+# ceil(boundary / RECLAIM_LOW_WATER_DIVISOR), and 0 without a deficit. A pass
+# sized to the deficit alone lands exactly AT the boundary, so the next round's
+# ordinary growth re-arms it (a summarizer pass nearly every round). Sized this
+# way it lands about an eighth of the boundary below (~125K tokens on a 1M
+# route, ~25K under the 200K Low target), so the next pass needs that much real
+# growth. Structural constant, not a setting: 8 (12.5 % of the boundary) is a
+# disclosed design choice, not a measured optimum; change it here and only here
+# (tests/test_context_budget_ssot.py pins it). Cost: older history is condensed
+# sooner and each summarizer pass is larger. The materializer, its receipts and
+# the route+round latch are unchanged; the checkpoint event records requested
+# margin versus achieved headroom (context_fit.measure_main_fit,
+# loop_model_call._run_main_reclaim).
+RECLAIM_LOW_WATER_DIVISOR = 8
 
 # One overflow vocabulary for every seam that must recognize a CONTEXT-WINDOW
 # overflow (Main provider-code precedence, the local transport, and the
@@ -91,6 +114,7 @@ MeasurementBasis = Literal["fresh_route_usage", "fresh_model_usage", "cold_estim
 ReclaimStatus = Literal[
     "applied", "no_eligible", "no_positive_reclaim", "checkpoint_failed",
     "summarizer_failed", "no_measurable_shrink", "binding_mismatch",
+    "no_op", "fit_rejected", "source_unavailable",
 ]
 
 
@@ -103,6 +127,11 @@ class ContextReclaimRequest:
     measurement_density: float
     reclaim_goal_tokens: int
     allow_partial_shrink: bool = True
+    working_note: Optional[str] = None
+    expected_view_revision: str = ""
+    keep_unit_ids: Optional[Tuple[str, ...]] = None
+    restore_unit_refs: Tuple[Dict[str, Any], ...] = ()
+    schema_names: Optional[Tuple[str, ...]] = None
 
 
 @dataclass(frozen=True)
@@ -116,6 +145,13 @@ class ContextReclaimReceipt:
     goal_reached: bool
     checkpoint_ref: Optional[Dict[str, Any]]
     capsule_refs: Tuple[Dict[str, Any], ...]
+    observed_view_revision: str = ""
+    view_revision: str = ""
+    retained_unit_ids: Tuple[str, ...] = ()
+    restored_unit_refs: Tuple[Dict[str, Any], ...] = ()
+    source_refs: Tuple[Dict[str, Any], ...] = ()
+    schema_names: Optional[Tuple[str, ...]] = None
+    fit: Optional[Dict[str, Any]] = None
 
 
 class SummarizerContextOverflow(RuntimeError):
@@ -168,14 +204,6 @@ class _Part:
     end_char: int
     text: str
     sha256: str
-
-# Background-consciousness assembled-context guards. P1: fail fast, never
-# silently truncate cognitive artifacts.
-BG_CONTEXT_WARN_CHARS = 600_000   # ~150K tokens: warn but proceed
-BG_CONTEXT_MAX_CHARS = 1_200_000  # ~300K tokens: skip the wakeup cycle
-
-# Drive-state JSON injection guard inside the consciousness context.
-BG_STATE_JSON_WARN_CHARS = 200_000
 
 # WARN threshold for a single oversized governance/knowledge context section.
 LARGE_CONTEXT_SECTION_CHARS = 200_000
@@ -232,15 +260,19 @@ SCRATCHPAD_MAX_CONTENT_CHARS = 60_000
 # any instrument — these thresholds are the instrument). Same family as
 # SCRATCHPAD_BLOAT_WARN_CHARS above: a health-invariant WARNING, not a gate.
 #
-# Ledger: measured evidence in ouroboros/usage_ledger.py::_locked — a ~20MB
-# usage_attempts.jsonl costs ~0.5s per full re-read UNDER THE MONETARY LOCK,
-# starving concurrent workers (the 2026-07-23 lock-timeout incident). Warn at
-# exactly that measured degradation point. Since CPL4-C6, size-triggered
-# compaction (config.USAGE_LEDGER_COMPACT_BYTES, usage_compaction.py) should
-# hold the file far below this — like the rotation-log warns, this fires only
-# if compaction is broken, the unfoldable residue itself grows this large, or
-# the lock directory takes no kernel locks and compaction refuses on the name
-# tier (typed usage_ledger_compaction_refused event, once per process).
+# Ledger: retain the historical 20MB growth tripwire (the 2026-07-23 incident).
+# Warm writers now validate only the tail; cold parsing runs outside the money
+# lock and revalidates its generation under it. Size still affects cold parsing,
+# full projections and compaction, not the cost of every reservation. Since
+# CPL4-C6, size-triggered compaction (config.USAGE_LEDGER_COMPACT_BYTES) should
+# hold the file below this. Growth can reflect a large unfoldable residue,
+# compaction that is broken or refused, or a file that has not yet outgrown the
+# growth floor its last committed pass stamped into the ledger header (declined
+# before the pass, so no typed event). The name tier (no kernel
+# locks) emits usage_ledger_compaction_refused once per process per data root;
+# a policy abort (_Abort) emits usage_ledger_compaction_skipped once per process
+# per (data root, reason). The two snapshot-race exits before archive/swap only
+# log warnings, without a typed event.
 USAGE_LEDGER_WARN_BYTES = 20_000_000
 # events/tools/supervisor/task_reflections logs are ROTATION-BOUNDED since the
 # CPL4-C1..C4 rotation train (same 800KB rotator and supervisor tick as
@@ -266,10 +298,6 @@ PROGRESS_LOG_WARN_BYTES = 8_000_000
 # fired follow-up. 2MB ≈ thousands of ~1KB records: the point where a
 # per-tick full parse + atomic rewrite under the lock stops being free.
 SCHEDULED_TASKS_WARN_BYTES = 2_000_000
-# Background observations are append-only and replayed by the consciousness
-# owner on each wake.  This is a warning, not a retention gate: acknowledged
-# and unacknowledged rows remain durable until a future owner-approved archive.
-BG_OBSERVATIONS_WARN_BYTES = 20_000_000
 # Compact root-task -> skill review index used by acceptance packet assembly.
 SKILL_REVIEW_ROOT_TASKS_WARN_BYTES = 20_000_000
 # ``chat_history`` can deliberately replay the archive chain, while ordinary
@@ -277,12 +305,17 @@ SKILL_REVIEW_ROOT_TASKS_WARN_BYTES = 20_000_000
 # explicit full-history read becomes seconds-scale; this is observability, not
 # a retention gate and never shortens the memory horizon.
 CHAT_ARCHIVE_SCAN_WARN_BYTES = 100_000_000
-# Custody replay (delegate_custody) walks the WHOLE events chain — live file
-# plus archive/events_*.jsonl — on ownership questions. This inherits the
+# The FIRST custody read of each process folds the WHOLE events chain — live
+# file plus archive/events_*.jsonl — into the process-local row memo
+# (delegate_custody_memo); later reads fold only appended bytes. Explicit
+# forensic and retirement scans still walk the chain. This inherits the
 # pre-rotation 100MB replay-degradation signal, now measured over the chain;
-# archives stay durable history (never GC'd), so the remediation is chain
-# indexing/compaction, never deletion.
+# archives stay durable history (never GC'd), so the remediation is a durable
+# compact custody projection, never deletion.
 EVENTS_ARCHIVE_SCAN_WARN_BYTES = 100_000_000
+# Warn before the observed 242-of-253 retained-drive corpus becomes routine;
+# count only direct children because startup health is an interactive path.
+RETAINED_EXECUTION_DRIVES_WARN_COUNT = 200
 
 
 def estimate_message_chars(messages: Any) -> int:

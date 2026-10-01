@@ -43,6 +43,7 @@ from starlette.routing import Route
 from starlette.testclient import TestClient
 
 from tests._shared import SETTINGS_WRITERS, calls_function
+from tests._governance_docs_shared import architecture_text
 
 # One owner-authored document, written entirely under keys a release renamed or
 # retired. Every value differs from both its legacy default and its current one,
@@ -424,6 +425,29 @@ def test_normalize_settings_raw_is_idempotent(isolated_settings):
     assert not isolated_settings.exists()
 
 
+@pytest.mark.parametrize(
+    ("minimum", "maximum", "expected_minimum", "expected_maximum"),
+    [(30, 30, 60, 60), (30, 7200, 60, 7200), (900, 14400, 900, 14400), (120, 600, 120, 600)],
+)
+def test_wakeup_bounds_read_normalization_preserves_valid_values_and_does_not_write(
+    isolated_settings, minimum, maximum, expected_minimum, expected_maximum,
+):
+    """Legacy short wake minima become the current effective floor in every
+    read, while clean and owner-customized bounds remain byte-for-byte choices
+    and a GET/read never rewrites settings.json."""
+    from ouroboros import config as cfg
+
+    _seed(isolated_settings, {
+        "OUROBOROS_BG_WAKEUP_MIN": minimum,
+        "OUROBOROS_BG_WAKEUP_MAX": maximum,
+    })
+    before = isolated_settings.read_bytes()
+    loaded = cfg.load_settings()
+    assert loaded["OUROBOROS_BG_WAKEUP_MIN"] == expected_minimum
+    assert loaded["OUROBOROS_BG_WAKEUP_MAX"] == expected_maximum
+    assert isolated_settings.read_bytes() == before
+
+
 def test_a_stale_owner_read_cannot_overwrite_a_change_it_never_saw(isolated_settings):
     """The unlocked read-modify-write, closed: a decision taken from an earlier read
     is bound to the document that read saw."""
@@ -665,8 +689,7 @@ def test_a_retired_key_is_absent_from_every_surface_that_would_react_to_it():
     from ouroboros import config as cfg
     from ouroboros.gateway import settings as settings_mod
 
-    documented = (pathlib.Path(__file__).resolve().parents[1]
-                  / "docs" / "ARCHITECTURE.md").read_text(encoding="utf-8").splitlines()
+    documented = architecture_text().splitlines()
     for key in cfg.RETIRED_SETTING_KEYS:
         assert key not in settings_mod._IMMEDIATE_KEYS, key
         assert key not in settings_mod._RESTART_REQUIRED_KEYS, key

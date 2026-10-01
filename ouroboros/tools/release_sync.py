@@ -91,7 +91,17 @@ RELEASE_ASSET_TEMPLATES = {
     "linux-rpm-x86_64": "ouroboros-{version}-1.x86_64.rpm",
     "linux-rpm-red80-x86_64": "ouroboros-{version}-1.red80.x86_64.rpm",
     "windows-x64": "Ouroboros-{version}-windows-x64.zip",
+    "android-arm64": "Ouroboros-{version}-android-arm64.tar.gz",
+    "android-apk": "Ouroboros-{version}-android.apk",
 }
+# Android has a rooted-device USB setup guide, not the desktop download flow.
+# Keep its artifacts in the same release registry without inventing missing
+# Android buttons in already-published desktop onboarding/version carriers.
+ANDROID_DOWNLOAD_IDS = ("android-arm64", "android-apk")
+DESKTOP_DOWNLOAD_IDS = tuple(
+    proof_id for proof_id in RELEASE_ASSET_TEMPLATES
+    if proof_id not in ANDROID_DOWNLOAD_IDS
+)
 _PUBLIC_REPOSITORY = "razzant/ouroboros"
 
 
@@ -130,14 +140,14 @@ class VersionCarrierSpan(NamedTuple):
 def _install_page_spans(tag: str, path: str) -> Tuple[VersionCarrierSpan, ...]:
     """Carrier spans for one public install page: every anchor tag owned by
     the release projection (``data-release-download``), derived from
-    ``RELEASE_ASSET_TEMPLATES`` so a new installer automatically gets a span.
+    ``DESKTOP_DOWNLOAD_IDS``; Android setup links belong to its own guide.
 
     ``macos-arm64`` appears twice by design (the platform button and the
     quick-start step); the pair disambiguates on the step's literal ``Click ``
     prefix. A page restructure that breaks either anchor degrades the file to
     the ordinary assisted path (malformed/duplicate anchor) — never a guess."""
     spans: List[VersionCarrierSpan] = []
-    for proof_id in RELEASE_ASSET_TEMPLATES:
+    for proof_id in DESKTOP_DOWNLOAD_IDS:
         if proof_id == "macos-arm64":
             spans.append(VersionCarrierSpan(
                 f"{tag}_download_{proof_id}_button", path,
@@ -340,7 +350,7 @@ def _download_url_desyncs(
         ("site/install/index.html", site_install_text),
         ("docs/install/index.html", docs_install_text),
     )
-    for proof_id in RELEASE_ASSET_TEMPLATES:
+    for proof_id in DESKTOP_DOWNLOAD_IDS:
         expected = release_asset_download_url(proof_id, version)
         if readme_has_projection:
             reference_pattern = re.compile(
@@ -501,6 +511,42 @@ def version_carrier_desyncs(
         )
     )
     return desync
+
+
+def release_metadata_findings(texts: dict[str, str]) -> List[str]:
+    """All independently decidable release findings over one source's readable files.
+
+    Reuse carrier grammar and P9 counters; unavailable files are absent from this
+    mapping and are reported by the reader. Never invent a future release version.
+    """
+    findings: List[str] = []
+    version = texts.get("VERSION", "").strip()
+    if "VERSION" in texts and not is_release_version(version):
+        findings.append("VERSION is empty or malformed; use a supported release version.")
+    readme = texts.get("README.md")
+    if readme is not None:
+        if is_release_version(version) and not re.search(r'\|\s*' + re.escape(version) + r'\s*\|', readme):
+            findings.append(f"VERSION is {version} but README.md changelog has no table row for this version. "
+                            "Add a changelog entry in the Version History table in README.md.")
+        limits = check_history_limit(readme)
+        if limits:
+            findings.append("README.md Version History exceeds BIBLE.md P9 limits.")
+            findings.extend(limits)
+    # A present empty carrier is malformed, not an absent optional older carrier.
+    findings.extend(f"{path} is empty; restore its release metadata."
+                    for path, text in texts.items() if path != "VERSION" and not text.strip())
+    findings.extend(version_carrier_desyncs(
+        version,
+        pyproject_text=texts.get("pyproject.toml", ""),
+        uv_lock_text=texts.get("uv.lock", ""),
+        web_package_text=texts.get("web/package.json", ""),
+        web_package_lock_text=texts.get("web/package-lock.json", ""),
+        readme_text=readme or "", arch_text=texts.get("docs/ARCHITECTURE.md", ""),
+        api_types_text=texts.get("web/modules/api_types.js", ""),
+        download_readme_text=readme or "", site_install_text=texts.get("site/install/index.html", ""),
+        docs_install_text=texts.get("docs/install/index.html", ""), detailed=True,
+    ))
+    return findings
 
 
 def check_worktree_version_sync(repo_dir) -> str:

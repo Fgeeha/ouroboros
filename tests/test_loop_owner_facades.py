@@ -1,18 +1,10 @@
-"""Facade-identity contract for the v7 L-B loop.py leaf owners (D01 lane).
+"""Facade-identity contract for the loop.py leaf owners.
 
-Every member the L-B split moved out of ``ouroboros/loop.py`` keeps a loop.py
-re-export under its historical name, so existing callers and monkeypatching
-tests keep working unchanged: the loop binding IS the leaf's object, and the
-sibling leaves' D33 call-time handle reads (``_loop().X``) resolve through this
-module as the family rendezvous.
-
-v7next transplant note: the reference (ouroboros_v7_wip @ 9f691656) later spent
-the private half of this facade (its L3 package, RETIRED_FROM_LOOP) by
-re-homing every loop-private test import to its leaf owner. That trimming is a
-consumer-rebind wave, not part of the byte-preserving relocation, and does NOT
-ride with the D01 lane: on this tree the tip consumer surface still addresses
-every moved name at ``ouroboros.loop``, so the FULL re-export surface is the
-contract here (see docs/v7next/LEDGER_CORRECTIONS.md, D01 lane).
+``ouroboros/loop.py`` re-exports its leaf owners' members under the names
+existing callers and monkeypatching tests use. The loop binding IS the leaf's
+object, and sibling leaves' call-time handle reads (``_loop().X``) resolve
+through this module as the family rendezvous. The full re-export surface is
+required while those consumers address the names through ``ouroboros.loop``.
 """
 
 from __future__ import annotations
@@ -89,7 +81,7 @@ LOOP_LEAF_OWNERS: dict[str, str] = {
         "_replace_delivery_candidate _ensure_explicit_acceptance_binding "
         "_forced_unaccepted_binding _live_delivery_candidate _current_delivery_candidate "
         "_degrade_retained_delivery_candidate _merge_finalization_trace "
-        "_delivery_control_prompt _delivery_replace_required _delivery_keep_allowed "
+        "_delivery_control_prompt _delivery_replace_required "
         "_arm_delivery_control _hold_delivery_for_skill_action "
         "_parse_delivery_control_object _resolve_delivery_control "
         "_compose_delivery_suffix _no_tool_final_answer"
@@ -98,11 +90,11 @@ LOOP_LEAF_OWNERS: dict[str, str] = {
         "_load_direct_child_results _direct_child_results _child_disposition_state "
         "_project_child_result_dispositions _record_forced_finalization "
         "_forced_orphan_note _claimed_child_dispositions _undispositioned_children "
-        "_maybe_enforce_child_absorption_gate _run_forced_children_acceptance "
+        "_maybe_enforce_child_absorption_gate "
         "_enforce_swarm_actions _finalize_forced_services _drain_forced_owner_directives "
         "_call_forced_model_once _publish_model_forced_candidate "
         "_publish_stale_forced_candidate _forced_fallback_result "
-        "_forced_swarm_router_result _resolve_forced_delivery_control "
+        "_resolve_forced_delivery_control "
         "_forced_final_answer"
     ),
 }
