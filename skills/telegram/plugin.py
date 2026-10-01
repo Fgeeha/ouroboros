@@ -27,7 +27,7 @@ from .lib.telegram_api import (
     _MAX_TELEGRAM_UPLOAD_BYTES,
 )
 from .lib.telegram_state import (
-    _state_file, _load_settings, _is_silent_mode_enabled,
+    _state_file, _load_settings, _telegram_proxy, _is_silent_mode_enabled,
     _get_silent_msg, _set_silent_msg, _clear_silent_msg, _subagent_cards_enabled,
     _mirror_progress_enabled, _render_subagent_card, _data_dir,
     _jsonl_tail, _load_runtime_state, _read_json_file, _child_row_held_for_root,
@@ -51,11 +51,10 @@ _HONOR_ENV_PROXIES = (not in_worker_process()) and env_proxies_configured()
 
 
 def _telegram_client(api) -> TelegramClient:
-    """The Bot API client every bridge path builds: the granted token plus, once the owner
-    sets and grants the TELEGRAM_PROXY secret, that Telegram-only proxy (not the Mini App)."""
-    granted = api.get_settings(["TELEGRAM_BOT_TOKEN", "TELEGRAM_PROXY"])
+    """Build each bridge client with the granted token and skill-local proxy."""
+    granted = api.get_settings(["TELEGRAM_BOT_TOKEN"])
     return TelegramClient(granted.get("TELEGRAM_BOT_TOKEN", ""), trust_env=_HONOR_ENV_PROXIES,
-                          proxy=granted.get("TELEGRAM_PROXY"))
+                          proxy=_telegram_proxy(api))
 
 _SLASH_COMMAND_RE = re.compile(r"^\s*/[A-Za-z]")
 
