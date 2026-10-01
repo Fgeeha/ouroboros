@@ -192,7 +192,7 @@ def test_provider_boot_attaches_notification_subscriber_before_supervisor_starts
     """
     from starlette.testclient import TestClient
     import server as srv
-    from ouroboros import event_bus, extension_loader
+    from ouroboros import event_bus, extension_loader, utils
     from supervisor import queue
 
     drive_root = tmp_path / "drive"
@@ -211,10 +211,17 @@ def test_provider_boot_attaches_notification_subscriber_before_supervisor_starts
         "notification": {"text": "due", "key": "cold-boot"},
     })
     observed = []
+    frames = []
+    monkeypatch.setattr(srv, "broadcast_ws_sync", frames.append)
 
     def reload_extensions(_root, _reader, *, repo_path=None):
         event_bus.get_global_event_bus().subscribe(
             "telegram", event_bus.OWNER_NOTIFICATION, observed.append,
+        )
+        # Host Service may append before the first supervisor tick. The
+        # provisional sink must cover this provider-configured boot window.
+        event_bus.emit_owner_notification(
+            drive_root, chat_id=1, category="notice", text="before tick", source="skill:test",
         )
         return {}
 
@@ -228,13 +235,16 @@ def test_provider_boot_attaches_notification_subscriber_before_supervisor_starts
     monkeypatch.setattr(srv, "_start_supervisor_if_needed", start_supervisor)
     try:
         with TestClient(srv.app):
-            assert [row["text"] for row in observed] == ["due"]
+            assert [row["text"] for row in observed] == ["before tick", "due"]
+            assert [f["data"]["text"] for f in frames if f.get("type") == "log"
+                    and f.get("data", {}).get("text") == "before tick"] == ["before tick"]
             assert queue.list_scheduled_tasks(drive_root)["tasks"][0]["completed_at"]
             queue.check_scheduled_tasks()
-            assert len(observed) == 1
+            assert len(observed) == 2
             assert not (drive_root / "logs" / "chat.jsonl").exists()
     finally:
         event_bus.init_global_event_bus()
+        utils.set_log_sink(None)
 
 
 def test_testclient_settings_hot_reload_uses_app_state_drive_root(tmp_path, monkeypatch):

@@ -1316,13 +1316,13 @@ async def lifespan(app):
 
     if not _exit_signalled.is_set():
         _supervisor_stop.clear()  # a fresh lifespan owns a fresh generation (symmetric with the teardown set)
+    from supervisor.log_addressing import install_startup_notification_sink
+    install_startup_notification_sink(settings, lifespan_drive_root, broadcast_ws_sync)
     startup_provider_ready = has_startup_ready_provider(settings)
     if not startup_provider_ready:
         _supervisor_ready.set()
         _supervisor_init_done.set()
         log.info("No supported provider or local routing configured. Supervisor not started.")
-        from supervisor.log_addressing import install_providerless_notification_sink
-        install_providerless_notification_sink(settings, lifespan_drive_root, broadcast_ws_sync)
     # P2: finalize a pending managed merge update (post-boot smoke / boot-loop rollback)
     # and run a one-shot boot-time update check (check-on-restart) so the main-screen
     # Update badge reflects availability. Both run OFF the startup critical path and

@@ -279,10 +279,10 @@ def make_server_log_sink(bridge: Any, drive_root: Any, running: Any = None):
     return _server_log_sink
 
 
-def install_providerless_notification_sink(settings: dict, drive_root: Any, broadcast: Callable) -> None:
-    """Keep immediate Host notices visible when no model supervisor starts.
+def install_startup_notification_sink(settings: dict, drive_root: Any, broadcast: Callable) -> None:
+    """Keep immediate Host notices live before the supervisor installs its sink.
 
-    A later supervisor generation replaces this provisional server-process sink.
+    This also covers a provider-less boot; a later supervisor replaces this sink.
     """
     from ouroboros.utils import set_log_sink
     from supervisor.message_bus import LocalChatBridge
