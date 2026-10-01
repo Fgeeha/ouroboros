@@ -663,7 +663,7 @@ def _run_retry_admission_transaction(
                         else:
                             # Cancellation lost the boundary and the successor is
                             # durable: the retry inherits its predecessor's room.
-                            bind_retry_to_origin_project(q.DRIVE_ROOT, task, task_id, retry_task_id)
+                            bind_retry_to_origin_project(q.DRIVE_ROOT, admitted, task_id, retry_task_id)
     except Exception:
         admission_block = "cancel_intent_authority_unreadable"
         log.error(

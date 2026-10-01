@@ -477,9 +477,9 @@ export function createChatInstance({
         onState: (id, status) => !destroyed
             && (liveCardRecords.get(id)?.reviewController?.setHydrateStatus?.(status) ?? false),
     });
-    // A task_named frame can arrive before the card's record exists; buffer it.
+    // Buffer task_named frames that precede their card.
     const pendingSuggestedNames = new Map();
-    // Server-confirmed in-flight direct/managed activities.
+    // Server-confirmed direct/managed activities.
     const activeDirectActivities = new Map();
     // Local user submissions awaiting server confirmation (clientMessageId
     // -> { clientMessageId, timestamp }).
@@ -490,7 +490,7 @@ export function createChatInstance({
     // slots are cleared whenever their cycle settles.
     const concludedDirectActivities = new Map();
     const CONCLUDED_ACTIVITY_LEDGER_MAX = 200;
-    // Retryable queue-loss candidates plus process-local single-flight reads.
+    // Queue-loss candidates and single-flight detail reads.
     const missingManagedTaskIds = new Set();
     const managedTaskDetailReads = new Set();
     // Owner rows kept until history confirms client_message_id.
@@ -512,8 +512,7 @@ export function createChatInstance({
         concludedDirectActivities.delete(aid);
         concludedDirectActivities.set(aid, Date.now());
         while (concludedDirectActivities.size > CONCLUDED_ACTIVITY_LEDGER_MAX) {
-            const oldest = concludedDirectActivities.keys().next().value;
-            concludedDirectActivities.delete(oldest);
+            concludedDirectActivities.delete(concludedDirectActivities.keys().next().value);
         }
     }
     function recordTerminalActivity(taskId) {
@@ -525,9 +524,8 @@ export function createChatInstance({
         else recordConcludedActivity(id);
         settleTerminalRootChildren(id);
     }
-    // A root proven terminal settles descendant cards a lost child terminal left
-    // open (#300): one single-flight durable read each, through the ordinary
-    // child-terminal path; no proven terminal fact = the child keeps its state.
+    // A terminal root reconciles open descendants through single-flight detail
+    // reads; only proven child terminality changes their state (#300).
     function settleTerminalRootChildren(rootId) {
         for (const [childId, info] of subagentChildParents) {
             if (info.parentId !== rootId) continue;
@@ -608,7 +606,40 @@ export function createChatInstance({
     // Main-only: transfer receipts are Main history rows.
     const handoffs = isMain ? createProjectHandoffs({ feed: messagesDiv, fetchDetail: fetchTaskDetailStrict, mutate: withStableViewport }) : null;
 
+    let childHoldRead = false;
+    async function refreshChildProjectHolds() {
+        const children = [...liveCardRecords.values()].filter(r => r.isSubagent && !r.finished && r.root?.isConnected);
+        if (destroyed || childHoldRead || !children.length) return;
+        childHoldRead = true;
+        const started = Date.now();
+        try {
+            const response = await apiFetch('/api/tasks?queue_only=1');
+            if (!response.ok) return;
+            const { queue } = await response.json();
+            if (destroyed || !Array.isArray(queue?.pending) || !Array.isArray(queue?.running)) return;
+            const tasks = new Map([...queue.pending, ...queue.running].map(row => [row.id, row.task]));
+            withStableViewport(() => {
+                for (const record of children) {
+                    if (record.finished || !record.root?.isConnected || record.lastLiveObservedAt > started) continue;
+                    const task = tasks.get(record.groupId);
+                    if (task && 'project_admission_hold' in task) {
+                        missingManagedTaskIds.delete(record.groupId);
+                        restoreCardActivity(record, task.project_admission_hold);
+                        record.projectHoldQueued = Boolean(record.projectHold);
+                    } else if (!task && record.projectHoldQueued) {
+                        record.projectHoldQueued = false;
+                        missingManagedTaskIds.add(record.groupId);
+                        void reconcileMissingManagedTask(record.groupId);
+                    }
+                }
+            });
+            syncChatStatus();
+        } catch { /* Keep the last fact; absence or a failed read proves no recovery. */ }
+        finally { childHoldRead = false; }
+    }
+
     function hydrateStateSnapshot(data, snapshotRequestedAt = Infinity) {
+        void refreshChildProjectHolds();
         syncHeaderControlState(data);
         handoffs?.snapshot(data);
         hostReady = supervisorReady(data) ?? hostReady;
@@ -622,9 +653,8 @@ export function createChatInstance({
                 if (activity.required_question) chatDecision.appendActivityQuestion(activity.required_question, snapshotRequestedAt);
                 if (Number(activity.chat_id ?? 1) === chatId) modelWaits.observe(activity.activity_id, activity);
             }
-        } else {
-            syncChatStatus();
         }
+        syncChatStatus();
     }
 
     async function refreshHeaderControlState(force = false) {
@@ -816,22 +846,18 @@ export function createChatInstance({
     }
 
     function queueTaskLiveUpdateMutation(summary, taskId, ts, dedupeKey = '', rawTs = '') {
-        // A live card is owned by an explicit task id (or by a classified
-        // review/pointer path before this seam).  The last visible card is a
-        // viewport fact, never an identity source for an unkeyed frame.
-        const resolvedTaskId = taskId || '';
-        if (!resolvedTaskId) return false;
+        // Explicit task/review identity owns a card; viewport position never does.
+        if (!taskId) return false;
         let changed = false;
-        const record = liveCardRecords.get(resolvedTaskId);
-        // A reusable slot's new cycle replaces its finished card; every other
-        // finished record absorbs late frames in applyLiveCardState (cost and
-        // model facts only, never a revived phase).
-        if (!_historyRow && record?.finished && REUSABLE_TASK_IDS.has(resolvedTaskId)
+        const record = liveCardRecords.get(taskId);
+        // Only reusable slots replace finished cards; other late frames update
+        // cost/model facts in applyLiveCardState without reviving the phase.
+        if (!_historyRow && record?.finished && REUSABLE_TASK_IDS.has(taskId)
                 && !isTerminalTaskPhase(summary.phase || '', summary.terminal)) {
             changed = Boolean(record.root?.isConnected);
-            disposeLiveCard(resolvedTaskId);
+            disposeLiveCard(taskId);
         }
-        return Boolean(applyLiveCardState(summary, resolvedTaskId, ts, dedupeKey, { rawTs }) || changed);
+        return Boolean(applyLiveCardState(summary, taskId, ts, dedupeKey, { rawTs }) || changed);
     }
 
     async function turnTaskIntoProject(record) {
@@ -865,10 +891,8 @@ export function createChatInstance({
         }
     }
 
-    // The conversion control from the record's facts: a block with work in Main
-    // offers "Turn into project" unless its origin is already bound to a Project
-    // (the one binding fact the /api/state sweep in app.js reads too); the title
-    // writers apply the same work predicate.
+    // Main blocks with work offer conversion unless their origin is bound
+    // (the same /api/state fact app.js reads); titles use the same work predicate.
     function syncBlockChrome(record) {
         if (record.root.dataset.projectCreated === '1') return;
         // A child is never a convertible unit (it inherits its root's Project by
@@ -1057,8 +1081,8 @@ export function createChatInstance({
         }
     }
 
-    function restoreCardActivity(record) {
-        if (!setHistoricalUnavailable(record, false)) return;
+    function restoreCardActivity(record, held = {}) {
+        if (!setHistoricalUnavailable(record, false, held)) return;
         renderLiveCardMeta(record);
         syncCancelRunButton(record);
     }
@@ -1067,14 +1091,11 @@ export function createChatInstance({
         const id = taskKey(taskId);
         if (!id) return false;
         cancelableTaskIds.add(id);
-        const record = liveCardRecords.get(id);
-        return record ? syncCancelRunButton(record) : false;
+        return syncCancelRunButton(liveCardRecords.get(id));
     }
 
-    // One-way conversion (P3): the WHOLE card becomes a calm "project identity"
-    // chip. The live task is now owned by the project panel (it's bound there),
-    // so the main chat is freed — the card stops being a busy red task and
-    // recolors to the project fuchsia. Plain wording (no "ack"); click opens the panel.
+    // Conversion replaces the whole Main card with a Project pointer; the
+    // bound task lives in that panel. The pointer opens it and uses Project ink.
     function markCardConverted(record, { project, handoff_id, handoff_receipt }) {
         return withStableViewport(() => {
             modelWaits.forget(record.groupId);
@@ -1410,8 +1431,7 @@ export function createChatInstance({
             // task_named is broadcast to every instance, so bound the early-name buffer.
             pendingSuggestedNames.set(tid, nm);
             if (pendingSuggestedNames.size > 100) {
-                const oldest = pendingSuggestedNames.keys().next().value;
-                pendingSuggestedNames.delete(oldest);
+                pendingSuggestedNames.delete(pendingSuggestedNames.keys().next().value);
             }
             return false;
         }
@@ -1803,6 +1823,7 @@ export function createChatInstance({
             renderLiveCardTimeline(record);
         }
         cancelableTaskIds.delete(record.groupId);
+        missingManagedTaskIds.delete(record.groupId);
         syncCancelRunButton(record);
         modelWaits.finish(record.groupId);
         // A lost task_done is healed only by refetching; a block nobody sees
@@ -3145,9 +3166,8 @@ export function createChatInstance({
 
     installChatResizeObservers();
 
-    // Per-thread input draft (P3): destroy-on-close would otherwise lose typed
-    // but unsent text. Saved on every input (cheap), restored at instance
-    // creation, cleared on send.
+    // Per-thread drafts survive destroy-on-close: save on input, restore on
+    // creation, clear on send.
     function saveInputDraft() {
         try {
             if (input.value) sessionStorage.setItem(storeKey(CHAT_DRAFT_KEY), input.value);
@@ -3210,9 +3230,8 @@ export function createChatInstance({
         }
     });
 
-    // The More menu is a native <details> (no auto-dismiss): collapse it when a
-    // click/tap lands outside it, or on Escape, so it never stays stuck open.
-    // Handler refs are kept so destroy() can remove them (P3 lifecycle).
+    // Native <details> needs outside-click/Escape dismissal; destroy removes
+    // these retained handler refs.
     let documentClickHandler = null;
     let documentKeydownHandler = null;
     if (!asPanel) {
@@ -3238,20 +3257,13 @@ export function createChatInstance({
 
     let headerControlInterval = null;
     if (asPanel) {
-        // A panel has no global controls/budget to poll; seed the status from
-        // the live socket and the page's newest snapshot: the one-shot WS
-        // `open` already fired before a late panel existed.
+        // Late panels missed socket open; seed from the socket and latest snapshot.
         hostReady = supervisorReady(stateSnapshots.latest?.()) ?? hostReady;
         const seed = computeDerivedChatStatus({ supervisorStarting: !hostReady });
         if (ws.isConnected?.()) setStatus(seed.kind, seed.text);
-        // 1A a panel created AFTER the socket opened missed the `open`-driven
-        // refresh — hydrate in-flight turns once from the census (the
-        // per-instance closure filters to this panel's chat_id).
-        refreshHeaderControlState(true);
-    } else {
-        refreshHeaderControlState(true);
-        headerControlInterval = setInterval(refreshHeaderControlState, 3000);
-    }
+    } else headerControlInterval = setInterval(refreshHeaderControlState, 3000);
+    // Both Main and late panels hydrate once; each instance filters its chat.
+    refreshHeaderControlState(true);
 
     const typingEl = document.createElement('div');
     // Per-instance id (main stays 'typing-indicator'; panels get a unique id) so
@@ -3454,7 +3466,7 @@ export function createChatInstance({
     }
     document.addEventListener('selectionchange', retryHistoricalUpserts);
 
-    // Mounted, unfinished, not waiting: the blocks that host their own running indicator.
+    // Active blocks host their own running indicator.
     const foregroundCards = () => Array.from(liveCardRecords.values()).filter((r) => isForegroundLiveCard(r) && !r.modelWaiting);
 
     function deriveChatStatus() {
@@ -3487,8 +3499,7 @@ export function createChatInstance({
 
     function revokeManagedTaskCancelAuthority(taskId) {
         cancelableTaskIds.delete(taskId);
-        const record = liveCardRecords.get(taskId);
-        if (record) syncCancelRunButton(record);
+        syncCancelRunButton(liveCardRecords.get(taskId));
     }
 
     async function reconcileMissingManagedTask(taskId, onDomWrite = withStableViewport) {
@@ -3498,17 +3509,12 @@ export function createChatInstance({
             || concludedDirectActivities.has(taskId)
             || !missingManagedTaskIds.has(taskId)
         ) return;
-        const record = liveCardRecords.get(taskId);
-        if (subagentChildParents.has(taskId) || record?.isSubagent) {
-            missingManagedTaskIds.delete(taskId);
-            return;
-        }
         managedTaskDetailReads.add(taskId);
         try {
             const detail = await fetchTaskDetailStrict(taskId);
             if (destroyed || concludedDirectActivities.has(taskId)) return;
             const currentRecord = liveCardRecords.get(taskId);
-            if (!currentRecord || currentRecord.isSubagent || subagentChildParents.has(taskId)) return;
+            if (!currentRecord || currentRecord.finished) return;
             onDomWrite(() => {
                 let changed = Boolean(attachTaskDetailReviews(taskId, detail));
                 const cancelPending = taskCancelPending(detail);
@@ -3532,6 +3538,7 @@ export function createChatInstance({
                     return changed;
                 }
                 if (cancelPending || (!vouched && !isTerminalTaskDetail(detail))) {
+                    if (currentRecord.isSubagent && detail?.status) missingManagedTaskIds.delete(taskId);
                     return Boolean(reconcileCancelCardFromDetail(currentRecord, taskId, detail) || changed);
                 }
                 if (vouched) return changed;
@@ -3547,9 +3554,7 @@ export function createChatInstance({
 
     function observeMissingManagedTask(taskId, onDomWrite = withStableViewport) {
         const id = taskKey(taskId);
-        if (!id || concludedDirectActivities.has(id)) return;
-        const record = liveCardRecords.get(id);
-        if (subagentChildParents.has(id) || record?.isSubagent) return;
+        if (!id || concludedDirectActivities.has(id) || subagentChildParents.has(id) || liveCardRecords.get(id)?.isSubagent) return;
         missingManagedTaskIds.add(id);
         void reconcileMissingManagedTask(id, onDomWrite);
     }
@@ -3569,13 +3574,11 @@ export function createChatInstance({
         activeDirectActivities.clear();
         for (const [k, v] of nextMap.entries()) {
             activeDirectActivities.set(k, v);
-            restoreCardActivity(liveCardRecords.get(k));
+            restoreCardActivity(liveCardRecords.get(k), v.project_admission_hold);
             markReviewAnchor(liveCardRecords.get(k));
-            noteDirectTurn(liveCardRecords.get(k), String(v.kind || '') !== 'managed_task');
+            noteDirectTurn(liveCardRecords.get(k), v.kind !== 'managed_task');
             if (v.kind === 'managed_task') missingManagedTaskIds.delete(k);
-            if (v.clientMessageId) {
-                pendingSubmissions.delete(v.clientMessageId);
-            }
+            if (v.clientMessageId) pendingSubmissions.delete(v.clientMessageId);
         }
         for (const taskId of globallyActiveActivityIds) missingManagedTaskIds.delete(taskId);
         for (const row of settledDirectRows) {
@@ -3602,7 +3605,6 @@ export function createChatInstance({
         if (complete) for (const taskId of missingManagedTaskIds) {
             if (!activeDirectActivities.has(taskId)) void reconcileMissingManagedTask(taskId);
         }
-        syncChatStatus();
     }
 
     const isKnownProjectFrame = (msg) => {
@@ -3776,10 +3778,8 @@ export function createChatInstance({
         withRemoteActivity(() => updateLiveCardFromLogEvent({ ...msg.data, _live_tool_frame: !msg.data._historical }));
     });
 
-    // Admission naming (a promoted root, a headless run) coined a name for a
-    // managed card — show it as the card title up front (turn-into-project then
-    // reuses the same name). Not thread-gated on chat_id: the broadcast carries
-    // only task_id, and applySuggestedName no-ops unless THIS thread holds that card.
+    // Admission names the card and its future Project. The broadcast has only
+    // task_id: applySuggestedName ignores ids this thread does not hold.
     onWs('task_named', (msg) => {
         withRemoteActivity(
             () => applySuggestedName(msg?.task_id || '', msg?.suggested_name || ''),

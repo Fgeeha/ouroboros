@@ -554,7 +554,7 @@ def test_assignment_skips_unresolved_invalid_depth_without_starving_healthy_rows
     monkeypatch.setattr(workers, "WORKERS", {1: worker})
     monkeypatch.setattr(workers, "load_state", lambda: {})
     monkeypatch.setattr(state, "budget_remaining", lambda *_args, **_kwargs: 100.0)
-    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": None)
+    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": True)
     monkeypatch.setattr(workers, "_emit_task_done_terminal", lambda *args, **kwargs: True)
     original_terminalize = workers._terminalize_invalid_pending_depth
     terminalization_attempts = []

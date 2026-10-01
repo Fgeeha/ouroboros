@@ -47,6 +47,7 @@ function waitingModel(row) {
 
 function waitLabels(row) {
     const labels = [];
+    if (row.project_admission_hold?.label) labels.push(row.project_admission_hold.label);
     if (waitingModel(row)) labels.push('Waiting for access');
     if (waitingQuestion(row)) labels.push('Waiting for your answer');
     return labels;
@@ -79,9 +80,10 @@ export function summarizeProjectActivities(rows = []) {
         if (!row || typeof row !== 'object') continue;
         // A row whose owner-question detail the census could not read may be
         // blocked on an answer: it stays static unknown rather than moving.
-        if (row._activityUnconfirmed || row.required_question_unavailable === true) { unknown = true; continue; }
+        if (row._activityUnconfirmed || (row.required_question_unavailable === true && !row.project_admission_hold)) { unknown = true; continue; }
         const phase = String(row.phase || '').trim().toLowerCase();
         const rowWaits = waitLabels(row);
+        if (row.project_admission_hold && /^budget_paus(ed|ing)$/.test(phase)) phases.add(phase);
         // A same-row wait supersedes its coarse queue/execution phase.
         if (!rowWaits.length) {
             if (WORKING_PHASES.has(phase) || QUEUED_PHASES.has(phase)) phases.add(phase);

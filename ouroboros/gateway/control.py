@@ -854,6 +854,8 @@ def _start_assisted_merge_fenced(plan: dict, tx: dict) -> JSONResponse:
             + list(plan.get("doc_conflict_paths") or [])
         ),
         "task_id": task_id,
+        # No resolver submitted yet: the first admission of this fresh id is provable.
+        "resolver_submitted_id": "",
         "owner_chat_id": owner_chat_id,
         "resolution_attempts": 0,
         **({"failed_update_ref": prior_attempt_ref} if prior_attempt_ref else {}),
@@ -926,7 +928,7 @@ def _start_assisted_merge_fenced(plan: dict, tx: dict) -> JSONResponse:
     if not enqueue_assisted_resolution_task(tx):
         return _rollback_fenced_update(
             "assisted_worker_start_failed",
-            "the merge was staged but its resolver worker could not start",
+            "the merge was staged but its resolver could not be started or admitted",
         )
     return JSONResponse({"status": "assisted_started", "task_id": task_id, "merge_plan": plan})
 

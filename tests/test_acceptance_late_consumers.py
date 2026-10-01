@@ -20,6 +20,16 @@ from tests.test_review_operation_lifetime import until
 
 @pytest.fixture
 def late(tmp_path, monkeypatch, fresh_sends):
+    # The model transport is synthetic; its budget quote must be offline too.
+    # Cold live catalogue I/O otherwise races the panel's 10s test wait. This
+    # synthetic tariff preserves real budget admission, reservation and settlement.
+    from ouroboros import pricing
+    for name in ("_cached_pricing", "_pricing_fetched_at", "_pricing_retry_after"):
+        monkeypatch.setattr(pricing, name, {})
+    monkeypatch.setattr(pricing, "_pricing_fetch_in_progress", set())
+    monkeypatch.setattr(pricing, "_fetch_live_rows", lambda provider, model="":
+                        {"openai/gpt-4.1-nano": (1.0, 1.0, 1.0, 1.0)}
+                        if provider == "openrouter" and not model else {})
     monkeypatch.setenv('OUROBOROS_TASK_REVIEW_MODE', 'auto')
     monkeypatch.setenv(REVIEWER_SLOTS_ENV, json.dumps({'triad': [
         {'slot_id': str(i), 'route': {'kind': 'api_chat', 'target_id': 'openai/gpt-4.1-nano'}} for i in range(3)],

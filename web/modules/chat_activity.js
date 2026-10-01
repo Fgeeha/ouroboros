@@ -1008,6 +1008,7 @@ export function computeDerivedChatStatus({
     queuedManagedCount = 0,
     pausedManagedCount = 0,
     waitingModelCount = 0,
+    projectWaitLabel = '',
     pendingSubmissionsCount = 0,
     supervisorStarting = false,
 } = {}) {
@@ -1036,6 +1037,7 @@ export function computeDerivedChatStatus({
         // never dress it up as Working or Queued.
         return { kind: 'online', text: 'Paused (budget)', showDots: false };
     }
+    if (projectWaitLabel) return { kind: 'online', text: projectWaitLabel, showDots: false };
     if (supervisorStarting) return { kind: 'starting', text: 'Starting…', showDots: false };
     return { kind: 'online', text: 'Online', showDots: false };
 }
@@ -1044,8 +1046,13 @@ export function computeDerivedChatStatus({
 // cards, where a managed root drives Working… and a direct turn keeps the census verdict (Thinking…).
 export function chatStatusCounts(activities, records, isWaiting = () => false) {
     const counts = { activeDirectCount: 0, activeManagedCount: 0, queuedManagedCount: 0, pausedManagedCount: 0,
-        hasActiveLiveCard: false, waitingModelCount: 0 };
+        hasActiveLiveCard: false, waitingModelCount: 0, projectWaitLabel: '' };
     for (const [id, entry] of activities) {
+        if (entry?.project_admission_hold?.label) {
+            counts.projectWaitLabel = entry.project_admission_hold.label;
+            if (/^budget_paus(ed|ing)$/.test(entry.phase ?? '')) counts.pausedManagedCount += 1;
+            continue;
+        }
         if (isWaiting(id)) continue;
         if (String(entry?.kind || '') !== 'managed_task') counts.activeDirectCount += 1;
         else if (String(entry?.phase || '') === 'queued') counts.queuedManagedCount += 1;
@@ -1054,6 +1061,11 @@ export function chatStatusCounts(activities, records, isWaiting = () => false) {
     }
     for (const record of records) {
         if (!isForegroundLiveCard(record)) continue;
+        if (record.projectHold) {
+            counts.projectWaitLabel ||= record.projectHold;
+            continue;
+        }
+        if (activities.get(record.groupId)?.project_admission_hold) continue;
         if (record.modelWaiting) counts.waitingModelCount += 1;
         else if (!record.direct) counts.hasActiveLiveCard = true;
     }
@@ -1224,6 +1236,7 @@ export function computeHydratedDirectActivities(existingMap, turnsList, chatId, 
             activityId: aid,
             kind: turn.kind || 'direct_chat',
             phase: turn.phase || 'thinking',
+            ...(turn.project_admission_hold ? { project_admission_hold: turn.project_admission_hold } : {}),
             clientMessageId: turn.client_message_id || nextMap.get(aid)?.clientMessageId || '',
         });
     }
@@ -1446,6 +1459,7 @@ export function renderLiveCardMeta(record, { agentModel = record?.agentModel || 
         ...[
             record.initiator === 'consciousness' ? 'Consciousness' : '',
             record.historicalUnavailable ? 'Outcome unavailable' : (record.historicalUnconfirmed ? 'Activity unconfirmed' : ''),
+            !record.finished && record.projectHoldDetail || '',
             record.historyRetentionProblem || '',
             modelExecutionLabel(record.modelExecution),
             Number.isInteger(record.toolCalls) ? `${record.toolCalls} tool ${record.toolCalls === 1 ? "call" : "calls"}` : '',

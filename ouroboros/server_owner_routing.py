@@ -532,10 +532,17 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
         # A refusal is already told by the promote handler's typed System row
         # (host_initiated) plus the receipt under the owner's message.
         return
-    reserved_project = _reserved_project_for_chat(ctx, chat_id)
+    try:
+        reserved_project = _reserved_project_for_chat(ctx, chat_id)
+    except (OSError, ValueError) as exc:
+        _record_routing_receipt(
+            bridge, ctx, chat_id=chat_id, client_message_id=client_message_id,
+            action="project_route", status="project_unavailable",
+            reason="project_routing_fence_lookup_failed", detail=str(exc))
+        return
     project_id = (
         str(reserved_project.get("id") or "")
-        if str((reserved_project or {}).get("lifecycle") or "active") == "active"
+        if reserved_project.get("lifecycle") == "active"
         else ""
     )
     if reserved_project and not project_id:
