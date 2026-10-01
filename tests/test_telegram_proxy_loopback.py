@@ -19,6 +19,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from httpcore._backends.anyio import AnyIOBackend
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -169,7 +170,7 @@ def test_all_telegram_consumers_succeed_through_real_transport(tmp_path, monkeyp
     plugin, _telegram_api, notifier = _load()
     caplog.set_level(logging.DEBUG, logger="httpcore")
     server_tls, client_tls = _tls_contexts(tmp_path)
-    real_client, real_dns, real_connect = httpx.AsyncClient, socket.getaddrinfo, socket.socket.connect
+    real_client, real_dns, real_connect = httpx.AsyncClient, socket.getaddrinfo, AnyIOBackend.connect_tcp
     options = []
     bot = _LoopbackBot()
     def dns(host, port, *args, **kwargs):
@@ -178,18 +179,18 @@ def test_all_telegram_consumers_succeed_through_real_transport(tmp_path, monkeyp
             host, port = "127.0.0.1", bot.origin_port
         assert host in ("127.0.0.1", b"127.0.0.1", "::1", b"::1", None)
         return real_dns(host, port, *args, **kwargs)
-    def connect(sock, address):
-        if isinstance(address, tuple):
-            assert ipaddress.ip_address(address[0]).is_loopback, address
-            if address[1] == 443:
-                # AnyIO keeps the requested port when consuming getaddrinfo.
-                address = (address[0], bot.origin_port, *address[2:])
-        return real_connect(sock, address)
+    async def connect(backend, host, port, *args, **kwargs):
+        # Redirect before the native connection: Windows ConnectEx bypasses
+        # socket.socket.connect, and AnyIO keeps the requested port after DNS.
+        if host in ("api.telegram.org", b"api.telegram.org"):
+            host, port = "127.0.0.1", bot.origin_port
+        assert ipaddress.ip_address(host).is_loopback, (host, port)
+        return await real_connect(backend, host, port, *args, **kwargs)
     def client_factory(**kwargs):
         options.append(dict(kwargs))
         return real_client(verify=client_tls, **kwargs)
     monkeypatch.setattr(socket, "getaddrinfo", dns)
-    monkeypatch.setattr(socket.socket, "connect", connect)
+    monkeypatch.setattr(AnyIOBackend, "connect_tcp", connect)
     monkeypatch.setattr(httpx, "AsyncClient", client_factory)
     monkeypatch.setattr(plugin, "_HONOR_ENV_PROXIES", False)
     # An explicit skill proxy must beat ambient routing; unset stays direct here.
