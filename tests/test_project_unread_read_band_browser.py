@@ -354,7 +354,33 @@ def test_a_room_read_on_one_client_clears_the_dot_on_another_at_its_next_state_r
     with sync_playwright() as pw:
         browser = getattr(pw, engine).launch()
         try:
-            other, other_row = _client(browser, direct_server_with_data["url"], "shared-room", other_acks)
+            # Control cursor reads from navigation onward, then settle startup
+            # reads before the ACK so only a later refresh can clear the dot.
+            hold_preferences = """() => {
+                const fetch = window.fetch.bind(window);
+                window.__holdPreferences = true;
+                window.__pendingPreferences = [];
+                window.__settledPreferences = 0;
+                window.fetch = async (input, init) => {
+                    const url = new URL(typeof input === 'string' ? input : input.url, location.href);
+                    if (url.pathname === '/api/ui/preferences' && (!init?.method || init.method === 'GET')
+                            && window.__holdPreferences) {
+                        await new Promise(resolve => window.__pendingPreferences.push(resolve));
+                        try { return await fetch(input, init); } finally { window.__settledPreferences += 1; }
+                    }
+                    return fetch(input, init);
+                };
+            }"""
+            other, other_row = _client(browser, direct_server_with_data["url"], "shared-room", other_acks,
+                                       init=(hold_preferences,))
+            # Keep the barrier armed after draining the initial page-load reads.
+            released = other.evaluate("""() => {
+                const held = window.__pendingPreferences.splice(0);
+                held.forEach(resolve => resolve());
+                return held.length;
+            }""")
+            assert released >= 1, "the initial preferences read must settle before the room is read"
+            other.wait_for_function("n => window.__settledPreferences >= n", arg=released)
             reader, row = _client(browser, direct_server_with_data["url"], "shared-room", reader_acks)
             row.evaluate("el => el.click()")
             reader.locator(PANEL).locator(".chat-bubble").filter(has_text="Reply 3").wait_for(state="attached")
@@ -364,6 +390,11 @@ def test_a_room_read_on_one_client_clears_the_dot_on_another_at_its_next_state_r
             row.locator(".nav-unread-dot").wait_for(state="detached")
             assert other_row.locator(".nav-unread-dot").count() == 1, "the other client has not refreshed yet"
             _emit_ws_frame(other, {"type": "projects_changed"})
+            other.wait_for_function("() => window.__pendingPreferences.length > 0")
+            other.evaluate("""() => {
+                window.__holdPreferences = false;
+                window.__pendingPreferences.splice(0).forEach(resolve => resolve());
+            }""")
             other_row.locator(".nav-unread-dot").wait_for(state="detached")
             other.screenshot(path=str(evidence / f"read-band-{engine}-other-client.png"))
             assert [ack for ack in other_acks if ack.get("project_seen_revision")] == [], \
