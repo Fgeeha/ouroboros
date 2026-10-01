@@ -195,6 +195,10 @@ def run_chat_viewport_smoke(
                 if after["remaining"] <= 1:
                     break
             finally:
+                if evidence.output_dir is not None:
+                    evidence._attempt("wheel_state", lambda: evidence.details.update(viewport_wheel=page.evaluate(
+                        "() => { const s = window.__viewportWheel; return s ? {seen: s.seen, scrolls: s.scrolls, "
+                        "settled: s.settled, time_ms: performance.now()} : {state: 'unavailable'}; }")))
                 page.evaluate("() => window.__viewportWheel.dispose()")
         page.evaluate(_SETTLE_TWO_FRAMES)
         evidence.checkpoint("read_to_latest:complete")
