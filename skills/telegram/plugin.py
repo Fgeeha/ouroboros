@@ -49,6 +49,14 @@ from .scripts.telegram_settings import (
 # system-wide or a proxy is set; the menu client stays pinned either way.
 _HONOR_ENV_PROXIES = (not in_worker_process()) and env_proxies_configured()
 
+
+def _telegram_client(api) -> TelegramClient:
+    """The Bot API client every bridge path builds: the granted token plus, once the owner
+    sets and grants the TELEGRAM_PROXY secret, that Telegram-only proxy (not the Mini App)."""
+    granted = api.get_settings(["TELEGRAM_BOT_TOKEN", "TELEGRAM_PROXY"])
+    return TelegramClient(granted.get("TELEGRAM_BOT_TOKEN", ""), trust_env=_HONOR_ENV_PROXIES,
+                          proxy=granted.get("TELEGRAM_PROXY"))
+
 _SLASH_COMMAND_RE = re.compile(r"^\s*/[A-Za-z]")
 
 # In strict/safe modes slash commands are still controlled locally. In
@@ -628,9 +636,8 @@ async def _validate_bot(api, client, command_mode: str, lang: str) -> None:
 
 async def _start_poller(api):
     try:
-        protected_settings = api.get_settings(["TELEGRAM_BOT_TOKEN"])
         _settings, pinned_chat, max_updates, command_mode, lang = _poller_preferences(api)
-        client = TelegramClient(protected_settings.get("TELEGRAM_BOT_TOKEN", ""), trust_env=_HONOR_ENV_PROXIES)
+        client = _telegram_client(api)
         offset = _load_offset(api)
         try:
             await _validate_bot(api, client, command_mode, lang)
@@ -1019,9 +1026,8 @@ def _make_poller(api):
 def _make_outbound(api):
     async def handle(event: Dict[str, Any]) -> None:
         try:
-            protected_settings = api.get_settings(["TELEGRAM_BOT_TOKEN"])
             local_settings = _load_settings(api)
-            client = TelegramClient(protected_settings.get("TELEGRAM_BOT_TOKEN", ""), trust_env=_HONOR_ENV_PROXIES)
+            client = _telegram_client(api)
             chat_id = _target_chat(local_settings, event)
             if not chat_id:
                 return
@@ -1113,9 +1119,8 @@ def _make_outbound(api):
 def _make_typing(api):
     async def handle(event: Dict[str, Any]) -> None:
         try:
-            protected_settings = api.get_settings(["TELEGRAM_BOT_TOKEN"])
             local_settings = _load_settings(api)
-            client = TelegramClient(protected_settings.get("TELEGRAM_BOT_TOKEN", ""), trust_env=_HONOR_ENV_PROXIES)
+            client = _telegram_client(api)
             chat_id = _target_chat(local_settings, event)
             if chat_id:
                 await client.send_chat_action(chat_id, "typing")
@@ -1127,9 +1132,8 @@ def _make_typing(api):
 def _make_photo(api):
     async def handle(event: Dict[str, Any]) -> None:
         try:
-            protected_settings = api.get_settings(["TELEGRAM_BOT_TOKEN"])
             local_settings = _load_settings(api)
-            client = TelegramClient(protected_settings.get("TELEGRAM_BOT_TOKEN", ""), trust_env=_HONOR_ENV_PROXIES)
+            client = _telegram_client(api)
             chat_id = _target_chat(local_settings, event)
             image_base64 = str(event.get("image_base64") or "").strip()
             if chat_id and image_base64:
@@ -1150,9 +1154,8 @@ def _make_photo(api):
 def _make_video(api):
     async def handle(event: Dict[str, Any]) -> None:
         try:
-            protected_settings = api.get_settings(["TELEGRAM_BOT_TOKEN"])
             local_settings = _load_settings(api)
-            client = TelegramClient(protected_settings.get("TELEGRAM_BOT_TOKEN", ""), trust_env=_HONOR_ENV_PROXIES)
+            client = _telegram_client(api)
             chat_id = _target_chat(local_settings, event)
             video_base64 = str(event.get("video_base64") or "").strip()
             if chat_id and video_base64:
@@ -1173,9 +1176,8 @@ def _make_document(api):
     async def handle(event: Dict[str, Any]) -> None:
         file_handle = None
         try:
-            protected_settings = api.get_settings(["TELEGRAM_BOT_TOKEN"])
             local_settings = _load_settings(api)
-            client = TelegramClient(protected_settings.get("TELEGRAM_BOT_TOKEN", ""), trust_env=_HONOR_ENV_PROXIES)
+            client = _telegram_client(api)
             chat_id = _target_chat(local_settings, event)
             file_base64 = str(event.get("file_base64") or "").strip()
             file_ref = event.get("file_ref") if isinstance(event.get("file_ref"), dict) else None
@@ -1261,9 +1263,8 @@ def _is_native_audio_document(filename: str, mime: str) -> bool:
 def _make_links(api):
     async def handle(event: Dict[str, Any]) -> None:
         try:
-            protected_settings = api.get_settings(["TELEGRAM_BOT_TOKEN"])
             local_settings = _load_settings(api)
-            client = TelegramClient(protected_settings.get("TELEGRAM_BOT_TOKEN", ""), trust_env=_HONOR_ENV_PROXIES)
+            client = _telegram_client(api)
             chat_id = _target_chat(local_settings, event)
             if not chat_id:
                 return
@@ -1299,9 +1300,8 @@ def _make_links(api):
 def _make_quiz(api):
     async def handle(event: Dict[str, Any]) -> None:
         try:
-            protected_settings = api.get_settings(["TELEGRAM_BOT_TOKEN"])
             local_settings = _load_settings(api)
-            client = TelegramClient(protected_settings.get("TELEGRAM_BOT_TOKEN", ""), trust_env=_HONOR_ENV_PROXIES)
+            client = _telegram_client(api)
             chat_id = _target_chat(local_settings, event)
             if not chat_id:
                 return
@@ -1371,9 +1371,7 @@ def _make_quiz_state(api):
         try:
             await telegram_quiz.follow_lifecycle(
                 api, event, _poller_preferences(api)[4],
-                client_factory=lambda: TelegramClient(
-                    api.get_settings(["TELEGRAM_BOT_TOKEN"]).get("TELEGRAM_BOT_TOKEN", ""),
-                    trust_env=_HONOR_ENV_PROXIES))
+                client_factory=lambda: _telegram_client(api))
         except Exception as exc:
             api.log("error", f"Telegram quiz state error: {exc}")
     return handle
@@ -1401,7 +1399,8 @@ def register(api):
                 {
                     "type": "markdown",
                     "text": (
-                        "Set TELEGRAM_BOT_TOKEN in Settings → Secrets, grant it to this skill, then configure the options below.\n\n"
+                        "Set TELEGRAM_BOT_TOKEN in Settings → Secrets, grant it to this skill, then configure the options below. "
+                        "If Telegram is reachable only through a proxy, also add TELEGRAM_PROXY there (e.g. `socks5://user:password@host:1080`) and grant it; the Mini App keeps direct egress.\n\n"
                         "**Command mode**: controls which slash commands can be sent from Telegram. "
                         "Use `/menu` in Telegram to see available commands as inline buttons.\n\n"
                         "**Mirror mode**: *all* mirrors every chat message (including web UI) to Telegram — requires Chat ID. "

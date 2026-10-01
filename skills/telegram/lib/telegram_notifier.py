@@ -62,8 +62,9 @@ async def _push_notification(
     recovered transition warning (which carries the exception) is the one
     owner-visible line per episode.
     """
-    protected = api.get_settings(["TELEGRAM_BOT_TOKEN"])
-    client = TelegramClient(protected.get("TELEGRAM_BOT_TOKEN", ""), trust_env=trust_env)
+    protected = api.get_settings(["TELEGRAM_BOT_TOKEN", "TELEGRAM_PROXY"])
+    client = TelegramClient(protected.get("TELEGRAM_BOT_TOKEN", ""), trust_env=trust_env,
+                            proxy=protected.get("TELEGRAM_PROXY"))
     try:
         await client.send_message(int(chat_id), text, parse_mode="")
         return "sent", None

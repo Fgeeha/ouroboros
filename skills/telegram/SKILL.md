@@ -1,14 +1,14 @@
 ---
 name: telegram
 description: Owner-only Telegram text bridge and Mini App gateway for the existing Ouroboros interface.
-version: 1.2.8
+version: 1.2.9
 type: extension
 entry: plugin.py
 plugin_api: "2.0"
 runtime: python3
 os: any
 permissions: [net, read_settings, widget, route, supervised_task, subscribe_event, inject_chat, subprocess, companion_process]
-env_from_settings: [TELEGRAM_BOT_TOKEN]
+env_from_settings: [TELEGRAM_BOT_TOKEN, TELEGRAM_PROXY]
 subscribe_events: [chat.outbound, chat.typing, chat.photo, chat.video, chat.document, chat.links, chat.quiz, chat.quiz_state]
 conflicts: [telegram-bridge, telegram-miniapp-poc]
 when_to_use: The owner wants to communicate with and control Ouroboros through Telegram.
@@ -81,6 +81,21 @@ and send the bot a private message to bind the owner. No legacy Telegram skill
 state is copied or changed. Installations that use `telegram-bridge` or
 `telegram-miniapp-poc` must disable or remove those skills before enabling this
 one.
+
+A host that reaches Telegram only through a proxy adds the secret
+`TELEGRAM_PROXY` in Settings → Secrets as `scheme://[user:password@]host[:port]`
+(`socks5`, `socks5h`, `http` or `https`; SOCKS needs an explicit port) and grants it on
+this skill's card. Polling, every reply, media and quiz send, file downloads
+and the notifier then use that proxy instead of any system proxy; nothing else
+in Ouroboros does. The Bot API stays `https://api.telegram.org` with TLS end to
+end, so the proxy sees the host but not the token, messages or files, and no
+redirect is followed. Credentials reach the proxy as its scheme sends them: in
+clear for `http` and SOCKS, inside TLS for `https`. A malformed value stops the
+bridge with an error naming the key, never its value. Without the secret no
+new grant is requested and the previous direct/ambient-proxy behavior remains;
+adding or removing it asks
+for the grants again. The Mini App companion — its tunnel and menu button —
+keeps direct egress and does not use the proxy.
 
 The Mini App supports macOS arm64/x86_64, Linux arm64/x86_64, and Windows
 x86_64. Only the explicit unsupported OS/architecture case degrades

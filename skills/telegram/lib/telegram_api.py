@@ -560,12 +560,44 @@ def _telegram_html_to_plain(value: str) -> str:
     return html_lib.unescape(re.sub(r"<[^>]+>", "", value))
 
 
+def _telegram_proxy(value: Any) -> Optional[str]:
+    """The owner's Telegram-only egress proxy, or None for a direct connection.
+
+    httpx parses the value, so exactly what it would dial is accepted; SOCKS has no
+    default port. The refusal never echoes the value: it may carry proxy credentials.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        url = httpx.Proxy(text).url
+        valid = (
+            url.scheme in ("http", "https", "socks5", "socks5h")
+            and bool(url.host)
+            and (url.port is not None or url.scheme in ("http", "https"))
+            and (url.port is None or 0 < url.port <= 65535)
+            and url.raw_path == b"/" and not url.query and not url.fragment
+        )
+    except Exception:
+        valid = False
+    if not valid:
+        raise ValueError(
+            "TELEGRAM_PROXY must be scheme://[user:password@]host[:port] "
+            "with scheme http, https, socks5 or socks5h (SOCKS requires a port)."
+        )
+    return text
+
+
 class TelegramClient:
-    def __init__(self, token: str, *, trust_env: bool = False):
+    def __init__(self, token: str, *, trust_env: bool = False, proxy: Optional[str] = None):
         self.token = str(token or "").strip()
         self.trust_env = bool(trust_env)
         if not self.token:
             raise ValueError("TELEGRAM_BOT_TOKEN is missing")
+        # An explicit proxy replaces ambient proxies for these calls only. The target stays
+        # https://api.telegram.org, so TLS runs end to end through the tunnel: the proxy
+        # sees the host, never the token-bearing path, and redirects are never followed.
+        self.proxy = _telegram_proxy(proxy)
         self.api_base = f"https://api.telegram.org/bot{self.token}"
         self.file_base = f"https://api.telegram.org/file/bot{self.token}"
 
@@ -575,7 +607,9 @@ class TelegramClient:
         try:
             # trust_env trades ambient-proxy/SSL_CERT isolation for a proxy-routed install's
             # only egress; decided once by the caller via net_transport.env_proxies_configured.
-            async with httpx.AsyncClient(timeout=timeout, trust_env=self.trust_env) as client:
+            async with httpx.AsyncClient(
+                timeout=timeout, trust_env=self.trust_env, proxy=self.proxy, follow_redirects=False,
+            ) as client:
                 response = await client.post(f"{self.api_base}/{method_text}", data=data, files=files)
         except httpx.TimeoutException:
             raise TelegramTransportError(f"Telegram API timed out during {safe_method}.") from None
@@ -621,7 +655,9 @@ class TelegramClient:
 
     async def _download_bytes(self, file_path: str) -> bytes:
         try:
-            async with httpx.AsyncClient(timeout=30, trust_env=self.trust_env) as client:
+            async with httpx.AsyncClient(
+                timeout=30, trust_env=self.trust_env, proxy=self.proxy, follow_redirects=False,
+            ) as client:
                 async with client.stream("GET", f"{self.file_base}/{file_path}") as response:
                     if response.status_code >= 400:
                         raise RuntimeError(f"Telegram file download returned HTTP {response.status_code}")
