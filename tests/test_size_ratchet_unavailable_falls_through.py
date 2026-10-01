@@ -24,6 +24,8 @@ from ouroboros.review import (
     validate_size_ratchet,
 )
 
+pytestmark = pytest.mark.serial
+
 
 # --- shared helpers ----------------------------------------------------------
 
@@ -44,7 +46,7 @@ def _empty_inventory() -> review_mod.SizeRatchetInventory:
 
 @pytest.fixture()
 def real_checkout(tmp_path):
-    """A bare git repository that has NO size-ratchet manifest in HEAD's tree
+    """A temporary Git checkout with NO size-ratchet manifest in HEAD's tree
     (so the validator runs on a bootstrap baseline against the live working
     copy the test writes)."""
     head = tmp_path
@@ -93,9 +95,9 @@ def _write_drift_manifest(checkout: pathlib.Path) -> None:
 # --- test 1 ------------------------------------------------------------------
 
 def test_validate_size_ratchet_parent_ref_unavailable_returns_findings(monkeypatch, real_checkout):
-    """A parent ref's gated-source blob is not in the local object store (simulated
-    via a monkey-patched cat-file --batch missing header).
-    ``validate_size_ratchet`` must NOT raise and must treat ``previous`` as
+    """A committed parent manifest that cannot be parsed as the current schema.
+    ``validate_size_ratchet`` must NOT raise; it keeps the live-tree findings
+    and adds a ``partial:`` finding instead of treating ``previous`` as a
     bootstrap.
     """
     _write_drift_manifest(real_checkout)
@@ -107,8 +109,8 @@ def test_validate_size_ratchet_parent_ref_unavailable_returns_findings(monkeypat
         # A parent whose manifest text parses as Python but is NOT a valid
         # size-ratchet manifest (pre-v6.114 assignment set / truncated history
         # after a managed-update fetch). parse_size_ratchet_manifest raises a
-        # bare ValueError for this; the fix's ``except ValueError`` must swallow
-        # it, leave ``previous`` as None, and validate the live tree only.
+        # bare ValueError for this; the validator must keep the live-tree
+        # findings and name the unchecked transition, never bootstrap.
         return "SOME_UNEXPECTED_ASSIGNMENT = 1\n"
 
     monkeypatch.setattr(review_mod, "collect_size_ratchet_inventory", fake_collect_inventory)
@@ -117,8 +119,10 @@ def test_validate_size_ratchet_parent_ref_unavailable_returns_findings(monkeypat
     findings = validate_size_ratchet(real_checkout)
     assert isinstance(findings, list)
     assert all(isinstance(line, str) for line in findings)
-    # bootstrap fall-through still surfaces the on-disk drift
+    # the live-tree comparison still surfaces the on-disk drift
     assert f"GIANT_PATHS contains stale entry: '{_DRIFT_PATH}'" in findings
+    assert findings[-1].startswith("partial: committed size-ratchet manifest unavailable (ValueError: ")
+    assert findings[-1].endswith("; not checked: shrink-only transition and staged index")
 
 
 # --- test 2 ------------------------------------------------------------------
@@ -126,7 +130,7 @@ def test_validate_size_ratchet_parent_ref_unavailable_returns_findings(monkeypat
 def test_validate_size_ratchet_staged_index_without_manifest_does_not_raise(monkeypatch, real_checkout):
     """A private ``GIT_INDEX_FILE`` (or otherwise empty) staged index does not
     cause ``validate_size_ratchet`` to raise — live-tree validation must
-    succeed.
+    succeed and the unchecked staged comparison is named.
     """
     _write_drift_manifest(real_checkout)
 
@@ -146,6 +150,8 @@ def test_validate_size_ratchet_staged_index_without_manifest_does_not_raise(monk
     findings = validate_size_ratchet(real_checkout)
     assert isinstance(findings, list)
     assert all(isinstance(line, str) for line in findings)
+    assert f"GIANT_PATHS contains stale entry: '{_DRIFT_PATH}'" in findings
+    assert findings[-1].startswith("partial: staged index tree unavailable (SizeRatchetRefUnavailable: ")
 
 
 # --- test 3 ------------------------------------------------------------------

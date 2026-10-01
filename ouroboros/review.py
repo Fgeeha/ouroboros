@@ -375,13 +375,13 @@ def _git_source_snapshot(repo_dir: pathlib.Path, ref: str) -> Iterator[tuple[pat
             if header_end < 0:
                 raise ValueError(f"git cat-file omitted the header for {path} at {ref}")
             header = batch[cursor:header_end].split(b" ")
-            if len(header) != 3 or header[0] != expected_id:
-                raise ValueError(f"git cat-file returned a malformed header for {path} at {ref}")
-            if header[1] == b"missing":
+            if header == [expected_id, b"missing"]:
                 raise SizeRatchetRefUnavailable(
                     f"git cat-file: object {expected_id.decode('ascii', errors='replace')} "
                     f"for {path} at {ref} is not in the local object store"
                 )
+            if len(header) != 3 or header[0] != expected_id:
+                raise ValueError(f"git cat-file returned a malformed header for {path} at {ref}")
             if header[1] != b"blob":
                 raise ValueError(
                     f"git cat-file returned a non-blob object for {path} at {ref}: {header[1]!r}"
@@ -673,6 +673,7 @@ def _bootstrap_baseline_errors(
 
 
 def _git_show_manifest(repo_dir: pathlib.Path, ref: str, manifest_path: str) -> str | None:
+    """Return None only when a readable tree lacks the manifest, never on a read failure."""
     result = subprocess.run(
         ["git", "show", f"{ref}:{manifest_path}"],
         cwd=repo_dir,
@@ -680,7 +681,19 @@ def _git_show_manifest(repo_dir: pathlib.Path, ref: str, manifest_path: str) -> 
         capture_output=True,
         text=True,
     )
-    return result.stdout if result.returncode == 0 else None
+    if result.returncode == 0:
+        return result.stdout
+    listed = subprocess.run(
+        ["git", "ls-tree", "--name-only", ref, "--", manifest_path],
+        cwd=repo_dir, check=False, capture_output=True, text=True,
+    )
+    if listed.returncode == 0 and not listed.stdout.strip():
+        return None
+    detail = (listed.stderr if listed.returncode else result.stderr).strip().splitlines()
+    raise SizeRatchetRefUnavailable(
+        f"size-ratchet comparison ref {ref} is unavailable in this checkout: "
+        f"{detail[0] if detail else 'git show failed'}"
+    )
 
 
 def _staged_manifest_inventory(
@@ -695,21 +708,23 @@ def _staged_manifest_inventory(
     try:
         staged = parse_size_ratchet_manifest(staged_text)
         inventory = collect_size_ratchet_inventory_at_ref(repo_dir, index_tree)
-    except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+    except SizeRatchetRefUnavailable:
+        raise
+    except ValueError as exc:
         raise ValueError(f"staged: {exc}") from exc
     return staged_text, staged, inventory
 
 
 def _commit_parents(repo_dir: pathlib.Path, commit: str) -> list[str]:
-    """Exact parent SHAs of ``commit`` in parent order (empty for a root commit)."""
-    listed = subprocess.run(
-        ["git", "rev-list", "--parents", "-n", "1", commit],
+    """Read exact parents from the object: a shallow history walk hides them."""
+    raw = subprocess.run(
+        ["git", "cat-file", "commit", commit],
         cwd=repo_dir,
         check=True,
         capture_output=True,
-        text=True,
-    ).stdout.split()
-    return listed[1:]
+    ).stdout
+    header = raw.split(b"\n\n", 1)[0].split(b"\n")
+    return [line[len(b"parent "):].decode("ascii") for line in header if line.startswith(b"parent ")]
 
 
 def resolve_committed_manifest_text(
@@ -725,7 +740,8 @@ def resolve_committed_manifest_text(
     first-parent history replay. ``None`` means no committed manifest exists on
     ``HEAD`` or any of its parents: a bootstrap, accepted from the current tree
     (interval archaeology is an owner-accepted tradeoff — the official
-    repository CI enforces the pairwise base-vs-tip transition instead).
+    repository CI enforces the pairwise base-vs-tip transition instead). An
+    unreadable ``HEAD`` or parent raises: only absence authorizes a bootstrap.
     """
     root = pathlib.Path(repo_dir).resolve()
     head = subprocess.run(
@@ -775,6 +791,15 @@ def _staged_tree_without_index_lock(root: pathlib.Path) -> str:
         ).stdout.strip()
 
 
+def _partial_finding(comparison: str, exc: Exception, unchecked: str) -> str:
+    """Name the unreadable comparison and the checks it prevented."""
+    stderr = getattr(exc, "stderr", None) or ""
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode("utf-8", "replace")
+    detail = next(iter(stderr.strip().splitlines()), str(exc))
+    return f"partial: {comparison} unavailable ({type(exc).__name__}: {detail}); not checked: {unchecked}"
+
+
 def _validate_manifest_candidate(
     root: pathlib.Path,
     current_text: str,
@@ -788,26 +813,15 @@ def _validate_manifest_candidate(
     inventory = inventory if inventory is not None else collect_size_ratchet_inventory(root)
     errors = _manifest_inventory_errors(current, inventory)
 
-    previous_text = resolve_committed_manifest_text(root, manifest_path=manifest_path)
-    previous: SizeRatchetManifest | None = None
-    if previous_text is not None:
-        try:
-            previous = parse_size_ratchet_manifest(previous_text)
-        except ValueError:
-            # A committed parent is unparseable: pre-schema assignment set (e.g.
-            # a pre-v6.114 manifest format), truncated history after a managed
-            # update, or its gated-source objects are not in the local store.
-            # The current manifest already parsed cleanly; treat the unparseable
-            # parent as "no committed authority" and validate the live tree only
-            # rather than letting the bare ValueError propagate to the advisory
-            # lane's broad ``except Exception`` and disable the whole validator.
-            #
-            # NOTE: parse_size_ratchet_manifest raises bare ``ValueError`` for
-            # every malformed-input class. SizeRatchetRefUnavailable is only
-            # raised by _git_source_snapshot's cat-file --batch path (a subclass
-            # of ValueError, so it is caught here too); a separate arm would be
-            # dead code.
-            pass
+    try:
+        previous_text = resolve_committed_manifest_text(root, manifest_path=manifest_path)
+        previous = parse_size_ratchet_manifest(previous_text) if previous_text is not None else None
+    except (OSError, SyntaxError, ValueError, subprocess.CalledProcessError) as exc:
+        # Unreadable or unparseable is not absent. Keep the live exactness
+        # findings without allowing an unknown authority to authorize growth.
+        unchecked = "shrink-only transition" + (" and staged index" if include_staged else "")
+        errors.append(_partial_finding("committed size-ratchet manifest", exc, unchecked))
+        return errors
     if previous is None:
         errors.extend(f"bootstrap: {error}" for error in _bootstrap_baseline_errors(current, inventory))
     elif current_text != previous_text:
@@ -820,28 +834,18 @@ def _validate_manifest_candidate(
         head_tree = subprocess.run(
             ["git", "rev-parse", "HEAD^{tree}"], cwd=root, check=True, capture_output=True, text=True
         ).stdout.strip()
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        # HEAD's tree is unresolvable in this checkout — skip the staged checks
-        # and return the live-tree findings rather than disabling the validator.
-        return errors
-    try:
         index_tree = _staged_tree_without_index_lock(root)
-    except (OSError, FileNotFoundError, subprocess.CalledProcessError, SizeRatchetRefUnavailable):
-        # A private ``GIT_INDEX_FILE`` staging gap (or a worktree layout the
-        # helper does not recognize) cannot produce a stable staged tree id.
-        # A bare ``ValueError`` here is NOT swallowed — it is a real integrity
-        # signal and must reach the caller.
+    except (OSError, subprocess.CalledProcessError, SizeRatchetRefUnavailable) as exc:
+        errors.append(_partial_finding("staged index tree", exc, "staged exactness and transition"))
         return errors
     if index_tree == head_tree:
         return errors
     try:
         staged_text, staged, staged_inventory = _staged_manifest_inventory(root, index_tree, manifest_path)
-    except (OSError, FileNotFoundError, subprocess.CalledProcessError, SizeRatchetRefUnavailable):
-        # The staged ref's gated-source blobs are not in the local object store;
-        # fall through with the live-tree findings rather than disabling the
-        # whole validator. A bare ``ValueError`` (malformed manifest text, a
-        # staged gated source that is not a regular file, a truncated blob) is a
-        # genuine finding and still propagates.
+    except (OSError, subprocess.CalledProcessError, SizeRatchetRefUnavailable) as exc:
+        # Malformed staged content still raises; unavailable objects retain
+        # the findings already collected and explicitly disclose the gap.
+        errors.append(_partial_finding("staged index inventory", exc, "staged exactness and transition"))
         return errors
     if staged_text is None:
         if previous is None:
@@ -876,6 +880,11 @@ def validate_size_ratchet(
     resolves from ``HEAD`` or any of its parents, and a checkout with no
     committed manifest anywhere bootstraps from its own tree — a locally
     evolved fork is never trapped by structural debt it inherited.
+
+    An unreadable or unparseable committed authority, or an unavailable staged
+    tree/inventory, retains the live findings plus a ``partial:`` finding naming
+    the unchecked comparisons. It never becomes an empty PASS or a bootstrap.
+    Malformed live or staged candidate content still raises.
     """
     root = pathlib.Path(repo_dir).resolve()
     current_path = root.joinpath(*pathlib.PurePosixPath(manifest_path).parts)
@@ -920,7 +929,9 @@ def validate_size_ratchet_transition_against_base(
     first adoption re-runs with a post-adoption base); empty/unresolvable
     (force-push loss) degrades to HEAD's parent whose manifest is first
     validated against the parent's own tree (fabricated bases are refused);
-    no parent manifest at all = bootstrap, transition skipped."""
+    no parent manifest at all = bootstrap, transition skipped. An unreadable
+    tip, base or parent raises rather than passing as absent; unavailable
+    parent inventory produces a failing finding, never a false PASS."""
     root = pathlib.Path(repo_dir).resolve()
     tip_text = _git_show_manifest(root, "HEAD", manifest_path)
     if tip_text is None:
