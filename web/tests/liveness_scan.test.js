@@ -110,7 +110,11 @@ test('chat.js hands the card projection to the selector inside hydrateDirectActi
     // The scan precedes the retry loop so a freshly observed id is not double-read
     // (reconcileMissingManagedTask dedupes on managedTaskDetailReads anyway).
     assert.ok(fn.indexOf('unconfirmedForegroundCardIds(') < fn.indexOf('for (const taskId of missingManagedTaskIds)'));
-    assert.match(fn.slice(fn.lastIndexOf('missingManagedTaskIds')), /syncChatStatus\(\);/);
+    // Snapshot hydration owns the one final header sync for both census shapes.
+    const snapshot = chatSource.slice(chatSource.indexOf('function hydrateStateSnapshot('),
+        chatSource.indexOf('async function refreshHeaderControlState('));
+    assert.ok(snapshot.indexOf('hydrateDirectActivities(') < snapshot.lastIndexOf('syncChatStatus();'));
+    assert.match(snapshot, /syncChatStatus\(\);/);
 });
 
 test('the replay batch no longer bypasses the status reducer', () => {

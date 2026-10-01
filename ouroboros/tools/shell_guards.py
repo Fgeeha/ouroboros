@@ -694,18 +694,18 @@ def _secret_runtime_data_mentions(
     work_dir: pathlib.Path,
     allowed_roots: List[pathlib.Path] | None = None,
 ) -> List[str]:
-    """Inspect the physical owner/control bindings used by file reads.
+    """Inspect the retained runtime-control bindings for command policy.
 
     Task roots are ordinary content, not a credential store inferred from a
     filename. An alias to actual owner state still resolves to that state.
     """
-    from ouroboros.tools.core_secret_paths import _is_subagent_secret_repo_target
+    from ouroboros.tools.core_secret_paths import is_runtime_secret_target
 
     drive = pathlib.Path(drive_root).resolve(strict=False)
     return [text for text in runtime_data_write_targets(
         raw_cmd, drive_root=drive, work_dir=work_dir,
         allowed_roots=list(allowed_roots or []),
-    ) if _is_subagent_secret_repo_target(pathlib.Path(text), drive, data_root=drive)]
+    ) if is_runtime_secret_target(pathlib.Path(text), drive, data_root=drive)]
 
 
 def _project_store_runtime_data_mentions(

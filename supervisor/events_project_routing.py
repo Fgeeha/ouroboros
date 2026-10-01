@@ -282,10 +282,16 @@ def _persist_promote_rejection(
     reason = str(outcome.get("reason") or "admission_rejected")
     if reason == "task_id_lookup_failed":
         return  # preserve the unreadable exact-id authority byte-for-byte
-    write_task_result(
+    from supervisor.task_admission import persist_never_admitted_refusal
+
+    never_admitted = bool(outcome.get("never_admitted") and status == "rejected")
+    cleanup_manifest = outcome.pop("_admission_cleanup_manifest", None)
+    write_refusal = persist_never_admitted_refusal if never_admitted else write_task_result
+    write_refusal(
         ctx.DRIVE_ROOT,
         task_id,
-        STATUS_FAILED,
+        **({"admission_token": str(evt.get("routing_token") or "")}
+           if never_admitted else {"status": STATUS_FAILED}),
         reason_code=reason,
         project_id=str(evt.get("project_id") or ""),
         description=str(evt.get("objective") or ""),
@@ -305,6 +311,15 @@ def _persist_promote_rejection(
             f"{str(outcome.get('detail') or '')}"
         ).strip(),
     )
+    if never_admitted:
+        from ouroboros.artifacts import remove_staged_attachments
+        from ouroboros.headless import remove_subagent_task_drive
+        from supervisor.queue import task_settlement_interlock, task_settlement_liveness
+
+        if cleanup_manifest:
+            remove_staged_attachments(cleanup_manifest)
+        remove_subagent_task_drive(ctx.DRIVE_ROOT, task_id, live=task_settlement_liveness,
+                                   guard=task_settlement_interlock, admission_rollback=True)
 
 
 def _prepare_promote_source_off_loop(evt: Dict[str, Any], ctx: Any) -> None:
@@ -314,12 +329,15 @@ def _prepare_promote_source_off_loop(evt: Dict[str, Any], ctx: Any) -> None:
     try:
         from ouroboros.promotion_source import resolve_promote_source
 
+        source_basis = {}
         folder, note, error, project_id, source_created = resolve_promote_source(
             ctx,
             str(evt.get("source") or ""),
             str(evt.get("project_id") or ""),
-            project_name=str(evt.get("project_name") or ""),
+            project_name=str(evt.get("project_name") or ""), admission_basis_out=source_basis,
         )
+        if source_basis:
+            continuation["_project_admission"] = source_basis
         continuation["project_id"] = project_id
         continuation["_source_note"] = note
         continuation["_source_error"] = error
@@ -422,6 +440,8 @@ def _promote_chat_to_task_outcome(evt: Dict[str, Any], ctx: Any) -> Dict[str, An
                 "task_id": task_id,
                 "reservation_owned": False,
             }
+            if blocked["reason"] in {"worker_pool_unavailable", "worker_pool_state_unavailable"}:
+                blocked["never_admitted"] = True
             if blocked["reason"] != "duplicate_task_id" or _own_emitted_stub(ctx, task_id, routing_token):
                 _persist_promote_rejection(ctx, evt, blocked)
             _emit_routing_receipt(
@@ -459,6 +479,7 @@ def _promote_chat_to_task_outcome(evt: Dict[str, Any], ctx: Any) -> Dict[str, An
             outcome = {
                 "status": "needs_manual_target",
                 "reason": "project_source_error",
+                "never_admitted": True,
                 "detail": source_error,
                 "task_id": task_id,
                 "reservation_owned": True,
@@ -470,6 +491,7 @@ def _promote_chat_to_task_outcome(evt: Dict[str, Any], ctx: Any) -> Dict[str, An
             outcome = {
                 "status": "needs_manual_target",
                 "reason": "worker_pool_unavailable",
+                "never_admitted": True,
                 "worker_pool_disabled_reason": str(pool_state.get("disabled_reason") or ""),
                 "task_id": task_id,
             }
@@ -506,6 +528,7 @@ def _promote_chat_to_task_outcome(evt: Dict[str, Any], ctx: Any) -> Dict[str, An
                 root_task_id=str(outcome.get("task_id") or task_id),
                 delegation_role="root",
                 task_contract=admitted_task_contract,
+                **{k: v for k, v in outcome.items() if k == "_project_admission"},
                 project_id=str(outcome.get("project_id") or evt.get("project_id") or ""),
                 description=str(evt.get("objective") or ""),
                 expected_output=str(evt.get("expected_output") or ""),
@@ -580,6 +603,12 @@ def _promote_chat_to_task_outcome(evt: Dict[str, Any], ctx: Any) -> Dict[str, An
                 log.warning("Failed to record admitted promote %s", task_id, exc_info=True)
             return outcome
 
+        if outcome.get("admission_started"):
+            outcome["status"] = "unconfirmed"
+            _emit_routing_receipt(ctx, evt, action=receipt_action, target=task_id,
+                                  status="unconfirmed", reason=str(outcome.get("reason") or ""),
+                                  detail="Admission persistence is unconfirmed; task resources were retained.")
+            return outcome
         _rollback_promoted_pending(
             ctx,
             str(outcome.get("task_id") or task_id),
@@ -587,7 +616,7 @@ def _promote_chat_to_task_outcome(evt: Dict[str, Any], ctx: Any) -> Dict[str, An
             reason="promote_chat_to_task_rejected",
         )
         supervisor_queue.release_task_admission(task_id, routing_token)
-        if (str(outcome.get("reason") or "") != "attachment_admission_rejected"
+        if (outcome.get("never_admitted") or str(outcome.get("reason") or "") != "attachment_admission_rejected"
                 or _own_emitted_stub(ctx, task_id, routing_token)):
             _persist_promote_rejection(ctx, evt, outcome)
         _emit_routing_receipt(
@@ -616,25 +645,21 @@ def _promote_chat_to_task_outcome(evt: Dict[str, Any], ctx: Any) -> Dict[str, An
         return outcome
     except Exception as exc:
         log.warning("promote_chat_to_task event failed", exc_info=True)
-        _rollback_promoted_pending(
-            ctx, task_id, routing_token, reason="promote_chat_to_task_failed",
-        )
-        try:
-            from supervisor import queue as supervisor_queue
+        # May have persisted or executed: never terminalize/clean an uncertain
+        # attempt. A late exception after the scheduled receipt can be read back.
+        from ouroboros.task_results import load_task_result
 
-            supervisor_queue.release_task_admission(task_id, routing_token)
+        try:
+            stored = load_task_result(ctx.DRIVE_ROOT, task_id, strict=True) or {}
+            admission = stored.get("promotion_admission") or {}
+            if admission.get("routing_token") == routing_token and admission.get("status") == "scheduled":
+                return {"status": "scheduled", "task_id": task_id, "replayed": True}
         except Exception:
-            pass
+            log.warning("Promotion receipt readback unavailable for %s", task_id, exc_info=True)
         failed_outcome = {
-            "status": "unconfirmed",
-            "reason": "promotion_persistence_failed",
-            "task_id": task_id,
+            "status": "unconfirmed", "reason": "promotion_persistence_failed", "task_id": task_id,
             "detail": f"{type(exc).__name__}: {exc}",
         }
-        try:
-            _persist_promote_rejection(ctx, evt, failed_outcome, status="unconfirmed")
-        except Exception:
-            log.warning("Failed to persist promote failure for %s", task_id, exc_info=True)
         _emit_routing_receipt(
             ctx,
             evt,

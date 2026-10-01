@@ -402,3 +402,19 @@ def test_editbench_counts_each_logical_call_once(tmp_path):
     metrics = _mine_metrics(tmp_path, "t")
     # ok + unknown + waited + late + legacy; the two waits ended and the legacy row erred.
     assert metrics["tool_calls"] == {"read_file": 5} and metrics["tool_errors"] == {"read_file": 3}
+
+
+def test_completion_receipts_replay_host_facts_without_hiding_errors(tmp_path):
+    from ouroboros.tool_call_log import replay_evidence
+
+    rows = [
+        _log_row("tool_call_started", "completed", tool="finish_task", completion_control=True),
+        _log_row("tool_call", "completed", tool="finish_task", completion_control=True, is_error=False),
+        _log_row("tool_call", "failed", tool="presence_finish", completion_control=True, is_error=True),
+        _log_row("tool_call", "review", tool="task_acceptance_review", is_error=False),
+    ]
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "tools.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    evidence = replay_evidence(tmp_path, "t")
+    assert [(row["receipt"], row["status"]) for row in evidence["observations"]] == [
+        (True, "unknown"), (True, "ok"), (True, "error"), (False, "ok")]

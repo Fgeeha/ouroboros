@@ -100,25 +100,42 @@ def _reject_schedule_task(
     persist_result: bool = True,
 ) -> None:
     """Clean up and notify a rejection, preserving an existing result when asked."""
-    _cleanup_rejected_worktree(tid, result_fields)
     log.warning("Rejecting scheduled task %s: %s", tid, detail)
     write_fields = {**result_fields, **(extra_fields or {})}
+    never_admitted = write_fields.get("admission_outcome") == "never_admitted"
+    refusal_confirmed = False
+    if persist_result and not never_admitted:
+        _cleanup_rejected_worktree(tid, result_fields)
     if reason_code:
         write_fields["reason_code"] = reason_code
     if persist_result:
         try:
-            write_task_result(
+            from supervisor.task_admission import persist_never_admitted_refusal
+
+            write_refusal = persist_never_admitted_refusal if never_admitted else write_task_result
+            write_refusal(
                 ctx.DRIVE_ROOT,
                 tid,
-                status,
+                **({} if never_admitted else {"status": status}),
                 **write_fields,
                 result=detail,
                 # ABI-3: a rejected schedule spent a confirmed zero — stamped
                 # under the honest name (the retired alias is read-only).
                 accounted_upper_bound_usd=0.0,
             )
+            refusal_confirmed = True
         except Exception:
             log.warning("Failed to persist schedule rejection for %s", tid, exc_info=True)
+    if refusal_confirmed and never_admitted:
+        _cleanup_rejected_worktree(tid, result_fields)
+        try:
+            from ouroboros.headless import remove_subagent_task_drive
+            from supervisor.queue import task_settlement_interlock, task_settlement_liveness
+
+            remove_subagent_task_drive(ctx.DRIVE_ROOT, tid, live=task_settlement_liveness,
+                                       guard=task_settlement_interlock, admission_rollback=True)
+        except Exception:
+            log.warning("Refused child drive cleanup deferred for %s", tid, exc_info=True)
     # A torn-down notification bus must not escape into the supervisor loop.
     try:
         if chat_id is not None:
@@ -211,11 +228,41 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
     workspace_root = str(evt.get("workspace_root") or "").strip()
     workspace_mode = str(evt.get("workspace_mode") or "").strip()
     project_id = str(evt.get("project_id") or "").strip()
+    project_basis = None
+    if project_id:
+        from ouroboros.projects_registry import project_admission_view, project_binding_for_task, validate_project_admission
+
+        try:
+            parent = (getattr(ctx, "RUNNING", {}).get(str(parent_id)) or {}).get("task") or {}
+            inherited_basis = parent.get("_project_admission")
+            if "_project_admission" in parent:
+                validate_project_admission(inherited_basis)
+            binding = project_binding_for_task(ctx.DRIVE_ROOT, root_task_id, strict=True) or {}
+            project_basis = (dict(inherited_basis) if isinstance(inherited_basis, dict)
+                             and inherited_basis.get("project_id") == project_id else
+                             project_admission_view(ctx.DRIVE_ROOT, project_id,
+                                                    allow_unregistered=binding.get("project_id") != project_id,
+                                                    frozen=True))
+        except (OSError, ValueError, RuntimeError) as exc:
+            _reject_schedule_task(
+                ctx, tid=tid, chat_id=chat_id, delegation_role=delegation_role,
+                parent_id=parent_id, root_task_id=root_task_id, role=role,
+                result_fields={"project_id": project_id, "child_drive_root": child_drive_root},
+                detail=f"Task not scheduled: Project state could not be checked: {exc}",
+                reason_code=getattr(exc, "reason", "project_routing_fence_lookup_failed"),
+                extra_fields={"admission_outcome": "never_admitted"})
+            return
     acting_reject_detail = ""
     if delegation_role == "subagent":
         task_constraint, workspace_root, workspace_mode, acting_reject_detail = _resolve_subagent_constraint(
             ctx, tid=tid, requested_constraint=task_constraint, workspace_root=workspace_root,
             workspace_mode=workspace_mode, base_sha=str(evt.get("base_sha") or ""), parent_task_id=str(parent_id or ""))
+    workspace_copy = {}
+    if (not acting_reject_detail and isinstance(task_constraint, dict)
+            and task_constraint.get("surface") == "self_worktree"):
+        from ouroboros.workspace_copies import admitted_copy_metadata
+
+        workspace_copy = admitted_copy_metadata(workspace_root)
     allowed_resources = normalize_allowed_resources(evt.get("allowed_resources") or {})
     task_contract = evt.get("task_contract") if isinstance(evt.get("task_contract"), dict) else build_task_contract({
         "id": tid,
@@ -232,6 +279,9 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
         "session_id": session_id,
         "delegation_role": delegation_role,
     })
+    if delegation_role == "subagent" and not acting_reject_detail:
+        task_contract = {**task_contract, "workspace": {
+            **task_contract.get("workspace", {}), "root": workspace_root, "mode": workspace_mode}}
     live_max_depth = _events().get_max_subagent_depth()
     max_depth = admitted_depth_cap(task_contract, live_max_depth)
     task_contract, depth_provenance = stamp_depth_provenance(
@@ -254,6 +304,8 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
         "context": task_context,
         "workspace_root": workspace_root,
         "workspace_mode": workspace_mode, "project_id": project_id,
+        "parent_workspace": evt.get("parent_workspace"),
+        **({"workspace_copy": workspace_copy} if workspace_copy else {}),
         **{key: evt[key] for key in ("directory_strategy", "scope_paths") if key in evt},
         "allowed_resources": allowed_resources,
         "task_contract": task_contract,
@@ -507,6 +559,8 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
             "task_constraint": task_constraint,
             "workspace_root": workspace_root,
             "workspace_mode": workspace_mode,
+            "parent_workspace": evt.get("parent_workspace"),
+            **({"workspace_copy": workspace_copy} if workspace_copy else {}),
             **{key: evt[key] for key in ("directory_strategy", "scope_paths") if key in evt},
             "project_id": project_id,
             "allowed_resources": allowed_resources,
@@ -528,6 +582,8 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
             **({"presence_binding_authority": evt["presence_binding_authority"]}
                if "presence_binding_authority" in evt else {}),
         })
+        if project_basis is not None:
+            task["_project_admission"] = project_basis
         scheduled_failure_reason = ""
         scheduled_failure_detail = ""
         persist_scheduled_failure = False
@@ -566,6 +622,10 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
                     admitted, project_id=project_id, root_task_id=root_task_id,
                 ),
             )
+            return
+        if isinstance(admitted, dict) and admitted.get("_admission_uncertain"):
+            ctx.persist_queue_snapshot(reason="schedule_subagent_receipt_unconfirmed")
+            log.warning("%s: %s", tid, admitted["_admission_uncertain"])
             return
         if scheduled_failure_reason:
             if scheduled_failure_reason == "scheduled_event_replay":

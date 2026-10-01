@@ -31,7 +31,8 @@ def _settled(row: dict) -> bool:
     re-runs), so it owes no terminal projection even when an earlier release already recorded readiness."""
     from ouroboros.task_status import SETTLED_STATUSES
 
-    return row.get("status") in SETTLED_STATUSES and not is_reconciled_presence_placeholder(row)
+    return (row.get("status") in SETTLED_STATUSES and not is_reconciled_presence_placeholder(row)
+            and row.get("admission_outcome") != "never_admitted")
 
 
 def _lineage(tid: str, row: dict) -> dict:
@@ -42,12 +43,8 @@ def _lineage(tid: str, row: dict) -> dict:
     })
 
 
-def _attempt(row: dict) -> dict:
-    # An obligation token distinguishes two publications even when old records
-    # lack attempt metadata. These facts additionally fence same-id retries.
-    metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
-    return {**{key: row.get(key) for key in ("task_attempt", "_attempt", "started_at")},
-            "metadata_attempt": metadata.get("attempt"), "metadata_task_attempt": metadata.get("task_attempt")}
+# Shared with the executor occurrence fact and wake's publication witness.
+from ouroboros.terminal_time import task_attempt_witness as _attempt, terminal_time_fact
 
 
 def _witness(row: dict) -> dict:
@@ -106,7 +103,8 @@ def _prepare(root: Any, tid: str, task: dict, event: dict) -> dict:
             chat_id = event.get("chat_id", 0)
         return {"status": current["status"], "canonical_terminal_projection_ready": {
             "summary_id": f"task-terminal:{tid}", "token": uuid.uuid4().hex,
-            "attempt": _attempt(current), "task_done_ts": str(event.get("ts") or current.get("ts") or utc_now_iso()),
+            "attempt": _attempt(current), "task_done_ts": utc_now_iso(),
+            "terminal_time": terminal_time_fact(current),
             "chat_id": int(chat_id or 0),
         }}
 
@@ -137,7 +135,8 @@ def _project_row(tid: str, row: dict, event: dict, ready: dict) -> dict:
     from ouroboros.dialogue_provenance import presence_provenance_fields
 
     result = {
-        "ts": str(ready.get("task_done_ts") or event.get("ts") or row.get("ts") or utc_now_iso()),
+        "ts": utc_now_iso(),
+        "terminal_time": ready.get("terminal_time") or terminal_time_fact(row),
         "direction": "system", "type": "task_summary",
         **presence_provenance_fields(row),  # a presence room labels its terminal row like every other row
         "summary_id": f"task-terminal:{tid}",
@@ -162,7 +161,7 @@ def _project_row(tid: str, row: dict, event: dict, ready: dict) -> dict:
     return result
 
 
-def _already_in_chat(root: Any, row: dict) -> bool:
+def _already_in_chat(root: Any, row: dict) -> dict | None:
     path = pathlib.Path(root) / "logs" / "chat.jsonl"
     # Pin the live inode before enumerating archives: rotation between append
     # and receipt persistence must not turn an existing row into an absence.
@@ -181,8 +180,8 @@ def _already_in_chat(root: Any, row: dict) -> bool:
                     continue
                 if (entry.get("summary_id") == row["summary_id"]
                         and entry.get("terminal_projection_token") == row.get("terminal_projection_token")):
-                    return True
-    return False
+                    return entry
+    return None
 
 
 def _append_project(root: Any, tid: str, task: dict, event: dict) -> bool:
@@ -201,7 +200,10 @@ def _append_project(root: Any, tid: str, task: dict, event: dict) -> bool:
         return False
     row = _project_row(tid, effective, {key: event[key] for key in ("ts", "chat_id") if key in event}, ready)
     appended = False
-    if not is_root or not _already_in_chat(root, row):
+    existing_row = _already_in_chat(root, row) if is_root else None
+    if existing_row:
+        row = existing_row  # append/receipt crash: retain actual publication time
+    else:
         appended = dialogue.append_canonical_task_summary(root, row)
         if not appended:
             return False
@@ -230,7 +232,8 @@ def append_terminal_projection(root: Any, tid: str, task: dict, event: dict, *, 
             fields = {**(task or {}), **result}
             status = fields.pop("status")
             fields.pop("task_id", None)
-            write_task_result(root, tid, status, create_only=True, strict_existing_dict=True, **fields)
+            write_task_result(root, tid, status, create_only=True, strict_existing_dict=True,
+                              _terminal_time_source=result, **fields)
         return _append_project(root, tid, task or {}, event or {})
 
 

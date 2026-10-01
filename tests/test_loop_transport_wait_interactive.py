@@ -442,36 +442,11 @@ def test_error_kind_change_closure_is_an_interactive_note(tmp_path, monkeypatch,
     assert incident is None
 
 
-@pytest.mark.parametrize("flags", [{}, {"is_direct_chat": True}])
-def test_local_fallback_adoption_closure_is_an_interactive_note(tmp_path, monkeypatch, flags):
-    """Adopting the local fallback route closes the episode with a durable row
-    for every episode; the owner note saying the remote connection is still
-    down is an interactive turn's only closure surface, so a managed episode
-    gets none."""
-    _FakeClock(monkeypatch)
-    ctx = _ctx(**flags)
-    notes = _NoteRecorder()
-    episode = _enter(tmp_path, ctx, notes, task_id="t-local")
-    assert loop_transport.reconcile_transport_wait(
-        episode, ctx, msg_present=True, error_kind="", drive_logs=tmp_path,
-        task_id="t-local", model="m", emit_progress=notes, after_local_pass=True,
-    ) is None
-
-    assert _read_network_wait_events(tmp_path)[-1]["detail"] == "local_fallback_adopted"
-    if not flags:
-        assert notes.texts == [BASE_MANAGED_ENTRY]  # the managed closure is its row, not a note
-        return
-    assert "still unavailable" in notes.texts[-1]
-    assert "local fallback model" in notes.texts[-1]
-    incident = notes.incidents[-1]
-    assert incident is None
-
-
-@pytest.mark.parametrize("closure", ["recovered", "local_fallback_adopted", "error_kind_changed"])
+@pytest.mark.parametrize("closure", ["recovered", "error_kind_changed"])
 def test_managed_episode_owner_texts_are_byte_identical_to_base(tmp_path, monkeypatch, closure):
     """The managed wordings are a frozen contract: entry still ends with the
     Stop promise its cancel authority honors, recovery still says resuming,
-    and the two other closures write their durable row and no note at all —
+    and the other closure writes its durable row and no note at all —
     the literal texts the base emits, nothing more."""
     clock = _FakeClock(monkeypatch)
     ctx = _ctx()
@@ -480,7 +455,6 @@ def test_managed_episode_owner_texts_are_byte_identical_to_base(tmp_path, monkey
     clock.now += 90.0
     outcome = {
         "recovered": dict(msg_present=True, error_kind=""),
-        "local_fallback_adopted": dict(msg_present=True, error_kind="", after_local_pass=True),
         "error_kind_changed": dict(msg_present=False, error_kind="provider_transient"),
     }[closure]
     assert loop_transport.reconcile_transport_wait(
@@ -493,7 +467,6 @@ def test_managed_episode_owner_texts_are_byte_identical_to_base(tmp_path, monkey
     last = _read_network_wait_events(tmp_path)[-1]
     assert (last["phase"], last.get("detail")) == {
         "recovered": ("recovered", None),
-        "local_fallback_adopted": ("ended", "local_fallback_adopted"),
         "error_kind_changed": ("ended", "error_kind_changed:provider_transient"),
     }[closure]
 

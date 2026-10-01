@@ -26,7 +26,8 @@ from ouroboros.anthropic_native_custody import scrub_native_custody
 from ouroboros.claudexor_daemon import ensure_owned_gateway, owned_engine_version, read_owned_gateway
 from ouroboros.deadline_utils import llm_transport_timeout_sec
 from ouroboros.gateways.claudexor import (
-    ClaudexorUnavailable, engine_at_least, model_failure_evidence_supported, _READ_TIMEOUT_SEC)
+    ClaudexorUnavailable, engine_at_least, model_failure_evidence_supported,
+    operation_query_supported, _READ_TIMEOUT_SEC)
 from ouroboros.llm_attempt import _attempt_request, _candidate_before_dispatch
 from ouroboros.send_clock import stamp_clock_note
 from ouroboros.llm_substitution import (
@@ -80,8 +81,7 @@ def prepare_processing_target(target: dict) -> dict:
     """
     if not target.get("processing_preference") or "processing_preferences" in target:
         return target
-    prepared = dict(target)
-    prepared["processing_preferences"] = []
+    prepared = {**target, "processing_preferences": []}
     try:
         sources = model_sources(processing_view=True)
     except ClaudexorUnavailable:
@@ -98,7 +98,7 @@ class ClaudexorModelError(RuntimeError):
     """A model-operation fact with its exact role, route and recovery identity."""
 
     def __init__(self, problem: dict, *, model_role: str = "", operation_id: str = "",
-                 route: dict | None = None, unknown: bool = False):
+                 route: dict | None = None, unknown: bool = False, same_operation_recoverable: bool = False):
         self.problem = copy.deepcopy(problem)
         self.code = "model_outcome_unknown" if unknown else str(problem.get("code") or "model_operation_failed")
         super().__init__(f"{self.code}: {problem.get('message') or 'Model operation did not complete'}")
@@ -117,7 +117,7 @@ class ClaudexorModelError(RuntimeError):
             # rejection: no unknown outcome or same-request wire repair.
             self.stream_rejected = self.stream_incomplete = True
             self.retryable = False
-        self.model_role = model_role
+        self.model_role, self.same_operation_recoverable = model_role, same_operation_recoverable  # the latter: a READ failure; rejoin, never regenerate
         self.operation_id = operation_id
         self.route = copy.deepcopy(route or {})
 
@@ -133,7 +133,7 @@ class ClaudexorModelError(RuntimeError):
             for key, label in fields
             if isinstance(value := context.get(key), str) and value.strip()
         ]
-        # Details lead so the existing terminal preview can name the refusal.
+        # Details lead so a shortened Logs preview still names the refusal.
         return sanitize_tool_result_for_log("; ".join([", ".join(details), str(self)]) if details else str(self))
 
 
@@ -173,8 +173,10 @@ def propagate_model_error(error: Exception) -> None:
             raise error
 
 
-def _usage(result: dict) -> tuple[dict, float | None, bool]:
+def _usage(result: dict, effort: dict | None = None) -> tuple[dict, float | None, bool]:
     """Normalize explicit model usage; never run the generic body-error/free branch."""
+    from ouroboros.effort_evidence import model_effort_usage
+
     counters = result.get("usage") or {}
     cost_evidence = result.get("cost") or {}
     cash = provider_cost_value(cost_evidence.get("cashUsd"))
@@ -182,13 +184,11 @@ def _usage(result: dict) -> tuple[dict, float | None, bool]:
     cost = cash if knowledge in {"exact", "estimated"} else None
     if knowledge == "estimated" and cost is None:
         cost = provider_cost_value(cost_evidence.get("estimatedUsd"))
-    usage = {
-        "prompt_tokens": counters.get("input_tokens"),
-        "completion_tokens": counters.get("output_tokens"),
-        "cached_tokens": counters.get("cached_input_tokens"),
-        "cache_write_tokens": counters.get("cache_write_tokens"),
-        "reasoning_tokens": counters.get("reasoning_tokens"),
-    }
+    usage = {key: counters.get(native) for key, native in (
+        ("prompt_tokens", "input_tokens"), ("completion_tokens", "output_tokens"),
+        ("cached_tokens", "cached_input_tokens"), ("cache_write_tokens", "cache_write_tokens"),
+        ("reasoning_tokens", "reasoning_tokens"))}
+    usage.update(model_effort_usage(result, effort))
     if isinstance(result.get("processing"), dict):
         usage["processing"] = copy.deepcopy(result["processing"])
     if cost_evidence:
@@ -230,9 +230,7 @@ def turn_state_for_route(slot: ModelTurnState | None, provider: str) -> ModelTur
     the caller, and returning later starts a fresh one rather than reviving a
     token the engine no longer owns.
     """
-    if slot is None:
-        return None
-    if str(provider or "") != "claudexor":
+    if slot is not None and str(provider or "") != "claudexor":
         slot.envelope = None
         return None
     return slot
@@ -290,6 +288,7 @@ def cache_key_for_model(model: str) -> str:
 def _request(target: dict, messages: list, tools: list | None, parameters: dict) -> dict:
     from ouroboros.llm_messages import _MessageShapingMixin, project_declared_system_prefix
 
+    target["requested_reasoning_effort"] = parameters.get("reasoning_effort")
     for name in ("response_format", "allow_server_web_search", "bypass_response_cache"):
         if parameters.get(name) or (name == "response_format" and parameters.get(name) is not None):
             raise ClaudexorModelError({"code": "unsupported_parameter", "message": f"Claudexor model transport does not support {name}.",
@@ -389,6 +388,7 @@ class _ModelInvocation:
         self.interrupt_reason = ""
         self.create_attempted = False
         self.capture_failure_evidence = False
+        self.capture_effort_evidence = False
         self.defer_close = False
         self.io_active = False
         self.io_lock = threading.Lock()
@@ -429,13 +429,17 @@ class _ModelInvocation:
             self.gateway = ensure_owned_gateway()
             # Freeze once before create. A lost create reply or replaced gateway
             # must reuse this same operation's diagnostic/idempotency contract.
-            self.capture_failure_evidence = model_failure_evidence_supported(self.gateway.operations())
+            operations = self.gateway.operations()
+            self.capture_failure_evidence = model_failure_evidence_supported(operations)
+            self.capture_effort_evidence = operation_query_supported(operations, method="POST",
+                path="/v2/model-operations", name="captureEffortEvidence", value="true")
             self.request_ref = self.gateway.upload_model_request(self.payload, idempotency_key=self.invocation_id)
             self.request_manifest_ref = persist_call(self.root, task_id=self.task_id, call_id=f"{self.invocation_id}_model_request",
                          call_type="llm_claudexor_request", payload=self.payload, keep_raw=True,
                          manifest={"invocation_id": self.invocation_id, "request_ref": self.request_ref,
                                    "model_role": self.role,
-                                   "capture_failure_evidence": self.capture_failure_evidence})["manifest_ref"]
+                                   "capture_failure_evidence": self.capture_failure_evidence,
+                                   "capture_effort_evidence": self.capture_effort_evidence})["manifest_ref"]
         except ClaudexorUnavailable as error:
             raise ClaudexorModelError({"code": error.code, "message": str(error)}, model_role=self.role) from None
 
@@ -450,7 +454,8 @@ class _ModelInvocation:
                     call_type="llm_claudexor_request", payload=self.payload, keep_raw=True,
                     manifest={"invocation_id": self.invocation_id, "request_ref": self.request_ref,
                               "model_role": self.role, "operation_id": self.operation_id,
-                              "capture_failure_evidence": self.capture_failure_evidence})["manifest_ref"]
+                              "capture_failure_evidence": self.capture_failure_evidence,
+                              "capture_effort_evidence": self.capture_effort_evidence})["manifest_ref"]
             except Exception as error:
                 self.request_manifest_ref = {}
                 log.warning("Model custody checkpoint unavailable: %s", type(error).__name__)
@@ -462,12 +467,11 @@ class _ModelInvocation:
             except Exception as error:
                 log.warning("Model custody observer unavailable: %s", type(error).__name__)
 
-    def error(self, problem: dict | None, detail: dict | None = None, *, unknown: bool = False):
-        detail = detail or {}
-        route = (detail.get("dispatch") or {}).get("route") or {}
+    def error(self, problem: dict | None, detail: dict | None = None, *, unknown: bool = False, rejoinable: bool = False):
+        route = ((detail or {}).get("dispatch") or {}).get("route") or {}
         cls = ClaudexorModelError if unknown else ClaudexorModelNotDispatched
-        return cls(problem or {"code": "model_operation_failed", "message": "The engine returned no model result."},
-                   model_role=self.role, operation_id=self.operation_id, route=route, unknown=unknown)
+        return cls(problem or {"code": "model_operation_failed", "message": "The engine returned no model result."}, model_role=self.role,
+                   operation_id=self.operation_id, route=route, unknown=unknown, same_operation_recoverable=rejoinable)
 
     def receive(self) -> dict:
         outage_started = None
@@ -479,7 +483,8 @@ class _ModelInvocation:
                     self.create_attempted = True
                     self.observe_operation()
                     detail = self.gateway.create_model_operation(self.request_ref, idempotency_key=self.invocation_id,
-                        **({"capture_failure_evidence": True} if self.capture_failure_evidence else {}))
+                        **({"capture_failure_evidence": True} if self.capture_failure_evidence else {}),
+                        **({"capture_effort_evidence": True} if self.capture_effort_evidence else {}))
                     self.operation_id = detail["id"]
                     self.observe_operation(accepted=True)
                 else:
@@ -488,7 +493,6 @@ class _ModelInvocation:
                 if self.outage_episode is not None:
                     self._control_outage(recovered=True)
                 if detail.get("state") not in {"queued", "running"}:
-                    self.detail = detail
                     response = detail.get("response") or {}
                     if response.get("state") != "ready":
                         raise self.error(detail.get("problem"), detail,
@@ -532,21 +536,22 @@ class _ModelInvocation:
                                       "context": {"httpStatus": error.status_code}}) from None
                 # A failed read after creation is never a provider connect failure.
                 # Drop its causal HTTP chain at this boundary: even ConnectError
-                # means only the local control read failed, not inference un-sent.
+                # means only the local control read failed, not inference un-sent (a refused read, 404 too).
                 if error.code != "daemon_unreachable" and not 500 <= error.status_code < 600:
-                    raise self.error({"code": error.code, "message": str(error)}, detail, unknown=True) from None
+                    if self._control_outage():  # rejoin by operation id OR the same create idempotency key
+                        continue
+                    raise self.error({"code": error.code, "message": str(error)}, detail, unknown=True, rejoinable=self.create_attempted) from None
                 if outage_started is None:
                     outage_started = time.monotonic()
                 if self._control_outage():
                     continue
                 if time.monotonic() - outage_started >= self.timeout:
-                    raise self.error({"code": "model_control_unreachable", "message": "Control connection lost; the same model operation may still finish."}, detail, unknown=True) from None
+                    raise self.error({"code": "model_control_unreachable", "message": "Control connection lost; the same model operation may still finish."}, detail, unknown=True, rejoinable=True) from None
             time.sleep(min(config.CLAUDEXOR_MODEL_POLL_INTERVAL_SEC, self.timeout))
 
     def _control_outage(self, *, recovered: bool = False) -> bool:
-        """Managed calls keep the same accepted operation through local HTTP loss."""
-        from ouroboros.loop_transport import (
-            TransportWaitEpisode, emit_network_wait_event, managed_transport_continuation)
+        """Ordinary direct and queued calls keep the same operation through control loss."""
+        from ouroboros.loop_transport import TransportWaitEpisode, emit_network_wait_event, managed_transport_continuation
         waiter = current_model_wait()
         ctx = getattr(waiter, "tool_context", None)
         if not managed_transport_continuation(ctx):
@@ -575,13 +580,10 @@ class _ModelInvocation:
             previous, self.gateway = self.gateway, replacement
             if previous is not None:
                 previous.close()
-        def controlled():
-            self.check_control()
-            return False
         # Unlike an owner-mail peek, check_control's exception must propagate.
         deadline = time.monotonic() + backoff
         while time.monotonic() < deadline:
-            controlled()
+            self.check_control()
             time.sleep(min(config.CLAUDEXOR_MODEL_POLL_INTERVAL_SEC, max(0, deadline - time.monotonic())))
         return True
 
@@ -616,7 +618,9 @@ class _ModelInvocation:
         return custody
 
     def extract_usage(self, result: dict) -> tuple[dict, float | None, bool]:
-        usage, cost, final = _usage(result)
+        from ouroboros.llm_attempt import effort_request_facts
+
+        usage, cost, final = _usage(result, effort_request_facts(self.target, self.payload))
         # Settlement reads this row before the caller decides anything, and the
         # density witness must know whose tokenizer it measured: a generation
         # another model produced teaches nothing about the requested one. The
@@ -638,10 +642,6 @@ class _ModelInvocation:
     def finish(self, result: dict) -> tuple[dict, dict]:
         usage, cost, final = self.extract_usage(result)
         route = result.get("route") or {}
-        requested_options = copy.deepcopy(self.payload.get("options") or {})
-        applied_options = copy.deepcopy(result.get("appliedOptions"))
-        options_honored = "unknown" if applied_options is None else (
-            "mismatch" if any(applied_options[key] != value for key, value in requested_options.items() if key in applied_options) else "confirmed")
         usage.pop("wire_layout", None)  # host-owned: the projection fact of THIS call's target
         usage.update(provider="claudexor", resolved_model=self.target["usage_model"], cost=cost, cost_final=final,
                      cost_estimated=cost is not None and not final,
@@ -650,8 +650,9 @@ class _ModelInvocation:
                                 "requested_profile": str((self.payload.get("account") or {}).get("profileId") or ""),
                                 "route": copy.deepcopy(route), "cost_evidence": copy.deepcopy(result.get("cost")),
                                 "outcome": result.get("outcome"), "problem": copy.deepcopy(result.get("problem")),
-                                "requested_options": requested_options, "applied_options": applied_options,
-                                "options_honored": options_honored,
+                                "requested_options": copy.deepcopy(self.payload.get("options") or {}),
+                                "applied_options": copy.deepcopy(result.get("appliedOptions")),
+                                "applied_options_source": "provider_response",
                                 "output_reserve_tokens": self.output_reserve, "output_cap_applied": False,
                                 "result_custody": {"state": "pending", "operation_id": self.operation_id,
                                                    "response_ref": self.response_ref,
@@ -855,8 +856,7 @@ def chat_claudexor(target: dict, messages: list, tools: list | None, **parameter
                 cause.physical_attempt_capture = error.physical_attempt_capture
                 all_operations_not_started &= (isinstance(cause, ClaudexorModelNotDispatched)
                                                and error.physical_attempt_capture.state == "released")
-                if isinstance(cause, ClaudexorModelError):
-                    cause.presence_all_operations_not_started = all_operations_not_started
+                cause.presence_all_operations_not_started = all_operations_not_started
                 raise cause from None
             raise
         finally:
@@ -918,7 +918,7 @@ def recover_model_attempt(drive_root, row: dict, *, gateway_factory=None):
         result = json.loads(raw)
         if not isinstance(result, dict) or result.get("outcome") not in {"completed", "incomplete", "failed"}:
             return "abandoned", {}, None, False
-        usage, cost, final = _usage(result)
+        usage, cost, final = _usage(result, row.get("effort"))
         return "settled", usage, cost, final
     finally:
         if gateway is not None and gateway_factory is None:

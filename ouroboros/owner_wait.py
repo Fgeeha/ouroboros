@@ -150,13 +150,19 @@ def continuation_state(ctx: Any, messages: list, trace: dict, usage: dict,
         "route": {key: getattr(ctx, key, None) for key in (
             "active_model", "active_effort", "active_use_local", "active_context_mode",
             "active_model_override", "active_effort_override", "active_use_local_override",
+            "active_role_override", "route_wait_on_primary", "primary_route", "_route_facts_pending",
         )},
         "delivery_candidate": asdict(candidate) if candidate is not None else None,
         "delivery": {key: getattr(ctx, key, None) for key in (
             "_delivery_candidate_revision", "_delivery_control_required",
             "_delivery_evidence_revision", "_delivery_evidence_fingerprint",
             "_delivery_effective_criteria", "_delivery_material_tool_indices",
-            "_acceptance_ack_source_sha256",
+            "_acceptance_ack_source_sha256", "_completion_request", "_completion_selected",
+            "_completion_observation", "_completion_held_sha256", "_presence_completion",
+            "_presence_completion_owner_revision", "_acceptance_observation",
+            "_presence_forced_declaration", "_presence_forced_pending", "_presence_completion_accepted",
+            "_task_acceptance_sealed_fence_token", "_task_acceptance_sealed_fence_generation",
+
         ) if getattr(ctx, key, None) is not None},
         "acceptance": {
             "_task_acceptance_improvement_passes": int(getattr(ctx, "_task_acceptance_improvement_passes", 0)),
@@ -235,11 +241,11 @@ def load_owner_wait(ctx: Any, handoff: dict | None = None) -> dict:
     return state
 
 
-def restore_owner_wait_allowed(root: Any, task: dict) -> bool:
-    """A snapshot is a locator; current wait and acknowledged restart authorize it."""
+def restore_owner_wait_allowed(root: Any, task: dict, *, strict: bool = False) -> bool:
+    """Current wait and acknowledged restart authorize a locator; strict preserves read failures."""
     from ouroboros.cancel_intents import has_active_intent
     from ouroboros.deadline_utils import parse_deadline_ts, utc_now
-    from ouroboros.delegate_recovery import _ack_direct_exec_successor, _read_restart_transaction
+    from ouroboros.delegate_recovery import _ack_direct_exec_successor, _read_restart_transaction, _restart_transaction_path
     from ouroboros.config import get_task_abs_ceiling_sec
     from ouroboros.model_wait import execution_elapsed_seconds
     import time
@@ -252,8 +258,10 @@ def restore_owner_wait_allowed(root: Any, task: dict) -> bool:
         return False
     _ack_direct_exec_successor(root)
     task_id = str(task.get("id") or "")
-    transaction = _read_restart_transaction(root, str(handoff.get("restart_transaction_id") or ""))
-    if transaction.get("status") != "normal_exit_acknowledged" or task_id not in transaction.get("task_ids", []):
+    transaction_id = str(handoff.get("restart_transaction_id") or "")
+    transaction = {} if strict else _read_restart_transaction(root, transaction_id)
+    if not strict and (transaction.get("status") != "normal_exit_acknowledged"
+                       or task_id not in transaction.get("task_ids", [])):
         return False
     row = load_task_result(root, task_id, strict=True) or {}
     wait = row.get("owner_wait") or {}
@@ -282,6 +290,13 @@ def restore_owner_wait_allowed(root: Any, task: dict) -> bool:
          "model_wait_quota_clock": wait.get("model_wait_quota_clock") or {},
          "budget_paused_sec": paused_carrier}, now)
     if started and ceiling is not None and executed >= ceiling:
+        return False
+    # Independent controls apply even when restart/replay evidence is unreadable.
+    if strict:
+        transaction = json.loads(_restart_transaction_path(root, transaction_id).read_text(encoding="utf-8"))
+    if not isinstance(transaction, dict):
+        raise ValueError("Owner-wait restart transaction is unreadable")
+    if transaction.get("status") != "normal_exit_acknowledged" or task_id not in transaction.get("task_ids", []):
         return False
     read_actor_source_bytes(root, task_id, wait["source_ref"])
     return True
@@ -542,7 +557,13 @@ def restore_continuation_state(tools: Any, state: dict, messages: list, trace: d
     for key, value in {**state["route"], **state["delivery"], **state["acceptance"]}.items():
         setattr(ctx, key, value)
     candidate = state.get("delivery_candidate")
-    ctx._delivery_candidate = DeliveryCandidate(**candidate) if candidate else None
+    ctx._delivery_candidate = DeliveryCandidate(**{key: value for key, value in candidate.items()
+        if key != "repair_attempted"}) if candidate else None
+    if ctx._delivery_candidate is not None:
+        value = ctx._delivery_candidate
+        if value.control_episode_seen or value.finalization_control not in {"candidate", "owner_revision_required"}:
+            ctx._delivery_control_required = True
+            value.control_episode_seen = True
 
 
 def rebind_restored_route(tools: Any, state: dict, messages: list) -> tuple:

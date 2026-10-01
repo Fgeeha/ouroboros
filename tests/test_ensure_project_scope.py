@@ -253,7 +253,8 @@ def test_supervisor_handler_creates_binds_updates_running_and_broadcasts(monkeyp
     # Hermetic (R13): the handler now reads the durable binding first, and
     # workers.DRIVE_ROOT here is the LIVE data root.
     monkeypatch.setattr(reg, "project_id_for_task", lambda dr, tid, **kw: "")
-    monkeypatch.setattr(reg, "create_project", lambda dr, pid, **kw: calls.__setitem__("create", (pid, kw)) or {"id": pid, "chat_id": 7})
+    monkeypatch.setattr(reg, "create_project", lambda dr, pid, **kw: calls.__setitem__("create", (pid, kw)) or {
+        "id": pid, "chat_id": 7, "lifecycle": "active", "routing_generation": 0, "working_dir": ""})
     monkeypatch.setattr(
         reg,
         "bind_task_to_project",
@@ -335,7 +336,8 @@ def test_supervisor_handler_stops_when_the_bind_raises(monkeypatch, tmp_path):
         raise ValueError("project binding is immutable")
 
     monkeypatch.setattr(reg, "project_id_for_task", lambda dr, tid, **kw: "")
-    monkeypatch.setattr(reg, "create_project", lambda dr, pid, **kw: {"id": pid, "chat_id": 7})
+    monkeypatch.setattr(reg, "create_project", lambda dr, pid, **kw: {
+        "id": pid, "chat_id": 7, "lifecycle": "active", "routing_generation": 0, "working_dir": ""})
     monkeypatch.setattr(reg, "touch_project", lambda *a, **kw: None)
     monkeypatch.setattr(reg, "bind_task_to_project", _raise)
     monkeypatch.setattr(mb, "get_bridge", lambda: calls.__setitem__("broadcast", True))
@@ -364,7 +366,8 @@ def test_supervisor_handler_treats_an_unreadable_store_as_unbound(monkeypatch, t
     (tmp_path / "state").mkdir(parents=True, exist_ok=True)
     (tmp_path / "state" / "project_task_bindings.json").write_text("{ not json", encoding="utf-8")
     bound = {}
-    monkeypatch.setattr(reg, "create_project", lambda dr, pid, **kw: {"id": pid, "chat_id": 7})
+    monkeypatch.setattr(reg, "create_project", lambda dr, pid, **kw: {
+        "id": pid, "chat_id": 7, "lifecycle": "active", "routing_generation": 0, "working_dir": ""})
     monkeypatch.setattr(reg, "touch_project", lambda *a, **kw: None)
     monkeypatch.setattr(reg, "bind_task_to_project",
                         lambda dr, tid, pid, chat=None, *, origin: bound.update({"pid": pid}))
@@ -524,4 +527,3 @@ def test_a_conflict_receipt_names_the_project_the_task_is_actually_bound_to():
     assert "durably bound to project 'existing'" in out and "'renamed'" not in out
     assert "applied to it as a rename" in out
     assert ctx.project_id == "existing"
-

@@ -321,7 +321,7 @@ def test_presence_turn_is_live_for_liveness_readers_but_never_an_owner_target(mo
                                      "wakes": ("", True)}
         # Once the turn returns the set is empty and the same orphan evidence reconciles.
         assert presence_runner.presence_turn_is_live(result.task_id) is False
-        assert result.task_id not in presence_runner._LIVE_PRESENCE_TASKS
+        assert (str(tmp_path.resolve()), result.task_id) not in presence_runner._LIVE_PRESENCE_TASKS
         assert _is_stale_orphan_running_task(tmp_path, result.task_id, orphan_row) is True
     finally:
         registry.clear()

@@ -3,11 +3,12 @@
 // in-flight direct/ephemeral turn status reducer and snapshot hydration.
 import { executorIdentityMarkup, joinMetaParts } from './harness_presentation.js';
 import { resultFilesItemHtml } from './result_files.js';
+import { taskSourceDownloadUrl } from './api_client.js';
 import { compactModel, formatLogDuration, modelExecutionLabel } from './log_events.js';
 import { createSystemMessageActions } from './ui_helpers.js';
 import { projectReference } from './project_reference.js';
 import { delegatedActivityBodyHtml, delegatedHeadline, delegatedLineView } from './delegated_activity.js';
-import { joinMarkdownHeadings } from './utils.js';
+import { joinMarkdownHeadings, MARKDOWN_FENCED_CODE } from './utils.js';
 import { REUSABLE_TASK_IDS } from './task_control_menu.js';
 import {
     accountedUpperBound,
@@ -72,6 +73,37 @@ export function isLiveLineExpandable(item) {
     );
 }
 
+// A late-review row links its exact applied review record through the task artifact
+// route (#1369) — an absent or unsupported `late_evidence.source_ref` offers no link
+// rather than a guessed one. The card's timeline and a card-less System row share it.
+export function cardRowEvidenceRef(msg) {
+    const evidence = msg?.late_evidence && typeof msg.late_evidence === 'object'
+        ? taskSourceDownloadUrl(String(msg.task_id || '').trim(), msg.late_evidence.source_ref) : '';
+    return evidence ? { href: evidence, label: 'Download the review record' } : null;
+}
+
+// The stored record link as one download anchor, or nothing. A value restored from
+// the session snapshot is held to the task artifact route it was minted on. It wears
+// the chat link ink (`md-link`), as the result-file downloads beside it do.
+export function evidenceLinkHtml(evidenceRef) {
+    const href = typeof evidenceRef?.href === 'string' && evidenceRef.href.startsWith('/api/tasks/') ? evidenceRef.href : '';
+    return href
+        ? `<p class="chat-live-line-evidence"><a class="md-link" href="${escapeHtmlAttr(href)}" download data-live-line-evidence>${escapeHtml(evidenceRef.label || 'Download the review record')}</a></p>`
+        : '';
+}
+
+// A host-placed card row (timeline or Reviews) as its timeline summary: the first line
+// heads, `card_row_id` is the row's stable identity, and a late-review row carries its
+// record link (`cardRowEvidenceRef`).
+export function cardRowSummary(msg, phase, rawTs = '') {
+    const lines = String(msg.text ?? msg.content ?? '').split('\n');
+    const rowId = String(msg.card_row_id || '').trim() || `${String(msg.system_type || '').trim()}|${rawTs}`;
+    return {
+        phase, headline: lines[0].trim(), body: lines.slice(1).join('\n').trim(), dedupeKey: `cardrow|${rowId}`,
+        cardRowRevision: msg.card_row_revision, evidenceRef: cardRowEvidenceRef(msg),
+    };
+}
+
 export function buildTimelineItemHtml(item, record) {
     if (item.resultArtifacts) return resultFilesItemHtml(item);
     // A delegated observation renders its per-seq projection; one wholly shown by
@@ -88,6 +120,8 @@ export function buildTimelineItemHtml(item, record) {
     const displayBody = expanded ? (item.fetchedFull || item.fullBody || item.body) : item.body;
     const showingFetched = expanded && Boolean(item.fetchedFull);
     const loadingFull = expanded && Boolean(item.truncated && item.fullRef && !item.fetchedFull);
+    // A late-review row offers its exact applied review record (`cardRowSummary`).
+    const evidenceHtml = evidenceLinkHtml(item.evidenceRef);
     const isProgressLine = item.phase === 'working' || item.phase === 'thinking';
     const bodyId = `chat-live-line-body-${String(record.groupId || 'task').replace(/[^A-Za-z0-9_-]/g, '-')}-${String(item.lineKey || '').replace(/[^A-Za-z0-9_-]/g, '-')}`;
     const headContent = `
@@ -113,12 +147,13 @@ export function buildTimelineItemHtml(item, record) {
         <div
             class="chat-live-line ${item.phase || 'working'}${expandable ? ' expandable' : ''}"
             data-live-line-key="${escapeHtmlAttr(item.lineKey || '')}"
-            ${item.historyId ? `data-history-id="${escapeHtmlAttr(item.historyId)}"` : ''}
+            ${item.historyId ? `data-history-id="${escapeHtmlAttr(item.historyId)}"`
+        : item.sourceHistoryId ? `data-source-history-id="${escapeHtmlAttr(item.sourceHistoryId)}"` : ''}
             data-expanded="${expanded ? '1' : '0'}"
         >
             ${headHtml}
             ${delegated ? `<div class="chat-live-line-body chat-delegated-activity" id="${escapeHtmlAttr(bodyId)}">${delegatedActivityBodyHtml(delegated, { expanded })}</div>`
-        : displayBody ? `<div class="chat-live-line-body${showingFetched ? ' chat-live-line-body-full' : ''}" id="${escapeHtmlAttr(bodyId)}">${renderMarkdown(displayBody, { inlineHeadingBreaks: true })}${loadingFull ? '<div class="chat-live-line-loading">Loading full output…</div>' : ''}</div>` : ''}
+        : displayBody || evidenceHtml ? `<div class="chat-live-line-body${showingFetched ? ' chat-live-line-body-full' : ''}" id="${escapeHtmlAttr(bodyId)}">${displayBody ? renderMarkdown(displayBody, { inlineHeadingBreaks: true }) : ''}${evidenceHtml}${loadingFull ? '<div class="chat-live-line-loading">Loading full output…</div>' : ''}</div>` : ''}
         </div>
     `;
 }
@@ -151,12 +186,13 @@ export function noteToolCall(record, observation) {
     const prev = calls.get(key);
     const fact = observation.fact || (['ok', 'error'].includes(observation.status) ? 'settled' : 'started');
     const next = { ...prev,
-        receipt: Boolean(observation.receipt) && (prev ? prev.receipt : true),
+        receipt: prev?.receipt ?? Boolean(observation.receipt),
         tool: observation.tool || prev?.tool || '',
     };
     if (fact === 'settled') {
         if (!next.settlement || (next.settlement.hostError && !observation.hostError)) {
             next.settlement = { status: observation.status, hostError: Boolean(observation.hostError) };
+            next.receipt = Boolean(observation.receipt);
         }
     } else if (fact === 'wait_ended') next.waitEnded = true;
     else next.started = true;
@@ -192,6 +228,7 @@ export function noteToolHostMetrics(record, host) {
         calls: carry(host?.calls, known.calls),
         errors: carry(host?.errors, known.errors),
         routing: carry(host?.routing, known.routing),
+        completion: carry(host?.completion, known.completion),
         counts,
     };
     return toolEvidenceView(record.toolFold);
@@ -256,12 +293,10 @@ export function toolEvidenceView(fold = null) {
         fullBody: (partial ? 'Invocation evidence is incomplete. ' : '') + perToolLine(host?.counts && typeof host.counts === 'object'
             ? Object.entries(host.counts) : [...liveCounts]),
         visible: true,
-        // Addressing calls report themselves on the owner's message, so a block
-        // that ran nothing else stands on nothing. The host's count decides when
-        // it stated one; otherwise the live map decides, but only while it
-        // accounts for every counted call. Knowing neither means content.
-        receipt: errors <= 0 && (Number.isInteger(host?.routing) ? host.routing >= calls
-            : live.length >= calls && live.length > 0 && live.every((call) => call.receipt)),
+        // Host-stamped routing/completion acts are receipts, never work. Missing
+        // aggregate fields do not erase complete per-invocation receipt evidence.
+        receipt: errors <= 0 && (Number(host?.routing || 0) + Number(host?.completion || 0) >= calls
+            || live.length >= calls && live.length > 0 && live.every((call) => call.receipt)),
         calls,
         errors,
     };
@@ -759,7 +794,7 @@ export const COLLAPSED_ACTIVITY_MAX = 240;
 export function plainActivityText(text = '') {
     const source = String(text || '');
     const plain = joinMarkdownHeadings(source)
-        .replace(/```\w*\n([\s\S]*?)```/g, '$1')
+        .replace(MARKDOWN_FENCED_CODE, '$1')
         .replace(/(``|`)(.+?)\1/g, '$2')
         .replace(/\*\*(.+?)\*\*/g, '$1')
         .replace(/\*(.+?)\*/g, '$1')
@@ -973,6 +1008,7 @@ export function computeDerivedChatStatus({
     queuedManagedCount = 0,
     pausedManagedCount = 0,
     waitingModelCount = 0,
+    projectWaitLabel = '',
     pendingSubmissionsCount = 0,
     supervisorStarting = false,
 } = {}) {
@@ -1001,6 +1037,7 @@ export function computeDerivedChatStatus({
         // never dress it up as Working or Queued.
         return { kind: 'online', text: 'Paused (budget)', showDots: false };
     }
+    if (projectWaitLabel) return { kind: 'online', text: projectWaitLabel, showDots: false };
     if (supervisorStarting) return { kind: 'starting', text: 'Starting…', showDots: false };
     return { kind: 'online', text: 'Online', showDots: false };
 }
@@ -1009,8 +1046,13 @@ export function computeDerivedChatStatus({
 // cards, where a managed root drives Working… and a direct turn keeps the census verdict (Thinking…).
 export function chatStatusCounts(activities, records, isWaiting = () => false) {
     const counts = { activeDirectCount: 0, activeManagedCount: 0, queuedManagedCount: 0, pausedManagedCount: 0,
-        hasActiveLiveCard: false, waitingModelCount: 0 };
+        hasActiveLiveCard: false, waitingModelCount: 0, projectWaitLabel: '' };
     for (const [id, entry] of activities) {
+        if (entry?.project_admission_hold?.label) {
+            counts.projectWaitLabel = entry.project_admission_hold.label;
+            if (/^budget_paus(ed|ing)$/.test(entry.phase ?? '')) counts.pausedManagedCount += 1;
+            continue;
+        }
         if (isWaiting(id)) continue;
         if (String(entry?.kind || '') !== 'managed_task') counts.activeDirectCount += 1;
         else if (String(entry?.phase || '') === 'queued') counts.queuedManagedCount += 1;
@@ -1019,6 +1061,11 @@ export function chatStatusCounts(activities, records, isWaiting = () => false) {
     }
     for (const record of records) {
         if (!isForegroundLiveCard(record)) continue;
+        if (record.projectHold) {
+            counts.projectWaitLabel ||= record.projectHold;
+            continue;
+        }
+        if (activities.get(record.groupId)?.project_admission_hold) continue;
         if (record.modelWaiting) counts.waitingModelCount += 1;
         else if (!record.direct) counts.hasActiveLiveCard = true;
     }
@@ -1189,6 +1236,7 @@ export function computeHydratedDirectActivities(existingMap, turnsList, chatId, 
             activityId: aid,
             kind: turn.kind || 'direct_chat',
             phase: turn.phase || 'thinking',
+            ...(turn.project_admission_hold ? { project_admission_hold: turn.project_admission_hold } : {}),
             clientMessageId: turn.client_message_id || nextMap.get(aid)?.clientMessageId || '',
         });
     }
@@ -1392,7 +1440,7 @@ export function costMetaKeys(src) {
 const CARD_META_KEYS = [
     ...COST_META_KEYS, 'executor_route', 'execution_evidence', 'actual_substrate',
     'executor_observation', 'model_execution', 'tool_calls', 'model', 'ts', 'initiator', 'cancel_origin',
-    'delegated_activity',
+    'delegated_activity', 'outcome_axes', 'task_completion',
 ];
 export function cardMetaKeys(src) {
     return Object.fromEntries(CARD_META_KEYS.map((key) => [key, src?.[key]]));
@@ -1411,6 +1459,7 @@ export function renderLiveCardMeta(record, { agentModel = record?.agentModel || 
         ...[
             record.initiator === 'consciousness' ? 'Consciousness' : '',
             record.historicalUnavailable ? 'Outcome unavailable' : (record.historicalUnconfirmed ? 'Activity unconfirmed' : ''),
+            !record.finished && record.projectHoldDetail || '',
             record.historyRetentionProblem || '',
             modelExecutionLabel(record.modelExecution),
             Number.isInteger(record.toolCalls) ? `${record.toolCalls} tool ${record.toolCalls === 1 ? "call" : "calls"}` : '',

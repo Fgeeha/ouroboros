@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from ouroboros.gateway import history
-from ouroboros.gateway.history_paging import HistorySource, decode_cursor
+from ouroboros.gateway.history_paging import HistorySource, decode_cursor, encode_cursor
 
 
 @pytest.fixture(autouse=True)
@@ -252,6 +252,41 @@ def test_partial_live_line_is_outside_frozen_history_even_after_rotation(tmp_pat
     replayed = request(tmp_path, cursor=first["page_cursor"])[1]
     assert replayed["messages"] == first["messages"]
     assert not any(message["text"] == "later" for page in pages(tmp_path, cursor=first["next_cursor"]) for message in page["messages"])
+
+
+def recoded(encoded, **fields):
+    """The same cursor with ``fields`` replaced; ``None`` drops a field."""
+    import base64
+
+    cursor = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+    for key, value in fields.items():
+        if value is None:
+            cursor.pop(key, None)
+        else:
+            cursor[key] = value
+    return encode_cursor(cursor)
+
+
+def test_a_cursor_minted_before_the_unfinished_boundary_field_reads_as_a_clean_boundary(tmp_path):
+    write(tmp_path / "logs" / "chat.jsonl", [row(index) for index in range(200)])
+    first = request(tmp_path)[1]
+    for name in ("next_cursor", "page_cursor"):
+        current = request(tmp_path, cursor=first[name])
+        legacy = request(tmp_path, cursor=recoded(first[name], unfinished=None))
+        assert current[0] == legacy[0] == 200
+        assert legacy[1]["messages"] == current[1]["messages"]
+        assert legacy[1]["next_cursor"] == current[1]["next_cursor"], "re-minted with the field, unchanged"
+
+
+@pytest.mark.parametrize("unfinished", [
+    "chat", False, {"chat": True}, ["chat", "chat"], ["progress", "chat"], ["archive"], [1], [["chat"]], [{}],
+])
+def test_a_malformed_unfinished_boundary_is_an_invalid_cursor(tmp_path, unfinished):
+    write(tmp_path / "logs" / "chat.jsonl", [row(index) for index in range(200)])
+    first = request(tmp_path)[1]
+    for name in ("next_cursor", "page_cursor"):
+        status, payload = request(tmp_path, cursor=recoded(first[name], unfinished=unfinished))
+        assert status == 400 and payload["reason_code"] == "history_cursor_invalid", unfinished
 
 
 def test_de_roled_recent_child_final_is_enriched_when_older_parent_arrives(tmp_path):

@@ -696,8 +696,8 @@ def _maybe_inject_finalization_nudges(
                 or llm_trace.get("authoring_handover_incomplete"))
     if isinstance(handover, dict):
         baseline = int(handover.get("tool_calls_at_handover") or 0)
-        current = len(llm_trace.get("tool_calls") or [])
-        if current > baseline:
+        from ouroboros.tool_capabilities import substantive_tool_calls
+        if substantive_tool_calls((llm_trace.get("tool_calls") or [])[baseline:]):
             handover["status"] = "recovered"
             incomplete = llm_trace.pop("authoring_handover_incomplete", None)
             if isinstance(incomplete, dict):
@@ -867,6 +867,8 @@ def _maybe_inject_finalization_nudges(
         emit_progress("Verify-before-done nudge injected before final response.")
         llm_trace["reasoning_notes"].append("Verify-before-done nudge injected before final response.")
         return True
+    from ouroboros.tool_capabilities import substantive_tool_calls
+    work_calls = substantive_tool_calls(llm_trace.get("tool_calls"))
     # A3 one-shot no-op nudge: a declared deliverable but no tool calls,
     # reviewable effects or FINAL ANSWER marker this turn (family of the M2
     # expected_output_ungrounded flag). Own latch after the verify nudge; never
@@ -874,7 +876,7 @@ def _maybe_inject_finalization_nudges(
     if (
         not getattr(tools._ctx, "_noop_attempt_nudged", False)
         and str(_contract_expected_output(tools._ctx)).strip()
-        and not (llm_trace.get("tool_calls") or [])
+        and not work_calls
         and not turn_has_reviewable_effects(llm_trace)
         and not extract_final_answer(content or "")
     ):
@@ -904,7 +906,7 @@ def _maybe_inject_finalization_nudges(
         and _answer_protocol_active(tools._ctx)  # v6.60.0: marker nudge is protocol-gated
         and content and content.strip()
         and not extract_final_answer(content or "")
-        and ((llm_trace.get("tool_calls") or []) or turn_has_reviewable_effects(llm_trace))
+        and (work_calls or turn_has_reviewable_effects(llm_trace))
     ):
         tools._ctx._final_marker_nudged = True
         return _inject(

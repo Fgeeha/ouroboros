@@ -61,7 +61,9 @@ def test_one_browser_lane_serves_pull_requests_manual_tags_and_ouroboros_pushes(
     assert ci_triggers["schedule"] == [{"cron": "37 4 * * *"}, {"cron": "17 3 * * *"}]
 
     push, push_triggers = _workflow("ui-browser-push.yml")
-    assert list(push_triggers) == ["push"]
+    assert list(push_triggers) == ["push", "workflow_dispatch"]
+    assert push_triggers["workflow_dispatch"]["inputs"]["diagnostic"]["options"] == [
+        "full", "viewport", "inflight"]
     assert push_triggers["push"] == {"branches": ["ouroboros"]}
     assert push["jobs"]["ui-smoke"]["uses"] == caller["uses"]
 

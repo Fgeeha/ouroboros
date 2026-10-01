@@ -25,12 +25,15 @@ def _history(root):
     (["read_file", "promote_chat_to_task"], [], {"read_file": 1, "promote_chat_to_task": 1}),
     (["steer_task", "steer_task", "route_to_project"], [1], {"steer_task": 2, "route_to_project": 1}),
     ([" read_file ", "new_extension_tool"], [], {"read_file": 1, "new_extension_tool": 1}),
+    (["finish_task"], [], {"finish_task": 1}),
+    (["presence_finish", "read_file", "finish_task"], [2], {"presence_finish": 1, "read_file": 1, "finish_task": 1}),
     ([], [], {}),
 ])
 def test_actual_metrics_summary_and_history_keep_complete_tool_census(tmp_path, monkeypatch, names, failed, expected):
     calls = [{"tool": name, "tool_call_id": f"call-{index}", "args": {},
               "result": "Recorded result", "is_error": index in failed,
-              "status": "error" if index in failed else "ok"}
+              "status": "error" if index in failed else "ok",
+              "completion_control": name in {"finish_task", "presence_finish"}}
              for index, name in enumerate(names)]
     trace = {"tool_calls": calls, "reasoning_notes": []}
     task = {"id": "native-metrics", "chat_id": 1, "type": "task", "text": "Owner objective",
@@ -64,6 +67,7 @@ def test_actual_metrics_summary_and_history_keep_complete_tool_census(tmp_path, 
         assert row["tool_calls"] == len(names)
         assert row["tool_errors"] == len(failed)
         assert row["routing_tool_calls"] == addressing
+        assert row["completion_tool_calls"] == sum(call["completion_control"] and not call["is_error"] for call in calls)
         assert row["tool_call_counts"] == expected
         assert row["outcome_axes"]["execution"] == metric["outcome_axes"]["execution"]
     assert model_calls == [] and facts["text"] == ""
@@ -92,7 +96,7 @@ def test_incomplete_trace_never_claims_empty_or_partial_census(trace, expected_t
     expected_routing = None if expected_total is None else sum(
         1 for call in trace.get("tool_calls") or [] if isinstance(call, dict) and call.get("tool") == "promote_chat_to_task")
     assert metrics == {"tool_calls": expected_total, "tool_errors": expected_errors,
-                       "routing_tool_calls": expected_routing, "tool_call_counts": None}
+                       "routing_tool_calls": expected_routing, "completion_tool_calls": None if expected_total is None else 0, "tool_call_counts": None}
 
 
 def test_unknown_and_legacy_evidence_keep_absence_distinct_from_zero(tmp_path, monkeypatch):
@@ -103,15 +107,22 @@ def test_unknown_and_legacy_evidence_keep_absence_distinct_from_zero(tmp_path, m
                        {"loop_evidence_unavailable": True},
                        {"loop_evidence_unavailable": True, "tool_calls": []}, tmp_path / "logs")
     [unknown] = _history(tmp_path)
-    assert all(unknown[key] is None for key in ("tool_calls", "tool_errors", "routing_tool_calls", "tool_call_counts"))
+    assert all(unknown[key] is None for key in ("tool_calls", "tool_errors", "routing_tool_calls", "completion_tool_calls", "tool_call_counts"))
     append_jsonl(tmp_path / "logs/chat.jsonl", {"type": "task_summary", "task_id": "legacy",
         "direction": "system", "chat_id": 1, "text": "Legacy summary", "tool_calls": 1, "rounds": 2})
     legacy = next(row for row in _history(tmp_path) if row["task_id"] == "legacy")
-    assert "tool_call_counts" not in legacy and "tool_errors" not in legacy and "routing_tool_calls" not in legacy
+    assert all(key not in legacy for key in ("tool_call_counts", "tool_errors", "routing_tool_calls", "completion_tool_calls"))
     wire = []
     ctx = SimpleNamespace(DRIVE_ROOT=tmp_path, RUNNING={}, PENDING=[], append_jsonl=append_jsonl,
                           bridge=SimpleNamespace(push_log=wire.append))
     _handle_task_metrics({"task_id": "legacy", "tool_calls": 1}, ctx)
-    assert "tool_call_counts" not in wire[0] and "routing_tool_calls" not in wire[0]
+    assert all(key not in wire[0] for key in ("tool_call_counts", "routing_tool_calls", "completion_tool_calls"))
     _handle_task_metrics({"task_id": "unknown", **task_tool_metrics({"loop_evidence_unavailable": True})}, ctx)
-    assert all(wire[1][key] is None for key in ("tool_calls", "tool_errors", "routing_tool_calls", "tool_call_counts"))
+    assert all(wire[1][key] is None for key in ("tool_calls", "tool_errors", "routing_tool_calls", "completion_tool_calls", "tool_call_counts"))
+
+
+def test_completion_metrics_require_the_host_fact_and_success():
+    calls = [{"tool": "finish_task"}, {"tool": "task_acceptance_review", "completion_control": True},
+             {"tool": "finish_task", "completion_control": True, "is_error": True}]
+    metrics = task_tool_metrics({"tool_calls": calls})
+    assert (metrics["tool_calls"], metrics["tool_errors"], metrics["completion_tool_calls"]) == (3, 1, 1)

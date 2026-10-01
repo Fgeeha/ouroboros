@@ -20,6 +20,16 @@ from tests.test_review_operation_lifetime import until
 
 @pytest.fixture
 def late(tmp_path, monkeypatch, fresh_sends):
+    # The model transport is synthetic; its budget quote must be offline too.
+    # Cold live catalogue I/O otherwise races the panel's 10s test wait. This
+    # synthetic tariff preserves real budget admission, reservation and settlement.
+    from ouroboros import pricing
+    for name in ("_cached_pricing", "_pricing_fetched_at", "_pricing_retry_after"):
+        monkeypatch.setattr(pricing, name, {})
+    monkeypatch.setattr(pricing, "_pricing_fetch_in_progress", set())
+    monkeypatch.setattr(pricing, "_fetch_live_rows", lambda provider, model="":
+                        {"openai/gpt-4.1-nano": (1.0, 1.0, 1.0, 1.0)}
+                        if provider == "openrouter" and not model else {})
     monkeypatch.setenv('OUROBOROS_TASK_REVIEW_MODE', 'auto')
     monkeypatch.setenv(REVIEWER_SLOTS_ENV, json.dumps({'triad': [
         {'slot_id': str(i), 'route': {'kind': 'api_chat', 'target_id': 'openai/gpt-4.1-nano'}} for i in range(3)],
@@ -203,13 +213,83 @@ def test_delayed_quorum_callback_keeps_one_final_historical_notice(
     for notice in [*notices, owed]:  # The real consumer also sees an outbox replay.
         chat._handle_send_message(notice, sender)
     assert len(sends) == 1 and sends[0][0] == 7, sends
-    assert 'pending' not in sends[0][1] and f'- 2: {last_verdict}' in sends[0][1], {
+    # The owner row says each outcome in words (DESIGN §4), one seat per roster slot in
+    # roster order, so the final notice reads slot 2's own verdict at seat 3.
+    words = {'PASS': 'passed it', 'FAIL': 'rejected it'}[last_verdict]
+    seats = [line.split(' — ')[0] for line in sends[0][1].split('\n')[1:]]
+    assert seats == [f'- openai/gpt-4.1-nano (requested) (seat {seat}): {outcome}'
+                     for seat, outcome in ((1, 'passed it'), (2, 'passed it'), (3, words))], {
         'notices': len(notices), 'sent': sends, 'retained': panel['late_settlement']['note']}
     assert len(notices) == 1, notices
     assert sends[0][1] == owed['text'] == panel['late_settlement']['note'] == source['late_settlement']['note']
     assert not pending_deliveries(f.root)
     again = _request(f, ctx, _source(ctx, text='Review this delivered historical answer again.'))
     assert again['reason'] == 'existing_paid_operation' and len(late.calls) == 3
+
+
+@pytest.mark.parametrize('order', ['drain_first', 'together'])
+def test_drain_and_last_slot_callback_settling_one_wave_queue_one_live_notice(late, tmp_path, monkeypatch, order):
+    """The drain's own settlement and the last slot's complete callback settle one wave.
+
+    ``drain_first``: the drain collects every slot and announces; the callback's
+    mailbox duty mark then lands and its settlement republishes. ``together``:
+    both reconcile the one pending run at once. The outbox owes one notice and
+    exactly one live copy is queued; no reviewer is bought again.
+    """
+    from ouroboros import acceptance_settlement as settlement
+    from ouroboros import review_dispatch, review_operation
+    from supervisor.terminal_delivery import pending_deliveries
+
+    f = delivered(tmp_path, monkeypatch)
+    ctx = _caller(f)
+    ctx.event_queue = queue.Queue()
+    drain = threading.current_thread()
+    complete, drain_entered, drain_done = threading.Event(), threading.Event(), threading.Event()
+    announce, settle = settlement.announce_acceptance_settlement, settlement.settle_acceptance_operation
+    collect, met, barrier = review_dispatch.collect_task_acceptance_run, [], threading.Barrier(2, timeout=10)
+
+    def last_slot_callback(usage_ctx, request, wave):
+        if all(wave['slots'].values()):
+            complete.set()
+            assert (drain_done if order == 'drain_first' else drain_entered).wait(10)
+        return announce(usage_ctx, request, wave)
+
+    def drain_settlement(usage_ctx, **kwargs):
+        if threading.current_thread() is not drain:
+            return settle(usage_ctx, **kwargs)
+        assert complete.wait(10)  # every slot is already in custody
+        drain_entered.set()
+        try:
+            return settle(usage_ctx, **kwargs)
+        finally:
+            drain_done.set()
+
+    def meeting_collect(run, **kwargs):
+        barrier.wait()
+        met.append(threading.current_thread().name)
+        return collect(run, **kwargs)
+
+    monkeypatch.setattr(settlement, 'announce_acceptance_settlement', last_slot_callback)
+    monkeypatch.setattr(settlement, 'settle_acceptance_operation', drain_settlement)
+    if order == 'together':
+        monkeypatch.setattr(review_dispatch, 'collect_task_acceptance_run', meeting_collect)
+    try:
+        result = _request(f, ctx, _source(ctx, text='Review this delivered historical answer.'))
+    finally:
+        for gate in (complete, drain_entered, drain_done):
+            gate.set()
+        until(lambda: not review_operation._LIVE)
+
+    assert result['status'] in {'announced', 'published'}, result
+    assert len(met) == (2 if order == 'together' else 0), met
+    notices = [row for row in list(ctx.event_queue.queue) if row.get('system_type') == 'acceptance_late_settlement']
+    owed, = pending_deliveries(f.root)
+    panel, = load_task_result(f.root, f.tid)['review_projection']['panels']
+    assert len(notices) == 1 and notices[0]['chat_id'] == 7, notices
+    assert notices[0]['delivery_id'] == owed['delivery_id'] and notices[0]['text'] == owed['text']
+    assert owed['text'] == panel['late_settlement']['note'] and len(late.calls) == 3
+    if order == 'drain_first':  # the callback's duty mark was consumed, not left to re-announce
+        assert not settlement.late_publication_owed(f.tid, panel['late_settlement']['reviewed_subject']['retry_key'])
 
 
 def _late_effects(f):
@@ -623,6 +703,8 @@ def test_handoff_failures_preserve_unknown_identity_without_resend(late, tmp_pat
     pointers = load_task_result(f.root, f.tid).get('review_operations') or {}
     assert pointers  # the preparation intent precedes the complete paid-request pointer
     assert any(p.get('source_ref') for p in pointers.values()) is (boundary != 'before_pointer')
+    # Only a recorded refusal, never an unknown preparation, leaves the debt retryable below.
+    assert boundary != 'before_pointer' or [p.get('state') for p in pointers.values()] == ['preparation_refused'], pointers
     claims = (load_task_result(f.root, f.accounting).get('task_acceptance_review_accounting') or {}).get('claims_by_binding') or {}
     assert bool(claims) is (boundary == 'after_claim')
     second = _request(f, ctx, _source(ctx, text='A separately requested retry after the handoff fault'))
@@ -630,6 +712,43 @@ def test_handoff_failures_preserve_unknown_identity_without_resend(late, tmp_pat
         until(lambda: len(late.calls) == 3)
     else:
         assert second['reason'] == 'existing_paid_operation' and not late.calls, second
+
+
+@pytest.mark.parametrize('reader', ['author', 'paid_stamp'])
+def test_a_read_denied_by_a_concurrent_replace_never_refuses_the_owner_panel(late, tmp_path, monkeypatch, reader):
+    """Windows denies an open that meets another thread's atomic replace of the same
+    task result. One such instant at a strict preclaim read (the author's before
+    dispatch, or the paid stamp's on a reviewer racing the author's publication) is
+    not unreadable authority: the owner's panel still buys its three reviewers once."""
+    import pathlib
+    from ouroboros import review_dispatch, review_operation
+    f = delivered(tmp_path, monkeypatch, retry=True)
+    ctx = _caller(f)
+    inside, denied = set(), []
+    preclaim, read_text = review_dispatch.task_acceptance_preclaim_refusal, pathlib.Path.read_text
+
+    def observed_preclaim(admission):
+        if (threading.current_thread() is not threading.main_thread()) == (reader == 'paid_stamp'):
+            inside.add(threading.get_ident())
+        try:
+            return preclaim(admission)
+        finally:
+            inside.discard(threading.get_ident())
+
+    def denied_once(path, *args, **kwargs):
+        if threading.get_ident() in inside and path.parent.name == 'task_results' and not denied:
+            denied.append(path.name)
+            raise PermissionError(13, 'The process cannot access the file', str(path))
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(review_dispatch, 'task_acceptance_preclaim_refusal', observed_preclaim)
+    monkeypatch.setattr(pathlib.Path, 'read_text', denied_once)
+    result = _request(f, ctx, _source(ctx))
+    assert result['status'] in {'pending', 'announced', 'published', 'settled'}, result
+    until(lambda: len(late.calls) == 3)
+    until(lambda: not review_operation._LIVE)
+    claims = (load_task_result(f.root, f.accounting).get('task_acceptance_review_accounting') or {}).get('claims_by_binding') or {}
+    assert denied and len(late.calls) == 3 and len(claims) == 1, (denied, claims)
 
 
 @pytest.mark.parametrize('amount,explicit,expected', [(None, 'original_admission', None), (2.0, 'original_admission', 2.0), (None, '', 9.0)])

@@ -51,20 +51,22 @@ def test_pull_requests_and_ouroboros_pushes_share_one_full_browser_lane():
     assert "steps" not in caller, "the browser steps belong to the shared lane"
 
     push = yaml.safe_load(push_path.read_text(encoding="utf-8"))
-    assert _triggers(push) == {"push": {"branches": ["ouroboros"]}}
+    assert set(_triggers(push)) == {"push", "workflow_dispatch"}
+    assert _triggers(push)["push"] == {"branches": ["ouroboros"]}
+    assert _triggers(push)["workflow_dispatch"]["inputs"]["diagnostic"]["options"] == ["full", "viewport", "inflight"]
     assert push["jobs"]["ui-smoke"]["uses"] == caller["uses"]
 
     shared = yaml.safe_load(shared_path.read_text(encoding="utf-8"))
     assert list(_triggers(shared)) == ["workflow_call"]
     steps = {step.get("name"): step for step in shared["jobs"]["ui-smoke"]["steps"] if step.get("name")}
     full = steps["Run complete host UI lane with collection and availability guards"]
-    assert full["if"] == "${{ !cancelled() && steps.install_browsers.outcome == 'success' }}"
-    assert full["run"].endswith(
-        "python -m pytest tests/ -m ui_browser --require-ui-browser -q --tb=short")
+    assert full["if"] == "${{ !cancelled() && steps.install_browsers.outcome == 'success' && inputs.diagnostic == 'full' }}"
+    assert "python -m pytest tests/ -m ui_browser --require-ui-browser -vv --tb=short" in full["run"]
     assert full["env"]["OUROBOROS_RUN_UI_SMOKE"] == "1"
     assert full["env"]["OUROBOROS_EXPECT_BROWSER_ENGINES"] == "chromium,webkit"
     assert steps["Run browser tools Chromium/WebKit smoke"]["if"] == (
         "${{ !cancelled() && steps.install_browsers.outcome == 'success'"
+        " && inputs.diagnostic == 'full'"
         " && (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')) }}")
     for text in (_job_text("ui-smoke"), shared_path.read_text(encoding="utf-8"),
                  push_path.read_text(encoding="utf-8")):

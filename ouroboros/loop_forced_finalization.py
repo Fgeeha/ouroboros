@@ -359,114 +359,16 @@ def _maybe_enforce_child_absorption_gate(
     undecided = _undispositioned_children(limit_ctx)
     if not undecided:
         return None
-    if not getattr(tools._ctx, "_child_absorption_reminded", False):
-        tools._ctx._child_absorption_reminded = True
-        if content and str(content).strip():
-            messages.append({"role": "assistant", "content": content})
-        listed = _undecided_children_listing(undecided)
-        reminder = (
-            "[CHILD_ABSORPTION_REQUIRED]\n"
-            "You have child result(s) without a current exact-hash disposition: "
-            f"{listed}. Before a clean final answer, inspect unfinished children or record a "
-            "tree_note(kind='decision') payload with type=child_result_disposition, child_task_id, "
-            "disposition=integrated|irrelevant|deferred, and the shown child_result_sha256. "
-            "To disposition several children in ONE call, pass a children array instead: "
-            "payload={'type': 'child_result_disposition', 'children': [{'child_task_id': ..., "
-            "'disposition': ..., 'child_result_sha256': ...}, ...]}. "
-            "discard_child_result remains the shorthand for irrelevant. This is a bounded reminder; "
-            "ignoring it will finalize best_effort, not clean."
-        )
+    reminder = ("[CHILD_ABSORPTION_REQUIRED]\nCurrent children without an exact disposition: "
+                + _undecided_children_listing(undecided) + ". Inspect/wait for results and record "
+                "tree_note(kind='decision', payload={'type':'child_result_disposition', 'children': "
+                "[{'child_task_id': ..., 'disposition': 'integrated|irrelevant|deferred', 'child_result_sha256': ...}]}). "
+                "You may discard or cancel with their existing tools, defer honestly, or explicitly "
+                "finish_task(action='stop', rationale=..., answer=...) with unfinished work. No reminder count ends the task.")
+    if not messages or messages[-1].get("content") != reminder:
         _loop()._append_or_merge_user_message(messages, reminder)
-        emit_progress("Child absorption reminder injected before final response.")
-        llm_trace["reasoning_notes"].append("Child absorption reminder injected before final response.")
-        return "continue"
-    # Fresh snapshot for the forced prompt: child statuses may have flipped
-    # since the reminder round; the model must state CURRENT statuses.
-    undecided = _undispositioned_children(limit_ctx)
-    text, usage, forced_trace = _loop()._forced_final_answer(
-        limit_ctx,
-        prompt=(
-            "[FINALIZE_WITH_UNABSORBED_CHILDREN]\n"
-            "You still have child results without exact dispositions and already received one "
-            "child-absorption reminder. Produce an honest best-effort final answer now that says "
-            "what remains unabsorbed or unfinished; the exact child state is: "
-            f"{_undecided_children_listing(undecided)}."
-        ),
-        fallback_text="⚠️ Finalized best-effort with undispositioned child results.",
-        reason_code="children_unabsorbed",
-    )
-    _loop()._merge_finalization_trace(llm_trace, forced_trace)
-    _run_forced_children_acceptance(
-        tools, limit_ctx, text, messages, emit_progress, llm_trace,
-    )
-    return text, usage, llm_trace
-
-
-def _run_forced_children_acceptance(
-    tools: ToolRegistry,
-    limit_ctx: _RoundLimitContext,
-    text: str,
-    messages: List[Dict[str, Any]],
-    emit_progress: Callable[[str], None],
-    llm_trace: Dict[str, Any],
-) -> None:
-    """Content acceptance still runs on the forced children_unabsorbed rail (owner Q2A).
-
-    The panel uses the ORDINARY entry point
-    (`_run_task_acceptance_review_once`) after the forced answer text exists
-    but BEFORE the loop seals it; the evidence packet carries the
-    undispositioned children via the ctx stash. The forced rail can never
-    take another model round, so a ``True`` return terminalizes here: a
-    requested improvement pass downgrades to ``finalized_unaccepted``; a WAIT
-    shape that never ran the panel keeps the typed acceptance-bypass verdict
-    from `_record_forced_finalization`. Never raises — salvage outranks review."""
-    if not str(text or "").strip():
-        return
-    tools_ctx = tools._ctx
-    try:
-        from ouroboros.tools.join_ledger import _child_result_sha256
-
-        # Fresh debt adjacent to the panel's own fresh subtree read: a child
-        # may settle across the forced call — one packet, one moment.
-        undecided = _undispositioned_children(limit_ctx)
-        debt = [
-            {
-                "task_id": str(c.get("task_id") or c.get("id") or ""),
-                "status": str(c.get("status") or "unknown"),
-                "child_result_sha256": _child_result_sha256(c),
-            }
-            for c in undecided[:20]
-            if isinstance(c, dict)
-        ]
-        if len(undecided) > 20:
-            # Explicit omission marker: a >20-child debt list must not read as complete.
-            debt.append({"omitted": len(undecided) - 20, "total": len(undecided)})
-        tools_ctx._forced_undispositioned_children = debt
-        another_round = _loop()._run_task_acceptance_review_once(
-            tools=tools,
-            content=str(text),
-            task_id=limit_ctx.task_id,
-            task_type=limit_ctx.task_type,
-            llm_trace=llm_trace,
-            drive_root=limit_ctx.drive_root,
-            messages=messages,
-            emit_progress=emit_progress,
-        )
-        if not another_round:
-            return
-        tools_ctx._task_acceptance_reviewed = True
-        _loop()._end_task_acceptance_fence(tools_ctx, outcome="terminal")
-        # This rail records its bypass BEFORE its panel, so the terminalisation
-        # belongs here rather than in the bypass recorder.
-        if _loop().terminalize_dangling_revision(llm_trace, rail="children_unabsorbed"):
-            emit_progress(
-                "Task acceptance ran on the forced rail; the requested improvement "
-                "pass is unavailable, finalizing unaccepted."
-            )
-    except Exception:
-        log.debug("Forced children_unabsorbed acceptance run failed", exc_info=True)
-    finally:
-        tools_ctx._forced_undispositioned_children = None
+    emit_progress("Child results still require an author disposition or an explicit unfinished stop.")
+    return "continue"
 
 
 def _plan_gate_identity(decision: Dict[str, Any]) -> str:
@@ -676,14 +578,14 @@ def _presence_forced_contract(ctx: _RoundLimitContext, tools_ctx: Any) -> str:
         "This task answers a Presence conversation. Your answer is its internal record for the "
         "owner and review; the people in the conversation receive only what you declare. Return "
         "exactly one JSON object and no other text: "
-        '{"delivery_control":"replace","full_answer":"<complete internal record>",'
+        '{"action":"finish","answer":"<complete internal record>",'
         '"presence_finish":{"outcome":"message","message":"<new text for the conversation>"}}'
-        + (' ("delivery_control":"keep" without full_answer keeps the current answer as the record)'
+        + (' (answer_sha256 instead of answer selects the exact retained record)'
            if _loop()._live_delivery_candidate(ctx) is not None else "")
         + ". Outcomes: message = new useful speech on their subject, an honest partial included; "
         "silent = nothing new needs saying; tool_delivered = the substantive result already reached "
         "them through a transport tool; deferred = acknowledge work that was actually scheduled"
-        + (" (it was)" if scheduled else " (none was)") + ". Keep internal facts in full_answer; "
+        + (" (it was)" if scheduled else " (none was)") + ". Keep internal facts in answer; "
         "the host never forwards that record automatically. You decide what, if anything, to say "
         "in presence_finish.message, including relevant limitations. "
         "An early acknowledgement is not the promised result and an uncertain send may not have "
@@ -742,6 +644,12 @@ def _forced_subject_prompt(ctx: _RoundLimitContext, llm_trace: Dict[str, Any]) -
         return ""
     observed = capture_acceptance_observation(tools_ctx, llm_trace, ctx.incoming_messages)
     rendered = acceptance_observation_prompt(tools_ctx, observed)
+    candidate = getattr(tools_ctx, "_delivery_candidate", None)
+    if candidate is not None:
+        rendered += ("\nAt this forced boundary do not call tools. Select the complete answer as prose "
+            "or one serialized completion request: {\"action\":\"finish\",\"answer_sha256\":\""
+            + candidate.content_sha256 + "\"}. Use answer instead for full replacement bytes; "
+            "stop also requires rationale naming unfinished work. Presence additionally requires its explicit outward declaration.")
     return "\n\n" + rendered if rendered else ""
 
 
@@ -1147,13 +1055,14 @@ def _resolve_forced_delivery_control(
         _loop()._resolve_forced_delivery_control_body(
             extracted, candidate, armed=armed,
             envelope_keys=("presence_finish",) if presence_armed else (),
+            messages=getattr(ctx, "messages", None), held_sha256=getattr(tools_ctx, "_completion_held_sha256", ""),
         )
     )
     if presence_armed and isinstance(tools_ctx._presence_forced_pending, dict):
         from ouroboros.loop_delivery import _parse_delivery_control_body
 
         parsed, _, _ = _parse_delivery_control_body(extracted)
-        if degraded or not (isinstance(parsed, dict) and parsed.get("delivery_control") in {"keep", "replace"}):
+        if degraded or not (isinstance(parsed, dict) and parsed.get("action") in {"finish", "stop"}):
             # A declaration cannot speak unless its outer control positively chose the final record.
             tools_ctx._presence_forced_pending = None
             tools_ctx._presence_forced_declaration = {
@@ -1183,6 +1092,12 @@ def _resolve_forced_delivery_control(
                         "status": ACCEPTANCE_FINALIZED_UNACCEPTED, "reason": REASON_DELIVERY_CONTROL_DEGRADED,
                         "source": "forced_acceptance_subject", "rationale": error,
                     })
+    if consumed and not degraded and llm_trace is not None:
+        parsed, _, _ = _parse_delivery_control_body(extracted)
+        if isinstance(parsed, dict) and parsed.get("action") == "stop":
+            import hashlib
+            llm_trace["task_completion"] = {"action": "stop", "rationale": parsed["rationale"],
+                "answer_sha256": hashlib.sha256(resolved.encode("utf-8")).hexdigest(), "source": "forced_completion"}
     return (
         resolved,
         REASON_DELIVERY_CONTROL_DEGRADED if degraded else "",

@@ -1,10 +1,11 @@
-import { accountedUpperBound, accountedUpperBoundWithChildren, formatUsd4, joinMarkdownHeadings } from './utils.js';
+import { accountedUpperBound, accountedUpperBoundWithChildren, formatUsd4, joinMarkdownHeadings, plainCauseText, savedTerminalRowNote } from './utils.js';
 import { cancelCauseClauses } from './cancel_presentation.js';
 import { taskCheckpointLabel, checkpointHasProgressRow } from './task_checkpoints.js';
 export { taskCheckpointLabel } from './task_checkpoints.js';
 import { harnessPresentation } from './harness_presentation.js';
 import { acceptanceIncidentClauses } from './acceptance_incident_presentation.js';
 import { historyRetentionView } from './history_retention.js';
+import { effortEvidenceText } from './effort_evidence.js';
 import { delegatedActivityView } from './delegated_activity.js';
 import {
     classifyReviewLifecycle,
@@ -27,11 +28,7 @@ export const LOG_CATEGORIES = {
     consciousness: { label: 'Consciousness', color: 'var(--accent)' },
 };
 
-// Logs phases that file a row under the Errors filter (#323). They are the
-// typed failure outcomes summarizeLogEvent already derives — a failed task_done,
-// a tool that errored/was killed/timed out, an LLM call failure, a review
-// lifecycle error — so the category and the phase pill of one row can never
-// disagree, live or on replay.
+// The Errors filter follows the same typed failure phases on live and replay rows.
 const ERROR_LOG_PHASES = new Set(['error', 'timeout', 'lifecycle_error']);
 
 export function categorizeLogEvent(evt, view = summarizeLogEvent(evt)) {
@@ -366,7 +363,7 @@ function toolCallKey(evt, groupId) {
 }
 
 const toolObservation = (evt, groupId, status) => ({
-    key: toolCallKey(evt, groupId), status, receipt: Boolean(evt.routing_action), tool: evt.tool || '',
+    key: toolCallKey(evt, groupId), status, receipt: Boolean(evt.routing_action) || evt.completion_control === true, tool: evt.tool || '',
     fact: (evt.type || evt.event) === 'tool_call_started' ? 'started'
         : ['tool_call_timeout', 'tool_timeout'].includes(evt.type || evt.event) ? 'wait_ended' : 'settled',
     hostError: evt.status === 'host_error', live: evt._live_tool_frame === true,
@@ -558,11 +555,8 @@ function terminalLimitations(record, reason, held = false) {
     return [deferred ? taskReasonPhrase('child_results_deferred') : '', open ? taskReasonPhrase(planReviewKey(record, planKey)) : ''];
 }
 
-// Every simultaneous cause the record holds, as ONE line: the primary cause is what
-// ENDED the task; a deferred child, a plan review still open at delivery and an
-// unreconciled custody debt are standing limitations of the SAME answer, stated
-// BESIDE it instead of replacing it or being replaced by it. Nothing ranks or folds;
-// equivalent clauses state themselves once. The twin of project_dialogue._completion_verdict.
+// One line for the primary cause and standing limitations; equivalent clauses
+// appear once. The twin of project_dialogue._completion_verdict.
 export function taskReasonDetail(evt) {
     const record = normalizeTaskTerminalRecord(evt);
     const decision = record.outcome_axes?.review?.acceptance_decision
@@ -570,6 +564,7 @@ export function taskReasonDetail(evt) {
     const severity = taskOutcomeSeverity(evt);
     const decisionCause = String(decision?.reason || '');
     const objective = record.outcome_axes?.objective;
+    const completion = record.task_completion ?? record.outcome_axes?.execution?.task_completion;
     // A healed debt is never restored: naming it again would state a debt the
     // same record shows as empty. Resolved once for every branch.
     const [reason, custody] = custodyDebtReason(record);
@@ -594,8 +589,8 @@ export function taskReasonDetail(evt) {
     } else if (!evt?.reason_code || evt.reason_code === 'final_message') {
         // A clean finish over a plan review that was only awaited states that fact; an amber
         // or red card owes its colour to something else, so the fact never sits in its cause slot.
-        clause = severity === 'done' && record.outcome_axes?.execution?.plan_review === 'awaiting'
-            ? taskReasonPhrase('plan_review_awaiting') : '';
+        clause = completion?.action === 'stop' && severity !== 'cancelled' ? taskReasonPhrase('author_stop')
+            : severity === 'done' && record.outcome_axes?.execution?.plan_review === 'awaiting' ? taskReasonPhrase('plan_review_awaiting') : '';
     } else {
         // The current execution reason speaks when there is one (the open plan review by its
         // class), otherwise the row states no cause and leaves the headline to its own axis.
@@ -604,7 +599,8 @@ export function taskReasonDetail(evt) {
             ? String(receiptVeto.detail).split(/\s+/).filter(Boolean).join(' ')
             : taskReasonPhrase(reason === 'plan_review_advisory' ? planReviewKey(record, reason) : reason);
     }
-    const line = joinCauseClauses([clause, authorStopRationale(decision), ...acceptanceIncidentClauses(decision, reason, TASK_CAUSE_PHRASES),
+    const rationale = completion?.action === 'stop' ? plainCauseText(completion.rationale, 0) : authorStopRationale(decision);
+    const line = joinCauseClauses([clause, rationale, ...acceptanceIncidentClauses(decision, reason, TASK_CAUSE_PHRASES),
         ...terminalLimitations(record, reason, held), custody ? taskReasonPhrase(custody) : '']);
     // Cancellation's host/browser sentence has identical punctuation. Other
     // cause policy stays with the runtime owner of this shared seam.
@@ -821,12 +817,11 @@ export function summarizeLogEvent(evt) {
 
     if (t === 'llm_round_finished' || t === 'llm_round') {
         return view('done', `LLM round ${evt.round || ''} finished`.trim(), {
+            body: effortEvidenceText(evt),
             meta: taskMeta(
                 evt.model || '',
                 formatLogTokens(evt),
-                // ABI-3: /api/logs backfill rows carry the honest name; live
-                // frames still say cost_usd/cost — resolve the pair via the
-                // SSOT helper, then the live-frame `cost` spelling.
+                // Backfill uses accounted upper bounds; live frames may carry cost.
                 formatLogMoney(accountedUpperBound(evt) ?? evt.cost),
                 evt.response_kind === 'tool_calls' ? `${evt.tool_call_count || 0} tool calls` : evt.response_kind || '',
             ),
@@ -848,6 +843,7 @@ export function summarizeLogEvent(evt) {
 
     if (t === 'llm_usage') {
         return view('usage', 'LLM usage recorded', {
+            body: effortEvidenceText(evt),
             meta: taskMeta(
                 evt.model || '',
                 formatLogTokens(evt),
@@ -1081,7 +1077,7 @@ export function summarizeLogEvent(evt) {
     // only a name visible under Errors, and it is pinned as a remainder, not a taxonomy.
     const level = String(evt.level || '').toLowerCase();
     const body = shortText(
-        evt.error || evt.message || evt.text || evt.result_preview
+        evt.error || evt.message || evt.text || evt.result_preview || effortEvidenceText(evt)
             || compactJson(evt.args || evt.task || evt.checks, 260), 260,
     );
     if (evt.ok === true) {
@@ -1105,7 +1101,7 @@ export function summarizeLogEvent(evt) {
 
 function chatView({
     phase = 'working',
-    headline = 'Working...',
+    headline = '',  // no placeholder: a frame naming nothing has none; the chip says Working (#1369)
     body = '',
     fullBody = '',
     fullHeadline = '',
@@ -1124,9 +1120,7 @@ function chatView({
     toolCall = null,
 } = {}) {
     const out = { phase, headline, body, visible, promote, terminal, human, dedupeKey };
-    // A receipt row renders inside a block but is not content the block can
-    // stand on: the fact it reports lives elsewhere (the owner message's
-    // routing annotation for an addressing call).
+    // Receipt rows render inside existing blocks but cannot create one.
     if (receipt) out.receipt = true;
     if (toolCall) out.toolCall = toolCall;  // folded into the block's one evidence row
     if (fullBody) out.fullBody = fullBody;
@@ -1165,8 +1159,8 @@ export function taskTerminalSummary(evt = {}) {
     const knownStatus = String(record?.status || record?.outcome_axes?.lifecycle?.status || '').toLowerCase();
     const observedOutcome = OBSERVED_OUTCOME_STATUSES.has(knownStatus) ? outcome : '';
     const presentation = taskPresentation(terminal ? outcome : 'working');
-    const body = [taskStoppedWithSummary(evt) ? OWNER_STOP_DETAIL_MARKER : '', taskReasonDetail(evt)]
-        .filter(Boolean).join('\n');
+    const body = [taskStoppedWithSummary(evt) ? OWNER_STOP_DETAIL_MARKER : '', taskReasonDetail(evt),
+        terminal ? savedTerminalRowNote(evt) : ''].filter(Boolean).join('\n');
     const cause = terminal ? taskReasonDetail(evt) : '';
     return {
         ...chatView({
@@ -1275,7 +1269,8 @@ function summarizeChatLiveEventView(evt) {
             ? taskReasonDetail({ status: 'cancelled', cancel_origin: evt.cancel_origin,
                 task_id: evt.subagent_task_id || evt.task_id,
                 parent_task_id: evt.parent_task_id, root_task_id: evt.root_task_id }) : '';
-        const reasonDetail = cancelDetail || (evt.reason_code ? taskReasonPhrase(evt.reason_code) : '');
+        const stopDetail = (evt.task_completion ?? evt.outcome_axes?.execution?.task_completion)?.action === 'stop' ? taskReasonDetail(evt) : '';
+        const reasonDetail = cancelDetail || stopDetail || (evt.reason_code ? taskReasonPhrase(evt.reason_code) : '');
         const detailParts = [
             progressText.full,
             resultText.full ? `[RESULT]\n${resultText.full}` : '',
@@ -1283,9 +1278,7 @@ function summarizeChatLiveEventView(evt) {
             errorText.full ? `[ERROR]\n${errorText.full}` : '',
             reasonDetail,
         ].filter(Boolean);
-        // A generic "completed" event still carries authoritative outcome axes: normalize it
-        // once here so every live/replay route takes label, phase and terminal truth from the
-        // canonical projector.
+        // Completed frames take label and phase from their authoritative outcome axes.
         const completionSeverity = rawEvent === 'completed' ? taskOutcomeSeverity(evt) : 'done';
         const event = rawEvent === 'completed'
             ? (completionSeverity === 'cancelled' ? 'cancelled'
@@ -1303,6 +1296,7 @@ function summarizeChatLiveEventView(evt) {
                             : event === 'scheduled' ? 'start'
                                 : 'working';
         const terminal = ['completed', 'completed_warn', 'failed', 'cancelled', 'rejected'].includes(event);
+        const terminalCause = terminal ? (cancelDetail || stopDetail) : '';
         // A child's own note carries the same voice fact (the progress branch below): a host
         // note inside the child's turn is a visible row that never claims the card's collapsed
         // line. The lifecycle, result and error frames state no voice, so they keep leading.
@@ -1325,9 +1319,9 @@ function summarizeChatLiveEventView(evt) {
         return chatView({
             phase,
             headline: subagentHeadline(sid, role, label, evt.model),
-            body: cancelDetail || activity.preview || '',
+            body: terminalCause || activity.preview || '',
             fullBody: detailParts.join('\n\n'),
-            activityPreview: cancelDetail || activity.preview || '',
+            activityPreview: terminalCause || activity.preview || '',
             visible: true,
             promote: promoted,
             human: promoted,
@@ -1352,7 +1346,8 @@ function summarizeChatLiveEventView(evt) {
         const narration = evt.narration === true || evt.narration === undefined;
         return chatView({
             phase: lifecycleTerminal ? (/failed\b/i.test(progressText.full) ? 'lifecycle_error' : 'done') : 'working',
-            headline: progressText.preview || 'Working...',
+            // An empty note is no narration: a placeholder would become the card title as if said (#1369).
+            headline: progressText.preview || '',
             fullHeadline: progressText.full || '',
             activityPreview: progressText.preview || '',
             visible: Boolean(progressText.preview),
@@ -1411,15 +1406,14 @@ function summarizeChatLiveEventView(evt) {
     if (t === 'tool_call_started' || (['tool_call_finished', 'tool_call'].includes(t) && !evt.is_error)) {
         // A successful call is execution evidence, not narration: start and finish feed the
         // block's ONE folded row (counts; tools behind Expand), a receipt while every counted
-        // call is a host-stamped addressing act (`routing_action`, reported by the owner
-        // message's annotation). A failure keeps its own error row and still counts. `done` is
+        // call is a host-stamped routing or completion act. Failures keep their own row. `done` is
         // the TASK's phase; a finished CALL is `ok`.
         const status = t === 'tool_call_started' ? (evt._live_tool_frame ? 'calling' : 'unknown') : 'ok';
         return chatView({
             phase: status,
             headline: '',
             visible: true,
-            receipt: Boolean(evt.routing_action),
+            receipt: Boolean(evt.routing_action) || evt.completion_control === true,
             dedupeKey: `tools|${groupId}`,
             toolCall: toolObservation(evt, groupId, status),
         });

@@ -143,6 +143,8 @@ export class ElementStub {
         }
         return [];
     }
+    matches(selector) { return selector.split(',').some((part) => part.trim().startsWith('.')
+        && this.classList.contains(part.trim().slice(1))); }
     closest(selector) {
         if (selector === '.page.active' && this.classList.contains('page') && this.classList.contains('active')) return this;
         return this.parentElement?.closest?.(selector) || null;

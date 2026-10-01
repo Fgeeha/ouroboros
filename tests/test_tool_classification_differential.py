@@ -379,6 +379,8 @@ CURRENT_PRODUCER_CONTRACTS = {
     "INTEGRATE_CAPPED_TREE": (True, "integration_blocked"),
     "INTEGRATE_DIRECTORY_SURFACE_MISMATCH": (True, "integration_blocked"),
     "INTEGRATE_FILE_OUTPUTS_UNAVAILABLE": (True, "integration_blocked"),
+    "INTEGRATE_APPLY_UNKNOWN": (True, "integration_blocked"),
+    "INTEGRATE_COPY_BINDING_MISMATCH": (True, "integration_blocked"),
     # The harvest puts every identifier first. A standalone capture failure
     # is an error; the actual successful-write suffix is pinned separately.
     "OUTPUT_CAPTURE_FAILED": (True, "error"),
@@ -409,6 +411,10 @@ CURRENT_PRODUCER_CONTRACTS = {
     "MCP_CATALOG_UNAVAILABLE": (True, "unavailable"),
     "TASK_FORBIDDEN": (True, "blocked"),
     "native:LEGACY_BLOCKED:TASK_FORBIDDEN": (True, "blocked"),
+    # #1412: send_user_message(destination="main") refuses a caller with no Main
+    # voice (delegated, Presence, agent-to-agent) through native ACCESS_BLOCKED.
+    "MAIN_NOTICE_BLOCKED": (True, "blocked"),
+    "native:ACCESS_BLOCKED:MAIN_NOTICE_BLOCKED": (True, "blocked"),
 }
 
 

@@ -45,7 +45,8 @@ def bound_project_chat_id(ctx: Any, task_id: Any, parent_task_id: Any = "", root
     )
 
 
-def ingress_chat_id(raw_chat_id: Any, drive_root: Any, project_id: Any = "", *, source: Any = "") -> int:
+def ingress_chat_id(raw_chat_id: Any, drive_root: Any, project_id: Any = "", *,
+                    source: Any = "", project_basis: Optional[dict] = None) -> int:
     """The address a headless/API task is admitted with (ingress capture rule).
 
     A run scoped to a REGISTERED project is admitted into that project's thread,
@@ -64,9 +65,11 @@ def ingress_chat_id(raw_chat_id: Any, drive_root: Any, project_id: Any = "", *, 
     a real session, never "missing", as ``address_task_event`` also enforces.
     A value that is not a whole number (a JSON boolean or fraction
     included) raises, so the caller keeps its typed 400. Lifecycle is NOT
-    consulted here: ``queue.enqueue_task`` fences a non-active project before an
+    consulted for refusal here: ``queue.enqueue_task`` fences a non-active project before an
     address can matter, and a project deleted mid-run keeps its reserved chat.
     """
+    # API preparation already captured this authority; do not re-read a different
+    # snapshot just to address it. Other ingress callers retain their lookup.
     project_chat = None
     reserved_chat = None
     pid = str(project_id or "").strip()
@@ -76,7 +79,8 @@ def ingress_chat_id(raw_chat_id: Any, drive_root: Any, project_id: Any = "", *, 
 
             from ouroboros.projects_registry import PROJECT_ACTIVE
 
-            row = get_reserved_project(drive_root, pid) or {}
+            row = (project_basis.get("project") if project_basis is not None
+                   else get_reserved_project(drive_root, pid)) or {}
             if row.get("chat_id") is not None:
                 reserved_chat = int(row["chat_id"])
                 # Only an ACTIVE project supplies an address. An inactive one

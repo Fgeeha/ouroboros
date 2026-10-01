@@ -123,7 +123,7 @@ def test_responses_flex_refusal_reprices_standard_and_keeps_original_intent(ctx,
     error.body = {"error": {"code": "resource_unavailable", "param": "service_tier"}}
     mock_openai.responses.create.side_effect = [error, _FakeStream([
         _make_event("response.output_text.delta", delta="answer"), _make_completed_event()])]
-    result = json.loads(_web_search(ctx, "same query"))
+    result = json.loads(_web_search(ctx, "same query", reasoning_effort="high"))
     assert result["answer"] == "answer"
     assert [call.kwargs["service_tier"] for call in mock_openai.responses.create.call_args_list] == ["flex", "default"]
     assert [request.processing_preference for request in prepared] == ["economy", "economy"]
@@ -132,6 +132,14 @@ def test_responses_flex_refusal_reprices_standard_and_keeps_original_intent(ctx,
         records = ua._read_records_locked_cached(holds[0].drive_root)
     matching = [row for row in records if row.get("candidate_raw_sha256") == prepared[0].candidate_raw_sha256]
     assert matching[-1]["state"] == "released"
+    for request in prepared:
+        assert request.effort == {
+            "requested": "high", "sent": {"reasoning": {"effort": "high"}},
+            "sent_state": "explicit", "sent_source": "host_candidate",
+            "reported": None, "report_source": None,
+        }
+        attempt_rows = [row for row in records if row.get("candidate_raw_sha256") == request.candidate_raw_sha256]
+        assert all(row["effort"] == request.effort for row in attempt_rows)
 
 
 def test_web_search_uses_official_openai_responses(monkeypatch):
