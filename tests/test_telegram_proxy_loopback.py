@@ -169,7 +169,7 @@ def test_all_telegram_consumers_succeed_through_real_transport(tmp_path, monkeyp
     plugin, _telegram_api, notifier = _load()
     caplog.set_level(logging.DEBUG, logger="httpcore")
     server_tls, client_tls = _tls_contexts(tmp_path)
-    real_client, real_dns, real_connect = httpx.AsyncClient, socket.getaddrinfo, socket.socket.connect
+    real_client, real_dns = httpx.AsyncClient, socket.getaddrinfo
     options = []
     bot = _LoopbackBot()
     def dns(host, port, *args, **kwargs):
@@ -178,18 +178,10 @@ def test_all_telegram_consumers_succeed_through_real_transport(tmp_path, monkeyp
             host, port = "127.0.0.1", bot.origin_port
         assert host in ("127.0.0.1", b"127.0.0.1", "::1", b"::1", None)
         return real_dns(host, port, *args, **kwargs)
-    def connect(sock, address):
-        if isinstance(address, tuple):
-            assert ipaddress.ip_address(address[0]).is_loopback, address
-            if address[1] == 443:
-                # AnyIO keeps the requested port when consuming getaddrinfo.
-                address = (address[0], bot.origin_port, *address[2:])
-        return real_connect(sock, address)
     def client_factory(**kwargs):
         options.append(dict(kwargs))
         return real_client(verify=client_tls, **kwargs)
     monkeypatch.setattr(socket, "getaddrinfo", dns)
-    monkeypatch.setattr(socket.socket, "connect", connect)
     monkeypatch.setattr(httpx, "AsyncClient", client_factory)
     monkeypatch.setattr(plugin, "_HONOR_ENV_PROXIES", False)
     # An explicit skill proxy must beat ambient routing; unset stays direct here.
@@ -201,6 +193,16 @@ def test_all_telegram_consumers_succeed_through_real_transport(tmp_path, monkeyp
     api = _Api(state, {"TELEGRAM_BOT_TOKEN": _TOKEN, "TELEGRAM_PROXY": "http://ignored.invalid"})
 
     async def scenario():
+        loop = asyncio.get_running_loop()
+        real_connect = loop.sock_connect
+        async def connect(sock, address):
+            if isinstance(address, tuple):
+                assert ipaddress.ip_address(address[0]).is_loopback, address
+                if address[1] == 443:
+                    # AnyIO retains the URL port; Proactor bypasses socket.connect.
+                    address = (address[0], bot.origin_port, *address[2:])
+            return await real_connect(sock, address)
+        monkeypatch.setattr(loop, "sock_connect", connect)
         origin = await asyncio.start_server(bot.accept(bot.origin), "127.0.0.1", 0, ssl=server_tls)
         bot.origin_port = origin.sockets[0].getsockname()[1]
         proxy = await asyncio.start_server(bot.accept(lambda r, w: bot.proxy(r, w, scheme)), "127.0.0.1", 0)
