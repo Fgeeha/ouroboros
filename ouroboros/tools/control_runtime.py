@@ -662,14 +662,14 @@ def stage_completion_request(ctx: ToolContext, request: dict, *, source: str = "
     )["is_root_task"]:
         error = "pending_review is available only on root tasks"
     if error:
-        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text="ERROR: COMPLETION_ARGUMENT: " + error))
+        return publish_no_effect(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text="ERROR: COMPLETION_ARGUMENT: " + error))
     staged = {key: copy.deepcopy(value) for key, value in request.items() if value is not None}
     staged.update(source=source, reply_later=reply_later, allow_empty=allow_empty,
                   observation=copy.deepcopy(getattr(ctx, "_completion_observation", {})))
     previous = getattr(ctx, "_completion_request", None)
     if previous is not None and previous.get("observation") == staged["observation"] and previous != staged:
         ctx._completion_conflict = True
-        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR",
+        return publish_no_effect(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR",
             text="ERROR: COMPLETION_CONFLICT: contradictory completion requests in one response; select again after seeing all results."))
     ctx._completion_request = staged
     return json.dumps({"status": "completion_requested", "completion_control": True, "action": action}, ensure_ascii=False)
