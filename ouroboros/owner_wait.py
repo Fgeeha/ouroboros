@@ -157,7 +157,12 @@ def continuation_state(ctx: Any, messages: list, trace: dict, usage: dict,
             "_delivery_candidate_revision", "_delivery_control_required",
             "_delivery_evidence_revision", "_delivery_evidence_fingerprint",
             "_delivery_effective_criteria", "_delivery_material_tool_indices",
-            "_acceptance_ack_source_sha256",
+            "_acceptance_ack_source_sha256", "_completion_request", "_completion_selected",
+            "_completion_observation", "_completion_held_sha256", "_presence_completion",
+            "_presence_completion_owner_revision", "_acceptance_observation",
+            "_presence_forced_declaration", "_presence_forced_pending", "_presence_completion_accepted",
+            "_task_acceptance_sealed_fence_token", "_task_acceptance_sealed_fence_generation",
+
         ) if getattr(ctx, key, None) is not None},
         "acceptance": {
             "_task_acceptance_improvement_passes": int(getattr(ctx, "_task_acceptance_improvement_passes", 0)),
@@ -552,7 +557,13 @@ def restore_continuation_state(tools: Any, state: dict, messages: list, trace: d
     for key, value in {**state["route"], **state["delivery"], **state["acceptance"]}.items():
         setattr(ctx, key, value)
     candidate = state.get("delivery_candidate")
-    ctx._delivery_candidate = DeliveryCandidate(**candidate) if candidate else None
+    ctx._delivery_candidate = DeliveryCandidate(**{key: value for key, value in candidate.items()
+        if key != "repair_attempted"}) if candidate else None
+    if ctx._delivery_candidate is not None:
+        value = ctx._delivery_candidate
+        if value.control_episode_seen or value.finalization_control not in {"candidate", "owner_revision_required"}:
+            ctx._delivery_control_required = True
+            value.control_episode_seen = True
 
 
 def rebind_restored_route(tools: Any, state: dict, messages: list) -> tuple:

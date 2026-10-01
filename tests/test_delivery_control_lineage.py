@@ -9,7 +9,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.test_delivery_forced_finalization import _forced_test_context
+from tests.test_delivery_forced_finalization import _forced_test_context, _select_completion
+from tests.test_delivery_candidate import _finish_response
 
 
 def _start_control_episode(
@@ -22,14 +23,9 @@ def _start_control_episode(
     assert initial.control_episode_seen is False
     loop._arm_delivery_control(registry, ctx, trace)
     assert initial.control_episode_seen is True
-    status, resolved = loop._resolve_delivery_control(
-        json.dumps({"delivery_control": "replace", "full_answer": text}),
-        registry,
-        ctx,
-        trace,
-    )
+    _select_completion(registry, ctx, trace, answer=text)
     candidate = registry._ctx._delivery_candidate
-    assert (status, resolved) == ("resolved", text)
+    assert candidate.full_text == text
     assert candidate.control_episode_seen is True
     assert trace["delivery_candidate"]["control_episode_seen"] is True
     assert registry._ctx._delivery_control_required is False
@@ -53,65 +49,34 @@ def _start_control_episode(
 def test_post_episode_invalid_whole_body_preserves_without_repair(tmp_path, raw):
     loop, registry, ctx, trace, candidate = _start_control_episode(tmp_path)
     before_messages = copy.deepcopy(ctx.messages)
-    before_binding = copy.deepcopy(candidate.acceptance_binding)
-    before_revision = candidate.revision
-    before_hash = candidate.content_sha256
-
-    status, text = loop._resolve_delivery_control(raw, registry, ctx, trace)
-
-    assert (status, text) == ("resolved", candidate.full_text)
+    before = (candidate.revision, candidate.content_sha256, copy.deepcopy(candidate.acceptance_binding))
+    assert loop._resolve_forced_delivery_control(registry._ctx, raw) == (
+        candidate.full_text, loop.REASON_DELIVERY_CONTROL_DEGRADED, True, False)
     assert ctx.messages == before_messages
-    assert candidate.repair_attempted is False
-    assert candidate.revision == before_revision
-    assert candidate.content_sha256 == before_hash
-    assert candidate.acceptance_binding == before_binding
-    assert registry._ctx._delivery_control_required is False
-    assert raw not in text
-
-    forced, reason, retained, replaced = loop._resolve_forced_delivery_control(
-        registry._ctx, raw,
-    )
-    assert (forced, reason, retained, replaced) == (
-        candidate.full_text, "", True, False,
-    )
-    assert ctx.messages == before_messages
+    assert loop._resolve_delivery_control(raw, registry, ctx, trace) == ("retry", candidate.full_text)
+    assert ctx.messages[-2] == {"role": "assistant", "content": raw}
+    assert ctx.messages[-1]["role"] == "user" and "latest whole held response" not in ctx.messages[-1]["content"]
+    assert ctx.messages[:-2] == before_messages
+    assert (candidate.revision, candidate.content_sha256, candidate.acceptance_binding) == before
+    assert registry._ctx._delivery_control_required is True
+    assert "DELIVERY_CONTROL_REPAIR" not in str(ctx.messages)
 
 
-def test_repair_prompt_starts_control_episode_lineage(tmp_path):
+def test_substantive_hold_starts_sticky_completion_episode_lineage(tmp_path):
     loop, registry, ctx, trace = _forced_test_context(tmp_path)
-    candidate = loop._replace_delivery_candidate(
-        registry, ctx, trace, "Initial complete answer.", control="candidate",
-    )
-    candidate.finalization_control = loop._SKILL_ACTION_HOLD_CONTROL
-
+    candidate = loop._replace_delivery_candidate(registry, ctx, trace, "Initial complete answer.", control="candidate")
     assert candidate.control_episode_seen is False
-    assert loop._resolve_delivery_control(
-        '{"delivery_control":"keep"}', registry, ctx, trace,
-    ) == ("retry", "")
+    loop._hold_delivery_for_skill_action(registry, trace)
     assert candidate.control_episode_seen is True
-    assert any(
-        "[DELIVERY_CONTROL_REPAIR]" in str(message.get("content") or "")
-        for message in ctx.messages
-    )
-
-    repaired_text = "Repaired complete answer."
-    assert loop._resolve_delivery_control(
-        json.dumps({
-            "delivery_control": "replace",
-            "full_answer": repaired_text,
-        }),
-        registry,
-        ctx,
-        trace,
-    ) == ("resolved", repaired_text)
-    repaired = registry._ctx._delivery_candidate
-    before_messages = copy.deepcopy(ctx.messages)
-
-    assert repaired.control_episode_seen is True
-    assert loop._resolve_delivery_control(
-        '{"delivery_control":"publish"}', registry, ctx, trace,
-    ) == ("resolved", repaired_text)
-    assert ctx.messages == before_messages
+    assert loop._resolve_delivery_control('{"delivery_control":"keep"}', registry, ctx, trace) == ("retry", candidate.full_text)
+    corrected_text = "Corrected complete answer."
+    _select_completion(registry, ctx, trace, answer=corrected_text)
+    corrected = registry._ctx._delivery_candidate
+    assert corrected.control_episode_seen is True
+    before = copy.deepcopy(ctx.messages)
+    assert loop._resolve_delivery_control('{"delivery_control":"publish"}', registry, ctx, trace) == ("retry", corrected_text)
+    assert ctx.messages[:-2] == before and ctx.messages[-1]["role"] == "user"
+    assert "DELIVERY_CONTROL_REPAIR" not in str(ctx.messages)
 
 
 def test_forced_resolver_ignores_non_candidate_state(tmp_path):
@@ -160,69 +125,46 @@ def test_no_episode_protocol_json_is_byte_exact_passthrough(tmp_path, raw):
         '{"payload":{"other":1,"other":2}}',
     ],
 )
-def test_post_episode_latch_off_residuals_stay_byte_exact(tmp_path, raw):
+def test_post_episode_residuals_stay_byte_exact_but_need_explicit_ordinary_selection(tmp_path, raw):
     loop, registry, ctx, trace, candidate = _start_control_episode(tmp_path)
     before_messages = copy.deepcopy(ctx.messages)
     before = (candidate.revision, candidate.content_sha256, copy.deepcopy(candidate.acceptance_binding))
-
-    assert loop._resolve_delivery_control(raw, registry, ctx, trace) == ("fresh", raw)
-    assert loop._resolve_forced_delivery_control(registry._ctx, raw) == (
-        raw, "", False, False,
-    )
+    assert loop._resolve_forced_delivery_control(registry._ctx, raw) == (raw, "", False, False)
     assert ctx.messages == before_messages
+    assert loop._resolve_delivery_control(raw, registry, ctx, trace) == ("retry", candidate.full_text)
+    assert ctx.messages[-2] == {"role": "assistant", "content": raw}
+    assert registry._ctx._completion_held_sha256 == hashlib.sha256(raw.encode()).hexdigest()
     assert (candidate.revision, candidate.content_sha256, candidate.acceptance_binding) == before
 
 
-def test_duplicate_full_answer_without_verb_preserves_stronger_control_rails(
-    tmp_path,
-):
+def test_duplicate_full_answer_without_verb_preserves_stronger_control_rails(tmp_path):
     raw = '{"full_answer":"one","full_answer":"two"}'
     loop, registry, ctx, trace, candidate = _start_control_episode(tmp_path)
     parsed, duplicate, embedded = loop._parse_delivery_control_body(raw)
-
-    assert parsed == {"full_answer": "two"}
-    assert getattr(parsed, "duplicate_keys", set()) == {"full_answer"}
+    assert parsed == {"full_answer": "two"} and getattr(parsed, "duplicate_keys", set()) == {"full_answer"}
     assert (duplicate, embedded) == (False, False)
-    assert loop._classify_parsed_delivery_control(
-        parsed, duplicate, embedded,
-    )[0] == "rail_invalid"
-
-    candidate.finalization_control = "owner_revision_required"
-    registry._ctx._delivery_control_required = False
-    assert loop._resolve_delivery_control(raw, registry, ctx, trace) == ("retry", "")
-    assert candidate.repair_attempted is True
-    assert any(
-        "[DELIVERY_CONTROL_REPAIR]" in str(message.get("content") or "")
-        for message in ctx.messages
-    )
-
-    loop, registry, ctx, trace, candidate = _start_control_episode(tmp_path)
-    candidate.finalization_control = loop._SKILL_ACTION_HOLD_CONTROL
-    assert loop._resolve_delivery_control(raw, registry, ctx, trace) == ("retry", "")
-    assert candidate.finalization_control.startswith("skill_revision_required")
-
-    loop, registry, _ctx, _trace, candidate = _start_control_episode(tmp_path)
-    registry._ctx._delivery_control_required = True
+    assert loop._classify_parsed_delivery_control(parsed, duplicate, embedded)[0] == "rail_invalid"
+    for control in ("owner_revision_required", loop._SKILL_ACTION_HOLD_CONTROL):
+        candidate.finalization_control = control
+        registry._ctx._delivery_control_required = False
+        assert loop._resolve_delivery_control(raw, registry, ctx, trace) == ("retry", candidate.full_text)
+        assert candidate.finalization_control == control
+        assert ctx.messages[-2]["content"] == raw and ctx.messages[-1]["role"] == "user"
+    assert "DELIVERY_CONTROL_REPAIR" not in str(ctx.messages)
     assert loop._resolve_forced_delivery_control(registry._ctx, raw) == (
-        candidate.full_text, loop.REASON_DELIVERY_CONTROL_DEGRADED, True, False,
-    )
+        candidate.full_text, loop.REASON_DELIVERY_CONTROL_DEGRADED, True, False)
 
 
-def test_arbitrary_duplicates_remain_prose_on_ordinary_unarmed_rails(tmp_path):
+def test_arbitrary_duplicates_remain_selectable_prose_during_ordinary_holds(tmp_path):
     raw = '{"other":1,"other":2}'
     loop, registry, ctx, trace, candidate = _start_control_episode(tmp_path)
-    candidate.finalization_control = "owner_revision_required"
-    assert loop._resolve_delivery_control(raw, registry, ctx, trace) == ("fresh", raw)
-
-    loop, registry, ctx, trace, candidate = _start_control_episode(tmp_path)
-    candidate.finalization_control = loop._SKILL_ACTION_HOLD_CONTROL
-    assert loop._resolve_delivery_control(raw, registry, ctx, trace) == ("fresh", raw)
-
-    loop, registry, _ctx, _trace, candidate = _start_control_episode(tmp_path)
+    for control in ("owner_revision_required", loop._SKILL_ACTION_HOLD_CONTROL):
+        candidate.finalization_control = control
+        assert loop._resolve_delivery_control(raw, registry, ctx, trace) == ("retry", candidate.full_text)
+        assert registry._ctx._completion_held_sha256 == hashlib.sha256(raw.encode()).hexdigest()
     candidate.finalization_control = "skill_revision_required"
     assert loop._resolve_forced_delivery_control(registry._ctx, raw) == (
-        candidate.full_text, loop.REASON_DELIVERY_CONTROL_DEGRADED, True, False,
-    )
+        candidate.full_text, loop.REASON_DELIVERY_CONTROL_DEGRADED, True, False)
 
 
 @pytest.mark.parametrize(
@@ -232,9 +174,9 @@ def test_arbitrary_duplicates_remain_prose_on_ordinary_unarmed_rails(tmp_path):
         (
             '```json\n{"delivery_control":"replace",'
             '"full_answer":"Forced **replacement**\\nline two"}\n```',
-            "Forced **replacement**\nline two",
-            False,
+            "Free-form improvement.",
             True,
+            False,
         ),
     ],
 )
@@ -258,7 +200,7 @@ def test_forced_latch_off_after_episode_resolves_stale_control(
     ("raw", "response_meta", "replacement", "degraded_reason"),
     [
         (
-            '{"delivery_control":"replace","full_answer":"decoded answer"}',
+            '{"action":"finish","answer":"decoded answer"}',
             {"finish_reason_present": True, "finish_reason": "length", "tool_call_count": 0},
             "decoded answer",
             "provider_terminal",
@@ -273,7 +215,7 @@ def test_forced_latch_off_after_episode_resolves_stale_control(
             '{"delivery_control":"publish"}',
             {"finish_reason_present": False, "finish_reason": None, "tool_call_count": 1},
             None,
-            "provider_terminal",
+            "delivery_control_degraded",
         ),
     ],
 )
@@ -333,8 +275,8 @@ def test_provider_terminal_incomplete_replace_prefers_current_candidate(
     loop, registry, ctx, trace, current = _start_control_episode(tmp_path)
     loop._arm_delivery_control(registry, ctx, trace)
     raw = json.dumps({
-        "delivery_control": "replace",
-        "full_answer": "decoded replacement",
+        "action": "finish",
+        "answer": "decoded replacement",
     })
     monkeypatch.setattr(
         loop,
@@ -494,8 +436,8 @@ def test_provider_terminal_incomplete_equal_text_replace_is_fresh(
         "is_error": False,
     })
     raw = json.dumps({
-        "delivery_control": "replace",
-        "full_answer": retained.full_text,
+        "action": "finish",
+        "answer": retained.full_text,
     })
     monkeypatch.setattr(
         loop,
@@ -692,8 +634,8 @@ def test_forced_equal_text_replace_after_evidence_change_is_fresh(tmp_path, monk
         "is_error": False,
     })
     replacement = json.dumps({
-        "delivery_control": "replace",
-        "full_answer": old.full_text,
+        "action": "finish",
+        "answer": old.full_text,
     })
     monkeypatch.setattr(
         loop,
@@ -716,25 +658,19 @@ def test_forced_equal_text_replace_after_evidence_change_is_fresh(tmp_path, monk
     assert returned_trace["delivery_candidate"]["evidence_current"] is True
 
 
-def test_ordinary_latch_off_after_episode_resolves_stale_keep(tmp_path):
+def test_ordinary_post_episode_legacy_keep_stays_private_without_finishing(tmp_path):
     loop, registry, ctx, trace, _candidate = _start_control_episode(tmp_path)
-    candidate = loop._replace_delivery_candidate(
-        registry, ctx, trace, "Free-form improvement.", control="candidate",
-    )
+    candidate = loop._replace_delivery_candidate(registry, ctx, trace, "Free-form improvement.", control="candidate")
     before_messages = copy.deepcopy(ctx.messages)
     before = (candidate.revision, candidate.content_sha256, copy.deepcopy(candidate.acceptance_binding))
-
-    status, text = loop._resolve_delivery_control(
-        '{"delivery_control":"keep"}', registry, ctx, trace,
-    )
-
-    assert (status, text) == ("resolved", candidate.full_text)
-    assert ctx.messages == before_messages
-    assert candidate.repair_attempted is False
+    raw = '{"delivery_control":"keep"}'
+    assert loop._resolve_delivery_control(raw, registry, ctx, trace) == ("retry", candidate.full_text)
+    assert ctx.messages[:-2] == before_messages and ctx.messages[-2]["content"] == raw
+    assert ctx.messages[-1]["role"] == "user" and not registry._ctx._completion_held_sha256
     assert (candidate.revision, candidate.content_sha256, candidate.acceptance_binding) == before
 
 
-def test_multi_improvement_stale_replace_is_decoded_before_acceptance_and_delivery(
+def test_multi_improvement_explicit_selection_binds_exact_answer_before_single_delivery(
     tmp_path,
     monkeypatch,
 ):
@@ -748,19 +684,11 @@ def test_multi_improvement_stale_replace_is_decoded_before_acceptance_and_delive
     from supervisor.terminal_delivery import already_delivered, pending_deliveries
 
     decoded = "Final **answer**\n\n- one\n- two"
-    stale_envelope = json.dumps({
-        "delivery_control": "replace",
-        "full_answer": decoded,
-    })
+    stale_envelope = json.dumps({"delivery_control": "replace", "full_answer": "Obsolete unselected text"})
     responses = iter([
-        "Initial complete draft.",
-        json.dumps({
-            "delivery_control": "replace",
-            "full_answer": "Controlled answer v1.",
-        }),
-        "Free-form improvement v2.",
-        "Free-form improvement v3.",
-        stale_envelope,
+        "Initial complete draft.", _finish_response("Controlled answer v1."),
+        _finish_response("Free-form improvement v2."), _finish_response("Free-form improvement v3."),
+        stale_envelope, _finish_response(decoded),
     ])
     model_calls = []
     acceptance_inputs = []
@@ -775,7 +703,9 @@ def test_multi_improvement_stale_replace_is_decoded_before_acceptance_and_delive
 
     def fake_call(_llm, request_messages, *_args, **_kwargs):
         model_calls.append([dict(row) for row in request_messages])
-        return {"role": "assistant", "content": next(responses)}, 0.0
+        response = next(responses)
+        return ({"role": "assistant", **response} if isinstance(response, dict)
+                else {"role": "assistant", "content": response}), 0.0
 
     def first_nudge_only(*_args, **_kwargs):
         nonlocal nudge_calls
@@ -829,6 +759,7 @@ def test_multi_improvement_stale_replace_is_decoded_before_acceptance_and_delive
     monkeypatch.setattr(loop, "_maybe_inject_finalization_nudges", first_nudge_only)
     monkeypatch.setattr(loop, "_execute_task_acceptance_panel", fake_panel)
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "auto")
+    monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "blocking")
     monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "4")
     monkeypatch.setenv("OUROBOROS_MAX_ROUNDS", "10")
     from tests.test_loop_acceptance_gate import _seed_acceptance_root
@@ -848,7 +779,7 @@ def test_multi_improvement_stale_replace_is_decoded_before_acceptance_and_delive
         tools=registry,
         llm=FakeLLM(),
         drive_logs=tmp_path,
-        emit_progress=lambda _text, *, incident=None: None,
+        emit_progress=lambda _text, **_facts: None,
         incoming_messages=queue.Queue(),
         task_id="issue-449",
         drive_root=tmp_path,
@@ -863,8 +794,8 @@ def test_multi_improvement_stale_replace_is_decoded_before_acceptance_and_delive
         )
         for call in model_calls
     ]
-    assert len(model_calls) == 5
-    assert prompt_counts == [0, 1, 1, 1, 1]
+    assert len(model_calls) == 6
+    assert prompt_counts[0] == 0 and all(count >= 1 for count in prompt_counts[1:])
     assert all(
         "[DELIVERY_CONTROL_REPAIR]" not in str(row.get("content") or "")
         for call in model_calls
@@ -900,7 +831,7 @@ def test_multi_improvement_stale_replace_is_decoded_before_acceptance_and_delive
             "cost_accounting_status": "available",
             "cost_final": True,
             "cost_usd": 0.0,
-            "total_rounds": 5,
+            "total_rounds": 6,
             "prompt_tokens": 1,
             "completion_tokens": 1,
             "reserved_usd": 0.0,
@@ -978,13 +909,11 @@ def test_post_episode_trailing_control_retains_answer_on_both_rails(tmp_path, ve
     raw = "A stray control preamble.\n" + json.dumps(payload)
     before = (candidate.revision, candidate.content_sha256, copy.deepcopy(candidate.acceptance_binding))
     before_messages = copy.deepcopy(ctx.messages)
-
-    assert loop._resolve_delivery_control(raw, registry, ctx, trace) == (
-        "resolved", candidate.full_text,
-    )
     assert loop._resolve_forced_delivery_control(registry._ctx, raw) == (
-        candidate.full_text, "", True, False,
-    )
-    assert (candidate.revision, candidate.content_sha256, candidate.acceptance_binding) == before
+        candidate.full_text, loop.REASON_DELIVERY_CONTROL_DEGRADED, True, False)
     assert ctx.messages == before_messages
-    assert candidate.repair_attempted is False
+    assert loop._resolve_delivery_control(raw, registry, ctx, trace) == ("retry", candidate.full_text)
+    assert (candidate.revision, candidate.content_sha256, candidate.acceptance_binding) == before
+    assert ctx.messages[:-2] == before_messages and ctx.messages[-2]["content"] == raw
+    assert ctx.messages[-1]["role"] == "user" and not registry._ctx._completion_held_sha256
+    assert "DELIVERY_CONTROL_REPAIR" not in str(ctx.messages)

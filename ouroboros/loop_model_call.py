@@ -857,8 +857,20 @@ def _dispatch_round_model(
     previous_call = ctx.accumulated_usage.get("_last_llm_call_meta")
     from ouroboros.acceptance_settlement import expose_acceptance_feedback
 
-    observe_feedback = lambda sent: expose_acceptance_feedback(
-        getattr(ctx.tools._ctx, "_execution_trace", {}), sent, str(ctx.task_id))
+    import copy
+    from ouroboros.loop_delivery import completion_observation, completion_feedback
+    trace = getattr(ctx.tools._ctx, "_execution_trace", None) or {}
+    observation = completion_observation(ctx.tools._ctx, trace)
+    feedback_snapshot = copy.deepcopy({key: trace.get(key) for key in (
+        "review_runs", "acceptance_review_outcome", "acceptance_preparation")})
+    ctx.tools._ctx._completion_observation = observation
+
+    def observe_feedback(sent):
+        expose_acceptance_feedback(trace, sent, str(ctx.task_id))
+        expose_acceptance_feedback(feedback_snapshot, sent, str(ctx.task_id))
+        observation.update(feedback=copy.deepcopy(completion_feedback(feedback_snapshot)),
+                           preparation=copy.deepcopy(feedback_snapshot.get("acceptance_preparation") or {}))
+
     with contextlib.ExitStack() as binding:
         deferral = None
         if waiter is not None:

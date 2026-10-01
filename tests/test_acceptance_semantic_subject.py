@@ -23,7 +23,8 @@ from ouroboros.loop_delivery import (
     _delivery_acceptance_binding,
     _no_tool_final_answer,
     _replace_delivery_candidate,
-    _resolve_delivery_control,
+    completion_observation,
+    consume_completion_request,
     apply_delivery_subject_decision,
     delivery_subject_hash,
     delivery_subject_projection,
@@ -63,6 +64,18 @@ def _followup(tool_ctx, text):
     _record_owner_directive(tool_ctx, source="direct_incoming", content=text, msg_id="followup")
 
 
+def _select_retained(tools, ctx, trace, **subject):
+    from ouroboros.tools.control_runtime import _finish_task
+
+    tool_ctx = tools._ctx
+    tool_ctx._completion_observation = completion_observation(tool_ctx, trace)
+    payload = json.loads(_finish_task(tool_ctx, action="finish",
+        answer_sha256=tool_ctx._delivery_candidate.content_sha256, acceptance_subject=subject or None))
+    assert payload["status"] == "completion_requested"
+    assert consume_completion_request(tools, ctx, trace)
+    return tool_ctx._delivery_candidate.full_text
+
+
 @pytest.mark.parametrize("text", ["Как дела?", "То есть мне нужен тот же полный отчёт."])
 def test_consumed_status_or_rephrasing_keeps_subject_and_paid_binding(case, text):
     tool_ctx, tools, ctx, trace, candidate, run = case
@@ -75,12 +88,8 @@ def test_consumed_status_or_rephrasing_keeps_subject_and_paid_binding(case, text
     observed = capture_acceptance_observation(tool_ctx, trace, ctx.incoming_messages)
     assert observed["owner_source_sha256"] in acceptance_observation_prompt(tool_ctx, observed)
     tool_ctx._delivery_control_required = True
-    state, answer = _resolve_delivery_control(json.dumps({
-        "delivery_control": "keep", "acceptance_subject": {
-            "owner_source_sha256": observed["owner_source_sha256"],
-        },
-    }), tools, ctx, trace)
-    assert (state, answer) == ("resolved", "The complete report.")
+    answer = _select_retained(tools, ctx, trace, owner_source_sha256=observed["owner_source_sha256"])
+    assert answer == "The complete report."
     assert delivery_subject_hash(tool_ctx, trace) == before
     assert not run.get("superseded_by_revision")
     assert candidate.acceptance_binding["authoritative"] is True
@@ -95,13 +104,10 @@ def test_changed_criteria_keeps_answer_but_creates_new_subject(case):
     _followup(tool_ctx, "Include the budget as a separate section.")
     observed = capture_acceptance_observation(tool_ctx, trace, ctx.incoming_messages)
     tool_ctx._delivery_control_required = True
-    state, answer = _resolve_delivery_control(json.dumps({
-        "delivery_control": "keep", "acceptance_subject": {
-            "owner_source_sha256": observed["owner_source_sha256"],
-            "effective_criteria": "Complete report, including a separate budget section.",
-        },
-    }), tools, ctx, trace)
-    assert state == "resolved" and answer == candidate.full_text
+    answer = _select_retained(tools, ctx, trace,
+        owner_source_sha256=observed["owner_source_sha256"],
+        effective_criteria="Complete report, including a separate budget section.")
+    assert answer == candidate.full_text
     assert candidate.content_sha256 == text_hash
     assert delivery_subject_hash(tool_ctx, trace) != before
     assert run["superseded_by_revision"] is True
@@ -242,9 +248,10 @@ def test_review_only_entry_reuses_complete_readiness_without_delivering_or_closi
         return False
     monkeypatch.setattr(loop, "_run_task_acceptance_review_once", review)
     monkeypatch.setattr(loop, "_handle_text_response", lambda text, *_args: (text, {}, trace))
+    selected = _select_retained(tools, ctx, trace)
     returned = _no_tool_final_answer(
-        '{"delivery_control":"keep"}', ctx, trace, tools, ctx.incoming_messages,
-        set(), lambda *_args: None, review_only=review_only,
+        selected, ctx, trace, tools, ctx.incoming_messages,
+        set(), lambda *_args: None, review_only=review_only, explicit_candidate=True,
     )
     assert seen == ["services", candidate.full_text]
     if review_only:

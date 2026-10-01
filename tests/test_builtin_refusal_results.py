@@ -1,5 +1,6 @@
 """Real builtin refusals keep producer facts through the string handler ABI."""
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -111,7 +112,12 @@ def test_presence_contract_refusal_and_valid_completion_remain_distinct():
     assert result.status == "unavailable"
     assert not hasattr(ctx, "_presence_completion")
     ctx.task_contract = {"capability_ceiling": {}}
-    assert _finish_presence(ctx, "message", "hello").startswith("PRESENCE_COMPLETION_RECORDED")
+    assert json.loads(_finish_presence(ctx, "message", "hello")) == {
+        "status": "completion_requested", "completion_control": True, "action": "finish",
+    }
+    assert ctx._completion_request["source"] == "presence_finish"
+    assert ctx._completion_request["answer"] == "hello"
+    assert ctx._presence_completion_accepted is False
     assert ctx._presence_completion == {"outcome": "message", "message": "hello"}
 
 

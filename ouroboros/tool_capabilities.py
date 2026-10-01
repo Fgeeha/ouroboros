@@ -20,6 +20,7 @@ COGNITIVE_MEMORY_TOOL_NAMES: frozenset[str] = frozenset({
 })
 
 CORE_TOOL_NAMES: frozenset[str] = frozenset({
+    "finish_task",
     "read_file", "list_files", "write_file", "edit_text",
     "apply_patch", "edit_batch",
     "search_code", "query_code", "plan_task",
@@ -81,6 +82,7 @@ LOCAL_READONLY_SUBAGENT_MODE: str = "local_readonly_subagent"
 # remains available by explicit product decision, so this mode is not a remote
 # website sandbox.
 LOCAL_READONLY_SUBAGENT_TOOL_NAMES: frozenset[str] = frozenset({
+    "finish_task",
     # switch_model changes COGNITIVE POWER, not authority: a child that started on
     # the cheap lane and finds the work harder raises itself instead of failing or
     # asking the parent to respawn it (BIBLE P5). Nothing about the sandbox changes.
@@ -132,6 +134,7 @@ ACTING_SUBAGENT_MODE: str = "acting_subagent"
 # MCP tools are denied unless explicitly granted per-child via
 # TaskConstraint.external_tool_grants.
 ACTING_SUBAGENT_TOOL_NAMES: frozenset[str] = frozenset({
+    "finish_task",
     # switch_model changes COGNITIVE POWER, not authority: a child that started on
     # the cheap lane and finds the work harder raises itself instead of failing or
     # asking the parent to respawn it (BIBLE P5). Nothing about the sandbox changes.
@@ -359,3 +362,24 @@ OBSERVE_WORLD_MUTATION_TOOLS: frozenset[str] = frozenset({
     "journal_write", "workpad_write",
     "create_github_issue", "comment_on_issue", "comment_on_pr", "close_github_issue", "pr_merge",
 })
+
+
+def completion_control_call(name: str, args: object = None) -> bool:
+    """Host-owned local completion identity, independent of presentation or success."""
+    if name in {"finish_task", "presence_finish"}:
+        return True
+    return name == "task_acceptance_review" and isinstance(args, dict) and (
+        args.get("author_action") in {"finish", "stop"}
+        or args.get("agent_disposition") in {"accepted", "rejected", "partial", "deferred"}
+    )
+
+
+def substantive_tool_calls(calls: object) -> list:
+    return [call for call in (calls or []) if isinstance(call, dict)
+            and not (call.get("completion_control") and not call.get("is_error"))]
+
+
+def completion_observation_calls(calls: object) -> list:
+    """Results a finish must observe; only successful schema bookkeeping is exempt."""
+    return [call for call in substantive_tool_calls(calls)
+            if call.get("is_error") or call.get("tool") not in {"enable_tools", "list_available_tools"}]

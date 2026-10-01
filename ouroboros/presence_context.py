@@ -295,3 +295,20 @@ __all__ = [
     "build_presence_context_section", "frame_presence_user_content",
     "presence_finish_not_accepted_note", "presence_send_facts",
 ]
+
+
+def confirmed_delivery_receipts(ctx: Any) -> frozenset[tuple[str, str]]:
+    """Host-confirmed tool sends for this task/conversation, never inferred from tool names."""
+    from ouroboros.presence_runner import _live_task_rows
+    from ouroboros.tool_access import canonical_data_root
+    presence = (getattr(ctx, "task_metadata", {}) or {}).get("presence") or {}
+    key = (presence.get("event") or {}).get("conversation_key")
+    if not key or presence.get("delivery_reporting_version") != 1:
+        return frozenset()
+    latest = {}
+    for row in _live_task_rows(canonical_data_root(ctx), str(getattr(ctx, "task_id", "")), key):
+        transport = row.get("transport") or {}
+        delivery = transport.get("delivery") or {}
+        if row.get("type") == "presence_delivery" and (transport.get("origin") or {}).get("kind") == "tool":
+            latest[(str(delivery.get("delivery_id")), str(delivery.get("part_id")))] = delivery.get("state")
+    return frozenset(identity for identity, state in latest.items() if state in {"delivered", "accepted"})
