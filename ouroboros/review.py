@@ -641,15 +641,15 @@ def _manifest_inventory_errors(
 ) -> list[str]:
     errors: list[str] = []
 
-    def compare_set(label: str, live: frozenset[Any], recorded: frozenset[Any]) -> None:
+    for label, live, recorded in (
+        ("GIANT_PATHS", inventory.giant_paths, manifest.giant_paths),
+        ("FUNCTION_DEBT", inventory.function_debt, manifest.function_debt),
+        ("BAND_PATHS", inventory.band_paths, frozenset(manifest.band_paths)),
+    ):
         for item in sorted(live - recorded):
             errors.append(f"{label} missing live entry: {item!r}")
         for item in sorted(recorded - live):
             errors.append(f"{label} contains stale entry: {item!r}")
-
-    compare_set("GIANT_PATHS", inventory.giant_paths, manifest.giant_paths)
-    compare_set("FUNCTION_DEBT", inventory.function_debt, manifest.function_debt)
-    compare_set("BAND_PATHS", inventory.band_paths, frozenset(manifest.band_paths))
     if dict(inventory.byte_debt) != dict(manifest.byte_debt):
         errors.append(f"BYTE_DEBT differs from live exact counts: live={dict(inventory.byte_debt)!r}")
     if len(inventory.functions) > MAX_TOTAL_FUNCTIONS:
