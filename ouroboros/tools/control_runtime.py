@@ -9,7 +9,7 @@ switch the model or reasoning effort for the next round.
 
 from __future__ import annotations
 
-from ouroboros.tools.tool_result import ToolResult, _publish_tool_result, completed_local_read
+from ouroboros.tools.tool_result import ToolResult, _publish_tool_result, completed_local_read, publish_no_effect
 
 import logging
 import os
@@ -281,21 +281,21 @@ def _send_user_message(ctx: ToolContext, text: str, reason: str = "", destinatio
     """
     chat_id = getattr(ctx, "current_chat_id", None)
     if chat_id is None or chat_id == "":  # 0 is a real hidden session, not absence
-        return _publish_tool_result(ctx, ToolResult(status="unavailable", code="CAPABILITY_UNAVAILABLE", text=("⚠️ No active chat — cannot send proactive message.")))
+        return publish_no_effect(ctx, ToolResult(status="unavailable", code="CAPABILITY_UNAVAILABLE", text=("⚠️ No active chat — cannot send proactive message.")))
     if not text or not text.strip():
-        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=("⚠️ Empty message.")))
+        return publish_no_effect(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=("⚠️ Empty message.")))
     # Models may fill optional keys: an empty value is the omitted default.
     target = str(destination or "").strip().lower() or "current"
     if target not in ("current", "main"):
         from ouroboros.tools.arg_feedback import argument_refusal
 
-        return argument_refusal(ctx, "SEND_USER_MESSAGE_DESTINATION", [
+        return publish_no_effect(ctx, argument_refusal(ctx, "SEND_USER_MESSAGE_DESTINATION", [
             f"destination={destination!r} is not a destination; use 'current' (this room) or 'main' (the owner's main chat)",
-        ], effect="Nothing was sent.")
+        ], effect="Nothing was sent."), tool_name="send_user_message")
     if target == "main":
         refusal = _main_notice_refusal(ctx, chat_id)
         if refusal:
-            return _publish_tool_result(ctx, ToolResult(status="blocked", code="ACCESS_BLOCKED", text=(
+            return publish_no_effect(ctx, ToolResult(status="blocked", code="ACCESS_BLOCKED", text=(
                 f"⚠️ MAIN_NOTICE_BLOCKED: destination='main' refused: {refusal}. Nothing was sent; "
                 "destination='current' still reaches this conversation.")))
         from ouroboros.contracts.chat_id_policy import WEB_UI_CHAT_ID
