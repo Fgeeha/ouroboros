@@ -38,7 +38,9 @@ from ouroboros.gateway.owner_settings import (
 )
 from ouroboros.onboarding_wizard import build_onboarding_html
 from ouroboros.platform_layer import is_container_env
-from ouroboros.provider_models import MINIMAX_REGION_ENDPOINTS, resolve_minimax_base_url
+from ouroboros.provider_models import (
+    MINIMAX_REGION_ENDPOINTS, ZAI_PLAN_ENDPOINTS, resolve_minimax_base_url, resolve_zai_base_url,
+)
 from ouroboros.secret_masking import (
     MCP_RESPONSE_ONLY_FIELDS,
     is_custom_secret_setting_key,
@@ -64,16 +66,6 @@ log = logging.getLogger(__name__)
 DEFAULT_PORT = int(os.environ.get("OUROBOROS_SERVER_PORT", "8765"))
 
 
-def _get_lan_ip() -> str:
-    """Return LAN IP via UDP socket trick; no packet is sent."""
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect(("192.0.2.1", 80))  # RFC 5737 TEST-NET-1, no packet sent
-            return s.getsockname()[0]
-    except OSError:
-        return ""
-
-
 def _trust_nonlocal_bind_without_password_enabled() -> bool:
     raw = os.environ.get("OUROBOROS_TRUST_NONLOCAL_BIND_WITHOUT_PASSWORD", "")
     return str(raw or "").strip().lower() in {"1", "true", "yes", "on"}
@@ -96,7 +88,15 @@ def _build_network_meta(bind_host: str, bind_port: int) -> dict:
         }
     wildcard = bind_host in ("0.0.0.0", "")
     if wildcard:
-        lan_ip = "" if is_container_env() else _get_lan_ip()
+        lan_ip = ""
+        if not is_container_env():
+            # The LAN IP via the UDP socket trick; no packet is sent.
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                    s.connect(("192.0.2.1", 80))  # RFC 5737 TEST-NET-1, no packet sent
+                    lan_ip = s.getsockname()[0]
+            except OSError:
+                lan_ip = ""
     elif bind_host in ("::", "[::]"):
         # AF_INET startup cannot advertise an IPv6 wildcard LAN IP reliably.
         lan_ip = ""
@@ -209,52 +209,107 @@ def _build_policy_state(settings: Dict[str, Any]) -> dict:
     }
 
 
+def _build_restart_state(settings: Dict[str, Any]) -> dict:
+    """Compare saved intent with component-owned inputs, never os.environ."""
+    from ouroboros.config import get_runtime_mode, normalize_runtime_mode
+    from ouroboros.local_model import get_manager, local_model_settings
+    from ouroboros.server_process import applied_restart_settings, applied_server_host_source
+
+    applied = applied_restart_settings()
+    desired = {key: settings.get(key, _SETTINGS_DEFAULTS.get(key, ""))
+               for key in _RESTART_REQUIRED_KEYS if key not in local_model_settings({})}
+    applied["OUROBOROS_RUNTIME_MODE"] = get_runtime_mode()
+    desired["OUROBOROS_RUNTIME_MODE"] = normalize_runtime_mode(settings.get("OUROBOROS_RUNTIME_MODE"))
+    pending = []
+    for key, value in desired.items():
+        if key not in applied:
+            continue
+        actual = applied[key]
+        if key == "OUROBOROS_SKILLS_REPO_PATH":
+            value = str(pathlib.Path(str(value).strip()).expanduser()) if str(value).strip() else ""
+            actual = str(pathlib.Path(str(actual).strip()).expanduser()) if str(actual).strip() else ""
+        if str(value).strip() != str(actual).strip():
+            pending.append(key)
+    unknown = sorted(set(desired) - set(applied))
+    host_key = "OUROBOROS_SERVER_HOST"
+    host_source = applied_server_host_source(DATA_DIR)
+    source_unknown = []
+    host_summary = ""
+    if host_key in pending and host_source != "settings":
+        pending.remove(host_key)
+        if host_source in {"environment", "cli"}:
+            host_summary = " Saved server host differs from the running listener; launch configuration overrides this setting."
+        else:
+            source_unknown.append(host_key)
+            host_summary = (" Saved server host differs from the running listener. This launcher did not report "
+                            "whether a launch override controls the next start; Restart may apply the saved host.")
+    local = get_manager().settings_application(settings)
+    summary = f"Restart Ouroboros to apply {len(pending)} saved setting(s)." if pending else ""
+    if unknown:
+        summary += f" Application state is not reported for {len(unknown)} runtime setting(s)."
+    summary += host_summary
+    return {"restart_required": bool(pending), "restart_keys": sorted(pending),
+            "restart_source_unknown_keys": source_unknown, "unknown_keys": unknown,
+            "local_model": local, "summary": summary.strip()}
+
+
 def _rehydrate_mcp_servers_payload(incoming: Any, current: Any) -> list:
+    """Restore masked MCP tokens/URLs from the ONE saved server with the same identity.
+
+    Identity is the loader's (``id``, ``slug`` or ``name``). A masked value whose
+    identity has several saved or incoming claimants raises
+    ``MCPSecretIdentityAmbiguous`` before anything is written: an equal token
+    does not make two servers the same, so a credential never moves between them.
+    """
     if not isinstance(incoming, list):
         return []
-    try:
-        from ouroboros.mcp_client import canonical_server_id as _mcp_canonical_id
-    except Exception:
-        _mcp_canonical_id = lambda value: str(value or "").strip()  # type: ignore[assignment]
-    current_by_id: Dict[str, Dict[str, Any]] = {}
-    if isinstance(current, list):
-        for entry in current:
-            if isinstance(entry, dict):
-                cur_id = _mcp_canonical_id(entry.get("id"))
-                if cur_id:
-                    current_by_id[cur_id] = entry
+    from ouroboros.mcp_client import canonical_server_id, raw_server_id
+
+    current_by_id: Dict[str, list] = {}
+    for entry in current if isinstance(current, list) else []:
+        if raw_server_id(entry):
+            current_by_id.setdefault(raw_server_id(entry), []).append(entry)
+    incoming_ids = [raw_server_id(entry) for entry in incoming if isinstance(entry, dict)]
     out = []
     for entry in incoming:
         if not isinstance(entry, dict):
             continue
         clone = {key: value for key, value in entry.items() if key not in MCP_RESPONSE_ONLY_FIELDS}
         if clone.get("id"):
-            clone["id"] = _mcp_canonical_id(clone.get("id"))
-        existing = current_by_id.get(_mcp_canonical_id(clone.get("id"))) or {}
+            clone["id"] = canonical_server_id(clone.get("id"))
+        server_id = raw_server_id(clone)
+        token = str(clone.get("auth_token") or "")
+        masked = looks_masked_mcp_secret(token) or (
+            "url" in clone and rehydrate_mcp_url(clone["url"], "") != str(clone["url"] or ""))
+        matches = current_by_id.get(server_id, []) if server_id else []
+        if masked and (len(matches) > 1 or incoming_ids.count(server_id) > 1):
+            raise MCPSecretIdentityAmbiguous(server_id)
+        existing = matches[0] if len(matches) == 1 else {}
         if "url" in clone:
             clone["url"] = rehydrate_mcp_url(clone["url"], existing.get("url"))
-        token = str(clone.get("auth_token") or "")
         if looks_masked_mcp_secret(token):
-            clone["auth_token"] = str((existing or {}).get("auth_token") or "")
+            clone["auth_token"] = str(existing.get("auth_token") or "")
         out.append(clone)
     return out
+
+
+class MCPSecretIdentityAmbiguous(ValueError):
+    """A masked MCP secret whose server identity is claimed more than once."""
+
+    code = "MCP_ID_AMBIGUOUS_SECRET"
+
+    def __init__(self, server_id: str) -> None:
+        super().__init__(
+            f"{self.code}: several MCP servers resolve to server id {server_id!r}, so its saved "
+            "credential cannot be matched to one of them. Give each server a distinct Server ID "
+            "(or re-enter its token/URL) and save again; nothing was saved."
+        )
 
 
 from ouroboros.settings_scales import (
     IMMEDIATE_SETTINGS as _IMMEDIATE_KEYS,
     RESTART_REQUIRED_SETTINGS as _RESTART_REQUIRED_KEYS,
 )
-
-
-def _classify_settings_changes(
-    old: Dict[str, Any],
-    new: Dict[str, Any],
-) -> list:
-    """Return changed keys requiring process restart; others hot-reload next task."""
-    return [
-        k for k in _RESTART_REQUIRED_KEYS
-        if str(new.get(k, "") or "") != str(old.get(k, "") or "")
-    ]
 
 
 def _effect_buckets(all_changed: list) -> tuple:
@@ -506,21 +561,6 @@ def _api_owner_auto_grant_sync(request: Request, body: Any) -> JSONResponse:
     return JSONResponse({"ok": True, "enabled": enabled})
 
 
-def _provider_base_url(settings: Dict[str, Any], provider: str) -> str:
-    """The settings key a provider's base URL resolves through (shared by both routes)."""
-    if provider == "openai":
-        return str(settings.get("OPENAI_BASE_URL") or "")
-    if provider == "openai-compatible":
-        return str(settings.get("OPENAI_COMPATIBLE_BASE_URL") or "")
-    if provider == "cloudru":
-        return str(settings.get("CLOUDRU_FOUNDATION_MODELS_BASE_URL") or "")
-    if provider == "gigachat":
-        return str(settings.get("GIGACHAT_BASE_URL") or "")
-    if provider == "minimax":
-        return resolve_minimax_base_url(settings.get("MINIMAX_REGION") or "")
-    return ""
-
-
 def _active_main_route(
     settings: Dict[str, Any],
     *,
@@ -537,7 +577,15 @@ def _active_main_route(
 
     model = str(model_override or settings.get("OUROBOROS_MODEL") or _config.SETTINGS_DEFAULTS.get("OUROBOROS_MODEL") or "").strip()
     provider = provider_for_model(model)
-    base_url = _provider_base_url(settings, provider)
+    # The settings key a provider's base URL resolves through.
+    base_url_key = {"openai": "OPENAI_BASE_URL", "openai-compatible": "OPENAI_COMPATIBLE_BASE_URL",
+                    "cloudru": "CLOUDRU_FOUNDATION_MODELS_BASE_URL", "gigachat": "GIGACHAT_BASE_URL"}.get(provider)
+    if provider == "minimax":
+        base_url = resolve_minimax_base_url(settings.get("MINIMAX_REGION") or "")
+    elif provider == "zai":
+        base_url = resolve_zai_base_url(settings.get("ZAI_PLAN") or "")
+    else:
+        base_url = str(settings.get(base_url_key) or "") if base_url_key else ""
     # CW7 (v6.34.0): honour the USE_LOCAL_MAIN routing setting — a local-routed main
     # lane must report provider='local' so the Max gate consults the local n_ctx
     # (Capability Evidence local-health) instead of the remote OUROBOROS_MODEL metadata.
@@ -548,47 +596,6 @@ def _active_main_route(
     if use_local:
         provider = "local"
     return {"provider": provider, "model": model, "base_url": base_url, "use_local": use_local}
-
-
-# Settings keys a review slot's route can resolve its base URL through. Changing one
-# changes the ROUTE FINGERPRINT for an unchanged model, so it must retrigger the
-# capability notice exactly as a slot change does (see _review_capability_notices).
-_REVIEW_ROUTE_BASE_URL_KEYS = frozenset({
-    "OPENAI_BASE_URL",
-    "OPENAI_COMPATIBLE_BASE_URL",
-    "CLOUDRU_FOUNDATION_MODELS_BASE_URL",
-    "GIGACHAT_BASE_URL",
-    "MINIMAX_REGION",
-})
-
-
-def _review_slot_route(settings: Dict[str, Any], model: str, *, session: bool = False) -> Dict[str, Any]:
-    """(provider, model, base_url, use_local) for a REVIEW slot's own route.
-
-    Deliberately NOT ``_active_main_route``: a review slot is pinned by its own model
-    id and must never inherit the main lane's USE_LOCAL_MAIN routing.
-
-    ``session=True`` is a RETRIEVING row, whose target is a harness route spec rather
-    than a provider model id; it fingerprints under the session provider that
-    ``reviewer_window.reviewer_route`` owns, so the ack recorded from this notice and
-    the evidence the scope gate reads back are the same route. Resolving it through
-    ``provider_for_model`` instead would file a harness under ``openrouter`` and the
-    ack would never match."""
-    from ouroboros.provider_models import provider_for_model
-    from ouroboros.reviewer_window import SESSION_ROUTE_PROVIDER
-
-    if session:
-        return {"provider": SESSION_ROUTE_PROVIDER, "model": str(model or ""),
-                "base_url": "", "use_local": False}
-    provider = provider_for_model(str(model or ""))
-    base_url = _provider_base_url(settings, provider)
-    use_local = provider == "local" or str(model or "").endswith(" (local)")
-    return {
-        "provider": "local" if use_local else provider,
-        "model": str(model or ""),
-        "base_url": base_url,
-        "use_local": use_local,
-    }
 
 
 def _unrecognised_review_models(models: Any) -> list:
@@ -632,24 +639,12 @@ def _candidate_scope_models(settings: Dict[str, Any]) -> list:
     """Scope-review API model candidates from CANDIDATE settings (6.1-aware).
 
     The structured reviewer-slot value wins when present and parseable: its
-    api_chat scope rows are the routes the >=1M gate applies to. A retrieving
-    (session) row is NOT a provider model id, so it is not a candidate here —
-    its own >=200K floor and its own ack route are handled by
-    ``_candidate_scope_session_targets``. Otherwise the live derived config
+    api_chat scope rows carry provider model ids, which is what
+    ``_unrecognised_review_models`` can check against a provider catalog. A
+    retrieving (session) row's target is a harness route spec, not a model id,
+    so it is not a candidate here. Otherwise the live derived config
     (ABI 7.0/ABI-10: the comma settings keys are retired)."""
     return [r.target_id for r in _candidate_reviewer_rows(settings, "scope") if not r.is_session]
-
-
-def _candidate_scope_session_targets(settings: Dict[str, Any]) -> list:
-    """Scope-review RETRIEVING row targets from CANDIDATE settings.
-
-    A retrieving row's blocking authority rests on SOURCED window evidence at the
-    session floor (``scope_review_session.SESSION_WINDOW_FLOOR``), and a harness
-    route publishes no model metadata — so owner-ack is the ONLY path that floor
-    can ever be reached by. Leaving these rows out of the notice made the floor
-    decorative: the mode could not reach `asserted` through any product path, so
-    every retrieving row stayed advisory-only forever by construction."""
-    return [r.target_id for r in _candidate_reviewer_rows(settings, "scope") if r.is_session and r.target_id]
 
 
 def _candidate_triad_models(settings: Dict[str, Any]) -> list:
@@ -658,81 +653,6 @@ def _candidate_triad_models(settings: Dict[str, Any]) -> list:
     # ABI 7.0 (ABI-10): no comma settings key to read — without a structured
     # value the candidate set is the live derived triad.
     return [r.target_id for r in _candidate_reviewer_rows(settings, "triad") if not r.is_session]
-
-
-def _review_capability_notices(settings: Dict[str, Any]) -> list:
-    """Owner-facing Capability Evidence notices for the configured review slots.
-
-    The Max-context gate only ever probed the MAIN route, so a PINNED scope reviewer
-    could not become "known" through any path and silently ran with the conservative
-    sub-floor window — exactly the failure the owner hit. Saving settings now probes
-    the review + scope-review slots too and returns the SAME
-    ``needs_ack:{route, route_fp, evidence}`` contract the Max gate already uses, and
-    ``settings.js`` renders it through the SAME confirm -> owner-capability-ack flow.
-    Advisory only: a slot without evidence stays fail-closed at review time (the pin is
-    routing intent, never evidence) — this just makes "known" reachable.
-
-    ONLY the scope-review surface is probed: it is the one surface whose window evidence
-    gates anything, so probing the triad slots was network work whose result was
-    discarded. The caller gates this on a ROUTE-AFFECTING change (the scope slot itself
-    or any base URL that route resolves through), not every settings save: capability is
-    a property of provider+base_url+model, so a hot base-URL change produces a route with
-    no evidence exactly as a model change does.
-
-    BOTH scope deliveries are offered their ack, each against ITS OWN floor: an api row
-    against the constitutional >=1M, a RETRIEVING row against the >=200K session floor
-    (BIBLE P3's retrieving amendment). The floor travels with the notice as
-    ``floor_tokens`` so the UI asks about the number that route is actually judged by.
-
-    The slot is read from the CANDIDATE settings, not from ``get_scope_review_models()``:
-    that reads process env, which is not necessarily the value being saved, so the notice
-    could describe the outgoing route instead of the incoming one."""
-    notices: list = []
-    try:
-        from ouroboros.capability_evidence import ONE_MILLION, confirms_at_least, model_account_options, probe
-        from ouroboros.config import DATA_DIR
-        from ouroboros.tools.scope_review_session import SESSION_WINDOW_FLOOR
-
-        candidates = _candidate_reviewer_rows(settings, "scope")
-        seen: set = set()
-        for row in candidates:
-            model, session = row.target_id, row.is_session
-            floor = SESSION_WINDOW_FLOOR if row.retrieves else ONE_MILLION
-            route = _review_slot_route(settings, model, session=session)
-            options = model_account_options(model, role=f"reviewer:{row.slot_id}",
-                        credential_profile_id=row.profile_id) if route["provider"] == "claudexor" else None
-            ev = probe(
-                DATA_DIR, provider=route["provider"], model=route["model"],
-                base_url=route["base_url"], use_local=route["use_local"],
-                allow_fetch=True, allow_generative=False,
-                options=options,
-            )
-            if ev.route_fp in seen:
-                continue
-            seen.add(ev.route_fp)
-            bound = route["provider"] != "claudexor" or bool(
-                ev.source_id and ev.credential_profile_id and ev.account_fingerprint
-                and (ev.source == "owner_ack" or ev.provenance and not ev.stale))
-            if options is not None and bound:
-                route["options"] = {**options, "credential_profile_id": ev.credential_profile_id,
-                                    "account_fingerprint": ev.account_fingerprint}
-            # SAME freshness policy the scope gate applies at review time
-            # (`reviewer_window.ReviewerWindow.blocking_authority_allowed`): an expired
-            # or outage-carried record will NOT authorise a blocking verdict, so the
-            # owner must be offered the ack now rather than told the slot is fine and
-            # then blocked at commit time by the twin check.
-            if not confirms_at_least(ev, floor, require_fresh=True):
-                notices.append({
-                    "surface": "scope_review_session" if session else "scope_review",
-                    "needs_ack": {**route, "route_fp": ev.route_fp, "evidence": ev.to_json()} if bound else None,
-                    "role": f"reviewer:{row.slot_id}", "binding_known": bound,
-                    "window_tokens": int(ev.window_tokens or 0),
-                    "floor_tokens": int(floor),
-                    "verified": int(ev.window_tokens or 0) > 0,
-                })
-    except Exception:
-        log.debug("review capability probe skipped", exc_info=True)
-    return notices
 
 
 @owner_write_guard
@@ -772,8 +692,8 @@ def _api_owner_context_mode_sync(request: Request, body: Any) -> JSONResponse:
     def _set_context_mode(current: Dict[str, Any]) -> Dict[str, Any]:
         current["OUROBOROS_CONTEXT_MODE"] = next_mode
         # The retired marker survives one compatibility window only as explicit false
-        # provenance, so owner Low still means "scope review not performed" while a bare
-        # forwarded env Low remains owner Max.
+        # provenance, so a stored Low carries owner intent while a bare forwarded env
+        # Low remains owner Max for the owner's own working window.
         current["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] = "false"
         return current
 
@@ -949,12 +869,14 @@ async def api_reviewer_slots(request: Request) -> JSONResponse:
                 "resolved_route": route,
             }
         return {"slot_id": r.slot_id, "route": route, "effort": r.effort,
-                "processing_preference": r.processing_preference}
+                "processing_preference": r.processing_preference,
+                # '' round-trips a pre-#1334 bare row as bare (still packet).
+                **({"delivery": r.delivery} if getattr(r, "delivery", "") else {})}
 
     payload["source"] = config.source
     payload["triad"] = [_row(r) for r in config.triad]
     payload["scope"] = [_row(r) for r in config.scope]
-    # The deep self-review singleton: the saved row, or the packed api row
+    # The deep self-review singleton: the saved row, or the native api row
     # synthesized from the legacy model key — disclosed as such so the editor
     # can say the row is not saved yet (saving materializes the migration).
     payload["deep_review"] = {k: v for k, v in _row(deep_review_slot(config)).items() if k != "slot_id"}
@@ -1003,6 +925,7 @@ async def api_settings_get(request: Request) -> JSONResponse:
     # not a second policy store.
     try:
         meta["policy_state"] = _build_policy_state(settings)
+        meta["restart_state"] = _build_restart_state(settings)
     except Exception:
         # A settings read must stay available even if an optional projection
         # helper is unavailable during startup.  The persisted values remain
@@ -1046,10 +969,12 @@ async def api_onboarding(request: Request) -> Response:
     (b) made a page load the author of provider defaults the owner never saw.
     The save paths (POST /api/settings, POST /api/onboarding/complete, the
     desktop wizard bridge) keep the same normalization and persist it."""
+    from ouroboros.config import SETTINGS_PATH
+
     settings, _changed, _keys = apply_runtime_provider_defaults(load_settings())
     if has_startup_ready_provider(settings):
         return Response(status_code=204)
-    return HTMLResponse(build_onboarding_html(settings, host_mode="web"))
+    return HTMLResponse(build_onboarding_html(settings, host_mode="web", fresh_install=not SETTINGS_PATH.exists()))
 
 
 def _apply_settings_save_side_effects(
@@ -1292,18 +1217,35 @@ def _api_settings_post_locked(request: Request, body: Any) -> JSONResponse:
             if raw_cycles:
                 body = dict(body)
                 body[REVIEW_MAX_CYCLES_KEY] = normalize_review_max_cycles(raw_cycles)
+        # Optional task bounds (round limit, absolute lifetime): the same vocabulary, but a
+        # blank, zero or malformed value is refused rather than read as "no limit" or as a
+        # silent default; a valid value persists as an int or the canonical "unlimited".
+        from ouroboros.settings_scales import OPTIONAL_BOUND_LEGACY, UNLIMITED, parse_positive_or_unlimited
+        for bound_key in (key for key in OPTIONAL_BOUND_LEGACY if key in body):
+            try:
+                bound = parse_positive_or_unlimited(body.get(bound_key))
+            except (TypeError, ValueError):
+                return unsaved_error(f"{bound_key} must be a positive integer or 'unlimited'.", 400)
+            body = dict(body)
+            body[bound_key] = UNLIMITED if bound is None else bound
         # Available-subagents roster first (S4 atomicity): reviewer
         # references must validate against the roster THIS save produces —
         # not the stale process env (see the check helper below).
         subagents_key = "OUROBOROS_SUBAGENTS"
         if subagents_key in body and body.get(subagents_key) not in (None, ""):
-            from ouroboros.configured_subagents import normalize_configured_subagents
+            from ouroboros.configured_subagents import (
+                normalize_configured_subagents, roster_save_error,
+            )
             try:
                 _subagents, canonical_subagents = normalize_configured_subagents(
                     body.get(subagents_key)
                 )
             except ValueError as exc:
                 return unsaved_error(str(exc), 400)
+            # Twins are refused only when THIS save changes the roster.
+            twin_error = roster_save_error(canonical_subagents, load_settings(), body)
+            if twin_error:
+                return unsaved_error(twin_error, 400)
             body = dict(body)
             body[subagents_key] = canonical_subagents
         # Reviewer-slot SSOT (6.1): 400 on malformed; save-time disclosure returned;
@@ -1336,10 +1278,13 @@ def _api_settings_post_locked(request: Request, body: Any) -> JSONResponse:
         old_effective_settings["OUROBOROS_RUNTIME_MODE"] = current_runtime_mode
         if "MCP_SERVERS" in body:
             body = dict(body)
-            body["MCP_SERVERS"] = _rehydrate_mcp_servers_payload(
-                body.get("MCP_SERVERS"),
-                old_settings.get("MCP_SERVERS"),
-            )
+            try:
+                body["MCP_SERVERS"] = _rehydrate_mcp_servers_payload(
+                    body.get("MCP_SERVERS"),
+                    old_settings.get("MCP_SERVERS"),
+                )
+            except MCPSecretIdentityAmbiguous as exc:
+                return unsaved_error(str(exc), 409, code=exc.code)
         current = _merge_settings_payload(old_effective_settings, body)
         from ouroboros.runtime_mode_policy import runtime_mode_at_least
 
@@ -1352,6 +1297,10 @@ def _api_settings_post_locked(request: Request, body: Any) -> JSONResponse:
         if minimax_region and minimax_region not in MINIMAX_REGION_ENDPOINTS:
             return unsaved_error("MINIMAX_REGION must be global_en or cn_zh.", 400)
         current["MINIMAX_REGION"] = minimax_region
+        zai_plan = str(current.get("ZAI_PLAN") or "").strip().lower()
+        if zai_plan and zai_plan not in ZAI_PLAN_ENDPOINTS:
+            return unsaved_error("ZAI_PLAN must be payg or coding.", 400)
+        current["ZAI_PLAN"] = zai_plan
         # Generic settings saves operate on the current boot baseline. A pending
         # next-boot mode written by /api/owner/runtime-mode is preserved on disk
         # below, but never hot-applied to this process/env.
@@ -1370,10 +1319,8 @@ def _api_settings_post_locked(request: Request, body: Any) -> JSONResponse:
             k for k in current
             if str(current.get(k, "") or "") != str(old_effective_settings.get(k, "") or "")
         ]
-        restart_keys = _classify_settings_changes(old_effective_settings, current)
         if runtime_changed:
             all_changed.append("OUROBOROS_RUNTIME_MODE")
-            restart_keys.append("OUROBOROS_RUNTIME_MODE")
 
         # Snapshot BEFORE the save lands: only a task already started at that
         # moment keeps the previous configuration. Measuring after the write
@@ -1483,9 +1430,11 @@ def _api_settings_post_locked(request: Request, body: Any) -> JSONResponse:
             resp["agent_task_running"] = True
         if not all_changed:
             resp["no_changes"] = True
-        if restart_keys:
+        restart_state = _build_restart_state(settings_to_save)
+        resp["restart_state"] = restart_state
+        if restart_state["restart_required"]:
             resp["restart_required"] = True
-            resp["restart_keys"] = restart_keys
+            resp["restart_keys"] = restart_state["restart_keys"]
         if immediate_changed:
             resp["immediate_changed"] = True
         if next_task_changed:
@@ -1505,19 +1454,6 @@ def _api_settings_post_locked(request: Request, body: Any) -> JSONResponse:
                     "and can break the review quorum — check for a truncated value."
                 )
                 resp["warnings"] = warnings
-        # Capability is a property of the whole ROUTE (provider + base_url + model), and
-        # the lazy scope probe memoises by that fingerprint. A base-URL change therefore
-        # produces an unprobed route exactly as a model change does; gating notices on
-        # the model alone left the next scope review at the conservative sub-floor with
-        # the advertised owner-ack path unreachable.
-        if any(
-            k.startswith("OUROBOROS_SCOPE_REVIEW_MODEL") or k == "OUROBOROS_REVIEWER_SLOTS"
-            or k in _REVIEW_ROUTE_BASE_URL_KEYS
-            for k in all_changed
-        ):
-            _capability_notices = _review_capability_notices(current)
-            if _capability_notices:
-                resp["review_capability_notices"] = _capability_notices
         return JSONResponse(resp)
     except Exception as e:
         if boundary.committed:

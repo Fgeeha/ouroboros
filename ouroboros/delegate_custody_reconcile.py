@@ -14,6 +14,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from ouroboros._usage_rows import REVIEW_ATTRIBUTION_KEYS
 from ouroboros.delegate_registration_policy import record_persistent as _record_persistent
+from ouroboros.subagent_history import session_request_facts
 
 from typing import TYPE_CHECKING
 
@@ -53,8 +54,9 @@ def pending_invocations(drive_root: Any,
     The launched-never-collected class one step EARLIER than ``open_runs``: a
     worker death between the accepted POST and ``record_started`` leaves only the
     ``START_REQUESTED`` row. Facts come from the FIRST request row (the minting,
-    same rule as ``invocation_record``); a record whose canonical body never
-    landed is excluded (nothing byte-identical can be replayed). ``rows`` shares
+    same rule as ``invocation_record``). Legacy rows without a body stay excluded;
+    an unreadable request reference retains identity with ``request=None``.
+    Reconciliation cannot replay it without that body. ``rows`` shares
     one pre-read snapshot with ``replay`` (atomic payload busy claim)."""
     from ouroboros.delegate_pending import pending_invocations as replay_pending
 
@@ -119,7 +121,7 @@ def reconcile_task_runs(drive_root: Any, task_id: str, *,
 
 def reconcile_orphaned_runs(
     drive_root: Any,
-    running_task_ids: Optional[set] = None,
+    running_task_ids: Optional[Any] = None,
     *,
     gateway_factory: Optional[Callable[[], Any]] = None,
     recoverable_task_ids: Optional[set] = None,
@@ -129,19 +131,28 @@ def reconcile_orphaned_runs(
     The owner-is-gone predicate is the SAME one ``process_custody.reap_orphaned_processes``
     already uses (the supervisor's live task set), so a delegated run and a spawned
     process cannot disagree about whether their owner still exists. ``running_task_ids``
-    of None means UNKNOWN and reconciles nothing — never mass-cancel on missing info.
+    is that set, or a zero-arg callable producing it; None means UNKNOWN and reconciles
+    nothing — never mass-cancel on missing info.
     """
     if running_task_ids is None:
         return []
-    spared = set(recoverable_task_ids or ())
-    live_or_reserved = set(running_task_ids) | spared
-    orphans = [c for c in _custody().open_runs(drive_root) if c.task_id and c.task_id not in live_or_reserved]
+    # CANDIDATES FIRST, LIVENESS SECOND, exactly as the process reaper reads its ledger:
+    # replaying the custody log takes seconds, and a candidate exists ⇒ its owner was
+    # registered earlier (admission takes ``_queue_lock`` before any spawn), so an owner
+    # absent from the LATER snapshot is really gone rather than merely not yet admitted.
+    candidates = _custody().open_runs(drive_root)
     # The class ONE STEP EARLIER (P34R.2): an invocation whose POST the daemon may have
     # accepted but whose worker died before record_started has no run row for the sweep
     # above to find — a live mutating run nobody could ever collect. Recovered here on
     # the SAME owner-is-gone predicate; a pending invocation whose owner is ALIVE stays
     # untouched, because that owner holds the retry token and decides.
-    stray = [record for record in _custody().pending_invocations(drive_root)
+    unbound = _custody().pending_invocations(drive_root)
+    live = running_task_ids() if callable(running_task_ids) else running_task_ids
+    if live is None:
+        return []  # the snapshot could not be taken: still UNKNOWN, still touch nothing
+    live_or_reserved = set(live) | set(recoverable_task_ids or ())
+    orphans = [c for c in candidates if c.task_id and c.task_id not in live_or_reserved]
+    stray = [record for record in unbound
              if record["task_id"] and record["task_id"] not in live_or_reserved]
     return _reconcile_each(drive_root, orphans, gateway_factory, pending=stray)
 
@@ -233,8 +244,14 @@ def _recover_pending_invocation(drive_root: Any, gateway: Any,
                   "reason": "review_panel_owns_invocation"}
         _custody().emit(drive_root, _custody().RECONCILED, result)
         return result
+    body = record.get("request")
+    if not isinstance(body, dict) or not body:
+        result = {"invocation_id": invocation_id, "task_id": task_id,
+                  "action": "invocation_retained", "reason": "invocation_request_unrecorded"}
+        _custody().emit(drive_root, _custody().RECONCILED, result)
+        return result
     try:
-        handle = gateway.start_run(dict(record["request"]), idempotency_key=invocation_id)
+        handle = gateway.start_run(dict(body), idempotency_key=invocation_id)
     except ClaudexorUnavailable as exc:
         status = int(getattr(exc, "status_code", 0) or 0)
         if 400 <= status < 500:
@@ -243,6 +260,8 @@ def _recover_pending_invocation(drive_root: Any, gateway: Any,
                 "run_id": "", "task_id": task_id, "project_id": record["project_id"],
                 "project_retired": retired, "reason": f"recovery_refused_{exc.code}",
                 "invocation_id": invocation_id, "definite": True,
+                **session_request_facts(record["request"], selected_subagent_id=record.get("selected_subagent_id", ""),
+                    task_id=task_id, route=record.get("route", ""), processing=record.get("processing") or {}),
             })
             result = {"invocation_id": invocation_id, "task_id": task_id,
                       "action": "invocation_retired"}
@@ -259,7 +278,6 @@ def _recover_pending_invocation(drive_root: Any, gateway: Any,
                   "action": "recovery_pending"}
         _custody().emit(drive_root, _custody().RECONCILED, result)
         return result
-    body = record["request"]
     execution = body.get("execution") if isinstance(body.get("execution"), dict) else {}
     scope = body.get("scope") if isinstance(body.get("scope"), dict) else {}
     custody = _custody().RunCustody(
@@ -267,6 +285,8 @@ def _recover_pending_invocation(drive_root: Any, gateway: Any,
         route_id=str(record["route"] or body.get("primaryHarness") or ""),
         model=str(body.get("model") or ""),
         profile_id=str(body.get("credentialProfileId") or ""),
+        effort=body.get("effort"),
+        processing_preference=(record.get("processing") or {}).get("requested"),
         project_id=record["project_id"], project_owned=bool(record["project_owned"]),
         project_persistent=_record_persistent(record),
         root_task_id=str(record.get("root_task_id") or ""),

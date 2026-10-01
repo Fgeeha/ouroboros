@@ -120,7 +120,7 @@ def test_ordinary_main_and_transport_refusals_keep_their_original_envelope(monke
     worker_chat_lane._handle_chat_direct_locked(chat_id, "hello", task_metadata={
         "origin_message_ref": build_owner_message_ref(chat_id=chat_id, client_message_id="ordinary", ts="now", text="hello"),
     })
-    assert sent == [((chat_id, "🚫 Budget exhausted. Task rejected. Please increase TOTAL_BUDGET in settings."), {})]
+    assert sent == [((chat_id, "🚫 Budget exhausted. Task rejected. Please increase TOTAL_BUDGET in settings."), {"role": "system", "system_type": "task_admission_notice"})]
 
 
 @pytest.mark.parametrize("host_operation", [False, True])

@@ -50,6 +50,7 @@ from ouroboros.review_session_custody import (
     owned_started_review_custody,
     review_recovery_facts,
 )
+from ouroboros.review_session_preparation import prepare_review_session_request, render_review_session_prompt
 from ouroboros.review_session_usage import (
     session_custody_attribution,
     session_invocation_fields,
@@ -147,7 +148,7 @@ def panel_delivery_class(slots: Any) -> str:
 # Policy keys a retrieving executor consumes itself (`review_native_episode`,
 # `AgentSessionReviewExecutor`); the rendered Policy JSON omits them so the api
 # pack states the review contract once, in its governance segment.
-ROUTE_OWNED_POLICY_KEYS = frozenset({"output_contract", "native_data_root"})
+ROUTE_OWNED_POLICY_KEYS = frozenset({"output_contract", "native_data_root", "review_source_closure"})
 
 
 def review_output_contract(request: ReviewRequest) -> str:
@@ -736,6 +737,7 @@ class SessionInvocation:
     operation_id: str = ""
     pending_invocation_checkpoint: Optional[Callable[[str], None]] = None
     owner_deadline_at: str = ""
+    source_delivery: Optional[Dict[str, Any]] = None
 
 def run_delegated_review_session(
     *,
@@ -744,19 +746,17 @@ def run_delegated_review_session(
     custody_drive: Any,
     invocation: SessionInvocation,
 ) -> Dict[str, Any]:
-    """Start, watch, settle and collect one delegated read-only review.
-    This is every review surface's single session transport. It pins one
-    subscription harness, asks for schema only when the effective adapter can
-    carry it, stores the canonical start request before POST, and replays only
-    an explicit pending invocation token. A bound token joins its existing run;
-    reconcile-only mode never mints a replacement. The nanny owns verified
-    cancellation at ``timeout_sec`` and reads the full primary output before
-    settling through ``delegate_custody``.
+    """All reviews share this transport: pin one subscription harness, request
+    schema only if its effective adapter supports it, store the canonical body
+    before POST, and replay only an explicit pending token. Bound tokens join
+    existing runs; reconciliation never replaces them. The nanny verifies
+    cancellation at ``timeout_sec`` and reads full output before ``delegate_custody`` settlement.
     """
     from ouroboros import delegate_custody as custody
     from ouroboros.claudexor_daemon import ensure_owned_gateway
     from ouroboros.gateways.claudexor import (
         WINDOW_EXHAUSTED_CODES, ClaudexorSubscriptionWindowExhausted, ClaudexorUnavailable, final_attempt_facts,
+        run_failure_error,
     )
     from ouroboros.subagents import delegated_run_shape, route_health
     from ouroboros.usage_accounting import current_usage_scope
@@ -778,10 +778,10 @@ def run_delegated_review_session(
         run_id, started_custody = owned_started_review_custody(
             custody, custody_drive, record, task_id)
         run_request, invocation_id = record.get("request"), retry_token
-    elif (record is not None and record["state"] == "pending"
-          and isinstance(record.get("request"), dict) and record["request"]):
-        run_request, invocation_id = record["request"], retry_token
-    recovering = bool(run_id) or run_request is not None
+    elif record is not None and record["state"] == "pending":
+        run_request, invocation_id = record.get("request"), retry_token
+    # Known pending custody survives body loss; recovery reports the missing request.
+    recovering = bool(run_id or invocation_id)
     if retry_token and not recovering and surface != "skill_review":
         raise ReviewRouteUnavailable(
             "delegated retry token has no durable invocation; refusing a second paid run",
@@ -829,6 +829,8 @@ def run_delegated_review_session(
                 raise ReviewRouteUnavailable(
                     f"delegated review route unavailable: {unavailable}", code=unavailable)
         if not recovering:
+            from ouroboros.acceptance_retrieving import prepare_session_source
+            prepare_session_source(invocation.source_delivery, task_id=task_id)
             existing_project = gateway.find_project_id(root)
             project_id = existing_project or gateway.register_project(root)
             schema_asked = bool(output_schema) and _effective_route_carries_schema(
@@ -847,30 +849,20 @@ def run_delegated_review_session(
             seconds = bounded_seconds(
                 timeout_sec, default=300, maximum=_CLAUDEXOR_MAX_SECONDS,
             )
-            run_request = {
-                "prompt": prompt,
-                "instructions": instructions,
-                "authPreference": "subscription",
-                "mode": shape.mode,
-                "access": shape.access,
-                "scope": {"kind": "project", "root": root},
-                # A one-element explicit pool is the pin; primaryHarness is only preference.
-                "harnesses": [route.route_id],
-                "primaryHarness": route.route_id,
-                "maxSeconds": seconds,
-            }
-            if use_thread:
-                run_request["_use_thread"] = True
-                run_request["_thread_id"] = thread_id
-            if route.model:
-                run_request["model"] = route.model
-            if route.effort:
-                run_request["effort"] = route.effort
-            if use_thread or getattr(route, "profile_id", ""):
-                run_request["credentialProfileId"] = getattr(route, "profile_id", "") or None
-            if schema_asked:
-                run_request["outputSchema"] = output_schema
+            run_request = prepare_review_session_request(
+                invocation, route, prompt=prompt, root=root,
+                thread_id=thread_id, schema_asked=schema_asked)
         if not run_id:
+            from ouroboros.budget_pause import dispatch_fenced
+
+            if dispatch_fenced(task_id):
+                # Observation-only while the owning task pauses (#1196): a
+                # fresh start AND a pending-invocation replay are both a new
+                # POST. The invocation row stays pending for the resumed task.
+                raise ReviewRouteUnavailable(
+                    "the owning task is entering an exact budget pause; no delegated "
+                    "review is started or re-posted while it pauses",
+                    code="budget_pausing_no_send")
             if (not recovering and owner_deadline_at and owner_deadline_exhausted(
                 deadline_at=owner_deadline_at, reserve_sec=get_finalization_grace_sec())):
                 raise _deadline_exhausted_error()
@@ -889,6 +881,7 @@ def run_delegated_review_session(
                 surface=surface, slot_id=slot_id,
                 # #112: pending recovery replays the request row's lineage.
                 root_task_id=root_task_id, parent_task_id=parent_task_id,
+                review_source_delivery=dict(invocation.source_delivery or {}),
                 **usage_custody,
             )
             if not requested:
@@ -983,16 +976,9 @@ def run_delegated_review_session(
         observed = final_attempt_facts(detail, run_id)
         run_state = str(summary.get("state") or "")
         if run_state != "succeeded":
-            failure = summary.get("failure") if isinstance(summary.get("failure"), dict) else {}
-            message = (f"delegated review session {run_id} ended {run_state or 'unknown'}"
-                       + (f": {json.dumps(failure, ensure_ascii=False)}" if failure else ""))
-            code = str(failure.get("code") or "")
             state.pop("pending_invocation_id", None)
             state.pop("delegated_run_id", None)
-            if code in WINDOW_EXHAUSTED_CODES:
-                raise ClaudexorSubscriptionWindowExhausted(
-                    message, reset_at=str(failure.get("resetsAt") or ""), code=code)
-            raise ClaudexorUnavailable(code or f"run_{run_state or 'unknown'}", message)
+            raise run_failure_error(run_id, run_state, summary.get("failure"))
         text = _full_session_text(gateway, run_id, detail)
         spend, estimated = custody.disclosed_spend(summary)
         thread_receipt: Dict[str, Any] = {}
@@ -1016,7 +1002,7 @@ def run_delegated_review_session(
             "custody_durable": custody_durable,
             "idempotent_recovery": recovering,
             "settlement": settlement,
-            "route_id": str(entry.route_id),
+            "route_id": str(entry.route_id), "run_dir": str(summary.get("runDir") or ""),
             # One final attempt, never the requested pool or a mixed summary route.
             "effective_route_ids": [observed["harness_id"]] if observed.get("harness_id") else [],
             "observed_attempt": observed,
@@ -1142,6 +1128,55 @@ def _full_session_text(gateway: Any, run_id: str, detail: Dict[str, Any]) -> str
         final_summary = detail.get("finalSummary")
         text = final_summary if isinstance(final_summary, str) else ""
     return text
+
+
+def session_identity_deltas(slot: Any, facts: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Disclose final-attempt identity versus the frozen request, also during pure collection."""
+    deltas = []
+    effective_routes = facts.get("effective_route_ids") or []
+    if not effective_routes:
+        deltas.append({
+            "kind": "capability_delta",
+            "requested": f"route {facts['route_id']} (pinned pool)",
+            "effective": "final-attempt route observation unavailable; pinned pool could not be verified",
+            "reason": "session_route_observation_unavailable",
+        })
+    elif facts["route_id"] and set(effective_routes) != {facts["route_id"]}:
+        # Belt over the pin: the request names exactly one eligible
+        # harness, so the engine's receipt disagreeing is drift that must
+        # surface loudly, never a quietly accepted substitute route.
+        deltas.append({
+            "kind": "capability_delta",
+            "requested": f"route {facts['route_id']} (pinned pool)",
+            "effective": "route(s) " + ", ".join(effective_routes),
+            "reason": "session_ran_off_pinned_route",
+        })
+    slot_model = str(slot.model or "")
+    session_target = str(getattr(slot, "session_target", "") or "")
+    from ouroboros.provider_models import normalize_model_identity
+    if session_target:
+        # Structured rows keep the opaque ``harness[=model]`` target in
+        # ``slot.model`` for row identity/display, while the daemon sees
+        # only the parsed model component. Compare like with like: the old
+        # full-spec-vs-model comparison invented a capability delta for
+        # every healthy pinned session row.
+        from ouroboros.subagents import parse_subagent_harness
+
+        parsed_target = parse_subagent_harness(session_target)
+        slot_model = str(getattr(parsed_target, "model", "") or "")
+    if (
+        slot_model and facts["model"]
+        and normalize_model_identity(slot_model) != normalize_model_identity(facts["model"])
+    ):
+        deltas.append({
+            "kind": "capability_delta",
+            "requested": f"model {slot_model}",
+            "effective": f"model {facts['model']}",
+            "reason": "session_route_resolves_its_own_model",
+        })
+    return deltas
+
+
 class AgentSessionReviewExecutor(ReviewSlotExecutor):
     """One pinned Claudexor run per reviewer slot.
 
@@ -1193,19 +1228,7 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
                     "agent_session slot has no session task: the surface must supply "
                     "the route-owned task text (request.session_task) — the assembled "
                     "api pack is deliberately not sendable to a session", code="session_task_missing")
-            parts = [
-                "You are an independent Ouroboros reviewer slot running as a "
-                "read-only agent session.",
-                f"Surface: {request.surface}",
-                f"Role hint: {slot.role_hint or 'general reviewer'}",
-                "",
-                task,
-                "",
-                "OUTPUT CONTRACT (your host parses this structurally):",
-                self._output_contract() + "\nThis contract governs the unwrapped substantive deliverable; emit any host-required transport metadata outside it exactly as separately instructed.",
-                f"Slot: {slot.slot_id}",
-            ]
-            self._session_prompt = "\n".join(parts)
+            self._session_prompt = render_review_session_prompt(request, slot, task)
         return self._session_prompt
     # -- delivery --------------------------------------------------------------
 
@@ -1331,6 +1354,7 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
                 operation_id=self.assignment.call_id,
                 pending_invocation_checkpoint=self._pending_invocation_checkpoint,
                 owner_deadline_at=str(getattr(request, "deadline_at", "") or ""),
+                source_delivery=(getattr(request, "slot_source_delivery", None) or {}).get(slot.slot_id),
             ),
         )
         self._run_id = facts["run_id"]
@@ -1357,23 +1381,7 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
                 "reason": "schema_not_conformed_on_effective_route",
             })
         effective_routes = facts.get("effective_route_ids") or []
-        if not effective_routes:
-            self._deltas.append({
-                "kind": "capability_delta",
-                "requested": f"route {facts['route_id']} (pinned pool)",
-                "effective": "final-attempt route observation unavailable; pinned pool could not be verified",
-                "reason": "session_route_observation_unavailable",
-            })
-        elif set(effective_routes) != {facts["route_id"]}:
-            # Belt over the pin: the request names exactly one eligible
-            # harness, so the engine's receipt disagreeing is drift that must
-            # surface loudly, never a quietly accepted substitute route.
-            self._deltas.append({
-                "kind": "capability_delta",
-                "requested": f"route {facts['route_id']} (pinned pool)",
-                "effective": "route(s) " + ", ".join(effective_routes),
-                "reason": "session_ran_off_pinned_route",
-            })
+        self._deltas.extend(session_identity_deltas(slot, facts))
         spend, estimated = facts["spend"], facts["spend_estimated"]
         self._session_usage = {
             "provider": "claudexor",
@@ -1382,6 +1390,8 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
             "delegated_route": effective_routes[0] if len(effective_routes) == 1 else "",
             "requested_route": facts["route_id"],
             "observed_attempt": facts.get("observed_attempt") or {},
+            **({"effort_resolution": facts["observed_attempt"]["effort_resolution"]}
+               if isinstance((facts.get("observed_attempt") or {}).get("effort_resolution"), dict) else {}),
             "review_thread_id": str(facts.get("thread_id") or ""),
             "review_turn_id": str(facts.get("turn_id") or ""),
             "review_thread_receipt": facts.get("thread_receipt") or {},
@@ -1406,29 +1416,21 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
             "cost_disclosed_usd": spend,
             "cost_estimated": estimated,
         }
-        slot_model = str(slot.model or "")
-        session_target = str(getattr(slot, "session_target", "") or "")
-        from ouroboros.provider_models import normalize_model_identity
-        if session_target:
-            # Structured rows keep the opaque ``harness[=model]`` target in
-            # ``slot.model`` for row identity/display, while the daemon sees
-            # only the parsed model component. Compare like with like: the old
-            # full-spec-vs-model comparison invented a capability delta for
-            # every healthy pinned session row.
-            from ouroboros.subagents import parse_subagent_harness
+        # What the vendor harness READ, folded from the tool-call journal the
+        # engine keeps under the run directory (`run_dir`, the only witness of a
+        # session's reads there is): the same usage facts a native episode folds
+        # from its host-executed receipts, under the weaker `harness_observed`
+        # provenance. The verdict is paid evidence, so the fold never raises out
+        # of settlement — an unreadable journal is a disclosed `unobserved`.
+        from ouroboros.review_session_reads import session_read_facts
 
-            parsed_target = parse_subagent_harness(session_target)
-            slot_model = str(getattr(parsed_target, "model", "") or "")
-        if (
-            slot_model and facts["model"]
-            and normalize_model_identity(slot_model) != normalize_model_identity(facts["model"])
-        ):
-            self._deltas.append({
-                "kind": "capability_delta",
-                "requested": f"model {slot_model}",
-                "effective": f"model {facts['model']}",
-                "reason": "session_route_resolves_its_own_model",
-            })
+        policy = request.policy or {}
+        self._session_usage.update(session_read_facts(
+            str(facts.get("run_dir") or ""), policy,
+            session_root=str(request.session_root or ""),
+            store={"root": policy.get("native_data_root") or self.assignment.custody_root,
+                   "task_id": request.task_id or "review", "run_id": self._run_id,
+                   "source_id": f"{self.assignment.call_id}-session-reads"}))
         # PAID EVIDENCE: the transcript always feeds the parser whole. A profile
         # continuity `cannot_verify` is telemetry, never a reason to blank it.
         self._raw_transcript = facts["text"]
@@ -1492,6 +1494,11 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
             "delegated_run_id": self._run_id,
             "verdict_method": method,
         }
+        if usage.get("native_incomplete"):
+            # The partial-product fact travels WITH the product, exactly as the
+            # native episode carries it: a consumer reading the text alone must
+            # still see that a required source went unread.
+            message["native_incomplete"] = usage["native_incomplete"]
         return ReviewAttemptResult(message=message, usage=usage, raw_text=canonical)
     def _emit_capability_delta(self, deltas: List[Dict[str, Any]], method: str) -> None:
         """Durable half of the disclosure (D4): every landing below what was

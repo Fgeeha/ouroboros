@@ -30,7 +30,7 @@ def candidate(tmp_path, monkeypatch):
     monkeypatch.setattr(advisory, "advisory_review_route", lambda: "agent_session")
     monkeypatch.setattr(advisory, "advisory_slot_enabled", lambda: True)
     monkeypatch.setattr(advisory, "check_worktree_readiness", lambda *a, **kw: [])
-    monkeypatch.setattr(advisory, "_release_metadata_preflight", lambda *a: None)
+    monkeypatch.setattr(advisory, "_release_metadata_preflight", lambda *a, **kw: None)
     monkeypatch.setattr(advisory, "_check_worktree_version_sync_shared", lambda *a: "")
     monkeypatch.setattr(git, "advisory_gate_unavailable", lambda: False)
     monkeypatch.setattr(git, "_managed_candidate_needs_proof", lambda ctx: False)
@@ -185,7 +185,7 @@ def test_rebuttal_reaches_real_prompt_builder(candidate, monkeypatch):
     from ouroboros.tools.preflight_review_prompt import _build_advisory_prompt
 
     rebuttal = "New evidence: both callers preserve a zero chat identifier."
-    prompt = _build_advisory_prompt(candidate.repo_dir, "candidate", prompt_context={"review_rebuttal": rebuttal}, governance_by_retrieval=True)
+    prompt = _build_advisory_prompt(candidate.repo_dir, "candidate", prompt_context={"review_rebuttal": rebuttal})
     assert rebuttal in prompt
     assert "Developer's rebuttal" in prompt
     assert "offset/limit" not in prompt

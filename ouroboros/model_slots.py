@@ -143,6 +143,27 @@ def task_model_binding(task: dict, *, context_fit_plan: object = None,
     return role, pin
 
 
+def route_binding(model: str, use_local: bool, role: str, *,
+                  overrides: dict | None = None) -> tuple[str, bool, str]:
+    """The complete identity a send on ``role`` uses: model, locality and account.
+
+    A live owner choice for the role (a wait-card switch) replaces the configured
+    route exactly as the send applies it; the account is the configured pin or
+    empty Auto, never an observed Auto account, and routes without accounts have
+    none. Equal model strings with different accounts are different routes.
+    """
+    from ouroboros.provider_models import provider_for_model
+
+    chosen = (overrides or {}).get(role) or {}
+    model, use_local = str(chosen.get("model", model) or ""), bool(chosen.get("use_local", use_local))
+    account = chosen.get("model_account_override")
+    if account is None:
+        account = model_role_option(MODEL_ACCOUNTS_KEY, role) if role else ""
+    if use_local or provider_for_model(model) != "claudexor":
+        account = ""
+    return model, use_local, str(account or "").strip()
+
+
 def task_processing_preference(task: dict, *, model_role: str = "",
                               override: str | None = None) -> str:
     """Capture the actor's intent; an unconfigured fallback preserves that intent."""
@@ -267,6 +288,7 @@ def apply_model_role_override(settings: dict, *, role: str, model: str,
             row["subagent_id"] = actor_id
         else:
             actor["route"] = {"kind": "api_model", "target_id": routed_model, "credential_profile_id": pin}
+        actor.pop("access", None)  # Native/API rows have no session access profile.
         result["OUROBOROS_SUBAGENTS"] = normalize_configured_subagents(roster)[1]
     if slots is not None:
         result["OUROBOROS_REVIEWER_SLOTS"] = json.dumps(slots, ensure_ascii=False)
@@ -393,7 +415,20 @@ def get_consciousness_model() -> str:
     return str(runtime_setting("OUROBOROS_MODEL_CONSCIOUSNESS", "") or "").strip() or _main_model()
 
 
-def get_deep_self_review_model() -> str:
-    """Return the configured deep self-review model slot."""
-    return (str(runtime_setting("OUROBOROS_MODEL_DEEP_SELF_REVIEW", "") or "").strip()
-            or str(SETTINGS_DEFAULTS["OUROBOROS_MODEL_DEEP_SELF_REVIEW"]))
+def get_deep_self_review_model(settings: dict | None = None, *, authored_panel: bool = False) -> str:
+    """Use Main only for a positively unauthored compatible-only deep default.
+
+    Empty means default, including after settings merges. Every nonempty model
+    stays pinned, even one equal to a shipped model; a saved panel without a
+    deep row keeps its unknown legacy provenance.
+    """
+    from ouroboros.provider_models import compatible_only_main_model
+    from ouroboros.settings_defaults import OPENROUTER_DEFAULTS
+    from ouroboros.settings_integrity import runtime_environ
+
+    source = runtime_environ() if settings is None else settings
+    key = "OUROBOROS_MODEL_DEEP_SELF_REVIEW"
+    chosen = str(source.get(key) or "").strip()
+    if not chosen and not authored_panel and not source.get("OUROBOROS_REVIEWER_SLOTS"):
+        chosen = compatible_only_main_model(source)
+    return chosen or str(OPENROUTER_DEFAULTS["deep_self_review"])

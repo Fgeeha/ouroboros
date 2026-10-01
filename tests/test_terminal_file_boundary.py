@@ -160,7 +160,7 @@ def test_post_task_cleanup_waits_for_pooled_files_only(tmp_path, monkeypatch, po
     monkeypatch.setattr(pipeline, "_pre_synthesis_usage_snapshot", lambda *_a: {})
     monkeypatch.setattr("ouroboros.llm.LLMClient", lambda: object())
     monkeypatch.setattr("ouroboros.memory.Memory", lambda **_kw: object())
-    for name in ("_run_chat_consolidation", "_run_scratchpad_consolidation", "_run_task_summary",
+    for name in ("_run_chat_consolidation", "_run_scratchpad_consolidation", "_record_task_facts",
                  "_run_reflection", "_update_improvement_backlog", "_apply_reflection_memory_actions"):
         monkeypatch.setattr(pipeline, name, lambda *_a, **_kw: None)
     monkeypatch.setattr("ouroboros.post_task_evolution.maybe_promote", lambda *_a: None)
@@ -213,7 +213,7 @@ def test_pooled_post_work_preserves_real_followup_until_copyback(tmp_path, monke
     monkeypatch.setattr(pipeline, "_pre_synthesis_usage_snapshot", lambda *_a: {})
     monkeypatch.setattr("ouroboros.llm.LLMClient", lambda: object())
     monkeypatch.setattr("ouroboros.memory.Memory", lambda **_kw: object())
-    for name in ("_run_chat_consolidation", "_run_scratchpad_consolidation", "_run_task_summary",
+    for name in ("_run_chat_consolidation", "_run_scratchpad_consolidation", "_record_task_facts",
                  "_run_reflection", "_update_improvement_backlog", "_apply_reflection_memory_actions"):
         monkeypatch.setattr(pipeline, name, lambda *_a, **_kw: None)
     monkeypatch.setattr("ouroboros.post_task_evolution.maybe_promote", lambda *_a: None)
@@ -222,9 +222,11 @@ def test_pooled_post_work_preserves_real_followup_until_copyback(tmp_path, monke
     mailbox = owner_mailbox._mailbox_path(child, task_id)
     assert mailbox.is_file(), "post-task completion must not erase copyback's accepted input source"
     result = headless.copy_child_task_result(parent, task)
-    assert result["child_ref_promotion"]["pending_refs"] == []
+    assert result["child_ref_promotion"]["pending_refs"]  # adoption does not wait for history
     captured = artifacts.task_artifact_dir_path(parent, task_id) / attachments[0]["relpath"]
     assert captured.read_bytes() == source.read_bytes()
+    retained = headless.retry_child_task_refs(parent, child, task_id)
+    assert retained["child_ref_promotion"]["pending_refs"] == []
     cleanup_settled_owner_mailbox(parent, task_id, task)
     assert not mailbox.exists()
 

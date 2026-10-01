@@ -50,6 +50,7 @@ def _handle_task_message_injected(evt: Dict[str, Any], ctx: Any) -> None:
         "task_id": evt.get("task_id", ""),
         "source_task_id": evt.get("source_task_id", ""),
         "provenance": evt.get("provenance", ""),
+        **({"relation": evt["relation"]} if evt.get("relation") in {"parent", "sibling"} else {}),
         "relayed_from_task_id": evt.get("relayed_from_task_id", ""),
         "text_preview": str(evt.get("text_preview") or "")[:200],
     }
@@ -70,6 +71,7 @@ def _handle_task_message_injected(evt: Dict[str, Any], ctx: Any) -> None:
 # fix registered one branch of review_helpers' if/else and missed the other.
 TELEMETRY_EVENT_HANDLERS = {
     "review_density_probe": _handle_typed_telemetry,
+    "review_scope_delivery_migrated": _handle_typed_telemetry,
     "review_scope_lead_unobserved": _handle_typed_telemetry,
     "review_wave_admission_unavailable": _handle_typed_telemetry,
     "review_wave_budget_insufficient": _handle_typed_telemetry,

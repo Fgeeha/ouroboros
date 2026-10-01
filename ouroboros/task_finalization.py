@@ -27,7 +27,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import pathlib
+import stat
 from typing import Any, Dict, List
 
 from ouroboros.utils import sanitize_tool_result_for_log, truncate_review_artifact
@@ -45,8 +47,8 @@ TERMINAL_ORIGIN_MODEL_FINAL = "model_final"
 TERMINAL_ORIGIN_HOST_SALVAGE = "host_salvage"
 # A terminal text the HOST wrote alone (a budget rejection, a round-limit rail
 # with nothing to deliver, a scheduled swarm handoff). It is not salvage: its
-# own words ARE the answer, so they are published verbatim on every transport
-# instead of being replaced by the outage receipt.
+# own words remain an owner-facing System diagnostic. Presence never turns
+# host-authored text into external speech.
 TERMINAL_ORIGIN_HOST_NOTICE = "host_notice"
 HOST_AUTHORED_TERMINAL_ORIGINS = frozenset({
     TERMINAL_ORIGIN_HOST_SALVAGE, TERMINAL_ORIGIN_HOST_NOTICE,
@@ -161,7 +163,9 @@ def stamp_root_final_phase(
     managed roots keep their task_done conclusion untouched.
     """
     if post_task_open:
-        send_event.setdefault("progress_meta", {})["task_phase"] = "finalizing"
+        send_event.setdefault("progress_meta", {}).update(
+            task_phase="finalizing", task_terminal_status=terminal_status,
+        )
     elif task.get("_is_direct_chat"):
         send_event.setdefault("progress_meta", {})["task_terminal_status"] = terminal_status
 
@@ -192,16 +196,14 @@ def prepare_terminal_send_event(
         usage["delegate_terminal_reconciliation"] = current["delegate_terminal_reconciliation"]
     origin = str(usage.get("terminal_origin") or "")
     notice = str(usage.get("terminal_provider_notice") or "")
-    # Two facts, two rows: the base host notice keeps the untyped System row a
-    # replayed card concludes on, and current delegated custody travels in its
-    # own field so the delivery seam can type it as a card row (#1006).
-    host_notice = str(usage.get("terminal_host_notice") or "")
+    # One voice: the host disclosure stays a typed field OF THE RESULT (CLI
+    # stderr, --jsonl, parent handoff, reviewers, synthesis, the child-result
+    # hash) and never becomes a second chat row. Current delegated custody
+    # still travels in its own field so the delivery seam can type it as a
+    # card row (#1006).
     custody_notice = terminal_custody_notice_text(usage)
-    if not presence:
-        if host_notice:
-            send_event["terminal_host_notice"] = host_notice
-        if custody_notice:
-            send_event["terminal_custody_notice"] = custody_notice
+    if not presence and custody_notice:
+        send_event["terminal_custody_notice"] = custody_notice
     if origin not in _STAMPED_TERMINAL_ORIGINS:
         return send_event
     canonical_root = pathlib.Path(task.get("budget_drive_root") or env_drive_root)
@@ -240,6 +242,9 @@ def terminal_result_fields(usage: Dict[str, Any]) -> Dict[str, Any]:
     for key in ("terminal_provider_notice", "terminal_host_notice"):
         if isinstance(usage.get(key), str) and usage[key]:
             fields[key] = usage[key]
+    handovers = usage.get("authoring_handovers")
+    if isinstance(handovers, list) and handovers:
+        fields["authoring_handovers"] = handovers
     return fields
 
 
@@ -251,7 +256,8 @@ def deliver_final_message_live(
 
     The buffer can also hold proactive ``send_user_message`` events that fell
     back to deferred delivery mid-task (live-first frames stamp ``task_id``
-    too), so the final answer is selected as the LAST send_message matching
+    too). Their typed rows (``proactive_message``, ``main_notice``) are never
+    candidates, and the final answer is selected as the LAST send_message matching
     the finalizing task's id — the host appends the terminal frame after all
     tool-time frames, so it wins the last-match scan — never the first match,
     which would ship a proactive text early while the answer stayed hostage
@@ -276,7 +282,9 @@ def deliver_final_message_live(
     tid = str(task_id or "")
     final = fallback = None
     for event in pending_events:
-        if isinstance(event, dict) and event.get("type") == "send_message":
+        # A mid-task reply or Main notice is never the answer, even with no final after it.
+        if (isinstance(event, dict) and event.get("type") == "send_message"
+                and event.get("system_type") not in ("proactive_message", "main_notice")):
             fallback = event
             if str(event.get("task_id") or "") == tid:
                 final = event
@@ -441,8 +449,128 @@ def completion_source_projection(
     return {**payload, **({"reason": reason} if reason else {})}
 
 
+def focus_source_projection(
+    drive_root: Any, task_id: str, result: Dict[str, Any], start_char: Any = None, end_char: Any = None,
+    sha256: str = "",
+) -> Dict[str, Any]:
+    """Read the bytes a task's focus source_ref answered at authoring time (focus.source_handle).
+
+    ``sha256`` selects a HISTORICAL retained source by digest: a roster row quotes
+    the handle it saw, and a later focus of the same author must not substitute
+    its own evidence for that row's.  The store is write-once and digest-named,
+    so the selector resolves to exactly one immutable file or to nothing.
+    """
+    from ouroboros.artifacts import read_actor_source_bytes, task_artifact_dir_path, text_source_range_projection
+    from ouroboros.focus import compact_focus
+
+    unavailable = {"schema": 1, "kind": "task_focus_source", "status": "unavailable"}
+    focus = compact_focus(result.get("focus"))
+    handle = focus.get("source_handle") if focus else None
+    wanted = str(sha256 or "").strip().lower()
+    if wanted and (not isinstance(handle, dict) or str(handle.get("sha256") or "") != wanted):
+        if len(wanted) != 64 or any(c not in "0123456789abcdef" for c in wanted):
+            return {**unavailable, "reason": "source_ref_invalid"}
+        try:
+            store = task_artifact_dir_path(drive_root, str(task_id), create=False) / "source_handles" / "context_checkpoints"
+            matches = sorted(p for p in store.glob(f"focus_source_*-{wanted}.md") if not p.is_symlink())
+        except (OSError, ValueError):
+            matches = []
+        if len(matches) != 1:
+            return {**unavailable, "reason": "source_unavailable", "requested_sha256": wanted}
+        handle = {"kind": "task_source", "root": "artifact_store",
+                  "path": f"source_handles/context_checkpoints/{matches[0].name}",
+                  "size": matches[0].stat().st_size, "sha256": wanted}
+        focus = None  # a historical selector carries no current source_ref/authored_at claim
+    if not isinstance(handle, dict):
+        return {**unavailable, "reason": "source_unavailable"}
+    try:
+        raw = read_actor_source_bytes(drive_root, str(task_id), handle)
+        projection, reason = text_source_range_projection(raw.decode("utf-8"), unavailable["kind"], start_char, end_char)
+    except ValueError as exc:
+        reason = "source_identity_mismatch" if "verification" in str(exc) else "source_ref_invalid"
+        return {**unavailable, "reason": reason}
+    except (OSError, RuntimeError):
+        return {**unavailable, "reason": "source_unavailable"}
+    payload = projection or unavailable
+    current = {"source_ref": focus["source_ref"], "authored_at": focus["authored_at"]} if focus else {"historical": True}
+    return {**payload, **current, **({"reason": reason} if reason else {})}
+
+
+def review_source_reader(task_id: str, ref: Dict[str, Any]) -> Dict[str, Any]:
+    """A receiver-independent selector for one author's immutable acceptance source."""
+    return {"tool": "get_task_result", "arguments": {
+        "task_id": task_id, "review_source_sha256": str(ref.get("sha256") or "")}}
+
+
+def host_acceptance_source(drive_root: Any, task_id: str, digest: str) -> tuple:
+    """``(ref, bytes)`` of this physical author's own HOST acceptance record, named by digest.
+
+    The digest fixes the path (no caller path, no store search); the bytes must
+    hash to it and decode to a host-root task-acceptance run of this very task,
+    or this raises. The model's ``review_source_sha256`` reader and the owner's
+    record download (``gateway.task_archive.serve_task_source``) share it.
+    """
+    from ouroboros.artifacts import read_actor_source_bytes, task_artifact_dir_path
+    from ouroboros.source_retention import retained_task_roots
+
+    if len(digest) != 64 or digest.strip("0123456789abcdef"):
+        raise ValueError("review source digest is invalid")
+    path = f"source_handles/context_checkpoints/acceptance-{digest}.json"
+    # The selector addresses exact bytes, not their current placement. Only
+    # this author's known retained drives can supply a not-yet-canonical file.
+    roots = [drive_root, *retained_task_roots(drive_root, task_id)]
+    stored = next((candidate for root in roots
+                   if (candidate := task_artifact_dir_path(root, task_id, create=False) / path).exists()), None)
+    if stored is None:
+        raise FileNotFoundError(path)
+    ref = {"kind": "task_source", "root": "artifact_store", "path": path,
+           "size": stored.stat().st_size, "sha256": digest}
+    raw = read_actor_source_bytes(drive_root, task_id, ref)
+    run = json.loads(raw)
+    request = run.get("request") if isinstance(run, dict) else None
+    if (not isinstance(request, dict) or run.get("authority") != "host_root"
+            or request.get("surface") != "task_acceptance" or request.get("task_id") != task_id):
+        raise ValueError("review source identity verification failed")
+    return ref, raw
+
+
+def review_source_projection(drive_root: Any, task_id: str, digest: str,
+                             start_char: Any = None, end_char: Any = None) -> Dict[str, Any]:
+    """Read a physical author's exact acceptance source, including historical panels.
+
+    Only host acceptance panels (``host_acceptance_source``) and the canonical
+    debt's exact pinned subject qualify; no caller path, successor substitution
+    or artifact-store search.
+    """
+    from ouroboros.artifacts import read_actor_source_bytes, text_source_range_projection
+
+    unavailable = {"schema": 1, "kind": "task_review_source", "status": "unavailable"}
+    if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+        return {**unavailable, "reason": "source_ref_invalid"}
+    try:
+        from ouroboros.task_results import load_task_result
+
+        debt = (load_task_result(drive_root, task_id, strict=True) or {}).get("acceptance_debt") or {}
+        historical_ref = debt.get("source_ref") or {}
+        if historical_ref.get("sha256") == digest:
+            from ouroboros.acceptance_history import read_acceptance_history
+
+            read_acceptance_history(drive_root, task_id, debt)
+            ref = historical_ref
+            raw = read_actor_source_bytes(drive_root, task_id, ref)
+        else:
+            ref, raw = host_acceptance_source(drive_root, task_id, digest)
+        projection, reason = text_source_range_projection(raw.decode("utf-8"), unavailable["kind"], start_char, end_char)
+        return {**(projection or unavailable), "task_id": task_id, "source_ref": ref,
+                **({"reason": reason} if reason else {})}
+    except (ValueError, TypeError, AttributeError, KeyError, UnicodeError):
+        return {**unavailable, "reason": "source_identity_mismatch"}
+    except (OSError, RuntimeError):
+        return {**unavailable, "reason": "source_unavailable"}
+
+
 def build_sealed_final_package(result_row: Any, final_text: str) -> Dict[str, Any]:
-    """Host-attested final outcome: delivered text + artifact-store manifest.
+    """Seal recorded reply preparation and artifact facts, not delivery receipts.
 
     The manifest comes from the DURABLE task result the pipeline just stored
     (whose ``artifacts`` were merged from ``collect_task_artifact_records``,
@@ -451,6 +579,7 @@ def build_sealed_final_package(result_row: Any, final_text: str) -> Dict[str, An
     independent filesystem walk (no second source of truth).
     """
     from ouroboros.outcomes import artifact_bundle_from_result
+    from ouroboros.dialogue_provenance import is_presence_task
 
     row = result_row if isinstance(result_row, dict) else {}
     manifest = [
@@ -460,13 +589,28 @@ def build_sealed_final_package(result_row: Any, final_text: str) -> Dict[str, An
         if isinstance(record, dict) and record.get("name")
     ]
     omitted = max(0, len(manifest) - _SEALED_MANIFEST_MAX_FILES)
-    return {
+    package = {
         "final_result_text": str(final_text or ""),
         "artifact_manifest": manifest[:_SEALED_MANIFEST_MAX_FILES],
         **({"artifact_manifest_omitted": omitted} if omitted else {}),
         "completion_observations": row.get("completion_observations") or {"status": "unavailable"},
         **({"terminal_host_notice": terminal_host_notice_text(row)} if terminal_host_notice_text(row) else {}),
     }
+    if is_presence_task(row):
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        # Remember the event-time body, not today's replay policy: a historical
+        # host diagnostic may actually have reached an adapter before this fix.
+        package["final_result_text"] = str(metadata.get("presence_result_text") or "")
+        package["presence_delivery"] = {
+            "reply_recorded": "presence_result_text" in metadata,
+            "outcome": str(metadata.get("presence_outcome") or "unknown"),
+            "work_ref": str(metadata.get("presence_work_ref") or ""),
+            **{key: str(row.get(key) or "unknown") for key in ("terminal_origin", "status", "reason_code")},
+        }
+        package["internal_terminal_text"] = str(row.get("result") or final_text or "")
+        if notice := terminal_notice_text(row):
+            package["terminal_host_notice"] = notice
+    return package
 
 
 def sealed_final_prompt_section(sealed_final: Dict[str, Any] | None) -> str:
@@ -492,25 +636,136 @@ def sealed_final_prompt_section(sealed_final: Dict[str, Any] | None) -> str:
     host_notice = truncate_review_artifact(
         str(sealed_final.get("terminal_host_notice") or ""), limit=_SEALED_FINAL_TEXT_PROMPT_CHARS,
     )
-    return (
-        "## Sealed final outcome (host-attested ground truth)\n"
+    introduction = (
         "Below are the final answer submitted for delivery and a host-built\n"
         "manifest of this task's durable artifact store (plain filesystem facts).\n"
         "Outcomes stated here OVERRIDE impressions from the error trace: if the\n"
         "trace suggests failure but this package shows a delivered result or\n"
         "artifact, describe the recovery honestly instead of declaring the\n"
         "deliverable missing.\n"
+    )
+    heading, presence_facts, internal_text = "Final result text (submitted for delivery):\n", "", ""
+    presence = sealed_final.get("presence_delivery")
+    if isinstance(presence, dict):
+        introduction = (
+            "The recorded automatic-reply body was prepared for the Presence adapter;\n"
+            "it is not a provider delivery receipt. Preserve its recorded origin and task status.\n"
+            "Internal terminal text is diagnostic evidence, not an authored external reply.\n"
+            "Historical host-origin reply bodies remain historical facts, not proof of delivery.\n"
+        )
+        heading = "Recorded automatic-reply body:\n"
+        presence_facts = "Recorded Presence facts:\n" + json.dumps(presence, ensure_ascii=False) + "\n"
+        if not presence.get("reply_recorded"):
+            final_text = "(automatic reply record unavailable)"
+        raw = str(sealed_final.get("internal_terminal_text") or "")
+        if raw and raw != str(sealed_final.get("final_result_text") or ""):
+            internal_text = "Internal terminal text (separate from the automatic reply):\n" + truncate_review_artifact(
+                raw, limit=_SEALED_FINAL_TEXT_PROMPT_CHARS,
+            ) + "\n"
+    return (
+        "## Sealed final outcome (host-attested ground truth)\n"
+        + introduction +
         "An empty final answer, manifest, or observation section is not evidence that no action occurred.\n"
         "Tool success records a submitted/queued action, not a chat receipt or proof the owner received it.\n"
         "Skill readiness is current task-related state; it does not attribute an owner's click to this task.\n"
         "Use the inline counts/results and coverage below; source refs are for later agent readers,\n"
         "not additional evidence you have read. Omitted or unavailable facts remain unknown.\n"
-        "Final result text (submitted for delivery):\n"
-        f"{final_text}\n"
+        + presence_facts + heading + f"{final_text}\n" + internal_text
         + (f"Host-authored terminal notice (separate from the model answer):\n{host_notice}\n" if host_notice else "") +
         "Artifact store manifest (task_results/artifacts/<task_id>/):\n"
         f"{manifest_text}\nTask completion observations:\n{observations}\n\n"
     )
+
+
+def artifact_store_roots(canonical_root: Any, task_id: str, *, task: Any = None,
+                         child_root: Any = None) -> List[pathlib.Path]:
+    """The task's artifact store directories: the canonical one and, for a split root, the child drive's.
+
+    The child drive is the caller's when it knows it (the pipeline's ``env.drive_root``),
+    else the task row's (``child_drive_root`` / ``drive_root``, the supervisor's own
+    resolution of a running task's drive), else the durable result's; the same store
+    named twice is listed once. Fail-soft: an unreadable result adds no store.
+    """
+    from ouroboros.headless import ARTIFACTS_DIR
+
+    row = task if isinstance(task, dict) else {}
+    child = str(child_root or row.get("child_drive_root") or row.get("drive_root") or "").strip()
+    if not child and canonical_root:
+        try:
+            from ouroboros.task_results import load_task_result
+
+            stored = load_task_result(pathlib.Path(canonical_root), str(task_id)) or {}
+            child = str(stored.get("child_drive_root") or stored.get("headless_child_drive_root")
+                        or stored.get("drive_root") or "").strip()
+        except Exception:
+            log.debug("artifact store roots: durable child drive unreadable for %s", task_id, exc_info=True)
+    stores: List[pathlib.Path] = []
+    for root in (str(canonical_root or ""), child):
+        store = pathlib.Path(root) / ARTIFACTS_DIR / str(task_id)
+        if root and store.resolve(strict=False) not in [known.resolve(strict=False) for known in stores]:
+            stores.append(store)
+    return stores
+
+
+def rescued_files_fact(task_id: str, stores: List[pathlib.Path]) -> Dict[str, Any]:
+    """How many deliverable files the task's artifact stores hold (TZ-2 C2).
+
+    Each distinct store is read by the shared unmeasured listing
+    (``artifacts.collect_task_artifact_records(measure=False, strict=True)``), so a
+    store's metadata, receipt stream, staged inputs and source handles are never
+    counted, a registration whose file is gone is not a file, and an unregistered
+    output is. The listing reads only the registration; no deliverable is opened,
+    hashed, copied or registered, and the fact says so (``hash_computed``). ``state`` is
+    ``positive``, ``zero`` (every store was listed and holds none; a store never
+    created is one nothing was written to) or ``unknown`` (a store could not be
+    listed — ``count`` is then what the listed stores held, a floor, never a total).
+    The count is physical files per store: the same name in two stores is two
+    listed files, never assumed to be one copy. Never raises.
+    """
+    rows: List[Dict[str, Any]] = []
+    for store in stores:
+        try:
+            count, readable = _listed_file_count(task_id, pathlib.Path(store)), True
+        except Exception:
+            count, readable = 0, False
+        rows.append({"store": str(store), "count": count, "readable": readable})
+    total = sum(int(row["count"]) for row in rows)
+    unreadable = not rows or any(not row["readable"] for row in rows)
+    state = "unknown" if unreadable else ("positive" if total else "zero")
+    return {"count": total, "state": state, "hash_computed": False, "stores": rows}
+
+
+def _listed_file_count(task_id: str, store: pathlib.Path) -> int:
+    """Deliverables the shared listing finds in ``store``; raises when it cannot vouch for them.
+
+    The listing reads a missing store as empty through ``exists()``, which also says
+    False for some unreadable paths and follows a link: the store's own ``lstat``
+    decides first, so only a store that is not there counts as zero.
+    """
+    from ouroboros.artifacts import collect_task_artifact_records, task_artifact_dir_path
+
+    drive = store.parents[2]
+    if task_artifact_dir_path(drive, task_id) != store:
+        raise ValueError(f"{store} is not task {task_id}'s artifact store")
+    try:
+        mode = os.lstat(store).st_mode
+    except FileNotFoundError:
+        return 0
+    if not stat.S_ISDIR(mode):  # a file or a link where the store directory should be
+        raise NotADirectoryError(str(store))
+    return len(collect_task_artifact_records(drive, task_id, measure=False, strict=True))
+
+
+def rescued_files_sentence(fact: Dict[str, Any]) -> str:
+    """ONE owner sentence for the stop receipt: the count, its state, and that no hash was computed."""
+    state, count = str(fact.get("state") or "unknown"), int(fact.get("count") or 0)
+    noun = "store" if len(fact.get("stores") or []) <= 1 else "stores"
+    if state == "positive":
+        return f"Files rescued: {count} listed in the task's artifact {noun} (hashes not computed)."
+    if state == "zero":
+        return f"Files rescued: none — listing the task's artifact {noun} found no files (hashes not computed)."
+    seen = f"; {count} listed before the failure" if count else ""
+    return f"Files rescued: unknown — a task artifact store could not be listed{seen} (hashes not computed)."
 
 
 def model_execution_projection(usage: Dict[str, Any]) -> Dict[str, Any] | None:

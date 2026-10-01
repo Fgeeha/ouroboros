@@ -9,6 +9,15 @@ from tests import test_subscription_setup_browser as setup_browser
 pytestmark = [pytest.mark.ui_browser, pytest.mark.serial]
 subscription_ui = setup_browser.subscription_ui
 capture = setup_browser.capture
+# Every route picker offers an API lane per provider whose credential is
+# stored, so a fixture that selects one advertises that provider's key first.
+API_KEYS = {"openrouter": "OPENROUTER_API_KEY", "openai": "OPENAI_API_KEY"}
+
+
+def api_lane(ui, provider="openrouter"):
+    """Store `provider`'s key in the served settings and return its route choice."""
+    ui["settings"][API_KEYS[provider]] = "***set***"
+    return f"api:{provider}"
 
 
 @pytest.fixture
@@ -72,6 +81,7 @@ def open_agents(ui):
 
 def test_reviewer_source_roundtrip_restores_its_own_model_and_account(role_ui):
     configure_mixed(role_ui)
+    lane = api_lane(role_ui, 'openai')
     page = open_agents(role_ui)
     for selector, model_field, account_field in [
         ('[data-slot-id="triad_1"]', '[data-slot-custom-api]', '[data-slot-profile]'),
@@ -79,13 +89,15 @@ def test_reviewer_source_roundtrip_restores_its_own_model_and_account(role_ui):
     ]:
         row = page.locator(selector)
         route = row.locator('[data-slot-route], [data-advisory-route]')
-        route.select_option('api')
-        row.locator(model_field).fill('openai::other-choice')
+        route.select_option(lane)
+        # The chooser holds the model alone; the source select names the provider.
+        row.locator(model_field).fill('other-choice')
         route.select_option('subscription:opaque-source')
         assert row.locator(model_field).input_value() == 'gpt-test'
         assert row.locator(account_field).input_value() == 'personal'
-        route.select_option('api')
-        assert row.locator(model_field).input_value() == 'openai::other-choice'
+        route.select_option(lane)
+        assert row.locator(model_field).input_value() == 'other-choice'
+        assert route.input_value() == lane
         route.select_option('subscription:opaque-source')
     page.locator('[data-advisory-row]').scroll_into_view_if_needed()
     capture(page, "reviewer-source-roundtrip-restored")
@@ -93,7 +105,7 @@ def test_reviewer_source_roundtrip_restores_its_own_model_and_account(role_ui):
     with page.expect_response('**/api/reviewer-slots'):
         page.locator('#btn-reload-settings').click()
         page.get_by_role('button', name='Discard and continue', exact=True).click()
-    page.locator('[data-advisory-route]').select_option('api')
+    page.locator('[data-advisory-route]').select_option(lane)
     assert page.locator('[data-advisory-api-model]').input_value() == ''
 
 
@@ -130,7 +142,11 @@ def test_subscription_accounts_roundtrip_existing_editors(role_ui, width):
         "els => els.filter(e => !e.hidden).map(e => {const b=e.getBoundingClientRect();return {x:b.x,y:b.y,w:b.width,h:b.height}})")
     assert all(b["x"] >= 0 and b["x"] + b["w"] <= width for b in boxes)
     if width > 1000:
-        assert max(b["y"] + b["h"] / 2 for b in boxes) - min(b["y"] + b["h"] / 2 for b in boxes) < 2, boxes
+        # Direct triad delivery adds a second line; every control remains
+        # reachable and no pair overlaps, including the trailing Remove.
+        assert all(a["x"] + a["w"] <= b["x"] or b["x"] + b["w"] <= a["x"]
+                   or a["y"] + a["h"] <= b["y"] or b["y"] + b["h"] <= a["y"]
+                   for i, a in enumerate(boxes) for b in boxes[i + 1:]), boxes
     capture(page, f"role-reviewers-{width}")
     raw.scroll_into_view_if_needed()
     capture(page, f"role-actors-{width}")
@@ -164,9 +180,10 @@ def test_subscription_accounts_roundtrip_existing_editors(role_ui, width):
 def test_source_switch_and_catalog_refresh_keep_focus_and_draft(role_ui):
     ui = role_ui
     configure_mixed(ui)
+    lane = api_lane(ui, 'openai')
     page = open_agents(ui)
     triad = page.locator('[data-slot-id="triad_1"]')
-    triad.locator('[data-slot-route]').select_option("api")
+    triad.locator('[data-slot-route]').select_option(lane)
     assert triad.locator('[data-slot-profile]').count() == 0
     triad.locator('[data-slot-custom-api]').fill("openai::gpt-api")
     triad.locator('[data-slot-route]').select_option("subscription:opaque-source")
@@ -187,7 +204,7 @@ def test_source_switch_and_catalog_refresh_keep_focus_and_draft(role_ui):
     capture(page, "role-source-refresh-focus")
 
 
-def test_scope_and_inline_deep_keep_packed_delivery_and_auto_account(role_ui):
+def test_scope_and_inline_deep_keep_native_delivery_and_auto_account(role_ui):
     ui = role_ui
     configure_mixed(ui)
     slots = ui["fixture"]["preview"]["reviewer_slots"]
@@ -201,7 +218,8 @@ def test_scope_and_inline_deep_keep_packed_delivery_and_auto_account(role_ui):
     scope.locator('[data-slot-profile]').select_option("")
     scope.locator('[data-slot-custom-api]').fill("gpt-scope-next")
     deep = page.locator('[data-deep-review-row]')
-    assert "One packed review" in deep.inner_text()
+    assert "Native inspection episode" in deep.inner_text()
+    assert "host read-only tools" in deep.inner_text()
     deep.locator('[data-deep-review-profile]').select_option("work")
     deep.locator('[data-deep-review-api-model]').fill("gpt-deep-next")
     deep.scroll_into_view_if_needed()
@@ -216,7 +234,8 @@ def test_scope_and_inline_deep_keep_packed_delivery_and_auto_account(role_ui):
     open_agents(ui)
     assert page.locator('[data-slot-id="scope_1"] [data-slot-profile]').input_value() == ""
     assert page.locator('[data-deep-review-profile]').input_value() == "work"
-    assert "One packed review" in page.locator('[data-deep-review-row]').inner_text()
+    assert "Native inspection episode" in page.locator('[data-deep-review-row]').inner_text()
+    assert "host read-only tools" in page.locator('[data-deep-review-row]').inner_text()
 
 
 def test_models_does_not_guess_a_credential_family_when_source_mapping_is_unread(role_ui):

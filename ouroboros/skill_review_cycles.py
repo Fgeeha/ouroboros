@@ -143,6 +143,10 @@ def skill_review_contract_fingerprint(
         if any(actor_ids):
             for row, actor in zip(rows, actor_ids):
                 row["subagent_id"] = actor
+        # A direct api row saved as native delivery (#1334): same identity rule.
+        for row, flag in zip(rows, delivery.get("retrieves") or []):
+            if flag and row["route"] == "api_chat" and not row.get("subagent_id"):
+                row["delivery"] = "native"
         identity = {"reviewer_rows": sorted(rows, key=lambda row: row["slot_id"])}
         if any(row["route"] == "agent_session" for row in rows):
             from ouroboros.skill_review_passes import skill_review_session_contract_hash
@@ -443,6 +447,23 @@ def skill_review_cycles_refusal(
         if root
         else "revise the skill content — a new snapshot starts a fresh manual count"
     )
+    try:
+        from ouroboros.config import get_review_enforcement
+        from ouroboros.tools.review_helpers import review_enforcement_blocks
+
+        enforcement = str(get_review_enforcement() or "")
+        author_finish_open = not review_enforcement_blocks(enforcement)
+    except Exception:
+        enforcement = ""
+        author_finish_open = False
+    # Use the author-finish tool's predicate, including Cyber Pro authority.
+    author_exit = (
+        " You may also finish through skill_review with author_disposition and "
+        "author_rationale, without a new panel or a fabricated reviewer PASS. "
+        "Ordinary Advisory requires prior reviewer feedback and a passing current "
+        "preflight; Cyber Pro retains its existing exceptions."
+        if author_finish_open else ""
+    )
     message = (
         f"⚠️ REVIEW_CYCLES_EXHAUSTED: {lane} already spent {paid} of {cap} paid "
         "skill-review panel cycle(s) (OUROBOROS_REVIEW_MAX_CYCLES). Refusing to buy "
@@ -450,13 +471,8 @@ def skill_review_cycles_refusal(
         "yourself: finalize and disclose the unreviewed skill, ask the owner to raise "
         f"Max Review Cycles (3/5/unlimited are one settings change away), or {fresh_exit}. "
         "A rebuttal cannot buy past the ceiling — rebuttal cycles count toward it."
+        f"{author_exit}"
     )
-    try:
-        from ouroboros.config import get_review_enforcement
-
-        enforcement = str(get_review_enforcement() or "")
-    except Exception:
-        enforcement = ""
     emit_review_cycles_exhausted(
         getattr(ctx, "event_queue", None),
         drive_root,

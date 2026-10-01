@@ -36,6 +36,24 @@ OWNER_LOW_TARGET_TOKENS = 200_000
 OWNER_NANO_TARGET_TOKENS = 81_920
 NANO_MIN_HEADROOM_TOKENS = 8_192
 
+# Low-water sizing of the automatic context-reclaim pass. The TRIGGER is
+# unchanged: a positive deficit against the binding boundary (the smaller known
+# of the owner target T and the route capacity W), one pass per route+round.
+# Only the SIZE of the requested pass changes: goal = deficit +
+# ceil(boundary / RECLAIM_LOW_WATER_DIVISOR), and 0 without a deficit. A pass
+# sized to the deficit alone lands exactly AT the boundary, so the next round's
+# ordinary growth re-arms it (a summarizer pass nearly every round). Sized this
+# way it lands about an eighth of the boundary below (~125K tokens on a 1M
+# route, ~25K under the 200K Low target), so the next pass needs that much real
+# growth. Structural constant, not a setting: 8 (12.5 % of the boundary) is a
+# disclosed design choice, not a measured optimum; change it here and only here
+# (tests/test_context_budget_ssot.py pins it). Cost: older history is condensed
+# sooner and each summarizer pass is larger. The materializer, its receipts and
+# the route+round latch are unchanged; the checkpoint event records requested
+# margin versus achieved headroom (context_fit.measure_main_fit,
+# loop_model_call._run_main_reclaim).
+RECLAIM_LOW_WATER_DIVISOR = 8
+
 # One overflow vocabulary for every seam that must recognize a CONTEXT-WINDOW
 # overflow (Main provider-code precedence, the local transport, and the
 # summarizer split path). A provider code or message shape added here reaches
@@ -242,13 +260,15 @@ SCRATCHPAD_MAX_CONTENT_CHARS = 60_000
 # any instrument — these thresholds are the instrument). Same family as
 # SCRATCHPAD_BLOAT_WARN_CHARS above: a health-invariant WARNING, not a gate.
 #
-# Ledger: measured evidence in ouroboros/usage_ledger.py::_locked — a ~20MB
-# usage_attempts.jsonl costs ~0.5s per full re-read UNDER THE MONETARY LOCK,
-# starving concurrent workers (the 2026-07-23 lock-timeout incident). Warn at
-# exactly that measured degradation point. Since CPL4-C6, size-triggered
-# compaction (config.USAGE_LEDGER_COMPACT_BYTES, usage_compaction.py) should
-# hold the file far below this. Growth can reflect a large unfoldable residue
-# or compaction that is broken, refused, or skipped. The name tier (no kernel
+# Ledger: retain the historical 20MB growth tripwire (the 2026-07-23 incident).
+# Warm writers now validate only the tail; cold parsing runs outside the money
+# lock and revalidates its generation under it. Size still affects cold parsing,
+# full projections and compaction, not the cost of every reservation. Since
+# CPL4-C6, size-triggered compaction (config.USAGE_LEDGER_COMPACT_BYTES) should
+# hold the file below this. Growth can reflect a large unfoldable residue,
+# compaction that is broken or refused, or a file that has not yet outgrown the
+# growth floor its last committed pass stamped into the ledger header (declined
+# before the pass, so no typed event). The name tier (no kernel
 # locks) emits usage_ledger_compaction_refused once per process per data root;
 # a policy abort (_Abort) emits usage_ledger_compaction_skipped once per process
 # per (data root, reason). The two snapshot-race exits before archive/swap only
@@ -285,11 +305,13 @@ SKILL_REVIEW_ROOT_TASKS_WARN_BYTES = 20_000_000
 # explicit full-history read becomes seconds-scale; this is observability, not
 # a retention gate and never shortens the memory horizon.
 CHAT_ARCHIVE_SCAN_WARN_BYTES = 100_000_000
-# Custody replay (delegate_custody) walks the WHOLE events chain — live file
-# plus archive/events_*.jsonl — on ownership questions. This inherits the
+# The FIRST custody read of each process folds the WHOLE events chain — live
+# file plus archive/events_*.jsonl — into the process-local row memo
+# (delegate_custody_memo); later reads fold only appended bytes. Explicit
+# forensic and retirement scans still walk the chain. This inherits the
 # pre-rotation 100MB replay-degradation signal, now measured over the chain;
-# archives stay durable history (never GC'd), so the remediation is chain
-# indexing/compaction, never deletion.
+# archives stay durable history (never GC'd), so the remediation is a durable
+# compact custody projection, never deletion.
 EVENTS_ARCHIVE_SCAN_WARN_BYTES = 100_000_000
 # Warn before the observed 242-of-253 retained-drive corpus becomes routine;
 # count only direct children because startup health is an interactive path.

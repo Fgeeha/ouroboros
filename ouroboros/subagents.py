@@ -32,6 +32,7 @@ from datetime import datetime, timezone  # noqa: F401
 from typing import Any, Dict, List, Mapping
 
 from ouroboros.config import runtime_setting
+from ouroboros.configured_subagents import SESSION_ACCESS_PROFILES
 from ouroboros.config import (
     SETTINGS_DEFAULTS,
     get_heavy_model,
@@ -116,9 +117,9 @@ def normalize_subagent_executor(value: Any) -> str:
 class DelegatedRunShape:
     """The complete run shape a child's own authority entitles it to.
 
-    Not a knob: every field follows from the ONE question ``delegated_run_shape``
-    asks, and none of them appears in any tool schema, so the model has nothing to
-    widen. It is derived here rather than at each consumer because the consumers are
+    The model may lower native access, never widen the captured task authority.
+    Every other field follows from the ONE question ``delegated_run_shape`` asks.
+    It is derived here rather than at each consumer because the consumers are
     not one — the DISPATCHER health-checks the route before a token is spent and the
     NANNY builds the wire request — and a shape re-derived at each of them drifts:
     a change to the access profile that forgets the isolation, or to the isolation
@@ -131,13 +132,14 @@ class DelegatedRunShape:
     delegated: bool = False
 
 
-def delegated_run_shape(acting: bool) -> DelegatedRunShape:
+def delegated_run_shape(acting: bool, access: str = "workspace_write") -> DelegatedRunShape:
     """The run shape for an acting (mutating) child, or for a read-only one.
 
-    A MUTATING child runs ``live``: Claudexor edits the nanny's OWN worktree in place,
-    so the nanny's existing workspace-patch capture sees the harness's edits with no
-    new plumbing, and the same capture invalidates itself if the harness dared to
-    commit. In place is also the ONE shape where Claudexor would otherwise hand the
+    A MUTATING child runs ``live`` in the host's private execution snapshot;
+    captured changes still require explicit integration. The selected immutable
+    session supplies its captured access; old snapshots keep workspace_write.
+    This changes the harness's OS powers, not the task's assignment or write target.
+    In place is also the ONE shape where Claudexor would otherwise hand the
     harness the operator's real ``$HOME`` — which holds the daemon control token — so
     ``delegated`` travels with it, inseparably, in the same record.
 
@@ -145,9 +147,10 @@ def delegated_run_shape(acting: bool) -> DelegatedRunShape:
     envelope, which is scoped already and needs no marker: that is one transport with
     one derived difference, not a second pipeline.
     """
-    if acting:
-        return DelegatedRunShape(access="workspace_write", mode="agent",
-                                 isolation="live", delegated=True)
+    if acting and access != "readonly":
+        if access not in SESSION_ACCESS_PROFILES:
+            raise ValueError("Delegated session access must be workspace_write or full")
+        return DelegatedRunShape(access=access, mode="agent", isolation="live", delegated=True)
     return DelegatedRunShape(access="readonly", mode="ask")
 
 
@@ -274,68 +277,9 @@ def get_subagent_harness() -> DelegationRoute | None:
 # only — nothing routes off it, and absence is shown as absence.
 # ---------------------------------------------------------------------------
 
-LAST_DELEGATION_FILENAME = "subagent_last_delegation.json"
-
-
-def _last_delegation_path():
-    import pathlib
-
-    from ouroboros.config import DATA_DIR
-
-    return pathlib.Path(DATA_DIR) / "state" / LAST_DELEGATION_FILENAME
-
-
-def record_last_delegation(*, route: str, requested_model: str,
-                           applied_model: str, run_id: str,
-                           selected_subagent_id: str = "",
-                           requested_profile: str = "",
-                           applied_profile: str = "") -> None:
-    """Record the last delegated run's route + requested/applied model + account.
-
-    Best-effort and atomic, in the CANONICAL data plane beside the saved
-    settings (the reviewer-slot projection's own rule): this is UI state, not
-    per-task forensics — those live in the custody event log and the ledger.
-    ``applied_model`` and ``applied_profile`` come from the same final attempt
-    in the engine's telemetry, '' when that attempt disclosed no such fact.
-    Neither the requested model nor a prior attempt supplies missing evidence;
-    ``requested_profile`` is the pin the request carried ('' = rotation) — the
-    two stay separate so a requested-vs-ran mismatch is disclosable, never
-    rewritten.
-    """
-    import json
-
-    from ouroboros.utils import utc_now_iso, write_text_atomic
-
-    try:
-        path = _last_delegation_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        # Idempotent per run: a re-read of an ALREADY-terminal run must not
-        # re-stamp `ts`, or the "N ago" line would call an old run fresh.
-        if subagent_last_delegation().get("run_id") == str(run_id or ""):
-            return
-        write_text_atomic(path, json.dumps({
-            "ts": utc_now_iso(),
-            "route": str(route or ""),
-            "requested_model": str(requested_model or ""),
-            "applied_model": str(applied_model or ""),
-            "requested_profile": str(requested_profile or ""),
-            "applied_profile": str(applied_profile or ""),
-            "selected_subagent_id": str(selected_subagent_id or ""),
-            "run_id": str(run_id or ""),
-        }, ensure_ascii=False, indent=1))
-    except Exception:
-        log.debug("subagent last-delegation projection write failed", exc_info=True)
-
-
-def subagent_last_delegation() -> Dict[str, Any]:
-    """Read the projection ({} on any read problem — disclosure only)."""
-    import json
-
-    try:
-        data = json.loads(_last_delegation_path().read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
+from ouroboros.subagent_history import (  # noqa: F401
+    LAST_DELEGATION_FILENAME, record_last_delegation, subagent_last_delegation,
+)
 
 
 @dataclass(frozen=True)

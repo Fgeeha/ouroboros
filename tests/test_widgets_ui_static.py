@@ -71,7 +71,15 @@ def test_widgets_page_reads_cheap_list_and_reconciles_by_signature():
     reconcile; it never restores the former blanket Refresh/reset behavior."""
     source = _widgets_js()
     helpers = _read("web/modules/widget_list.js")
-    assert "apiClient.widgets()" in source
+    # The cheap-list read itself lives in the list helper (with its deadline and
+    # its abort controller); the page reaches it only through that seam.
+    assert "apiClient.widgets({ signal })" not in source
+    assert "client.widgets({ signal })" in helpers
+    assert "export function requestWidgetListPayload" in helpers
+    assert "export function requestWidgetCards" in helpers
+    assert "export function widgetListRequests" in helpers
+    assert "requestWidgetListPayload(apiClient, controller)" in source
+    assert "listRequests.abortAll();" in source
     assert "apiClient.extensions()" not in source
     assert "live.ui_tabs" not in source
     assert "live?.ui_tabs" not in source
@@ -233,7 +241,7 @@ def test_widgets_keep_iframe_sandbox_locked_down():
     assert "const csp = moduleFrameCsp(tab.skill);" in module
     assert "connect-src" not in source
     assert "'unsafe-eval'" not in source
-    assert "window.OuroborosWidget = { fetch: request, onEvent, download, openExternal: (url) => openExternal(url) };" in source
+    assert "window.OuroborosWidget = { fetch: request, onEvent, onTheme, download, openExternal: (url) => openExternal(url) };" in source
     assert "module widget fetch outside extension route prefix" in source
 
 
@@ -389,12 +397,12 @@ def test_widgets_launch_policy_controls_and_stop_suppression():
     assert ".widgets-card-controls .ui-status[data-tone]::before" in style
     # An open policy menu is never painted under a sibling card (CA-14).
     assert ".widgets-card:has(.skills-card-menu-dialog[open]) {" in style
-    # Widgets is not a migrated surface (DESIGN.md section 8): the phase-2/3 card
-    # controls / menu / facade rules keep the surface's literals, not type tokens;
-    # the shared `.ui-status[data-tone]` pair (section 4) is the one exception.
+    # Appearance shares readable foreground roles in both themes, while this
+    # historical surface keeps its existing type geometry (DESIGN section 8).
     controls_css = style.split("/* Framed-card head controls", 1)[1].split(".widgets-card-source {", 1)[0]
-    for token in ("var(--type-", "var(--line-", "var(--text-meta)"):
+    for token in ("var(--type-", "var(--line-"):
         assert token not in controls_css, token
+    assert "color: var(--text-meta);" in controls_css
     # Page: policy gate, suppression, owner controls, whole-map persistence.
     assert "const stoppedByOwner = new Set();" in page
     assert "effectiveStartMode(tab, uiPreferences) !== 'manual'" in page
@@ -559,7 +567,7 @@ def test_widgets_card_order_is_owner_ui_preference():
     assert "previousLiveCard" not in source
     assert ".widgets-card-drag" in css
     assert ".widgets-card.drag-over" in css
-    assert "uiPreferences: () => fetchJson('/api/ui/preferences'" in api_client
+    assert "uiPreferences: (init = {}) => fetchJson('/api/ui/preferences'" in api_client
     assert "saveUiPreferences: (payload) => jsonPost('/api/ui/preferences', payload)" in api_client
 
 

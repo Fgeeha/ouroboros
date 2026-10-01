@@ -1,9 +1,10 @@
 // Activity dashboard subtab (P4): a single observability + minimal-control view for
 // cron/scheduled tasks, what is running/queued now, and background consciousness.
 // Management is DIRECT mechanical control via existing APIs (cancel a task, enable/
-// disable/delete a MANUAL schedule, start/stop background consciousness). Skill-managed
-// schedules are READ-ONLY ("managed by skill") because the lifecycle resync would
-// overwrite a direct toggle (supervisor/queue.py) — control those via the skill itself.
+// disable/delete/restore schedules, start/stop background consciousness). Every
+// lifecycle button NAMES its action to the one audited server seam, so the owner's
+// buttons and the agent's tool mean exactly the same thing. Skill rows retain an
+// owner override in the existing schedule store, so a lifecycle resync cannot undo it.
 
 import { fetchJson } from './api_client.js';
 import { setInlineStatus } from './ui_helpers.js';
@@ -30,8 +31,20 @@ function esc(value) {
 
 const getJson = (url) => fetchJson(url, { cache: 'no-store' });
 
-// A schedule synced from a skill manifest is reconciled from skill readiness, so a
-// direct enable/disable/delete here would be temporary/misleading — show it read-only.
+/** A stored UTC schedule instant for the owner: this viewer's local time, the exact
+ * UTC instant beside it (and in `datetime`/`title`). Records stay UTC; an unparseable
+ * value is shown raw rather than guessed. `timeZone` exists for tests only. */
+export function scheduleInstantHtml(value, { timeZone } = {}) {
+    const raw = String(value || '');
+    const parsed = new Date(raw);
+    if (!raw || Number.isNaN(parsed.getTime())) return esc(raw);
+    const fields = { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' };
+    const local = parsed.toLocaleString([], { ...fields, timeZone, timeZoneName: 'short' });
+    const utc = parsed.toLocaleString([], { ...fields, timeZone: 'UTC' });
+    const exact = parsed.toISOString().replace('.000Z', 'Z');
+    return `<time datetime="${esc(exact)}" title="${esc(exact)}">${esc(local)} (${esc(utc)} UTC)</time>`;
+}
+
 function isSkillManaged(s) {
     return Boolean(s && (String(s.source || '') === 'skill_manifest' || String(s.skill || '')));
 }
@@ -40,6 +53,8 @@ export function initActivity({ mount, ws } = {}) {
     if (!mount) return { refresh: () => {} };
     let busy = false;
     let refreshRevision = 0;
+    // Remembered across re-renders: the owner's retained-history disclosure state.
+    let historyOpen = false;
     mount.innerHTML = `<div class="activity-scroll">
         <div class="activity-section" data-activity-section="queue"><h3 class="activity-h">Running &amp; queued</h3></div>
         <div class="activity-section" data-activity-section="background"><h3 class="activity-h">Background</h3></div>
@@ -56,7 +71,7 @@ export function initActivity({ mount, ws } = {}) {
         return { root, status, content, loaded: false };
     });
 
-    function renderQueue(queue) {
+    function renderQueue(queue, census) {
         if (!Array.isArray(queue?.running) || !Array.isArray(queue?.pending)) throw new Error('Queue unavailable');
         const { running, pending } = queue;
         // #322: the snapshot already carries the pause truth — a member's own
@@ -65,8 +80,13 @@ export function initActivity({ mount, ws } = {}) {
             ((queue && queue.budget_root_fences) || [])
                 .filter((f) => f && ['active', 'paused'].includes(String(f.status || '')))
                 .map((f) => String(f.root_task_id || '')));
+        // #1196: a row whose root fence was lifted keeps a durable HOLD instead —
+        // nothing dispatches it until an explicit selection is recorded, so
+        // showing it as plain "queued" would promise work that cannot start.
+        const heldRow = (t) => Boolean(t && t._budget_pause_hold && !t._budget_pause_hold.selected);
         const rowBudgetPaused = (q, t, kind) => kind === 'pending' && Boolean(
             (t && t._budget_pause)
+            || heldRow(t)
             || fencedRoots.has(String((t && (t.root_task_id || t.id)) || q.id || '')));
         const row = (q, kind) => {
             const t = (q && q.task) || {};
@@ -76,18 +96,42 @@ export function initActivity({ mount, ws } = {}) {
             const paused = rowBudgetPaused(q, t, kind);
             const kindLabel = paused ? 'paused (budget)' : kind;
             const meta = `${esc(kindLabel)}${q.type ? ` · ${esc(q.type)}` : ''}${rt}`;
+            const hold = t.project_admission_hold;
+            const projectWait = hold?.label ? ` · ${esc(hold.label)}: ${esc(hold.detail || hold.reason)}` : '';
             return `<div class="activity-row">
                 <div class="activity-row-main">
                     <span class="activity-name">${label}</span>
-                    <span class="activity-sub">${meta}</span>
+                    <span class="activity-sub">${meta}${projectWait}</span>
                 </div>
                 <div class="activity-row-actions">
                     <button type="button" class="btn btn-xs btn-danger" data-act="task-control" data-id="${id}"${paused ? ' data-budget-paused="1"' : ''}>${esc(TASK_CONTROL_TRIGGER_LABEL)}</button>
                 </div>
             </div>`;
         };
-        const parts = [...running.map((q) => row(q, 'running')), ...pending.map((q) => row(q, 'pending'))];
-        return parts.length ? parts.join('') : '<div class="activity-empty">Nothing running or queued.</div>';
+        // Queue facts keep their runtime/budget controls. The census adds only
+        // missing identities; queued direct turns can appear in both sources.
+        const known = new Set([...running, ...pending].map((q) => String(q.id || q.task?.id || '')));
+        const live = (Array.isArray(census?.active_chat_activities) ? census.active_chat_activities : [])
+            .filter((a) => a && !known.has(String(a.activity_id || '')));
+        const names = { direct_chat: 'Direct turn', managed_task: 'Managed task' };
+        const liveRow = (a) => {
+            const started = Number(a.started_at) || 0;
+            const elapsed = started > 0 ? ` · ${Math.max(0, Math.round(Date.now() / 1000 - started))}s` : '';
+            return `<div class="activity-row">
+                <div class="activity-row-main">
+                    <span class="activity-name">${esc(names[a.kind] || 'Live turn')}</span>
+                    <span class="activity-sub">${esc(a.phase || '')}${elapsed}</span>
+                </div>
+                <div class="activity-row-actions">
+                    <button type="button" class="btn btn-xs btn-danger" data-act="task-control" data-id="${esc(a.activity_id || '')}">${esc(TASK_CONTROL_TRIGGER_LABEL)}</button>
+                </div>
+            </div>`;
+        };
+        const parts = [...running.map((q) => row(q, 'running')), ...pending.map((q) => row(q, 'pending')), ...live.map(liveRow)];
+        if (parts.length) return parts.join('');
+        return census?.active_chat_activities_complete === true
+            ? '<div class="activity-empty">Nothing running or queued.</div>'
+            : '<div class="activity-empty">Queue empty; live turns unknown.</div>';
     }
 
     function formatWhen(value) {
@@ -120,38 +164,110 @@ export function initActivity({ mount, ws } = {}) {
         </div>`;
     }
 
+    // The server names the lifecycle word; these fall back for an older payload
+    // so a row is never silently promoted to "active" by a missing field.
+    function scheduleStatus(s) {
+        const once = String((s.trigger || {}).type || 'cron') === 'once';
+        if (s.status) return String(s.status);
+        if (once && s.completed_at) return 'consumed';
+        if (isSkillManaged(s) && ['disabled', 'deleted'].includes(String(s.manual_override || ''))) return 'suppressed';
+        return s.enabled === false ? 'disabled' : 'active';
+    }
+
+    function scheduleRow(s) {
+        const managed = isSkillManaged(s);
+        const trigger = s.trigger || {};
+        const once = String(trigger.type || 'cron') === 'once';
+        // One-shot rows have no cron: show the fire instant + a "one-shot" tag. A cron
+        // expression runs in its record's zone, or the server's when none is stored.
+        const timing = once
+            ? `one-shot · at/after ${scheduleInstantHtml(trigger.run_at)}`
+            : `${esc(trigger.expr || s.cron || '')} (${s.timezone ? esc(s.timezone) : 'server time zone'})`;
+        const next = s.next_run_at ? scheduleInstantHtml(s.next_run_at) : '';
+        const status = scheduleStatus(s);
+        const enabled = status === 'active';
+        const consumed = status === 'consumed';
+        const suppressed = status === 'suppressed';
+        const id = esc(s.id || '');
+        // A due occurrence that waits (capacity, a missing folder, an unknown fact) says why.
+        const waiting = s.hold && s.hold.reason
+            ? ` · <span class="activity-tag" title="${esc(s.hold.detail || '')}">waiting: ${esc(s.hold.reason)}</span>` : '';
+        const sub = `${timing}${next && !consumed ? ` · next ${next}` : ''} · ${esc(status)}${managed && s.skill ? ` · ${esc(s.skill)}` : ''}${waiting}`;
+        // A consumed one-shot cannot be re-armed, so it carries no Enable: the
+        // only honest control left is removing the receipt. A suppressed skill
+        // row offers Restore, which asks the server to re-evaluate the skill.
+        // A skill row that is disabled WITHOUT the owner's marker is held back by
+        // its skill's readiness and re-arms on resync; an Enable button there
+        // would offer to lift a suppression nobody applied.
+        const readinessHeld = managed && !enabled && !suppressed;
+        const lifecycle = consumed
+            ? '<span class="activity-tag">consumed once · history</span>'
+            : readinessHeld
+                ? '<span class="activity-tag">disabled by skill readiness</span>'
+                : `<button type="button" class="btn btn-xs btn-default" data-act="schedule-toggle" data-id="${id}" data-action="${suppressed || !enabled ? 'restore' : 'disable'}">${enabled ? 'Disable' : (suppressed ? 'Restore' : 'Enable')}</button>`;
+        return `<div class="activity-row${enabled ? '' : ' off'}">
+            <div class="activity-row-main">
+                <span class="activity-name">${esc(s.name || s.id || 'schedule')}</span>
+                <span class="activity-sub">${sub}</span>
+            </div>
+            <div class="activity-row-actions">${lifecycle}
+               <button type="button" class="btn btn-xs btn-danger" data-act="schedule-delete" data-id="${id}" data-managed="${managed ? '1' : ''}">Delete</button></div>
+        </div>`;
+    }
+
     function renderSchedules(data) {
         if (!Array.isArray(data?.tasks)) throw new Error('Schedules unavailable');
         const tasks = data.tasks;
         if (!tasks.length) return '<div class="activity-empty">No scheduled tasks.</div>';
-        return tasks.map((s) => {
-            const managed = isSkillManaged(s);
-            const trigger = s.trigger || {};
-            const once = String(trigger.type || 'cron') === 'once';
-            // One-shot rows have no cron: show the fire instant + a "one-shot" tag.
-            const timing = once
-                ? `one-shot · at/after ${esc(trigger.run_at || '')}`
-                : esc(trigger.expr || s.cron || '');
-            const next = esc(s.next_run_at || '');
-            const enabled = s.enabled !== false;
-            const id = esc(s.id || '');
-            const sub = `${timing}${next ? ` · next ${next}` : ''}${managed && s.skill ? ` · ${esc(s.skill)}` : ''}`;
-            const actions = managed
-                ? '<span class="activity-tag">managed by skill</span>'
-                : `<button type="button" class="btn btn-xs btn-default" data-act="schedule-toggle" data-id="${id}">${enabled ? 'Disable' : 'Enable'}</button>
-                   <button type="button" class="btn btn-xs btn-danger" data-act="schedule-delete" data-id="${id}">Delete</button>`;
-            return `<div class="activity-row${enabled ? '' : ' off'}">
-                <div class="activity-row-main">
-                    <span class="activity-name">${esc(s.name || s.id || 'schedule')}</span>
-                    <span class="activity-sub">${sub}</span>
-                </div>
-                <div class="activity-row-actions">${actions}</div>
-            </div>`;
-        }).join('');
+        // Retained rows — a fired one-shot, a suppressed skill row — are history,
+        // not schedules wearing a disabled flag. They stay reachable (and
+        // restorable) but collapsed, so the standing schedules are the list.
+        const standing = [];
+        const retained = [];
+        for (const s of tasks) (['consumed', 'suppressed'].includes(scheduleStatus(s)) ? retained : standing).push(s);
+        const parts = standing.length
+            ? standing.map(scheduleRow)
+            : ['<div class="activity-empty">No active or disabled schedules.</div>'];
+        if (retained.length) {
+            // A refresh rebuilds this markup, so the disclosure carries the state
+            // the owner LEFT it in: a poll that silently re-collapses the history
+            // they just opened (and drops the focus they had inside it) reads as
+            // the app undoing their action.
+            parts.push(`<details class="activity-history" data-activity-history${historyOpen ? ' open' : ''}>
+                <summary>History &amp; suppressed (${retained.length})</summary>
+                ${retained.map(scheduleRow).join('')}
+            </details>`);
+        }
+        return parts.join('');
+    }
+
+    function rememberDisclosure() {
+        const details = mount.querySelector('[data-activity-history]');
+        if (details) historyOpen = Boolean(details.open ?? details.hasAttribute('open'));
+    }
+
+    function focusedControl() {
+        const active = document.activeElement;
+        return active && mount.contains?.(active) ? active.closest('[data-act]') : null;
+    }
+
+    function restoreFocus(previous) {
+        if (!previous) return;
+        const target = [...mount.querySelectorAll('[data-act]')].find((el) => (
+            el.dataset.act === previous.act && (el.dataset.id || '') === previous.id));
+        if (!target) return;
+        // Focus lives inside the disclosure for a retained row: open it rather
+        // than focusing a control the owner cannot see.
+        const details = target.closest?.('[data-activity-history]');
+        if (details && !details.open) details.open = true;
+        target.focus?.();
     }
 
     async function refresh() {
         const revision = ++refreshRevision;
+        rememberDisclosure();
+        const focused = focusedControl();
+        const focusedKey = focused && { act: focused.dataset.act, id: focused.dataset.id || '' };
         sections.forEach(({ root, status, loaded }) => {
             root.setAttribute('aria-busy', 'true');
             setInlineStatus(status, loaded ? 'Refreshing… Previously loaded values shown.' : 'Loading…');
@@ -164,13 +280,24 @@ export function initActivity({ mount, ws } = {}) {
             getJson('/api/schedules'),
         ]);
         if (revision !== refreshRevision) return;
-        const renderers = [(data) => renderQueue(data?.queue), renderBg, renderSchedules];
+        // A request can take long enough for the owner to move focus elsewhere.
+        // Only restore the original control when it is still the active owner;
+        // if this render detaches it, activeElement is still the original node
+        // immediately before replacement.  A different active element means
+        // the owner made a newer choice while the request was in flight.
+        const mayRestoreFocus = !focusedKey || document.activeElement === focused;
+        const census = results[1].status === 'fulfilled' ? results[1].value : null;
+        const renderers = [(data) => renderQueue(data?.queue, census), renderBg, renderSchedules];
         sections.forEach((section, index) => {
             const { root, status, content } = section;
             root.removeAttribute('aria-busy');
             try {
                 const result = results[index];
                 if (result.status === 'rejected') throw result.reason;
+                // Disclosure is an owner choice too.  Capture it at the render
+                // boundary, after the async reads, so opening/closing history
+                // while a poll is pending is not undone by a stale snapshot.
+                if (index === 2) rememberDisclosure();
                 content.innerHTML = renderers[index](result.value);
                 section.loaded = true;
                 setInlineStatus(status, '');
@@ -180,12 +307,61 @@ export function initActivity({ mount, ws } = {}) {
                     : 'Could not load. Current state is unknown. Reopen Activity to try again.', 'error');
             }
         });
+        if (mayRestoreFocus) restoreFocus(focusedKey);
     }
 
-    async function findSchedule(id) {
-        const data = await getJson('/api/schedules');
-        const tasks = (data && Array.isArray(data.tasks)) ? data.tasks : [];
-        return tasks.find((s) => String(s.id) === String(id)) || null;
+    // One seam for every lifecycle button: the owner NAMES the action and why.
+    // The server applies and audits it; nothing here infers a command from text.
+    // Delete goes through here too — reading the outcome is not optional for one
+    // button and skipped for another, or a refused delete reads as a silent no-op.
+    async function scheduleAction(id, action, reason) {
+        const outcome = await fetchJson(`/api/schedules/${encodeURIComponent(id)}/action`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action, reason }),
+        });
+        reportScheduleOutcome(action, outcome);
+        return outcome;
+    }
+
+    // The response says two separable things: whether the schedule CHANGED, and
+    // whether both audit facts landed. A change whose outcome record was lost is
+    // neither a clean success nor a failure, and saying either would be wrong.
+    function reportScheduleOutcome(action, outcome) {
+        if (!outcome || typeof outcome !== 'object' || typeof outcome.changed !== 'boolean') {
+            showToast(`Schedule ${action}: the server did not say what happened.`, 'error');
+            return;
+        }
+        const detail = String(outcome.detail || outcome.status || 'no status reported');
+        if (outcome.changed === false) {
+            showToast(`Schedule ${action} did not change anything: ${detail}`, 'error');
+            return;
+        }
+        if (outcome.audit !== 'recorded') {
+            showToast(`Schedule ${action} applied, but its audit record is incomplete: ${detail}`, 'warn');
+            return;
+        }
+        if (outcome.status === 'delete_deferred') {
+            showToast(`Schedule deletion is pending: ${detail}`, 'info');
+            return;
+        }
+        if (outcome.status === 'restored_not_ready') {
+            showToast(`Schedule suppression lifted, but it is not ready to run: ${detail}`, 'warn');
+        } else if (outcome.ok !== true) {
+            showToast(`Schedule ${action} changed, but did not finish successfully: ${detail}`, 'warn');
+        }
+        // Name what actually happened: a delete on a skill row is a durable
+        // suppression, and saying "deleted" would claim a removal that did not occur.
+        const done = outcome.status === 'suppressed' ? 'suppressed (kept disabled until restored)' : `${action}d`;
+        // Lifecycle actions govern FUTURE dispatch; a run already admitted keeps
+        // going. Silence here would let the owner read the button as a stop.
+        if (outcome.running_or_queued === true) {
+            showToast(`Schedule ${done}. A task it already admitted is queued or running and was not cancelled.`, 'info');
+        } else if (outcome.running_or_queued === null || outcome.running_or_queued === undefined) {
+            showToast(`Schedule ${done}. Whether a task it already started is still running is unknown.`, 'info');
+        } else if (outcome.status === 'suppressed') {
+            showToast(`Schedule ${done}.`, 'info');
+        }
     }
 
     mount.addEventListener('click', async (event) => {
@@ -246,25 +422,25 @@ export function initActivity({ mount, ws } = {}) {
         btn.disabled = true;
         try {
             if (act === 'schedule-delete') {
+                // A skill-declared schedule cannot be removed: the skill's manifest
+                // would recreate it. Delete SUPPRESSES it durably, and the dialog
+                // says so before anything is sent.
+                const managedRow = btn.dataset.managed === '1';
                 const confirmedDelete = await openConfirmDialog({
-                    title: 'Delete schedule',
-                    body: 'Delete this schedule?',
-                    confirmLabel: 'Delete',
+                    title: managedRow ? 'Suppress skill schedule' : 'Delete schedule',
+                    body: managedRow
+                        ? 'This schedule is declared by an installed skill and cannot be removed; Delete keeps it suppressed until you Restore it. Suppress it?'
+                        : 'Delete this schedule?',
+                    confirmLabel: managedRow ? 'Suppress' : 'Delete',
                     danger: true,
                 });
                 if (!confirmedDelete) return;
-                await fetchJson(`/api/schedules/${encodeURIComponent(id)}`, { method: 'DELETE' });
+                await scheduleAction(id, 'delete', 'owner deleted the schedule from Activity');
             } else if (act === 'schedule-toggle') {
-                // Read-modify-write the FULL record (upsert replaces by id; never drop
-                // timezone/trigger/task/source) with the flipped enabled flag.
-                const rec = await findSchedule(id);
-                if (rec) {
-                    await fetchJson('/api/schedules', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ ...rec, enabled: !(rec.enabled !== false) }),
-                    });
-                }
+                // The button already carries the action it means; no full-record
+                // round trip, so a stale read can never overwrite runtime fields.
+                const action = btn.dataset.action === 'disable' ? 'disable' : 'restore';
+                await scheduleAction(id, action, `owner chose ${action} from Activity`);
             } else if (act === 'bg-toggle') {
                 const on = btn.dataset.enabled === '1';
                 // Reuse the existing direct control command (same as the chat header

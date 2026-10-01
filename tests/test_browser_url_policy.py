@@ -1,8 +1,7 @@
 """Unit tests for the subagent browser URL policy (no Playwright needed).
 
 Verifies the shared target decision: readonly/acting subagents
-may browse external HTTP(S), localhost on non-Ouroboros ports, and file:// under
-their workspace, while the Ouroboros control-plane ports, private/link-local IPs,
+may browse external HTTP(S), localhost on non-Ouroboros ports, and parent-readable file:// targets, while the Ouroboros control-plane ports, private/link-local IPs,
 DNS-rebind, and other schemes stay blocked.
 """
 from __future__ import annotations
@@ -69,12 +68,12 @@ def test_non_http_schemes_blocked():
         assert _blocked(url, _ctx()), url
 
 
-def test_file_url_blocked_without_workspace():
-    assert _blocked("file:///etc/passwd", _ctx())
-    assert _blocked("file:///tmp/app/index.html", _ctx(""))
+def test_file_url_parent_parity_without_workspace():
+    assert not _blocked("file:///etc/passwd", _ctx())
+    assert not _blocked("file:///tmp/app/index.html", _ctx(""))
 
 
-def test_file_url_scoped_to_workspace(tmp_path):
+def test_file_url_starting_workspace_is_not_a_read_fence(tmp_path):
     ws = tmp_path / "ws"
     (ws / "build").mkdir(parents=True)
     app = ws / "build" / "index.html"
@@ -84,7 +83,7 @@ def test_file_url_scoped_to_workspace(tmp_path):
     ctx = _ctx(str(ws))
     # Path.as_uri() yields a platform-correct file URL (file:///C:/... on Windows).
     assert _blocked(app.as_uri(), ctx) == ""
-    assert _blocked(outside.as_uri(), ctx)
+    assert not _blocked(outside.as_uri(), ctx)
 
 
 def test_actual_service_bindings_win_over_env_and_default_ports(live_bindings, monkeypatch):

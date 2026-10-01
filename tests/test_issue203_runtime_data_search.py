@@ -52,11 +52,11 @@ def test_promoted_task_can_read_search_read_runtime_data(
 
     affordances = filesystem_affordance_map(ctx, runtime_mode=runtime_mode)
     assert "runtime_data" in affordances["searchable_roots"]
-    assert "task_drive" not in affordances["searchable_roots"]
-    assert "artifact_store" not in affordances["searchable_roots"]
+    assert "task_drive" in affordances["searchable_roots"]
+    assert "artifact_store" in affordances["searchable_roots"]
 
 
-def test_specialized_child_stays_blocked_with_searchable_root_hint(tmp_path):
+def test_child_searches_parent_readable_runtime_data(tmp_path):
     repo = tmp_path / "repo"
     data = tmp_path / "data"
     logs = data / "logs"
@@ -77,9 +77,10 @@ def test_specialized_child_stays_blocked_with_searchable_root_hint(tmp_path):
         {"root": "runtime_data", "path": "logs", "query": "CHILD_MUST_NOT_FIND"},
     )
 
-    assert result.startswith("⚠️ TOOL_ACCESS_BLOCKED"), result
-    assert "CHILD_MUST_NOT_FIND" not in result
-    assert "Roots your profile can search:" in result
-    assert "active_workspace" in result
-    assert "system_repo" in result
-    assert "skill_payload" in result
+    assert "CHILD_MUST_NOT_FIND" in result
+    # Generic settings content is parent-readable; the helper sees the same text.
+    (data / "settings.json").write_text('{"OPENAI_API_KEY":"CHILD_OWNER_SECRET"}', encoding="utf-8")
+    found = registry.execute("search_code", {"root": "runtime_data", "path": "settings.json",
+                                                "query": "CHILD_OWNER_SECRET"})
+    assert "CHILD_OWNER_SECRET" in found
+    assert "Found 1 match" in found

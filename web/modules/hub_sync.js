@@ -1,7 +1,7 @@
 /**
  * OuroborosHub card verdict — the ONE client-side authority joining a hub
  * catalog row with the global /api/extensions listing row for the same
- * canonical name (plan §7.5, frozen contract).
+ * canonical name (plan §7.5, repaired for issue #1314).
  *
  * Pure data-in/data-out: no fetches, no DOM, no version parsing. The only
  * comparisons are string inequality on versions and strict equality between
@@ -11,13 +11,21 @@
  * equality lives server-side in the official_hub review profile and reaches
  * this function only as the `official_hub_verified` fact).
  *
+ * The publish receipt is history, never an action gate: a catalog row proves
+ * neither that a particular pull request merged nor who owns the served copy,
+ * and a receipt/catalog version difference cannot tell a pending update PR
+ * from a merged one the catalog has since moved past. So the action comes
+ * from the local location and catalog presence alone, and the receipt reaches
+ * the cards as quiet `submission` facts beside it.
+ *
  * @typedef {Object} HubListingRow  One /api/extensions skill row projection.
  * @property {string} name               canonical skill name
  * @property {string} source            classification tag (self_authored, …)
  * @property {string} location          physical bucket: external|clawhub|ouroboroshub|native|user_repo|''
  * @property {string} version            local manifest version
  * @property {string} content_hash       loader content hash of the local tree
- * @property {boolean} official_hub_verified byte-exact match with the live catalog (server fact)
+ * @property {boolean} official_hub_verified byte-exact match with the hub catalog (server fact; the raw
+ *   listing field is null while the server holds no fresh catalog view — see hubFactsPending)
  * @property {Object|null} published     publish receipt section (slug, version, content_hash, pr_number, pr_url, …)
  * @property {boolean} published_malformed  receipt exists on disk but is unreadable (server projects published=null)
  * @property {boolean} review_stale
@@ -28,16 +36,21 @@
  * @property {string} latest_version
  * @property {boolean} identity_conflict catalog holds >1 slug with this canonical name
  *
+ * @typedef {Object} HubSubmission  What this installation last submitted (the receipt's own facts).
+ * @property {string} version           the SUBMITTED version, never the current local version
+ * @property {number|null} pr_number
+ * @property {string} pr_url            raw receipt URL; renderers pass it through safeExternalHrefAttr
+ * @property {boolean} local_differs    the local content hash differs from the submitted hash
+ *   (edits, but also an install/adopt sidecar — never proof of manual edits)
+ *
  * @typedef {Object} HubSyncVerdict
- * @property {'install'|'installed'|'update'|'adopt'|'wait_pr'|'none'} action
- * @property {Array<'submitted_pr'|'published'|'update_available'|'catalog_unavailable'|'listing_unavailable'|'conflict'>} badges
- * @property {{local_version: string, catalog_version: string, receipt_pr: number|null,
- *            edited_since_submission: boolean, occupying_bucket: string|null,
- *            no_receipt: boolean, receipt_unreadable: boolean}} copy_facts
- *   `receipt_unreadable` is the §7.5 "publish record unreadable" copy fact —
- *   additive beside the frozen keys so malformed-receipt copy stays distinct
- *   from the no-receipt warning (`no_receipt` is false when the receipt is
- *   merely unreadable).
+ * @property {'install'|'installed'|'update'|'adopt'|'none'} action
+ * @property {Array<'published'|'update_available'|'catalog_unavailable'|'listing_unavailable'|'conflict'>} badges
+ * @property {{local_version: string, catalog_version: string, occupying_bucket: string|null,
+ *            no_receipt: boolean, receipt_unreadable: boolean, submission: HubSubmission|null}} copy_facts
+ *   `no_receipt` (no local record) and `receipt_unreadable` (a record that
+ *   fails validation) stay distinct; an explicitly cleared record reads as
+ *   no record, because clearing is the owner deliberately forgetting it.
  */
 
 /**
@@ -63,6 +76,37 @@ export function hubListingRowFor(skill) {
     };
 }
 
+/**
+ * True while a listing carries a hub fact the server could not know yet:
+ * /api/extensions is a local read that never waits for the hub catalog, so
+ * `official_hub_verified` is null until a catalog read has landed. The caller
+ * re-reads the listing once after its own catalog read settles.
+ */
+export function hubFactsPending(skills) {
+    return Array.isArray(skills) && skills.some((skill) => skill?.official_hub_verified === null);
+}
+
+/**
+ * Submission history from a listing row's publish receipt, or null without
+ * one. Independent of the catalog and of the card action; a structurally
+ * valid receipt for a foreign-looking slug/repository is still only history.
+ * @param {HubListingRow|null} listingRow
+ * @returns {HubSubmission|null}
+ */
+export function hubSubmissionFacts(listingRow) {
+    const published = listingRow && listingRow.published && typeof listingRow.published === 'object'
+        ? listingRow.published
+        : null;
+    if (!published) return null;
+    const localHash = String(listingRow.content_hash || '');
+    return {
+        version: String(published.version || ''),
+        pr_number: Number.isInteger(published.pr_number) && published.pr_number > 0 ? published.pr_number : null,
+        pr_url: String(published.pr_url || ''),
+        local_differs: Boolean(localHash) && localHash !== String(published.content_hash || ''),
+    };
+}
+
 function listingLocation(skill) {
     const explicit = String(skill.location || '');
     if (explicit) return explicit;
@@ -75,7 +119,6 @@ function listingLocation(skill) {
 
 /**
  * Compute the card verdict for one (listing row, catalog row) pair.
- * Rules verbatim from plan §7.5; §7 wins over every earlier draft.
  *
  * @param {HubListingRow|null} listingRow local occupant of the canonical name, or null
  * @param {HubCatalogRow|null} catalogRow catalog entry for the slug, or null (slug absent)
@@ -97,24 +140,18 @@ export function hubSyncVerdict(listingRow, catalogRow, flags = {}) {
         || (listing && listing.identity_collision === true),
     );
 
-    const published = listing && listing.published && typeof listing.published === 'object'
-        ? listing.published
-        : null;
     const location = listing ? String(listing.location || '') : '';
     const localVersion = listing ? String(listing.version || '') : '';
     const catalogVersion = catalog ? String(catalog.latest_version || '') : '';
-    const publishedVersion = published ? String(published.version || '') : '';
-    const receiptHashMatches = Boolean(published
-        && String(listing.content_hash || '') === String(published.content_hash || ''));
+    const submission = hubSubmissionFacts(listing);
 
     const copy_facts = {
         local_version: localVersion,
         catalog_version: catalogVersion,
-        receipt_pr: published && typeof published.pr_number === 'number' ? published.pr_number : null,
-        edited_since_submission: Boolean(published && !receiptHashMatches),
         occupying_bucket: listing && location && location !== 'ouroboroshub' ? location : null,
-        no_receipt: Boolean(listing && !published && listing.published_malformed !== true),
+        no_receipt: Boolean(listing && !submission && listing.published_malformed !== true),
         receipt_unreadable: Boolean(listing && listing.published_malformed === true),
+        submission,
     };
 
     let action = 'none';
@@ -126,27 +163,16 @@ export function hubSyncVerdict(listingRow, catalogRow, flags = {}) {
             // Hub bucket: Installed, or Update when the live catalog version
             // differs (string inequality only — no ordering semantics).
             action = catalog && catalogVersion !== localVersion ? 'update' : 'installed';
-        } else if (location === 'external') {
-            // wait_pr preempts Adopt: the local bytes ARE the submitted bytes
-            // and the catalog does not serve that submitted version yet —
-            // never offer adopting the older catalog back over the submission.
-            if (!catalogUnavailable && published && receiptHashMatches
-                && catalogVersion !== publishedVersion) {
-                action = 'wait_pr';
-            } else if (catalog) {
-                action = 'adopt';
-            }
+        } else if (location === 'external' && catalog) {
+            // An available catalog row can replace the local copy whatever the
+            // receipt says and whichever way the versions differ; the confirm
+            // dialog names the replacement and the Adopt CAS guards the bytes.
+            action = 'adopt';
         }
         // clawhub (v1 unsupported), native, user_repo, unknown → 'none'.
     }
 
     const badges = [];
-    if (!listingUnavailable && !conflict && !catalogUnavailable && published
-        && (!catalog || catalogVersion !== publishedVersion)) {
-        // Receipt exists and the catalog does not confirm the published version
-        // (slug absent, or a different served version) → "Submitted PR #N".
-        badges.push('submitted_pr');
-    }
     if (listing && location === 'ouroboroshub' && listing.official_hub_verified === true) {
         // "Published vX" rides ONLY on the server's byte-exact verification.
         badges.push('published');

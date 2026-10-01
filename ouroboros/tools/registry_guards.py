@@ -1,9 +1,7 @@
 """Host-owned pre-dispatch guards: capability/resource, managed-update and skill-payload constraints.
 
-Every span is extracted VERBATIM from the parent's tip bytes by
-scripts/v7next_transplant.py (D18/D33 module-handle split, proof-checked);
-the parent re-exports every moved name, so historical imports and
-monkeypatch targets keep working unchanged.
+The facade re-exports these definitions so existing imports and monkeypatch
+targets retain the same bindings.
 """
 
 from __future__ import annotations
@@ -34,7 +32,7 @@ def _registry():
     The parent owns the rebindable module state and the members tests
     monkeypatch there; reading them through the module at each call keeps
     one binding, where a from-import would freeze the value this leaf saw
-    at import time (the owner-approved D18/D33 mechanical exception).
+    at import time.
     """
     from ouroboros.tools import registry
 
@@ -329,7 +327,7 @@ def _disabled_tools(ctx: Any) -> frozenset:
     # too (harmless: nothing registers it), so old contracts round-trip as-is.
     if "claude_code_edit" in names:
         names.add("delegate_start")
-    # Q1 rename compatibility: contracts that withheld `advisory_review` keep
+    # Rename compatibility: contracts that withheld `advisory_review` keep
     # withholding the SAME organ under its new name, and vice versa (a new
     # contract naming only the new spelling must also silence the alias).
     if "advisory_review" in names:
@@ -350,6 +348,7 @@ _GITHUB_TOKEN_TOOLS = frozenset({
     "list_github_prs",
     "get_github_pr",
     "comment_on_pr",
+    "pr_merge",
     "list_github_issues",
     "get_github_issue",
     "comment_on_issue",
@@ -406,6 +405,16 @@ def _capability_resource_guard_result(
     is_mcp: bool = False,
 ) -> ToolResult | None:
     """Apply direct task capability and resource admission in legacy order."""
+    # Consciousness Observe keeps the names it needs for useful read-only research
+    # visible, but their ARGUMENTS cannot carry back the mutating authority the
+    # level removed. The policy lives with the level that owns it (a call-time
+    # import, like every other D04->D15 edge); a failure to consult it raises
+    # here rather than reading as permission.
+    from ouroboros.consciousness_authority import observe_argument_refusal
+
+    metadata = getattr(ctx, "task_metadata", {}) if isinstance(getattr(ctx, "task_metadata", {}), dict) else {}
+    if refusal := observe_argument_refusal(metadata, name, args):
+        return ToolResult(status="blocked", code="RESOURCE_CONSTRAINT_BLOCKED", text=refusal)
     if name in _disabled_tools(ctx):
         return ToolResult(
             status="blocked",
@@ -597,26 +606,6 @@ def _executor_backend_candidate_path(ctx: Any, candidate: str) -> pathlib.Path |
         return None
 
 
-def _workspace_write_block_runtime_result(path_text: Any = "", spelled: Any = "") -> ToolResult:
-    """Typed carrier of the Guard-B runtime-path denial (same bytes in text)."""
-    return ToolResult(
-        status="blocked",
-        code="WORKSPACE_BLOCKED",
-        text=_workspace_write_block_runtime_message(path_text, spelled),
-    )
-
-
-def _workspace_write_block_outside_root_result(
-    path_text: Any = "", work_dir: Any = "", spelled: Any = "",
-) -> ToolResult:
-    """Typed carrier of the Guard-B outside-root denial (same bytes in text)."""
-    return ToolResult(
-        status="blocked",
-        code="WORKSPACE_BLOCKED",
-        text=_workspace_write_block_outside_root_message(path_text, work_dir, spelled),
-    )
-
-
 def _git_protected_roots(self) -> list:
     """Ouroboros runtime roots the target-aware git resolver protects, by
     enumeration: the system repo + EVERY data drive the task touches (parent
@@ -667,6 +656,7 @@ def _direct_shell_write_block(self, raw_cmd: Any, work_dir: pathlib.Path, runtim
     """Apply existing resource authority to certain direct writes, never mentions."""
     from dataclasses import replace
     from ouroboros.tool_access import _process_root_candidates, _resolve_target_in_selected_base, decide_tool_access, path_is_relative_to
+    from ouroboros.tool_access_user_files import UserFilesPathBlockedError
     from ouroboros.tools.deliverables_shell import _command_path
     from ouroboros.tools.shell_guards import direct_utility_target_rows, directory_destination_pairs
     from ouroboros.tools.core import _binding_skill_control_plane_path, is_skill_control_plane_path
@@ -677,25 +667,38 @@ def _direct_shell_write_block(self, raw_cmd: Any, work_dir: pathlib.Path, runtim
     rows = direct_utility_target_rows(raw_cmd)
     if not any(row[1] for row in rows):
         return None
+    # A command word alone (touch, rm, mkdir, ...) is a guess, not evidence of a
+    # write (DEVELOPMENT §2: permission is never reconstructed from command
+    # words). For a top-level principal the guess still meets light mode,
+    # protected paths and skill trust state below, never the outside-every-root
+    # fence (owner decision 5A); a subordinate child keeps its write confinement,
+    # so the guess still fences it.
+    guess_fences = self._is_acting_subagent() or self._is_local_readonly_subagent()
+    certain_rows = direct_utility_target_rows(raw_cmd, certain_only=True)
     items = _registry()._binding_items(binding)
     selected = items[0] if items else _registry().build_resolved_resource_binding(
         self._ctx, operation="shell", process_cwd=str(work_dir))
-    roots = list(dict.fromkeys([(selected.root, selected.base_path, selected.source, selected.skill_name),
-                               *_process_root_candidates(self._ctx, "shell")]))
-    system_repo = pathlib.Path(getattr(self._ctx, "system_repo_dir", None) or self._ctx.repo_dir)
+    roots = [row for row in dict.fromkeys([(selected.root, selected.base_path, selected.source, selected.skill_name),
+                                          *_process_root_candidates(self._ctx, "shell")])
+             if decide_tool_access(profile=selected.profile, root=row[0], operation="write").allow]
+    system_repo = pathlib.Path(getattr(self._ctx, "system_repo_dir", None) or self._ctx.repo_dir).resolve(strict=False)
 
-    def _refuse_write(target: pathlib.Path, token: str) -> ToolResult:
-        if self._is_acting_subagent():
-            return _workspace_write_block_outside_root_result(target.resolve(strict=False), work_dir, token)
-        light_internal = runtime_mode == "light" and any(
-            path_is_relative_to(target, root) for root in _git_protected_roots(self))
-        code = "LIGHT_MODE_BLOCKED" if light_internal else "WORKSPACE_BLOCKED"
-        prefix = "LIGHT_MODE_BLOCKED" if light_internal else "WORKSPACE_SHELL_BLOCKED"
-        return ToolResult(status="blocked", code=code, text=(
-            f"⚠️ {prefix}: explicit write target {target} is outside the resources this task may write. "
-            f"Selected process root: {work_dir}. The process was not started."))
+    def _refuse_write(target: pathlib.Path, token: str, declined: list, light_internal: bool) -> ToolResult:
+        # The refusal names the real reason and every root this task may write.
+        writable = ", ".join(dict.fromkeys(
+            f"{root}={pathlib.Path(base).resolve(strict=False)}" for root, base, _source, _skill in roots
+            if not (light_internal and pathlib.Path(base).resolve(strict=False) == system_repo))) or "(none)"
+        reason = ("runtime_mode=light keeps the Ouroboros repository and runtime control data read-only"
+                  if light_internal else "explicit write target is outside every root this task may write")
+        return ToolResult(
+            status="blocked", code="LIGHT_MODE_BLOCKED" if light_internal else "WORKSPACE_BLOCKED",
+            text=(f"⚠️ {'LIGHT_MODE_BLOCKED' if light_internal else 'WORKSPACE_SHELL_BLOCKED'}: {reason}."
+                  + _blocked_path_note(target, token) + f" Writable roots: {writable}."
+                  + "".join(f" {why}" for why in declined) + " The process was not started."))
 
-    for (argv, targets, _inline, _unknown), cwd in zip(rows, _registry().sequential_effective_cwds(rows, work_dir)):
+    for (argv, targets, _inline, _unknown), (_argv, certain, _i, _u), cwd in zip(
+            rows, certain_rows, _registry().sequential_effective_cwds(rows, work_dir)):
+        guessed = set(targets) - set(certain)
         for command, destination, source in directory_destination_pairs(argv):
             directory = _command_path(self._ctx, cwd, destination)
             child = directory_destination_child_name(command, argv, source)
@@ -712,10 +715,9 @@ def _direct_shell_write_block(self, raw_cmd: Any, work_dir: pathlib.Path, runtim
             # install resolves user_files to the whole host, which would admit a
             # repository target under that name for a light-capped task.
             if runtime_mode == "light" and path_is_relative_to(target, system_repo):
-                return _refuse_write(target, token)
+                return _refuse_write(target, token, [], True)
+            declined: list[str] = []
             for root, base, source, skill in roots:
-                if not decide_tool_access(profile=selected.profile, root=root, operation="write").allow:
-                    continue
                 try:
                     resolved = _resolve_target_in_selected_base(
                         self._ctx, root=root, base_path=base, path=str(target), operation="write")
@@ -727,21 +729,28 @@ def _direct_shell_write_block(self, raw_cmd: Any, work_dir: pathlib.Path, runtim
                             f"⚠️ SKILL_PAYLOAD_BLOCKED: explicit write target {resolved} is skill control-plane state. "
                             "Edit user-authored payload files instead. The process was not started."))
                     if _registry().binding_targets_system_repo(self._ctx, target_binding):
-                        if runtime_mode == "light" or (protected_paths_in([resolved.relative_to(base).as_posix()])
-                                                       and not mode_allows_protected_write(runtime_mode)):
+                        if runtime_mode == "light":
                             continue
+                        protected = protected_paths_in([resolved.relative_to(base).as_posix()])
+                        if protected and not mode_allows_protected_write(runtime_mode):
+                            return _registry()._protected_write_block_result(
+                                path=protected[0].path, runtime_mode=runtime_mode, action="let run_command write")
                     # Process output uses the existing shell/write grant owner,
                     # including a remapped Deliverables logical path prefix.
-                    if root == "user_files":
-                        if not _presence_allows_user_output(self._ctx, resolved):
-                            continue
-                    elif not _registry()._presence_binding_allowed(self._ctx, target_binding):
+                    if (not _presence_allows_user_output(self._ctx, resolved) if root == "user_files"
+                            else not _registry()._presence_binding_allowed(self._ctx, target_binding)):
+                        declined.append(f"{root} declines it under the Presence output policy.")
                         continue
                     break
+                except UserFilesPathBlockedError as exc:
+                    declined.append(f"user_files declines it: {str(exc).removeprefix('user_files path blocked: ')}")
                 except (OSError, ValueError, RuntimeError):
                     continue
             else:
-                return _refuse_write(target, token)
+                light_internal = runtime_mode == "light" and any(
+                    path_is_relative_to(target, root) for root in _git_protected_roots(self))
+                if guess_fences or light_internal or token not in guessed:
+                    return _refuse_write(target, token, declined, light_internal)
     return None
 
 
@@ -793,7 +802,7 @@ def _shell_git_and_runtime_block(
     """Direct-git-via-shell policy + the external-workspace runtime/secret read
     guard. External workspaces AND the default (non-workspace) lane get full
     task-local git through ONE target-aware resolver — only the Ouroboros
-    runtime is protected (Q4=A unwind, 2026-08-08) — while raw non-git shell
+    runtime is protected — while raw non-git shell
     in external workspaces still cannot read the runtime/secrets;
     self_worktree keeps the strict read-only git policy."""
     if not _registry().shell_argv(raw_cmd):
@@ -866,7 +875,7 @@ def _shell_git_and_runtime_block(
                 ),
             )
         return None
-    # DEFAULT (non-workspace) lane. Q4=A (owner 2026-08-08): mutating git
+    # DEFAULT (non-workspace) lane: mutating git
     # is free EVERYWHERE outside the Ouroboros runtime. The argv-text
     # blanket is replaced by the SAME target-aware resolver the external
     # lane runs since v6.27: read-only git allowed even at a runtime

@@ -172,7 +172,7 @@ def _notify_chat_progress(job: LifecycleJob, phase: str) -> None:
             is_progress=True,
             task_id=_chat_task_id(job),
             progress_meta={"lifecycle": lifecycle},
-        )
+            role="system", system_type="skill_lifecycle")
     except Exception:
         return
 
@@ -214,7 +214,7 @@ def _notify_duplicate_pointer(requested: LifecycleJob, existing: LifecycleJob) -
                 "presentation_owner_task_id": existing.presentation_owner_task_id,
                 "source": existing.source,
             }},
-        )
+            role="system", system_type="skill_lifecycle_pointer")
     except Exception:
         return
 
@@ -278,21 +278,6 @@ def _release_dedupe(job: LifecycleJob) -> None:
     with _state_lock:
         if _dedupe_jobs.get(job.dedupe_key) is job:
             _dedupe_jobs.pop(job.dedupe_key, None)
-
-
-@contextlib.contextmanager
-def skill_lifecycle_file_lock(drive_root: pathlib.Path):
-    from ouroboros.platform_layer import file_lock_exclusive, file_unlock
-
-    lock_dir = pathlib.Path(drive_root) / "state"
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = lock_dir / "skill_lifecycle.lock"
-    with lock_path.open("a+") as fh:
-        file_lock_exclusive(fh.fileno())
-        try:
-            yield
-        finally:
-            file_unlock(fh.fileno())
 
 
 @contextlib.asynccontextmanager

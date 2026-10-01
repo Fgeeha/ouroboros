@@ -39,6 +39,8 @@ def test_stop_arriving_in_real_backoff_keeps_only_actual_physical_attempts(
     ctx = kwargs["tools"]._ctx
     ctx.task_id, ctx.task_attempt, ctx.budget_drive_root = "t-death", 1, canonical
     ctx.is_direct_chat = not owner_grace
+    if not owner_grace:  # inline Presence, the one direct caller that keeps the paid-repeat rail
+        kwargs["task_type"] = ctx.current_task_type = "presence"
     ctx.task_metadata = {"root_task_id": "t-death"}
     first_empty_check = threading.Event()
     real_wait = loop_transport.interruptible_wait_sleep

@@ -125,7 +125,7 @@ def test_acceptance_review_empty_host_diff_does_not_fall_back_to_agent(monkeypat
     assert captured["evidence"]["agent_supplied"]["agent_supplied_repo_diff"] == "FABRICATED_AGENT_DIFF"
 
 
-def test_acceptance_review_records_agent_disposition(monkeypatch, tmp_path):
+def test_acceptance_review_only_records_agent_rationale(monkeypatch, tmp_path):
     from types import SimpleNamespace as NS
 
     import ouroboros.review_evidence as re_mod
@@ -150,15 +150,50 @@ def test_acceptance_review_records_agent_disposition(monkeypatch, tmp_path):
     raw = _handle_task_acceptance_review(
         ctx,
         claim="done",
-        agent_disposition="rejected",
         rationale="Reviewer asked for a benchmark-specific workaround; I reject it as scope drift.",
     )
     payload = json.loads(raw)
 
-    assert captured["evidence"]["agent_supplied"]["agent_decision"]["disposition"] == "rejected"
-    assert payload["agent_decision"]["disposition"] == "rejected"
+    decision = captured["evidence"]["agent_supplied"]["agent_decision"]
+    assert decision["disposition"] == ""
+    assert decision["explicit_finish"] is False
+    assert payload["agent_decision"] == decision
     assert "scope drift" in payload["agent_decision"]["rationale"]
-    event = json.loads((tmp_path / "logs" / "events.jsonl").read_text().strip())
+
+
+def test_acceptance_review_records_agent_disposition(monkeypatch, tmp_path):
+    """The deprecated terminal alias stages the same completion act before review."""
+    import ouroboros.review_evidence as re_mod
+    import ouroboros.review_substrate as rs
+    from ouroboros.tools.review import _handle_task_acceptance_review
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("author completion must stage before evidence or reviewer dispatch")
+
+    monkeypatch.setattr(re_mod, "collect_turn_diff", forbidden)
+    monkeypatch.setattr(rs, "run_review_request", forbidden)
+    ctx = SimpleNamespace(
+        drive_root=str(tmp_path), drive_logs=lambda: tmp_path / "logs", task_id="t",
+        task_metadata={"root_task_id": "root", "parent_task_id": "root"},
+        _completion_observation={"tool_count": 2, "feedback": {}},
+    )
+    raw = _handle_task_acceptance_review(
+        ctx, claim="done", agent_disposition="rejected",
+        rationale="  Reviewer asked for a benchmark-specific workaround;\nI reject it as scope drift.  ",
+    )
+    assert json.loads(raw) == {
+        "status": "completion_requested", "completion_control": True, "action": "finish",
+    }
+    request = ctx._completion_request
+    assert request["answer"] == "done" and request["source"] == "task_acceptance_review"
+    assert request["observation"] == ctx._completion_observation
+    decision = request["agent_decision"]
+    assert decision["disposition"] == "rejected" and decision["explicit_finish"] is True
+    assert decision["author_action"] == "finish"
+    assert decision["rationale"] == (
+        "Reviewer asked for a benchmark-specific workaround; I reject it as scope drift."
+    )
+    event = json.loads((tmp_path / "logs" / "events.jsonl").read_text(encoding="utf-8").strip())
     assert event["type"] == "deprecated_task_acceptance_alias"
     assert event["aliases"] == ["agent_disposition"]
     assert event["removal"] == "next_major"
@@ -279,10 +314,12 @@ def test_typed_retry_root_defers_self_review_and_is_host_eligible(
         return result
 
     monkeypatch.setattr(loop_mod, "_task_acceptance_eligible", capture_eligible)
+    # Stop the gate right after eligibility, before any reviewer slot is resolved: an
+    # unanswered fence no longer buys a wait round, a live subtree still does.
+    monkeypatch.setattr(loop_mod, "_begin_task_acceptance_fence", lambda *_a, **_k: (False, None))
     monkeypatch.setattr(
-        loop_mod,
-        "_begin_task_acceptance_fence",
-        lambda *_args, **_kwargs: (False, None),
+        loop_mod, "_task_acceptance_subtree_snapshot",
+        lambda *_a, **_k: (False, [{"task_id": "child", "status": "running"}]),
     )
     assert loop_mod._run_task_acceptance_review_once(
         tools=registry,

@@ -99,8 +99,9 @@ _REVIEW_SUBSTRATE_PATHS = frozenset({
     "ouroboros/tools/review.py", "ouroboros/tools/review_multi_model.py", "ouroboros/tools/review_context_atlas.py",
     "ouroboros/tools/review_helpers.py", "ouroboros/tools/review_prompt_text.py", "ouroboros/tools/review_file_pack.py",
     "ouroboros/tools/review_revalidation.py", "ouroboros/tools/review_binary_context.py", "ouroboros/tools/release_sync.py",
-    "ouroboros/tools/review_synthesis.py", "ouroboros/tools/scope_review.py", "ouroboros/tools/scope_review_pack.py",
-    "ouroboros/tools/scope_review_budget.py", "ouroboros/tools/scope_review_contract.py", "ouroboros/tools/scope_review_session.py",
+    "ouroboros/tools/review_synthesis.py", "ouroboros/tools/scope_review.py", "ouroboros/tools/scope_review_contract.py",
+    "ouroboros/tools/scope_review_session.py", "ouroboros/tools/scope_required_sources.py",
+    "ouroboros/tools/governance_context.py", "ouroboros/review_session_reads.py",
     "ouroboros/tools/scope_window.py", "ouroboros/claudexor_daemon.py", "ouroboros/delegate_custody.py",
     "ouroboros/delegate_custody_usage.py", "ouroboros/delegate_output.py", "ouroboros/gateways/claudexor.py",
     "ouroboros/review_evidence.py", "ouroboros/review_evidence_sections.py", "ouroboros/subagents.py",
@@ -744,6 +745,7 @@ def _resolved_review_config(*, profile: str = "production_commit_gate") -> dict:
             "route": route,
             "effort": row_effort(row, surface),
             **({"subagent_id": row.subagent_id} if row.subagent_id else {}),
+            **({"delivery": row.delivery} if row.delivery else {}),
         }
 
     triad_slots = [_project(row, "review") for row in config.triad]
@@ -1032,21 +1034,23 @@ def _write_contributor_packet(
 def _diff_size_refusal(args, resolved_config: dict, reviewable_chars: int, cap: int) -> bool:
     """The cap binds packet recipients; configured retrieving actors read files.
 
-    The non-contributor advisory flow keeps its existing hard cap. Native
-    API actors remain paid seats even though they do not receive a packet.
+    Scope rows always retrieve; only triad rows can receive a packet. The
+    non-contributor advisory flow keeps its existing hard cap. Native API
+    actors remain paid seats even though they do not receive a packet.
     """
-    from ouroboros.review_execution import delivery_retrieves
+    from ouroboros.reviewer_slot_config import row_plan_retrieves
 
     if reviewable_chars <= cap:
         return False
     if not getattr(args, "contributor", False):
         return True
     return any(
-        not delivery_retrieves((row.get("route") or {}).get("kind"), row.get("subagent_id"))
-        for row in [
-            *list(resolved_config.get("triad_slots") or []),
-            *list(resolved_config.get("scope_slots") or []),
-        ]
+        not row_plan_retrieves({
+            "routes": [(row.get("route") or {}).get("kind")],
+            "subagent_ids": [row.get("subagent_id")],
+            **({"retrieves": [row["delivery"] == "native"]} if row.get("delivery") else {}),
+        }, 0)
+        for row in resolved_config.get("triad_slots") or []
     )
 
 

@@ -38,6 +38,50 @@ export function safeExternalHrefAttr(value) {
     return '';
 }
 
+/**
+ * ` · since HH:MM` in the viewer's own 24-hour clock, for an instant the host
+ * actually recorded. A wait that began on an earlier local day carries that day
+ * too, so `since 23:50` can never be misread as tonight. A missing or
+ * unparseable value yields '': a moment is never invented or inferred.
+ */
+export function sinceLocalTime(value, now = Date.now()) {
+    const at = new Date(Date.parse(String(value ?? '').trim()));
+    if (Number.isNaN(at.getTime())) return '';
+    const clock = at.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+    if (at.toDateString() === new Date(now).toDateString()) return ` · since ${clock}`;
+    return ` · since ${at.toLocaleDateString([], { month: 'short', day: 'numeric' })} ${clock}`;
+}
+
+const absoluteTime = (value, zone = false) => {
+    const date = value ? new Date(value) : null;
+    return date && !Number.isNaN(date.getTime()) ? date.toLocaleString(undefined, {
+        year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+        ...(zone ? { timeZoneName: 'short' } : {}),
+    }) : '';
+};
+// The instant's own minute: local clock text repeats across a DST fallback hour.
+const minuteOf = value => Math.floor(new Date(value).getTime() / 60000);
+
+/** A task's host-observed end and the time its notification was added are two
+ * facts (#1347); an unknown end says so rather than borrowing the second. Two
+ * different minutes that read alike locally carry their zone names. */
+export function terminalTimeNote(terminalTime, addedAt) {
+    const known = terminalTime?.source === 'executor_terminal' && absoluteTime(terminalTime.occurred_at);
+    const zone = Boolean(known) && known === absoluteTime(addedAt) && minuteOf(terminalTime.occurred_at) !== minuteOf(addedAt);
+    const occurred = known ? absoluteTime(terminalTime.occurred_at, zone) : '';
+    return `${occurred ? `Task ended ${occurred}` : 'Task end time not recorded'} · Notification added ${absoluteTime(addedAt, zone)}`;
+}
+
+/** A saved end row may be published long after its task ended. Its line keeps the
+ * row's own time and adds the note when the end falls in another minute or is
+ * unknown; live frames and rows saved before the host fact existed stay as they were. */
+export function savedTerminalRowNote(row) {
+    const fact = row?.system_type === 'task_summary' ? row.terminal_time : null;
+    if (!fact || typeof fact !== 'object' || !absoluteTime(row.ts)) return '';
+    const known = fact.source === 'executor_terminal' && absoluteTime(fact.occurred_at);
+    return known && minuteOf(fact.occurred_at) === minuteOf(row.ts) ? '' : terminalTimeNote(fact, row.ts);
+}
+
 /** Bound untrusted text with a visible marker before it reaches DOM surfaces. */
 export function boundedText(value, maxLen = 1200) {
     const text = String(value ?? '');
@@ -153,8 +197,9 @@ export function renderHubCard(item, {
     const lifecycleHint = lifecycle?.hint
         ? `<div class="marketplace-card-state-hint">${escapeHtmlAttr(lifecycle.hint)}</div>`
         : '';
+    // The local copy's own version only; the catalog version is the title's fact.
     const status = installed
-        ? `<span class="skills-status-chip skills-status-ok">Installed v${escapeHtmlAttr(installed.version || item.latest_version || '')}</span>`
+        ? `<span class="skills-status-chip skills-status-ok">Installed${installed.version ? ` v${escapeHtmlAttr(installed.version)}` : ''}</span>`
         : '';
     return `
         <article class="${working ? 'marketplace-card is-working' : 'marketplace-card'}" data-slug="${escapeHtmlAttr(slug)}">
@@ -181,6 +226,24 @@ export function renderHubCard(item, {
             </div>
         </article>
     `;
+}
+
+/**
+ * One quiet line of OuroborosHub submission history (the hub_sync
+ * `submission` facts), shared by the installed card's details and the hub
+ * card's disclosure. It states what this installation submitted — never
+ * ownership, a merge or an open pull request — and an unsafe receipt URL
+ * stays plain text without hiding the other facts.
+ */
+export function renderSubmissionHistory(submission) {
+    if (!submission || typeof submission !== 'object') return '';
+    const parts = [submission.version ? `Submitted v${escapeHtmlAttr(submission.version)}` : 'Submitted'];
+    const pr = submission.pr_number !== null ? `PR #${escapeHtmlAttr(String(submission.pr_number))}` : 'Pull request';
+    const href = safeExternalHrefAttr(submission.pr_url);
+    if (href) parts.push(`<a href="${href}" target="_blank" rel="noopener noreferrer">${pr}</a>`);
+    else if (submission.pr_number !== null) parts.push(pr);
+    if (submission.local_differs) parts.push('Local files differ from the submitted copy');
+    return parts.join(' · ');
 }
 
 /**
@@ -365,11 +428,49 @@ export function accountedUpperBoundWithChildren(payload) {
 // count as what the reader sees, not as their markup.
 export const MARKDOWN_HEADING_MAX_CHARS = 80;
 
+// Code is the author's literal text: a later span, heading, list, link or table
+// rule must never see inside a fence or code span. Each one is parked as a token
+// of letters and digits the text does not contain (so no later pattern can match
+// in or across it) and `restore` puts the parked text back. Parked code is
+// markup, so `holds` lets a rule that writes an attribute refuse to carry it.
+const CODE_SPAN = /(``|`)(.+?)\1/g;
+const CODE_STEM = 'OUROBOROSCODE';
+
+// The token's stem: `OUROBOROSCODE` and a fixed-width tag of capital letters that
+// follows no `OUROBOROSCODE` in the text. There are more tags of that width than
+// occurrences, so one scan finds a free tag and the stem stays short on any input
+// (lengthening it until the text lacked it cost a rescan per letter and grew every
+// token with the text).
+function codeStem(text) {
+    const after = [];
+    for (let at = text.indexOf(CODE_STEM); at >= 0; at = text.indexOf(CODE_STEM, at + 1)) after.push(at + CODE_STEM.length);
+    let width = 0;
+    while (26 ** width <= after.length) width += 1;
+    const taken = new Set(after.map((at) => text.slice(at, at + width)));
+    const tag = (n) => Array.from({ length: width }, (_, i) => String.fromCharCode(65 + (Math.floor(n / 26 ** i) % 26))).join('');
+    let free = 0;
+    while (taken.has(tag(free))) free += 1;
+    return CODE_STEM + tag(free);
+}
+
+function codeStash(text) {
+    const stem = codeStem(text);
+    const parked = [];
+    const pattern = new RegExp(`${stem}(\\d+)${stem}`, 'g');
+    return {
+        token: (value) => `${stem}${parked.push(value) - 1}${stem}`,
+        holds: (value) => String(value).includes(stem),
+        restore: (value) => String(value).replace(pattern, (_, index) => parked[Number(index)]),
+    };
+}
+
 // What the reader sees of a heading, at either stage of the pipeline. Rendered
 // text has already turned matched spans into tags (not visible) and `<`/`&` into
-// entities (one character each). Raw text is projected the way the renderer
-// would: only MATCHED span pairs and link destinations are invisible; an unmatched
-// `*`, a literal `<okay>` or a literal `&amp;` stay visible characters.
+// entities (one character each); its code spans are still parked, so `restore`
+// reveals them after link targets are gone. Raw text is projected the way the
+// renderer would: only MATCHED span pairs and link destinations are invisible; an
+// unmatched `*`, a literal `<okay>`, a literal `&amp;` and everything inside a code
+// span stay visible characters.
 // `[label](url)` → label with one forward cursor: a regex retried from every
 // unmatched `[` is quadratic on hostile input, and this runs on live frames.
 function withoutLinkTargets(text) {
@@ -386,31 +487,35 @@ function withoutLinkTargets(text) {
     return out + text.slice(i);
 }
 
-function visibleHeadingText(text, rendered) {
-    const linkless = withoutLinkTargets(text);
+function visibleHeadingText(text, rendered, restore = (value) => value) {
+    const code = rendered ? null : codeStash(text);
+    const reveal = code ? code.restore : restore;
+    const linkless = withoutLinkTargets(code ? text.replace(CODE_SPAN, (_, _tick, body) => code.token(body)) : text);
     // Past this length no span markup can bring a line under the cap; skipping the
     // span regexes keeps a hostile marker run from costing quadratic time.
-    if (linkless.length > 8 * MARKDOWN_HEADING_MAX_CHARS) return linkless;
-    if (rendered) return linkless.replace(/<[^>]*>/g, '').replace(/&[#\w]+;/g, 'x');
-    return linkless.replace(/(``|`)(.+?)\1/g, '$2').replace(/\*\*(.+?)\*\*/g, '$1').replace(/\*(.+?)\*/g, '$1').replace(/~~(.+?)~~/g, '$1');
+    if (reveal(linkless).length > 8 * MARKDOWN_HEADING_MAX_CHARS) return reveal(linkless);
+    if (rendered) return reveal(linkless).replace(/<[^>]*>/g, '').replace(/&[#\w]+;/g, 'x');
+    return reveal(linkless.replace(/\*\*(.+?)\*\*/g, '$1').replace(/\*(.+?)\*/g, '$1').replace(/~~(.+?)~~/g, '$1'));
 }
 
-function isMarkdownHeading(text, { rendered = false } = {}) {
-    return visibleHeadingText(text, rendered).length <= MARKDOWN_HEADING_MAX_CHARS;
+function isMarkdownHeading(text, { rendered = false, restore } = {}) {
+    return visibleHeadingText(text, rendered, restore).length <= MARKDOWN_HEADING_MAX_CHARS;
 }
 
-function headingOrProse(cls, text, breakAfter = false) {
-    return isMarkdownHeading(text, { rendered: true })
+function headingOrProse(cls, text, breakAfter = false, restore = undefined) {
+    return isMarkdownHeading(text, { rendered: true, restore })
         ? `<strong class="${cls}">${text}</strong>${breakAfter ? '<br>' : ''}` : text;
 }
 
-// The renderer's fence grammar (`/```(\w*)\n([\s\S]*?)```/`), line by line on the
-// ORIGINAL lines: a line ending in ``` plus a word-only info string right before
-// the newline opens a fence, whatever precedes it — trailing blanks or a CR make it
-// ordinary text, exactly as for the renderer — PROVIDED a later line closes it (the
-// renderer's regex needs the closer; an unclosed opener is ordinary text); the next
-// line containing ``` closes it. `md-js` opens nothing.
-const FENCE_OPEN = /```\w*$/;
+// One compact fence grammar for rendering and both plain previews: an optional
+// word-character language label with + # . - punctuation, then spaces/tabs and
+// LF or CRLF. A nonempty label needs a word character: a prose ``` followed only
+// by punctuation is not an opener. Nor is more prose after a blank, which could pair an inline ``` with
+// a later code fence. Prefixed/indented openers and the next-``` closer keep their
+// existing semantics; an opener without a later closer remains ordinary text.
+const FENCE_START = '```(?:(?=[\\w+#.-]*\\w)[\\w+#.-]+)?[\\t ]*\\r?';
+const FENCE_OPEN = new RegExp(FENCE_START + '$');
+export const MARKDOWN_FENCED_CODE = new RegExp(FENCE_START + '\\n([\\s\\S]*?)```', 'g');
 const FENCE_CLOSE = /```/;
 
 /**
@@ -450,11 +555,52 @@ export function joinMarkdownHeadings(text) {
     }).join('\n');
 }
 
+/**
+ * One plain-text projection of RECORDED free text before it joins a host cause
+ * cancellation clause. The Python twin is
+ * `ouroboros.utils.strip_markdown` followed by a whitespace split/join, and the
+ * two strip the SAME marker inventory so one stored cause reads the same in the
+ * browser card and in the host's durable chat row. Line-anchored patterns
+ * (headings, bullets) only match while the newlines are still there, so
+ * stripping precedes flattening — exactly the order the Python docstring names.
+ * The common fixture pins Markdown, empty provenance and sentence punctuation
+ * through both consumers. `max` of 0 keeps the whole text; any other value
+ * bounds it by Unicode characters with an ellipsis.
+ */
+export function plainCauseText(value, max = 160) {
+    const plain = String(value || '')
+        .replace(/```[^\n]*\n([\s\S]*?)```/g, '$1')
+        .replace(/`([^`]+)`/g, '$1')
+        .replace(/\*\*\*(.+?)\*\*\*/g, '$1')
+        .replace(/\*\*(.+?)\*\*/g, '$1')
+        .replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g, '$1')
+        .replace(/(?<![\p{L}\p{N}_])_(.+?)_(?![\p{L}\p{N}_])/gu, '$1')
+        .replace(/~~(.+?)~~/g, '$1')
+        .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+        .replace(/^#{1,6}\s+/gm, '')
+        .replace(/^[*-]\s+/gm, '• ')
+        .replace(/\*\*|__|~~|`/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+    const chars = Array.from(plain);
+    return max > 0 && chars.length > max ? `${chars.slice(0, max - 1).join('').trimEnd()}…` : plain;
+}
+
+const TABLE_ALIGN = [[/^:-+:$/, 'center'], [/^-+:$/, 'right'], [/^:-+$/, 'left']];
+
+// `[text](address "title")` on one line. The address has no blanks and keeps its
+// parentheses balanced one level deep (`wiki/Foo_(bar)`); an optional title in
+// quotes or parentheses follows a blank and is not part of it. Any other form is
+// not read as a link and stays the author's text, never a guessed address.
+const MARKDOWN_LINK = /(!?)\[([^\]]+)\]\([ \t]*((?:[^()\s]|\([^()\s]*\))+)(?:[ \t]+("[^"\n]*"|'[^'\n]*'|\([^()\n]*\)))?[ \t]*\)/g;
+
 export function renderMarkdown(text, { inlineHeadingBreaks = false } = {}) {
     let html = escapeHtmlText(text);
-    html = html.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>');
+    const code = codeStash(html);
+    html = html.replace(MARKDOWN_FENCED_CODE, (_, body) => code.token(`<pre><code>${body}</code></pre>`));
     // One pass for both span forms: a double-backtick span may contain backticks.
-    html = html.replace(/(``|`)(.+?)\1/g, '<code class="inline-code">$2</code>');
+    html = html.replace(CODE_SPAN, (match, _tick, body) => code.holds(body)
+        ? match : code.token(`<code class="inline-code">${body}</code>`));
     html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
     html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
     html = html.replace(/~~(.+?)~~/g, '<del>$1</del>');
@@ -464,15 +610,22 @@ export function renderMarkdown(text, { inlineHeadingBreaks = false } = {}) {
     // Timeline labels stay inline, but their following paragraph needs a real
     // copyable break when its surface collapses source whitespace.
     const heading = (cls) => (match, content, offset, source) => headingOrProse(
-        cls, content, inlineHeadingBreaks && ['\r', '\n'].includes(source[offset + match.length]),
+        cls, content, inlineHeadingBreaks && ['\r', '\n'].includes(source[offset + match.length]), code.restore,
     );
     html = html.replace(/^#{3,6} (.+)$/gm, heading('md-h3'));
     html = html.replace(/^## (.+)$/gm, heading('md-h2'));
     html = html.replace(/^# (.+)$/gm, heading('md-h1'));
     html = html.replace(/^- (.+)$/gm, '<span class="md-li">\u2022 $1</span>');
-    html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, function(_, text, url) {
+    // An image is never loaded (#1368); its reference stays a visible link. The
+    // title is dropped: the anchor keeps its one fixed shape.
+    // Code restored after the href was escaped would end the attribute with its
+    // own quote, and this output reaches the page unsanitized: a destination that
+    // holds parked code is no destination, and its source stays literal text.
+    html = html.replace(MARKDOWN_LINK, function(source, image, text, url, title = '') {
+        if (code.holds(url + title)) return source;
         const safe = safeExternalUrl(decodeHtmlEntities(url));
-        return '<a href="' + escapeHtmlAttr(safe) + '" target="_blank" rel="noopener noreferrer" class="md-link">' + text + '</a>';
+        return '<a href="' + escapeHtmlAttr(safe) + '" target="_blank" rel="noopener noreferrer" class="md-link'
+            + (image ? ' md-image-ref">Image: ' : '">') + text + '</a>';
     });
     html = html.replace(/((?:^\|.+\|$\n?)+)/gm, function(block) {
         const rows = block.trim().split('\n').filter(r => r.trim());
@@ -481,7 +634,10 @@ export function renderMarkdown(text, { inlineHeadingBreaks = false } = {}) {
         let headIdx = -1;
         for (let i = 0; i < rows.length; i++) { if (isSep(rows[i])) { headIdx = i; break; } }
         if (headIdx < 1) return block;
-        const parseRow = (r, tag) => '<tr>' + r.trim().replace(/^\||\|$/g, '').split('|').map(c => `<${tag}>${c.trim()}</${tag}>`).join('') + '</tr>';
+        const cells = (r) => r.trim().replace(/^\||\|$/g, '').split('|').map((c) => c.trim());
+        // The separator row's colons are the author's column alignment (GFM).
+        const align = cells(rows[headIdx]).map((c) => TABLE_ALIGN.find(([pattern]) => pattern.test(c))?.[1]);
+        const parseRow = (r, tag) => '<tr>' + cells(r).map((c, i) => `<${tag}${align[i] ? ` align="${align[i]}"` : ''}>${c}</${tag}>`).join('') + '</tr>';
         let t = '<table class="md-table">';
         for (let i = 0; i < headIdx; i++) t += '<thead>' + parseRow(rows[i], 'th') + '</thead>';
         t += '<tbody>';
@@ -489,7 +645,7 @@ export function renderMarkdown(text, { inlineHeadingBreaks = false } = {}) {
         t += '</tbody></table>';
         return '<div class="md-table-wrap">' + t + '</div>';
     });
-    return html;
+    return code.restore(html);
 }
 
 export function extractVersions(data) {
@@ -556,15 +712,18 @@ export function initMatrixRain() {
     function syncMotion() {
         if (timer !== null) clearInterval(timer);
         timer = null;
+        if (document.documentElement.dataset.theme === 'light') return;
         if (motion.matches) draw();
         else timer = setInterval(draw, 66);
     }
     motion.addEventListener('change', syncMotion);
+    window.addEventListener('ouro:theme-changed', syncMotion);
     syncMotion();
     return () => {
         if (timer !== null) clearInterval(timer);
         timer = null;
         motion.removeEventListener('change', syncMotion);
+        window.removeEventListener('ouro:theme-changed', syncMotion);
         window.removeEventListener('resize', resize);
         canvas.remove();
     };

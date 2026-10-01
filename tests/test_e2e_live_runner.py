@@ -611,13 +611,14 @@ def test_key_probe_failures_are_informational_and_back_off():
     assert probe.fragment() == "key uncapped"
 
 
-def test_watcher_tick_never_waits_on_the_key_probe(capsys):
+def test_watcher_tick_never_waits_on_the_key_probe(capsys, monkeypatch):
     """A probe stuck in a provider call must not delay the tick: the watcher reads the probe's
     last fragment and prints the ledger's spend regardless."""
-    stop, release = threading.Event(), threading.Event()
+    monkeypatch.setattr(run_live_lanes.shutil, "disk_usage", lambda _mount: types.SimpleNamespace(free=100 * 2**30))
+    stop = threading.Event()
 
     def stuck() -> float | None:
-        release.wait(10)
+        stop.wait(10)
         return None
 
     probe = run_live_lanes.KeyProbe(stuck, floor=1.0, interval=30.0, stop=stop)
@@ -634,11 +635,11 @@ def test_watcher_tick_never_waits_on_the_key_probe(capsys):
         time.sleep(0.05)
         seen += capsys.readouterr().out
     stop.set()
-    release.set()
     thread.join(timeout=5)
     line = next(ln for ln in seen.splitlines() if "[watch]" in ln)
     assert "spent $2.50/$50.00 reserved $16.00" in line and "SM1_a1=running scenario" in line   # $16 per task, one root
-    assert "key probe pending" in line and "ALERT" not in line
+    # Disk alerts are independent of the key probe's pending state.
+    assert line.endswith(" | key probe pending")
 
 
 # --------------------------------------------------------------------------- #
@@ -889,7 +890,8 @@ def test_absorb_wait_and_check_follow_the_scenarios_expects_absorb(tmp_path, mon
         lane = tmp_path / sid / "out" / "lanes" / f"{sid}_a1" / "data"
         state = json.loads((lane / "state" / "state.json").read_text(encoding="utf-8"))
         assert json.loads((lane / "settings.json").read_text())["OUROBOROS_POST_TASK_EVOLUTION"] == ("true" if sid == "SM1" else "false")
-        assert state["owner_chat_id"] == 1 and "evolution_mode_enabled" not in state, state
+        assert state["owner_chat_id"] == 1 and state["evolution_mode_enabled"] is False, state
+        assert state["initialization_id"]  # a positive first-boot witness, not a guessed state
         assert not (lane / "state" / "evolution_campaign.json").exists(), sid
 
 
@@ -1113,11 +1115,18 @@ def test_sm1_stub_bumps_the_release_carriers_through_the_sync_ssot(tmp_path):
     bumped = carriers["VERSION"].strip()
     assert scenarios.version_is_bumped(seed, bumped) and f"| {bumped} |" in carriers["README.md"]
     root = tmp_path / "carriers"
+    root.mkdir()
+    # Release admission reads Git scope, so materialize carriers in a disposable
+    # repository rather than a bare directory.
+    subprocess.run(["git", "init", "-q"], cwd=str(root), check=True)
     for rel in sorted(CARRIER_SPAN_PATHS):
         if (REPO_ROOT / rel).is_file():
             (root / rel).parent.mkdir(parents=True, exist_ok=True)
             (root / rel).write_text(carriers.get(rel) or (REPO_ROOT / rel).read_text(encoding="utf-8"), encoding="utf-8")
     assert release_metadata_preflight(root, scenarios.SM1_COMMIT_MESSAGE, ["VERSION"]) is None
+    assert scenarios.release_carriers_desync_at(root, _commit(root, "coherent release")) == ""
+    (root / "pyproject.toml").write_text('[project]\nversion = "0.0.0"\n', encoding="utf-8")
+    assert "pyproject.toml" in scenarios.release_carriers_desync_at(root, _commit(root, "broken carrier"))
     assert scenarios.sm1_next_version("7.0.0-rc.14") == "7.0.0-rc.15" and scenarios.sm1_next_version("7.0.0") == "7.0.1"
     # A seed cloned from an older ref carries the newer tags: the stub skips taken versions.
     assert scenarios.sm1_next_version("7.0.0-rc.14", {"v7.0.0-rc.15", "v7.0.0-rc.16"}) == "7.0.0-rc.17"

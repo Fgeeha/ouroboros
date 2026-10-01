@@ -50,6 +50,13 @@ from ouroboros.usage_accounting import UsageAccountingError, last_physical_attem
 log = logging.getLogger("ouroboros.llm")
 
 
+def _response_body_error(client: Any, response: Any) -> Optional[Dict[str, Any]]:
+    try:
+        return client._provider_body_error(response.model_dump())
+    except Exception:
+        return None
+
+
 class _RecoveryLadderMixin:
     """Provider-failure classification, one-shot repairs and the send drivers."""
 
@@ -365,10 +372,9 @@ class _RecoveryLadderMixin:
 
         def _send(candidate: Dict[str, Any]) -> Any:
             nonlocal prior_capture
-            # Socket policy is not model input; seal only the provider payload.
-            candidate = {key: value for key, value in candidate.items() if key != "timeout"}
             candidate = _finalized_physical_candidate(
                 target, candidate, "messages" if target.get("provider") == "anthropic" else "chat.completions",
+                fresh_clock=True,
             )
             request = _attempt_request(target, candidate)
 
@@ -404,12 +410,6 @@ class _RecoveryLadderMixin:
                 note_wire_send_failed()
                 raise
 
-        def _body_error(response: Any) -> Optional[Dict[str, Any]]:
-            try:
-                return self._provider_body_error(response.model_dump())
-            except Exception:
-                return None
-
         def _recover_existing(
             candidate: Dict[str, Any],
             *,
@@ -424,7 +424,7 @@ class _RecoveryLadderMixin:
                 signature_used = False
                 for _ in range(8):
                     if current_failure is None:
-                        body = _body_error(current_response)
+                        body = _response_body_error(self, current_response)
                         retry_kwargs = plan_next_wire_retry(
                             current_candidate, error=body, body_error=True, target=target,
                         )
@@ -532,8 +532,7 @@ class _RecoveryLadderMixin:
 
         async def _send(candidate: Dict[str, Any]) -> Any:
             nonlocal prior_capture
-            candidate = {key: value for key, value in candidate.items() if key != "timeout"}
-            candidate = _finalized_physical_candidate(target, candidate, "chat.completions")
+            candidate = _finalized_physical_candidate(target, candidate, "chat.completions", fresh_clock=True)
             request = _attempt_request(target, candidate)
 
             async def dispatch():
@@ -568,12 +567,6 @@ class _RecoveryLadderMixin:
                 note_wire_send_failed()
                 raise
 
-        def _body_error(response: Any) -> Optional[Dict[str, Any]]:
-            try:
-                return self._provider_body_error(response.model_dump())
-            except Exception:
-                return None
-
         async def _recover_existing(
             candidate: Dict[str, Any],
             *,
@@ -588,7 +581,7 @@ class _RecoveryLadderMixin:
                 signature_used = False
                 for _ in range(8):
                     if current_failure is None:
-                        body = _body_error(current_response)
+                        body = _response_body_error(self, current_response)
                         retry_kwargs = plan_next_wire_retry(
                             current_candidate, error=body, body_error=True, target=target,
                         )

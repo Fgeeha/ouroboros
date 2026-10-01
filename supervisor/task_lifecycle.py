@@ -57,8 +57,8 @@ BUDGET_ROOT_FENCES: Dict[str, Dict[str, Any]] = {}
 # FENCED under the queue lock, because a schedule event already draining would be
 # admitted after any number of cascade sweeps. Bounded in memory (newest kept) —
 # a cancelled tree is terminal, so an evicted entry names a tree that settled long
-# ago; the registry is per-process by design (a restart has no live descendants to
-# admit, and terminal task results are the durable truth).
+# ago; the registry is per-process because a restart re-derives it: restore cancels
+# the PENDING children of every interrupted root, and terminal results do the rest.
 CANCELLED_ROOT_FENCES: Dict[str, str] = {}
 _CANCELLED_ROOT_FENCE_CAP = 4096
 _CANCELLED_ROOT_FENCE_GRACE_SEC = 300.0
@@ -195,7 +195,10 @@ def restore_queue_fences(
                 if not root_id:
                     malformed_acceptance = True
                     break
-                fenced_roots.add(root_id)
+                # A saved author stop closes its own admission, not its children.
+                # Pre-terminal shutdown and cancel custody are restored separately.
+                if status != "sealed" or fence.get("outcome") != "author_stop":
+                    fenced_roots.add(root_id)
     malformed_budget = not isinstance(raw_budget, list)
     restored: Dict[str, Dict[str, Any]] = {}
     if not malformed_budget:
@@ -663,6 +666,13 @@ def cancel_task_custody(task_id: str, *, deliver: bool = True) -> str:
                     break
 
     if captured_pending is None and captured_worker is None:
+        from ouroboros.review_operation import task_has_live_review_operation
+
+        if task_has_live_review_operation(q.DRIVE_ROOT, task_id):
+            # The operation reads this durable Stop. Keep it open until paid
+            # workers release custody; a terminal author is not proof of that.
+            _release_intent_claim(q, task_id, error="review operation still owns paid work", intent=intent)
+            return CANCEL_FAILED
         # A settled row does not prove the direct turn is done: the pipeline
         # persists the terminal BEFORE post-task cognition, whose in-process
         # synthesis thread outlives the turn's own liveness (the pooled twin:
@@ -1545,7 +1555,3 @@ from supervisor.queue_transitions import (  # noqa: E402, F401 -- intentional pu
     task_subtree_is_live,
     transition_acceptance_fence,
 )
-
-# Scheduled-admission projection moved to its owner module, but callers may
-# still import the established lifecycle surface.
-from supervisor.task_admission import record_scheduled_admission  # noqa: E402, F401

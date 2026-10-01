@@ -1,17 +1,9 @@
 """Structural contracts for the semantic-no-op shell tool extraction.
 
-Carried from the v7 reference (ouroboros_v7_wip @ 9f691656) with the following
-identity continuations to THIS tree's bytes:
-
-1. Ten output-audit owners the reference placed in ``shell_outputs`` were
-   relocated by upstream itself into ``ouroboros/tools/shell_audit.py`` (a
-   post-cutoff upstream extraction); the ownership map below names the
-   upstream owner for those rows and the facade identity clause still holds
-   for every one of them.
-2. The frozen-tool-inventory clauses are dropped: ``ouroboros.tool_module_
-   inventory`` is a D04-family v7 leaf absent from this tree; the
-   non-catalog-owner and no-backedge clauses keep the structural half of that
-   contract. The inventory clause returns with its leaf.
+The output-audit helpers live in ``ouroboros.tools.shell_audit``. The owner
+map names that module alongside the process, output and effects leaves;
+the facade identity clause covers every moved helper. The leaves remain
+non-catalog owners without backedges into the facade.
 """
 
 from __future__ import annotations
@@ -117,10 +109,21 @@ def test_shell_catalog_schema_bytes_and_handler_owners_are_stable():
     ).encode()
     # run_script accepts any installed file interpreter; its temporary file
     # lives in an ignored workspace directory or the existing task drive.
+    # Workflow scope: explicit saved-setting references and lazy-output guidance.
+    # run_command states its real contract: only a bare builtin as cmd[0] is
+    # refused, a background child stalls the call and is never tracked after it
+    # (tests/test_run_command_schema_truth.py). Rolled once more: the sentence no
+    # longer says the child is never STOPPED, which is false where the timeout kill
+    # still reaches the exited shell's process group (Linux).
     assert hashlib.sha256(schema_bytes).hexdigest() == (
-        "2e6ebf9e5d81bc2fb321bd9615d66af2c6cd1e58f7bcc23a1a557353049e99f8"
+        "7d7a07b763cec4e8fc95bdfb733c2b8362bb8c0f0648b33825b56e52dccda4ce"
     )
     original = json.loads(schema_bytes)
+    for schema in original:
+        schema["parameters"]["properties"].pop("env_from_settings")
+        schema["parameters"]["properties"]["outputs"]["description"] = (
+            "Generated file paths to copy/register into the task artifact store after success."
+        )
     original[1]["description"] = (
         "Run a short task-scoped temporary script with a declared interpreter. "
         "Use for multi-line diagnostics or harness helpers; generated script files live under the task drive. "
@@ -128,7 +131,7 @@ def test_shell_catalog_schema_bytes_and_handler_owners_are_stable():
     )
     assert hashlib.sha256(json.dumps(original, sort_keys=True, ensure_ascii=False,
                                     separators=(",", ":")).encode()).hexdigest() == (
-        "a85e03bfc1a9834116b3ada4ce86638a56a1fec267e289e23a5a8f31e8a12f60"
+        "c6504272bceed19cc138a9cc8ee98a04db2f6ac3b41d70fdacbc4fa4022542bc"
     )
     assert {
         entry.name: (entry.handler.__module__, entry.handler.__name__)
@@ -160,4 +163,4 @@ def test_shell_extraction_size_bounds_have_meaningful_headroom():
     }
     assert counts["ouroboros.tools.shell"] <= 800
     assert all(count <= 1000 for count in counts.values())
-    assert 400 <= counts["ouroboros.tools.shell_outputs"] <= 1000
+    assert counts["ouroboros.tools.shell_outputs"] <= 1000

@@ -55,7 +55,7 @@ def test_replay_learns_subagent_lineage_before_merging_card_rows():
     assert "function learnSubagentLineage(msg)" in src
     assert "for (const msg of messages) learnSubagentLineage(msg);" in src
     history = src[src.index("function applyHistoryMessages"):src.index("async function syncHistory")]
-    assert history.index("for (const msg of messages) learnSubagentLineage(msg);") < history.index("handleCardReference(msg)")
+    assert history.index("for (const msg of messages) learnSubagentLineage(msg);") < history.index("admitCardMetadata(msg)")
     # A page may contain a child whose parent is already represented elsewhere.
     # Keep those bindings during replay; only final instance disposal clears them.
     for collection in ("subagentChildParents", "subagentTerminalChildren"):

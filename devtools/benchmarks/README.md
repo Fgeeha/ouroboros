@@ -33,6 +33,9 @@ runtime core and are not packaged as app runtime code.
   the exact model, provider, final-PoC, and denominator contract.
 - `harness_bench_fast/` — Ouroboros CLI wrapper and methodology notes for the
   public `ai-forever/harness-bench-fast` runner.
+- `cowork_bench/` — pinned Cowork Bench task-container adapter, persistent MCP
+  sessions, campaign spending and resource limits, plus an offline evidence audit;
+  see [its methodology](cowork_bench/METHODOLOGY.md) for protocol differences.
 - `common/` — shared manifests, result ledgers, safe run roots, secret hygiene,
   and official command builders.
 
@@ -70,7 +73,9 @@ CALL) — NEVER STAY SILENT.**
   every requested instance, including setup failures, timeouts, and empty
   patches, even when the official benchmark prediction/submission format only
   accepts successful rows. Defaults are adapter-specific (`result_index.jsonl`,
-  `<predictions>.ledger.jsonl`, or `osworld_preflight.ledger.jsonl`).
+  `<predictions>.ledger.jsonl`, or `osworld_preflight.ledger.jsonl`). A row's
+  `official_eval_status` is `unreported` unless its adapter states one;
+  `not_run` is an explicit claim that the official evaluator never ran.
 
 These sidecars are audit artifacts, not replacement scoring. Official benchmark
 harnesses and official result files remain the scoring authority.

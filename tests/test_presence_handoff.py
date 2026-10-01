@@ -14,6 +14,7 @@ def test_presence_handoff_writer_feeds_terminal_consumer_and_preserves_first_rec
     ctx = SimpleNamespace(
         task_metadata={"presence": {"binding_id": "presence-binding"}},
         _presence_completion={"outcome": "deferred"},
+        _presence_completion_accepted=True,
     )
     event = {"task_id": "managed-presence-work", "routing_token": "first-token"}
     response = "The actual admission response."
@@ -33,7 +34,7 @@ def test_presence_handoff_writer_feeds_terminal_consumer_and_preserves_first_rec
     assert ctx._swarm_handoff_attempt is first
     assert first["task_id"] == "managed-presence-work" and first["status"] == status
     task = {"id": "presence-turn", "metadata": dict(ctx.task_metadata)}
-    terminal = build_presence_result_event(task, "Work continues.", ctx)
+    terminal = build_presence_result_event(task, "Work continues.", ctx, terminal_origin="model_final")
     assert terminal["work_ref"] == (event["task_id"] if status == "scheduled" else "")
     assert terminal["outcome"] == ("deferred" if status == "scheduled" else "message")
 

@@ -17,6 +17,7 @@ import pathlib
 import uuid
 from typing import Any, Dict, List, Optional
 
+from ouroboros.tools.arg_feedback import argument_refusal
 from ouroboros.tools.registry import ToolContext
 from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
 
@@ -293,7 +294,8 @@ def validate_link_actions(actions: Any) -> List[Dict[str, str]]:
 
 
 _MAX_QUIZ_OPTIONS = 6
-_MAX_QUIZ_QUESTION_CHARS = 2000
+# A label is button text; it is refused beyond this bound, never sliced.
+_MAX_QUIZ_LABEL_CHARS = 120
 
 
 class QuizValidationError(ValueError):
@@ -317,17 +319,22 @@ def validate_quiz_payload(
     ``max_wait_minutes`` bounds a required wait only, and never past the task's
     absolute wall-clock ceiling: beyond it the ceiling would end the task
     first, so a larger bound would be a promise the runtime cannot keep.
+
+    The authored text (question, option details, stake, assumption) is kept
+    whole: the card may be the only explanation its reader gets, so there is no
+    quiz-specific length cap and nothing is silently cut (BIBLE P1). Only a
+    label, which is button text, has a bound, and an over-long label refuses
+    the card instead of being sliced.
     """
     q_text = str(question or "").strip()
-    if not q_text or len(q_text) > _MAX_QUIZ_QUESTION_CHARS:
-        raise QuizValidationError(
-            "QUIZ_QUESTION_INVALID",
-            f"question must be 1..{_MAX_QUIZ_QUESTION_CHARS} characters.",
-        )
-    if not isinstance(options, list) or not 2 <= len(options) <= _MAX_QUIZ_OPTIONS:
+    if not q_text:
+        raise QuizValidationError("QUIZ_QUESTION_INVALID", "question must be non-empty.")
+    if options is None:
+        options = []
+    if not isinstance(options, list) or len(options) > _MAX_QUIZ_OPTIONS:
         raise QuizValidationError(
             "QUIZ_OPTIONS_INVALID",
-            f"provide 2..{_MAX_QUIZ_OPTIONS} options.",
+            f"provide at most {_MAX_QUIZ_OPTIONS} options.",
         )
     cleaned: List[Dict[str, Any]] = []
     for item in options:
@@ -343,9 +350,14 @@ def validate_quiz_payload(
             raise QuizValidationError(
                 "QUIZ_OPTIONS_INVALID", "each option needs a non-empty label."
             )
-        option: Dict[str, Any] = {"label": label[:120]}
+        if len(label) > _MAX_QUIZ_LABEL_CHARS:
+            raise QuizValidationError(
+                "QUIZ_OPTIONS_INVALID",
+                f"option labels must be at most {_MAX_QUIZ_LABEL_CHARS} characters.",
+            )
+        option: Dict[str, Any] = {"label": label}
         if detail:
-            option["detail"] = detail[:500]
+            option["detail"] = detail
         if item.get("recommended") is True:  # the asker's recommendation rides with its option
             option["recommended"] = True
         cleaned.append(option)
@@ -359,40 +371,108 @@ def validate_quiz_payload(
     if not assumption_text and not wait_for_answer:
         raise QuizValidationError(
             "QUIZ_ASSUMPTION_REQUIRED",
-            "state the assumption you continue under until the owner answers.",
+            "state the assumption you continue under until the owner answers "
+            "(what you do meanwhile, for example your recommended option).",
         )
     bound = _validate_wait_bound(max_wait_minutes, wait_for_answer=wait_for_answer)
     return {
         "question": q_text,
         "options": cleaned,
-        "stake": str(stake or "").strip()[:500],
-        "assumption": assumption_text[:500],
+        "stake": str(stake or "").strip(),
+        "assumption": assumption_text,
         **({"max_wait_minutes": bound} if bound is not None else {}),
     }
 
 
+# The escalate catalog entry lives beside its validator and handler: the
+# description and field texts define the same wire shape validate_quiz_payload
+# enforces (core.get_tools registers it).
+ESCALATE_TOOL_SCHEMA: Dict[str, Any] = {
+    "name": "escalate",
+    "description": (
+        "Escalate one decision up the responsibility chain instead of guessing. "
+        "A root task asks its human through a quiz card; a subagent asks its parent "
+        "through a typed mailbox frame, which the parent answers with forward_to_worker "
+        "or escalates higher verbatim.\n\n"
+        "The card may be the only thing your human sees. It may be read later, outside "
+        "this room, by someone who remembers the purpose of the work without remembering "
+        "its mechanisms or your earlier discussion. Issue, specification and question "
+        "numbers, function names and reviewer names belong to your working context; they "
+        "are not shared context by themselves. The card carries the explanation needed to "
+        "understand this decision and its consequences.\n\n"
+        "The source of the fork belongs in that explanation, in ordinary prose: the human's "
+        "words, a document they supplied, your idea, or a reviewer's proposal. Human words "
+        "the fork rests on are quoted exactly when available; missing wording is disclosed, "
+        "and your paraphrase is identified as your interpretation. Your own proposal is a "
+        "distinct option, not an assumed premise of every option.\n\n"
+        "Offer 0-6 real alternatives for this decision: none for an open question the human "
+        "answers in their own words; with options, mark your recommendation with "
+        "recommended=true. By default, state the assumption you continue under and keep "
+        "working; the card stays answerable and a late answer still arrives. Set "
+        "wait_for_answer=true on a live root, including an ordinary conversation, when the "
+        "next step is irreversible or costly to redo, or the choice belongs to the human; "
+        "your judgment decides. Waiting begins after the current tool batch, without model "
+        "calls. Waiting questions in one batch share one wait, ending on the first incoming "
+        "message, not necessarily an owner answer. A plain-text clarification ends this "
+        "turn; a waited question keeps it alive. How many decisions to raise and when "
+        "remains your judgment."
+    ),
+    "parameters": {"type": "object", "properties": {
+        "question": {"type": "string", "description": (
+            "The self-contained explanation of one decision, in the reader's language. "
+            "Markdown renders in chat. No quiz-specific character limit.")},
+        "options": {"type": "array", "items": {"type": "object", "properties": {
+            "label": {"type": "string", "description": (
+                "Short name of the choice, understandable to the reader on a button "
+                "(max 120 characters).")},
+            "detail": {"type": "string", "description": (
+                "What choosing this option changes for the human: what they gain and what "
+                "they give up, including any relevant cost, delay or lost capability (optional).")},
+            "recommended": {"type": "boolean", "description": (
+                "True on the one option you recommend; omitted or false otherwise.")},
+        }, "required": ["label"]}, "description": (
+            "Optional 0-6 mutually exclusive alternatives for this decision; omit for an open "
+            "question answered in the human's own words.")},
+        "stake": {"type": "string", "description": (
+            "What depends on this decision for the human or the work (optional).")},
+        "assumption": {"type": "string", "description": (
+            "What you will do while the question remains unanswered. Required when continuing "
+            "without a wait; may be empty when wait_for_answer=true. It is your assumption, "
+            "not the human's answer.")},
+        "wait_for_answer": {"type": "boolean", "default": False, "description": (
+            "Live roots: wait for addressed owner input before another model round. Default "
+            "false; an unanswered card remains answerable either way.")},
+        "max_wait_minutes": {"type": "integer", "description": (
+            "Optional positive whole-minute bound for wait_for_answer, within the task's "
+            "existing lifetime limit. On expiry, resume with a system notice; the card stays "
+            "answerable. Silence is not an answer.")},
+    }, "required": ["question"]},
+}
+
+
 def _validate_wait_bound(max_wait_minutes: Any, *, wait_for_answer: bool) -> Optional[int]:
     """The optional wait bound in whole minutes, capped by the task ceiling."""
-    if max_wait_minutes is None:
+    if max_wait_minutes is None or not wait_for_answer:
+        # On an optional question a bound only spells out the documented default (no wait):
+        # it takes the omitted path, and the asker's receipt says so.
         return None
-    if not wait_for_answer:
-        raise QuizValidationError(
-            "QUIZ_WAIT_BOUND_INVALID",
-            "max_wait_minutes applies only to wait_for_answer=true.",
-        )
     if (isinstance(max_wait_minutes, bool) or not isinstance(max_wait_minutes, int)
             or max_wait_minutes < 1):
         raise QuizValidationError(
-            "QUIZ_WAIT_BOUND_INVALID", "max_wait_minutes must be a positive integer.",
+            "QUIZ_WAIT_BOUND_INVALID",
+            "max_wait_minutes must be a positive integer; omit it for an unbounded wait.",
         )
     from ouroboros.config import get_task_abs_ceiling_sec
 
-    ceiling_minutes = max(1, int(get_task_abs_ceiling_sec()) // 60)
+    ceiling_sec = get_task_abs_ceiling_sec()
+    if ceiling_sec is None:  # no task lifetime: any positive bound is within it
+        return int(max_wait_minutes)
+    ceiling_minutes = max(1, int(ceiling_sec) // 60)
     if max_wait_minutes > ceiling_minutes:
         raise QuizValidationError(
             "QUIZ_WAIT_BOUND_INVALID",
             f"max_wait_minutes must be at most {ceiling_minutes} "
-            "(the task's absolute wall-clock ceiling).",
+            "(the task's absolute wall-clock ceiling); omit it for an unbounded wait.",
         )
     return int(max_wait_minutes)
 
@@ -409,7 +489,18 @@ def _send_links(
     try:
         actions = validate_link_actions(links)
     except LinkActionsValidationError as exc:
-        return f"⚠️ {exc.code}: {exc}"
+        # The marker names the CAUSE in the refusal the model reads: SEND_LINKS_URL_BLOCKED a
+        # policy denial, SEND_LINKS_ARG_ERROR an argument fault. Neither name is in the legacy
+        # code map (no _ARG_ERROR suffix rule exists), so the adapter types them from their
+        # SHAPE: the _BLOCKED head becomes LEGACY_BLOCKED and the _ERROR head
+        # LEGACY_TOOL_ERROR. Different buckets, but these TWO are both recorded as a
+        # refusal rather than a successful call, which is why the marker is here. It says
+        # nothing about this tool's other codes: SEND_LINKS_TOO_MANY is a LEGACY_WARNING
+        # whose status stays ok.
+        from ouroboros.tools.tool_result import LegacyTextResultAdapter
+
+        return _publish_tool_result(ctx, LegacyTextResultAdapter.from_text(
+            "send_links", f"⚠️ {exc.code}: {exc} No links were sent."))
     from ouroboros.tools.owner_delivery import deliver_owner_event
     mode = deliver_owner_event(ctx, {
         "type": "send_links",
@@ -420,6 +511,62 @@ def _send_links(
     if mode == "live":
         return "OK: link buttons sent to owner chat."
     return "OK: link buttons queued for delivery to owner."
+
+
+def _quiz_host_facts(ctx: ToolContext, canonical_root: pathlib.Path, task_id: str, chat_id: int) -> str:
+    """The host's one-sentence account under a root's owner card: which task asks,
+    how its run started, and when the owner last wrote in this chat. Read from
+    typed records only (the task record's ``run_origin`` provenance and the chat
+    log tail), never from the question text; an unrecorded fact says unknown."""
+    from ouroboros.consciousness_authority import CONSCIOUSNESS_INITIATOR
+    from ouroboros.deadline_utils import parse_deadline_ts as moment, utc_now
+    from ouroboros.dialogue_provenance import run_origin
+    from ouroboros.task_results import load_task_result
+    from ouroboros.tools.followup import FOLLOWUP_SOURCE
+    from ouroboros.utils import iter_jsonl_objects
+
+    def shown(when: Any) -> str:
+        return when.strftime("%Y-%m-%d %H:%M UTC")
+
+    meta = getattr(ctx, "task_metadata", {}) if isinstance(getattr(ctx, "task_metadata", {}), dict) else {}
+    try:
+        record = load_task_result(canonical_root, task_id) or {}
+    except Exception:
+        record = {}
+    # The live metadata (which carries the owner door's stamp) laid over the
+    # persisted record's own, as the post-task synthesis reads the same origin.
+    metadata = {**(record.get("metadata") if isinstance(record.get("metadata"), dict) else {}), **meta}
+    origin = run_origin({**record, "metadata": metadata})
+    ref = metadata.get("origin_message_ref") or record.get("origin_message_ref")
+    origin_task = str(origin.get("origin_task_id") or "")
+    if origin.get("owner_ingress"):
+        sent = moment(ref.get("ts")) if isinstance(ref, dict) else None
+        started = "started by your message" + (f" of {shown(sent)}" if sent else "")
+    elif origin.get("source") == FOLLOWUP_SOURCE and origin_task:
+        started = f"started as a scheduled follow-up of task {origin_task}"
+    elif origin.get("initiator") == CONSCIOUSNESS_INITIATOR:
+        started = "started by background consciousness"
+    elif origin.get("source") == "promote_chat_to_task":
+        started = "started by promotion" + (f" from task {origin_task}" if origin_task else "")
+    elif origin.get("schedule_id"):
+        started = f"started by schedule {origin['schedule_id']}"
+    elif origin_task:
+        started = f"started from task {origin_task}"
+    else:
+        started = "origin unknown" + (f" (recorded source: {origin['source']})" if origin.get("source") else "")
+    last = None
+    try:
+        for entry in iter_jsonl_objects(canonical_root / "logs" / "chat.jsonl", tail_bytes=512_000):
+            if entry.get("direction") == "in" and str(entry.get("chat_id")) == str(chat_id):
+                last = moment(entry.get("ts")) or last
+    except Exception:
+        last = None
+    if last is None:
+        seen = "your last message in this chat: unknown"
+    else:
+        minutes = max(0, int((utc_now() - last).total_seconds() // 60))
+        seen = f"your last message in this chat: {shown(last)} ({minutes} minutes before this question)"
+    return f"Asked by task {task_id}, {started}; {seen}."
 
 
 def _escalate(
@@ -452,7 +599,10 @@ def _escalate(
                                         wait_for_answer=wait_for_answer,
                                         max_wait_minutes=max_wait_minutes)
     except QuizValidationError as exc:
-        return f"⚠️ {exc.code}: {exc}"
+        # Typed, and it says what did NOT happen: a refusal that only restates the rule is retried unchanged.
+        return argument_refusal(ctx, exc.code, [str(exc)], effect="The quiz was not sent.")
+    ignored_bound = (" max_wait_minutes ignored: it applies only to wait_for_answer=true."
+                     if max_wait_minutes is not None and not wait_for_answer else "")
     task_id = str(getattr(ctx, "task_id", "") or "").strip()
     if not task_id:
         return "⚠️ ESCALATE_UNAVAILABLE: escalate requires an active task context."
@@ -526,7 +676,8 @@ def _escalate(
                     "under your stated assumption and record the open question "
                     "in your result.")
         parent_task_id = target_id
-        lines = [f"ESCALATION (decision requested): {payload['question']}", "Options:"]
+        lines = [f"ESCALATION (decision requested): {payload['question']}"]
+        lines.append("Options:" if payload["options"] else "Open question — answer in your own words.")
         lines += [
             f"{i + 1}. {row['label']}" + (f" — {row['detail']}" if row.get("detail") else "")
             + (" [recommended]" if row.get("recommended") else "")
@@ -550,7 +701,8 @@ def _escalate(
         if not written:
             return f"⚠️ ESCALATE_UNWRITTEN: the escalation to parent {parent_task_id} was not persisted."
         return (f"OK: escalated to parent task {parent_task_id}; continuing under "
-                f"assumption: {payload['assumption']}")
+                f"assumption: {payload['assumption']}"
+                + (f" ({ignored_bound.strip().rstrip('.')})" if ignored_bound else ""))
 
     # Root task: the owner gets a typed quiz card.
     from ouroboros.owner_quiz import record_asked
@@ -563,6 +715,7 @@ def _escalate(
         card_chat_id = int(getattr(ctx, "current_chat_id", None) or 0)
     except (TypeError, ValueError):
         card_chat_id = 0
+    host_facts = _quiz_host_facts(ctx, canonical_root, task_id, card_chat_id)
     asked = record_asked(
         canonical_root, task_id,
         quiz_id=quiz_id, question=payload["question"],
@@ -572,6 +725,7 @@ def _escalate(
         stake=payload["stake"], assumption=payload["assumption"],
         wait_for_answer=wait_for_answer, chat_id=card_chat_id,
         max_wait_minutes=payload.get("max_wait_minutes"),
+        host_facts=host_facts,
     )
     if asked.get("refused"):
         if wait_for_answer:
@@ -592,12 +746,15 @@ def _escalate(
         "assumption": payload["assumption"],
         "state": "open",
         "task_id": task_id,
+        "host_facts": host_facts,
         **({"wait_for_answer": True} if wait_for_answer else {}),
     })
-    delivered = "delivered to the owner" if mode == "live" else "queued for the owner"
+    delivered = "accepted for delivery" if mode == "live" else "queued for delivery"
     if wait_for_answer:
         bound = payload.get("max_wait_minutes")
         ctx._owner_wait_requested = quiz_id
+        # One batch shares one wait: an earlier question's bound must not outlive it.
+        ctx._owner_wait_deadline_at, ctx._owner_wait_max_minutes = "", 0
         if bound:
             # An ABSOLUTE stamp, not a countdown: the bound must survive a
             # planned restart instead of starting over on the warm resume.
@@ -612,8 +769,9 @@ def _escalate(
                  "continues with a notice" if bound else "the task waits after this tool batch")
         return (f"OK: quiz {quiz_id} {delivered}; {limit}, "
                 "preserving its live browser and releasing active execution capacity. "
-                "Addressed owner text resumes your judgment; existing Stop and task deadlines still apply.")
+                "Any incoming mail or an owner hurry request ends the wait; only an owner answer "
+                "answers the question. Other mail leaves the card open. Stop and task deadlines still apply.")
     return (f"OK: quiz {quiz_id} {delivered}; continuing under assumption: "
             f"{payload['assumption']}. The answer (if any) arrives as an owner "
             "quiz answer in a later round; the card stays answerable after this "
-            "task ends — a later answer reaches this chat as an ordinary owner message.")
+            f"task ends — a later answer reaches this chat as an ordinary owner message.{ignored_bound}")

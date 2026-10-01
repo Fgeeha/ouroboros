@@ -14,6 +14,7 @@ from ouroboros.llm_attempt import _attempt_request, _candidate_before_dispatch
 from ouroboros.llm_claudexor import cache_key_for_model
 from ouroboros.loop_model_call import _reprepare_waiting_main
 from ouroboros.model_slots import MODEL_ACCOUNTS_KEY
+from ouroboros.send_clock import CLOCK_NOTE_PREFIX
 from tests.test_context_fit_integration import _plan
 from tests.test_llm_claudexor import MODEL, ROUTE, result, ledger, setup as gateway_fixture
 from tests.test_model_wait import live_wait as wait_fixture
@@ -95,7 +96,11 @@ def test_native_account_repair_rebinds_real_physical_candidate_before_send(main_
     assert len(gateway.accepted_operations) == 2 and gateway.creates[0] != gateway.creates[1]
     resent = gateway.uploads[1][0]["messages"]
     assert "nativeContinuation" not in resent[2]
-    assert resent[2]["tool_calls"] == original[2]["tool_calls"] and resent[3:] == original[3:]
+    # A Main round's repaired send is a new host preparation: canonical rows, then its own
+    # clock line. The bare async driver binds no Main clock.
+    clocked = resent[-1]["content"].startswith(CLOCK_NOTE_PREFIX)
+    assert clocked is (not asynchronous)
+    assert resent[2]["tool_calls"] == original[2]["tool_calls"] and resent[3:len(resent) - clocked] == original[3:]
     assert "nativeContinuation" not in ctx.messages[2]
     assert ctx.context_fit_plan.core_sha256 == "a" * 64
 
@@ -116,6 +121,133 @@ def test_quota_auto_wait_rejoins_same_round_then_repairs_changed_account(main_ca
     assert [event["state"] for event in waits] == ["waiting", "waiting", "resolved"]
     assert waits[-1]["resolution"] == "resource_available"
     assert [row["state"] for row in ledger(ctx.drive_root)].count("settled") == 1
+
+
+@pytest.mark.parametrize("image_mode", ["off", "caption"])
+def test_wait_reprepares_vision_from_canonical_images(main_call, monkeypatch, image_mode):
+    from ouroboros import vision_routing
+
+    ctx, gateway, _controller, _events, _decide, _observations = main_call
+    image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,eA=="}}
+    ctx.messages[-1]["content"] = [{"type": "text", "text": "Original visual evidence"}, image]
+    original = deepcopy(ctx.messages)
+    monkeypatch.setattr(vision_routing, "get_image_input_mode", lambda: image_mode)
+    monkeypatch.setattr(vision_routing, "resolve_vision_caption_model", lambda *a, **kw: "fixture/vision")
+    captions = []
+
+    def caption(*args, **kwargs):
+        captions.append(True)
+        return "The exact diagram caption", {"prompt_tokens": 2, "completion_tokens": 3, "cost": 0.01}
+
+    monkeypatch.setattr(ctx.llm, "vision_query", caption)
+    gateway.results = [_failed("subscription_window_exhausted"), result()]
+    gateway.dispatch = ["not_started", "response_received"]
+    answer, _, _ = _dispatch(ctx)
+    assert answer and len(gateway.accepted_operations) == 2
+    # The consumed clock line of the answered send now closes the canonical transcript.
+    assert ctx.messages[-1]["content"] == gateway.uploads[1][0]["messages"][-1]["content"]
+    assert ctx.messages[-2]["content"] == original[-1]["content"]
+    sent = [item[0]["messages"][-2]["content"] for item in gateway.uploads]
+    assert sent[0] == sent[1] and "image_url" not in str(sent)
+    assert len(captions) == (1 if image_mode == "caption" else 0)
+    assert ctx.messages[-3]["content"] == "verified read A"
+
+
+def test_main_authored_checkpoint_after_a_real_projected_image_wait(main_call, monkeypatch, tmp_path):
+    from ouroboros import context_compaction, vision_routing
+    from ouroboros.artifacts import read_actor_source_bytes
+    from ouroboros.tools.registry import ToolRegistry
+    from tests.test_main_authored_context import call
+
+    ctx, gateway, controller, events, _decide, _observations = main_call
+    monkeypatch.setenv("OUROBOROS_CONTEXT_MODE", "max")
+    monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
+    monkeypatch.setenv("OUROBOROS_SAFETY_MODE", "off")
+    monkeypatch.setenv("MCP_ENABLED", "false")
+    monkeypatch.setattr(loop, "_maybe_inject_finalization_nudges", lambda *_a: False)
+    monkeypatch.setattr(context_compaction, "_call_summarizer", lambda *a, **kw: pytest.fail("No authored helper"))
+    monkeypatch.setattr(vision_routing, "get_image_input_mode", lambda: "off")
+    registry = ToolRegistry(repo_dir=tmp_path / "repo", drive_root=ctx.drive_root)
+    registry._ctx.repo_dir.mkdir()
+    (registry._ctx.repo_dir / "source.txt").write_text("Complete evidence.\n" * 160, encoding="utf-8")
+    registry._ctx.context_fit_plan = ctx.context_fit_plan
+    registry._ctx.task_model_override = MODEL
+    controller.tool_context = registry._ctx
+    image_turn = {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,eA=="}}]}
+    def response(message):
+        row = result()
+        row["message"] = message
+        return row
+    gateway.results = [response(call("read_file", {"path": "source.txt"}, "read")),
+        _failed("subscription_window_exhausted"),
+        response(call("compact_context", {"working_note": "The image and source remain available.", "keep_unit_ids": []}, "compact")),
+        response({"role": "assistant", "content": "done"})]
+    gateway.dispatch = ["response_received", "not_started", "response_received", "response_received"]
+    answer, _, _ = loop.run_llm_loop(
+        messages=[*ctx.context_fit_plan.messages_for("max"), deepcopy(image_turn)], tools=registry,
+        llm=ctx.llm, drive_root=ctx.drive_root, drive_logs=ctx.drive_logs,
+        incoming_messages=queue.Queue(), emit_progress=lambda *a, **kw: None,
+        event_queue=events, task_id="task-one")
+    assert answer == "done" and len(gateway.accepted_operations) == 4
+    receipt = registry._ctx._context_view_receipt
+    assert receipt["status"] == "applied"
+    checkpoint = json.loads(read_actor_source_bytes(ctx.drive_root, "task-one", receipt["checkpoint_ref"]))
+    assert image_turn in checkpoint["messages"] and image_turn in registry._ctx.messages
+    assert any(m.get("tool_call_id") == "read" for m in checkpoint["messages"])
+    assert not any(m.get("tool_call_id") == "read" for m in gateway.uploads[-1][0]["messages"])
+    assert all("image omitted" in str(payload[0]["messages"]) for payload in gateway.uploads)
+
+
+@pytest.mark.parametrize("inline_first", [True, False])
+def test_reprepare_selected_vision_route_preserves_source_and_accounts_caption(main_call, monkeypatch, inline_first):
+    from ouroboros import vision_routing
+    from ouroboros.loop_llm_call import _prepare_main_messages
+
+    ctx, _gateway, _controller, _events, _decide, _observations = main_call
+    image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,eA=="}}
+    ctx.messages[-1]["content"] = [deepcopy(image)]
+    monkeypatch.setattr(vision_routing, "get_image_input_mode", lambda: "auto")
+    monkeypatch.setattr(vision_routing, "supports_vision", lambda model, **kw: (model == MODEL) == inline_first)
+    monkeypatch.setattr(vision_routing, "resolve_vision_caption_model", lambda *a, **kw: "fixture/vision")
+    captions = []
+    def caption(*args, **kwargs):
+        assert ua.current_physical_attempt_context() is None
+        captions.append(True)
+        return "A complete caption", {"prompt_tokens": 2, "completion_tokens": 3, "cost": 0.01}
+    monkeypatch.setattr(ctx.llm, "vision_query", caption)
+    sent = _prepare_main_messages(ctx.messages, model=MODEL, model_role="main", model_account_override=None,
+        llm=ctx.llm, accumulated_usage=ctx.accumulated_usage, drive_root=ctx.drive_root,
+        task_id=ctx.task_id, event_queue=ctx.event_queue, use_local=False, task_attempt=1, deadline_ts=None)
+    assert (sent[-1]["content"] == [image]) is inline_first
+    physical = loop._physical_context_for_fit(loop._measure_round_main_fit(ctx, automatic_pass_used=False))
+    with ua.bind_physical_attempt_context(physical):
+        prepared = _reprepare_waiting_main(ctx, {"messages": sent, "model": "openai::vision-route",
+                                                "model_role": "main", "tools": []})
+    assert (prepared.kwargs["messages"][-1]["content"] == [image]) is not inline_first
+    assert "image caption" in str(prepared.kwargs["messages"][-1]["content"] if inline_first else sent[-1]["content"])
+    assert ctx.messages[-1]["content"] == [image] and captions == [True]
+    assert ctx.accumulated_usage["cost"] == 0.01
+
+
+def test_processing_repair_does_not_authorize_native_source_reset(main_call, monkeypatch):
+    from ouroboros import llm_claudexor
+    from tests.test_processing_claudexor import refusal
+
+    ctx, gateway, _controller, _events, _decide, observations = main_call
+    monkeypatch.setenv("OUROBOROS_PROCESSING_PREFERENCE", "economy")
+    monkeypatch.setattr(llm_claudexor, "model_sources", lambda **kw: {
+        "sources": [{"id": "codex", "processingPreferences": ["standard", "economy"]}]})
+    original = deepcopy(ctx.messages[2]["nativeContinuation"])
+    failed = refusal()
+    failed["route"] = ROUTE_B
+    gateway.results = [failed, result(route=ROUTE_B)]
+    gateway.dispatch = ["response_received", "response_received"]
+    answer, _, _ = _dispatch(ctx)
+    assert answer and len(gateway.accepted_operations) == 2
+    assert ctx.messages[2]["nativeContinuation"] == original
+    assert gateway.uploads[1][0]["messages"][2]["nativeContinuation"] == original
+    assert observations[0]["model_route"] == ROUTE_B
+    assert gateway.uploads[1][0]["options"]["processingPreference"] == "standard"
 
 
 @pytest.mark.parametrize("destination,use_local,pin", [
@@ -169,8 +301,10 @@ def test_manual_switch_updates_only_waiting_role_and_continues_current_main_call
     assert controller.overrides == {"main": {"model": destination, "use_local": use_local, "model_account_override": pin}}
     assert json.loads(__import__("os").environ[MODEL_ACCOUNTS_KEY])["light"] == "light-account"
     assert cost == (None if destination == MODEL else 0 if use_local else 0.2)
-    assert ctx.messages[-2:][0]["content"] == "verified read A"
-    assert ctx.messages[-1]["content"] == "completed review B"
+    rows = [row for row in ctx.messages if not str(row.get("content") or "").startswith(CLOCK_NOTE_PREFIX)]
+    assert rows[-2]["content"] == "verified read A" and rows[-1]["content"] == "completed review B"
+    # Only a real stamping lane seals — and so replays — a clock line; this fixture's direct lane does not.
+    assert str(ctx.messages[-1]["content"]).startswith(CLOCK_NOTE_PREFIX) is (destination == MODEL)
     # The same model used by Light remains pinned to its own account after Main switches.
     ctx.llm.chat([], MODEL, model_role="light")
     assert gateway.uploads[-1][0]["account"] == {"mode": "pin", "profileId": "light-account"}
@@ -257,7 +391,8 @@ def test_same_round_delivery_uses_the_route_changed_inside_model_call(tmp_path, 
         call.active_model, call.active_use_local = "local-destination", True
         return {"role": "assistant", "content": "finished"}, 0, "max"
 
-    def final(_content, limit, trace, tools, *_args):
+    def final(_content, limit, trace, tools, *_args, explicit_candidate=False):
+        assert not explicit_candidate  # This fixture's first ordinary reply stays plain.
         assert limit.active_model == tools._ctx.active_model == "local-destination"
         assert limit.active_use_local is tools._ctx.active_use_local is True
         return "finished", limit.accumulated_usage, trace
@@ -363,7 +498,7 @@ def _run_loop(tmp_path, monkeypatch, rounds, registry=None):
 
     monkeypatch.setattr(loop, "_call_round_model", call_round)
     monkeypatch.setattr(loop, "_no_tool_final_answer",
-                        lambda _content, limit, trace, *_args: ("finished", limit.accumulated_usage, trace))
+                        lambda _content, limit, trace, *_args, explicit_candidate=False: ("finished", limit.accumulated_usage, trace))
     monkeypatch.setattr(loop, "handle_tool_calls", tools_then_steering)
     registry = registry if registry is not None else ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
     loop.run_llm_loop(

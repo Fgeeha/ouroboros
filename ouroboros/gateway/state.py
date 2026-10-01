@@ -131,12 +131,14 @@ def _state_snapshot(request: Request) -> Dict[str, Any]:
     concurrent request.
     """
     from ouroboros.tools.github import github_token_from_env_or_settings
-    from ouroboros.usage_accounting import ensure_legacy_imported, usage_breakdown, usage_projection
+    from ouroboros.usage_accounting import ensure_legacy_imported, usage_projection, usage_writer_snapshot
     from supervisor.queue import get_evolution_status_snapshot
-    from supervisor.state import TOTAL_BUDGET_LIMIT, load_state
+    from supervisor.state import TOTAL_BUDGET_LIMIT, control_value, load_state
     from supervisor.workers import PENDING, RUNNING, WORKERS
 
     st = load_state()
+    bg_known, bg_value = control_value(st, "bg_consciousness_enabled")
+    bg_enabled = bool(bg_value) if bg_known else None  # unknown is never shown as off (#1307)
     alive = 0
     total_w = 0
     try:
@@ -152,13 +154,24 @@ def _state_snapshot(request: Request) -> Dict[str, Any]:
     accounting_available = True
     try:
         ensure_legacy_imported(drive_root)
-        breakdown = usage_breakdown(drive_root)
+        # The writer's slim snapshot (totals, marker, OpenRouter bucket): this response
+        # serializes ``physical_calls`` and scalar accounting fields only, so the five
+        # grouped axes of ``usage_breakdown`` would be rendered per poll and thrown away.
+        # Its private provenance keys stay off the wire even when the unbounded-budget
+        # branch reuses the mapping directly as its accounting projection.
+        # /api/state is polled: both reads are display reads, so a contended ledger lock
+        # serves the last validated snapshot instead of parking this worker thread.
+        breakdown = {
+            key: value
+            for key, value in usage_writer_snapshot(drive_root, allow_stale=True).items()
+            if not str(key).startswith("_")
+        }
         # include_roots=False: /api/state serializes named scalars only, so the
         # per-root map would be built per poll and thrown away (O(N×roots) work
         # with zero readers on this path). The slim projection still carries
         # limit_usd/remaining_known_usd for the evolution budget snapshot below.
         accounting = (
-            usage_projection(drive_root, global_limit_usd=limit, include_roots=False)
+            usage_projection(drive_root, global_limit_usd=limit, include_roots=False, allow_stale=True)
             if limit > 0
             else dict(breakdown)
         )
@@ -199,6 +212,22 @@ def _state_snapshot(request: Request) -> Dict[str, Any]:
     activities = _chat_activities_snapshot_safe(
         drive_root, task_bindings, direct_turns=direct_turns, availability=activity_availability,
     )
+    # Registered-project facts (never raise): the compact sidebar list, and the
+    # COMPLETE (uncapped, all-status) project chat_ids for the live WS fan-out
+    # isolation SSOT — distinct from the capped/filtered sidebar list, so
+    # isolation never lapses for projects beyond the summary limit or hidden rows.
+    try:
+        from ouroboros.projects_registry import projects_summary
+
+        projects = projects_summary(request_drive_root(request))
+    except Exception:
+        projects = []
+    try:
+        from ouroboros.projects_registry import reserved_project_chat_ids
+
+        project_chat_ids = sorted(reserved_project_chat_ids(request_drive_root(request)))
+    except Exception:
+        project_chat_ids = []
     return {
         "st": st,
         # Resolved here so the checkout file reads stay on the snapshot thread.
@@ -215,10 +244,10 @@ def _state_snapshot(request: Request) -> Dict[str, Any]:
         "evolution_state": evolution_state,
         # The alarm's snapshot reads the usage ledger (a cross-process lock): computed HERE,
         # on the worker thread with the rest of the snapshot, never on the event loop.
-        "bg_state": (_describe_bg(request)(bool(st.get("bg_consciousness_enabled"))) if _describe_bg(request) else {}),
+        "bg_state": (_describe_bg(request)(bg_enabled) if _describe_bg(request) else {}),
         "github_token_configured": bool(github_token_from_env_or_settings()),
-        "projects": _projects_summary_safe(request),
-        "project_chat_ids": _project_chat_ids_safe(request),
+        "projects": projects,
+        "project_chat_ids": project_chat_ids,
         "task_bindings": task_bindings,
         "active_direct_turns": direct_turns,
         "active_chat_activities": activities,
@@ -230,7 +259,10 @@ def _direct_turns_snapshot_safe(*, availability=None) -> list:
     try:
         from supervisor.active_activity import get_direct_activity_registry
 
-        return get_direct_activity_registry().snapshot()
+        registry = get_direct_activity_registry()
+        if availability is None:
+            return registry.snapshot()
+        return registry.snapshot(availability=availability)
     except Exception:
         if availability is not None:
             availability["complete"] = False
@@ -267,7 +299,8 @@ def _task_activity_facts(drive_root: Any, task_id: str) -> dict:
     except Exception:
         _FINALIZING_MEMO.pop(memo_id, None)
         return {}
-    key = (str(path), stat.st_mtime_ns, stat.st_size)
+    # Atomic replacement can preserve size and mtime within one timestamp tick.
+    key = (str(path), stat.st_dev, stat.st_ino, stat.st_ctime_ns, stat.st_mtime_ns, stat.st_size)
     memo = _FINALIZING_MEMO.get(memo_id)
     if memo is not None and memo[0] == key:
         return memo[1]
@@ -290,7 +323,9 @@ def _task_activity_facts(drive_root: Any, task_id: str) -> dict:
              # The census pointer is the same complete row history and the live delivery carry
              # (project_dialogue.project_question_pointer): display fields ride along.
              "quiz": {key: quiz[key] for key in ("quiz_id", "state", "asked_at", "wait_for_answer", "question",
-                                                 "options", "answered_index", "comment", "wait_ended_at")
+                                                 "options", "option_details", "stake", "assumption",
+                                                 "recommended_index", "answered_index", "comment", "wait_ended_at",
+                                                 "host_facts")
                       if isinstance(quiz, dict) and key in quiz}}
     if len(_FINALIZING_MEMO) >= _FINALIZING_MEMO_MAX:
         _FINALIZING_MEMO.clear()
@@ -300,6 +335,19 @@ def _task_activity_facts(drive_root: Any, task_id: str) -> dict:
 
 def _managed_task_finalizing(drive_root: Any, task_id: str) -> bool:
     return bool(_task_activity_facts(drive_root, task_id).get("finalizing"))
+
+
+def _managed_task_budget_pausing(drive_root: Any, row: Dict[str, Any], task_id: str) -> bool:
+    """A RUNNING task writing its exact budget pause (#1196): the durable
+    ``budget_pause`` row is the only truth of that window; never raises."""
+    try:
+        from ouroboros.budget_pause import STATE_PAUSING, budget_pause_row
+
+        pause = budget_pause_row(pathlib.Path(row.get("budget_drive_root") or drive_root), task_id)
+        return bool(pause and pause.get("state") == STATE_PAUSING
+                    and int(pause.get("task_attempt") or 0) == int(row.get("_attempt") or 1))
+    except Exception:
+        return False
 
 
 def _chat_activities_snapshot_safe(drive_root: Any, task_bindings: Any = None, *, direct_turns=None, availability=None) -> list:
@@ -358,6 +406,8 @@ def _chat_activities_snapshot_safe(drive_root: Any, task_bindings: Any = None, *
                 return False
 
         def _activity(task_id: str, row: Dict[str, Any], phase: str, started_at: float) -> Dict[str, Any]:
+            from ouroboros.project_admission import project_hold_fact
+
             return {
                 "activity_id": task_id,
                 "chat_id": int(row.get("chat_id") or 0),
@@ -368,6 +418,8 @@ def _chat_activities_snapshot_safe(drive_root: Any, task_bindings: Any = None, *
                 "started_at": started_at,
                 "task_attempt": int(row.get("_attempt") or 1),
                 **({"model_waits": row["model_waits"]} if row.get("model_waits") else {}),
+                **({"project_admission_hold": project_hold_fact(row)}
+                   if row.get("_project_admission_restore_hold") else {}),
             }
 
         from supervisor.queue_transitions import budget_pause_fact
@@ -381,7 +433,12 @@ def _chat_activities_snapshot_safe(drive_root: Any, task_bindings: Any = None, *
                 activities.append(_activity(task_id, row, phase, _epoch_or_zero(row.get("queued_at"))))
         for task_id, row, started_at in running_rows:
             if task_id and _is_root(task_id, row):
-                phase = "finalizing" if _managed_task_finalizing(drive_root, task_id) else "working"
+                # #1196: a RUNNING root whose durable budget_pause row says
+                # "pausing" is neither working nor paused yet — additive phase.
+                if _managed_task_budget_pausing(drive_root, row, task_id):
+                    phase = "budget_pausing"
+                else:
+                    phase = "finalizing" if _managed_task_finalizing(drive_root, task_id) else "working"
                 activities.append(_activity(task_id, row, phase, started_at))
         from ouroboros.post_task_checkpoint import post_task_model_waits
         visible = {row["activity_id"]: row for row in activities}
@@ -413,7 +470,15 @@ def _chat_activities_snapshot_safe(drive_root: Any, task_bindings: Any = None, *
         from ouroboros.projects_registry import list_reserved_projects
 
         projects = {str(row["id"]): row for row in list_reserved_projects(drive_root)}
+    except Exception:
+        # Without the registry no row's question can be resolved: every row
+        # discloses that instead of reading as "no question pending".
+        log.debug("Required-question activity detail unavailable", exc_info=True)
         for activity in activities:
+            activity["required_question_unavailable"] = True
+        return activities
+    for activity in activities:
+        try:
             facts = _task_activity_facts(drive_root, str(activity.get("activity_id") or ""))
             wait = facts.get("owner_wait", {})
             if not wait.get("quiz_id"):
@@ -422,11 +487,18 @@ def _chat_activities_snapshot_safe(drive_root: Any, task_bindings: Any = None, *
                 {"task_id": activity["activity_id"], "quiz_id": wait["quiz_id"], "wait_for_answer": True},
                 facts.get("quiz"), projects.get(str(activity.get("project_id") or "")), wait,
             )
-            if pointer:
-                activity["required_question"] = pointer
-    except Exception:
-        # Optional display detail cannot disprove the copied live-id census.
-        log.debug("Required-question activity detail unavailable", exc_info=True)
+        except Exception:
+            # Optional display detail cannot disprove the copied live-id census,
+            # but a row that MAY be blocked on an answer must say it is unknown.
+            log.debug("Required-question activity detail unavailable", exc_info=True)
+            activity["required_question_unavailable"] = True
+            continue
+        if pointer:
+            activity["required_question"] = pointer
+        else:
+            # A recorded quiz wait with no readable Project pointer: the wait is
+            # real, its detail is not; disclose rather than animate.
+            activity["required_question_unavailable"] = True
     return activities
 
 
@@ -448,7 +520,13 @@ async def api_state(request: Request) -> JSONResponse:
         accounting_available = snap["accounting_available"]
         spent = snap["spent"]
         evolution_state = snap["evolution_state"]
-        bg_requested = bool(st.get("bg_consciousness_enabled"))
+        from supervisor.state import STATE_READ_KEY, control_value
+
+        # A read that is not current never renders its controls as known (#1307).
+        state_read = st.get(STATE_READ_KEY) if isinstance(st.get(STATE_READ_KEY), dict) else {}
+        evolution_known, evolution_enabled = control_value(st, "evolution_mode_enabled")
+        bg_known, bg_requested = control_value(st, "bg_consciousness_enabled")
+        bg_requested = bool(bg_requested) if bg_known else None
         bg_state = snap.get("bg_state") or {}
         supervisor_ready = _state_attr(request, "supervisor_ready_event")
         get_supervisor_error = _state_attr(request, "get_supervisor_error")
@@ -472,8 +550,11 @@ async def api_state(request: Request) -> JSONResponse:
             # guessed branch is not identity.
             "branch": runtime_branch,
             "sha": (runtime_sha or "")[:8],
-            "evolution_enabled": bool(st.get("evolution_mode_enabled")),
+            "evolution_enabled": bool(evolution_enabled) if evolution_known else None,
             "bg_consciousness_enabled": bg_requested,
+            "state_quality": {"quality": str(state_read.get("quality") or "current"),
+                              "source": str(state_read.get("source") or "primary"),
+                              "unconfirmed": list(state_read.get("unconfirmed") or [])},
             "evolution_cycle": int(st.get("evolution_cycle") or 0),
             "evolution_state": evolution_state,
             "bg_consciousness_state": bg_state,
@@ -538,16 +619,6 @@ async def api_state(request: Request) -> JSONResponse:
         return json_exception(exc)
 
 
-def _projects_summary_safe(request: Request) -> list:
-    """Compact registered-projects list for the sidebar (never raises)."""
-    try:
-        from ouroboros.projects_registry import projects_summary
-
-        return projects_summary(request_drive_root(request))
-    except Exception:
-        return []
-
-
 def _task_bindings_safe(request: Request, *, availability=None) -> dict:
     """{task_id: {project_id, chat_id}} for tasks BOUND to a project. The frontend
     uses this to recognise a bound task card: it suppresses the stray "turn into
@@ -603,17 +674,6 @@ def _task_bindings_safe(request: Request, *, availability=None) -> dict:
     return bindings
 
 
-def _project_chat_ids_safe(request: Request) -> list:
-    """COMPLETE (uncapped, all-status) registered project chat_ids for the live
-    WS fan-out isolation SSOT — distinct from the capped/filtered sidebar list,
-    so isolation never lapses for projects beyond the summary limit or hidden
-    rows. Never raises."""
-    try:
-        from ouroboros.projects_registry import reserved_project_chat_ids
-
-        return sorted(reserved_project_chat_ids(request_drive_root(request)))
-    except Exception:
-        return []
 
 
 __all__ = ["api_health", "api_state"]

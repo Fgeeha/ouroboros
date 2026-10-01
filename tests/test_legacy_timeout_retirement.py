@@ -19,6 +19,7 @@ from __future__ import annotations
 import ast
 import inspect
 import pathlib
+import subprocess
 
 import pytest
 
@@ -123,23 +124,24 @@ def test_no_runtime_or_settings_surface_still_names_either_key():
         # later chapter split cannot silently turn a record of a removal into a
         # live surface finding.
         "docs/ARCHITECTURE.md",
-        "ADOPTION_v7next.md",                   # ...and adopted: the D04 row names
-                                                # what it retired, same as the already
-                                                # skipped docs/v7next/ ledger. A record
-                                                # of a removal is not a live surface
     }
     from ouroboros.reference_books import book_entrypoint_for
 
     offenders = []
-    for pattern in ("*.py", "*.js", "*.json", "*.md", "*.html"):
-        for path in REPO.rglob(pattern):
+    # Inspect the checkout, including new source, not ignored frozen review
+    # exports or dependency trees. Tracked paths remain checked even if ignored.
+    paths = subprocess.check_output(
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"], cwd=REPO,
+    ).decode().split("\0")
+    for pattern in (".py", ".js", ".json", ".md", ".html"):
+        for path in (REPO / rel for rel in paths if rel.endswith(pattern)):
             rel = path.relative_to(REPO).as_posix()
             # A reference book is allowed as a BOOK: whichever chapter of an
             # allowlisted entrypoint carries the retirement record, the record
             # is still documentation and not a live surface.
             if book_entrypoint_for(rel) in allowed:
                 continue
-            if rel in allowed or rel.startswith(("venv", "node_modules", "docs/v7next/", "docs/archive/")):
+            if rel in allowed or rel.startswith(("venv", "node_modules", "docs/archive/")):
                 continue
             try:
                 text = path.read_text(encoding="utf-8")
@@ -165,6 +167,25 @@ def test_the_rc_auditor_reports_the_pair_as_removed_in_this_window():
     for key in RETIRED:
         assert rows[key]["since"] == "7.0", key
         assert rows[key]["behavior"] == "stripped-on-load"
+
+
+def test_surface_scan_excludes_ignored_exports_but_checks_tracked_and_new_source(tmp_path, monkeypatch):
+    subprocess.run(['git', 'init', '-q', str(tmp_path)], check=True)
+    (tmp_path / 'tracked.py').write_text(RETIRED[0])
+    subprocess.run(['git', 'add', 'tracked.py'], cwd=tmp_path, check=True)
+    (tmp_path / '.gitignore').write_text('.review-drive/\ntracked.py\n')
+    export = tmp_path / '.review-drive' / 'old'
+    export.mkdir(parents=True)
+    (export / 'snapshot.py').write_text(RETIRED[0])
+    monkeypatch.setattr(__import__(__name__, fromlist=['REPO']), 'REPO', tmp_path)
+    with pytest.raises(AssertionError, match='tracked.py'):
+        test_no_runtime_or_settings_surface_still_names_either_key()
+    (tmp_path / 'tracked.py').write_text('current = True')
+    (tmp_path / 'new.py').write_text(RETIRED[1])
+    with pytest.raises(AssertionError, match='new.py'):
+        test_no_runtime_or_settings_surface_still_names_either_key()
+    (tmp_path / 'new.py').write_text('current = True')
+    test_no_runtime_or_settings_surface_still_names_either_key()
 
 
 def test_the_ledger_row_is_not_a_second_dispatcher_for_the_status_line():

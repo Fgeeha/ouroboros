@@ -170,9 +170,9 @@ def test_task_api_admission_refusal_is_terminal_not_scheduled_phantom(tmp_path, 
     assert not (data / "state" / "headless_tasks" / "blocked-root").exists()
 
 
-def test_task_api_refuses_when_durable_queue_snapshot_fails(tmp_path, monkeypatch):
+def test_task_api_retains_possible_admission_when_snapshot_is_unconfirmed(tmp_path, monkeypatch):
     import supervisor.queue as queue
-    from ouroboros.task_results import STATUS_FAILED, load_task_result
+    from ouroboros.task_results import load_task_result
 
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -194,15 +194,16 @@ def test_task_api_refuses_when_durable_queue_snapshot_fails(tmp_path, monkeypatc
     app.state.repo_dir = repo
     response = TestClient(app).post(
         "/api/tasks",
-        json={"description": "must be durable", "task_id": "snapshot-fail"},
+        json={"description": "must be durable", "task_id": "snapshot-fail", "memory_mode": "empty"},
     )
 
     assert response.status_code == 503
-    assert response.json()["admission"]["reason_code"] == "queue_snapshot_persist_failed"
-    assert pending == []
-    assert calls == ["api_task_create", "api_task_create_rollback"]
-    assert load_task_result(data, "snapshot-fail")["status"] == STATUS_FAILED
-    assert not (data / "state" / "headless_tasks" / "snapshot-fail").exists()
+    assert response.json()["status"] == "unconfirmed"
+    assert [row["id"] for row in pending] == ["snapshot-fail"]
+    assert calls == ["api_task_create"]
+    assert load_task_result(data, "snapshot-fail") is None
+    assert (data / "state" / "headless_tasks" / "snapshot-fail").exists()
+    assert queue.reserve_task_admission("snapshot-fail", "other", drive_root=data)["reason"] == "duplicate_task_id"
 
 
 def test_task_api_releases_reservation_when_payload_composition_fails(
@@ -684,6 +685,49 @@ def test_task_api_rejects_negative_depth_before_reservation_or_queue(tmp_path, m
         assert task_id not in queue_module.ADMISSION_RESERVATIONS
         assert not (data / "task_results" / f"{task_id}.json").exists()
     assert captured == []
+
+
+@pytest.mark.parametrize("selection", ["declared", "shared", ["declared"]])
+def test_task_api_refuses_reserved_input_selection_before_any_admission_effect(tmp_path, monkeypatch, selection):
+    from ouroboros.gateway import tasks
+    from supervisor import queue
+
+    data, repo, workspace = (tmp_path / name for name in ("data", "repo", "workspace"))
+    for path in (data, repo, workspace):
+        path.mkdir()
+    source = workspace / "source.txt"
+    source.write_text("unchanged workspace\n")
+    calls = []
+
+    def observe(owner, name):
+        original = getattr(owner, name)
+
+        def wrapped(*args, **kwargs):
+            calls.append(name)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(owner, name, wrapped)
+
+    observe(queue, "reserve_task_admission")
+    for name in ("prepare_task_drive", "stage_initial_task_attachments", "collect_workspace_preflight"):
+        observe(tasks, name)
+    monkeypatch.setattr(queue, "enqueue_task", lambda task: calls.append("enqueue_task") or task)
+    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda **_: True)
+    app = Starlette(routes=[Route("/api/tasks", endpoint=api_tasks_create, methods=["POST"])])
+    app.state.drive_root, app.state.repo_dir = data, repo
+    before = sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
+
+    response = TestClient(app).post("/api/tasks", json={
+        "task_id": "reserved-selection", "description": "root task", "workspace_root": str(workspace),
+        "metadata": {"input_sources": selection}, "attachments": [{"path": str(source)}],
+    })
+
+    assert (response.status_code, calls) == (400, []), response.text
+    assert response.json()["reason_code"] == "input_source_selection_unsupported"
+    assert "metadata.input_sources is reserved" in response.json()["error"]
+    assert "reserved-selection" not in queue.ADMISSION_RESERVATIONS
+    assert sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*")) == before
+    assert source.read_text() == "unchanged workspace\n"
 
 
 def test_large_input_manifest_survives_real_queue_snapshot_restore(tmp_path, monkeypatch):

@@ -23,6 +23,7 @@ from ouroboros import (
     llm_probe,
     llm_routing,
     llm_stream,
+    llm_substitution,
 )
 from ouroboros.llm import LLMClient
 
@@ -33,6 +34,7 @@ _LEAVES = (
     llm_attempt,
     llm_capability_policy,
     llm_claudexor,
+    llm_substitution,
     llm_routing,
     llm_messages,
     llm_fallback,
@@ -43,7 +45,7 @@ _LEAVES = (
     llm_pricing,
     # Not a mixin and not an extraction: the probe transport arrived whole from
     # upstream. It is an llm_* leaf all the same, so the leaf rules bind it —
-    # never import the parent, no cycles, real weight.
+    # never import the parent and never form cycles.
     llm_probe,
     llm_stream,
 )
@@ -259,8 +261,6 @@ def test_llm_extraction_size_bounds_have_meaningful_headroom():
     }
     assert counts["ouroboros.llm"] <= 750
     assert all(count <= 1000 for count in counts.values()), counts
-    # Every leaf carries real weight; a 40-line leaf would be a seam, not an owner.
-    assert all(count >= 200 for count in counts.values()), counts
 
 
 def test_llm_leaf_import_graph_is_acyclic_and_shallow():

@@ -19,6 +19,7 @@ from ouroboros.platform_layer import (
     kill_process_group_id,
     kill_process_tree,
     process_group_id,
+    request_process_tree_kill,
 )
 from ouroboros.process_interpreters import (
     active_node_resolution,
@@ -37,7 +38,6 @@ from ouroboros.tool_access import (
     build_resolved_resource_binding,
     canonical_data_root,
     shell_cwd_block_message,
-    _TOP_LEVEL_PRINCIPAL_PROFILES,
 )
 from ouroboros.utils import append_jsonl, utc_now_iso
 from ouroboros.workspace_executor import executor_ref_from_ctx
@@ -81,6 +81,7 @@ class ServiceRecord:
 
 
 _LOCK = threading.Lock()
+_panic_requested = False
 _SERVICES: Dict[str, ServiceRecord] = {}
 _SERVICE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
 _MAX_SERVICE_LOG_BLOB_BYTES = 5_000_000
@@ -375,17 +376,9 @@ def _start_service(
     try:
         refs = validate_process_env(env_from_settings)
         if refs:
-            # Presence authority is relevant only to selecting new Settings
-            # references; literal env keeps its existing process capability.
-            from ouroboros.presence_authority import presence_ceiling_from_context
+            from ouroboros.tools.process_facts import settings_environment_allowed
 
-            from ouroboros.config import get_runtime_mode
-            from ouroboros.runtime_mode_policy import mode_has_unrestricted_agency
-
-            cyber_actor = (active_tool_profile(ctx) == "acting_subagent"
-                           and mode_has_unrestricted_agency(get_runtime_mode()))
-            if (not cyber_actor and active_tool_profile(ctx) not in (_TOP_LEVEL_PRINCIPAL_PROFILES | {"operator_control"})
-                    or presence_ceiling_from_context(ctx) is not None):
+            if not settings_environment_allowed(ctx):
                 return _publish_tool_result(ctx, ToolResult(
                     status="blocked", code="ACCESS_BLOCKED",
                     text="⚠️ SERVICE_ENV_REFERENCE_BLOCKED: this task cannot select settings-backed service environment. A root task can start the service; existing literal environment and configured MCP access remain available.",
@@ -399,6 +392,8 @@ def _start_service(
     readiness_timeout, readiness_error = _readiness_timeout(readiness)
     if readiness_error:
         return readiness_error
+    if _panic_requested:
+        return "⚠️ SERVICE_START_ERROR: Emergency Stop has retired service admission"
     key = _service_key(ctx, service_name)
     with _LOCK:
         existing = _SERVICES.get(key)
@@ -478,6 +473,32 @@ def _start_service(
     log_dir = pathlib.Path(ctx.drive_root) / "services" / task_id
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{service_name}.log"
+
+    def publish_process(proc):
+        record = ServiceRecord(
+            name=service_name,
+            service_id=key,
+            task_id=task_id,
+            cmd=[str(part) for part in cmd],
+            cwd=str(workdir),
+            log_path=log_path,
+            proc=proc,
+            pgid=process_group_id(proc.pid),
+            readiness=dict(readiness or {}),
+            outputs=declared_outputs,
+            cwd_root=cwd_root,
+            cwd_base=str(binding.base_path),
+            cwd_source=binding.source,
+            skill_name=binding.skill_name,
+            before_outputs=before_outputs,
+            keep_alive=keep_alive,
+            env=env,
+            secret_values=secret_values,
+        )
+        _SERVICES[key] = record
+        if _panic_requested:
+            raise RuntimeError(f"Emergency Stop during service spawn: {request_process_tree_kill(proc)}")
+
     log_fh = log_path.open("ab")
     try:
         bootstrap_process_path()
@@ -494,6 +515,7 @@ def _start_service(
             purpose=f"service:{service_name}",
             scope="session" if keep_alive else "task",
             owner_task_id=task_id,
+            on_spawn=publish_process,
             cwd=str(workdir),
             stdout=log_fh,
             stderr=subprocess.STDOUT,
@@ -503,33 +525,11 @@ def _start_service(
             # a healthy resolution leaves the env byte-identical.
             env=overlay_env(apply_env_path_prepend(_service_env(), active_node_resolution(ctx)), env),
         )
-        pgid = process_group_id(proc.pid)
         log_fh.close()
     except Exception as exc:
         log_fh.close()
         return redact_known_values(f"⚠️ SERVICE_START_ERROR: {type(exc).__name__}: {exc}", secret_values)
-    record = ServiceRecord(
-        name=service_name,
-        service_id=key,
-        task_id=task_id,
-        cmd=[str(part) for part in cmd],
-        cwd=str(workdir),
-        log_path=log_path,
-        proc=proc,
-        pgid=pgid,
-        readiness=dict(readiness or {}),
-        outputs=declared_outputs,
-        cwd_root=cwd_root,
-        cwd_base=str(binding.base_path),
-        cwd_source=binding.source,
-        skill_name=binding.skill_name,
-        before_outputs=before_outputs,
-        keep_alive=keep_alive,
-        env=env,
-        secret_values=secret_values,
-    )
-    with _LOCK:
-        _SERVICES[key] = record
+    record = _SERVICES[key]
     try:
         system_root = pathlib.Path(
             getattr(ctx, "system_repo_dir", None) or getattr(ctx, "repo_dir")
@@ -843,6 +843,7 @@ def kill_all_services(
     *,
     wait: bool = True,
     include_keep_alive: bool = True,
+    request_only: bool = False,
 ) -> List[Dict[str, Any]]:
     """Stop every tracked service process group for panic/shutdown paths.
 
@@ -852,6 +853,18 @@ def kill_all_services(
     emergency cleanup keep the default and kill everything.
     """
 
+    global _panic_requested
+    if request_only:
+        _panic_requested = True
+        # A shallow builtin copy keeps the existing owner table readable even
+        # when cleanup holds _LOCK; leave custody/log settlement to that owner.
+        requested = [
+            {"service_id": record.service_id, **request_process_tree_kill(record.proc)}
+            for record in _SERVICES.copy().values()
+            if include_keep_alive or not record.keep_alive
+        ]
+        requested.extend(executor_kill_all_services(drive_root, request_only=True))
+        return requested
     with _LOCK:
         if include_keep_alive:
             records = list(_SERVICES.values())

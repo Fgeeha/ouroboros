@@ -97,7 +97,6 @@ def test_empty_advisory_result_is_error(monkeypatch, tmp_path):
                         ))
     monkeypatch.setattr(adv_mod, "_get_staged_diff", lambda *a, **kw: "diff")
     monkeypatch.setattr(adv_mod, "_get_changed_file_list", lambda *a, **kw: "M file.py")
-    monkeypatch.setattr(adv_mod, "build_advisory_changed_context", lambda *a, **kw: (["file.py"], "pack", []))
     monkeypatch.setattr(adv_mod, "_build_advisory_prompt", lambda *a, **kw: "prompt")
     ctx = SimpleNamespace(repo_dir=tmp_path, drive_root=tmp_path, pending_events=[], emit_progress_fn=lambda *_: None)
 
@@ -454,8 +453,9 @@ def test_next_step_guidance_for_skipped_advisory():
     assert "commit_reviewed" in msg, "message should still indicate commit can proceed"
 
 
-def test_next_step_guidance_requires_reaudit_when_obligations_remain():
-    """Open obligations after a blocked review should trigger explicit re-audit guidance."""
+def test_next_step_guidance_leaves_repair_procedure_to_author_when_obligations_remain():
+    """Open obligations keep the outcome duty and the preflight next step, with no
+    mandatory re-read/group/rewrite-plan order."""
     adv_mod = _get_advisory_module()
     from ouroboros.review_state import AdvisoryRunRecord, AdvisoryReviewState, ObligationItem
 
@@ -484,10 +484,13 @@ def test_next_step_guidance_requires_reaudit_when_obligations_remain():
         open_debts=[],
         effective_is_fresh=True,
     )
+    assert "1 open obligation(s)" in msg
+    assert adv_mod.REVIEW_REPAIR_JUDGMENT in msg
     lowered = msg.lower()
-    assert "re-read the full diff" in lowered
-    assert "group obligations by root cause" in lowered
-    assert "rewrite the plan" in lowered
+    assert "re-run preflight_review so it can mark addressed items pass" in lowered
+    for retired in ("re-read the full diff", "group obligations by root cause",
+                    "rewrite the plan", "one finding at a time"):
+        assert retired not in lowered, retired
 
 
 @pytest.mark.parametrize(
@@ -608,8 +611,8 @@ def test_advisory_context_build_failure_is_surfaced(monkeypatch, tmp_path):
     monkeypatch.setattr(adv_mod, "_get_changed_file_list", lambda *args, **kwargs: "M foo.py")
     monkeypatch.setattr(
         adv_mod,
-        "build_advisory_changed_context",
-        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("context pack exploded")),
+        "_build_advisory_prompt",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("context assembly exploded")),
     )
 
     from types import SimpleNamespace
@@ -1098,8 +1101,6 @@ class TestLLMFallbackExtraction:
                         lambda prompt, repo_dir, ctx_, slot, model, **_: (
                             fake_run_readonly(), model,
                         ))
-        monkeypatch.setattr(self.mod, "build_advisory_changed_context",
-                            lambda *a, **kw: ([], "", set()))
         monkeypatch.setattr(self.mod, "_get_staged_diff",
                             lambda *a, **kw: "diff --git a/foo.py b/foo.py")
         monkeypatch.setattr(self.mod, "_get_changed_file_list",
@@ -1134,7 +1135,10 @@ class TestAdvisoryCleanSentinel:
             lambda repo_dir, commit_message, ctx, **kwargs: (adv._parse_advisory_output(raw_text), raw_text, "opus", 10),
         )
         # Release-metadata preflight (BIBLE P9) runs before the SDK branch under
-        # test, so the fake change set must carry the release artifacts.
+        # test. These cases pin the sentinel verdict, not release admission, and
+        # ``tmp_path`` is no Git worktree — isolate the admission read rather than
+        # let its honest "source unavailable" answer stand in for a verdict.
+        monkeypatch.setattr(adv, "_release_metadata_preflight", lambda *a, **kw: None)
         monkeypatch.setattr(adv, "_get_staged_diff", lambda repo_dir, paths=None: "diff --git a/x.py b/x.py")
         monkeypatch.setattr(
             adv, "_get_changed_file_list",
@@ -1263,7 +1267,6 @@ class TestEmptyArrayIsVerifiedClean:
                                 ), model))
         monkeypatch.setattr(adv_mod, "_get_staged_diff", lambda *a, **kw: "diff")
         monkeypatch.setattr(adv_mod, "_get_changed_file_list", lambda *a, **kw: "M f.py")
-        monkeypatch.setattr(adv_mod, "build_advisory_changed_context", lambda *a, **kw: (["f.py"], "pack", []))
         monkeypatch.setattr(adv_mod, "_build_advisory_prompt", lambda *a, **kw: "prompt")
         ctx = SimpleNamespace(repo_dir=tmp_path, drive_root=tmp_path,
                               pending_events=[], emit_progress_fn=lambda *_: None)

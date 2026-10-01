@@ -1,6 +1,6 @@
-"""CPL-5 pins: the ``model-visible ⟺ logged`` invariant at the model_send seam.
+"""Pins the ``model-visible ⟺ logged`` invariant at the model_send seam.
 
-Design contract: ``docs/v7next/DESIGN_MODEL_VISIBLE_LOGGED.md`` (F15-narrowed).
+Design contract: ``docs/MODEL_SEND_OBSERVABILITY.md``.
 Forward — every physical attempt seals its exact send copy before dispatch and
 the seam reconstructs that durable record and byte-compares it ON THE CALL;
 a mismatch is a typed durable fact, never a second dispatch gate. Exclusions
@@ -425,7 +425,7 @@ def test_a_compacted_attempt_is_recorded_history_not_an_orphan_seal(data_root):
     archive segment, on purpose. Asking the live file alone would make every
     folded attempt a durable orphan_seal fact on the monetary/dispatch
     invariant, at every startup, for history that is perfectly well recorded
-    (``docs/v7next/DESIGN_USAGE_COMPACTION.md`` §10: the verdict consults the
+    (``docs/USAGE_COMPACTION.md`` §10: the verdict consults the
     union)."""
     from ouroboros import usage_compaction as uc
 
@@ -553,6 +553,7 @@ def test_sweep_skips_every_conclusion_on_an_unreadable_ledger(data_root):
     (data_root / ua.LEDGER_REL).write_text("not-json\n{}\n", encoding="utf-8")
     report = seal_mod.reconcile_model_send_seals(data_root)
     assert report == {
+        "status": "unknown", "manifests_checked": 0,
         "seals": 0, "sealed_attempts": 0,
         "orphan_seals": 0, "unlogged_attempts": 0,
         "facts_written": 0, "truncated": False,
@@ -570,4 +571,6 @@ def test_sweep_rides_the_startup_family(data_root, monkeypatch):
     )
     # Neighbour sweep steps degrade fail-soft on this synthetic root.
     maintenance._startup_custody_sweep()
-    assert calls == [data_root]
+    # Historical reconciliation moved out of the synchronous custody sweep;
+    # the supervisor launches its session child after readiness.
+    assert calls == []

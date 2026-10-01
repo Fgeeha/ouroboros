@@ -8,9 +8,10 @@ entered the owner-directive corpus and superseded a paid acceptance panel. The
 host now mints ONE issuer fact by value (``control_routing._routing_issuer``): an
 owner turn keeps today's path; a task's own words are written as a task-message
 row with ``independent_task`` provenance, render under their own prefix, enter no
-owner corpus, bump no owner generation, notify no chat, and are confirmed (or
+owner corpus, bump no owner generation, and are confirmed (or
 refused) to the issuer as WRITTEN with the host's reason. Fixture geometry
 matters: the issuing roots below are POOLED/Swarm roots with no chat ingress id.
+A drained owner message keys the visible receipt without changing authorship.
 """
 
 from __future__ import annotations
@@ -41,11 +42,51 @@ def _pooled_root_ctx(tmp_path, *, task_id="swarm-root", chat_id=1, metadata=None
 
 
 def _owner_turn_ctx(tmp_path, *, client_message_id="cm-1"):
+    """A direct turn the owner door stamped (``origin_message_ref``): the one shape
+    that speaks as an owner turn; a client id alone never does."""
     return types.SimpleNamespace(
         pending_events=[], event_queue=None, current_chat_id=1, drive_root=tmp_path,
         task_id="turn-1", is_direct_chat=True, last_owner_delivery=None,
-        task_metadata={"client_message_id": client_message_id, "origin_message_text": _OWNER_ORIGIN},
+        task_metadata={"client_message_id": client_message_id, "origin_message_text": _OWNER_ORIGIN,
+                       "origin_message_ref": {"chat_id": 1, "client_message_id": client_message_id}},
     )
+
+
+def _owner_started_receiver():
+    """The receiving root was started by the owner: its first text keeps the owner label."""
+    return types.SimpleNamespace(
+        task_attempt=1, task_metadata={"origin_message_ref": {"chat_id": 42, "client_message_id": "t-target-origin"}},
+    )
+
+
+def _drain_owner_followup(tmp_path, ctx, *, client_message_id="owner-followup"):
+    from ouroboros.loop_round_limits import _drain_incoming_messages
+    from ouroboros.owner_mailbox import write_owner_message
+
+    write_owner_message(tmp_path, "Please coordinate the review", task_id=ctx.task_id,
+                        msg_id="followup-mailbox", client_message_id=client_message_id)
+    _drain_incoming_messages([], queue.Queue(), tmp_path, ctx.task_id, None, set(), owner_ctx=ctx)
+    assert ctx.last_owner_delivery["client_message_id"] == client_message_id
+
+
+@pytest.fixture(params=["pooled", "direct"])
+def target_lane(request):
+    import threading
+    from supervisor.active_activity import get_direct_activity_registry
+
+    actor = types.SimpleNamespace(
+        _owner_message_admission_lock=threading.RLock(), _busy=True,
+        _accepting_owner_messages=True, _current_task_id="t-target", _current_chat_id=1,
+        _current_task_metadata={}, _current_task_text="Review", _owner_message_generation=3,
+    )
+    registry = get_direct_activity_registry()
+    if request.param == "direct":
+        registry.register("t-target", 1, actor=actor)
+    try:
+        yield actor
+    finally:
+        if request.param == "direct":
+            registry.unregister("t-target")
 
 
 def _supervisor(tmp_path, *, running=None, acks=None, notices=None):
@@ -88,12 +129,21 @@ def _queue_root(tmp_path, monkeypatch):
 
 # --- (a) a pooled root's words are a task message, not the owner's -----------
 
-def test_a_pooled_root_steer_is_written_as_its_own_words_and_supersedes_nothing(tmp_path, monkeypatch):
+@pytest.mark.parametrize("drained_owner", [None, "owner-followup", ""], ids=["standalone", "owner-id", "legacy-no-id"])
+@pytest.mark.parametrize("project_sender", [False, True])
+@pytest.mark.parametrize("root_shape", ["headless", "promoted"])
+def test_a_pooled_root_steer_is_written_as_its_own_words_and_supersedes_nothing(
+    tmp_path, target_lane, drained_owner, project_sender, root_shape,
+):
+    """``promoted`` is the common geometry: the root inherited the owner door's stamp
+    and client id from the message that promoted it (ancestry, by value) but is not
+    a direct turn, so it still speaks as a task; ``headless`` carries no stamp at all."""
     import supervisor.queue as queue_mod
     from ouroboros.loop_messages import _initialize_owner_directives, owner_source_sha256
     from ouroboros.loop_round_limits import _drain_incoming_messages
     from ouroboros.owner_mailbox import KIND_TASK_MESSAGE, acknowledged_task_message_ids, drain_owner_entries
     from ouroboros.project_dialogue import latest_chat_annotations
+    from ouroboros.projects_registry import create_project
     from ouroboros.tools.control import _steer_task
 
     fence = {"status": "active", "owner_message_generation": 3}
@@ -103,7 +153,14 @@ def test_a_pooled_root_steer_is_written_as_its_own_words_and_supersedes_nothing(
         tmp_path, running={"t-target": {"task": {"id": "t-target", "chat_id": 1, "root_task_id": "t-target"}}},
         acks=acks, notices=notices,
     )
-    ctx = _wire(_pooled_root_ctx(tmp_path), supervisor, emitted)
+    chat_id = create_project(tmp_path, "source", name="Source")["chat_id"] if project_sender else 1
+    inherited = {
+        "client_message_id": "cm-origin",
+        "origin_message_ref": {"chat_id": 1, "client_message_id": "cm-origin", "ts": "t", "text_sha256": "x" * 64},
+    } if root_shape == "promoted" else {}
+    ctx = _wire(_pooled_root_ctx(tmp_path, chat_id=chat_id, metadata=inherited), supervisor, emitted)
+    if drained_owner is not None:
+        _drain_owner_followup(tmp_path, ctx, client_message_id=drained_owner)
 
     out = _steer_task(ctx, "t-target", "the PR is ready; please review it")
 
@@ -119,9 +176,17 @@ def test_a_pooled_root_steer_is_written_as_its_own_words_and_supersedes_nothing(
         KIND_TASK_MESSAGE, "independent_task", "swarm-root",
     )
     assert "client_message_id" not in row
-    # No owner generation moved, no chat was told, no acknowledgement published.
+    # A drained owner message gets its receipt, never authorship of the relay.
     assert fence["owner_message_generation"] == 3
-    assert notices == [] and acks == []
+    assert target_lane._owner_message_generation == 3
+    assert notices == []
+    if drained_owner:
+        assert emitted[0]["client_message_id"] == "owner-followup"
+        assert len(acks) == 1 and acks[0]["client_message_id"] == "owner-followup"
+        assert acks[0]["status"] == "delivered"
+    else:
+        assert emitted[0]["client_message_id"].startswith("agent-steer:")
+        assert acks == []
     receipt = latest_chat_annotations(tmp_path)[emitted[0]["client_message_id"]]
     assert (receipt["action"], receipt["status"], receipt["target"]) == ("steer_task", "delivered", "t-target")
     assert "options" not in receipt
@@ -131,7 +196,7 @@ def test_a_pooled_root_steer_is_written_as_its_own_words_and_supersedes_nothing(
     # The RECEIVER drains it as context: rendered under its own prefix, the owner
     # corpus untouched (so owner_source_sha256 cannot supersede a reviewed answer),
     # no owner delivery stamped, the row acknowledged, the injected event typed.
-    receiver = types.SimpleNamespace(task_attempt=1)
+    receiver = _owner_started_receiver()
     messages = [{"role": "user", "content": "Initial requirement verbatim"}]
     _initialize_owner_directives(receiver, messages)
     corpus_before = owner_source_sha256(receiver)
@@ -152,8 +217,11 @@ def test_a_pooled_root_steer_is_written_as_its_own_words_and_supersedes_nothing(
 
 # --- (b) an owner turn keeps today's exact path -------------------------------
 
-def test_an_owner_turn_from_main_still_steers_with_owner_text_and_bumps_the_generation(tmp_path):
+@pytest.mark.parametrize("stamp", ["logged-ref", "suppressed-log"])
+def test_an_owner_turn_from_main_still_steers_with_owner_text_and_bumps_the_generation(tmp_path, stamp):
     import supervisor.queue as queue_mod
+    from ouroboros.loop_messages import _initialize_owner_directives, owner_source_sha256
+    from ouroboros.loop_round_limits import _drain_incoming_messages
     from ouroboros.owner_mailbox import KIND_OWNER_TEXT, drain_owner_entries
     from ouroboros.tools.control import _steer_task
 
@@ -165,6 +233,9 @@ def test_an_owner_turn_from_main_still_steers_with_owner_text_and_bumps_the_gene
         acks=acks, notices=notices,
     )
     ctx = _wire(_owner_turn_ctx(tmp_path), supervisor, emitted)
+    if stamp == "suppressed-log":  # a never-logged owner message: the door's designed absence of a ref
+        del ctx.task_metadata["origin_message_ref"]
+        ctx.task_metadata["origin_suppressed"] = True
 
     out = _steer_task(ctx, "t-target", "model paraphrase")
 
@@ -179,31 +250,45 @@ def test_an_owner_turn_from_main_still_steers_with_owner_text_and_bumps_the_gene
     assert notices == []
     assert _events(tmp_path, "task_message_routed") == []
 
+    receiver = _owner_started_receiver()
+    messages = [{"role": "user", "content": "Initial requirement verbatim"}]
+    _initialize_owner_directives(receiver, messages)
+    corpus_before = owner_source_sha256(receiver)
+    _drain_incoming_messages(messages, queue.Queue(), tmp_path, "t-target", None, set(), owner_ctx=receiver)
+    assert "[Message from my human]" in messages[-1]["content"]
+    assert owner_source_sha256(receiver) != corpus_before
+    assert [directive["source"] for directive in receiver._owner_directives] == ["initial_user", "owner_mailbox"]
+    assert receiver.last_owner_delivery["client_message_id"] == "cm-1"
 
-def test_a_task_relaying_a_drained_owner_message_is_an_owner_turn(tmp_path):
-    """The drained-delivery rule of #896/#900 is untouched: a task that just
-    received an owner message relays it as owner text under that message's id."""
-    from ouroboros.owner_mailbox import KIND_OWNER_TEXT, drain_owner_entries
+
+def test_a_relay_retry_deduplicates_without_losing_the_owner_receipt(tmp_path):
+    from ouroboros.owner_mailbox import KIND_TASK_MESSAGE, drain_owner_entries
     from ouroboros.tools.control import _steer_task
+    from supervisor.steering import _handle_steer_task
 
-    emitted = []
-    supervisor = _supervisor(tmp_path, running={"t-target": {"task": {"id": "t-target", "chat_id": 1}}})
+    emitted, acks = [], []
+    supervisor = _supervisor(tmp_path, acks=acks,
+                             running={"t-target": {"task": {"id": "t-target", "chat_id": 1}}})
     ctx = _pooled_root_ctx(tmp_path)
-    ctx.last_owner_delivery = {"msg_id": "m:swarm-root:tok", "client_message_id": "msg-later",
-                               "text": "Anton says: ask questions", "ts": "2026-09-15T00:00:00+00:00"}
+    _drain_owner_followup(tmp_path, ctx)
     _wire(ctx, supervisor, emitted)
 
-    _steer_task(ctx, "t-target", "Anton says: ask questions")
+    _steer_task(ctx, "t-target", "My review is complete")
+    _handle_steer_task(emitted[0], supervisor)
 
-    assert emitted[0]["issuer"] == {"kind": "owner_turn"}
-    assert emitted[0]["client_message_id"] == "msg-later"
     [row] = drain_owner_entries(tmp_path, "t-target")
-    assert row["kind"] == KIND_OWNER_TEXT and row["client_message_id"] == "msg-later"
+    assert row["kind"] == KIND_TASK_MESSAGE and "client_message_id" not in row
+    assert row["text"] == "My review is complete"
+    assert acks and all(ack["client_message_id"] == "owner-followup" for ack in acks)
+    assert all(ack["status"] == "delivered" for ack in acks)
 
 
 # --- (c) refusals to a task issuer: typed, silent in chat, one Logs row -------
 
-def test_a_task_steer_of_a_cancelling_target_is_refused_typed_with_no_chat_and_no_picker(tmp_path, monkeypatch):
+@pytest.mark.parametrize("drained_owner", [False, True])
+def test_a_task_steer_of_a_cancelling_target_is_refused_typed_with_no_chat_and_no_picker(
+    tmp_path, monkeypatch, drained_owner,
+):
     import ouroboros.cancel_intents as cancel_intents
     from ouroboros.project_dialogue import latest_chat_annotations
     from ouroboros.tools.control import _steer_task
@@ -214,11 +299,14 @@ def test_a_task_steer_of_a_cancelling_target_is_refused_typed_with_no_chat_and_n
         tmp_path, running={"t-target": {"task": {"id": "t-target", "chat_id": 1}}}, acks=acks, notices=notices,
     )
     ctx = _wire(_pooled_root_ctx(tmp_path), supervisor, emitted)
+    if drained_owner:
+        _drain_owner_followup(tmp_path, ctx)
 
     out = _steer_task(ctx, "t-target", "stop after this file")
 
     assert out.startswith("⚠️ STEER_REJECTED: task t-target was not steered (cancel_pending)")
-    assert notices == [] and acks == []
+    assert notices == []
+    assert [ack["client_message_id"] for ack in acks] == (["owner-followup"] if drained_owner else [])
     receipt = latest_chat_annotations(tmp_path)[emitted[0]["client_message_id"]]
     assert (receipt["status"], receipt["reason"]) == ("rejected", "cancel_pending")
     assert "options" not in receipt
@@ -226,6 +314,36 @@ def test_a_task_steer_of_a_cancelling_target_is_refused_typed_with_no_chat_and_n
     assert (logged["task_id"], logged["target_task_id"], logged["status"], logged["reason"]) == (
         "swarm-root", "t-target", "refused", "cancel_pending",
     )
+
+
+def test_a_task_relay_to_a_closing_direct_turn_keeps_the_owner_receipt(tmp_path, monkeypatch):
+    import threading
+    from ouroboros.owner_mailbox import drain_owner_entries
+    from ouroboros.project_dialogue import latest_chat_annotations, routing_refusal_cause
+    from ouroboros.tools.control import _steer_task
+    from supervisor import workers
+
+    actor = types.SimpleNamespace(_owner_message_admission_lock=threading.RLock(),
+                                 _busy=True, _accepting_owner_messages=False,
+                                 _current_task_id="t-target", _owner_message_generation=3)
+    # Discovery succeeded, but admission closed before the transaction acquired its lock.
+    monkeypatch.setattr(workers, "get_direct_chat_agent", lambda _target: actor)
+    monkeypatch.setattr(workers, "direct_chat_turn", lambda _target: {
+        "id": "t-target", "chat_id": 1, "_is_direct_chat": True,
+    })
+    acks, notices, emitted = [], [], []
+    supervisor = _supervisor(tmp_path, acks=acks, notices=notices)
+    ctx = _wire(_pooled_root_ctx(tmp_path), supervisor, emitted)
+    _drain_owner_followup(tmp_path, ctx)
+
+    out = _steer_task(ctx, "t-target", "My review is complete")
+
+    assert "STEER_REJECTED" in out and "target_closed" in out
+    assert drain_owner_entries(tmp_path, "t-target") == [] and notices == []
+    assert actor._owner_message_generation == 3
+    assert len(acks) == 1 and acks[0]["client_message_id"] == "owner-followup"
+    assert latest_chat_annotations(tmp_path)["owner-followup"]["reason"] == "target_closed"
+    assert acks[0]["cause"] == routing_refusal_cause("steer_task", "needs_manual_target", "target_closed")
 
 
 def test_a_headless_root_steering_a_finished_target_is_refused_without_any_chat_row(tmp_path):
@@ -288,7 +406,8 @@ def test_a_project_root_messages_another_projects_root_twice_in_order(tmp_path):
     assert notices == []
 
 
-def test_an_owner_turn_in_a_project_room_still_gets_the_room_veto(tmp_path):
+@pytest.mark.parametrize("stamp", ["logged-ref", "suppressed-log"])
+def test_an_owner_turn_in_a_project_room_still_gets_the_room_veto(tmp_path, stamp):
     """Today's veto for owner turns, computed from the registry lane: a Project
     room turn cannot steer another room's root; Main can (it sees the manifest)."""
     from ouroboros.owner_mailbox import drain_owner_entries
@@ -303,6 +422,9 @@ def test_an_owner_turn_in_a_project_room_still_gets_the_room_veto(tmp_path):
         running={"t-b": {"task": {"id": "t-b", "chat_id": room_b["chat_id"], "project_id": "proj-b"}}},
     )
     ctx = _wire(_owner_turn_ctx(tmp_path), supervisor, emitted)
+    if stamp == "suppressed-log":
+        del ctx.task_metadata["origin_message_ref"]
+        ctx.task_metadata["origin_suppressed"] = True
     ctx.current_chat_id = room_a["chat_id"]
 
     out = _steer_task(ctx, "t-b", "cross-room owner words")
@@ -342,7 +464,7 @@ def test_forward_to_worker_reaches_a_host_listed_root_on_its_own_drive(tmp_path)
     [row] = drain_owner_entries(root_drive, "root-x")
     assert (row["provenance"], row["source_task_id"], row["text"]) == ("independent_task", "sender", "the shared schema changed")
     assert "TASK_FORBIDDEN" in forbidden and "nor an active independent root" in forbidden
-    assert "TASK_FORBIDDEN" in relayed and "independent root" in relayed
+    assert "TASK_FORBIDDEN" in relayed and "independent recipient" in relayed
     assert drain_owner_entries(tmp_path, "stranger") == []
 
 
@@ -358,14 +480,16 @@ def test_the_roster_note_is_appended_on_change_and_never_rewrites_a_sent_row(tmp
 
     assert maybe_append_roster_note(ctx, messages, tmp_path) is True
     assert maybe_append_roster_note(ctx, messages, tmp_path) is False, "unchanged roster: no note"
-    # Nothing was sent yet, so the note MERGES into the unsent task row.
-    assert len(messages) == 2
+    # No send witness proves the task tail is unsent, so append the note.
+    assert len(messages) == 3
+    assert messages[1] == {"role": "user", "content": "task"}
     note = str(messages[-1]["content"])
-    assert "\n\n---\n\n[System task message]\n[INDEPENDENT_ROOTS]" in note
+    assert note.startswith("[System task message]\n[INDEPENDENT_ROOTS]")
     assert "- r-1 · Deploy docs · project=docs · running" in note
     assert "objective" not in note.lower()
     # A root that is the reader itself and a subagent row never appear.
     observe_send(ctx, messages, round_idx=1)
+    sent_bytes = json.dumps(messages, ensure_ascii=False).encode("utf-8")
     _snapshot(tmp_path, [
         {"id": "r-1", "task": {"id": "r-1", "title": "Deploy docs", "chat_id": 0, "project_id": "docs"}},
         {"id": "me", "task": {"id": "me", "title": "Myself", "chat_id": 1}},
@@ -374,30 +498,42 @@ def test_the_roster_note_is_appended_on_change_and_never_rewrites_a_sent_row(tmp
     ])
     assert maybe_append_roster_note(ctx, messages, tmp_path) is True
     # The sent row is byte-frozen: the changed roster is a NEW tail row.
-    assert len(messages) == 3
+    assert len(messages) == 4
     second = str(messages[-1]["content"])
     assert second.startswith("[System task message]\n[INDEPENDENT_ROOTS]")
     assert "- r-2 · Audit · chat=7 · running" in second
     assert "- me ·" not in second and "kid" not in second
-    assert note == str(messages[1]["content"])
+    assert note == str(messages[2]["content"])
+    assert json.dumps(messages[:-1], ensure_ascii=False).encode("utf-8") == sent_bytes
 
 
-def test_the_roster_note_skips_direct_turns_and_subagents_and_discloses_gaps(tmp_path):
+def test_the_roster_note_includes_direct_roots_but_skips_subagents_and_discloses_gaps(tmp_path):
     from ouroboros.peer_roster import maybe_append_roster_note, render_roster_note
 
     _snapshot(tmp_path, [{"id": "r-1", "task": {"id": "r-1", "title": "Deploy docs", "chat_id": 0}}])
     direct = types.SimpleNamespace(task_id="turn", is_direct_chat=True, task_metadata={})
     child = types.SimpleNamespace(task_id="kid", task_metadata={"delegation_role": "subagent"})
-    assert maybe_append_roster_note(direct, [], tmp_path) is False
+    # Main's routing manifest does not carry authored focus. Its first roster
+    # view is required, just like any root's, and remains restorable.
+    assert maybe_append_roster_note(direct, [], tmp_path) is True
+    _snapshot(tmp_path, [{"id": "r-1", "task": {"id": "r-1", "title": "Deploy docs", "chat_id": 0}},
+                         {"id": "r-2", "task": {"id": "r-2", "title": "New work", "chat_id": 0}}])
+    assert maybe_append_roster_note(direct, [], tmp_path) is True
     assert maybe_append_roster_note(child, [], tmp_path) is False
     rendered = render_roster_note({
         "roots": [{"task_id": f"r-{i}", "title": "", "chat_id": 1, "project_id": "", "status": "pending"} for i in range(45)],
         "incomplete": True,
     })
     assert "…and 5 more not shown." in rendered and "roster incomplete" in rendered
+    assert 'owner direct turn sends owner steering' in rendered
+    assert 'Project room (Main may address any listed root)' in rendered
+    assert 'a task speaks as itself' in rendered
+    assert "Presence's existing authority restrictions still apply" in rendered
+    assert 'never as owner text' not in rendered
 
 
-def test_the_direct_roots_fragment_never_blocks_on_a_held_actor_lock(tmp_path, monkeypatch):
+@pytest.mark.parametrize("origin", [{}, {"initiator": "consciousness"}], ids=["owner", "consciousness"])
+def test_the_direct_roots_fragment_never_blocks_on_a_held_actor_lock(tmp_path, monkeypatch, origin):
     import threading
 
     from supervisor import direct_roots
@@ -408,7 +544,7 @@ def test_the_direct_roots_fragment_never_blocks_on_a_held_actor_lock(tmp_path, m
     lock_free = threading.RLock()
     free_actor = types.SimpleNamespace(
         _owner_message_admission_lock=lock_free, _busy=True, _accepting_owner_messages=True,
-        _current_task_id="turn-free", _current_chat_id=1, _current_task_metadata={"title": "Chat"},
+        _current_task_id="turn-free", _current_chat_id=1, _current_task_metadata={"title": "Chat", **origin},
         _current_task_text="hello",
     )
     lock_held = threading.Lock()
@@ -433,6 +569,12 @@ def test_the_direct_roots_fragment_never_blocks_on_a_held_actor_lock(tmp_path, m
     roster = independent_roots(tmp_path)
     assert [row["task_id"] for row in roster["roots"]] == ["turn-free"]
     assert roster["roots"][0]["direct_chat"] is True and roster["incomplete"] is True
+    from ouroboros.peer_roster import render_roster_note
+
+    note = render_roster_note(roster)
+    assert "live direct conversation" in note
+    assert "live owner conversation" not in note and "person is having" not in note
+    assert "turn-free" in note, "the direct lane remains addressable"
     direct_roots.clear_direct_roots(tmp_path)
     assert independent_roots(tmp_path)["roots"] == []
 
@@ -537,7 +679,8 @@ def _promote_supervisor(tmp_path, running, enqueued):
     )
 
 
-def test_an_unmet_swarm_obligation_moves_to_the_promoted_root(_projects_root, monkeypatch):
+@pytest.mark.parametrize("drained_owner", [False, True])
+def test_an_unmet_swarm_obligation_moves_to_the_promoted_root(_projects_root, monkeypatch, drained_owner):
     """(h) Through the real admission handler: the new root carries force_plan,
     the promoter is released with a transferred receipt on its live row and its
     task details, the tool result names the move, and the worker's own copy of
@@ -555,6 +698,8 @@ def test_an_unmet_swarm_obligation_moves_to_the_promoted_root(_projects_root, mo
                                        "metadata": {"force_plan": True, "force_plan_source": "swarm"}}}}
     supervisor = _promote_supervisor(tmp_path, running, enqueued)
     ctx = _pooled_root_ctx(tmp_path)
+    if drained_owner:
+        _drain_owner_followup(tmp_path, ctx)
     ctx.event_queue = types.SimpleNamespace(put_nowait=lambda event: _handle_promote_chat_to_task(event, supervisor))
 
     out = _promote_chat_to_task(ctx, "Implement the plan in a new root", predecessor_task_id="")
@@ -635,3 +780,55 @@ def test_a_transfer_admitted_after_the_wait_returned_still_releases_the_worker(t
     assert ctx.task_metadata["force_plan_transferred_to"] == "new-root"
     assert force_plan_decision(ctx, {}, enforcement="blocking")["status"] == "not_required"
 
+
+def test_a_returning_roster_is_re_announced_after_an_intervening_change(tmp_path):
+    """A → B → A: the OLD A row must not suppress the fresh A tail (the model
+    would otherwise keep reading B). Only the latest representation counts,
+    whether it stands alone or was merged into an unsent owner row."""
+    from ouroboros.peer_roster import maybe_append_roster_note
+
+    ctx = types.SimpleNamespace(task_id="me", task_metadata={"budget_drive_root": str(tmp_path)})
+    roster_a = [{"id": "r-1", "task": {"id": "r-1", "title": "Deploy docs", "chat_id": 0, "project_id": "docs"}}]
+    roster_b = roster_a + [{"id": "r-2", "task": {"id": "r-2", "title": "Audit", "chat_id": 7}}]
+    messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "task"}]
+
+    _snapshot(tmp_path, roster_a)
+    assert maybe_append_roster_note(ctx, messages, tmp_path) is True
+    note_a = str(messages[-1]["content"])
+    _snapshot(tmp_path, roster_b)
+    assert maybe_append_roster_note(ctx, messages, tmp_path) is True
+    assert "- r-2 · Audit" in str(messages[-1]["content"])
+    _snapshot(tmp_path, roster_a)
+    assert maybe_append_roster_note(ctx, messages, tmp_path) is True, "the roster returned to A: announce it again"
+    assert str(messages[-1]["content"]) == note_a
+    assert maybe_append_roster_note(ctx, messages, tmp_path) is False, "unchanged since the latest note"
+
+    # The latest representation may be a note merged into an unsent owner row
+    # (string or text blocks); it deduplicates exactly like a standalone row.
+    merged = [{"role": "user", "content": "owner text\n\n" + note_a}]
+    assert maybe_append_roster_note(ctx, merged, tmp_path) is False
+    blocks = [{"role": "user", "content": [{"type": "text", "text": "owner text"}, {"type": "text", "text": note_a}]}]
+    assert maybe_append_roster_note(ctx, blocks, tmp_path) is False
+
+
+def test_live_roots_refusals_are_typed_failures_at_the_result_boundary(tmp_path):
+    """A refused or stale-snapshot catalogue read is recorded as a FAILED call,
+    not as a successful one carrying an ``error`` key."""
+    from ouroboros.tools.recent_tasks import _handle_live_roots
+    from ouroboros.tools.tool_result import _structured_failure
+    from ouroboros.tool_capabilities import tool_result_limit
+
+    child = types.SimpleNamespace(drive_root=tmp_path, task_id="kid",
+                                  task_metadata={"parent_task_id": "root", "delegation_role": "subagent"})
+    refused = _handle_live_roots(child)
+    assert _structured_failure(refused) and json.loads(refused)["host_code"] == "TOOL_FORBIDDEN"
+
+    _snapshot(tmp_path, [{"id": f"r-{i}", "task": {"id": f"r-{i}", "title": "T" * 80, "chat_id": i, "project_id": f"proj-{i}"}}
+                         for i in range(100)])
+    root = types.SimpleNamespace(drive_root=tmp_path, task_id="me", task_metadata={"budget_drive_root": str(tmp_path)})
+    page = _handle_live_roots(root, limit=100)
+    assert not _structured_failure(page) and json.loads(page)["returned"] == 100
+    # A maximum page is structured JSON: it must fit the result bound the truncator applies.
+    assert len(page) < tool_result_limit("live_roots")
+    stale = _handle_live_roots(root, limit=100, snapshot="not-the-current-token")
+    assert _structured_failure(stale) and json.loads(stale)["host_code"] == "LIVE_ROOTS_SNAPSHOT_CHANGED"

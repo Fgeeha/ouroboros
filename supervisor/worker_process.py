@@ -28,7 +28,9 @@ log = logging.getLogger(__name__)
 
 
 WORKER_LOG_SINK_SUPPRESSED_TYPES = frozenset({
-    "tool_call", "llm_round", "task_checkpoint", "task_done", "llm_usage",
+    # The durable start/wait-ended rows share the live frame's payload (#1316).
+    "tool_call", "tool_call_started", "tool_call_timeout",
+    "llm_round", "task_checkpoint", "task_done", "llm_usage",
     "provider_incomplete_response", "llm_empty_response", "provider_body_error",
     "review_cycles_exhausted", "plan_review_advisory_open",
 })
@@ -103,8 +105,148 @@ def _adopt_published_extensions(pool_drive_root: str) -> None:
         log.debug("extension generation adoption failed", exc_info=True)
 
 
+def spawn_worker_process(ctx, wid, in_q, out_q, repo_dir, drive_root):
+    """Bind a private emergency channel to this exact worker before it starts."""
+    import socket
+    import weakref
+    from functools import partial
+
+    parent, child = socket.socketpair()
+    try:
+        parent.setblocking(False)
+        proc = ctx.Process(target=worker_main, args=(wid, in_q, out_q, str(repo_dir), str(drive_root),
+                                                   _current_custody_session_id(), child))
+        proc.daemon = True
+        proc.start()
+    except BaseException:
+        parent.close()
+        raise
+    finally:
+        child.close()
+    proc._ouroboros_stop_socket = parent
+    proc._ouroboros_stop_request = partial(request_worker_stop, weakref.proxy(proc))
+    weakref.finalize(proc, parent.close)  # fallback for failed/abandoned pool installation
+    return proc
+
+
+def request_worker_stop(proc):
+    """Ask the worker's owners first; force our native child to stop after a bound.
+
+    This Process still owns its native Popen. It is NOT an attached PID/watch:
+    Process.kill retains multiprocessing's native exited-child checks, including
+    on Darwin, and works before the child installs or can service its lifeline.
+    """
+    import threading
+
+    native_kill = proc._popen.kill  # retain the owned native child even if the pool drops its Process
+    backstop = getattr(proc, "_ouroboros_stop_backstop", None)
+    native_request = getattr(proc, "_ouroboros_stop_native_request", None)
+    if native_request is None:
+        native_request = {"requested": False, "error": "native backstop not completed"}
+        proc._ouroboros_stop_native_request = native_request
+
+    def force_stop():
+        try:
+            native_kill()  # same native operation as Process.kill; no join or application callback
+            native_request.update(requested=True, error="")
+        except Exception as exc:
+            native_request.update(requested=False, error=f"{type(exc).__name__}: {exc}")
+
+    if backstop is None:
+        # Give held child owners their bounded request phase before root death.
+        # Retain the native child owner until its request; no PID rediscovery.
+        backstop = threading.Timer(0.75, force_stop)
+        backstop.daemon = True
+        proc._ouroboros_stop_backstop = backstop
+        try:
+            backstop.start()
+        except RuntimeError:
+            force_stop()  # inability to start a timer cannot remove the native stop
+    try:
+        proc._ouroboros_stop_socket.send(b"!")
+        requested, error = True, ""
+    except OSError as exc:
+        requested, error = False, type(exc).__name__
+    return {"pid": proc.pid, "requested": requested, "scope": "worker_owners",
+            "confirmation": "unconfirmed", "error": error,
+            "root_backstop": "armed_native_owner", "native_request": native_request,
+            "limit": "unpublished spawns/unresponsive child owners unconfirmed"}
+
+
+def close_worker_stop_channel(proc):
+    """Retire parent IPC without cancelling a still-owed native stop request."""
+    channel = getattr(proc, "_ouroboros_stop_socket", None)
+    if channel is not None:
+        channel.close()
+    backstop = getattr(proc, "_ouroboros_stop_backstop", None)
+    if backstop is not None and proc.exitcode is not None:
+        backstop.cancel()
+        if backstop.ident is not None:
+            backstop.join(timeout=1)
+        proc._ouroboros_stop_backstop = None
+
+
+def request_worker_owned_stops(drive_root):
+    """Attempt local owner requests independently within one 250 ms budget.
+
+    Only loaded modules can hold local owners. Do not import an absent owner
+    (or wait for an in-flight import) during Emergency Stop. An unpublished
+    Popen or an unresponsive owner remains unconfirmed, never a death proof.
+    """
+    import sys
+    import threading
+    import time
+
+    deadline = time.monotonic() + 0.25
+    results, threads = {}, []
+
+    def request(module_name, method, *, manager=False):
+        try:
+            module = sys.modules.get(module_name)
+            if module is None:
+                results[module_name] = {"requested": False, "error": "owner module unavailable"}
+                return
+            owner = getattr(module, method)
+            if manager:
+                owner = owner(create=False)
+                value = owner.panic_stop(request_only=True) if owner is not None else []
+            else:
+                value = owner(request_only=True)
+                if module_name == "ouroboros.tools.shell_process":
+                    # Give returning spawns a bounded chance to publish; already
+                    # held children received their requests before this wait.
+                    while module._spawning_subprocesses and time.monotonic() < deadline:
+                        time.sleep(0.001)
+                    value.extend(owner(request_only=True))
+                    if module._spawning_subprocesses:
+                        value.append({"requested": False, "error": "spawn still unpublished"})
+            results[module_name] = value
+        except BaseException as exc:
+            results[module_name] = {"requested": False, "error": type(exc).__name__}
+
+    for module_name, method, manager in (
+        ("ouroboros.tools.shell_process", "kill_all_tracked_subprocesses", False),
+        ("ouroboros.workspace_executor", "kill_all_foreground", False),
+        ("ouroboros.tools.services", "kill_all_services", False),
+        ("ouroboros.extension_companion", "panic_kill_all", False),
+        ("ouroboros.claudexor_daemon", "get_owned_daemon", True),
+        ("ouroboros.local_model", "get_manager", True),
+    ):
+        results[module_name] = {"requested": False, "error": "owner request unfinished"}
+        thread = threading.Thread(target=request, args=(module_name, method),
+                                  kwargs={"manager": manager}, daemon=True)
+        try:
+            thread.start()
+            threads.append(thread)
+        except RuntimeError:
+            continue
+    for thread in threads:
+        thread.join(timeout=max(0, deadline - time.monotonic()))
+    return results
+
+
 def worker_main(wid: int, in_q: Any, out_q: Any, repo_dir: str, drive_root: str,
-                custody_session_id: str = "") -> None:
+                custody_session_id: str = "", stop_socket=None) -> None:
     import os as _os
     # Mark this process as a worker BEFORE importing the agent/LLM stack so the
     # central network-transport policy disables system proxy resolution
@@ -115,6 +257,17 @@ def worker_main(wid: int, in_q: Any, out_q: Any, repo_dir: str, drive_root: str,
     # Before ANY import that resolves the update-tx marker through git_ops (see
     # _bind_worker_repo_root): a spawned child would otherwise gate on the hardcoded default repo.
     _bind_worker_repo_root(repo_dir, drive_root)
+    # Entry progress precedes extension loading and agent construction. If logging
+    # fails, the parent retains the ordinary readiness window rather than losing the child.
+    try:
+        from ouroboros.utils import append_jsonl, utc_now_iso
+
+        append_jsonl(pathlib.Path(drive_root) / "logs" / "events.jsonl", {
+            "ts": utc_now_iso(), "type": "worker_starting",
+            "worker_id": wid, "pid": _os.getpid(), "phase": "entry",
+        })
+    except Exception:
+        log.debug("Worker entry progress unavailable", exc_info=True)
     # Adopt the server's custody session id. Under the 'spawn' start method this
     # process re-imported process_custody and minted a fresh _SESSION_ID; without
     # adopting the server's id, every service/process this worker records looks
@@ -136,7 +289,8 @@ def worker_main(wid: int, in_q: Any, out_q: Any, repo_dir: str, drive_root: str,
     try:
         from ouroboros.process_custody import start_parent_lifeline
 
-        start_parent_lifeline(label=f"worker-{wid}")
+        start_parent_lifeline(label=f"worker-{wid}", stop_socket=stop_socket,
+                              before_exit=lambda: request_worker_owned_stops(drive_root))
     except Exception:
         pass
     # Stream this worker's append_jsonl log lines to the dashboard Logs panel.
@@ -163,8 +317,10 @@ def worker_main(wid: int, in_q: Any, out_q: Any, repo_dir: str, drive_root: str,
     if not getattr(_sys, 'frozen', False):
         _sys.path.insert(0, repo_dir)
     _drive = _pathlib.Path(drive_root)
-    # Spawned workers must pin the runtime-mode baseline from the parent env;
-    # forked workers inherit it. This keeps the elevation ratchet consistent.
+    # Every worker must pin the runtime-mode baseline. Spawn and forkserver do
+    # not inherit live parent memory, so the pin travels through the
+    # parent-exported OUROBOROS_BOOT_RUNTIME_MODE environment key (config.py
+    # _resolve_baseline_from_env). This keeps the elevation ratchet consistent.
     try:
         from ouroboros.config import initialize_runtime_mode_baseline
         initialize_runtime_mode_baseline()
@@ -189,7 +345,6 @@ def worker_main(wid: int, in_q: Any, out_q: Any, repo_dir: str, drive_root: str,
         if pytest_default_real_data_dir:
             extensions_owned = False
             try:
-                from ouroboros.utils import append_jsonl, utc_now_iso
                 append_jsonl(_drive / "logs" / "supervisor.jsonl", {
                     "ts": utc_now_iso(),
                     "type": "worker_extension_reload_skipped",

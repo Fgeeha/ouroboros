@@ -15,6 +15,7 @@ const SETTINGS_TABS = [
     { value: 'models', label: 'Models' },
     { value: 'agents', label: 'Agents' },
     { value: 'behavior', label: 'Behavior' },
+    { value: 'appearance', label: 'Appearance' },
     { value: 'advanced', label: 'Advanced' },
     { value: 'about', label: 'About' },
 ];
@@ -132,7 +133,17 @@ const PROVIDER_CARDS = [
         ],
         testProvider: 'deepseek',
         testInputs: { 's-deepseek-key': 'DEEPSEEK_API_KEY' },
-        note: 'Pick DeepSeek as the source in Models or Agents, then choose deepseek-v4-pro or deepseek-v4-flash. Blocking deep/scope review in Max context mode additionally needs the owner 1M-window acknowledgement.',
+        note: 'Pick DeepSeek as the source in Models or Agents, then choose deepseek-v4-pro or deepseek-v4-flash.',
+    },
+    {
+        id: 'zai', title: 'Z.ai (GLM)', icon: '', hint: 'Direct OpenAI-compatible runtime', advanced: true,
+        fields: [
+            { id: 's-zai-key', settingKey: 'ZAI_API_KEY', label: 'API Key', placeholder: 'sk-...' },
+            { id: 's-zai-plan', label: 'Plan', placeholder: 'payg or coding' },
+        ],
+        testProvider: 'zai',
+        testInputs: { 's-zai-key': 'ZAI_API_KEY', 's-zai-plan': 'ZAI_PLAN' },
+        note: 'Pick Z.ai as the source in Models or Agents, then choose glm-5.3 or glm-5.3-flash. Coding Plan subscribers: set Plan to <code>coding</code>; the default <code>payg</code> is pay-as-you-go, and a Coding Plan key tested there reports No credits.',
     },
     {
         id: 'gigachat', title: 'GigaChat', icon: '/static/providers/gigachat.svg', hint: 'Sber GigaChat via the gigachat library', advanced: true,
@@ -229,6 +240,7 @@ export const SECRET_KEYS = [
     ['ANTHROPIC_API_KEY', 'Anthropic API Key', 'sk-ant-...'],
     ['MINIMAX_API_KEY', 'MiniMax API Key', 'MiniMax key'],
     ['DEEPSEEK_API_KEY', 'DeepSeek API Key', 'sk-...'],
+    ['ZAI_API_KEY', 'Z.ai API Key (GLM)', 'Z.ai key'],
     ['GITHUB_TOKEN', 'GitHub Token', 'ghp_...'],
     ['OUROBOROS_NETWORK_PASSWORD', 'Network Password', 'Required for LAN/Docker binds'],
 ];
@@ -398,7 +410,7 @@ export function renderSettingsPage() {
                 <section class="settings-panel" data-settings-panel="behavior">
                     <div class="form-section">
                         <h3>Reasoning Effort</h3>
-                        <div class="settings-section-copy">Controls how deeply the model thinks per task type. Higher effort = slower but more thorough.</div>
+                        <div class="settings-section-copy">Preferred reasoning effort per task type. Unsupported levels adapt to the route; native mappings, required minimums or provider defaults may apply. Requested, sent and reported effort are recorded in Logs.</div>
                         <div class="settings-effort-grid">
                             ${EFFORT_FIELDS.map(([id, label, defaultValue]) => effortField({ id, label, defaultValue })).join('')}
                         </div>
@@ -424,7 +436,7 @@ export function renderSettingsPage() {
 
                     <div class="form-section">
                         <h3>Task Result Review</h3>
-                        <div class="settings-section-copy">Auto and Required run the root-owned review panel for queued/headless work and substantive direct results. Pure conversation and routing controls are skipped; Required additionally enforces the selected Advisory or Blocking improvement policy.</div>
+                        <div class="settings-section-copy">Auto and Required run the root-owned review panel for queued/headless work and substantive direct results. Pure conversation and routing controls are skipped. Once review applies, both follow the selected Advisory or Blocking policy.</div>
                         <div class="settings-effort-card">
                             <label>Task Result Review</label>
                             <input id="s-task-review-mode" type="hidden" value="auto">
@@ -442,7 +454,7 @@ export function renderSettingsPage() {
 
                     <div class="form-section">
                         <h3>Max Review Cycles</h3>
-                        <div class="settings-section-copy">One shared cap on paid review cycles per task for plan review, task acceptance (improvement passes = cycles &minus; 1), the commit gate (paid triad+scope cycles per root task, shared across the whole task tree; an unchanged diff never buys a new review after a recorded verdict block regardless of this number &mdash; blocking enforcement refuses it for free, while a pure advisory line records no verdict blocks and its no-new-spend guarantee is the free replay after exhaustion, with a loud durable disclosure) and skill review (paid panel runs per root task or per manual snapshot; identical snapshots replay free). <code>&infin;</code> removes the cap; the task's own deadline, budget and lifecycle rails still bind.</div>
+                        <div class="settings-section-copy">Limits paid review waves, including dispatched technical failures: plan and task review per task, commit triad+scope per root task, and skill review per root task or manual snapshot. The last review still permits author corrections within ordinary task limits; explicit task-local author limits remain separate. Collection and exact replay are free. Advisory allows an explicit decision after receiving feedback or a disclosed unavailable result; Blocking still requires reviewer approval. <code>&infin;</code> removes the count cap, while deadlines, budgets and lifecycle limits still apply.</div>
                         <div class="settings-effort-card">
                             <label>Max Review Cycles</label>
                             <input id="s-review-max-cycles" type="hidden" value="2">
@@ -496,7 +508,7 @@ export function renderSettingsPage() {
                         <div class="settings-section-copy">
                             Working-context size profile (separate axis from Runtime Mode and Review Enforcement).
                             <code>Max</code> inlines ARCHITECTURE and DEVELOPMENT in full &mdash; for ~1M-context models (today's behavior).
-                            <code>Nano</code> is the compact owner window. <code>Low</code> fits ~200K / local models: ARCHITECTURE becomes a navigation map (read full sections on demand), DEVELOPMENT stays full for normal runnable tasks unless a structured non-development caller opts out, and memory compacts sooner. It never changes the model or reasoning effort, and never lowers the review context floor.
+                            <code>Nano</code> is the compact owner window. <code>Low</code> fits ~200K / local models: ARCHITECTURE becomes a navigation map (read full sections on demand), DEVELOPMENT stays full for normal runnable tasks unless a structured non-development caller opts out, and memory compacts sooner. It governs Ouroboros's own working window: it never changes the model or reasoning effort, and scope review runs in every mode.
                             <br><strong>Human controlled:</strong> saved via the owner endpoint; saves immediately (no restart), and lowering requires Ouroboros to be idle.
                         </div>
                         <div class="settings-effort-card">
@@ -661,7 +673,7 @@ export function renderSettingsPage() {
                             <label>Consciousness Autonomy</label>
                             <input id="s-consciousness-autonomy" type="hidden" value="act">
                             ${renderSegmentedField({ target: 's-consciousness-autonomy', options: [{ value: 'observe', label: 'Observe' }, { value: 'act', label: 'Act' }, { value: 'full', label: 'Full' }] })}
-                            <div class="settings-inline-note"><strong>Observe:</strong> think, keep memory and knowledge, write to you &mdash; start nothing. <strong>Act (default):</strong> everything the runtime mode allows except editing Ouroboros's own code and prompts, evolution, restart and settings. <strong>Full:</strong> everything the runtime mode allows, evolution included.</div>
+                            <div class="settings-inline-note"><strong>Observe:</strong> research, internal memory and task/project notes, read-only research children it can also stop, schedule controls and replies to you; no shell, user-file, source, skill/settings or publication changes. <strong>Act (default):</strong> everything the runtime mode allows except editing Ouroboros's own code and prompts, evolution, restart and settings. <strong>Full:</strong> everything the runtime mode allows, evolution included.</div>
                         </div>
                         <div class="form-row">
                             <div class="form-field ui-field">
@@ -724,6 +736,72 @@ export function renderSettingsPage() {
                     </div>
                 </section>
 
+                <section class="settings-panel" data-settings-panel="appearance">
+                    <div class="form-section">
+                        <h3>Theme</h3>
+                        <div class="settings-section-copy">
+                            <code>System</code> follows this device's OS appearance and is the default for a new client.
+                            <code>Light</code> and <code>Dark</code> pin the palette regardless of the OS.
+                            <br><strong>Per device, not per account:</strong> the choice is stored by this client alone
+                            (the desktop window and each browser keep their own), never sent to the server and never
+                            shared with other devices. Clearing this client's site data returns it to System.
+                        </div>
+                        <div class="settings-effort-card">
+                            <label class="theme-choice-label" id="s-appearance-theme-label">Theme</label>
+                            <div data-theme-control aria-labelledby="s-appearance-theme-label"></div>
+                            <div class="settings-inline-note theme-status" data-theme-status role="status" aria-live="polite"></div>
+                        </div>
+                    </div>
+
+                    <div class="form-section" data-notify-settings>
+                        <h3>Notifications</h3>
+                        <div class="settings-section-copy">
+                            While this client is running, Ouroboros can pull you back to a question or a
+                            finished task. Notifications arrive whether or not this window has focus, and
+                            clicking one opens its source.
+                            <br><strong>Per device, not per account:</strong> like the theme above, these choices
+                            are stored by this client alone and never sent to the server.
+                            Where this system exposes no notifications, or permission is denied, alerts appear
+                            inside the app instead. Do Not Disturb and OS permissions still decide what you see.
+                        </div>
+                        <div class="settings-effort-card">
+                            <label class="local-toggle ui-field ui-field-inline">
+                                <input type="checkbox" class="ui-checkbox" data-notify-pref="enabled">
+                                Enable notifications
+                            </label>
+                            <label class="local-toggle ui-field ui-field-inline">
+                                <input type="checkbox" class="ui-checkbox" data-notify-pref="needs_answer">
+                                A question or decision is waiting for you
+                            </label>
+                            <label class="local-toggle ui-field ui-field-inline">
+                                <input type="checkbox" class="ui-checkbox" data-notify-pref="task_done">
+                                A task finished or stopped
+                            </label>
+                            <label class="local-toggle ui-field ui-field-inline">
+                                <input type="checkbox" class="ui-checkbox" data-notify-pref="important">
+                                Messages Ouroboros sends you while it works
+                            </label>
+                            <label class="local-toggle ui-field ui-field-inline">
+                                <input type="checkbox" class="ui-checkbox" data-notify-pref="main_reply">
+                                Ordinary replies in Main
+                            </label>
+                            <label class="local-toggle ui-field ui-field-inline">
+                                <input type="checkbox" class="ui-checkbox" data-notify-pref="sound">
+                                Sound
+                            </label>
+                            <label class="local-toggle ui-field ui-field-inline">
+                                <input type="checkbox" class="ui-checkbox" data-notify-pref="show_text">
+                                Show the message text (otherwise only the kind of event)
+                            </label>
+                            <div class="settings-toolbar">
+                                <button type="button" class="btn btn-default btn-sm" data-notify-test>Send a test notification</button>
+                            </div>
+                            <div class="settings-inline-note" data-notify-status role="status" aria-live="polite"></div>
+                            <div class="settings-inline-note" data-notify-attention-status role="status" aria-live="polite"></div>
+                        </div>
+                    </div>
+                </section>
+
                 <section class="settings-panel" data-settings-panel="advanced">
                     <div class="form-section">
                         <div class="settings-card-head">
@@ -762,6 +840,18 @@ export function renderSettingsPage() {
                             <div class="form-field ui-field">
                                 <label for="s-gh-repo">GitHub Repo</label>
                                 <input id="s-gh-repo" placeholder="owner/repo-name" class="ui-control" name="s-gh-repo" type="text">
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="form-section">
+                        <h3>Extra CA Certificates</h3>
+                        <div class="settings-section-copy">Only for a network whose TLS certificates the default bundle does not trust: a TLS-inspecting proxy, or an endpoint behind a national CA such as GigaChat's. Ouroboros adds the file to its defaults for every provider call; everything else keeps working.</div>
+                        <div class="form-row">
+                            <div class="form-field ui-field">
+                                <label for="s-extra-ca-bundle">Extra CA bundle (PEM)</label>
+                                <input id="s-extra-ca-bundle" placeholder="/path/to/extra-ca.pem" class="ui-control" name="s-extra-ca-bundle" type="text" aria-describedby="s-extra-ca-bundle-help">
+                                <div class="settings-inline-note ui-field-help" id="s-extra-ca-bundle-help">Absolute or <code>~</code>-prefixed path to a PEM file on the machine that runs Ouroboros (its own filesystem, not the device showing this page). Leave empty unless a provider fails with a certificate error.</div>
                             </div>
                         </div>
                     </div>
@@ -817,11 +907,19 @@ export function renderSettingsPage() {
                              Agents → Delegation (D-10): they bound the agents,
                              not the process pool. Max Workers stays: it is
                              runtime worker processes, not an agent setting. -->
-                        <div class="settings-section-copy">Workers control parallel task capacity. Task liveness is governed automatically by progress, deadlines, the absolute ceiling, and the reaper. Budget limits control runtime cost thresholds. How many subagents a task may run, and how deep they may nest, live in <code>Agents</code>.</div>
+                        <div class="settings-section-copy">Workers control parallel task capacity. Task liveness is governed automatically by progress, deadlines, the idle rail and the reaper; the per-task round and lifetime limits are optional — a positive number, or <code>unlimited</code> for none (the fresh-install default). A settings file from an earlier release that never set them keeps the finite limits it ran under until you change them here; startup names the values once. Budget limits control runtime cost thresholds. How many subagents a task may run, and how deep they may nest, live in <code>Agents</code>.</div>
                         <div class="form-grid two">
                             <div class="form-field ui-field">
                                 <label for="s-workers">Max Workers</label>
                                 <input id="s-workers" type="number" min="1" max="50" value="10" class="ui-control" name="s-workers">
+                            </div>
+                            <div class="form-field ui-field">
+                                <label for="s-max-rounds">Max Rounds per Task</label>
+                                <input id="s-max-rounds" type="text" inputmode="numeric" value="unlimited" placeholder="unlimited" class="ui-control" name="s-max-rounds">
+                            </div>
+                            <div class="form-field ui-field">
+                                <label for="s-task-lifetime">Task Lifetime Limit (s)</label>
+                                <input id="s-task-lifetime" type="text" inputmode="numeric" value="unlimited" placeholder="unlimited" class="ui-control" name="s-task-lifetime">
                             </div>
                             <div class="form-field ui-field">
                                 <label for="s-presence-max-active">Concurrent Presence Conversations</label>
@@ -905,10 +1003,11 @@ export function renderSettingsPage() {
                     <button type="button" class="btn btn-secondary" id="btn-reload-settings">Reload Settings</button>
                     <button class="btn btn-save" id="btn-save-settings">Save Settings</button>
                     <button type="button" class="btn btn-secondary" id="btn-restart-now" hidden
-                        title="Restart the agent process to apply the saved changes">Restart now</button>
+                        title="Restart the agent process">Restart now</button>
                 </div>
                 <div class="settings-footer-status">
                     <span id="settings-unsaved-indicator" class="settings-inline-status settings-unsaved-indicator" aria-hidden="true">Unsaved changes</span>
+                    <div id="settings-restart-status" class="settings-inline-status" role="status" aria-live="polite" hidden></div>
                     <div id="settings-status" class="settings-inline-status" role="status" aria-live="polite" aria-atomic="true"></div>
                 </div>
             </div>

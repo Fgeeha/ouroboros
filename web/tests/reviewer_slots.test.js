@@ -107,7 +107,7 @@ test('the deep self-review row rides the composed setting on the shared vocabula
     // no `deep_review` key is ever invented.
     assert.equal('deep_review' in JSON.parse(buildReviewerSlotsSetting(base)), false);
 
-    // A direct api row: the packed review. '' effort is OMITTED (the
+    // A direct api row: the inspection episode. '' effort is OMITTED (the
     // Behavior-tab deep effort keeps deciding); the synthesized label and the
     // fixed identity never reach the saved bytes.
     const api = JSON.parse(buildReviewerSlotsSetting({
@@ -135,14 +135,17 @@ test('the deep self-review row rides the composed setting on the shared vocabula
     assert.deepEqual(ref.deep_review, { subagent_id: 'deep-critic' });
 });
 
-test('the deep self-review block says the ONE difference from the advisory where the owner picks', () => {
+test('the deep self-review block states the delivery where the owner picks', () => {
     const markup = renderReviewerSlotsSection();
     assert.match(markup, /<h4[^>]*>Deep self-review<\/h4>/);
     assert.match(markup, /id="reviewer-deep-review-row"/);
-    // API model = one packed review here; the advisory's API model = inspection episode.
-    assert.match(markup, /receives ONE packed review/);
-    assert.match(markup, /unlike the advisory, whose API model runs an inspection episode/);
+    // Same delivery as the advisory: an API model runs the inspection episode.
+    assert.match(markup, /Delivery is the same\s+as the advisory's/);
+    assert.doesNotMatch(markup, /packed|Atlas/);
+    assert.match(markup, /a model you name or a configured subagent/);
     assert.match(markup, /native\s+inspection episode with host-observed reads/);
+    assert.match(markup, /core rules supplied inline/);
+    assert.match(markup, /reference books available on demand/);
     assert.match(markup, /reads not host-observed/);
     assert.match(markup, /memory whitelist reaches the reviewer\s+inline byte-exact/);
     assert.match(markup, /outranks the Behavior-tab deep\s+self-review effort/);
@@ -151,8 +154,12 @@ test('the deep self-review block says the ONE difference from the advisory where
         { subagent_id: 'api-critic', route: { kind: 'api_model', target_id: 'openai/gpt-5.6-terra' } },
         { subagent_id: 'sess', route: { kind: ROUTE_KIND_SESSION, target_id: 'codex=gpt-5.6-sol' } },
     ];
-    assert.match(deepReviewDeliveryNote({ route: { kind: ROUTE_KIND_API, target_id: 'openai/x' } }), /One packed review/);
-    assert.match(deepReviewDeliveryNote({ route: { kind: ROUTE_KIND_API, target_id: 'openai/x' } }), /inspection episode instead/);
+    // A bare API route and a configured subagent on an API model say the SAME
+    // thing, because they are the same delivery.
+    assert.equal(deepReviewDeliveryNote({ route: { kind: ROUTE_KIND_API, target_id: 'openai/x' } }),
+        deepReviewDeliveryNote({ subagent_id: 'api-critic' }, { roster }));
+    assert.match(deepReviewDeliveryNote({ route: { kind: ROUTE_KIND_API, target_id: 'openai/x' } }), /Native inspection episode/);
+    assert.match(deepReviewDeliveryNote({ route: { kind: ROUTE_KIND_API, target_id: 'openai/x' } }), /host-observed/);
     assert.match(deepReviewDeliveryNote({ subagent_id: 'api-critic' }, { roster }), /Native inspection episode/);
     assert.match(deepReviewDeliveryNote({ subagent_id: 'api-critic' }, { roster }), /host-observed/);
     assert.match(deepReviewDeliveryNote({ subagent_id: 'api-critic' }, { roster }), /memory whitelist reaches it inline byte-exact/);
@@ -162,6 +169,24 @@ test('the deep self-review block says the ONE difference from the advisory where
     // Absence claims follow provenance, as everywhere in this editor.
     assert.match(deepReviewDeliveryNote({ subagent_id: 'gone' }, { roster }), /none exists with this ID/);
     assert.match(deepReviewDeliveryNote({ subagent_id: 'gone' }, { roster: [], rosterKnown: false }), /could not be read/);
+});
+
+test('the scope group states the delivery and asks for no window confirmation', () => {
+    // Owner decision (2026-09-17): a scope reviewer's context window is not a
+    // condition of its authority, so the note must not promise authority "once
+    // that agent's context window is confirmed at 200K or more" — the owner has no
+    // window to confirm and no place to confirm it. Both scope deliveries retrieve;
+    // what differs is who executed the reads, which is what the note now says.
+    const markup = renderReviewerSlotsSection();
+    const scopeAt = markup.indexOf('class="reviewer-slots-heading">Scope slots');
+    const note = markup.slice(scopeAt, markup.indexOf('id="reviewer-scope-rows"'));
+    assert.ok(scopeAt > 0, 'the Scope slots group exists');
+    assert.match(note, /Every scope row reads the repository itself/);
+    assert.match(note, /bounded inspection episode with host read-only tools/);
+    assert.match(note, /recovered from the harness run journal/);
+    assert.doesNotMatch(markup, /200K|200,000/);
+    assert.doesNotMatch(markup, /context window is\s+confirmed/);
+    assert.doesNotMatch(markup, /does not attest which files the agent opened/);
 });
 
 test('the Models tab no longer authors the deep self-review model (R7)', () => {
@@ -662,9 +687,10 @@ test('the roster select survives a saved reference the roster no longer lists', 
     ];
     const listed = subagentOptionsFor(roster, 'deep');
     assert.deepEqual(listed.map((o) => o.value), ['deep', 'fast']);
-    // 2=A label contract: FACTS lead (channel first), description is a caption.
-    assert.equal(listed[0].label, '#deep · API · openai/gpt-5.6-sol · high — Long reasoning over big diffs');
-    assert.equal(listed[1].label, '#fast · cursor · grok-4.6');
+    // Label contract: the row's HANDLE leads (route target plus its own set
+    // facets), the description is a caption; the stored id is the VALUE only.
+    assert.equal(listed[0].label, 'openai/gpt-5.6-sol/high — Long reasoning over big diffs');
+    assert.equal(listed[1].label, 'cursor=grok-4.6');
 
     const missing = subagentOptionsFor(roster, 'gone');
     assert.deepEqual(missing.map((o) => o.value), ['deep', 'fast', 'gone']);
@@ -688,7 +714,7 @@ test('the one flat reviewer picker leads with roster references, then the inline
     const refGroups = reviewerChoiceGroups({ roster, row: refRow, harnesses });
     assert.equal(refGroups[0].label, 'Available subagents');
     assert.deepEqual(refGroups[0].options.map((o) => o.value), [`${SUBAGENT_CHOICE_PREFIX}deep`]);
-    assert.match(refGroups[0].options[0].label, /^#deep · API/);
+    assert.match(refGroups[0].options[0].label, /^openai\/gpt-5\.6-sol\/high — /);
     assert.deepEqual(refGroups.slice(1).map((g) => g.label),
         ['Subscriptions · models', 'API keys', 'Agents · sessions']);
     assert.ok(!refGroups.slice(1).flatMap((g) => g.options).some((o) => o.value === 'session:gone'));
@@ -746,7 +772,7 @@ test('picker captions strip directional marks and never split a surrogate pair',
         recommended_use: '\u200Efast\u200F \u061Ccheap\u202Eevil',
         route: { kind: 'api_model', target_id: 'openai/gpt-5.6-luna' },
     }], '')[0].label;
-    assert.equal(marked, '#row · API · openai/gpt-5.6-luna — fast cheap' + 'evil');
+    assert.equal(marked, 'openai/gpt-5.6-luna — fast cheap' + 'evil');
 
     const emoji = '\u{1F9EA}'.repeat(60); // 60 code points, 120 UTF-16 units
     const long = subagentOptionsFor([{
@@ -997,7 +1023,7 @@ test('an untouched deep self-review placeholder is omitted from the save; an edi
         { route: { kind: 'api_chat', target_id: '' } });
     assert.match(deepReviewMetaNotes(blanked).join(' '), /Model id required — an empty model id is refused at save/);
     assert.match(deepReviewMetaNotes(untouched).join(' '), /Not saved as a row yet — shown from OUROBOROS_MODEL_DEEP_SELF_REVIEW/);
-    assert.match(deepReviewMetaNotes(untouched).join(' '), /an untouched row is not written/);
+    assert.match(deepReviewMetaNotes(untouched).join(' '), /stored when edited or when the default panel is first saved/);
     assert.deepEqual(deepReviewMetaNotes(edited), []);
     assert.deepEqual(deepReviewMetaNotes({ ...blanked, subagent_id: 'deep' }), []);
     assert.deepEqual(deepReviewMetaNotes({ ...blanked, route: { kind: ROUTE_KIND_SESSION, target_id: 'codex' } }), []);
@@ -1119,9 +1145,19 @@ test('a last-run receipt is read against the route that produced it', () => {
         lastRunMetaPrefix(receipt({ route_kind: 'api_chat', model: 'claudexor::codex-models=gpt' }), sessionRow,
             { modelSources: [{ id: 'codex-models', label: 'Codex' }] }),
         'Last run, before this row changed (it ran as a model on Codex)');
+    // A reference is named from the receipt's OWN recorded route — never by the
+    // stored id, and never from today's roster (that would relabel the past).
+    assert.equal(
+        lastRunMetaPrefix(receipt({ route_kind: 'api_chat', subagent_id: 'deep', model: 'openai/gpt-5.6-sol',
+            effort: 'high', processing_preference: 'fast' }), apiRow),
+        'Last run, before this row changed (it ran as the configured subagent openai/gpt-5.6-sol/high/fast)');
+    assert.equal(
+        lastRunMetaPrefix(receipt({ route_kind: ROUTE_KIND_SESSION, subagent_id: 'deep', model: 'ignored',
+            session_target: 'codex=gpt-6-astra', profile_id: 'koshak' }), apiRow),
+        'Last run, before this row changed (it ran as the configured subagent codex=gpt-6-astra/@koshak)');
     assert.equal(
         lastRunMetaPrefix(receipt({ route_kind: 'api_chat', subagent_id: 'deep' }), apiRow),
-        'Last run, before this row changed (it ran as the configured subagent #deep)');
+        'Last run, before this row changed (it ran as a configured subagent)');
 });
 
 test('no reviewer control teaches the stored prefix, and the advisory says what it delivers', () => {
@@ -1144,4 +1180,56 @@ test('no reviewer control teaches the stored prefix, and the advisory says what 
         { codex: { status: 'ok' } });
     assert.match(session, /agent session — retrieves context with its own tools/);
     assert.doesNotMatch(session, /inspection episode/);
+});
+
+test('an owner-disabled roster row leaves the picker but a saved reference to it stays', () => {
+    // The roster's per-row switch is withdrawal from NEW choices, not a silent
+    // rewiring: the save-time parser refuses a fresh reference to a switched-off
+    // row, so offering it here would only manufacture a 400 the owner cannot see
+    // coming. An ALREADY selected reference keeps its option (the same
+    // survive-the-save rule as a row that fell out of the roster) and says why.
+    const roster = [
+        { subagent_id: 'deep', recommended_use: 'Long reasoning over big diffs',
+          route: { kind: 'api_model', target_id: 'openai/gpt-5.6-sol' }, effort: 'high' },
+        { subagent_id: 'paused', recommended_use: 'Paused seat',
+          route: { kind: 'api_model', target_id: 'openai/gpt-5.6-luna' }, enabled: false },
+    ];
+    assert.deepEqual(subagentOptionsFor(roster, '').map((o) => o.value), ['deep']);
+    assert.deepEqual(subagentOptionsFor(roster, 'deep').map((o) => o.value), ['deep']);
+
+    const holding = subagentOptionsFor(roster, 'paused');
+    assert.deepEqual(holding.map((o) => o.value), ['deep', 'paused']);
+    // The handle leads, the owner's switch rides with the facts, the caption follows.
+    assert.equal(holding[1].label, 'openai/gpt-5.6-luna · switched off — Paused seat');
+    assert.equal(holding[0].label, 'openai/gpt-5.6-sol/high — Long reasoning over big diffs');
+    assert.doesNotMatch(holding[1].label, /not in the roster/, 'the row exists; it is switched off');
+
+    // The flat picker keeps the same behaviour through its group builder.
+    const groups = reviewerChoiceGroups({ roster, row: { subagent_id: 'paused' }, harnesses: [] });
+    const rosterGroup = groups.find((group) => group.label === 'Available subagents');
+    assert.deepEqual(rosterGroup.options.map((o) => o.value),
+        [`${SUBAGENT_CHOICE_PREFIX}deep`, `${SUBAGENT_CHOICE_PREFIX}paused`]);
+
+    // The read-only disclosure states the consequence and the way out.
+    const described = describeSubagentReference('paused', roster);
+    assert.match(described, /switched off/);
+    assert.match(described, /refused at save rather than rerouted/);
+    assert.match(described, /turn the row back on/);
+    assert.doesNotMatch(describeSubagentReference('deep', roster), /switched off/);
+});
+
+
+test('referenced captions follow row effort overrides while compound routes stay immutable', () => {
+    const roster = [
+        { subagent_id: 'ordinary', effort: 'high', route: { kind: ROUTE_KIND_SESSION, target_id: 'codex=gpt-model' } },
+        { subagent_id: 'compound', effort: 'xhigh', route: { kind: ROUTE_KIND_SESSION, target_id: 'cursor=cursor-grok-xhigh' } },
+    ];
+    assert.match(describeSubagentReference('ordinary', roster, { effort: 'low' }), /preferred effort low/);
+    assert.doesNotMatch(describeSubagentReference('ordinary', roster, { effort: 'low' }), /effort high/);
+    assert.match(describeSubagentReference('ordinary', roster), /preferred effort high/);
+    const compound = describeSubagentReference('compound', roster, { effort: 'low' });
+    assert.match(compound, /cursor-grok-xhigh/);
+    assert.match(compound, /preferred effort xhigh/);
+    assert.doesNotMatch(compound, /effort low/);
+    assert.equal(roster[1].route.target_id, 'cursor=cursor-grok-xhigh');
 });

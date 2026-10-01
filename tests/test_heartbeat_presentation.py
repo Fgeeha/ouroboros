@@ -214,6 +214,7 @@ def test_cancel_failure_is_progress_incident_not_chat_bubble(monkeypatch) -> Non
     assert args[1].startswith("❌ cancel cancel-me")
     assert "watchdog" in args[1]  # the intent stays open and is retried
     assert kwargs == {
+        "role": "system", "system_type": "cancellation_notice",
         "is_progress": True,
         "task_id": "cancel-me",
         "progress_meta": {

@@ -1,9 +1,7 @@
 """Concrete per-task context shared by tool handlers and the registry facade.
 
-Every span is extracted VERBATIM from the parent's tip bytes by
-scripts/v7next_transplant.py (D18/D33 module-handle split, proof-checked);
-the parent re-exports every moved name, so historical imports and
-monkeypatch targets keep working unchanged.
+The facade re-exports these definitions so existing imports and monkeypatch
+targets retain the same bindings.
 """
 
 from __future__ import annotations
@@ -31,7 +29,7 @@ def _registry():
     The parent owns the rebindable module state and the members tests
     monkeypatch there; reading them through the module at each call keeps
     one binding, where a from-import would freeze the value this leaf saw
-    at import time (the owner-approved D18/D33 mechanical exception).
+    at import time.
     """
     from ouroboros.tools import registry
 
@@ -76,7 +74,9 @@ class ToolContext:
     pending_restart_reason: Optional[str] = None
     last_push_succeeded: bool = False
     last_reviewed_commit_sha: str = ""
-    emit_progress_fn: Callable[[str], None] = field(default=lambda _: None)
+    # The real binder accepts keyword facts (``narration=True`` for a tool that relays
+    # the model's own words); an unbound context must swallow them the same way.
+    emit_progress_fn: Callable[[str], None] = field(default=lambda _text, **_kw: None)
 
     # LLM-driven model/effort switch.
     active_model_override: Optional[str] = None
@@ -130,7 +130,9 @@ class ToolContext:
         room = project_room_lens_dir(self)
         if room is not None:
             return room
-        return pathlib.Path(self.repo_dir)
+        from ouroboros.tool_access import folderless_scratch_dir
+
+        return folderless_scratch_dir(self) or pathlib.Path(self.repo_dir)
 
     def is_workspace_mode(self) -> bool:
         return (

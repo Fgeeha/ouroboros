@@ -178,6 +178,35 @@ def test_spec_delta_reports_renumbered_ids_and_convergence_rule_says_retarget():
     assert "re-target `breaks` against the CURRENT spec ids" in user and "renumbered" in user
 
 
+def test_cycle_two_packet_carries_the_adjudication_duty_and_the_goal_fact():
+    """Cycle ≥2: the reviewer's first duty is to adjudicate its OWN earlier findings
+    (RESOLVED / SUPERSEDED / STILL OPEN with the residual), and the host states whether the
+    goal changed since the previous cycle; a cycle-1 packet carries neither."""
+    from ouroboros.tools.plan_packet import build_plan_review_user_content
+
+    prev, _ = plan_spec.normalize_spec({"goal": "ship the deck", "affected_paths": []})
+    same, _ = plan_spec.normalize_spec({"goal": "ship the deck", "affected_paths": [], "in_scope": ["five slides"]})
+    moved, _ = plan_spec.normalize_spec({"goal": "ship a memo instead", "affected_paths": []})
+
+    def packet(spec, delta, cycle):
+        return build_plan_review_user_content(
+            objective="o", goal=spec["goal"], plan_prose="p", spec=spec,
+            manifest={"declared": [], "attached": [], "omissions": []},
+            prior_cycles=[{"cycle_index": cycle - 1, "aggregate": "REVIEW_REQUIRED", "findings": []}] if cycle > 1 else [],
+            dispositions=[], spec_delta=delta, root_exploration_log=None, cycle_index=cycle)
+
+    unchanged = packet(same, plan_spec.spec_delta(prev, same), 2)
+    for word in ("adjudicate your OWN earlier findings first", "RESOLVED", "SUPERSEDED", "STILL OPEN",
+                 "still breaks a CURRENT element", "Goal changed since cycle 1: no"):
+        assert word in unchanged, word
+    assert unchanged.index("## ROOT EXPLORATION LOG") < unchanged.index("Goal changed since cycle 1")
+    assert "Goal changed since cycle 1: yes" in packet(moved, plan_spec.spec_delta(prev, moved), 2)
+    truncated = packet(same, {"unavailable": "previous frozen spec body truncated"}, 2)
+    assert "Goal changed since cycle 1: unknown" in truncated
+    first = packet(same, None, 1)
+    assert "Goal changed since" not in first and "adjudicate your OWN" not in first and "STILL OPEN" not in first
+
+
 # ------------------------------------------------------------ B2 constitutional
 
 
@@ -613,6 +642,17 @@ def test_aggregate_need_evidence_only_wave_and_degraded():
     assert [f["finding_id"] for f in dup["findings"]] == ["rev:b", "rev_2:b"]
 
 
+def test_notes_never_change_the_aggregate():
+    """GREEN = a quorum parsed and the open set is empty; notes are optional advice."""
+    notes = plan_spec.aggregate([_slot("1", [NOTE]), _slot("2", [dict(NOTE, id="n2")]), _slot("3", [])])
+    assert notes["aggregate"] == "GREEN" and notes["reasons"] == [] and notes["counts"]["note"] == 2
+    assert [f["finding_id"] for f in notes["findings"]] == ["1:n", "2:n2"]  # advice is kept, never counted
+    held = plan_spec.aggregate([_slot("1", [BLOCK]), _slot("2", [NOTE]), _slot("3", [])])
+    assert held["aggregate"] == "REVIEW_REQUIRED" and "blocking_below_quorum:1/2" in held["reasons"]
+    asked = plan_spec.aggregate([_slot("1", [NEED]), _slot("2", [NOTE]), _slot("3", [])])
+    assert asked["aggregate"] == "REVIEW_REQUIRED" and "need_evidence_only" in asked["reasons"]
+
+
 def _control(outcome: str, closed: bool):
     return _parse_plan_review_control(PLAN_REVIEW_CONTROL_PREFIX + json.dumps({"outcome": outcome, "closed": closed}))
 
@@ -633,6 +673,10 @@ def test_closure_table_and_control_line_invariants():
     assert no_rationale["closed"] is False and "invalid_disposition:2:e" in no_rationale["notes"]
     done = plan_spec.closure_after_disposition("REVIEW_REQUIRED", findings, full, "blocking")
     assert done["closed"] is True and done["open_ids"] == []
+    # The table also says what to RECORD: an emptied open set is written GREEN, with its note.
+    assert done["aggregate"] == "GREEN" and partial["aggregate"] == "REVIEW_REQUIRED"
+    assert "closed_by_disposition: REVIEW_REQUIRED → GREEN (open set emptied)" in done["notes"]
+    assert green["aggregate"] == "GREEN"
     deferred = plan_spec.closure_after_disposition(
         "REVIEW_REQUIRED", findings, [dict(full[0], decision="defer"), full[1]], "blocking",
     )
@@ -641,12 +685,12 @@ def test_closure_table_and_control_line_invariants():
         "REVISE_PLAN", [dict(BLOCK, finding_id="1:b")] + findings,
         [{"finding_id": "1:b", "decision": "reject", "rationale": "disagree"}] + full, "blocking",
     )
-    assert revise["closed"] is False and revise["open_ids"] == ["1:b"]
+    assert revise["closed"] is False and revise["open_ids"] == ["1:b"] and revise["aggregate"] == "REVISE_PLAN"
     assert any(n.startswith("revise_plan_not_closable_by_disposition") for n in revise["notes"])
     advisory = plan_spec.closure_after_disposition("REVISE_PLAN", [dict(BLOCK, finding_id="1:b")], [], "advisory")
     assert advisory["closed"] is False and any(n.startswith("advisory_enforcement") for n in advisory["notes"])
     degraded = plan_spec.closure_after_disposition("DEGRADED", [], [], "blocking")
-    assert degraded["closed"] is False
+    assert degraded["closed"] is False and degraded["aggregate"] == "DEGRADED"
     unknown = plan_spec.closure_after_disposition("REVIEW_REQUIRED", findings, full + [{"finding_id": "9:z", "decision": "accept", "rationale": "r"}], "blocking")
     assert unknown["closed"] is True and "unknown_finding_id:9:z" in unknown["notes"]
     vacuous = plan_spec.closure_after_disposition("REVIEW_REQUIRED", [], [], "blocking")
@@ -663,7 +707,6 @@ def test_closure_table_and_control_line_invariants():
 def test_optional_notes_do_not_require_disposition(enforcement):
     note = dict(NOTE, finding_id="1:n")
     need = dict(NEED, finding_id="2:e")
-    blocker = dict(BLOCK, finding_id="3:b")
     closure = plan_spec.closure_after_disposition("REVIEW_REQUIRED", [note], [], enforcement)
     assert closure["closed"] and closure["open_ids"] == []
     mixed = plan_spec.closure_after_disposition("REVIEW_REQUIRED", [note, need], [], enforcement)
@@ -672,12 +715,39 @@ def test_optional_notes_do_not_require_disposition(enforcement):
     assert plan_spec.closure_after_disposition(
         "REVIEW_REQUIRED", [note, need], disposed, enforcement,
     )["closed"]
-    rejected = [{"finding_id": "3:b", "decision": "reject", "rationale": "disagree"}]
-    below_quorum = plan_spec.closure_after_disposition(
-        "REVIEW_REQUIRED", [note, blocker], rejected, enforcement,
-    )
-    assert not below_quorum["closed"] and below_quorum["open_ids"] == ["3:b"]
     assert not plan_spec.closure_after_disposition("DEGRADED", [note], [], enforcement)["closed"]
+
+
+@pytest.mark.parametrize("enforcement", ["blocking", "advisory"])
+def test_reasoned_reject_closes_below_quorum_blocking_only_under_advisory(enforcement):
+    """The open set: under advisory a reject WITH its rationale closes a below-quorum
+    blocking finding, per finding; accept and defer keep it open; under blocking the
+    same reject leaves it open (a changed spec or the reviewer retiring it closes it)."""
+    note = dict(NOTE, finding_id="1:n")
+    blocker = dict(BLOCK, finding_id="3:b")
+    advisory = enforcement == "advisory"
+    rejected = [{"finding_id": "3:b", "decision": "reject", "rationale": "disagree"}]
+    closure = plan_spec.closure_after_disposition("REVIEW_REQUIRED", [note, blocker], rejected, enforcement)
+    assert closure["closed"] is advisory and closure["open_ids"] == ([] if advisory else ["3:b"])
+    assert closure["aggregate"] == ("GREEN" if advisory else "REVIEW_REQUIRED")
+    assert ("closed_by_disposition: REVIEW_REQUIRED → GREEN (open set emptied)" in closure["notes"]) is advisory
+    assert any(n.startswith("blocking_finding_below_quorum_stays_open") for n in closure["notes"]) is not advisory
+    for decision in ("accept", "defer"):
+        kept = plan_spec.closure_after_disposition(
+            "REVIEW_REQUIRED", [note, blocker], [dict(rejected[0], decision=decision)], enforcement)
+        assert not kept["closed"] and kept["open_ids"] == ["3:b"] and kept["aggregate"] == "REVIEW_REQUIRED"
+    unreasoned = plan_spec.closure_after_disposition(
+        "REVIEW_REQUIRED", [blocker], [dict(rejected[0], rationale="")], enforcement)
+    assert not unreasoned["closed"] and "invalid_disposition:3:b" in unreasoned["notes"]
+    # Per finding: one rejected of two blocking findings still holds the wave.
+    second = dict(BLOCK, finding_id="4:b")
+    partial = plan_spec.closure_after_disposition("REVIEW_REQUIRED", [blocker, second], rejected, enforcement)
+    assert not partial["closed"] and partial["open_ids"] == ([] if advisory else ["3:b"]) + ["4:b"]
+    # REVISE_PLAN and DEGRADED stay unclosable whatever is rejected.
+    revise = plan_spec.closure_after_disposition(
+        "REVISE_PLAN", [blocker, second], rejected + [dict(rejected[0], finding_id="4:b")], enforcement)
+    assert not revise["closed"] and revise["open_ids"] == ["3:b", "4:b"] and revise["aggregate"] == "REVISE_PLAN"
+    assert not plan_spec.closure_after_disposition("DEGRADED", [blocker], rejected, enforcement)["closed"]
 
 
 # ------------------------------------------------------------------- B5 packet
@@ -704,6 +774,10 @@ def test_system_prompt_stance_and_bible_gating():
     assert "OMISSION NOTE: ARCHITECTURE navigation map not supplied" in plain
     assert checklist in plain
     assert "Convergence rule" not in plain
+    # The height rule sends an unverifiable claim back as a question or a note, never a blocker.
+    assert "STRUCTURALLY" not in plain and "structurally unverifiable" not in lowered
+    assert "A claim you cannot check as written is a question to the author" in plain
+    assert "6. Subtraction" in plain and "7. Governance" not in plain
     assert "blocking" in lowered and "`breaks`" in plain
     assert "need_evidence" in plain
     assert "important brainstorming opportunity" in plain
@@ -717,6 +791,7 @@ def test_system_prompt_stance_and_bible_gating():
         cycle_index=2, enforcement="advisory", architecture_text="ARCH BODY",
     )
     assert "BIBLE BODY" in constitutional and "Governance" in constitutional
+    assert "6. Subtraction" in constitutional and "7. Governance" in constitutional and "6. Governance" not in constitutional
     # W3: ARCHITECTURE.md rides inline, in full, in the self-modification pack
     assert "## ARCHITECTURE.md" in constitutional and "ARCH BODY" in constitutional
     # the convergence rule is cycle-dependent and now lives in the USER prior-cycles section
@@ -938,3 +1013,33 @@ def test_the_findings_contract_advertises_locator_forms_and_range_selectors() ->
         assert token in PLAN_FINDINGS_ARRAY_CONTRACT, token
     assert _PLAN_FINDING_ELEMENT_SCHEMA.startswith("{")
     assert _PLAN_FINDING_ELEMENT_SCHEMA.endswith("}")
+
+
+def test_merge_dispositions_keeps_earlier_answers_and_supersedes_only_the_answered_id() -> None:
+    """One wave's answers after another call: order is kept-then-fresh, a later answer
+    replaces every earlier entry for ITS id only, and non-mapping entries are dropped."""
+    from ouroboros.tools.plan_spec import merge_dispositions
+
+    a = {"finding_id": "s1:q1", "decision": "accept", "rationale": "yes"}
+    b = {"finding_id": "s2:q2", "decision": "defer", "rationale": "later"}
+    a2 = {"finding_id": "s1:q1", "decision": "reject", "rationale": "no"}
+    assert merge_dispositions([], [a]) == [a]
+    assert merge_dispositions([a], [b]) == [a, b]
+    assert merge_dispositions([a, b], [a2]) == [b, a2]
+    assert merge_dispositions([a, a2], [b]) == [a, a2, b]  # an earlier contradiction is not rewritten
+    assert merge_dispositions([a, "junk", None], [b, 3]) == [a, b]
+    assert merge_dispositions(None, None) == []
+
+
+def test_merge_dispositions_keeps_a_within_call_duplicate_for_closure_to_refuse() -> None:
+    """Two entries for one id in ONE call stay as written: ``closure_after_disposition`` reads
+    them as a contradiction (``duplicate_disposition``) and keeps the finding open."""
+    from ouroboros.tools.plan_spec import closure_after_disposition, merge_dispositions
+
+    twice = [{"finding_id": "1:q1", "decision": "accept", "rationale": "yes"},
+             {"finding_id": "1:q1", "decision": "reject", "rationale": "no"}]
+    merged = merge_dispositions([], twice)
+    assert merged == twice
+    question = {"finding_id": "1:q1", "id": "q1", "class": "need_evidence", "breaks": "claim_1", "summary": "?"}
+    closure = closure_after_disposition("REVIEW_REQUIRED", [question], merged, "blocking")
+    assert closure["closed"] is False and "duplicate_disposition:1:q1" in closure["notes"]

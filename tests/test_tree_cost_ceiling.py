@@ -17,6 +17,7 @@ import pytest
 from ouroboros import task_pacing, usage_accounting
 from ouroboros.contracts.task_contract import normalize_budget_profile
 from ouroboros.loop import _check_budget_limits, _RoundLimitContext
+from ouroboros.task_pacing import main_loop_wire_options
 
 
 @pytest.fixture(autouse=True)
@@ -211,6 +212,12 @@ class TestCacheAwareReservation:
 
 
 
+# These pins rebuild the "actual" candidate by hand, so they carry the send's own
+# options from their one owner; tests/test_wrapup_real_send_parity.py drives the
+# real send, which is where a key these mirrors forget would be caught.
+_MAIN_LOOP_OPTIONS = main_loop_wire_options("openai::gpt-test", allow_server_web_search=False)
+
+
 def _patch_execute_candidate(monkeypatch, llm_module, execute):
     """Patch the physical candidate executor where the v7 lanes BIND it.
 
@@ -381,6 +388,7 @@ class TestWrapupAffordability:
             )
             client._chat_anthropic(
                 target, messages, tools, "high", prospective.max_completion_tokens, "auto",
+                stream=_MAIN_LOOP_OPTIONS["stream"],
             )
 
         actual = captured["request"]
@@ -416,7 +424,7 @@ class TestWrapupAffordability:
             )
             candidate = client._build_remote_candidate(
                 target, messages, "high", prospective.max_completion_tokens, "auto", None, tools,
-                skip_capability_fetch=True,
+                skip_capability_fetch=True, **_MAIN_LOOP_OPTIONS,
             )
             client._normalize_payload_cache_ttl(target, candidate)
             client._create_chat_completion_with_retries(lambda **_kwargs: None, candidate, target)
@@ -428,6 +436,7 @@ class TestWrapupAffordability:
     def test_wire_recovery_matches_physical_candidate(self, monkeypatch, tmp_path):
         from ouroboros import llm as llm_module
         from ouroboros.llm import LLMClient
+        from ouroboros.request_wire_contract import physical_candidate_bytes, physical_candidate_sha256
 
         monkeypatch.setenv("OPENAI_API_KEY", "unused")
         client = LLMClient(api_key="unused")
@@ -437,9 +446,13 @@ class TestWrapupAffordability:
         captured = {}
         real_prepare = llm_module.prepare_wire_payload_for_send
 
-        def prepare(target_, payload, *, api_surface):
-            prepared = real_prepare(target_, payload, api_surface=api_surface)
+        def prepare(target_, payload, *, api_surface, logical_payload=None):
+            prepared = real_prepare(
+                target_, payload, api_surface=api_surface, logical_payload=logical_payload,
+            )
             prepared["recovered_wire_field"] = True
+            captured.setdefault("prepared", []).append(prepared)
+            captured.setdefault("logical", []).append(logical_payload)
             return prepared
 
         def execute(request, _send, _before_dispatch):
@@ -462,12 +475,22 @@ class TestWrapupAffordability:
             )
             candidate = client._build_remote_candidate(
                 target, messages, "high", prospective.max_completion_tokens, "auto", None, None,
-                skip_capability_fetch=True,
+                skip_capability_fetch=True, **_MAIN_LOOP_OPTIONS,
             )
+            candidate["timeout"] = 33.0
             client._normalize_payload_cache_ttl(target, candidate)
             client._create_chat_completion_with_retries(lambda **_kwargs: None, candidate, target)
 
         actual = captured["request"]
+        assert len(captured["prepared"]) == len(captured["logical"]) == 2
+        assert captured["logical"][-1] is candidate
+        assert captured["logical"][-1]["timeout"] == 33.0
+        assert all("timeout" not in payload for payload in captured["prepared"])
+        prepared = captured["prepared"][-1]
+        assert prepared["recovered_wire_field"] is True
+        assert actual.candidate_raw_size_bytes == len(physical_candidate_bytes(prepared))
+        assert actual.candidate_raw_sha256 == physical_candidate_sha256(prepared)
+        assert prospective.prompt_tokens_estimate == actual.prompt_tokens_estimate
         assert prospective.candidate_raw_size_bytes == actual.candidate_raw_size_bytes
         assert prospective.candidate_raw_sha256 == actual.candidate_raw_sha256
 
@@ -571,7 +594,7 @@ class TestGlobalOnlyTreeAccounting:
 
         monkeypatch.setattr(
             usage_accounting, "refresh_root_accounting",
-            lambda drive_root, root_task_id, max_age_sec: {"accounted_usd": 7.5, "root": root_task_id},
+            lambda drive_root, root_task_id, max_age_sec, strict=False: {"accounted_usd": 7.5, "root": root_task_id},
         )
         with usage_accounting.usage_scope(usage_accounting.UsageScope(
             drive_root=tmp_path, task_id="child", root_task_id="root1", global_limit_usd=100.0,
@@ -963,7 +986,7 @@ class TestWrapupAffordabilityRail:
         assert result is not None
         assert seen["source"] == "budget_wrapup_unaffordable"
         assert seen["reason"] == "budget_exhausted"
-        assert "not even one wrap-up call" in seen["text"]
+        assert "Not even one wrap-up call" in seen["text"]
         assert ctx.accumulated_usage["cost_stop_rail"] == "wrapup_reservation_last_fit"
         assert [call.get("request") for call in calls] == [None, request, request]
 
@@ -1015,7 +1038,8 @@ class TestWrapupAffordabilityRail:
         monkeypatch.setattr(
             "ouroboros.loop._loop_tree_accounting", lambda **_k: {"accounted_usd": 20.0},
         )
-        answers = iter((True, False, True, False, True, False))
+        # proxy, exact probe, prepared; then the fresh request's own admission at its own price.
+        answers = iter((True, False, True, False, True, False, True))
         monkeypatch.setattr(
             task_pacing, "wrapup_reservation_fits", lambda **_kwargs: next(answers),
         )
@@ -1034,22 +1058,25 @@ class TestWrapupAffordabilityRail:
             dispatched["messages"] = kwargs["initial_messages"]
             from ouroboros.llm import _attempt_request, _finalized_physical_candidate
             from ouroboros.request_wire_recovery import request_wire_call_scope
+            from ouroboros.send_clock import MainSendClock, stamp_clock_note
 
             target = ctx.llm._resolve_remote_target(ctx.active_model)
-            with request_wire_call_scope():
+            # The real Main send seals a FRESH clock line into this candidate
+            # (``send_clock``); the admission compares everything but its digits.
+            with MainSendClock(kwargs["send_clock_policy"]).bound(), request_wire_call_scope():
                 candidate = ctx.llm._build_remote_candidate(
                     target, kwargs["initial_messages"], ctx.active_effort,
                     built["request"].max_completion_tokens, "auto", None, ctx.tool_schemas,
-                    skip_capability_fetch=True,
+                    skip_capability_fetch=True, **_MAIN_LOOP_OPTIONS,
                 )
                 ctx.llm._normalize_payload_cache_ttl(target, candidate)
                 candidate = _finalized_physical_candidate(
-                    target, candidate,
+                    target, stamp_clock_note(candidate, blocks=target.get("provider") == "anthropic"),
                     "messages" if target.get("provider") == "anthropic" else "chat.completions",
                 )
-            actual = _attempt_request(target, candidate)
+                actual = _attempt_request(target, candidate)
             dispatched["accepted"] = kwargs["candidate_predicate"](actual)
-            dispatched["sha256"] = actual.candidate_raw_sha256
+            dispatched["sha256"] = actual.candidate_clock_free_sha256
             return {"content": "wrapped up"}, 0.0
 
         monkeypatch.setattr(loop_module, "call_llm_with_retry", call)
@@ -1059,7 +1086,7 @@ class TestWrapupAffordabilityRail:
         assert result is not None
         assert dispatched["messages"] is built["messages"]
         assert dispatched["accepted"] is True
-        assert dispatched["sha256"] == built["request"].candidate_raw_sha256
+        assert dispatched["sha256"] and dispatched["sha256"] == built["request"].candidate_clock_free_sha256
         assert built["messages"][0]["content"][1] == {
             "type": "text", "text": "[image caption: wire caption]",
         }
@@ -1092,7 +1119,7 @@ class TestWrapupAffordabilityRail:
     def test_the_stop_text_names_the_cap_and_the_reason(self):
         text = task_pacing.wrapup_last_fit_text(49.9, self._ceiling(50.0))
 
-        assert "$49.900" in text and "$50.00" in text
+        assert "$49.90 of its own $50.00 cap" in text
         assert "wrap-up call" in text
 
 

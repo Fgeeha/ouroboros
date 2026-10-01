@@ -250,8 +250,8 @@ class TestChildDriveSkillPayload:
         assert "launcher-seed" in marker
         assert "nativeDependency" in dependency
         assert "node_modules/" in listing and ".seed-origin" in listing
-        assert ".clawhub.json" not in listing
-        assert "BLOCKED" in control
+        assert ".clawhub.json" in listing
+        assert '{"origin":"catalog"}' in control
         assert "SKILL.md" in search
 
         write = registry.execute("write_file", {
@@ -272,6 +272,7 @@ class TestBudgetDriftOpenRouterOnly:
         from supervisor import state as sup_state
 
         sup_state.init(tmp_path, total_budget_limit=0.0)
+        sup_state.save_state({})  # an initialized install: only explicit init creates state (#1307)
         monkeypatch.setenv("OPENROUTER_API_KEY", "unit-test-key-1")
 
         breakdown = {
@@ -290,11 +291,12 @@ class TestBudgetDriftOpenRouterOnly:
             "attempt_counts": {"settled": calls},
             "integrity_degraded": integrity_degraded,
             "by_provider": {"openrouter": {"settled_usd": or_settled}},
+            "_ledger_high_water_seq": [0, calls],
         }
         import ouroboros.usage_accounting as ua
 
         monkeypatch.setattr(ua, "ensure_legacy_imported", lambda *_a, **_k: None)
-        monkeypatch.setattr(ua, "usage_breakdown", lambda *_a, **_k: dict(breakdown))
+        monkeypatch.setattr(ua, "usage_writer_snapshot", lambda *_a, **_k: dict(breakdown))
         return sup_state
 
     def _seed_session(self, sup_state, *, total_snap: float, or_snap: float):

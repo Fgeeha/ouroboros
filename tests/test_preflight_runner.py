@@ -533,7 +533,7 @@ def test_projected_settings_keys_never_reach_the_candidate_suite(tmp_path, monke
 
     monkeypatch.setenv(key, "owner-runtime-state")
     env = _preflight_env(tmp_path / "root", tmp_path / "root" / "repo")
-    assert key not in env, f"{key} leaked into the candidate suite"
+    assert env.get(key) != "owner-runtime-state", f"{key} leaked into the candidate suite"
 
 
 def test_the_gate_pins_the_worker_count_it_verified(tmp_path, monkeypatch):
@@ -567,7 +567,7 @@ def test_the_worker_probe_is_prepended_to_pythonpath(tmp_path, monkeypatch):
     assert entries[0] == str(pr._probe_dir(root.resolve(strict=False))), (
         "the gate's probe dir is shadowable"
     )
-    assert "/inherited/first" in entries, "the inherited PYTHONPATH was discarded, not prepended to"
+    assert "/inherited/first" not in entries, "an owner import path leaked into the candidate"
 
     module = pr._install_worker_probe(root)
     assert module.startswith(pr._WORKER_PROBE_MODULE + "_"), module
@@ -948,16 +948,13 @@ def test_classify_green_and_empty_pass():
 #
 # These drive `run_hermetic_pytest` end to end — real git worktree, real
 # diff/env plumbing — with `_execute_pytest_pass` stubbed, so the budget and
-# sweep contracts are pinned WITHOUT depending on pytest-xdist being installed
+# pass contracts are pinned WITHOUT depending on pytest-xdist being installed
 # in the interpreter running this file.
 
 
 @pytest.fixture
 def stub_passes(monkeypatch):
-    """Replace the pytest spawn with a recorder, and log the temp-root sweeps.
-
-    Both are appended to ONE ordered event log so a caller can pin not just how
-    often the sweep runs but WHERE it runs relative to each pass.
+    """Replace each contained pytest pass with an ordered result recorder.
 
     The two OTHER real-interpreter seams `run_hermetic_pytest` crosses are
     neutralised here as well, because neither can work when nothing is spawned:
@@ -973,14 +970,10 @@ def stub_passes(monkeypatch):
     `test_a_nominally_parallel_pass_on_one_worker_is_a_hard_block` and the
     real-spawn `test_the_parallel_pass_really_starts_more_than_one_worker`.
     """
-    from ouroboros import platform_layer, preflight_runner
+    from ouroboros import preflight_runner
 
     events: list[tuple] = []
 
-    def _record_sweep(marker: str) -> None:
-        events.append(("sweep", marker))
-
-    monkeypatch.setattr(platform_layer, "kill_processes_referencing", _record_sweep)
     monkeypatch.setattr(preflight_runner, "_verify_preflight_plugins", lambda *a, **k: [])
     monkeypatch.setattr(preflight_runner, "_observed_worker_ids", lambda *a, **k: {"gw0", "gw1"})
 
@@ -1000,27 +993,6 @@ def stub_passes(monkeypatch):
         return events
 
     return _install
-
-
-def test_temp_root_is_swept_between_passes_not_only_at_teardown(tmp_path, two_pass_env, stub_passes):
-    """A pass-1 escapee (detached child, bound port, stray server) must be reaped
-    BEFORE pass 2 reads the same worktree. Pinned positionally in the event log:
-    deleting the in-loop sweep leaves the teardown sweep behind, which a bare
-    `"kill_processes_referencing" in source` assertion cannot distinguish."""
-    from ouroboros.preflight_runner import run_hermetic_pytest
-
-    events = stub_passes([(0, ""), (0, "")])
-    repo = _make_repo(tmp_path, {"tests/test_plain.py": "def test_ok():\n    assert True\n"})
-
-    assert run_hermetic_pytest(repo, timeout=120) is None
-
-    kinds = [event[0] for event in events]
-    assert kinds == ["pass", "sweep", "pass", "sweep", "sweep"], (
-        f"expected a sweep after EVERY pass plus one at teardown, got {kinds}"
-    )
-    # ...and it is the two-pass split that ran, in order.
-    assert "not serial and" in events[0][1][2]
-    assert events[2][1][2].startswith("serial and")
 
 
 def test_second_pass_never_starts_once_the_total_budget_is_gone(tmp_path, two_pass_env, stub_passes):
@@ -1287,6 +1259,75 @@ def test_a_pass_whose_tree_cannot_be_proven_gone_blocks_even_when_it_exits_zero(
     assert [event[0] for event in events].count("pass") == 1, (
         "the serial pass ran on top of a tree that could not be proven gone"
     )
+
+
+@pytest.mark.parametrize("lane", ["proven", "pass_reported", "pass_raised", "node_reported", "node_raised"])
+def test_the_hermetic_tree_is_deleted_only_after_every_lane_proved_its_teardown(
+    tmp_path, two_pass_env, stub_passes, monkeypatch, lane,
+):
+    """The verdict blocks; the TREE is a separate custody question.
+
+    A lane whose processes were not proven gone — reported by its container, or
+    left unknown because the lane raised — must not have the worktree those
+    processes run in deleted under them, nor its source-repository registration
+    removed: tree, marker and registration stay, and the verdict names the path.
+    The proven control is the other half: a clean run leaks nothing."""
+    from ouroboros import preflight_runner as pr
+    from ouroboros.test_environment import RETENTION_MARKER
+
+    temp_root = (tmp_path / "preflight-root").resolve()
+    temp_root.mkdir()
+    monkeypatch.setattr(tempfile, "mkdtemp", lambda *a, **k: str(temp_root))
+    worktree = temp_root / "repo"
+    unproven = "pid 4242 was still alive after the reap"
+
+    def crash(*_args):
+        raise RuntimeError("the lane crashed before its teardown settled")
+
+    if lane == "node_reported":
+        monkeypatch.setattr(pr, "run_node_tests", lambda *_a: {
+            "returncode": 0, "reap_error": unproven,
+            "error": "⚠️ PRE_PUSH_TEST_ERROR: PREFLIGHT_CONTAINMENT_FAILED (hard block): node",
+        })
+    elif lane == "node_raised":
+        monkeypatch.setattr(pr, "run_node_tests", crash)
+    stub_passes({
+        "proven": [(0, "1 passed"), (0, "1 passed")],
+        "pass_reported": [(0, "1 passed", unproven)],
+        "pass_raised": [crash],
+    }.get(lane, []))
+    repo = _make_repo(tmp_path, {"tests/test_plain.py": "def test_ok():\n    assert True\n"})
+    try:
+        result = pr.run_hermetic_pytest(repo, timeout=120)
+        registered = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"], cwd=str(repo),
+            capture_output=True, text=True, check=True,
+        ).stdout
+        if lane == "proven":
+            assert result is None, result
+            assert not temp_root.exists(), "a proven teardown leaked its disposable tree"
+            assert f"worktree {worktree.as_posix()}\n" not in registered, registered
+            return
+        assert result is not None and result.startswith("⚠️ PRE_PUSH_TEST_ERROR"), result
+        assert result.splitlines()[1].startswith(f"RETAINED (not deleted): {temp_root}"), result
+        assert worktree.is_dir(), "the worktree was deleted under processes not proven gone"
+        assert f"worktree {worktree.as_posix()}\n" in registered, registered
+        marker = (temp_root / RETENTION_MARKER).read_text(encoding="utf-8")
+        assert marker.startswith("hermetic preflight: "), marker
+        assert (unproven in marker) == lane.endswith("_reported"), marker
+    finally:
+        subprocess.run(["git", "worktree", "remove", "--force", str(worktree)],
+                       cwd=str(repo), capture_output=True)
+
+
+def test_the_retention_notice_precedes_the_body_and_stays_inside_the_budget():
+    from ouroboros.preflight_runner import _with_retention_notice
+
+    tree = pathlib.Path("/t/ouroboros-preflight-x/repo")
+    assert _with_retention_notice("H\nbody", "", tree, 8000) == "H\nbody"
+    kept = _with_retention_notice("H\n" + "b" * 9000, "unproven", tree, 400)
+    assert kept.startswith(f"H\nRETAINED (not deleted): {tree.parent},"), kept
+    assert len(kept) == 400
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX marker-enumeration containment")
@@ -2647,7 +2688,17 @@ def test_timeout_message_survives_an_empty_or_missing_excerpt():
 def test_hermetic_pytest_applies_candidate_diff_and_scrubs_live_env(tmp_path, monkeypatch, two_pass_env):
     """BOTH passes must see the candidate diff and the scrubbed env — a probe in
     only one lane would leave the other lane's wiring unproven."""
+    import getpass
+
     from ouroboros.preflight_runner import run_hermetic_pytest
+
+    # Model another run's stale pytest tree without touching the host temp area.
+    ambient = tmp_path / "ambient"
+    unrelated = ambient / f"pytest-of-{getpass.getuser()}" / "garbage-unrelated" / "keep.txt"
+    unrelated.parent.mkdir(parents=True)
+    unrelated.write_text("another run", encoding="utf-8")
+    for key in ("TMPDIR", "TEMP", "TMP", "PYTEST_DEBUG_TEMPROOT"):
+        monkeypatch.setenv(key, str(ambient))
 
     # 20-space indent: `_make_repo` dedents the 16-space template around it, so
     # these land one level in, inside the probe function body.
@@ -2662,6 +2713,7 @@ def test_hermetic_pytest_applies_candidate_diff_and_scrubs_live_env(tmp_path, mo
             'assert "ouroboros-preflight-" in os.environ["OUROBOROS_DATA_DIR"]',
             'assert os.environ["OUROBOROS_SETTINGS_PATH"].startswith(os.environ["OUROBOROS_DATA_DIR"])',
             'assert "ouroboros-preflight-" in os.environ["OUROBOROS_REPO_DIR"]',
+            'assert pathlib.Path(os.environ["OUROBOROS_DATA_DIR"]).parent in tmp_path.parents',
         ]
     )
     repo = _make_repo(
@@ -2670,15 +2722,17 @@ def test_hermetic_pytest_applies_candidate_diff_and_scrubs_live_env(tmp_path, mo
             "value.py": "FLAG = False\n",
             "tests/test_parallel_lane.py": f"""
                 import os
+                import pathlib
                 import extra_value
                 import value
 
 
-                def test_candidate_diff_and_env_are_hermetic():
+                def test_candidate_diff_and_env_are_hermetic(tmp_path):
 {assertions}
             """,
             "tests/test_serial_lane.py": f"""
                 import os
+                import pathlib
 
                 import pytest
 
@@ -2687,7 +2741,7 @@ def test_hermetic_pytest_applies_candidate_diff_and_scrubs_live_env(tmp_path, mo
 
 
                 @pytest.mark.serial
-                def test_candidate_diff_and_env_are_hermetic_in_serial_pass():
+                def test_candidate_diff_and_env_are_hermetic_in_serial_pass(tmp_path):
 {assertions}
             """,
         },
@@ -2702,6 +2756,7 @@ def test_hermetic_pytest_applies_candidate_diff_and_scrubs_live_env(tmp_path, mo
     monkeypatch.setenv("OUROBOROS_FAKE_API_KEY", "must-not-reach-tests")
     result = run_hermetic_pytest(repo, timeout=120)
 
+    assert unrelated.read_text(encoding="utf-8") == "another run"
     assert result is None, result
 
 
@@ -2888,10 +2943,9 @@ def test_a_green_pass_cannot_leak_a_child_into_the_next_pass(tmp_path, two_pass_
     `communicate()` returning only proves the pytest CONTROLLER exited. A test
     that spawned a child and did not wait for it leaves that child alive, and
     after the controller dies nothing can find it: the `pgrep -P` parent->child
-    walk is gone with the ppid links, and the temp-root command-line sweep misses
-    an argv that names no sweepable path. Such a child ran on into pass 2 — the
-    very cross-pass contamination the inter-pass sweep exists to prevent — and
-    then past teardown onto the machine.
+    walk is gone with the ppid links. Such a child ran on into pass 2 and then
+    past teardown onto the machine. The pass-owned container must reap it before
+    returning control to the next pass.
 
     The child here calls `setsid()` (`start_new_session=True`), which is the
     HARDEST shape: it leaves the controller's process group, so the recorded pgid
@@ -2917,9 +2971,9 @@ def test_a_green_pass_cannot_leak_a_child_into_the_next_pass(tmp_path, two_pass_
         {
             # Stdio to DEVNULL so the child does NOT hold the inherited pipe open
             # — otherwise `communicate` blocks and this becomes the timeout case
-            # that was already covered. The argv is deliberately path-free, so the
-            # temp-root sweep cannot see it either. `start_new_session=True` puts
-            # it in its OWN session and process group, so the group handle the
+            # that was already covered. The argv is deliberately path-free:
+            # ownership must not depend on path text. `start_new_session=True`
+            # puts it in its OWN session and process group, so the group handle the
             # container recorded at spawn does not cover it.
             "tests/test_leaks_a_child.py": f"""
                 import pathlib
@@ -2975,6 +3029,82 @@ def test_a_green_pass_cannot_leak_a_child_into_the_next_pass(tmp_path, two_pass_
             leaked = int(marker.read_text().strip())
             if pid_is_alive(leaked):
                 force_kill_pid(leaked)
+
+
+@requires_preflight_plugins
+@pytest.mark.skipif(os.name == "nt", reason="POSIX detached-process cleanup")
+def test_hermetic_pytest_reaps_owned_children_and_preserves_unrelated_process(
+    tmp_path, two_pass_env, monkeypatch,
+):
+    """The two-pass gate must clean its own children without claiming the host.
+
+    The pytest-lane counterpart of test_preflight_node.py's
+    `test_relative_root_reaps_owned_children_and_preserves_unrelated_process`:
+    a process the gate never started, whose argv merely NAMES a path under the
+    disposable temp root, must survive both the between-pass boundary and the
+    teardown `finally`. The temp root is pinned here only so the stranger can
+    name it before the run starts. A command-line search is intercepted even on
+    regression, so this test can never signal arbitrary host processes; real
+    container discovery still runs and still has to reap the probe's orphan."""
+    from ouroboros.preflight_runner import run_hermetic_pytest
+
+    temp_root = (tmp_path / "preflight-root").resolve()
+    temp_root.mkdir()
+    monkeypatch.setattr(tempfile, "mkdtemp", lambda *a, **k: str(temp_root))
+    marker = tmp_path / "owned.pid"
+    repo = _make_repo(tmp_path, {
+        "tests/test_leaks_a_child.py": f"""
+            import pathlib
+            import subprocess
+            import sys
+
+
+            def test_spawns_a_child_and_passes():
+                child = subprocess.Popen(
+                    [sys.executable, "-c", "import time; time.sleep(180)"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+                pathlib.Path(r'{marker}').write_text(str(child.pid), encoding="utf-8")
+        """,
+    })
+    stranger = subprocess.Popen(
+        [sys.executable, "-c", "import time; print('ready', flush=True); time.sleep(120)",
+         str(temp_root / "repo" / "unrelated.host.service")],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        start_new_session=True,
+    )
+    original_run = subprocess.run
+    broad_queries = []
+
+    def record_process_search(argv, *args, **kwargs):
+        if list(argv[:2]) == ["pgrep", "-f"]:
+            broad_queries.append(argv)
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        return original_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", record_process_search)
+    try:
+        assert stranger.stdout.readline().strip() == "ready"
+        assert run_hermetic_pytest(repo, timeout=180) is None
+        assert not broad_queries, "preflight rediscovered process ownership from command-line text"
+        assert stranger.poll() is None, "an unrelated process was killed because its argv named a path"
+        assert marker.exists(), "the owned probe never spawned its child"
+        owned = int(marker.read_text(encoding="utf-8").strip())
+        deadline = time.monotonic() + 10
+        while pid_is_alive(owned) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not pid_is_alive(owned), "an owned orphan survived the gate"
+    finally:
+        if marker.exists():
+            leaked = int(marker.read_text(encoding="utf-8").strip())
+            if pid_is_alive(leaked):
+                force_kill_pid(leaked)
+        stranger.terminate()
+        stranger.wait(timeout=10)
+        stranger.stdout.close()
 
 
 @requires_preflight_plugins
@@ -3093,8 +3223,9 @@ def test_pass2_timeout_names_serial_pass(tmp_path, two_pass_env):
 
 def test_hermetic_pytest_timeout_invokes_full_tree_reaper():
     """The timeout path must delegate to the full-tree reaper (not a bare killpg),
-    and that reaper must use the recursive PID-tree kill, escaped process-group
-    kill, and the temp-root sweep so detached/reparented children cannot survive."""
+    and the pass-owned container must reap detached/reparented descendants.
+    The timeout helper retains its captured PID-tree and process-group cleanup.
+    """
     from ouroboros import preflight_runner
 
     pass_src = inspect.getsource(preflight_runner._execute_pytest_pass)
@@ -3129,16 +3260,13 @@ def test_hermetic_pytest_timeout_invokes_full_tree_reaper():
     assert "container.reap()" in teardown
     assert "container.close()" in teardown
 
-    # The inter-pass temp-root sweep is pinned BEHAVIOURALLY by
-    # `test_temp_root_is_swept_between_passes_not_only_at_teardown`, not here: a
-    # bare `"kill_processes_referencing" in run_hermetic_pytest source` check
-    # cannot fail, because the teardown `finally` block contains that same call
-    # and predates the two-pass split.
+    # Real orphan cleanup before the next pass is covered by
+    # test_a_green_pass_cannot_leak_a_child_into_the_next_pass; timeout cleanup
+    # is covered by test_hermetic_pytest_timeout_reaps_detached_session_child.
     reaper_src = inspect.getsource(preflight_runner._terminate_preflight_tree)
     assert "kill_process_tree" in reaper_src
     assert "kill_pid_tree" in reaper_src
     assert "kill_process_group_id" in reaper_src
-    assert "kill_processes_referencing" in reaper_src
     # Platform-specific process discovery stays behind platform_layer helpers.
     assert "collect_descendant_pids" in reaper_src
 

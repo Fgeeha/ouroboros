@@ -13,7 +13,8 @@ def progress(task, text, **extra):
 
 
 @pytest.mark.parametrize('width', [390, 1440])
-def test_observed_executor_role_activity_and_project_pointer_live_replay(subscription_ui, width):
+@pytest.mark.parametrize('linux_metrics', [False, True], ids=['native-font', 'linux-metrics'])
+def test_observed_executor_role_activity_and_project_pointer_live_replay(subscription_ui, width, linux_metrics):
     ui = subscription_ui
     page = ui['page']
     page.set_viewport_size({'width':width,'height':800})
@@ -25,7 +26,13 @@ def test_observed_executor_role_activity_and_project_pointer_live_replay(subscri
                      root_task_id='root',delegation_role='subagent',subagent_role='UI reviewer',
                      model='openai/gpt-6-astra',executor_route='cursor',executor_observation=observation)
     rows = [progress('root','Inspecting the shared UI system. '+ 'Useful activity text. '*20,suggested_name='UI coherence', model='openai/gpt-6-astra'), child]
-    page.route('**/api/chat/history*',lambda route:route.fulfill(content_type='application/json',body=json.dumps({'messages':rows,'progress':[], 'window':{'complete':False,'truncated_by':['quota']}})))
+    history = {'messages': rows, 'progress': [], 'page_cursor': 'executor-recent',
+               'next_cursor': 'executor-older', 'has_more': True,
+               'window': {'complete': False, 'truncated_by': ['quota']},
+               'coverage': {'v': 1, 'view': 'executor-proof', 'upper': {'chat': 0, 'progress': 7},
+                            'spans': {'chat': {'from': 0, 'to': 0, 'chain': 'empty', 'gaps': []},
+                                      'progress': {'from': 5, 'to': 7, 'chain': 'retained', 'gaps': ['incomplete_live_line']}}}}
+    page.route('**/api/chat/history*',lambda route:route.fulfill(content_type='application/json',body=json.dumps(history)))
     page.goto(ui['url'])
     page.wait_for_selector('#chat-input')
     # A real secondary instance with its own mock WS boundary and the same history API.
@@ -64,17 +71,35 @@ def test_observed_executor_role_activity_and_project_pointer_live_replay(subscri
     assert activity.evaluate('e=>getComputedStyle(e).webkitLineClamp') == '1'
     pointer=page.locator('#executor-proof .project-work-pointer')
     assert 'UI coherence' in pointer.inner_text()
+    if linux_metrics:
+        # Exercise the Linux status-pill width without bundling another font.
+        page.add_style_tag(content='''
+            #executor-proof .chat-panel-statusbar .status-badge { min-width: 81px; }
+        ''')
     # One-line pointer: the label ellipsizes instead of wrapping the status bar open.
     label=pointer.locator('.project-work-pointer-label')
     assert label.evaluate('e=>[getComputedStyle(e).whiteSpace,getComputedStyle(e).textOverflow]')==['nowrap','ellipsis']
     assert pointer.bounding_box()['height'] <= 40
-    # Row policy: the coined name is never clipped at either width; a default desktop
-    # panel keeps one row, a phone-width panel wraps the note and pill to a second row
-    # and never a third.
+    # Pointer and pill share one row. The common history disclosure has its own
+    # readable, wrapping row; its content determines the additional bar height.
     assert label.evaluate('e=>e.scrollWidth<=e.clientWidth')
-    bar_height=page.locator('#executor-proof .chat-panel-statusbar').bounding_box()['height']
-    assert bar_height <= (80 if width < 980 else 44)
-    assert page.locator('#executor-proof .project-work-coverage').inner_text() == 'Loaded messages only'
+    bar = page.locator('#executor-proof .chat-panel-statusbar')
+    note = bar.locator('.chat-history-status')
+    assert note.inner_text() == 'Some saved history is not loaded. Shown messages may have gaps.'
+    assert page.locator('#executor-proof .chat-load-older-note').count() == 1
+    assert page.locator('#executor-proof .project-work-coverage').count() == 0
+    geometry = bar.evaluate('''bar => {
+        const box = selector => bar.querySelector(selector).getBoundingClientRect();
+        const pointer = box('.project-work-pointer'), pill = box('.status-badge'), note = box('.chat-history-status');
+        const css = getComputedStyle(bar), rect = bar.getBoundingClientRect();
+        return {pointer, pill, note, bar:rect,
+            spacing:parseFloat(css.paddingTop)+parseFloat(css.paddingBottom)+parseFloat(css.rowGap || 0)};
+    }''')
+    assert abs(geometry['pointer']['y'] - geometry['pill']['y']) <= 8
+    assert geometry['note']['y'] >= max(geometry['pointer']['bottom'], geometry['pill']['bottom'])
+    assert geometry['note']['x'] >= geometry['bar']['x']
+    assert geometry['note']['right'] <= geometry['bar']['right'] + 1
+    assert geometry['bar']['height'] <= max(geometry['pointer']['height'], geometry['pill']['height']) + geometry['note']['height'] + geometry['spacing'] + 3
     input_box=page.locator('#proof-input')
     input_box.fill('Message stays in this Project')
     pointer.click()
@@ -85,6 +110,6 @@ def test_observed_executor_role_activity_and_project_pointer_live_replay(subscri
     page.evaluate('''frame=>{for(const fn of executorProof.handlers.get('chat')||[])fn({...frame,chat_id:101})}''',terminal)
     page.wait_for_function("document.querySelector('#executor-proof [data-task-id=child]').textContent.includes('Observed: Cursor Grok 4.6')")
     assert 'Coordinator: gpt-6-astra' in card.inner_text()
-    capture(page,f'executor-card-{width}')
+    capture(page,f'executor-card-{width}-{"linux-metrics" if linux_metrics else "native-font"}')
     page.evaluate('executorProof.instance.destroy()')
     assert page.locator('#executor-proof .project-work-pointer').count()==0

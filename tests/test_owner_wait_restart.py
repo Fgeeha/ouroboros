@@ -297,3 +297,136 @@ def test_child_budget_fence_allows_only_restored_owner_continuation(restart_case
             accounting.reserve_attempt(accounting.AttemptRequest(
                 model="fixture", provider="openai", reservation_usd=1.0))
         assert refused.value.limit_scope == "root"
+
+
+def restore_project_wait(case, monkeypatch, *, registry_outage=True):
+    """Real planned-restart handoff and restore, with an optional admission outage."""
+    from ouroboros import projects_registry as registry
+    from supervisor import state, git_ops
+
+    state.init(case.root)
+    monkeypatch.setattr(git_ops, "DRIVE_ROOT", case.root)
+    room = registry.create_project(case.root, "target")
+    case.task.update(project_id="target", chat_id=room["chat_id"], admitted_dispatch="possible",
+                     _project_admission=registry.project_admission_view(case.root, "target", frozen=True))
+    first_cleanup(case)
+    acknowledge(case, monkeypatch, "launcher")
+    path = registry._registry_path(case.root)
+    original = path.read_bytes()
+    if registry_outage:
+        path.write_text("{torn", encoding="utf-8")
+    assert restore_stale_snapshot(case) == (0 if registry_outage else 1)
+    [restored] = workers.PENDING
+    assert bool(restored.get("_project_admission_restore_hold")) is registry_outage
+    path.write_bytes(original)
+    return restored
+
+
+@pytest.mark.serial
+def test_project_wait_recovers_once_after_registry_hold(restart_case, monkeypatch):
+    from tests.test_project_hold_recovery import worker
+
+    case = restart_case
+    restored = restore_project_wait(case, monkeypatch)
+    handoff = dict(restored["_owner_wait_resume"])
+    original = read_actor_source_bytes(case.root, case.task_id, handoff["source_ref"])
+    sent = worker(SimpleNamespace(root=case.root), monkeypatch)
+    workers.assign_tasks()
+    workers.assign_tasks()
+    assert [row["id"] for row in sent] == [case.task_id]
+    assert sent[0]["_attempt"] == case.attempt
+    assert sent[0]["_owner_wait_resume"] == handoff
+    assert sent[0]["admitted_dispatch"] == "possible"
+    assert not sent[0].get("_project_admission_restore_hold")
+    assert read_actor_source_bytes(case.root, case.task_id, handoff["source_ref"]) == original
+    assert owner_wait.load_owner_wait(case.ctx, handoff)["round_idx"] == 7
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("fault", ["result", "source", "transaction"])
+def test_project_wait_unreadable_authority_stays_same_id_then_recovers(restart_case, monkeypatch, fault):
+    from tests.test_project_hold_recovery import worker
+
+    case = restart_case
+    restored = restore_project_wait(case, monkeypatch, registry_outage=fault != "result")
+    if fault == "result":
+        path = case.root / "task_results" / (case.task_id + ".json")
+    elif fault == "transaction":
+        path = delegate_recovery._restart_transaction_path(case.root, case.transaction_id)
+    else:
+        path = task_artifact_dir_path(case.root, case.task_id) / case.wait["source_ref"]["path"]
+    original = path.read_bytes()
+    path.write_bytes(b"{torn")
+    sent = worker(SimpleNamespace(root=case.root), monkeypatch)
+    workers.assign_tasks()
+    workers.assign_tasks()
+    assert not sent and workers.PENDING == [restored]
+    assert restored["_project_admission_restore_hold"] and not restored.get("_terminalization_retry")
+    assert restored["admitted_dispatch"] == "possible" and path.read_bytes() == b"{torn"
+    path.write_bytes(original)
+    workers.assign_tasks()
+    workers.assign_tasks()
+    assert [row["id"] for row in sent] == [case.task_id]
+    assert sent[0]["_owner_wait_resume"]["source_ref"] == case.wait["source_ref"]
+    assert owner_wait.load_owner_wait(case.ctx, sent[0]["_owner_wait_resume"])["round_idx"] == 7
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("refusal", ["unacknowledged", "spent_wait", "panic", "owner_restart", "deadline", "ceiling",
+                                   "ceiling_unreadable_transaction", "stop"])
+def test_project_wait_positive_refusal_uses_existing_custody(restart_case, monkeypatch, refusal):
+    from ouroboros.cancel_intents import request_cancel
+    from tests.test_project_hold_recovery import worker
+
+    case = restart_case
+    restored = restore_project_wait(case, monkeypatch)
+    if refusal == "unacknowledged":
+        transaction = delegate_recovery._read_restart_transaction(case.root, case.transaction_id)
+        delegate_recovery._write_restart_transaction(case.root, {**transaction, "status": "prepared"})
+    elif refusal == "spent_wait":
+        owner_wait.set_owner_wait(case.root, case.task_id, {**case.wait, "state": "resumed"},
+                                  expected_wait_id=case.wait["wait_id"])
+    elif refusal in {"panic", "owner_restart"}:
+        name = "panic_stop.flag" if refusal == "panic" else "owner_restart_no_resume.flag"
+        (case.root / "state" / name).write_text(refusal, encoding="utf-8")
+    elif refusal == "deadline":
+        restored["deadline_at"] = "2000-01-01T00:00:00Z"
+    elif refusal.startswith("ceiling"):
+        monkeypatch.setattr("ouroboros.config.get_task_abs_ceiling_sec", lambda: 1)
+        if refusal == "ceiling_unreadable_transaction":
+            delegate_recovery._restart_transaction_path(case.root, case.transaction_id).write_bytes(b"{torn")
+    else:
+        request_cancel(case.root, case.task_id, reason="owner stopped")
+    sent = worker(SimpleNamespace(root=case.root), monkeypatch)
+    workers.assign_tasks()
+    workers.assign_tasks()
+    assert not sent and not workers.PENDING
+    stored = load_task_result(case.root, case.task_id)
+    assert stored["status"] == ("failed" if refusal == "deadline" else "cancelled")
+    assert stored.get("admission_outcome") != "never_admitted"
+    if refusal not in {"deadline", "stop"}:
+        assert stored["cancel_origin"]["reason"] == "server_shutdown"
+        assert stored["cancel_origin"]["source"] == "snapshot_restore"
+
+
+@pytest.mark.serial
+def test_project_wait_refusal_retains_custody_until_cancel_intent_is_durable(restart_case, monkeypatch):
+    from tests.test_project_hold_recovery import worker
+
+    case = restart_case
+    restored = restore_project_wait(case, monkeypatch)
+    (case.root / "state/panic_stop.flag").write_text("panic", encoding="utf-8")
+    sent = worker(SimpleNamespace(root=case.root), monkeypatch)
+    with monkeypatch.context() as patch:
+        def unavailable(*args, **kwargs):
+            raise OSError("synthetic cancel intent write failure")
+        patch.setattr("ouroboros.cancel_intents.request_cancel", unavailable)
+        workers.assign_tasks()
+        workers.assign_tasks()
+    assert workers.PENDING == [restored] and not sent
+    assert restored["_project_admission_restore_hold"] and not restored.get("_terminalization_retry")
+    assert load_task_result(case.root, case.task_id)["status"] == "running"
+    workers.assign_tasks()
+    workers.assign_tasks()
+    assert not workers.PENDING and not sent
+    assert load_task_result(case.root, case.task_id)["status"] == "cancelled"

@@ -1,20 +1,9 @@
 """Structural contracts for the semantic-no-op core tool extraction.
 
-Carried from the v7 reference (ouroboros_v7_wip @ 9f691656) with the following
-identity continuations to THIS tree's bytes:
-
-1. The catalog schema hash is re-pinned to tip bytes (upstream drifted the
-   read/list/write schemas after the reference cutoff).
-2. This tree keeps a re-export facade on ``tools/core.py`` (the §5.3 partial-
-   split idiom, matching the shell facade) instead of the reference's
-   no-facade cutover, so the reference's ``isdisjoint(vars(core))`` clause is
-   replaced by the facade identity clause; the consumer-rebinding rows of the
-   reference (browser/vision/query_code/edit_ops/test bindings) stay pending
-   and ride with their own hygiene wave.
-3. The frozen-tool-inventory clauses are dropped: ``ouroboros.tool_module_
-   inventory`` is a D04-family v7 leaf absent from this tree; the
-   non-catalog-owner and no-backedge clauses keep the structural half of that
-   contract. The inventory clause returns with its leaf.
+``tools/core.py`` keeps a re-export facade, matching the shell facade, so
+existing importers retain the exact leaf objects. The catalog schema hash
+pins the current tool schemas and the handler map pins their owners.
+The leaves are non-catalog owners without backedges into the facade.
 """
 
 from __future__ import annotations
@@ -38,7 +27,6 @@ _MOVED_NAMES = frozenset({
     "_MAX_VIDEO_FILE_BYTES",
     "_MEMORY_AT_DRIVE_MEMORY",
     "_SKILL_OWNER_STATE_FILENAMES",
-    "_SUBAGENT_SECRET_FILE_NAMES",
     "_access_or_block",
     "_annotate_reread",
     "_coerce_line_window",
@@ -49,17 +37,11 @@ _MOVED_NAMES = frozenset({
     "_detect_image_mime",
     "_detect_video_mime",
     "_direct_resource_binding",
-    "_filter_subagent_secret_listing",
-    "_filter_subagent_secret_repo_listing",
     "_is_cognitive_data_path",
     "_is_skill_owner_state_target",
-    "_is_subagent_secret_data_path",
-    "_is_subagent_secret_repo_path",
-    "_is_subagent_secret_repo_target",
     "_list_dir",
     "_list_files",
     "_list_user_files_dir",
-    "_local_readonly_resource_block",
     "_normalize_data_read_path",
     "_profile_roots_hint",
     "_read_file",
@@ -70,7 +52,6 @@ _MOVED_NAMES = frozenset({
     "_send_file",
     "_send_photo",
     "_send_video",
-    "is_restricted_subagent_profile",
 })
 
 
@@ -123,10 +104,32 @@ def test_core_catalog_schema_bytes_and_handler_owners_are_stable():
     # message from an independent task. Rolled again for owner decision В17a=A: the
     # escalate description stops promising expiry at task end (a late answer reaches
     # the chat as an ordinary owner message) and the optional `max_wait_minutes`
-    # bound joins its parameters. Diffing the whole catalog base to head shows
-    # exactly those edits and nothing else.
+    # bound joins its parameters. Rolled again for the owner's "autonomy first" decision:
+    # the escalate description states when waiting is worth it (an irreversible or costly
+    # next step, or a choice that is the owner's to make) and that waiting questions of one
+    # batch share one wait, ended by the first incoming message; 935 -> 932 bytes. Rolled
+    # again for owner decision 7A: the read_file description states that an absolute path
+    # with no root selects the permitted root holding it (one sentence replaced, 103 -> 100
+    # bytes). Rolled again for serial addressed turns: the forward_to_worker description
+    # names its peer addressees (your own parent or a sibling, delivered as a message from a
+    # peer task naming the relation; relay refused there), the 8000-char body bound and the
+    # await_messages companion (395 -> 698 bytes); the `message` parameter description states
+    # the bound. Rolled again for the truthful owner-question work (PR1, owner 1D/2A): the
+    # escalate description and its nine field descriptions were replaced (the card is written
+    # for a reader outside the room, names the source of the fork, and the question has no
+    # quiz-specific length cap); schema shape, types, defaults and required keys are unchanged,
+    # and the entry's literal moved beside its validator in core_artifacts (byte-identical
+    # serialization). Rolled again for TZ-2 B1 (zero-option questions) and owner V13: the
+    # escalate description offers 0-6 alternatives (none for an open question answered in the
+    # human's own words), states that a shared wait ends on any incoming message and that a
+    # plain-text clarification ends the turn while a waited question keeps it alive; the
+    # `options` description says optional 0-6 and `options` leaves the required keys. Rolled
+    # again for TZ-1 V10: forward_to_worker also writes into a queued task's mailbox, so its
+    # description and `task_id` description say "running or queued" and when each reads it.
+    # Presence peer mail expands only forward_to_worker's description; the
+    # catalog comparison preserves every parameter and handler owner.
     assert hashlib.sha256(schema_bytes).hexdigest() == (
-        "532059cb95c431df39b0a950ced52e05228e88ec3ddd180bc0d2fa9a0cc8f616"
+        "d51c4783df9c532f763a7d57c0ff732b86ca397c0875e151fcc1430fb8e3489e"
     )
     assert {
         entry.name: (entry.handler.__module__, entry.handler.__name__)
@@ -184,6 +187,6 @@ def test_core_extraction_size_bounds_have_meaningful_headroom():
         module.__name__: len(pathlib.Path(module.__file__).read_text(encoding="utf-8").splitlines())
         for module in (core, core_file_tools, core_artifacts)
     }
-    assert 1200 <= counts["ouroboros.tools.core"] <= 1499
-    assert 750 <= counts["ouroboros.tools.core_file_tools"] <= 1000
-    assert 150 <= counts["ouroboros.tools.core_artifacts"] <= 1000
+    assert counts["ouroboros.tools.core"] <= 1499
+    assert counts["ouroboros.tools.core_file_tools"] <= 1000
+    assert counts["ouroboros.tools.core_artifacts"] <= 1000

@@ -77,16 +77,24 @@ def context(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("strategy", ["direct", "copy"])
-def test_start_uses_normal_writing_mode_without_git_or_fake_snapshot(tmp_path, monkeypatch, strategy):
+@pytest.mark.parametrize("access", ["workspace_write", "full"])
+def test_start_uses_normal_writing_mode_without_git_or_fake_snapshot(tmp_path, monkeypatch, strategy, access):
     from ouroboros.gateways import claudexor
+    import tests._delegated_transport_shared as shared
     ctx, target = context(tmp_path, monkeypatch)
     engine = DirectoryEngine(target, strategy)
+    engine.profiles = ("readonly", "workspace_write", "full")
+    snapshot = shared._transport_snapshot
+    monkeypatch.setattr(shared, "_transport_snapshot", lambda route: {**snapshot(route), "access": access})
+    grants = []
+    monkeypatch.setattr(engine, "ensure_full_access", lambda root: grants.append(root), raising=False)
     monkeypatch.setattr(claudexor, "ClaudexorGateway", lambda *a, **k: engine)
     result = json.loads(delegate._delegate_start(ctx, "edit documents", directory_strategy=strategy, scope_paths=["."]).text)
     assert result["status"] == "started", result
     request, key = engine.posts[0]
     assert request["scope"]["root"] == str(target)
-    assert request["mode"] == "agent" and request["access"] == "workspace_write"
+    assert request["mode"] == "agent" and request["access"] == access
+    assert grants == ([str(target)] if access == "full" else [])
     assert request["execution"]["workspaceKind"] == "directory"
     assert request["execution"]["isolation"] == ("live" if strategy == "direct" else "envelope")
     assert request["execution"]["scopePaths"] == ["."]
@@ -161,7 +169,8 @@ def test_a_git_workspace_treats_the_named_default_as_omission_and_still_refuses_
     # differ by construction; every OTHER key and value must match, including the
     # key set itself — that is what "took the omitted path" means here.
     per_case = ("root", "execution_root", "snapshot_id", "baseline_sha", "baseline_id",
-                "baseline_manifest_read", "run_id", "invocation_id", "authority_target_root")
+                "baseline_manifest_read", "run_id", "invocation_id", "authority_target_root",
+                "snapshot")  # the receipt's provisioning facts carry wall-clock seconds (#1241)
     compared = lambda payload: {key: ("<per-case identity>" if key in per_case else value)
                                 for key, value in payload.items()}
     omitted, omitted_engine = _git_workspace_start(tmp_path, monkeypatch, "omit")
@@ -291,3 +300,11 @@ def test_lost_start_replays_original_processing_facts_after_setting_changes(tmp_
     assert retried["status"] == "started" and retried["processing"] == original
     assert engine.posts[0] == engine.posts[1]
     assert engine.posts[1][0]["processingPreference"] == "economy"
+    held = custody.replay(ctx.drive_root)["directory-run"]
+    assert held.processing_preference == "economy"
+    assert held.effort == engine.posts[1][0].get("effort", "")
+    from ouroboros.subagent_history import record_session_execution, subagent_last_delegation
+    monkeypatch.setattr(custody, "invocation_record", lambda *_a, **_kw: pytest.fail("history scanned an invocation"))
+    record_session_execution(ctx.drive_root, held,
+        {"summary": {"state": "succeeded", "finishedAt": "2099-01-01T00:00:00Z"}}, {})
+    assert subagent_last_delegation(ctx.drive_root)["identity"]["processing_preference"] == "economy"

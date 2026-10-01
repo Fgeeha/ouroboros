@@ -166,11 +166,14 @@ def test_update_project_provenance_fields_and_tombstone(tmp_path):
     folder = tmp_path / "keepme"
     folder.mkdir()
     update_project(data, "p1", working_dir=str(folder))
+    before_deletion = get_project(data, "p1")["routing_generation"]
     with pytest.raises(RuntimeError, match="cancellation/quiescence"):
         delete_project(data, "p1")
     deleting = begin_project_deletion(data, "p1")
     assert deleting["lifecycle"] == "deleting"
-    assert deleting["routing_generation"] == 1
+    # The preceding working-dir change also advances the routing generation;
+    # deletion must advance from THAT source instead of resetting the count.
+    assert deleting["routing_generation"] == before_deletion + 1
     complete_project_deletion(data, "p1")
     assert delete_project(data, "p1") is True  # idempotent compatibility completion
     assert get_project(data, "p1") is None
@@ -463,3 +466,48 @@ def test_promote_source_registers_derived_project_and_mirrors_conflict(tmp_path,
     )
     ws4, _, err4, _, _ = resolve_promote_source(ctx, "https://example.com/myrepo.git", "myrepo")
     assert ws4 == "" and "conflict" in err4
+
+
+def test_promote_with_a_source_keeps_the_display_name_the_model_gave(tmp_path, monkeypatch):
+    """A sourced promotion registers the row in its off-loop half, BEFORE the named create.
+
+    ``create_project`` returns an existing row untouched, so the name must reach the first
+    call: withheld, a non-Latin name (whose id is ``proj_<digest>``) showed the id everywhere.
+    """
+    from types import SimpleNamespace
+
+    import ouroboros.config as config
+    from ouroboros.project_facts import project_id_from_display_name
+    from ouroboros.projects_registry import PROJECT_NAME_MAX, create_project, get_project
+    from ouroboros.promotion_source import resolve_promote_source
+
+    data = tmp_path / "data"
+    data.mkdir()
+    monkeypatch.setattr(config, "DATA_DIR", data)
+    ctx = SimpleNamespace(repo_dir=str(tmp_path / "repo"))
+    name = "Переключатели субагентов"
+    pid = project_id_from_display_name(name)
+    assert pid.startswith("proj_")  # no Latin slug: the id is a digest, the NAME is what people read
+    folder = tmp_path / "work"
+    folder.mkdir()
+
+    _, _, err, got, created = resolve_promote_source(ctx, str(folder), pid, project_name=name)
+    assert err == "" and got == pid and created is True
+    assert get_project(data, pid)["name"] == name
+    # The worker-side named create that follows finds the row and changes nothing.
+    assert create_project(data, pid, name=name, origin="promote_chat_to_task")["created"] is False
+    assert get_project(data, pid)["name"] == name
+
+    # No name given stays what it was: the row is named by its id.
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    _, _, err2, pid2, _ = resolve_promote_source(ctx, str(plain), "plain-project")
+    assert err2 == "" and get_project(data, pid2)["name"] == "plain-project"
+
+    # A title over the registry limit never turns a finished clone/attach into a refusal.
+    longer = tmp_path / "longer"
+    longer.mkdir()
+    _, _, err3, pid3, created3 = resolve_promote_source(
+        ctx, str(longer), "long-title", project_name="x" * (PROJECT_NAME_MAX + 1))
+    assert err3 == "" and created3 is True and get_project(data, pid3)["name"] == "long-title"
+

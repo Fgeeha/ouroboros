@@ -922,12 +922,13 @@ export function createChatMedia({
         }
         function appendQuizMessage(msg) {
             const quizId = String((msg.quiz && msg.quiz.quiz_id) || msg.quiz_id || '');
-            const key = `quiz:${msg.task_id || ''}:${quizId}`;
+            const keys = keysFor(msg, `quiz:${msg.task_id || ''}:${quizId}`);
             // The decision controller updates the existing keyed card, keeping
-            // drafts/focus when targeted detail and ordinary history overlap.
+            // drafts/focus when targeted detail and ordinary history overlap. A
+            // card first shown live gains the row history names, as media does.
             const bubble = buildQuizCard ? buildQuizCard(msg) : null;
-            if (!bubble) return false;
-            rememberMessageKey(key);
+            if (!bubble) { alreadyRendered(msg, keys); return false; }
+            rememberBubble(bubble, keys);
             return insertMessageNode(bubble) !== false;
         }
         // Media frames carry no activity identity: hide the dots row but keep

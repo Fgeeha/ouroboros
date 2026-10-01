@@ -27,8 +27,9 @@ half below has no such bound and holds on the working tree forever.
 
 The entrypoint preamble is deliberately NOT part of the byte proof: it was
 replaced by one merged/authored paragraph plus the `## Chapters` membership
-list, and `docs/reference-books-migration.md` records what it said before. Its
-H1 line IS pinned here, because that line is the release version carrier.
+list. The historical `docs/reference-books-migration.md` blob at the split
+commit records the former preamble; that file is no longer needed in HEAD.
+The H1 line IS pinned here, because it is the release version carrier.
 """
 
 import hashlib
@@ -44,8 +45,8 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 # The integration base this migration was cut from.
 MIGRATION_BASE = "5585133db86419c1a28673e498de4fb13c6b2d1e"
 
-# Found by content, not pinned: the commit that ADDED the operator transfer
-# table is the split commit.
+# Historical lookup key, not a current-file dependency: the commit that
+# ADDED the former operator transfer table is the split commit.
 TRANSFER_TABLE = "docs/reference-books-migration.md"
 
 # Recorded at the base commit by the split itself (and mirrored in the transfer
@@ -81,7 +82,8 @@ def _git(*args: str) -> bytes | None:
 
 
 def _migration_commit() -> str | None:
-    out = _git("log", "--diff-filter=A", "--format=%H", "--", TRANSFER_TABLE)
+    # Contributor merges can simplify away a deleted path on one parent.
+    out = _git("log", "--full-history", "--diff-filter=A", "--format=%H", "--", TRANSFER_TABLE)
     lines = [line for line in (out or b"").decode().split("\n") if line.strip()]
     return lines[-1] if lines else None
 
@@ -154,7 +156,11 @@ def test_entrypoint_keeps_its_h1_line_and_carries_only_the_membership(book_id):
     rel = BOOK_ENTRYPOINTS[book_id]
     raw = (REPO / rel).read_bytes()
     lines = raw.decode("utf-8").split("\n")
-    assert lines[0] == OLD_MONOLITHS[book_id]["h1"]
+    # The architecture h1 is a release version carrier (`release_sync` rewrites
+    # its version token on every bump): the whole line stays pinned, and only
+    # that token follows VERSION instead of the split-time 7.0.0.
+    version = (REPO / "VERSION").read_text(encoding="utf-8").strip()
+    assert lines[0] == OLD_MONOLITHS[book_id]["h1"].replace("v7.0.0", f"v{version}")
     book = load_reference_book(REPO, book_id)
     # One `## Chapters` heading and nothing else: the entrypoint orients, the
     # chapters carry the book.
@@ -174,16 +180,3 @@ def test_no_chapter_body_was_reheaded_into_a_duplicate_title():
         titles = [h.title for source in (book.entrypoint, *book.chapters) for h in source.headings]
         duplicates = sorted({t for t in titles if titles.count(t) > 1})
         assert not duplicates, f"{book_id}: ambiguous section titles {duplicates}"
-
-
-def test_the_transfer_table_is_committed_and_is_not_a_book_member():
-    table = REPO / TRANSFER_TABLE
-    assert table.is_file(), "the operator transfer table must be reviewable"
-    text = table.read_text(encoding="utf-8")
-    assert MIGRATION_BASE in text
-    for book_id in BOOK_ENTRYPOINTS:
-        book = load_reference_book(REPO, book_id)
-        assert TRANSFER_TABLE not in [c.source_path for c in book.chapters]
-        for chapter in book.chapters:
-            assert f"`{chapter.source_path}`" in text, chapter.source_path
-        assert OLD_MONOLITHS[book_id]["moved_sha256"] in text

@@ -26,6 +26,7 @@ def schedule_subagent_properties() -> Dict[str, Any]:
     Returns a FRESH mapping per call, exactly as the inline literal did, so a caller that mutates
     a returned schema cannot corrupt every later `get_tools()`."""
     from ouroboros.tool_access import SUBAGENT_CAPABILITIES
+    from ouroboros.configured_subagents import SESSION_ACCESS_LOWERING
 
     return {
         "subagent_id": {
@@ -35,16 +36,42 @@ def schedule_subagent_properties() -> Dict[str, Any]:
                 "snapshotted into the child, so later Settings edits do not retarget it."
             ),
         },
+        "access": {"type": "string", "enum": ["inherit", *SESSION_ACCESS_LOWERING], "default": "inherit", "description":
+            "Default inherit (or omit) preserves the owner's Agent-session access. "
+            "readonly or workspace_write may only lower it. For API-model rows this field "
+            "is ignored with a disclosure; write_surface controls read/write authority. "
+            "This does not change write_surface or grant task authority; readonly tasks stay readonly."},
         "objective": {"type": "string", "description": "Focused child objective. Be specific about scope. State the OUTCOME you need, not a step-by-step script: on a delegated (harness) dispatch the child forwards the work to its own delegated run, and a script-shaped objective reads as orders to execute natively."},
         "expected_output": {"type": "string", "description": "Concrete handoff expected from the child."},
         "role": {"type": "string", "description": "Optional freeform role label for lineage/UI, e.g. architecture-reviewer."},
         "context": {"type": "string", "description": "Optional parent reference material. It is injected as context, not instructions; for a harness-dispatched child it becomes the WORK ORDER for its delegated run's prompt, so put the recipe/details here rather than in the objective."},
+        "input_sources": {
+            "type": "string", "enum": ["shared", "declared"],
+            "description": (
+                "Omit or shared for ordinary shared context. declared selects only the authored "
+                "objective/context/constraints and full governance/task authority as automatic inputs; "
+                "it excludes automatic shared memory, dialogue, project knowledge, inherited parent "
+                "context and attachments. Put common evidence explicitly in context. API-model "
+                "children only; inherited declared cannot be widened by descendants. Selection lasts "
+                "for the task; the assignment defines first-position retention and collaboration. "
+                "Tool results and messages can broaden the input. This selector prescribes no "
+                "exchange sequence or transport and is not access isolation or a claim about "
+                "provider context or learned priors."
+            ),
+        },
         "constraints": {"type": "string", "description": "Optional constraints/non-goals for the child."},
         "memory_mode": {
             "type": "string",
             "enum": sorted(VALID_SUBTASK_MEMORY_MODES),
-            "description": "Child memory mode. Default forked copies stable memory only; empty starts blank. shared is disabled for live local subagents.",
+            "description": (
+                "Seed of the child's OWN execution drive. Default forked copies stable memory files there "
+                "(identity, WORLD, registry and knowledge; a Project child gets only the shared patterns); "
+                "empty seeds that drive with nothing. In ordinary mode the child's context is still built from the "
+                "canonical governance (BIBLE, SYSTEM, reference books) and the canonical data root's shared "
+                "memory, so empty is a blank drive, not a blank context. shared is disabled for live local subagents. "
+                "input_sources=declared independently selects automatic inputs."),
         },
+        "workspace_root": {"type": "string", "description": "Optional folder, inherited from the parent when omitted. Read-only helpers start exactly here, including Git subdirectories. For self_worktree this selects the Git source copied with its current files into the isolated working tree. For external_workspace an explicit write_root must name the same folder; omit workspace_root for genesis, which provisions an empty project. The folder must already be readable by the parent and grants no read or write authority."},
         "write_surface": {
             "type": "string",
             # No empty-string member: Google Gemini's function-calling validator
@@ -55,9 +82,9 @@ def schedule_subagent_properties() -> Dict[str, Any]:
             # self_worktree (the trap behind the read-only-audit cancel-storm). It is NOT
             # an acting VALID_WRITE_SURFACES member — it normalizes to the omit path.
             "enum": ["read_only", "self_worktree", "external_workspace", "genesis"],
-            "description": "read_only (or omit) = read-only child auditing THIS repo. A MUTATIVE child uses self_worktree (isolated repo patch), external_workspace (native children write shared files directly), or genesis (standalone project). See tool description for integration. Acting surfaces require mutative subagents enabled (default ON in advanced/pro).",
+            "description": "read_only (or omit) = read-only child starting in workspace_root or the inherited folder. A MUTATIVE child uses self_worktree (isolated current-tree Git copy of workspace_root or the inherited source, returning a patch for parent integration), external_workspace (native children write shared files directly), or genesis (standalone project). See tool description for integration. Acting surfaces require mutative subagents enabled (default ON in advanced/pro).",
         },
-        "write_root": {"type": "string", "description": "For write_surface=external_workspace: the external project directory, with or without Git, never runtime data. An installed skill payload has its own resource address: delegate it directly with delegate_start(subagent_id=..., prompt=..., root='skill_payload', bucket=..., skill_name=...). OMIT write_root to build COOPERATIVELY from scratch — the host mints ONE shared git tree the whole subagent tree writes into together (deeper descendants inherit it), and you verify the combined files with integrate_subagent_patch without reapplying them. Ignored for self_worktree and genesis (both auto-provisioned)."},
+        "write_root": {"type": "string", "description": "For write_surface=external_workspace: the external project directory, with or without Git, never runtime data. An installed skill payload has its own resource address: delegate it directly with delegate_start(subagent_id=..., prompt=..., root='skill_payload', bucket=..., skill_name=...). OMIT write_root to build COOPERATIVELY from scratch — the host mints ONE shared git tree the whole subagent tree writes into together (deeper descendants inherit it), and you verify the combined files with integrate_subagent_patch without reapplying them. Ignored for self_worktree (workspace_root selects its source), read_only and genesis (which provisions its own empty root)."},
         "directory_strategy": {
             "type": "string", "enum": ["direct", "copy"],
             "description": "For an agent_session in an ordinary folder: direct works in the selected folder; copy works in a separate copy of scope_paths and returns changes for application. Choose according to the task and any owner preference. Omit for direct ordinary-folder work. Write-capable children only: a read-only child omits both this and scope_paths (direct with no scope is the same as omitting). Native/API children use shared files directly and do not support copy.",
@@ -124,7 +151,7 @@ _INTERNAL_SCHEDULE_OPTIONS: frozenset = frozenset()
 def _validated_schedule_fields(params: Dict[str, Any], *, ctx: Any = None) -> tuple[Dict[str, Any], str]:
     """Normalize and validate the public schedule_subagent fields.
 
-    Returns ``(fields, "")`` or ``({}, refusal)``. Extracted from ``_schedule_task`` so
+    Returns ``(fields, "")`` or ``({optional reason}, refusal)``. Extracted from ``_schedule_task`` so
     the handler stays inside the method-size gate — argument validation is a coherent
     phase with one job, not a slice taken to shed lines.
     """
@@ -221,6 +248,20 @@ def _validated_schedule_fields(params: Dict[str, Any], *, ctx: Any = None) -> tu
     parent = metadata.get("task_contract") if isinstance(metadata.get("task_contract"), dict) else {}
     if not parent and isinstance(getattr(ctx, "task_contract", None), dict):
         parent = ctx.task_contract
+    from ouroboros.contracts.task_contract import normalize_input_sources
+
+    input_source_fields = {}
+    try:
+        if "input_sources" in parent:
+            input_source_fields["input_sources"] = normalize_input_sources(parent["input_sources"])
+        if "input_sources" in params:
+            selected = normalize_input_sources(params["input_sources"])
+            if input_source_fields.get("input_sources") == "declared" and selected != "declared":
+                return {"reason": "INPUT_SOURCE_SELECTION_WIDENING"}, (
+                    "⚠️ TOOL_ARG_ERROR (schedule_subagent): input_sources=shared cannot widen an inherited declared selection.")
+            input_source_fields["input_sources"] = selected
+    except ValueError as exc:
+        return {"reason": "INPUT_SOURCE_SELECTION_INVALID"}, f"⚠️ TOOL_ARG_ERROR (schedule_subagent): {exc}."
     resource_policy = normalize_resource_policy(parent.get("resource_policy") or metadata.get("resource_policy"))
     if "allowed_origins" in params:
         requested = params["allowed_origins"]
@@ -243,6 +284,7 @@ def _validated_schedule_fields(params: Dict[str, Any], *, ctx: Any = None) -> tu
         "acceptance_claims": acceptance_claims,
         "resource_policy": resource_policy,
         "parent_contract": parent,
+        **input_source_fields,
         **directory_options,
     }, ""
 

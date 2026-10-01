@@ -9,9 +9,9 @@ from ouroboros.gateways.claudexor import final_attempt_facts
 from ouroboros.llm_claudexor import (
     ClaudexorModelError,
     _ModelInvocation,
-    _remember_failed_profile,
     _request,
 )
+from ouroboros.llm_substitution import remember_failed_profile
 
 
 def _write_telemetry(tmp_path, attempts, *, final_id="a02", run_id="run-fixture"):
@@ -116,12 +116,11 @@ def test_missing_engine_run_directory_never_reads_the_working_directory(detail, 
     assert final_attempt_facts(detail, "run-fixture") == {}
 
 
-@pytest.mark.parametrize("applied,expected", [
-    ({"reasoningEffort": "xhigh"}, "confirmed"),
-    ({"reasoningEffort": "medium"}, "mismatch"),
-    (None, "unknown"),
+@pytest.mark.parametrize("applied", [
+    {"reasoningEffort": "xhigh"}, {"reasoningEffort": "medium"}, None, {},
+    {"cacheKey": "unrelated"}, {"reasoningEffort": None},
 ])
-def test_model_invocation_records_requested_and_applied_options(applied, expected):
+def test_model_invocation_records_requested_and_applied_options(applied):
     requested = {"reasoningEffort": "xhigh"}
     invocation = _ModelInvocation(
         {"usage_model": "claudexor::codex=model"}, {"options": requested}, {}
@@ -137,7 +136,8 @@ def test_model_invocation_records_requested_and_applied_options(applied, expecte
     observed = usage["claudexor"]
     assert observed["requested_options"] == requested
     assert observed["applied_options"] == applied
-    assert observed["options_honored"] == expected
+    assert usage["effort"]["reported"] == (applied or {}).get("reasoningEffort")
+    assert usage["effort"]["report_source"] == ("provider_applied_options" if isinstance(applied, dict) and applied.get("reasoningEffort") is not None else None)
 
 
 def test_a_differently_echoed_cache_key_is_a_durable_mismatch_of_its_own():
@@ -152,7 +152,8 @@ def test_a_differently_echoed_cache_key_is_a_durable_mismatch_of_its_own():
         "appliedOptions": {"reasoningEffort": "xhigh", "cacheKey": "engine-b"},
     })
 
-    assert usage["claudexor"]["options_honored"] == "mismatch"
+    assert usage["claudexor"]["requested_options"] == requested
+    assert usage["claudexor"]["applied_options"] == {"reasoningEffort": "xhigh", "cacheKey": "engine-b"}
 
 
 def _continuation(profile="profile-a", source="codex", model="gpt-6"):
@@ -181,7 +182,7 @@ def test_status_null_failure_suppresses_only_the_next_same_route_preference():
         route={"source": "codex", "model": "gpt-6", "credentialProfileId": "profile-a"},
         unknown=True,
     )
-    _remember_failed_profile(target, parameters, error)
+    remember_failed_profile(target, parameters, error)
 
     assert _request(target, _continuation(), None, parameters)["account"] == {"mode": "auto"}
     assert _request(target, _continuation(), None, parameters)["account"] == {
@@ -198,7 +199,7 @@ def test_failure_fact_survives_an_interleaved_request_on_another_route():
         route={"source": "codex", "model": "gpt-6", "credentialProfileId": "profile-a"},
         unknown=True,
     )
-    _remember_failed_profile(target, parameters, error)
+    remember_failed_profile(target, parameters, error)
 
     # A request on another route neither consumes the fact nor loses its own preference.
     assert _request(other, _continuation("profile-b", "claude", "sonnet"), None, parameters)["account"] == {
@@ -218,14 +219,14 @@ def test_failure_fact_does_not_change_pin_or_single_account_auto_mode():
          "context": {"httpStatus": 429}},
         route={"source": "codex", "model": "gpt-6", "credentialProfileId": "only-profile"},
     )
-    _remember_failed_profile(target, parameters, error)
+    remember_failed_profile(target, parameters, error)
 
     pinned = _request(target, _continuation("only-profile"), None, {
         **parameters, "model_account_override": "only-profile",
     })
     assert pinned["account"] == {"mode": "pin", "profileId": "only-profile"}
 
-    _remember_failed_profile(target, parameters, error)
+    remember_failed_profile(target, parameters, error)
     assert _request(target, _continuation("only-profile"), None, parameters)["account"] == {
         "mode": "auto",
     }

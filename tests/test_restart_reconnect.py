@@ -50,7 +50,8 @@ def test_chat_resyncs_history_after_reconnect():
     # window constants govern; the dead `?limit=1000` placebo is gone.
     client = _read("web/modules/api_client.js")
     history = client[client.index("chatHistory:"):client.index("health:")]
-    assert "await apiClient.chatHistory({ chatId })" in source
+    assert "await fetchHistory(null)" in source
+    assert "apiClient.chatHistory({ chatId, cursor, ...options })" in source
     assert "if (chatId !== 1) params.set('chat_id', String(chatId));" in history
     assert "const query = params.toString();" in history
     assert "fetchJson(`/api/chat/history${query ? `?${query}` : ''}`" in history
@@ -307,18 +308,21 @@ def test_no_severity_keyed_visibility_writer_survives_restart_paths():
 
 
 def test_chat_scrolls_to_bottom_after_first_history_load():
-    """syncHistory must scroll to bottom on first load (restart/open) but
-    respect user scroll position on subsequent reconnect syncs."""
+    """Fresh first load follows latest; saved reading intent and reconnect
+    use the shared position owner rather than unconditional first-load pinning."""
     source = _read("web/modules/chat.js")
     media_source = _read("web/modules/chat_media.js")
     # First-load guard: wasFirstLoad captures pre-call state
     assert "wasFirstLoad = !historyLoaded" in source, \
         "Missing first-load detection before setting historyLoaded"
-    # Conditional scroll: first load always scrolls, reconnect only when near bottom
-    assert "if (wasFirstLoad || (fromReconnect ? scrollBeforeSync.nearBottom : isNearBottom()))" in source, \
-        "Missing conditional scroll-to-bottom after history sync"
-    assert "anchor: captureVisibleTimelineAnchor()" in source
-    assert "restoreVisibleTimelineAnchor(scrollBeforeSync.anchor)" in source, \
+    # Pending data-aware restore wins over first-load/latest following.
+    assert "if (reading.pending)" in source and "reading.position();" in source
+    assert "else if (wasFirstLoad && reading.stick)" in source
+    assert "reading.followAfterLayout();" in source
+    position = _read("web/modules/chat_reading_position.js")
+    assert "const follow = forceFollow || (state.stick && state.nearBottom());" in position
+    assert "const anchor = follow ? null : anchors.capture(excludeAnchorNode);" in position
+    assert "else anchors.restore(anchor);" in position, \
         "Reconnect must restore a visible DOM anchor, not apply total height growth"
     # The anchor pair lives in chat_render_batch.js (extracted verbatim from
     # chat.js at the byte ratchet); the identity contract is unchanged.
@@ -343,8 +347,8 @@ def test_chat_scrolls_to_bottom_after_first_history_load():
     assert "const parent = liveCardRecords.get(record.parentGroupId);" in source
     assert "seen.has(record.groupId)" in source, \
         "Nested subagent timestamps must propagate to the top-level ancestor safely"
-    assert "if (wasFirstLoad) scrollToBottomAfterLayout();" in source, \
-        "First load must pin the fresh feed to the newest message explicitly"
+    assert "stick: initial ? initial.stick !== false : true" in position, \
+        "Only a fresh feed defaults to following latest; an archived bookmark must not be overwritten"
     # The shared photo/video builder and the separate document builder must
     # each stamp sortable data-ts from the raw source timestamp.
     bubble_frame = media_source.split("function bubbleFrame", 1)[1].split(
@@ -373,8 +377,13 @@ def test_restart_watchdog_waits_for_uvicorn_exit():
     assert "_uvicorn_exited.set()" in source
 
 
-def test_owner_restart_copy_is_explicit_about_stopped_task():
-    source = _read("server.py")
+def test_owner_restart_copy_is_explicit_about_stopped_task(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import server
+
+    from ouroboros import server_restart
+
+    source = _read("ouroboros/server_restart.py")
     assert "Stopping active task. New settings apply to the next message." in source
     assert "owner_restart_no_resume.flag" in source
     assert "owner_restart_no_resume" in source
@@ -383,12 +392,38 @@ def test_owner_restart_copy_is_explicit_about_stopped_task():
     assert "stable_skip_flag.unlink(missing_ok=True)" in source
     # Checkout gate first (a refusal leaves the server intact), then the durable
     # no-resume intent, then the owned-work stop, then the owner's stop notice.
-    owner_restart = source.split('elif lowered.startswith("/restart"):', 1)[1].split(
+    owner_restart = _read("server.py").split('lowered.startswith("/restart"):', 1)[1].split(
         'elif lowered == "/review"', 1
     )[0]
-    notice = owner_restart.index("Stopping active task. New settings apply to the next message.")
-    assert (owner_restart.index("_safe_restart_serialized(") < owner_restart.index("owner_restart_no_resume.flag")
-            < owner_restart.index("_stop_owned_work(ctx)") < notice)
+    assert "_perform_owner_restart(ctx, reply)" in owner_restart
+    flags = tmp_path / "state"
+    calls = []
+    ctx = SimpleNamespace(safe_restart=object())
+
+    def checked(function, **kwargs):
+        assert function is ctx.safe_restart and not flags.exists()
+        assert kwargs == {"reason": "owner_restart", "unsynced_policy": "rescue_and_reset"}
+        calls.append("checked")
+        return True, "ok"
+
+    def stopped(actual):
+        assert actual is ctx
+        assert (flags / "owner_restart_no_resume.flag").read_text(encoding="utf-8") == "owner_restart"
+        assert (flags / "panic_stop.flag").read_text(encoding="utf-8") == "owner_restart_no_resume"
+        calls.append("stopped")
+        return ["active-task"]
+
+    def notice(text, _suffix):
+        assert calls == ["checked", "stopped"]
+        assert text == "Stopping active task. New settings apply to the next message."
+        calls.append("notice")
+
+    monkeypatch.setattr(server_restart, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(server_restart, "_safe_restart_serialized", checked)
+    monkeypatch.setattr(server_restart, "_stop_owned_work", stopped)
+    monkeypatch.setattr(server_restart, "_request_restart_exit", lambda owner: calls.append(("exit", owner)))
+    assert server._perform_owner_restart(ctx, notice) == (True, "")
+    assert calls == ["checked", "stopped", "notice", ("exit", True)]
     stop = _read("ouroboros/server_restart.py").split("def _stop_owned_work", 1)[1]
     assert (stop.index("request_cancel(") < stop.index("ctx.kill_workers(")
             < stop.index("reconcile_orphaned_runs(") < stop.index("stop_outcome()"))
@@ -467,7 +502,7 @@ def test_owner_restart_proceeds_when_worker_shutdown_fails(tmp_path, monkeypatch
             mutator(live)
             return live
 
-        def send_with_budget(self, _chat_id, text):
+        def send_with_budget(self, _chat_id, text, **kwargs):
             messages.append(text)
 
         def safe_restart(self, **_kwargs):
@@ -482,7 +517,7 @@ def test_owner_restart_proceeds_when_worker_shutdown_fails(tmp_path, monkeypatch
     monkeypatch.setattr(server_restart, "DATA_DIR", tmp_path)
     monkeypatch.setattr(config, "DATA_DIR", tmp_path)
     monkeypatch.setattr(message_bus, "log_chat", lambda *args, **kwargs: None)
-    monkeypatch.setattr(server, "_request_restart_exit", lambda owner=False: exits.append(owner))
+    monkeypatch.setattr(server_restart, "_request_restart_exit", lambda owner=False: exits.append(owner))
 
     server._process_bridge_updates(Bridge(), 0, Ctx())
 
@@ -518,7 +553,7 @@ def test_ws_sha_reload_decision_is_single_sourced():
         "arming recovery must be gated on the in-flight probe flag so hung "
         "probes cannot pile up and multi-count the healthy fuse"
     )
-    refresh_body = source.split("_refreshStateAfterOpen(previouslyConnected) {", 1)[1].split(
+    refresh_body = source.split("\n    _refreshStateAfterOpen(", 1)[1].split(
         "_flushPendingMessages() {", 1
     )[0]
     assert "_applyShaDecision(servedSha, previouslyConnected, true)" in refresh_body, (
@@ -570,7 +605,7 @@ def test_only_an_owner_restart_asks_for_the_runtime_mode_to_be_re_read(tmp_path,
             mutator(live)
             return live
 
-        def send_with_budget(self, _chat_id, _text):
+        def send_with_budget(self, _chat_id, _text, **kwargs):
             return None
 
         def safe_restart(self, **_kwargs):
@@ -581,8 +616,10 @@ def test_only_an_owner_restart_asks_for_the_runtime_mode_to_be_re_read(tmp_path,
 
     monkeypatch.setattr(server, "DATA_DIR", tmp_path)
     monkeypatch.setattr(message_bus, "log_chat", lambda *args, **kwargs: None)
+    from ouroboros import server_restart
+    monkeypatch.setattr(server_restart, "DATA_DIR", tmp_path)
     # The owned-work stop has its own suite; this pin is about the owner flag alone.
-    monkeypatch.setattr(server, "_stop_owned_work", lambda ctx: None)
+    monkeypatch.setattr(server_restart, "_stop_owned_work", lambda ctx: None)
 
     server._owner_restart_requested.clear()
     server._restart_requested.clear()

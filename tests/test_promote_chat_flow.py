@@ -1185,76 +1185,6 @@ def test_promote_success_relocates_pre_admitted_attachment_to_child_drive(
     ).exists()
 
 
-def test_promote_post_stage_lookup_failure_cleans_attachment(tmp_path, monkeypatch):
-    import ouroboros.projects_registry as projects_registry
-    import supervisor.workers as workers
-
-    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
-    source = tmp_path / "input.txt"
-    source.write_text("input", encoding="utf-8")
-    monkeypatch.setattr(
-        projects_registry,
-        "get_reserved_project",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("registry unavailable")),
-    )
-    ctx = types.SimpleNamespace(
-        enqueue_task=lambda task: task,
-        persist_queue_snapshot=lambda **_kwargs: True,
-        load_state=lambda: {"owner_chat_id": 1},
-    )
-
-    outcome = workers.promote_chat_to_task({
-        "task_id": "attach-lookup-fail",
-        "objective": "use input",
-        "project_id": "lookup-project",
-        "attachment_uploads": [{"path": str(source), "label": "input"}],
-    }, ctx)
-
-    assert outcome["reason"] == "project_routing_fence_lookup_failed"
-    assert not (
-        tmp_path / "task_results" / "artifacts" / "attach-lookup-fail"
-    ).exists()
-
-
-@pytest.mark.parametrize("failure", ["enqueue", "snapshot"])
-def test_promote_queue_failure_cleans_pre_staged_attachment(
-    tmp_path, monkeypatch, failure,
-):
-    import supervisor.workers as workers
-
-    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
-    source = tmp_path / f"{failure}.txt"
-    source.write_text("input", encoding="utf-8")
-    captured = []
-
-    def enqueue(task):
-        captured.append(task)
-        if failure == "enqueue":
-            return {"_admission_blocked": "project_routing_fence"}
-        return task
-
-    ctx = types.SimpleNamespace(
-        enqueue_task=enqueue,
-        persist_queue_snapshot=lambda **_kwargs: failure != "snapshot",
-        load_state=lambda: {"owner_chat_id": 1},
-    )
-    tid = f"attach-{failure}-fail"
-
-    outcome = workers.promote_chat_to_task({
-        "task_id": tid,
-        "objective": "use input",
-        "workspace": "none",
-        "attachment_uploads": [{"path": str(source), "label": "input"}],
-    }, ctx)
-
-    expected = "project_routing_fence" if failure == "enqueue" else "queue_snapshot_persist_failed"
-    assert outcome["reason"] == expected
-    assert captured
-    staged_path = pathlib.Path(captured[0]["attachments"][0]["abs_path"])
-    assert not staged_path.exists()
-    assert not (tmp_path / "task_results" / "artifacts" / tid).exists()
-
-
 def test_promote_worker_persists_swarm_intent_on_managed_root(tmp_path, monkeypatch):
     import supervisor.workers as workers
 
@@ -1474,6 +1404,8 @@ def test_promote_route_persists_source_ref_and_fails_closed_on_binding_error(tmp
         "status": "needs_manual_target",
         "reason": "project_binding_failed",
         "task_id": "route-fail",
+        "never_admitted": True,
+        "_admission_cleanup_manifest": [],
     }
     assert len(enqueued) == 1
 
@@ -2346,8 +2278,9 @@ def test_steer_task_tool_emits_event_with_target_and_client_id(tmp_path):
     events = []
     ctx = types.SimpleNamespace(
         pending_events=events, event_queue=None, current_chat_id=1,
-        drive_root=tmp_path,
-        task_metadata={"client_message_id": "cm-42"},
+        drive_root=tmp_path, is_direct_chat=True,
+        task_metadata={"client_message_id": "cm-42",
+                       "origin_message_ref": {"chat_id": 1, "client_message_id": "cm-42"}},
     )
     out = _steer_task(ctx, "abc12345", "also add the benchmarks slide")
     assert out.startswith("⚠️ STEER_UNCONFIRMED")
@@ -2375,9 +2308,11 @@ def test_steer_task_uses_exact_ingress_owner_text(tmp_path):
         event_queue=None,
         current_chat_id=1,
         drive_root=tmp_path,
+        is_direct_chat=True,
         task_metadata={
             "client_message_id": "cm-exact",
             "origin_message_text": exact,
+            "origin_message_ref": {"chat_id": 1, "client_message_id": "cm-exact"},
         },
     )
 
@@ -2399,8 +2334,10 @@ def test_main_steer_can_address_project_bound_root_from_host_manifest(tmp_path, 
         event_queue=None,
         current_chat_id=1,
         drive_root=tmp_path,
+        is_direct_chat=True,
         task_metadata={
             "client_message_id": "main-42",
+            "origin_message_ref": {"chat_id": 1, "client_message_id": "main-42"},
             "routing_contract": {"source_lane": "main"},
         },
     )
@@ -2461,8 +2398,10 @@ def test_busy_direct_main_root_is_manifested_and_steerable_without_promotion(tmp
         event_queue=None,
         current_chat_id=1,
         drive_root=tmp_path,
+        is_direct_chat=True,
         task_metadata={
             "client_message_id": "followup-1",
+            "origin_message_ref": {"chat_id": 1, "client_message_id": "followup-1"},
             "routing_contract": metadata["routing_contract"],
         },
     )
@@ -2730,6 +2669,7 @@ def test_handle_steer_task_stale_target_notifies_visibly(tmp_path, monkeypatch):
     from supervisor.events import _handle_steer_task
     from ouroboros.owner_mailbox import drain_owner_entries
     from ouroboros.projects_registry import create_project
+    from ouroboros.project_dialogue import routing_refusal_cause
 
     monkeypatch.setattr(queue, "DRIVE_ROOT", str(tmp_path))
     room = int(create_project(tmp_path, "issuing-room", name="Issuing Room")["chat_id"])
@@ -2740,12 +2680,19 @@ def test_handle_steer_task_stale_target_notifies_visibly(tmp_path, monkeypatch):
             "other": {"task": {"id": "other", "chat_id": 999}},  # different chat
             "sub": {"task": {"id": "sub", "chat_id": room, "delegation_role": "subagent"}},
         },
-        send_with_budget=lambda cid, text, *a, **k: notices.append(text),
+        send_with_budget=lambda cid, text, **kwargs: notices.append((cid, text, kwargs)),
     )
     _handle_steer_task({"target_task_id": "gone", "message": "a", "chat_id": room}, ctx)   # not running
     _handle_steer_task({"target_task_id": "other", "message": "b", "chat_id": room}, ctx)  # wrong chat
     _handle_steer_task({"target_task_id": "sub", "message": "c", "chat_id": room}, ctx)    # subagent
-    assert len(notices) == 3 and all("Couldn't steer task" in n for n in notices)
+    assert len(notices) == 3
+    for (cid, text, kwargs), target, reason in zip(
+        notices, ("gone", "other", "sub"), ("target_unknown", "chat_mismatch", "subagent_target"),
+    ):
+        assert cid == room
+        assert kwargs == {"role": "system", "system_type": "steer_not_delivered", "task_id": target}
+        assert routing_refusal_cause("steer_task", "needs_manual_target", reason) in text
+        assert "I'll" not in text and "Couldn't steer task" not in text
     assert drain_owner_entries(tmp_path, "gone") == []
     assert drain_owner_entries(tmp_path, "other") == []
     assert drain_owner_entries(tmp_path, "sub") == []
@@ -2997,7 +2944,7 @@ def _steer_refusal(tmp_path, monkeypatch, *, running: dict, chat_id: int = 1):
     ctx = types.SimpleNamespace(
         DRIVE_ROOT=tmp_path, RUNNING=running, PENDING=[],
         get_chat_agent=lambda: None,
-        send_with_budget=lambda _chat_id, text: sent.append(text),
+        send_with_budget=lambda _chat_id, text, **kwargs: sent.append((text, kwargs)),
     )
     _handle_steer_task(
         {"target_task_id": "target-1", "message": "hurry up", "chat_id": chat_id}, ctx,
@@ -3011,6 +2958,7 @@ def test_steer_refusal_names_the_room_when_the_task_belongs_to_another_chat(tmp_
     receipt said only `target_not_steerable`. The room is what the owner needs.
     The refusing turn is itself a Project room (Main may address any root)."""
     from ouroboros.projects_registry import create_project
+    from ouroboros.project_dialogue import routing_refusal_cause
 
     create_project(tmp_path, "roomp", name="RoomP")
     issuing_room = int(create_project(tmp_path, "rooma", name="RoomA")["chat_id"])
@@ -3020,24 +2968,52 @@ def test_steer_refusal_names_the_room_when_the_task_belongs_to_another_chat(tmp_
     })
 
     assert receipt["status"] == "needs_manual_target" and receipt["reason"] == "chat_mismatch"
-    assert sent and "RoomP › Deploy the docs" in sent[0]
-    assert "may have finished" not in sent[0]
-    assert "belongs to another chat" in sent[0]
+    assert len(sent) == 1
+    text, kwargs = sent[0]
+    assert text == "RoomP › Deploy the docs · " + routing_refusal_cause("steer_task", "needs_manual_target", "chat_mismatch")
+    assert kwargs == {"role": "system", "system_type": "steer_not_delivered", "task_id": "target-1"}
 
 
-@pytest.mark.parametrize("running, reason, phrase", [
-    ({}, "target_unknown", "may have finished"),
+@pytest.mark.parametrize("running, reason", [
+    ({}, "target_unknown"),
     ({"target-1": {"task": {"id": "target-1", "chat_id": 1, "delegation_role": "subagent",
-                            "title": "Review"}}}, "subagent_target", "delegated helper"),
-    ({"target-1": {"task": {"id": "target-1", "chat_id": 1, "_is_direct_chat": True,
-                            "title": "Chat"}}}, "direct_chat_turn", "conversation turn has already"),
+                            "title": "Review"}}}, "subagent_target"),
 ])
 def test_steer_refusal_keeps_a_distinct_reason_for_every_other_cause(
-        tmp_path, monkeypatch, running, reason, phrase):
+        tmp_path, monkeypatch, running, reason):
+    from ouroboros.project_dialogue import routing_refusal_cause
+
     receipt, sent = _steer_refusal(tmp_path, monkeypatch, running=running)
 
     assert receipt["reason"] == reason and receipt["status"] == "needs_manual_target"
-    assert sent and phrase in sent[0]
+    assert len(sent) == 1
+    text, kwargs = sent[0]
+    assert routing_refusal_cause("steer_task", "needs_manual_target", reason) in text
+    assert "I'll" not in text and "Couldn't steer task" not in text
+    assert kwargs == {"role": "system", "system_type": "steer_not_delivered", "task_id": "target-1"}
+
+
+def test_steer_reaches_a_queue_resident_direct_turn(tmp_path, monkeypatch):
+    """A direct turn resumed on a pooled worker under the SAME id after its exact
+    budget pause (#1196) is a RUNNING row: the owner's follow-up is delivered to
+    that actor's mailbox and is never refused as a finished direct reply."""
+    import supervisor.events as events_mod
+    from supervisor.steering import _handle_steer_task
+
+    receipts: list = []
+    monkeypatch.setattr(events_mod, "_emit_routing_receipt",
+                        lambda ctx, evt, **kwargs: receipts.append(kwargs) or {})
+    ctx = types.SimpleNamespace(
+        DRIVE_ROOT=tmp_path, PENDING=[], get_chat_agent=lambda: None,
+        RUNNING={"target-1": {"task": {"id": "target-1", "chat_id": 1, "_is_direct_chat": True,
+                                       "title": "Chat"}}},
+        send_with_budget=lambda _chat_id, text, **kwargs: None,
+    )
+    _handle_steer_task({"target_task_id": "target-1", "message": "hurry up", "chat_id": 1}, ctx)
+
+    assert receipts, "a steer must leave a receipt"
+    assert receipts[-1].get("reason") != "direct_chat_turn"
+    assert receipts[-1].get("status") == "delivered"
 
 
 def test_the_steer_tool_renders_the_typed_reason_and_still_defaults_without_one(monkeypatch):
@@ -3304,10 +3280,11 @@ def test_the_implicit_promote_claim_creates_and_binds_under_the_claim_lock(
     registry.bind_task_to_project(tmp_path, "t-turn", "the-work", room["chat_id"],
                                   origin={"ref": ref, "text": text})
     real_create, real_bind = registry.create_project, registry.bind_task_to_project
-    held: list = []
+    held, bases = [], []
 
     def _create(*args, **kwargs):
         held.append(("create_project", registry._ORIGIN_CLAIM_LOCK._is_owned()))
+        bases.append(kwargs.get("admission_basis"))
         return real_create(*args, **kwargs)
 
     def _bind(*args, **kwargs):
@@ -3330,7 +3307,9 @@ def test_the_implicit_promote_claim_creates_and_binds_under_the_claim_lock(
     }, ctx)
 
     # The CPython RLock answers "is this thread inside the claim?" directly.
-    assert held == [("create_project", True), ("bind_task_to_project", True)]
+    assert held == [("create_project", True), ("bind_task_to_project", True), ("create_project", False)]
+    # Provisioning is outside the origin lock but CAS-fenced by the captured room.
+    assert bases[1] == registry.project_admission_basis("the-work", room)
     assert outcome["status"] == "scheduled" and outcome["project_id"] == "the-work"
     assert enqueued[0]["project_id"] == "the-work"
     assert (registry.project_binding_for_task(tmp_path, "root01") or {}).get(

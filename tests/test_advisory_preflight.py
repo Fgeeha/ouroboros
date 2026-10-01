@@ -54,7 +54,6 @@ def _stub_preflight_lanes(repo, monkeypatch):
     monkeypatch.delenv("OUROBOROS_PREFLIGHT_TIMEOUT_SEC", raising=False)
     monkeypatch.setattr(pr, "_verify_preflight_plugins", lambda *a: [])
     monkeypatch.setattr(pr, "_observed_worker_ids", lambda *a: {"gw0", "gw1"})
-    monkeypatch.setattr("ouroboros.platform_layer.kill_processes_referencing", lambda *a: None)
     monkeypatch.setattr(git, "_consecutive_test_failures", 0)
     lanes = []
 
@@ -194,11 +193,6 @@ class TestPreflightGatesBeforeSDK:
             adv, "_get_changed_file_list",
             lambda repo_dir, paths=None: "M  broken.py",
         )
-        monkeypatch.setattr(
-            adv, "build_advisory_changed_context",
-            lambda repo_dir, changed_files_text, paths=None, exclude_paths=None:
-                (["broken.py"], "(touched pack)", []),
-        )
 
         sdk_called = {"n": 0}
 
@@ -247,11 +241,6 @@ class TestPreflightGatesBeforeSDK:
         monkeypatch.setattr(
             adv, "_get_changed_file_list",
             lambda repo_dir, paths=None: "M  good.py",
-        )
-        monkeypatch.setattr(
-            adv, "build_advisory_changed_context",
-            lambda repo_dir, changed_files_text, paths=None, exclude_paths=None:
-                (["good.py"], "(touched pack)", []),
         )
         monkeypatch.setattr(
             adv, "_build_advisory_prompt",
@@ -351,6 +340,7 @@ class TestHandleAdvisoryPreReviewSurfacesPreflightBlocked:
             adv, "_check_worktree_version_sync_shared",
             lambda *args, **kwargs: "",
         )
+        monkeypatch.setattr(adv, "_release_metadata_preflight", lambda *a, **kw: None)
         monkeypatch.setattr(
             adv, "compute_snapshot_hash", lambda *args, **kwargs: "deadbeef",
         )
@@ -419,6 +409,7 @@ class TestHandleAdvisoryPreReviewSurfacesPreflightBlocked:
         from ouroboros.tools import claude_advisory_review as adv
 
         repo = _make_agent_repo(tmp_path)
+        _init_git_repo(repo)
         _write_release_files(repo, version="5.99.0-rc.1")
         (repo / "uv.lock").write_text(
             '[[package]]\nname = "ouroboros"\nversion = "5.98.0"\n'
@@ -443,6 +434,7 @@ class TestHandleAdvisoryPreReviewSurfacesPreflightBlocked:
         from ouroboros.tools import claude_advisory_review as adv
 
         repo = _make_agent_repo(tmp_path)
+        _init_git_repo(repo)
         _write_release_files(repo, version="5.99.0-rc.1")
         (repo / "web").mkdir()
         (repo / "web" / "package.json").write_text(
@@ -668,6 +660,7 @@ class TestPreflightBlockedPersistence:
             adv, "_check_worktree_version_sync_shared",
             lambda *args, **kwargs: "",
         )
+        monkeypatch.setattr(adv, "_release_metadata_preflight", lambda *a, **kw: None)
         monkeypatch.setattr(
             adv, "compute_snapshot_hash",
             lambda *args, **kwargs: "preflight-test-hash",

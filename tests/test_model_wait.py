@@ -201,7 +201,7 @@ def test_quota_wait_rejoins_call_without_replaying_tools_and_keeps_ledger(elapse
     assert rows[-1]["revision"] > rows[0]["revision"]
     assert all(row["worker_slot_held"] is True and row["is_progress"] is False for row in rows)
     assert load_task_result(root, "task-one")["model_waits"][rows[0]["wait_id"]]["state"] == "resolved"
-    assert controller.paused_seconds() == 2.5
+    assert controller.paused_seconds() == pytest.approx(2.5)
 
 
 def test_auto_wait_requests_its_model_and_resumes_when_compatible_second_account_recovers(live_wait, monkeypatch):
@@ -288,13 +288,20 @@ def test_wait_projection_refuses_corrupt_existing_task_result(tmp_path):
     assert path.read_bytes() == b'{"broken":'
 
 
-def test_unknown_or_generic_empty_pool_never_becomes_quota_wait(live_wait):
-    _root, transport, client, _controller, events, _decide = live_wait
-    transport.results = [_refusal("credential_pool_exhausted")]
-    transport.dispatch = ["not_started"]
-    with pytest.raises(Exception) as raised:
-        client.chat([{"role": "user", "content": "hi"}], MODEL, model_role="main")
-    assert raised.value.code == "credential_pool_exhausted" and events.empty()
+def test_dated_pool_of_unknown_cause_waits_visibly_as_unavailable_never_as_quota(elapsed_quota_wait):
+    """#1409 case 1: an engine-dated pool refusal is neither quota nor sign-in. With no later
+    route it takes the visible, interruptible live wait under its own reason and heals on the
+    SAME call; it never sleeps to the reset and never reads as quota."""
+    root, transport, client, controller, events, _decide = elapsed_quota_wait
+    transport.results = [_refusal("credential_pool_exhausted"), result()]
+    transport.dispatch = ["not_started", "response_received"]
+    answer, usage = client.chat([{"role": "user", "content": "hi"}], MODEL, model_role="main")
+    assert answer == result()["message"] and len(usage["ledger_attempt_ids"]) == 2
+    rows = list(events.queue)
+    assert rows[0]["reason"] == rows[-1]["reason"] == "unavailable"
+    assert rows[0]["reset_at"] == "2099-01-01T00:00:00Z" and rows[0]["quota_clock"]["active"] is False
+    assert rows[-1]["resolution"] == "resource_available" and controller.paused_seconds() == 0
+    assert load_task_result(root, "task-one")["model_waits"][rows[0]["wait_id"]]["reason"] == "unavailable"
 
 
 def test_async_cancellation_resolves_only_its_wait_and_keeps_shared_task(live_wait, monkeypatch):

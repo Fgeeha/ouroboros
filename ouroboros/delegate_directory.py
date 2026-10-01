@@ -11,6 +11,7 @@ from hashlib import sha256
 import uuid
 
 from ouroboros import delegate_custody as custody
+from ouroboros.configured_subagents import SESSION_ACCESS_PROFILES
 from ouroboros.artifacts import stream_artifact_file
 from ouroboros.utils import atomic_write_json
 
@@ -41,6 +42,13 @@ def default_shaped_directory_options(strategy, scope_paths) -> bool:
     return strategy in (None, "direct") and not scope_paths
 
 
+def git_directory_options_refusal(target_root, strategy, scope_paths, *, git_workspace=False):
+    """One argument-shape check for scheduling and direct Git session starts."""
+    if (git_workspace or (Path(target_root) / ".git").exists()) and not default_shaped_directory_options(strategy, scope_paths):
+        return "Directory options apply to ordinary folders; Git workspaces keep their snapshot contract."
+    return ""
+
+
 def blocked_geometry_refusal(ctx, authority, selector_root, strategy, scope_paths):
     """Typed pre-POST refusal for geometry this shape can never serve, else ``None``.
 
@@ -60,7 +68,7 @@ def blocked_geometry_refusal(ctx, authority, selector_root, strategy, scope_path
     ``directory_execution``'s geometry validation and because ``_delegate_start`` sits
     at the 300-line function cap on a shrink-only band path.
     """
-    if not (selector_root or getattr(authority, "access", "") != "workspace_write"):
+    if not (selector_root or getattr(authority, "access", "") not in SESSION_ACCESS_PROFILES):
         return None
     if default_shaped_directory_options(strategy, scope_paths):
         return None
@@ -190,7 +198,7 @@ def directory_capture_block(drive, entry, manifest):
 
 
 def integrate_directory_result(ctx, entry, decision, reason, gateway, *, acknowledge_ambiguous=False,
-                               paths=None, orphan=False):
+                               paths=None, orphan=False, admission_check=None):
     """Use engine CAS/disposition, retaining unknown effects under the same host intent."""
     drive = custody.custody_root(ctx)
     manifest = capture_directory_result(drive, entry, gateway)
@@ -200,6 +208,8 @@ def integrate_directory_result(ctx, entry, decision, reason, gateway, *, acknowl
         return "⚠️ INTEGRATE_DELEGATED_TARGET_MISMATCH: the run belongs to another folder."
     if paths is not None and (not isinstance(paths, list) or not paths or any(not isinstance(path, str) or not path for path in paths)):
         return "⚠️ TOOL_ARG_ERROR (integrate_delegated_patch): paths must be a nonempty list of captured file paths."
+    if admission_check and (refusal := admission_check()):
+        return refusal
     if decision == "reject":
         if manifest["strategy"] == "direct":
             return "⚠️ INTEGRATE_DIRECTORY_ALREADY_APPLIED: direct effects remain in the folder; rejecting a report cannot undo them."
@@ -222,9 +232,14 @@ def integrate_directory_result(ctx, entry, decision, reason, gateway, *, acknowl
         key = sha256(json.dumps([entry.run_id, manifest["engine_manifest_sha256"], request], sort_keys=True).encode()).hexdigest()
         if entry.patch_apply_pending and getattr(entry, "patch_apply_key", "") != key:
             return "⚠️ INTEGRATE_DELEGATED_APPLY_AMBIGUOUS: retry the original path selection; its apply request still has an unknown outcome."
+        replaying_intent = entry.patch_apply_pending
         if not custody.record_patch_apply_started(drive, entry, target_root=entry.target_root,
                                                   apply_idempotency_key=key):
             return "⚠️ INTEGRATE_INTENT_UNWRITTEN: the apply intent could not be saved; nothing was submitted."
+        if admission_check and (refusal := admission_check()):
+            if not replaying_intent:
+                custody.record_patch_apply_resolved(drive, entry, reason="authority_changed")
+            return refusal
         receipt = gateway.apply_run(entry.run_id, request, idempotency_key=key)
         if receipt.get("applied") is not True or receipt.get("refused") is True:
             if receipt.get("refused") is True:
@@ -242,7 +257,8 @@ def integrate_directory_result(ctx, entry, decision, reason, gateway, *, acknowl
                         manifest=manifest, applied=disposition == "applied", conflicts=[], protected=[],
                         target=entry.target_root)
     if not custody.record_patch_disposed(drive, entry, disposition=disposition,
-                                         reason=reason, engine_receipt=receipt):
+                                         reason=reason, engine_receipt=receipt,
+                                         disposed_by_task_id=str(getattr(ctx, "task_id", "") or "")):
         return "⚠️ INTEGRATE_DISPOSITION_UNWRITTEN: the engine completed the operation but its host receipt could not be saved."
     return json.dumps({"status": disposition, "run_id": entry.run_id, "target": entry.target_root,
                        "engine_receipt": receipt,

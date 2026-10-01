@@ -524,7 +524,6 @@ def scan_data_paths(root: pathlib.Path = REPO) -> frozenset[str]:
         paths.update({
             "projects/*/knowledge/*.md",
             "projects/*/knowledge_history.jsonl",
-            "projects/*/knowledge_journal.jsonl",
         })
     return frozenset(paths)
 
@@ -562,7 +561,33 @@ def scan_data_paths(root: pathlib.Path = REPO) -> frozenset[str]:
 # and its startup fold; the archive segments ``archive/consciousness_observations_<ts>``
 # left the population and the one-time ``archive/consciousness_observations.jsonl``
 # move target (``ouroboros/consciousness.py``) took their place.
-EXPECTED_SCAN_PATHS = 290  # Linked project knowledge history is a dynamic validated shelf.
+# 290 -> 291: the retained focus source (``task_results/artifacts/*/source_handles/
+# context_checkpoints``, ``ouroboros/task_finalization.py``'s digest glob) is the
+# one new durable plane of cross-focus awareness; it has its own row in section 2.
+# 291 -> 292: the streamed bytes blob's temp name under observability/blobs (the existing
+# ``observability/{calls,blobs,salvaged}/**`` row covers it).
+# 292 -> 293: the Presence previous-turn pointer (``state/presence_turn_gate/last-<sha256>.json``),
+# one rebuildable projection per conversation written by presence_runner at the end of an executed
+# turn; it has its own row in section 2.
+# 293 -> 295: the disposable test-environment caches (``cache/pip``, ``cache/uv``; test root only).
+# 295 -> 294: TZ-3 removed the destructive memory journal rewrite and its
+# ``.compact.tmp`` sibling path; PERSISTENCE.md keeps the journals, now
+# read-only observed and never age-digested.
+# 294 -> 296 (upstream 7.5.0): the merged extra-CA bundle is content-addressed under
+# ``state/extra-ca-bundle/`` (the directory and its ``*.pem`` members, so a changed
+# owner PEM rotates every cache); one section-2 row covers both.
+# 296 -> 297 (Presence resilience): Presence recovery inspects the retained quarantine
+# members (``task_results/quarantine/*``) before deciding whether an event ever started.
+# 297 -> 296 (TZ-3 PR-1): the ``knowledge_journal.jsonl`` size-telemetry writer is
+# removed (its only reader was this inventory); ``knowledge_history.jsonl`` keeps the
+# complete captures, now host-stamped.
+# 296 -> 300 (TZ-1 child-drive custody): ``task_results/<id>.custody.lock`` (the per-task
+# custody lock) and the settlement's ``state/custody_staging`` / ``state/custody_trash``
+# entries; one PERSISTENCE.md row covers all three.
+# 300 -> 303: state-initialization witness plus named review source and review_inputs.
+# 303 -> 305: immutable retention names exact text-CAS manifest versions and the
+# existing blob copy destination; both stay under the documented observability store.
+EXPECTED_SCAN_PATHS = 308
 
 # Scanned paths that must always be present — guards the scanner itself
 # against a silent regression that would shrink coverage while keeping counts

@@ -398,10 +398,12 @@ def test_escalate_subagent_writes_parent_mailbox_frame(tmp_path, monkeypatch):
                         lambda root, tid: {"status": "running",
                                            "drive_root": str(tmp_path)})
     ctx = _tool_ctx(tmp_path, task_id="child-9", parent="root-1")
+    # A child cannot wait, so a habit-filled bound is ignored — and the receipt says so.
     out = _escalate(ctx, question="Delete the flaky test?",
                     options=[{"label": "delete"}, {"label": "quarantine"}],
-                    stake="CI health", assumption="quarantine meanwhile")
+                    stake="CI health", assumption="quarantine meanwhile", max_wait_minutes=1)
     assert out.startswith("OK: escalated to parent task root-1")
+    assert "max_wait_minutes ignored: it applies only to wait_for_answer=true" in out
     entries = drain_owner_entries(tmp_path, "root-1", set())
     assert entries and entries[0]["provenance"] == "descendant_task"
     text = entries[0]["text"]
@@ -410,6 +412,10 @@ def test_escalate_subagent_writes_parent_mailbox_frame(tmp_path, monkeypatch):
     assert "forward_to_worker(task_id=child-9" in text
     # No owner card, no projection for the child hop.
     assert not [e for e in ctx.pending_events if e.get("type") == "send_quiz"]
+    # A habit-filled bound is disclosed on the child's receipt too, never sent up the chain.
+    out = _escalate(ctx, question="Again?", options=["a", "b"], assumption="keep going.", max_wait_minutes=1)
+    assert out.endswith("assumption: keep going. (max_wait_minutes ignored: it applies only to wait_for_answer=true)")
+    assert "max_wait_minutes" not in drain_owner_entries(tmp_path, "root-1", set())[-1]["text"]
     assert quiz_states(tmp_path, "child-9") == {}
 
 
@@ -425,10 +431,11 @@ def test_escalate_settled_parent_is_a_typed_dead_end(tmp_path, monkeypatch):
 
 def test_escalate_invalid_payload_is_typed(tmp_path):
     ctx = _tool_ctx(tmp_path)
-    out = _escalate(ctx, question="?", options=["only-one"], assumption="a")
+    out = _escalate(ctx, question="?", options=["a"] * 7, assumption="a")
     assert out.startswith("⚠️ QUIZ_OPTIONS_INVALID")
     out = _escalate(ctx, question="?", options=["a", "b"], assumption="")
     assert out.startswith("⚠️ QUIZ_ASSUMPTION_REQUIRED")
+    assert "what you do meanwhile" in out  # the refusal names its own repair
 
 
 
@@ -686,8 +693,10 @@ def test_own_answer_needs_no_option_index(tmp_path, monkeypatch):
 
     entries = drain_owner_entries(tmp_path, "task-1", set())
     frame_text = [e for e in entries if e.get("kind") == KIND_QUIZ_ANSWER][0]["text"]
-    assert ("The owner rejected all offered options and answered verbatim: "
-            "neither — use duckdb") in frame_text
+    assert ("The owner answered in their own words without choosing an offered "
+            "option. Verbatim: neither — use duckdb") in frame_text
+    # The host never words the free answer as a rejection the owner did not state.
+    assert "rejected" not in frame_text
     assert "chose option" not in frame_text
 
 
@@ -841,18 +850,30 @@ def test_quiz_state_frame_carries_the_comment_only_when_recorded():
     """#471: `send_quiz_state` puts the owner's free-text answer on the live
     `quiz_state` frame when one was recorded and leaves the key absent
     otherwise (an option-only answer, an expiry, a supersede)."""
+    from ouroboros import event_bus
     from supervisor.message_bus import LocalChatBridge
 
     frames = []
+    bus = event_bus.init_global_event_bus()
+    published = []
+    bus.subscribe("test-transport", event_bus.CHAT_QUIZ_STATE, published.append)
     bridge = LocalChatBridge.__new__(LocalChatBridge)
     bridge._broadcast_fn = frames.append
-    bridge.send_quiz_state("q1", "t1", "answered", answered_index=1)
+    bridge._chat_transports = {7: {"provider": "telegram"}}
+    bridge.send_quiz_state("q1", "t1", "answered", answered_index=1, chat_id=7)
     bridge.send_quiz_state("q1", "t1", "answered", comment="neither — use duckdb")
     bridge.send_quiz_state("q1", "t1", "expired_terminal", comment="")
     assert [("comment" in f, f.get("comment")) for f in frames] == [
         (False, None), (True, "neither — use duckdb"), (False, None),
     ]
     assert frames[0]["answered_index"] == 1 and "answered_index" not in frames[1]
+    # TZ-2 B2: the same lifecycle fact reaches transport skills through the event
+    # bus (the WebSocket reaches only the SPA), carrying the chat's transport so a
+    # skill can edit the card it already delivered instead of waiting for a reload.
+    assert [e["state"] for e in published] == ["answered", "answered", "expired_terminal"]
+    assert published[0]["transport"] == {"provider": "telegram"} and published[1]["transport"] == {}
+    assert published[0]["chat_id"] == 7 and "chat_id" not in published[1]
+    assert published[2]["topic"] == event_bus.CHAT_QUIZ_STATE
 
 
 def test_recommended_option_rides_the_card_the_projection_and_the_parent_frame(tmp_path, monkeypatch):
@@ -919,7 +940,8 @@ def test_two_recommended_options_are_refused_and_one_survives_live_and_replay_al
     out = _escalate(ctx, question="Which db?",
                     options=[{"label": "sqlite", "recommended": True}, {"label": "postgres", "recommended": True}],
                     assumption="sqlite meanwhile")
-    assert out == "⚠️ QUIZ_RECOMMENDED_INVALID: mark at most one option as recommended."
+    assert out == ("⚠️ QUIZ_RECOMMENDED_INVALID: mark at most one option as recommended. "
+                   "The quiz was not sent.")
     assert not [e for e in ctx.pending_events if e.get("type") == "send_quiz"]
     assert quiz_states(tmp_path, "root-1") == {}
     out = _escalate(ctx, question="Which db?",

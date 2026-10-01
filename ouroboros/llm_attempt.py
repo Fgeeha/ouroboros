@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional, Set
 
 from ouroboros.anthropic_native_custody import is_replayed_native_content
 from ouroboros.context_budget import CONTEXT_OVERFLOW_CODES
+from ouroboros.request_wire_contract import physical_candidate_bytes as _canonical_candidate_bytes
 from ouroboros.request_wire_recovery import prepare_wire_payload_for_send
 from ouroboros.transport_custody import ProviderNotDispatched, is_loopback_base_url
 from ouroboros.usage_accounting import (
@@ -61,6 +62,19 @@ class PhysicalDispatchInterrupted(PhysicalAttemptPreconditionFailed):
 
 class _PhysicalSendNotStarted(PhysicalDispatchInterrupted, ProviderNotDispatched):
     """Positive no-dispatch evidence for this send alone, not the recovery ladder."""
+
+
+def physical_attempt_headroom() -> Optional[int]:
+    """Sends still claimable in this actor context; None when unbounded.
+
+    An advisory read beside the window above: the claim itself is what enforces
+    the bound, this only lets a caller decline to spend a send it knows belongs
+    to its own later repair.
+    """
+    from ouroboros.usage_accounting import _PHYSICAL_LIMIT
+
+    state = _PHYSICAL_LIMIT.get()
+    return None if state is None else max(0, state.maximum - state.used)
 
 
 def require_physical_dispatch_window() -> Optional[float]:
@@ -166,6 +180,36 @@ def supports_message_cache_control(model: str) -> bool:
     return m.startswith("anthropic/") or m.startswith("google/gemini-")
 
 
+def openai_family_model(model: str) -> bool:
+    """Whether a model id names OpenAI's public-API family (``openai/…`` on OpenRouter,
+    ``openai::…`` direct; the ``~`` processing prefix and a ``:online`` suffix keep it).
+
+    Dated external fact (probes 2026-09-25; inventory row in DEVELOPMENT §2): this family
+    reuses a prompt cache only for the WHOLE leading system section plus tool schemas as
+    one unit, or for an exact earlier prompt as a prefix, and the routing key partitions
+    it. That is why its send copy keeps mutable context out of the leading system message
+    (``llm_messages.split_leading_system_prefix``) and shares one sticky session per model
+    and governance prefix (``_openrouter_session_identity``). OpenRouter ``openai/gpt-oss-*``
+    ids are served by third parties and merely inherit the projection: disclosed, not gated.
+    """
+    from ouroboros.provider_models import normalize_model_identity
+
+    raw = str(model or "").strip().lstrip("~")
+    identity = normalize_model_identity(raw) or raw
+    return identity.strip().lower().startswith("openai/")
+
+
+def openai_family_route(target: Dict[str, Any]) -> bool:
+    """The send-copy predicate: direct ``openai``, or an OpenRouter ``openai/…`` id — never
+    a generic OpenAI-compatible server that happens to serve an ``openai/…`` name."""
+    provider = str(target.get("provider") or "").strip().lower()
+    if provider == "openai":
+        return True
+    if provider != "openrouter":
+        return False
+    return openai_family_model(str(target.get("usage_model") or target.get("resolved_model") or ""))
+
+
 def _route_normalizes_cache_breakpoints(target: Dict[str, Any]) -> bool:
     """Whether the send-time finalizer may normalize cache breakpoints."""
     if str(target.get("provider") or "") == "anthropic":
@@ -252,6 +296,10 @@ def attach_processing_receipt(target: Dict[str, Any], usage: Dict[str, Any]) -> 
     model = str(target.get("usage_model") or target.get("resolved_model") or "")
     capture = last_physical_attempt_capture()
     matched = capture is not None and capture.provider == provider and capture.model == model
+    usage.pop("effort", None)  # Host evidence cannot be supplied by a provider usage echo.
+    usage.pop("effort_resolution", None)
+    if matched and capture.effort is not None:
+        usage["effort"] = copy.deepcopy(capture.effort)
     requested = (capture.processing_preference if matched
                  else str(target.get("processing_preference") or ""))
     submitted = capture.submitted_processing_mode if matched else ""
@@ -336,6 +384,31 @@ def processing_refusal(target: Dict[str, Any], payload: Dict[str, Any],
     return error
 
 
+def effort_request_facts(target: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Original preference and actual host-send fields, never provider execution.
+
+    Kept with every physical attempt, including refused/failed sends. Native
+    mappings are facts of the payload; an absent knob means vendor default.
+    """
+    fields = {key: copy.deepcopy(payload[key]) for key in
+              ("reasoning_effort", "reasoning", "thinking") if key in payload}
+    output = payload.get("output_config")
+    if isinstance(output, dict) and "effort" in output:
+        fields["output_config.effort"] = copy.deepcopy(output["effort"])
+    extra = payload.get("extra_body")
+    extra = extra if isinstance(extra, dict) else {}
+    for key in ("reasoning", "thinking"):
+        if key in extra:
+            fields[f"extra_body.{key}"] = copy.deepcopy(extra[key])
+    options = payload.get("options")
+    options = options if isinstance(options, dict) else {}
+    if "reasoningEffort" in options:
+        fields["options.reasoningEffort"] = options["reasoningEffort"]
+    return {"requested": target.get("requested_reasoning_effort"),
+            "sent": fields, "sent_state": "explicit" if fields else "omitted",
+            "sent_source": "host_candidate", "reported": None, "report_source": None}
+
+
 def _attempt_request(
     target: Dict[str, Any],
     payload: Dict[str, Any],
@@ -370,6 +443,13 @@ def _attempt_request(
     context = _canonical_candidate_bytes({
         key: payload[key] for key in ("system", "messages", "tools", "functions") if key in payload
     })
+    from ouroboros.send_clock import record_candidate, split_clock_note
+
+    # The same bytes carry the Main clock line; its clock-free twin identifies
+    # the candidate across two samples (the forced-final admission predicate).
+    clock_note, clock_free = split_clock_note(payload)
+    raw_sha256 = hashlib.sha256(raw).hexdigest()
+    record_candidate(raw_sha256, clock_note)
     return AttemptRequest(
         model=str(target.get("usage_model") or target.get("resolved_model") or payload.get("model") or ""),
         provider=str(target.get("provider") or "unknown"),
@@ -377,7 +457,7 @@ def _attempt_request(
         max_completion_tokens=int(payload.get("max_completion_tokens") or payload.get("max_tokens") or 0),
         source=str(request_source or ""),
         prompt_cache_ttl=_applied_payload_cache_ttl(payload) or "",
-        candidate_raw_sha256=hashlib.sha256(raw).hexdigest(),
+        candidate_raw_sha256=raw_sha256,
         candidate_raw_size_bytes=len(raw),
         candidate_context_sha256=hashlib.sha256(context).hexdigest(),
         candidate_context_size_bytes=len(context),
@@ -388,14 +468,12 @@ def _attempt_request(
         processing_preference=str(target.get("processing_preference") or ""),
         submitted_processing_mode=submitted_processing_mode(target, payload),
         processing_basis=copy.deepcopy(target.get("processing_basis")),
+        effort=effort_request_facts(target, payload),
+        candidate_clock_free_sha256=(
+            hashlib.sha256(_canonical_candidate_bytes(clock_free)).hexdigest()
+            if clock_note is not None else None
+        ),
     )
-
-
-def _canonical_candidate_bytes(payload: Dict[str, Any]) -> bytes:
-    return json.dumps(
-        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
-        allow_nan=False, default=str,
-    ).encode("utf-8")
 
 
 def _physical_candidate(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -417,14 +495,20 @@ def _physical_candidate(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _finalized_physical_candidate(
-    target: Dict[str, Any], payload: Dict[str, Any], api_surface: str,
+    target: Dict[str, Any], payload: Dict[str, Any], api_surface: str, *, fresh_clock: bool = False,
 ) -> Dict[str, Any]:
-    physical = _physical_candidate(payload)
+    from ouroboros.request_wire_recovery import refresh_wire_clock
+
+    # Bind the caller's exact logical input before removing host/socket metadata
+    # or sampling a fresh clock; recovery must not guess those transformations.
+    physical = _physical_candidate({key: value for key, value in payload.items() if key != "timeout"})
+    if fresh_clock:
+        physical = refresh_wire_clock(physical, api_surface=api_surface)
     if target.get("context_mode") == "nano":
         physical = _fit_output_payload(target, physical, api_surface)
     return prepare_wire_payload_for_send(
         {**target, "contract_headers": processing_contract_headers(target, physical)},
-        physical, api_surface=api_surface,
+        physical, api_surface=api_surface, logical_payload=payload,
     )
 
 

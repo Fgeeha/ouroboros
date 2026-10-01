@@ -175,11 +175,11 @@ def _handle_chat_direct_locked(
     try:
         remaining = budget_remaining(load_state(), strict=True)
     except Exception:
-        _pool().send_with_budget(chat_id, "⚠️ Cost accounting is unavailable. Task was not dispatched; retry after ledger recovery.", **failure_meta)
+        _pool().send_with_budget(chat_id, "⚠️ Cost accounting is unavailable. Task was not dispatched; retry after ledger recovery.", **failure_meta, role="system", system_type="task_admission_notice")
         return
     if remaining <= 0:
         try:
-            _pool().send_with_budget(chat_id, "🚫 Budget exhausted. Task rejected. Please increase TOTAL_BUDGET in settings.", **failure_meta)
+            _pool().send_with_budget(chat_id, "🚫 Budget exhausted. Task rejected. Please increase TOTAL_BUDGET in settings.", **failure_meta, role="system", system_type="task_admission_notice")
         except Exception:
             pass
         return
@@ -298,6 +298,15 @@ def _admit_chat_task(
             task["task_constraint"] = dict(task_constraint)
         if task_metadata:
             task["metadata"] = dict(task_metadata)
+            if task_metadata.get("late_answer") is not None:
+                # A LATE quiz answer: the owner's row holds only their words; the
+                # model reads the card they answered, rebuilt from the stored
+                # block (disclosed when unreadable) -- the one shared builder.
+                from ouroboros.owner_quiz import late_answer_model_text
+
+                task["text"] = late_answer_model_text(
+                    _pool().DRIVE_ROOT, task_metadata.get("late_answer"), str(text or ""),
+                )
             # The ingress-captured origin identity rides on the TASK RECORD so a
             # later post-hoc "Turn into project" reads it from the persisted
             # result instead of re-deriving identity from content.
@@ -353,7 +362,7 @@ def _admit_chat_task(
                     chat_id,
                     f"⚠️ Task not started: every attachment was rejected.\n{rendered}",
                     **_host_operation_failure(task_metadata),
-                )
+                    role="system", system_type="attachment_notice")
                 registry.unregister(task["id"])
                 return None
             from ouroboros.artifacts import attachment_manifest_projection
@@ -364,7 +373,7 @@ def _admit_chat_task(
                     chat_id,
                     "⚠️ Some declared attachments could not be staged; the task "
                     f"starts with the rest.\n{rendered}",
-                )
+                    role="system", system_type="attachment_notice")
             if manifest:
                 manifest = [dict(row) for row in manifest]
                 task["drive_root"] = str(_pool().DRIVE_ROOT)
@@ -464,7 +473,60 @@ def _execute_chat_task(admitted: Dict[str, Any]) -> bool:
             events = agent.handle_task(task)
         finally:
             agent._event_queue = prev_queue
-        for e in events:
+        # An exact budget pause of THIS turn is parked here, in-process and
+        # synchronously, while the registry entry below still owns the id (#1196).
+        # The turn's ``budget_pause`` event carries its own task record (a direct
+        # turn was never in RUNNING). Handing that event to the supervisor loop
+        # and unregistering the actor races: between the unregister and the park
+        # the SAME id is nowhere — not live, not queued — and a restart in that
+        # window fences a saved pause. The direct lane runs inside the supervisor
+        # process, so it parks the record itself through the ONE park owner
+        # (``events_budget.install_exact_budget_pause``) against the same queue
+        # state, under the queue lock, and drops the event from the hand-off. A
+        # park that fails leaves the event on the ordinary path (typed, logged),
+        # never a silently lost pause. Either way the turn's LOCAL dispatch fence
+        # is released: the actor has unwound and the durable row (parked here or
+        # by the supervisor loop) owns the hold, so a fence left closed in this
+        # process would refuse the resumed turn's sends under the same id. Every
+        # other event passes through unchanged.
+        remaining: list = []
+        for event in list(events or []):
+            checkpoint = ((event.get("resource_limit") or {}).get("checkpoint")
+                          if isinstance(event, dict) and isinstance(event.get("resource_limit"), dict) else None)
+            if not (isinstance(event, dict) and str(event.get("type") or "") == "budget_pause"
+                    and event.get("_is_direct_chat") and isinstance(checkpoint, dict)):
+                remaining.append(event)
+                continue
+            task_id = str(event.get("task_id") or task.get("id") or "")
+            try:
+                from types import SimpleNamespace
+
+                from supervisor import queue as queue_mod
+                from supervisor.events_budget import install_exact_budget_pause
+                from supervisor.message_bus import get_bridge
+
+                pool = _pool()
+                shim = SimpleNamespace(
+                    RUNNING=pool.RUNNING, PENDING=pool.PENDING, WORKERS=pool.WORKERS, DRIVE_ROOT=pool.DRIVE_ROOT,
+                    sort_pending=queue_mod.sort_pending, persist_queue_snapshot=queue_mod.persist_queue_snapshot,
+                    bridge=get_bridge(),
+                )
+                install_exact_budget_pause(shim, task_id, checkpoint, evt=event, source="direct_turn_inline_park")
+                append_jsonl(
+                    pool.DRIVE_ROOT / "logs" / "supervisor.jsonl",
+                    {"ts": utc_now_iso(), "type": "direct_turn_budget_pause_parked_inline",
+                     "task_id": task_id, "chat_id": event.get("chat_id"),
+                     "pause_id": str(checkpoint.get("pause_id") or "")},
+                )
+            except Exception:
+                log.error("Direct turn %s could not be parked inline; its pause event takes the ordinary path",
+                          task_id, exc_info=True)
+                remaining.append(event)
+            finally:
+                from ouroboros.budget_pause import end_dispatch_fence
+
+                end_dispatch_fence(task_id)  # quiescent actor unwound; the durable row owns the dispatch hold
+        for e in remaining:
             _pool().get_event_q().put(turn_queue.stamp(e))
         ok = True
     except Exception as e:
@@ -525,7 +587,7 @@ def _report_direct_chat_error(admitted: Dict[str, Any], e: BaseException) -> Non
             err_msg,
             task_id=failed_task_id,
             progress_meta=progress_meta,
-        )
+            role="system", system_type="task_error")
     except Exception:
         log.debug("Suppressed exception", exc_info=True)
 
@@ -535,6 +597,7 @@ def handle_wake_direct(
     text: str,
     task_metadata: Optional[dict],
     on_finished: Optional[Callable[[str, bool], None]] = None,
+    bind_input: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
     """Start a self-initiated Main turn (a consciousness wake-up) as an
     ordinary direct turn, and answer with a typed receipt.
@@ -549,14 +612,21 @@ def handle_wake_direct(
     can back off after a failure too. The wake's ``task_metadata`` (its
     origin label, ledger category, reason, autonomy level, model role) rides
     verbatim on ``task["metadata"]``; nothing here pauses or resumes the
-    legacy background loop.
+    legacy background loop. ``bind_input(task)`` runs once the wake is
+    registered (its id exists) and before its thread starts — the alarm binds
+    its immutable observation source there; a binder failure leaves the
+    complete text as the wake's only input.
     """
     if not wake_gate_open():
         return {"admitted": False, "task_id": "", "reason": "repo_writer_gate_closed"}
-    from supervisor.state import budget_remaining, load_state
+    from supervisor.state import budget_remaining, control_is, load_state
+    from ouroboros.consciousness import panic_blocks_wake
 
+    current = load_state()
+    if panic_blocks_wake(_pool().DRIVE_ROOT) or not control_is(current, "bg_consciousness_enabled", True):
+        return {"admitted": False, "task_id": "", "reason": "consciousness_disabled_or_unknown"}
     try:
-        remaining = budget_remaining(load_state(), strict=True)
+        remaining = budget_remaining(current, strict=True)
     except Exception:
         return {"admitted": False, "task_id": "", "reason": "cost_accounting_unavailable"}
     if remaining <= 0:
@@ -571,6 +641,11 @@ def handle_wake_direct(
         reason = "repo_writer_gate_closed" if not wake_gate_open() else "admission_failed"
         return {"admitted": False, "task_id": "", "reason": reason}
     task_id = str(admitted["task"]["id"])
+    if bind_input is not None:
+        try:
+            bind_input(admitted["task"])
+        except Exception:
+            log.warning("wake %s input binding failed; the complete text stays its input", task_id, exc_info=True)
 
     def _run() -> None:
         ok = False
@@ -610,19 +685,31 @@ def auto_resume_after_restart() -> None:
             except Exception:
                 log.debug("Failed to consume owner restart compatibility flag", exc_info=True)
             log.info("Owner restart flag detected — skipping auto-resume.")
-            return
+            if not (_pool().DRIVE_ROOT / "state" / "panic_stop.flag").exists():
+                return  # a kept Panic flag still owes its durable controls below
 
-        # Panic/owner-restart flags suppress auto-resume and are consumed.
+        # Panic/owner-restart flags suppress auto-resume. The Panic flag is consumed
+        # only AFTER its disabled controls are durably known in state (#1307): if that
+        # write fails, the flag stays and every boot grant keeps reading it.
         panic_flag = _pool().DRIVE_ROOT / "state" / "panic_stop.flag"
         if panic_flag.exists():
+            from ouroboros.server_control import PANIC_CONTROL_KEYS, _panic_controls
+            from supervisor.state import StateUnavailable, update_state
+
+            try:
+                update_state(_panic_controls, confirm=PANIC_CONTROL_KEYS)
+            except StateUnavailable as exc:
+                log.warning("Panic flag kept: its disabled controls are not durable yet (%s)", exc)
+                return
             panic_flag.unlink(missing_ok=True)
             log.info("Panic flag detected — skipping auto-resume.")
             return
 
-        st = _pool().load_state()
-        chat_id = st.get("owner_chat_id")
-        if not chat_id:
-            return
+        from supervisor.state import control_value
+
+        chat_known, chat_id = control_value(_pool().load_state(), "owner_chat_id")
+        if not chat_known or chat_id in (None, "", 0):
+            return  # an autonomous resume turn needs a KNOWN owner chat (#1307)
 
         restart_verify_path = _pool().DRIVE_ROOT / "state" / "pending_restart_verify.json"
         recent_restart = False
@@ -714,11 +801,11 @@ def stop_direct_chat_turn(task_id: str, turn: Dict[str, Any], *, deliver: bool =
     ``deliver=False`` (a cascade sweep, which speaks for the tree once)
     suppresses the owner toast.
     """
+    from ouroboros.config import get_direct_turn_stop_wait_sec
     from supervisor import queue as q
     from supervisor import workers
     from supervisor.owner_stop import REASON_OWNER_STOPPED_DIRECT_TURN
     from supervisor.task_reaper import request_finalization_grace
-    from ouroboros.config import get_direct_turn_stop_wait_sec
 
     if turn.get("stop_control_msg_id"):
         return DIRECT_TURN_STOP_LIVE if workers.direct_chat_turn(task_id) is not None else DIRECT_TURN_STOP_ENDED

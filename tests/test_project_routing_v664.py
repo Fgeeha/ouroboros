@@ -878,7 +878,8 @@ def test_transport_without_client_id_gets_stable_host_owned_routing_id(tmp_path,
     assert not any(row.get("type") == "message_annotation" for row in broadcasts)
 
 
-def test_unread_revision_advances_only_for_visible_result_or_incident(tmp_path, monkeypatch):
+def test_unread_revision_advances_only_for_conversation_messages(tmp_path, monkeypatch):
+    """A progress incident is a row of the task's card: it toasts but leaves unread alone."""
     from ouroboros.projects_registry import create_project, get_project
     from supervisor import message_bus
 
@@ -899,10 +900,10 @@ def test_unread_revision_advances_only_for_visible_result_or_incident(tmp_path, 
         task_id="t",
         progress_meta={"task_incident": "worker_lost", "toast_once": "t:worker_lost"},
     )
-    assert get_project(tmp_path, "racer")["visible_revision"] == 1
+    assert get_project(tmp_path, "racer")["visible_revision"] == 0
 
     message_bus.send_with_budget(chat_id, "final answer", task_id="t")
-    assert get_project(tmp_path, "racer")["visible_revision"] == 2
+    assert get_project(tmp_path, "racer")["visible_revision"] == 1
 
 
 def test_routing_ack_is_typed_and_never_broadcast_as_chat_bubble(monkeypatch):
@@ -1115,6 +1116,9 @@ def test_project_completion_enqueues_once_for_root_and_never_for_child_or_direct
             "project_name": "Launch 🚀",
             "target_label": "Launch 🚀 › Ship release",
             "status": "completed",
+            "terminal_time": {"v": 1, "occurred_at": None, "source": "unknown",
+                              "attempt": dict.fromkeys(("task_attempt", "_attempt", "started_at",
+                                                        "metadata_attempt", "metadata_task_attempt"))},
         },
     }]
 

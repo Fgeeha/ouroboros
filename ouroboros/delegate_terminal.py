@@ -485,7 +485,7 @@ _REFRESH_SCAN_CAP_BYTES = 5 * 1024 * 1024  # bounded work per sweep tick
 _REFRESH_DEFERRED_CAP = 500  # terminal-boundary tasks awaiting their result
 
 
-def refresh_recently_settled_terminals(drive_root: Any) -> int:
+def refresh_recently_settled_terminals(drive_root: Any, live_task_ids: Any = None) -> int:
     """Refresh terminal results of tasks whose runs settled since the cursor.
 
     The orphan sweep only revisits tasks named in THIS generation's reconcile
@@ -500,6 +500,12 @@ def refresh_recently_settled_terminals(drive_root: Any) -> int:
     to a rename. A shrunken chain (manual surgery) resets the cursor; the
     one-time historical pass is paced by the per-tick byte cap. Returns the
     number of refreshed tasks.
+
+    ``live_task_ids`` is the sweep's one live-owner source — a set or a zero-arg
+    callable, read AFTER the batch like both custody surfaces read theirs. A task
+    whose owner still bills (the post-task synthesis window outlives the terminal
+    write) is DEFERRED, not healed under a live writer; None means unknown and
+    heals whatever the log named.
     """
     import os as _os
     import pathlib as _pathlib
@@ -574,8 +580,12 @@ def refresh_recently_settled_terminals(drive_root: Any) -> int:
     now_iso = utc_now_iso()
     refreshed = 0
     next_deferred: Dict[str, str] = {}
+    live = live_task_ids() if callable(live_task_ids) else live_task_ids
     for tid in sorted(batch_ids | set(deferred)):
         since = deferred.get(tid) or now_iso
+        if live is not None and tid in live:
+            next_deferred[tid] = since  # its owner is still writing; heal after it ends
+            continue
         try:
             if _task_is_terminal(drive_root, tid):
                 if refresh_terminal_reconciliation(drive_root, tid):
@@ -658,10 +668,72 @@ def record_terminal_reconciliation(
         return False
 
 
+def refresh_disposed_reconciliation(drive_root: Any, run_id: str, *, reader_task_id: str) -> int:
+    """Remove one proven disposed obligation from current retry-chain disclosures.
+
+    A predecessor mirror may still be interrupted, and intermediate retries may
+    have copied its debt. Only exact settled/disposed identifiers are removed,
+    under each result writer's lock. Other debt, lifecycle, cost, counters,
+    reasons and review evidence retain their meaning; this never audits or
+    controls a live execution and never creates a missing result.
+    """
+    from ouroboros.delegate_shared import _confirmed_retry_chain
+    from ouroboros.task_results import write_task_result
+
+    if custody.custody_log_unreadable(drive_root):
+        return 0
+    entry = custody.replay(drive_root).get(str(run_id or ""))
+    if entry is None or entry.review_owned or not entry.settled or not entry.patch_disposed:
+        return 0
+    chain = _confirmed_retry_chain(drive_root, entry.task_id, reader_task_id)
+    task_ids = chain or (entry.task_id,)
+    tokens = {entry.run_id, f"patch:{entry.run_id}"}
+    if entry.invocation_id:
+        tokens.add(f"invocation:{entry.invocation_id}")
+    refreshed = 0
+    for task_id in task_ids:
+        changed = False
+
+        def project(existing, _incoming):
+            nonlocal changed
+            if not existing:
+                return None
+            fields = {"status": existing["status"]}
+            debt = existing.get("delegated_runs_unreconciled")
+            if isinstance(debt, list):
+                fields["delegated_runs_unreconciled"] = [item for item in debt if item not in tokens]
+                changed |= fields["delegated_runs_unreconciled"] != debt
+            audit = existing.get("delegate_terminal_reconciliation")
+            if isinstance(audit, dict):
+                updated = dict(audit)
+                for key, cleared in (
+                    ("unreconciled", tokens), ("open_run_ids", {entry.run_id}),
+                    ("undisposed_patch_run_ids", {entry.run_id}),
+                    ("pending_invocation_ids", {entry.invocation_id} if entry.invocation_id else set()),
+                ):
+                    values = audit.get(key)
+                    if isinstance(values, list):
+                        updated[key] = [item for item in values if item not in cleared]
+                fields["delegate_terminal_reconciliation"] = updated
+                changed |= updated != audit
+            return fields if changed else None
+
+        try:
+            stored = write_task_result(drive_root, task_id, "running", _field_projector=project,
+                                       strict_existing_dict=True)
+            if changed and isinstance(stored, dict) and not tokens.intersection(
+                    stored.get("delegated_runs_unreconciled") or []):
+                refreshed += 1
+        except Exception:
+            log.warning("Disposed custody disclosure refresh failed for %s", task_id, exc_info=True)
+    return refreshed
+
+
 __all__ = [
     "backfill_terminal_reconciliations",
     "custody_audit_snapshot",
     "record_terminal_reconciliation",
+    "refresh_disposed_reconciliation",
     "refresh_recently_settled_terminals",
     "refresh_terminal_reconciliation",
     "terminal_reconcile_task",

@@ -27,6 +27,8 @@ class SourceReader:
     def finish(self, prompt):
         if self.answer:
             return self.answer
+        if prompt.startswith("Compare this draft memory"):
+            return "I retain the beginning, middle and last event, checked against the complete source."
         if "scratchpad working memory has" in prompt:
             return json.dumps({"knowledge_entries": [], "compressed_block": "I retain the beginning, middle and last event, including unresolved questions."})
         if prompt.startswith("Compress these older memory blocks"):
@@ -143,7 +145,9 @@ def test_pressure_reduces_whole_chronicle_and_one_huge_block_before_normal_send(
         assert json.loads((tmp_path / ref["read"]["arguments"]["path"]).read_text(encoding="utf-8")) == [original]
     journal = [json.loads(line) for line in memory.journal_path().read_text(encoding="utf-8").splitlines()]
     assert next(row for row in journal if row["type"] == "blocks_consolidated")["source_blocks"] == [scratch]
-    assert len(actor.sources) == 3 and all(actor.received)
+    # Two contiguous runs: each is compressed and then corrected against its complete
+    # sections through the retained-source route, plus the scratchpad source.
+    assert len(actor.sources) == 5 and all(actor.received)
     assert all("CURRENT GOAL: resolve the outstanding research question." in source for source in actor.received)
     # The caller can now construct its normal first request; maintenance has
     # not changed the identity or truncated any original source to achieve fit.
@@ -166,7 +170,7 @@ def test_force_tail_is_explicit_and_advances_a_huge_short_dialogue_once(tmp_path
         fits=lambda: meta.exists() and json.loads(meta.read_text(encoding="utf-8")).get("last_consolidated_offset") == 1)
     assert result["status"] == "fitting"
     assert chat.read_bytes() == before
-    assert len(actor.calls) == 1  # the tail now fits, so no additional era call
+    assert len(actor.calls) == 2  # one draft and its correction; the tail now fits, so no era call
     assert sum(row["message_count"] for row in json.loads(blocks.read_text(encoding="utf-8"))) == 1
     assert not c.should_consolidate(meta, chat)
 
@@ -182,13 +186,22 @@ def test_pressure_uses_read_revision_to_rewrite_the_authored_overview(tmp_path, 
             if self.calls == 1:
                 return {"tool_calls": [call("knowledge_read", {"topic": "overview", "scope": "global"}, "read-overview")]}, {"cost": 0.01}
             assert old.text in kwargs["messages"][-1]["content"]
+            # Pressure shortening is an explicit edit of the whole long span it replaces.
             return {"content": json.dumps({"knowledge_entries": [{"topic": "overview", "scope": "global",
-                "content": "---\nsummary: Authored compact orientation.\n---\nFull scope retained with [detail](detail.md)."}]})}, {"cost": 0.02}
+                "summary": "Authored compact orientation.",
+                "edits": [{"old_text": "Detailed understanding. " * 500,
+                           "new_text": "Full scope retained with [detail](detail.md).",
+                           "basis": "The complete current source is retained in the detailed note."}]}]})}, {"cost": 0.02}
     result = c.maintain_memory_pressure(memory, Overview(), ctx, fits=lambda: len(address.path.read_bytes()) < 1000)
     assert result["status"] == "fitting"
     assert result["actions"][0]["writes"][0]["ok"]
+    current = k.read_knowledge_note(address)
+    assert current.metadata == {"summary": "Authored compact orientation.", "type": "note"}
+    assert current.text.endswith("---\nFull scope retained with [detail](detail.md).")
     history = [json.loads(line) for line in (tmp_path / "memory/knowledge_history.jsonl").read_text(encoding="utf-8").splitlines()]
-    assert any(row.get("old_content") == old.text for row in history)
+    change = next(row for row in history if row.get("old_content") == old.text)
+    assert change["writer"] == "knowledge_maintenance" and change["edits"][0]["basis"]
+    assert change["summary"] == "Authored compact orientation."
 
 
 def test_irreducible_identity_is_preserved_with_no_progress(tmp_path, fit):

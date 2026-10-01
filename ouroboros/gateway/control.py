@@ -9,6 +9,7 @@ from typing import Any, Dict
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+from starlette.background import BackgroundTask
 
 from ouroboros import get_version
 from ouroboros.gateway._helpers import json_error, json_exception, request_drive_root, request_json_or, request_repo_dir
@@ -140,6 +141,11 @@ async def api_reset(request: Request) -> JSONResponse:
     if lock_error is not None:
         return lock_error
     try:
+        from supervisor.message_bus import try_get_bridge
+
+        bridge = try_get_bridge()
+        if bridge is not None:
+            bridge.panic.invalidate_owner()
         deleted = []
         # Keep synchronization files until restart. Removing the directory that
         # contains the held managed-update lock would let a second updater enter.
@@ -152,6 +158,11 @@ async def api_reset(request: Request) -> JSONResponse:
         if settings_file.exists():
             settings_file.unlink()
             deleted.append("settings.json")
+        # The owner's explicit fresh start (#1307): boot initializes a new state from
+        # this pending witness instead of reading the wiped root as a lost one.
+        from supervisor.state_initialization import mark_pending
+
+        mark_pending(data_dir, origin="owner_reset")
         _request_restart(request)
         return JSONResponse({"status": "ok", "deleted": deleted, "restarting": True})
     except Exception as exc:
@@ -167,7 +178,10 @@ async def api_command(request: Request) -> JSONResponse:
         if cmd:
             from supervisor.message_bus import get_bridge, log_chat
 
-            bridge = get_bridge()
+            try:
+                bridge = get_bridge()
+            except AssertionError:
+                bridge = None
             visible_text = str(body.get("visible_text") or "").strip()
             task_constraint = body.get("task_constraint") if isinstance(body.get("task_constraint"), dict) else None
             visible_task_id = str(body.get("visible_task_id") or "").strip()
@@ -189,6 +203,15 @@ async def api_command(request: Request) -> JSONResponse:
             # frames. The honest stamp names the ENDPOINT — the host cannot know
             # the true caller here (disclosed non-goal).
             send_kwargs["task_metadata"] = {"client_surface": {"channel": "api_command"}}
+            # Publication precedes readiness. Bind the independent owner, keeping
+            # this transport's metadata if the supervisor becomes ready meanwhile.
+            if bridge is None or str(cmd).strip().lower() == "/restart":
+                callback = getattr(request.app.state, "startup_owner_command", None)
+                action = callback(cmd, send_kwargs=send_kwargs) if callable(callback) else None
+                if action is not None:
+                    return JSONResponse({"status": "ok"}, background=BackgroundTask(action))
+            if bridge is None:
+                return json_error("Complete provider setup before sending this command.", 409)
             bridge.ui_send(cmd, **send_kwargs)
             if visible_task_id:
                 _RECENT_VISIBLE_COMMANDS[visible_task_id] = time.monotonic()
@@ -831,6 +854,8 @@ def _start_assisted_merge_fenced(plan: dict, tx: dict) -> JSONResponse:
             + list(plan.get("doc_conflict_paths") or [])
         ),
         "task_id": task_id,
+        # No resolver submitted yet: the first admission of this fresh id is provable.
+        "resolver_submitted_id": "",
         "owner_chat_id": owner_chat_id,
         "resolution_attempts": 0,
         **({"failed_update_ref": prior_attempt_ref} if prior_attempt_ref else {}),
@@ -903,7 +928,7 @@ def _start_assisted_merge_fenced(plan: dict, tx: dict) -> JSONResponse:
     if not enqueue_assisted_resolution_task(tx):
         return _rollback_fenced_update(
             "assisted_worker_start_failed",
-            "the merge was staged but its resolver worker could not start",
+            "the merge was staged but its resolver could not be started or admitted",
         )
     return JSONResponse({"status": "assisted_started", "task_id": task_id, "merge_plan": plan})
 

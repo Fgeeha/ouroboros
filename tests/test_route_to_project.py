@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import json
+import queue
 import types
 
+import pytest
+
+from ouroboros.project_dialogue import build_owner_message_ref
 from ouroboros.projects_registry import create_project
 from ouroboros.tools.control import _list_projects, _route_to_project, get_tools
 
@@ -21,6 +25,51 @@ def _ctx(tmp_path, events=None, *, task_metadata=None, **overrides):
     return types.SimpleNamespace(**values)
 
 
+def _owner_turn_ctx(tmp_path, events, metadata):
+    """A direct turn the owner door stamped (``origin_message_ref``): the one shape
+    that speaks as an owner turn and is offered the manual-target picker; a client
+    id alone never does."""
+    ref = build_owner_message_ref(
+        chat_id=1, client_message_id=metadata["client_message_id"],
+        ts="2026-09-24T00:00:00+00:00", text="owner text",
+    )
+    return _ctx(tmp_path, events, is_direct_chat=True, task_metadata={
+        **metadata, "origin_message_ref": ref, "origin_message_text": "owner text",
+    })
+
+
+def test_a_task_on_a_forked_drive_reads_the_registry_from_the_canonical_root(tmp_path, monkeypatch):
+    """A promoted task with a workspace runs on a forked execution drive that never
+    carries ``state/projects.json``; the routing verbs read the registry through the
+    canonical data root, so such a task lists, routes into and names the owner's
+    projects. A context without a canonical root still reads its own drive."""
+    from ouroboros.tools.control_routing import _effective_scope_note, _promote_chat_to_task
+
+    create_project(tmp_path, "racer", name="Racer")
+    child = tmp_path / "state" / "headless_tasks" / "fork-1" / "data"
+    child.mkdir(parents=True)
+    forked = _ctx(child, task_metadata={"budget_drive_root": str(tmp_path)}, budget_drive_root=str(tmp_path))
+
+    assert "racer — Racer" in _list_projects(forked)
+    out = _route_to_project(forked, "racer", "continue the engine tuning", predecessor_task_id="")
+    assert out.startswith("⚠️ ROUTE_UNCONFIRMED:"), out
+    assert forked.pending_events[0]["project_id"] == "racer"
+    assert _effective_scope_note(forked, "racer") == " in project 'Racer' (racer)"
+
+    monkeypatch.setattr(
+        "ouroboros.tools.control_events._wait_for_promotion_admission",
+        lambda *_a, **_k: {"status": "scheduled", "effective_project_id": "racer"},
+    )
+    promoted = _ctx(child, task_metadata={"budget_drive_root": str(tmp_path)}, budget_drive_root=str(tmp_path))
+    out = _promote_chat_to_task(promoted, "tune the engine", project_id="racer", workspace="none", predecessor_task_id="")
+    assert out.startswith("OK: task") and "in project 'Racer' (racer)" in out, out
+
+    # The quiet direction: no canonical root at all means the task's own drive is the registry.
+    own_drive = _ctx(child)
+    assert _list_projects(own_drive).startswith("No projects yet")
+    assert "target_not_found" in _route_to_project(own_drive, "racer", "msg", predecessor_task_id="")
+
+
 def test_route_to_existing_project_emits_event_and_receipt(tmp_path):
     create_project(tmp_path, "racer", name="Racer")
     # The origin identity is captured at INGRESS and rides task_metadata by
@@ -33,11 +82,12 @@ def test_route_to_existing_project_emits_event_and_receipt(tmp_path):
         "text_sha256": "b" * 64,
     }
     events = []
-    ctx = _ctx(tmp_path, events, task_metadata={
+    ctx = _ctx(tmp_path, events, is_direct_chat=True, task_metadata={
         "client_message_id": "owner-route-1",
         "origin_message_ref": origin_ref,
         "origin_message_text": "continue the engine tuning",
     })
+    ctx.task_id = "drafter"
     out = _route_to_project(ctx, "racer", "paraphrased: keep tuning the engine", reason="follow-up", predecessor_task_id="")
     assert out.startswith("⚠️ ROUTE_UNCONFIRMED:")
     assert "do not retry automatically" in out.lower()
@@ -53,6 +103,8 @@ def test_route_to_existing_project_emits_event_and_receipt(tmp_path):
     assert evt["routing_token"]
     assert evt["source_ref"] == origin_ref
     assert evt["source_text"] == "continue the engine tuning"
+    assert evt["objective_author"] == {"kind": "task", "task_id": ctx.task_id}
+    assert evt["owner_corpus"] == [{"source": "origin_message", "content": "continue the engine tuning"}]
     assert ctx._typed_routing_action_emitted == "route_to_project"
 
 
@@ -130,7 +182,7 @@ def test_route_to_missing_project_emits_typed_manual_target(tmp_path):
         "client_message_id": "owner-1",
         "routing_contract": {"manual_options": [{"task_id": "task-1", "title": "Fix it"}]},
     }
-    ctx = _ctx(tmp_path, events, task_metadata=metadata)
+    ctx = _owner_turn_ctx(tmp_path, events, metadata)
     out = _route_to_project(ctx, "ghost", "do the thing", predecessor_task_id="")
     assert "ROUTING_UNCONFIRMED" in out
     assert len(events) == 1
@@ -160,7 +212,7 @@ def test_manual_target_preserves_valid_predecessor_and_rejects_unreadable_one(tm
     metadata = {"client_message_id": "owner-4", "main_routing_manifest": {"final_results": [preview]}}
 
     out = _route_to_project(
-        _ctx(tmp_path, events, task_metadata=metadata),
+        _owner_turn_ctx(tmp_path, events, metadata),
         "missing-project", "continue it", predecessor_task_id="previous",
     )
 
@@ -178,7 +230,7 @@ def test_manual_target_preserves_valid_predecessor_and_rejects_unreadable_one(tm
     }]}}
     rejected_events = []
     rejected = _route_to_project(
-        _ctx(tmp_path, rejected_events, task_metadata=unreadable_metadata),
+        _owner_turn_ctx(tmp_path, rejected_events, unreadable_metadata),
         "missing-project", "continue it", predecessor_task_id="gone",
     )
     assert "AUTHORITY_SOURCE_UNAVAILABLE" in rejected
@@ -189,22 +241,31 @@ def test_manual_target_preserves_valid_predecessor_and_rejects_unreadable_one(tm
 def test_route_rejects_dirty_project_id(tmp_path):
     events = []
     metadata = {"client_message_id": "owner-3"}
-    out = _route_to_project(_ctx(tmp_path, events, task_metadata=metadata), "Bad Name!", "msg", predecessor_task_id="")
+    out = _route_to_project(_owner_turn_ctx(tmp_path, events, metadata), "Bad Name!", "msg", predecessor_task_id="")
     assert "ROUTING_UNCONFIRMED" in out
     assert events[0]["routing_token"]
     assert events[0]["reason"] == "invalid_project_id"
 
 
-def test_a_task_issuer_gets_a_typed_refusal_and_no_owner_picker(tmp_path):
+@pytest.mark.parametrize("drained_owner", [False, True])
+def test_a_task_issuer_gets_a_typed_refusal_and_no_owner_picker(tmp_path, drained_owner):
     """7=A: a pooled or Swarm root routing to a missing, malformed or unnamed project gets
     ROUTE_REJECTED in its own result; no manual-target event is emitted, so no picker or ack
     can reach an owner surface under an empty message id (the 14.09 incident's class)."""
+    from ouroboros.loop_round_limits import _drain_incoming_messages
+    from ouroboros.owner_mailbox import write_owner_message
+
     events = []
     for target, failure in (("ghost", "target_not_found"), ("Bad Name!", "invalid_project_id"), ("", "target_unspecified")):
         ctx = _ctx(tmp_path, events, task_id="root-1", task_metadata={
             "root_task_id": "root-1",
             "routing_contract": {"manual_options": [{"task_id": "task-1", "title": "Fix it"}]},
         })
+        if drained_owner:
+            write_owner_message(tmp_path, "Continue the work", task_id="root-1",
+                                msg_id=f"followup-{failure}", client_message_id="owner-followup")
+            _drain_incoming_messages([], queue.Queue(), tmp_path, "root-1", None, set(), owner_ctx=ctx)
+            assert ctx.last_owner_delivery["client_message_id"] == "owner-followup"
         out = _route_to_project(ctx, target, "continue the work there", predecessor_task_id="")
         assert out.startswith(f"⚠️ ROUTE_REJECTED ({failure})"), out
         assert "list_projects" in out
@@ -220,7 +281,7 @@ def test_route_empty_target_is_the_typed_abstention_path(tmp_path):
             "manual_options": [{"action": "new_task_in_project", "label": "New task in Project"}],
         },
     }
-    out = _route_to_project(_ctx(tmp_path, events, task_metadata=metadata), "", "ambiguous follow-up", predecessor_task_id="")
+    out = _route_to_project(_owner_turn_ctx(tmp_path, events, metadata), "", "ambiguous follow-up", predecessor_task_id="")
     assert "ROUTING_UNCONFIRMED" in out
     assert events[0]["routing_token"]
     assert events[0]["reason"] == "target_unspecified"
@@ -291,7 +352,7 @@ def test_route_refusal_keeps_the_typed_code_and_carries_the_models_words_as_deta
     events = []
     metadata = {"client_message_id": "owner-9", "routing_contract": {"manual_options": []}}
     out = _route_to_project(
-        _ctx(tmp_path, events, task_metadata=metadata),
+        _owner_turn_ctx(tmp_path, events, metadata),
         "ghost", "continue it there", reason="I could not find it", predecessor_task_id="",
     )
 
@@ -324,7 +385,7 @@ def test_route_abstention_without_a_target_leaves_the_receipt_target_empty(tmp_p
     events = []
     metadata = {"client_message_id": "owner-10", "routing_contract": {"manual_options": []}}
     _route_to_project(
-        _ctx(tmp_path, events, task_metadata=metadata),
+        _owner_turn_ctx(tmp_path, events, metadata),
         "", "continue it somewhere", reason="", predecessor_task_id="",
     )
     assert events[0]["reason"] == "target_unspecified"
@@ -342,3 +403,35 @@ def test_route_abstention_without_a_target_leaves_the_receipt_target_empty(tmp_p
     assert row["target"] == ""
     assert (row["status"], row["reason"]) == ("needs_manual_target", "target_unspecified")
     assert row["cause"] == "Not started: no destination was chosen"
+
+
+def test_a_suppressed_origin_still_hands_the_routed_task_the_owners_stamped_instruction(tmp_path):
+    """Finding 4: a suppressed (never-logged) owner message puts no ``source_text`` on
+    the promote event, and the corpus filter dropped the host-stamped ``initial_user``
+    row, so the routed task got ``objective_author=task`` with an EMPTY owner corpus:
+    the owner's instruction disappeared. The stamped row now rides the corpus under
+    its own label; a first turn nobody typed (``initial_text``) is never laundered."""
+    from ouroboros.loop_messages import _initialize_owner_directives
+
+    create_project(tmp_path, "racer", name="Racer")
+    events = []
+    ctx = _ctx(tmp_path, events, is_direct_chat=True,
+               task_metadata={"client_message_id": "owner-route-2", "origin_suppressed": True})
+    ctx.task_id = "drafter"
+    ctx._owner_directives = [{"source": "initial_user", "content": "continue the engine tuning"}]
+    out = _route_to_project(ctx, "racer", "paraphrased objective", reason="follow-up", predecessor_task_id="")
+    assert out.startswith("⚠️ ROUTE_UNCONFIRMED:"), out
+    evt = events[0]
+    assert evt["origin_suppressed"] is True and "source_text" not in evt
+    assert evt["objective_author"] == {"kind": "task", "task_id": "drafter"}
+    assert evt["owner_corpus"] == [{"source": "initial_user", "content": "continue the engine tuning"}]
+    routed = types.SimpleNamespace(task_metadata={
+        "origin_suppressed": True, "objective_author": evt["objective_author"], "owner_corpus": evt["owner_corpus"]})
+    _initialize_owner_directives(routed, [{"role": "user", "content": "paraphrased objective"}])
+    assert routed._owner_directives == [{"source": "initial_user", "content": "continue the engine tuning"}]
+
+    unstamped = _ctx(tmp_path, [], task_metadata={"client_message_id": "wake-1"})
+    unstamped.task_id = "drafter"
+    unstamped._owner_directives = [{"source": "initial_text", "content": "a wake-up nobody typed"}]
+    _route_to_project(unstamped, "racer", "objective", reason="r", predecessor_task_id="")
+    assert unstamped.pending_events[0]["owner_corpus"] == []

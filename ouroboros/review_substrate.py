@@ -133,6 +133,7 @@ from ouroboros.review_dispatch import (  # noqa: E402,F401 — re-exports
     SLOT_ID_PREFIX,
     slot_id_for_row,
     stamp_review_paid_on_dispatch,
+    task_acceptance_row_refusal,
     task_acceptance_zero_physical_refusal,
 )
 
@@ -163,6 +164,13 @@ def scope_reviewer_slots(
     legacy path used to take this parameter's old literal default instead,
     silently running the BLOCKING reviewer below configured strength (the
     downgrade class the owner forbade).
+
+    Every scope row delivers by RETRIEVAL (owner decision 2026-09-17): an
+    ``api_chat`` row on this surface means a bounded native inspection episode
+    on that model, an ``agent_session`` row a delegated read-only session.
+    ``scope_delivery_rows`` states that on the row itself, so the transport
+    seam reads one fact instead of inferring delivery from an actor id the
+    scope surface does not require.
     """
     if effort is None:
         from ouroboros.config import resolve_effort
@@ -173,14 +181,30 @@ def scope_reviewer_slots(
 
         structured = structured_scope_review_slots()
         if structured is not None:
-            return structured
+            return scope_delivery_rows(structured)
         # Resolved at call time so the configured list stays the live authority.
         from ouroboros.config import get_scope_review_models
 
         models = get_scope_review_models()
-    return reviewer_slots(
+    return scope_delivery_rows(reviewer_slots(
         models, effort=effort, role_hint=SCOPE_ROLE_HINT, id_prefix=SCOPE_SLOT_ID_PREFIX,
-    )
+    ))
+
+
+def scope_delivery_rows(slots: List[ReviewSlot]) -> List[ReviewSlot]:
+    """Mark every ``api_chat`` scope row as a native retrieving reviewer.
+
+    The scope surface owns the delivery of its own rows, so the fact rides the
+    row rather than a synthesized ``subagent_id``: identity, route, model,
+    credential pin, effort, processing preference and local-route flag stay
+    exactly as configured.
+    """
+    return [
+        replace(slot, native_retrieval_override=True)
+        if str(getattr(slot.route, "value", slot.route) or "") == ReviewRouteKind.API_CHAT.value
+        else slot
+        for slot in slots
+    ]
 
 
 def review_usage_category(surface: str) -> str:
@@ -282,7 +306,7 @@ class ReviewCoordinator:
                 global_limit = resolve_total_budget_usd()
             except Exception:
                 global_limit = None
-        if base_scope.root_limit_usd is not None:
+        if base_scope.root_limit_source or base_scope.root_limit_usd is not None:
             root_limit = base_scope.root_limit_usd
         else:
             try:
@@ -306,6 +330,7 @@ class ReviewCoordinator:
                                  else "settings_budget_resolver"),
             global_limit_revision=(base_scope.global_limit_revision if base_scope.global_limit_usd is not None else None),
             root_limit_usd=root_limit,
+            root_limit_source=base_scope.root_limit_source,
         )
 
         from ouroboros.review_custody import run_custodied_review_slots
@@ -361,7 +386,23 @@ class ReviewCoordinator:
             )
             else self.usage_ctx
         )
-        actors = run_custodied_review_slots(
+        source_error = ''
+        if request.surface == 'task_acceptance' and request.policy.get('native_data_root') and not request.reconcile_only:
+            try:
+                from ouroboros.review_source_closure import retain_review_request_sources
+                from ouroboros.acceptance_retrieving import acceptance_retrieving_work_order, retain_review_source
+
+                retain_review_request_sources(request, source_root=request.policy['native_data_root'],
+                                              custody_root=self._custody_drive_root())
+                acceptance_retrieving_work_order(request, [slot for slot in slots if slot.retrieves],
+                    session_root=request.session_root, data_root=pathlib.Path(request.policy['native_data_root']))
+                for slot in slots:
+                    if slot.retrieves:
+                        retain_review_source(request, slot.slot_id, self._custody_drive_root())
+            except Exception as exc:
+                source_error = f'review_source_closure_unavailable: {type(exc).__name__}: {exc}'
+        actors = [self._error_actor(request, slot, source_error, operation_state='not_dispatched')
+                  for slot in slots] if source_error else run_custodied_review_slots(
             request=request, slots=slots,
             usage_ctx=custody_usage_ctx,
             task_id=task_id,
@@ -493,6 +534,8 @@ class ReviewCoordinator:
         base_call_type = request.call_type or f"{request.surface}_review"
         from ouroboros.review_dispatch import review_operation_binding
         binding = review_operation_binding(request, slot, str(operation_id or call_id))
+        from ouroboros.acceptance_retrieving import retain_review_source
+        retain_review_source(request, slot.slot_id, self._custody_drive_root())
         assignment = ReviewAssignment(
             request=request, slot=slot, call_id=call_id, call_type=base_call_type,
             custody_root=self._custody_drive_root(),
@@ -530,9 +573,13 @@ class ReviewCoordinator:
                           "review_operation_binding": binding},
             )
         except Exception:
+            if request.slot_source_delivery.get(slot.slot_id):
+                # A sourced review must retain its canonical identity before
+                # dispatch, not only in a post-run result or a worker buffer.
+                raise
             prompt_ref = {}
         free_refusal = (
-            task_acceptance_zero_physical_refusal(request.evidence, retrieving=bool(slot.retrieves))
+            task_acceptance_row_refusal(request, slot)
             if request.surface == "task_acceptance"
             else {}
         )
@@ -722,6 +769,7 @@ class ReviewCoordinator:
                 transport_status=_transport_error_status(exc),
                 failure_code=failure_code,
                 reset_at=str(getattr(exc, "reset_at", "") or ""),
+                reported_cause=str(getattr(exc, "reported_cause", "") or ""),
                 http_status=http_status if isinstance(http_status, int) and http_status else None,
                 usage=failure_custody,
                 prompt_ref=prompt_ref,

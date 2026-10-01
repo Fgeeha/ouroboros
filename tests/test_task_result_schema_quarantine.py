@@ -138,6 +138,39 @@ def test_missing_read_is_not_reclassified_when_a_result_appears(tmp_path, monkey
     assert not _quarantine_events(tmp_path)
 
 
+@pytest.mark.parametrize("strict,denials", [(False, 1), (True, 1), (True, None)])
+def test_a_read_denied_by_a_concurrent_replace_is_not_unreadable_authority(tmp_path, monkeypatch, strict, denials):
+    """Windows denies an open that meets a writer's atomic replace; that instant is
+    retried within the writer's own bound. A denial that outlasts it stays the
+    strict fail-closed refusal, and neither case moves the intact row."""
+    from ouroboros import utils
+
+    write_task_result(tmp_path, "shared", "completed", result="intact")
+    path = _results_dir(tmp_path) / "shared.json"
+    before = path.read_bytes()
+    read_text = pathlib.Path.read_text
+    denied = []
+
+    def denied_open(selected, *args, **kwargs):
+        if selected == path and (denials is None or len(denied) < denials):
+            denied.append(selected)
+            raise PermissionError(13, "The process cannot access the file", str(path))
+        return read_text(selected, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "read_text", denied_open)
+    monkeypatch.setattr(utils.time, "sleep", lambda _s: None)
+    if denials is None:
+        with pytest.raises(ValueError, match="unreadable or invalid"):
+            load_task_result(tmp_path, "shared", strict=strict)
+        assert len(denied) == utils._REPLACE_RETRY_ATTEMPTS
+    else:
+        assert load_task_result(tmp_path, "shared", strict=strict)["result"] == "intact"
+        assert len(denied) == denials
+    assert path.read_bytes() == before
+    assert not _quarantine_files(tmp_path)
+    assert not _quarantine_events(tmp_path)
+
+
 def test_unstamped_history_is_quarantined_not_converted(tmp_path):
     legacy = {"task_id": "t5", "status": "completed", "result": "pre-7.0"}
     path = _write_raw(tmp_path, "t5", legacy)
@@ -258,6 +291,7 @@ def test_state_save_stamps_and_an_unstamped_state_loads_unchanged(tmp_path, monk
     monkeypatch.setattr(state, "STATE_PATH", tmp_path / "state" / "state.json")
     monkeypatch.setattr(state, "STATE_LAST_GOOD_PATH", tmp_path / "state" / "state.last_good.json")
     monkeypatch.setattr(state, "STATE_LOCK_PATH", tmp_path / "locks" / "state.lock")
+    monkeypatch.setattr(state, "DRIVE_ROOT", tmp_path)  # a fresh root: the first whole-state write may mint
 
     state.save_state({"spent_usd": 1.25})
     for path in (state.STATE_PATH, state.STATE_LAST_GOOD_PATH):

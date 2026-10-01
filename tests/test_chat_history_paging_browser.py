@@ -22,6 +22,7 @@ HISTORY_URL = "/api/chat/history"
 _FRAMES = "() => new Promise(done => requestAnimationFrame(() => requestAnimationFrame(done)))"
 _EDGE_SCROLL = """(root, direction) => {
     root.scrollTop = direction === 'older' ? 0 : root.scrollHeight;
+    root.dispatchEvent(new WheelEvent('wheel', {deltaY: direction === 'older' ? -1 : 1}));
     root.dispatchEvent(new Event('scroll'));
 }"""
 _OBSERVE_HISTORY = """() => {
@@ -128,13 +129,13 @@ def _reads(page, chat_id=1):
 
 def _step(page, feed, direction="older", *, automatic=False):
     before = page.evaluate("() => window.__historyReads.length")
-    if automatic:
+    if automatic and direction == "older":
         page.locator(feed).evaluate(_EDGE_SCROLL, direction)
     else:
-        assert direction == "older", "`Load older messages` is the only paging button"
+        # Mixed cards have no physical edge: the common button fills the known gap.
         # This exercises the visible button's handler without changing a reader's
         # selection or forcing an off-screen control into the reading viewport.
-        page.locator(f"{feed} .chat-load-{direction} button").evaluate("node => node.click()")
+        page.locator(f"{feed} .chat-load-older button").evaluate("node => node.click()")
     page.wait_for_function("n => window.__historyReads.length > n", arg=before, timeout=30_000)
     _idle(page, feed)
 
@@ -142,8 +143,10 @@ def _step(page, feed, direction="older", *, automatic=False):
 def _to_beginning(page, feed):
     for _ in range(80):
         _idle(page, feed)
-        if page.locator(f"{feed} .chat-load-older button").is_hidden():
-            assert page.locator(f"{feed} .chat-load-older-note").inner_text() == "Beginning of saved history"
+        latest = page.evaluate("() => window.__historyReads.filter(read => read.done && read.body).at(-1)?.body")
+        if latest and latest.get("has_more") is False:
+            note = page.locator(feed).locator('..').locator('.chat-load-older-note').inner_text()
+            assert note in {"Beginning of saved history", "Some saved history is not loaded. Shown messages may have gaps."}
             return
         _step(page, feed, automatic=True)
     pytest.fail("archive navigation did not reach its physical beginning")
@@ -160,8 +163,7 @@ def _open_project(page, project):
     feed = f'#pchat-{project["id"]}-messages'
     page.locator(feed).wait_for(state="visible", timeout=30_000)
     _idle(page, feed)
-    # Project show/reopen owns a bounded restoration lease before edge scrolling
-    # is admitted. Use the existing viewport suite's frame settlement contract.
+    # Settle completed rendering before the first deliberate edge gesture.
     page.evaluate(_SETTLE_RESTORE_FRAMES)
     return feed
 
@@ -169,7 +171,7 @@ def _open_project(page, project):
 def _screenshot(page, tmp_path, name):
     root = Path(os.environ.get("HISTORY_UI_EVIDENCE_DIR") or tmp_path / "history-ui-evidence")
     root.mkdir(parents=True, exist_ok=True)
-    page.screenshot(path=str(root / f"{name}.png"), full_page=False)
+    page.screenshot(path=str(root / f"{name}.png"), full_page=False, animations="disabled")
 
 
 def _assert_main_beginning_visible(page):
@@ -178,17 +180,23 @@ def _assert_main_beginning_visible(page):
     bounds = page.evaluate("""() => {
         const root = document.querySelector('#chat-messages');
         const first = [...root.querySelectorAll('.message')].find(node => node.textContent === 'history-human-0000');
-        const note = root.querySelector('.chat-load-older-note');
+        const note = root.parentElement.querySelector('.chat-load-older-note');
         const header = document.querySelector('#page-chat .chat-page-header');
         const box = root.getBoundingClientRect();
-        return {top: first?.getBoundingClientRect().top, noteTop: note?.getBoundingClientRect().top,
+        const noteBox = note?.getBoundingClientRect(), headerBox = header?.getBoundingClientRect();
+        return {top: first?.getBoundingClientRect().top, noteTop: noteBox?.top, noteBottom: noteBox?.bottom,
+            noteInHeader: header?.contains(note), headerTop: headerBox?.top, headerBottom: headerBox?.bottom,
             floor: Math.max(box.top, header?.getBoundingClientRect().bottom || 0),
             bottom: box.bottom, scrollTop: root.scrollTop, note: note?.textContent};
     }""")
     assert bounds["scrollTop"] <= 1, bounds
     assert bounds["floor"] - 2 <= bounds["top"] < bounds["bottom"], bounds
-    assert bounds["floor"] - 2 <= bounds["noteTop"] < bounds["bottom"], bounds
-    assert bounds["note"] == "Beginning of saved history", bounds
+    # Uncertain coverage stays in persistent chrome; a complete beginning note
+    # belongs at the feed edge. Both must remain visible in their actual owner.
+    note_floor = bounds["headerTop"] if bounds["noteInHeader"] else bounds["floor"]
+    note_ceiling = bounds["headerBottom"] if bounds["noteInHeader"] else bounds["bottom"]
+    assert note_floor - 2 <= bounds["noteTop"] < bounds["noteBottom"] <= note_ceiling + 2, bounds
+    assert bounds["note"] in {"Beginning of saved history", "Some saved history is not loaded. Shown messages may have gaps."}, bounds
 
 
 @pytest.mark.parametrize("browser_engine", ["chromium", "webkit"])
@@ -292,7 +300,7 @@ def test_history_archive_navigation_rotation_retry_and_sparse_project(
                         _idle(page, feed)
                     assert len(_reads(page, project["chat_id"])) == settled, "a settled sparse room must not refetch"
                     assert page.locator(f"{feed} .message").filter(has_text="SPARSE_FIRST_SAVED_MESSAGE").count() == 1
-                    assert "OTHER_ROOM_ONLY" not in page.locator(feed).inner_text()
+                    assert "OTHER_ROOM_ONLY" not in page.locator(feed).locator('..').inner_text()
                     assert any(read.get("body", {}).get("messages") == [] and read["body"]["has_more"]
                                for read in _reads(page, project["chat_id"]) if read.get("cursor"))
                     _screenshot(page, tmp_path, f"sparse-beginning-{browser_engine}-{width}")
@@ -308,6 +316,7 @@ def _feature_history(root):
     from ouroboros.projects_registry import create_project
 
     project = create_project(root, "history-details", name="History detail room")
+    destination = create_project(root, "history-destination", name="Routing destination room")
     cid = project["chat_id"]
     quiz = {"quiz_id": "saved-choice", "question": "How should the retained history read?",
             "options": [{"label": "First", "detail": "Keep the first form"},
@@ -330,13 +339,17 @@ def _feature_history(root):
     ]
     _write(root / "archive" / "chat_20260901T000000.jsonl", old)
     # Both source budgets reach these oldest companions in the same final page.
-    _write(root / "logs" / "chat.jsonl", [*[_human(index, cid) for index in range(5, 1655)],
+    _write(root / "logs" / "chat.jsonl", [
+        _human(5, cid, text="Routed to another project", client_message_id="routed-other"),
+        *[_human(index, cid) for index in range(6, 1655)],
         _human(1656, cid, direction="system", type="quiz_answer", task_id="quiz-owner", text="",
                quiz={**quiz, "state": "answered", "comment": comment}),
         *[_human(1700 + index, cid, text=f"Following dialogue {index}", ts="2026-09-12T10:00:01Z")
           for index in range(20)]])
     append_chat_annotation(root, "routed-archive", action="route_to_project", status="delivered",
                            target="far-parent", target_label="History detail room", project_id=project["id"], project_chat_id=cid)
+    append_chat_annotation(root, "routed-other", action="route_to_project", status="delivered",
+                           target_label=destination["name"], project_id=destination["id"], project_chat_id=destination["chat_id"])
     child = {"task_id": "linked-child", "delegation_role": "subagent", "subagent_task_id": "linked-child",
              "parent_task_id": "far-parent", "root_task_id": "far-parent", "subagent_role": "Archive reader"}
     _write(root / "archive" / "progress_20260901T000000.jsonl", [
@@ -360,7 +373,7 @@ def _feature_history(root):
     for task_id in ["far-parent", "linked-child", "focus-root", "history-media", "quiz-owner", *[f"history-task-{n}" for n in range(5)]]:
         _result(root, task_id, chat_id=cid, project_id=project["id"],
                 **({"review_projection": review, "suggested_name": "Selectable history title"} if task_id == "focus-root" else {}))
-    return project, comment
+    return project, destination, comment
 
 
 @pytest.mark.parametrize("browser_engine", ["chromium", "webkit"])
@@ -368,7 +381,7 @@ def test_history_details_selection_replay_and_project_reopen(direct_server_with_
     from playwright.sync_api import sync_playwright
 
     root, url = direct_server_with_data["data_dir"], direct_server_with_data["url"]
-    project, comment = _feature_history(root)
+    project, destination, comment = _feature_history(root)
     with sync_playwright() as pw:
         browser = getattr(pw, browser_engine).launch(headless=True)
         try:
@@ -484,16 +497,27 @@ def test_history_details_selection_replay_and_project_reopen(direct_server_with_
                     assert image.count() > 0
                     assert page.locator(feed).get_by_text("history-note.txt", exact=True).count() > 0
                     anchor = page.locator(f'{feed} [data-client-message-id="routed-archive"]')
+                    assert anchor.locator('.msg-routing-annotation').text_content() == "Routed to project · History detail room"
+                    assert anchor.locator('.msg-routing-actions').count() == 0
+                    other = page.locator(f'{feed} [data-client-message-id="routed-other"]')
                     # The routing receipt's button lives in the shared action row between the note and the
                     # timestamp (never inside the nowrap note line): DESIGN "Quiz card", ARCHITECTURE 03.
-                    assert anchor.locator('.msg-routing-actions').get_by_role("button", name="Open Project").count() == 1
-                    assert anchor.locator('.msg-routing-annotation').get_by_role("button").count() == 0
-                    assert anchor.evaluate("""node => {
+                    assert other.locator('.msg-routing-actions [data-intent="open-project"]').count() == 1
+                    assert other.locator('.msg-routing-annotation').get_by_role("button").count() == 0
+                    assert other.evaluate("""node => {
                         const note = node.querySelector('.msg-routing-annotation'), row = node.querySelector('.msg-routing-actions'),
                             time = node.querySelector('.msg-time');
                         const follows = (a, b) => (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
                         return Boolean(note && row && time) && follows(note, row) && follows(row, time);
                     }""")
+                    # Live receipt updates use the same room address as retained history.
+                    for routed_project in (project, destination):
+                        _emit_ws_frame(page, {"type": "message_annotation", "annotation_type": "routing_ack",
+                            "chat_id": project["chat_id"], "client_message_id": "routed-other",
+                            "action": "route_to_project", "status": "delivered", "target_label": routed_project["name"],
+                            "project_id": routed_project["id"], "project_chat_id": str(routed_project["chat_id"])})
+                        assert other.locator('.msg-routing-annotation').text_content() == f"Routed to project · {routed_project['name']}"
+                        assert other.locator('.msg-routing-actions').count() == int(routed_project is destination)
                     anchor.scroll_into_view_if_needed()
                     identity = anchor.get_attribute("data-history-id")
                     before_top = anchor.evaluate("node => node.getBoundingClientRect().top - node.closest('.chat-messages').getBoundingClientRect().top")
@@ -506,6 +530,16 @@ def test_history_details_selection_replay_and_project_reopen(direct_server_with_
                     after_top = restored.evaluate("node => node.getBoundingClientRect().top - node.closest('.chat-messages').getBoundingClientRect().top")
                     assert abs(after_top - before_top) <= 8, (before_top, after_top)
                     assert page.locator(f'{reopened} [data-quiz-id="saved-choice"] .chat-quiz-answer').text_content() == f"Owner's answer: {comment}"
+                    assert restored.locator('.msg-routing-annotation').text_content() == "Routed to project · History detail room"
+                    assert restored.locator('.msg-routing-actions').count() == 0
+                    other = page.locator(f'{reopened} [data-client-message-id="routed-other"]')
+                    other.scroll_into_view_if_needed()
+                    _screenshot(page, tmp_path, f"routing-other-project-{browser_engine}-{width}")
+                    other.locator('.msg-routing-actions [data-intent="open-project"]').click()
+                    destination_feed = f'#pchat-{destination["id"]}-messages'
+                    page.locator(destination_feed).wait_for(state="visible", timeout=30_000)
+                    _idle(page, destination_feed)
+                    _screenshot(page, tmp_path, f"routing-destination-opened-{browser_engine}-{width}")
                 finally:
                     context.close()
         finally:

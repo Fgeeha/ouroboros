@@ -1,9 +1,7 @@
 """The user_files confinement: secret-name policy and path resolution.
 
-Every span is extracted VERBATIM from the parent's tip bytes by
-scripts/v7next_transplant.py (D18/D33 module-handle split, proof-checked);
-the parent re-exports every moved name, so historical imports and
-monkeypatch targets keep working unchanged.
+The facade re-exports these definitions so existing imports and monkeypatch
+targets retain the same bindings.
 """
 
 from __future__ import annotations
@@ -23,7 +21,7 @@ def _tool_access():
     The parent owns the rebindable module state and the members tests
     monkeypatch there; reading them through the module at each call keeps
     one binding, where a from-import would freeze the value this leaf saw
-    at import time (the owner-approved D18/D33 mechanical exception).
+    at import time.
     """
     from ouroboros import tool_access
 
@@ -122,12 +120,12 @@ def user_files_path_block_reason(
 ) -> str:
     """Return a block reason when candidate is not an external user file.
 
-    Location checks (outside-home, control-plane overlap) apply to every
-    operation. Root reads are location-authorized with byte masking at egress.
+    Ordinary reads follow location checks and return unchanged bytes. Children
+    inherit their parent's read reach; their write/action ceilings remain separate.
     Mutations additionally protect known credential leaves and physical owner
     stores through credential_shapes; ordinary .config/Library/settings files
     and the exact SSH config are not rejected as credential stores by name.
-    Children never hold a user_files grant in the profile matrix.
+    Cyber Pro follows the existing per-operation agency exemption below.
     """
 
     resolved = pathlib.Path(candidate).expanduser().resolve(strict=False)
@@ -135,7 +133,8 @@ def user_files_path_block_reason(
     from ouroboros.runtime_mode_policy import mode_has_unrestricted_agency
     from ouroboros.tool_access import active_tool_profile
 
-    if mode_has_unrestricted_agency(get_runtime_mode()) and active_tool_profile(ctx) != "local_readonly_subagent":
+    read_only = operation in _tool_access()._READ_OPS
+    if mode_has_unrestricted_agency(get_runtime_mode()) and (read_only or active_tool_profile(ctx) != "local_readonly_subagent"):
         return ""
     home = _tool_access()._user_files_root()
     outside_home = not _tool_access().path_is_relative_to(resolved, home) and not _tool_access()._path_is_relative_to_casefold(resolved, home)
@@ -143,8 +142,11 @@ def user_files_path_block_reason(
     # sibling checkouts). The runtime-overlap guard BELOW still runs on the full
     # path, so the Ouroboros repo/data drive stays protected even when home
     # confinement is lifted.
-    if outside_home and not _tool_access().is_external_workspace(ctx):
-        return f"path is outside user home {home}"
+    from ouroboros.tool_access_reads import read_allows_outside_home
+    if outside_home:
+        outside_home_allowed = read_allows_outside_home(ctx) if read_only else _tool_access().is_external_workspace(ctx)
+        if not outside_home_allowed:
+            return f"path is outside user home {home}"
 
     # The Ouroboros runtime/control surface is the system repo PLUS every data
     # drive the task touches: the parent drive (ctx.drive_root) and any child /
@@ -237,7 +239,7 @@ class UserFilesPathBlockedError(ValueError):
     the typed ``⚠️ USER_FILES_PATH_BLOCKED`` prefix so the outcome axis can
     partition it into ``execution.policy_denials`` (v6.57.0) instead of the
     generic ``error`` status that falsely degraded a shipped task to
-    ``tool_failure`` (the submarine wave-3 incident)."""
+    ``tool_failure``."""
 
 
 def resolve_user_file_path(
@@ -283,8 +285,10 @@ def resolve_user_file_path(
         from ouroboros.runtime_mode_policy import mode_has_unrestricted_agency
         from ouroboros.tool_access import active_tool_profile
 
-        cyber = mode_has_unrestricted_agency(get_runtime_mode()) and active_tool_profile(ctx) != "local_readonly_subagent"
-        if not allow_outside_home and not cyber and not _tool_access().is_external_workspace(ctx):
+        read_only = operation in _tool_access()._READ_OPS
+        cyber = mode_has_unrestricted_agency(get_runtime_mode()) and (read_only or active_tool_profile(ctx) != "local_readonly_subagent")
+        from ouroboros.tool_access_reads import read_allows_outside_home
+        if not allow_outside_home and not cyber:
             home_resolved = home.resolve(strict=False)
             # Case-insensitive-platform parity with the user_files_path_block_reason
             # authority: a differently-cased safe home path must not be rejected
@@ -301,7 +305,10 @@ def resolve_user_file_path(
                     ) or _tool_access()._path_is_relative_to_casefold(candidate, deliverables_resolved)
                 except (OSError, ValueError):
                     inside_deliverables = False
+            outside_home_allowed = True
             if not inside_home and not inside_deliverables:
+                outside_home_allowed = read_allows_outside_home(ctx) if read_only else _tool_access().is_external_workspace(ctx)
+            if not outside_home_allowed:
                 raise UserFilesPathBlockedError(
                     "user_files path blocked: absolute path "
                     f"{raw_text!r} is outside the user_files home ({home_resolved}). "

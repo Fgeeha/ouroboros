@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createChatInstance } from '../modules/chat.js';
-import { installDom, restoreDom, ElementStub } from './chat_dom_fixture.js';
+import { installDom, restoreDom, ElementStub, walkCard } from './chat_dom_fixture.js';
 
 const TS = '2026-09-12T12:00:00.000Z';
 const row = (id, text, extra = {}) => ({
@@ -32,7 +32,7 @@ function fixture(t, initial = page([]), fetchPage = null) {
         ws: { on(type, handler) { handlers.set(type, handler); return () => handlers.delete(type); },
             isConnected: () => true, send() {} },
         state: { activePage: 'chat', projectChatIds: new Set(), unreadCount: 0 },
-        updateUnreadBadge() {}, stateSnapshots: { begin: () => ({ generation: 1, requestedAt: Date.now() }),
+        updateUnreadBadge() {}, stateSnapshots: { begin: () => ({ generation: 1, requestedAt: Date.now() }), gate() { return Promise.resolve(this.begin()); },
             isCurrent: () => true, apply() {} },
         chatId: 2, idPrefix: 'chat', mountEl: mount, asPanel: true,
     });
@@ -43,11 +43,12 @@ function fixture(t, initial = page([]), fetchPage = null) {
         bubbles: () => messages.children.filter((node) => node.classList.contains('chat-bubble')
             && !node.classList.contains('typing-bubble') && node.dataset.ephemeral !== '1'),
         emit: (message) => handlers.get('chat')({ chat_id: 2, ...message }),
+        reconnect: () => handlers.get('open')({ previouslyConnected: true }),
         respond: next => { response = next; },
         async refresh(next = response) {
             response = next;
             const result = await instance.refreshHistory({ revision: ++revision });
-            assert.equal(result.painted, true, 'history reached the public paint acknowledgement');
+            assert.equal(result.painted, true, 'the readable response reaches paint ACK independently of navigation');
         },
         async clickOlder() {
             const button = messages.querySelector('.chat-load-older').querySelector('.chat-load-older-btn');
@@ -62,6 +63,7 @@ function fixture(t, initial = page([]), fetchPage = null) {
 // fetch chain drain until it stops asking for pages.
 async function scrollEdge(f, scrollTop = 0) {
     f.messages.scrollTop = scrollTop;
+    for (const handler of f.messages.listeners.get('wheel')) handler({ type: 'wheel', deltaY: scrollTop ? 1 : -1 });
     for (const handler of f.messages.listeners.get('scroll')) handler({});
     for (let n = 0, spent = -1; spent !== f.calls.length && n < 40; n += 1) {
         spent = f.calls.length;
@@ -82,9 +84,12 @@ test('a sparse room walks to its floor without minting a Load-newer control', as
     const f = sparseRoom(t);
     await f.refresh();
     await scrollEdge(f);
+    assert.deepEqual(f.calls, [null, 'before:1', 'before:2'], 'one gesture performs a bounded sparse traversal');
+    await scrollEdge(f);
+    await scrollEdge(f);
     assert.deepEqual(f.calls, [null, 'before:1', 'before:2', 'before:3', 'before:4', 'before:5']);
     const controls = f.messages.querySelector('.chat-load-older');
-    assert.equal(controls.querySelector('.chat-load-older-note').textContent, 'Beginning of saved history');
+    assert.equal((f.messages.parentNode.querySelector('.chat-panel-statusbar').querySelector('.chat-load-older-note') || f.messages.querySelector('.chat-load-older').querySelector('.chat-load-older-note')).textContent, 'Some saved history is not loaded. Shown messages may have gaps.');
     assert.equal(controls.querySelector('.chat-load-older-btn').hidden, true);
     assert.equal(f.messages.querySelector('.chat-load-newer'), null, 'walked-over empty pages are not a gap');
     assert.equal(f.bubbles().filter(node => node.dataset.historyId === 'chat:900').length, 1);
@@ -96,6 +101,7 @@ test('a walked-out sparse room asks for nothing more, however often the reader s
     await scrollEdge(f);
     // Everything fits on one screen, so the reader is at the top edge and near the
     // bottom at the same time: both edges are live on every one of these events.
+    await scrollEdge(f); await scrollEdge(f);
     const spent = f.calls.length;
     for (let n = 0; n < 5; n += 1) await scrollEdge(f);
     assert.equal(f.calls.length, spent, 'no pill to click 64 times, and no request storm behind it');
@@ -127,7 +133,7 @@ test('at the bottom edge a released page returns by its exact handle and closes 
     assert.equal(f.bubbles().filter(node => node.dataset.historyId === 'chat:900').length, 1,
         'the recent rows stay mounted after the pager released their page');
     // Near the bottom without being at the top: only the newer edge is live here.
-    await scrollEdge(f, 200);
+    await f.clickOlder(); // ambiguous synthetic geometry uses the common button
     assert.deepEqual(f.calls, [null, 'before:1', 'before:2', 'before:3', 'page:recent'],
         'the released page is refetched by its own frozen handle, page zero first');
     const ids = [...f.messages.querySelectorAll('[data-history-id]')].map(node => node.dataset.historyId);
@@ -193,12 +199,14 @@ test('a replayed refusal receipt shows the host cause and a later scheduled rece
     assert.equal(note.textContent, cause);
     await f.refresh(page([{ ...message, chat_annotation: {
         action: 'promote_chat_to_task', status: 'scheduled', target: 'task-started', target_label: 'Investigation',
+        project_id: 'current-project', project_chat_id: 2,
     } }]));
     assert.equal(f.bubbles().filter((node) => node.dataset.historyId === 'chat:250').length, 1);
     assert.equal(f.bubbles().find((node) => node.dataset.historyId === 'chat:250'), bubble);
     assert.equal(bubble.querySelector('.msg-routing-annotation'), note);
     assert.equal(bubble.dataset.chatAnnotationStatus, 'scheduled');
     assert.equal(note.textContent, 'Started task · Investigation');
+    assert.equal(bubble.querySelector('.msg-routing-actions'), null, 'the current Project is already displayed');
 });
 
 test('two physical rows with identical timestamp and body remain two messages across refresh', async (t) => {
@@ -301,10 +309,66 @@ for (const hydrated of [false, true]) test(`an unavailable archive keeps recent 
     const controls = f.messages.querySelector('.chat-load-older');
     const button = controls.querySelector('.chat-load-older-btn');
     assert.equal(button.textContent, 'Retry loading messages');
-    assert.notEqual(controls.querySelector('.chat-load-older-note').textContent, 'Beginning of saved history');
+    assert.notEqual((f.messages.parentNode.querySelector('.chat-panel-statusbar').querySelector('.chat-load-older-note') || f.messages.querySelector('.chat-load-older').querySelector('.chat-load-older-note')).textContent, 'Some saved history is not loaded. Shown messages may have gaps.');
     f.respond(page([row('chat:10', 'Readable recent answer')], 'real-page', 'real-older'));
     await f.clickOlder();
-    assert.equal(button.textContent, 'Load older messages');
+    assert.equal(button.textContent, 'Load more history');
     assert.deepEqual(f.bubbles().filter(node => node.dataset.historyId === 'chat:10'), [recent]);
     assert.equal(f.calls.at(-1), null, 'retry captures a fresh real boundary rather than inventing a cursor');
 });
+
+for (const phase of ['unknown', 'done', 'error', 'warn', 'cancelled']) {
+    test(`compact historical terminal preserves the projected outcome: ${phase}`, async (t) => {
+        // This flat DOM fixture drops nested text; observe the details markup it receives.
+        const markup = [], html = Object.getOwnPropertyDescriptor(ElementStub.prototype, 'innerHTML');
+        Object.defineProperty(ElementStub.prototype, 'innerHTML', { ...html, set(value) {
+            markup.push(String(value)); html.set.call(this, value);
+        } });
+        t.after(() => Object.defineProperty(ElementStub.prototype, 'innerHTML', html));
+        const TASK = `projected-${phase}`;
+        const rationale = 'Verification is unfinished; the complete cause remains available.';
+        const status = phase === 'cancelled' ? 'cancelled' : 'completed';
+        const axes = { lifecycle: { status }, execution: { status: 'ok' },
+            objective: { status: phase === 'error' ? 'fail' : phase === 'warn' ? 'degraded' : 'pass' } };
+        if (phase === 'error') {
+            axes.execution.task_completion = { action: 'stop', rationale, source: 'finish_task' };
+            axes.objective.source = 'task_completion';
+        }
+        const observed = { task_id: TASK, role: 'assistant', text: 'The complete selected answer.', ts: TS,
+            _is_direct_chat: true, ...(phase === 'unknown' ? { is_progress: true }
+                : { task_terminal_status: status, outcome_axes: axes }) };
+        const rows = phase === 'unknown' ? [observed] : [observed,
+            { task_id: TASK, role: 'system', system_type: 'task_summary', text: '', ts: TS,
+                _is_direct_chat: true, task_terminal_status: status, outcome_axes: axes,
+                tool_calls: 1, completion_tool_calls: 1, tool_errors: 0 },
+            { task_id: TASK, role: 'system', system_type: 'task_summary', text: '', ts: TS,
+                summary_kind: 'terminal_root_projection', historical_terminal: {
+                    status, phase, ts: TS, provenance: 'canonical_task_result_after_finalization',
+                } },
+        ];
+        const f = fixture(t, page(rows));
+        await f.refresh();
+        for (const reconnect of [false, true]) {
+            if (reconnect) { f.reconnect(); await new Promise(setImmediate); }
+            const card = walkCard(f.messages, TASK);
+            if (phase === 'done') {
+                assert.equal(card, null, 'successful completion-only work remains a receipt without a card');
+                continue;
+            }
+            assert.ok(card, 'a failed objective must not disappear merely because execution completed');
+            const chip = card.querySelector('[data-live-phase]');
+            if (phase === 'unknown') {
+                assert.notEqual(card.dataset.finished, '1', 'missing terminal evidence cannot create completion');
+                assert.equal(chip.hidden, true, 'unknown history cannot claim a terminal status');
+            } else {
+                assert.equal(card.dataset.finished, '1');
+                assert.equal(chip.dataset.phase, phase);
+            }
+            assert.equal(card.querySelector('[data-cancel-run]'), null, 'history does not restore Stop authority');
+            if (phase === 'error') assert.ok(markup.some(html => html.includes(rationale)),
+                'the existing full cause survives in the card details');
+        }
+        assert.ok(f.calls.length >= 2, 'the real reconnect handler refetched history');
+        assert.equal(rows.at(-1).historical_terminal?.status || status, status, 'raw lifecycle is unchanged');
+    });
+}
