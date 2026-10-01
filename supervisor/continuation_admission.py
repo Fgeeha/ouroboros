@@ -11,9 +11,11 @@
    without its result row (a stop between the snapshot and the result write)
    is recovered as the same admission, never admitted twice.
 2. CLAIM on the predecessor before any effect (``claim_on_predecessor``):
-   eligibility, the complete owner sources and the binding are settled first;
-   a write that fails refuses with nothing done. The same nonce resumes its
-   own claim; another nonce is answered with the accepted successor.
+   eligibility, the complete owner sources and the binding (its room read from
+   the predecessor's canonical Project binding, ``continuation_room``) are
+   settled first; a write that fails refuses with nothing done. The same nonce
+   resumes its own claim and frozen room; another nonce is answered with the
+   accepted successor.
 3. ADMISSION through the existing reservation and durable enqueue (queue row,
    persisted snapshot, then the result row under the queue lock). A
    predecessor whose writers are not proven settled — a RUNNING or
@@ -275,11 +277,36 @@ def _billing_group(q: Any, predecessor: str, result: Dict[str, Any]) -> Dict[str
             "billing_group_limit_source": "ledger_first_row"}
 
 
+def _prepare_project_room(q: Any, predecessor: str, task: Dict[str, Any]) -> Dict[str, Any]:
+    """The successor's prepared Project basis; bound work also binds its successor.
+
+    A fresh admission carries the basis (the producer seam schedule_task uses); a
+    basis-less row would be held as legacy forever. When the predecessor is bound
+    to the claim's room, the successor joins it through the same writer a timeout
+    retry uses, so late frames, helpers and history resolve the room by lineage,
+    with the original owner message as its origin. The successor id belongs to
+    this claim alone: the bind is idempotent, fenced by the basis and made before
+    the row exists. Refusals raise; the queue lock is not held here.
+    """
+    from ouroboros.projects_registry import bind_task_to_project, project_admission_view, project_binding_for_task
+
+    bound = project_binding_for_task(q.DRIVE_ROOT, predecessor, strict=True) or {}
+    basis = project_admission_view(q.DRIVE_ROOT, task["project_id"], frozen=True,
+                                   allow_unregistered=bound.get("project_id") != task["project_id"])
+    if (bound.get("project_id"), bound.get("project_chat_id")) == (task["project_id"], task["chat_id"]):
+        ref = bound.get("source_ref")
+        origin = ({"ref": ref, **({"text": bound["source_text"]} if "source_text" in bound else {})}
+                  if isinstance(ref, dict) else {"absent": bound.get("origin_absent") or "post_hoc_unresolved"})
+        bind_task_to_project(q.DRIVE_ROOT, task["id"], task["project_id"], task["chat_id"],
+                             origin=origin, admission_basis=basis)
+    return basis
+
+
 def admit_continuation(predecessor_task_id: str, *, action_nonce: str) -> Dict[str, Any]:
     """Admit (or replay) the owner's Continue of one interrupted root (module docstring)."""
     from ouroboros.owner_continue import (
         VERB, BINDING_VERSION, binding_sha, claim_on_predecessor, continuation_eligibility,
-        owner_sources, successor_id, valid_nonce,
+        continuation_room, owner_sources, successor_id, valid_nonce,
     )
     from ouroboros.task_results import STATUS_SCHEDULED, load_task_result, validate_task_id, write_task_result
 
@@ -311,10 +338,14 @@ def admit_continuation(predecessor_task_id: str, *, action_nonce: str) -> Dict[s
         billing = {} if claim else _billing_group(q, predecessor, result)
     except Exception:
         return {"ok": False, "error": "billing_authority_unavailable"}
+    try:
+        # A recorded claim keeps the room it froze, even if the work was converted since.
+        room = {} if claim else continuation_room(q.DRIVE_ROOT, predecessor, result)
+    except (OSError, ValueError):
+        return {"ok": False, "error": "project_routing_fence_lookup_failed"}
     binding = dict(claim.get("binding") or {}) if claim else {
         "verb": VERB, "binding_version": BINDING_VERSION, "predecessor_task_id": predecessor,
-        "action_nonce": nonce, "successor_task_id": successor, "cause": verdict["cause"],
-        "chat_id": result.get("chat_id"), "project_id": str(result.get("project_id") or ""),
+        "action_nonce": nonce, "successor_task_id": successor, "cause": verdict["cause"], **room,
         "workspace_root": str(result.get("workspace_root") or ""),
         "workspace_mode": str(result.get("workspace_mode") or ""),
         "deadline_at": str(result.get("deadline_at") or (result.get("metadata") or {}).get("deadline_at")
@@ -351,14 +382,8 @@ def admit_continuation(predecessor_task_id: str, *, action_nonce: str) -> Dict[s
                                "root_task_id": successor})
     project_basis = None
     if task.get("project_id"):
-        # A fresh admission carries its prepared Project basis (the producer seam
-        # schedule_task uses); a basis-less row would be held as legacy forever.
-        from ouroboros.projects_registry import project_admission_view, project_binding_for_task
-
         try:
-            bound = project_binding_for_task(q.DRIVE_ROOT, predecessor, strict=True) or {}
-            project_basis = project_admission_view(q.DRIVE_ROOT, task["project_id"], frozen=True,
-                                                   allow_unregistered=bound.get("project_id") != task["project_id"])
+            project_basis = _prepare_project_room(q, predecessor, task)
         except (OSError, ValueError, RuntimeError) as exc:
             # The claim stays: the same nonce retries once the authority is readable.
             return {"ok": False, "error": getattr(exc, "reason", "project_routing_fence_lookup_failed"),

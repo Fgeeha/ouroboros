@@ -773,7 +773,7 @@ Root Resume rechecks whole-tree effect custody at the canonical budget root, bin
 
 #### Owner Continue after a technical interruption
 
-Continue admits a NEW root in the same room/folder, reads interrupted work and leaves old helpers paused, adopting none. Owner Stop/Panic/author finish stay final. The successor judges and asks in the existing conversation, without a date/budget form.
+Continue admits a NEW root in the same room/folder, reads interrupted work and leaves old helpers paused, adopting none. Its room is the predecessor's canonical Project binding, never a stale row copy; bound work binds its successor. Owner Stop/Panic/author finish stay final. The successor judges and asks in the existing conversation, without a date/budget form.
 
 | Step | Authority |
 |---|---|

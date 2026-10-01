@@ -349,6 +349,28 @@ def owner_sources(drive_root: Any, result: Dict[str, Any], task_id: str) -> Dict
                                  "kind": "predecessor_authored_note"}}
 
 
+def continuation_room(drive_root: Any, predecessor_task_id: str, result: Dict[str, Any]) -> Dict[str, Any]:
+    """The room a FRESH Continue is admitted to: ``{"chat_id", "project_id"}``.
+
+    "Turn into project" writes only the immutable task<->Project binding, the one
+    truth about a task's room (owner decision B4=A); the interrupted worker's own
+    result keeps the chat and project copy it started with. The binding therefore
+    outranks that copy, and unbound work keeps its own row. Only the room moves:
+    the original owner message, its ref and the prepared folder stay the
+    predecessor's. An unreadable store or a malformed row raises, so the caller
+    refuses before its claim instead of admitting the work to Main.
+    """
+    from ouroboros.projects_registry import project_binding_for_task
+
+    bound = project_binding_for_task(drive_root, predecessor_task_id, strict=True)
+    if not bound:
+        return {"chat_id": result.get("chat_id"), "project_id": str(result.get("project_id") or "")}
+    chat = bound.get("project_chat_id")
+    if type(chat) is not int or chat <= 0:
+        raise ValueError("Project binding is unavailable")
+    return {"chat_id": chat, "project_id": bound["project_id"]}
+
+
 def owner_corpus_rows(sources: Dict[str, Any]) -> List[Dict[str, Any]]:
     """The successor's seeded owner corpus (``_initialize_owner_directives``), exact words only."""
     rows: List[Dict[str, Any]] = []
