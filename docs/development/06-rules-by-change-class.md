@@ -1,6 +1,6 @@
 # Rules by change class
 
-This chapter gives one rule section per change class: tool registration, skill payloads, the live E2E stand, light mode and deliverables, retention, delegated subagents, cancellation, onboarding and settings, transport and late-result custody, LLM calls, timeout/wait control, and loop/acceptance state machines. Each section names its enforcing tests or gates, or marks rules as review-only; check a change against its applicable classes.
+Rules by change class: tool registration, skill payloads, the live E2E stand, light mode and deliverables, retention, delegated subagents, cancellation, onboarding and settings, transport and late-result custody, LLM calls, timeout/wait control, and loop/acceptance state machines. Each section names its enforcing tests or gates, or marks rules as review-only; check a change against its applicable classes.
 
 `docs/CHECKLISTS.md` remains the only reviewer scorer; its `development_compliance` item points at this handbook as a whole.
 
@@ -586,13 +586,12 @@ Settings, accounts and shared controls. Tests: `test_owner_settings_write_seam.p
   existence, preview or matching prompt prose alone grants authority —
   missing/partial/error/mismatched custody never buys another same-operation
   dispatch.
-- Managed unknown-outcome recovery uses the existing transport-wait owner
-  (`loop_transport.py`) with non-generating upstream observations (what proves
-  recovery and what cannot: ARCHITECTURE §6 "Caller-owned subscription model
-  calls"): keep the old outcome/cost unknown, apply current
-  budget/Stop/deadline before dispatch, and let a control-channel outage first
-  rejoin the same accepted operation. No scheduler, provider/model table, paid
-  readiness probe or automatic manual-restart recovery is introduced.
+- Unknown-outcome recovery is typed (`loop_transport.new_generation_after_unknown`),
+  not silence: configured routes, then transport-wait observations (ARCHITECTURE §6);
+  inline Presence retains its contract. Old outcome/cost stay unknown;
+  new attempts get their own identity and facts-only input; a control-link or read
+  failure only rejoins (`same_operation_recoverable`).
+  No scheduler, pass counter or paid probe (`test_unknown_fallback_first.py`).
 - `delegate_wait` supervision's observation beat is separate from its HTTP
   read allowance, and a typed read-only-retryable transport failure is a quiet
   observation hole, not a wake (the per-class reasons and the once-per-episode
@@ -650,7 +649,8 @@ and what enforces each.
   Density evidence never crosses models. Proven no-send returns the local attempt
   claim even if bounded ledger release fails; the reservation and capture then remain.
   Unknown or dispatched claims stay charged.
-- Resource refusals wait inside the live call, before helper catch-all blocks, on the
+- Resource refusals try configured routes first, never sleep to a reset, and
+  wait inside the live call, before helper catch-all blocks, on the
   existing task owner, mailbox, clocks and settings writer. Reviewer calls use their
   panel's operation wait (§6 Already-paid operations), preserving original task money
   and controls. Reprepare wake input against the new route's tools/capacity/reserve
@@ -797,7 +797,7 @@ and what enforces each.
   alone to exceed the window); quota/auth/billing, hard bad-request and
   request-too-large are non-retryable as-is (exact category, recovery hint); a typed
   408/429/5xx or a proven pre-dispatch failure may retry; a dispatched request with no
-  terminal outcome stops same-model and cross-model sends until reconciled. Who may
+  terminal outcome is never resent as is; only an eligible unknown permits a NEW generation. Who may
   repeat after a typed transport death, how often, on whose row, what ends the round:
   ARCHITECTURE §6 "Context fitting, retry, and compaction"
   (`tests/test_transport_death_retry.py`). Call-site rules: decide `retry_same_request`
@@ -809,8 +809,8 @@ and what enforces each.
   untouched); generic transient/empty-response backoffs keep their contract. A budget
   refusal does NOT un-count: the budget rail cannot prove the repeat never left the
   host (`llm.chat` retries on the wire before a later reservation can refuse), so the
-  attempt stays booked and the budget terminal ends the round. Every caller outside the
-  interactive primary rail keeps `transport_death_retries=0`; no
+  attempt stays booked and the budget terminal ends the round. Every caller outside
+  inline Presence's primary rail keeps `transport_death_retries=0`; no
   consumed/terminal/patch-disposition predicate gates a session supervisor's cognition,
   and a successful live-leaf hold closes any prior transport episode so its
   acknowledged wake alone resumes the model.

@@ -132,6 +132,7 @@ BAND_PATHS = {
     "ouroboros/marketplace/ouroboroshub.py": "Entered the band from 373 lines: the hubflow sprint added the adopt transaction (eligibility prelude, CAS re-verification, move-aside + state-quintet snapshot, verified rollback with per-step error collection, retention finalize) beside the existing install/update flows (hubflow sprint, adopt-in-ouroboroshub owner decision D4).",
     "ouroboros/mcp_client.py": "F3.1 typed-organ producer cutover (D05 entry 7b) plus E5+s2r2 (#447): the MCP transport keeps the SDK-owned error bit as a typed ToolResult, follows nextCursor pagination with injective 12-hex slugs, and discloses collision/pagination omissions; grew into the band from 984 lines, shrink-only otherwise.",
     "ouroboros/memory.py": "ibl-2b09abdadd25: scratchpad content-size cap added alongside the existing block-count cap in append_scratchpad_block's eviction loop",
+    "ouroboros/model_wait.py": "The existing task wait owner coordinates confirmed resource waits, owner controls and warm/cold sleep through shared clocks and custody; keeping their wake and interruption rules together preserves one authority path.",
     "ouroboros/observability.py": "Owns forensic call and blob storage, exact-version readers and result-reference custody; graph traversal is independently owned by source_retention.",
     "ouroboros/preflight_runner.py": None,
     "ouroboros/presence_runner.py": "Presence turn admission, durable retry identity and transport custody remain one owner; separating them now would duplicate the gate and receipt seam.",

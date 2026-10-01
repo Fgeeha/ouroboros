@@ -20,9 +20,9 @@ jobs:
   ui-smoke:
     name: ${{ inputs.diagnostic == 'full' && 'ui-smoke' || format('PARTIAL DIAGNOSTIC UI - {0}', inputs.diagnostic) }}
     runs-on: ubuntu-latest
-    # The full host lane takes about 98 minutes plus setup on a hosted runner.
-    # Keep a finite ceiling with room for the complete two-engine collection
-    # and evidence upload; an exhausted job must still fail, never skip cases.
+    # The complete 513-case lane reached 98% at the former two-hour limit on
+    # GitHub's runner. Keep a finite whole-job ceiling with room for the tail
+    # and evidence upload; per-test assertions and collection guards remain.
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -66,8 +66,7 @@ jobs:
           OUROBOROS_EXPECT_BROWSER_ENGINES: chromium,webkit
           PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/ui-browsers
         run: >-
-          python -I -S scripts/safe_test.py -- python -m pytest tests/ -m ui_browser --require-ui-browser -q --tb=short
-          -o verbosity_test_cases=1
+          python -I -S scripts/safe_test.py -- python -m pytest tests/ -m ui_browser --require-ui-browser -vv --tb=short
           --junitxml="${{ runner.temp }}/ci-private/ui/host.xml"
           --ci-evidence-dir="${{ runner.temp }}/ci-evidence/ui/host"
       - name: Run PARTIAL DIAGNOSTIC host UI scenario

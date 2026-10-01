@@ -167,12 +167,24 @@ def test_grant_without_a_new_attempt_is_not_a_phantom_repeat(tmp_path):
         ("continued", "continuation_outcome_unknown", 1)]
 
 
-@pytest.mark.parametrize("flag", ["is_direct_chat"])
-def test_unknown_policy_does_not_expand_other_execution_classes(tmp_path, flag):
-    ctx = SimpleNamespace(task_id="t", **{flag: True})
-    assert transport.reconcile_transport_wait(None, ctx, msg_present=False,
+def test_unknown_policy_admits_direct_turns_but_not_presence_or_a_readable_operation(tmp_path):
+    """Owner decision 1A: a direct turn's eligible unknown outcome enters the same wait and
+    continuation as a queued one, inside its interactive bound. Inline Presence keeps its own
+    no-resend terminal, and an accepted operation whose read failed is only rejoined."""
+    notes = []
+    direct = SimpleNamespace(task_id="t", is_direct_chat=True, _accumulated_usage={})
+    episode = transport.reconcile_transport_wait(None, direct, msg_present=False,
         error_kind="provider_outcome_unknown", drive_logs=tmp_path, task_id="t", model="m",
-        emit_progress=lambda *a, **kw: pytest.fail("unexpected automatic continuation")) is None
+        emit_progress=lambda text, **_kw: notes.append(text))
+    assert episode is not None and episode.interactive and episode.wait_cause == "provider_outcome_unknown"
+    assert episode.wait_bound_sec is not None and notes and "Stop cancels" not in notes[0]
+    readable = {"_pending_transport_outcome": {"physical_attempt_id": "a", "same_operation_recoverable": True}}
+    for ctx in (SimpleNamespace(task_id="t", is_direct_chat=True, current_task_type="presence", _accumulated_usage={}),
+                SimpleNamespace(task_id="t", _accumulated_usage=readable),
+                SimpleNamespace(task_id="t", task_metadata={"presence": {"binding": "b"}}, _accumulated_usage={})):
+        assert transport.reconcile_transport_wait(None, ctx, msg_present=False,
+            error_kind="provider_outcome_unknown", drive_logs=tmp_path, task_id="t", model="m",
+            emit_progress=lambda *a, **kw: pytest.fail("unexpected automatic continuation")) is None
 
 
 def test_deadline_closes_unknown_wait_without_a_probe_or_send(tmp_path, monkeypatch):

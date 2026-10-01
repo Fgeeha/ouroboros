@@ -363,6 +363,8 @@ def test_outage_wrap_keeps_older_wire_death_custody_without_summary(tmp_path, mo
     def run():
         kwargs = _loop_kwargs(tmp_path, ControlledLLM(), [])
         kwargs["tools"]._ctx.is_direct_chat = interactive
+        if interactive:  # inline Presence retains the paid-repeat rail
+            kwargs["task_type"] = kwargs["tools"]._ctx.current_task_type = "presence"
         with model_wait.task_model_wait_scope(task={"id": "t-death"}, drive_root=tmp_path,
                 event_queue=None, worker_slot_held=not interactive) as owner:
             owner.tool_context = kwargs["tools"]._ctx

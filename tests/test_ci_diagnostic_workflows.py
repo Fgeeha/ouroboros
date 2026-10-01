@@ -89,7 +89,7 @@ def test_manual_ui_selection_is_fixed_partial_and_never_a_paid_or_full_check():
     assert "inputs.diagnostic != 'full'" in partial["if"]
     assert "--require-ui-browser" in full["run"] and "pytest tests/ -m ui_browser" in full["run"]
     assert shared["jobs"]["ui-smoke"]["timeout-minutes"] == 180
-    assert "-o verbosity_test_cases=1" in full["run"]
+    assert "-vv --tb=short" in full["run"]
     assert "--require-ui-browser" not in partial["run"]
     assert '${{ inputs.diagnostic }}' not in partial["run"]
     assert partial["env"]["DIAGNOSTIC"] == "${{ inputs.diagnostic }}"

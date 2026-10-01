@@ -557,10 +557,14 @@ def _set_next_wakeup(ctx: ToolContext, seconds: int) -> str:
             "next wake-up (a wake-up already pending keeps its time; a wake-up calling this sets its own next one).")
 
 
-def _switch_model(ctx: ToolContext, model: str = "", effort: str = "") -> str:
+def _switch_model(ctx: ToolContext, model: str = "", effort: str = "", primary: str = "") -> str:
     """LLM-driven model/effort switch (Constitution P5: LLM-first).
 
-    Stored in ToolContext, applied on the next LLM call in the loop.
+    Stored in ToolContext, applied on the next LLM call in the loop. ``primary``
+    returns to this turn's primary binding (the acting model's choice): its model, role,
+    locality and account policy with the owner's live wait-card choice for that
+    role; "wait" also keeps a refusal there on the primary's own wait instead of
+    paid alternatives. Effort intent is untouched.
     """
     from ouroboros.config import EFFORT_SCALE
     from ouroboros.llm import LLMClient
@@ -572,8 +576,26 @@ def _switch_model(ctx: ToolContext, model: str = "", effort: str = "") -> str:
     requested_effort = str(effort or "").strip().lower()
     if requested_effort and requested_effort not in EFFORT_SCALE:
         return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(f"⚠️ Unknown effort: {effort}. Valid: {', '.join(EFFORT_SCALE)}")))
+    requested_primary = str(primary or "").strip().lower()
+    route = getattr(ctx, "primary_route", None)
+    if requested_primary and (requested_primary not in ("return", "wait") or model):
+        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(
+            "⚠️ primary must be 'return' or 'wait', without model.")))
+    if requested_primary and not (isinstance(route, dict) and route.get("model")):
+        return _publish_tool_result(ctx, ToolResult(status="unavailable", code="CAPABILITY_UNAVAILABLE", text=(
+            "⚠️ This turn has no recorded primary route to return to.")))
 
-    if model:
+    if requested_primary:
+        waiter = getattr(ctx, "model_wait_context", None)
+        chosen = ((getattr(waiter, "overrides", None) or {}).get(route["role"]) or {})
+        ctx.active_model_override = str(chosen.get("model") or route["model"])
+        ctx.active_use_local_override = bool(chosen.get("use_local", route["use_local"]))
+        ctx.active_role_override = route["role"]
+        ctx.route_wait_on_primary = requested_primary == "wait"
+        changes.append(f"primary route {ctx.active_model_override}{' (local)' if ctx.active_use_local_override else ''}"
+                       f" (role {route['role']}; if it refuses: "
+                       f"{'wait for it' if requested_primary == 'wait' else 'configured routes again'})")
+    elif model:
         if model not in available:
             return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(f"⚠️ Unknown model: {model}. Available: {', '.join(available)}")))
 
@@ -589,6 +611,7 @@ def _switch_model(ctx: ToolContext, model: str = "", effort: str = "") -> str:
 
         ctx.active_model_override = model
         ctx.active_use_local_override = use_local
+        ctx.route_wait_on_primary, ctx.active_role_override = False, None  # an explicit route ends a declared wait
         changes.append(f"model={model}{' (local)' if use_local else ''}")
 
     if requested_effort:
@@ -596,6 +619,7 @@ def _switch_model(ctx: ToolContext, model: str = "", effort: str = "") -> str:
         changes.append(f"effort={requested_effort}")
 
     if not changes:
-        return f"Current available models: {', '.join(available)}. Pass model and/or effort to switch."
+        return (f"Current available models: {', '.join(available)}. Pass model and/or effort to switch, "
+                "or primary='return'/'wait' to go back to this turn's primary route.")
 
     return f"OK: switching to {', '.join(changes)} on next round."

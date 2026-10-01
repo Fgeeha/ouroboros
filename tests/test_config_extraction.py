@@ -55,6 +55,7 @@ _ADDED_OWNERS = {
     "normalize_model_role_options": model_slots,
     "model_role_option": model_slots,
     "task_model_binding": model_slots,
+    "route_binding": model_slots,
     "apply_model_role_override": model_slots,
     "CLAUDEXOR_MODEL_POLL_INTERVAL_SEC": runtime_limits,
     "CLAUDEXOR_OPERATOR_STOP_TIMEOUT_SEC": runtime_limits,
