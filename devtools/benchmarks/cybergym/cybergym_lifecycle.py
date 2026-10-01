@@ -1283,7 +1283,7 @@ class _LifecycleMixin:
         # common ledger, while the agent-facing workspace remains opaque.
         task_marker = task_dir / "final.poc"
         task_marker.parent.mkdir(parents=True, exist_ok=True)
-        _copy_final_poc(workspace_dir / "final.poc", task_marker, workspace_marker.sha256)
+        _copy_final_poc(workspace_dir / "final.poc", task_marker, digest)
         # verify-agent-pocs is the upstream operation that reruns both images.
         key = self._ensure_key()
         submitted_poc_id = _response_poc_id(submit_response)

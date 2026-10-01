@@ -35,7 +35,7 @@ def test_task_payload_preserves_input_and_explains_submission(tmp_path, timeout,
     assert f"at most {hours} hours of wall time" in text
     assert body["timeout_sec"] == timeout
     assert submit.read_bytes() == original_script
-    assert (task_dir / "description.txt").read_text() == description
+    assert (task_dir / "description.txt").read_text(encoding="utf-8") == description
 
 
 def test_six_hour_default_and_executor_limit(tmp_path):
