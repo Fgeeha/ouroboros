@@ -1305,11 +1305,8 @@ async def lifespan(app):
     except Exception:
         log.warning("Native skills bootstrap failed", exc_info=True)
 
-    # Boot-reconcile the project registry BEFORE /api/state and context-building
-    # can rely on registered_project_chat_ids (the multi-project isolation SSOT):
-    # register any pre-existing data/projects/<id>/ store whose row is missing, so
-    # an inherited project's raw chat is partitioned from turn one (not only after
-    # the 300s periodic tick). Idempotent and never prunes.
+    # Reconcile project chat IDs before /api/state or context reads them, so
+    # inherited rooms are partitioned from turn one. Idempotent; never prunes.
     try:
         if not pytest_default_real_data_dir:
             from ouroboros.projects_registry import reconcile_projects
@@ -1324,6 +1321,8 @@ async def lifespan(app):
         _supervisor_ready.set()
         _supervisor_init_done.set()
         log.info("No supported provider or local routing configured. Supervisor not started.")
+        from supervisor.log_addressing import install_providerless_notification_sink
+        install_providerless_notification_sink(settings, lifespan_drive_root, broadcast_ws_sync)
     # P2: finalize a pending managed merge update (post-boot smoke / boot-loop rollback)
     # and run a one-shot boot-time update check (check-on-restart) so the main-screen
     # Update badge reflects availability. Both run OFF the startup critical path and
@@ -1363,6 +1362,7 @@ async def lifespan(app):
         init_global_event_bus().set_loop(_event_loop)
         init_global_supervisor(lifespan_drive_root)
         host_service_app = create_host_service_app(lifespan_drive_root)
+        host_service_app.state.notification_scheduler_ready = lambda: bool(_supervisor_thread and _supervisor_thread.is_alive() and _supervisor_ready.is_set())
         host_port = host_service_port()
         # Bind before starting the asyncio task: uvicorn's bind-error SystemExit
         # otherwise escapes run_forever and kills the main server. Keep that

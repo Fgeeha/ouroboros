@@ -157,6 +157,33 @@ def test_testclient_lifespan_reload_all_uses_app_state_drive_root(tmp_path, monk
     assert calls == [(drive_root, str(repo_root))]
 
 
+def test_no_provider_immediate_notification_still_reaches_browser_log_sink(tmp_path, monkeypatch):
+    """Host Service survives onboarding; its immediate notice must not be a
+    durable-only row merely because the model supervisor is absent."""
+    from starlette.testclient import TestClient
+    import server as srv
+    from ouroboros import event_bus, extension_loader, utils
+
+    drive_root = tmp_path / "drive"
+    drive_root.mkdir()
+    monkeypatch.setattr(srv.app.app.state, "drive_root", drive_root, raising=False)
+    monkeypatch.setattr(srv.app.app.state, "repo_dir", tmp_path / "repo", raising=False)
+    _patch_lifespan_for_drive_root_test(monkeypatch, srv, {})
+    monkeypatch.setattr(extension_loader, "reload_all", lambda *_a, **_k: {})
+    frames = []
+    monkeypatch.setattr(srv, "broadcast_ws_sync", frames.append)
+    try:
+        with TestClient(srv.app):
+            row = event_bus.emit_owner_notification(
+                drive_root, chat_id=1, category="notice", text="no model needed", source="skill:test",
+            )
+            assert row is not None
+            assert [frame["data"]["text"] for frame in frames
+                    if frame.get("type") == "log" and frame.get("data", {}).get("type") == "owner_notification"] == ["no model needed"]
+    finally:
+        utils.set_log_sink(None)
+
+
 def test_provider_boot_attaches_notification_subscriber_before_supervisor_starts(tmp_path, monkeypatch):
     """An overdue reminder may fire on the first supervisor tick, without replay.
 

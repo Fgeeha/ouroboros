@@ -893,10 +893,13 @@ fires it at its instant without a model — a reminder whose instant passed whil
 Ouroboros was off fires on the next tick, like any one-shot. The table consumes
 the occurrence before the outbound append: a crash can lose one alert, but
 cannot replay it automatically. Inspect the row and events before re-arming.
-If no task-capable provider is configured, the Host Service can still accept
-deferred rows, but the supervisor does not start: they remain pending until a
-provider is configured and the supervisor starts. No model call is needed at
-firing time; that is distinct from the supervisor's startup prerequisite.
+If the supervisor is not running, `POST /notify` refuses a new or moved deferred row
+with `503 {ok:false, scheduled:false, status:"scheduler_unavailable"}` before
+writing it. An immediate notice still appends and reaches a connected browser
+through the server log sink without a model; cancellation of an existing row
+remains available. Previously stored rows can still wait if the supervisor
+later stops. No model call is needed at firing time, but the existing scheduler
+requires a running supervisor; no independent notification scheduler is started.
 On a configured boot, the supervisor starts after extension subscribers load;
 a failed extension load or an absent browser client still cannot guarantee a
 Telegram push or a desktop banner. Browser banners are live-only, not replayed

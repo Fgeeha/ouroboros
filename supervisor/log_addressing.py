@@ -279,6 +279,19 @@ def make_server_log_sink(bridge: Any, drive_root: Any, running: Any = None):
     return _server_log_sink
 
 
+def install_providerless_notification_sink(settings: dict, drive_root: Any, broadcast: Callable) -> None:
+    """Keep immediate Host notices visible when no model supervisor starts.
+
+    A later supervisor generation replaces this provisional server-process sink.
+    """
+    from ouroboros.utils import set_log_sink
+    from supervisor.message_bus import LocalChatBridge
+
+    bridge = LocalChatBridge(settings)
+    bridge._broadcast_fn = broadcast
+    set_log_sink(make_server_log_sink(bridge, drive_root, running={}))
+
+
 def address_handler_push(drive_root: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
     """Address a supervisor-handler's explicit push against the LIVE RUNNING
     table (the handlers that push a suppressed type own the one delivery of

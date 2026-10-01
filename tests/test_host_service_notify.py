@@ -66,6 +66,31 @@ def test_notify_delivers_one_owner_notification_without_a_chat_row(tmp_path: pat
         event_bus.init_global_event_bus()
 
 
+def test_deferred_notify_refuses_without_supervisor_but_immediate_and_cancel_still_work(tmp_path: pathlib.Path) -> None:
+    from supervisor import queue
+
+    queue.init(tmp_path)
+    client, app = _notify_client(tmp_path)
+    app.state.notification_scheduler_ready = lambda: False
+    headers = {"X-Skill-Token": "tok"}
+    for body in ({"text": "later", "at": "2999-01-01T00:00:00Z"},
+                 {"text": "daily", "cron": "0 9 * * *", "timezone": "Europe/Moscow"}):
+        response = client.post("/notify", headers=headers, json=body)
+        assert response.status_code == 503
+        assert response.json()["status"] == "scheduler_unavailable"
+        assert response.json()["scheduled"] is False
+    assert queue.list_scheduled_tasks(tmp_path)["tasks"] == []
+    assert client.post("/notify", headers=headers, json={"text": "now"}).status_code == 200
+    # A previously armed reminder remains cancellable even when the tick is down.
+    app.state.notification_scheduler_ready = lambda: True
+    posted = client.post("/notify", headers=headers, json={"text": "future", "key": "old",
+                                                        "at": "2999-01-01T00:00:00Z"})
+    assert posted.status_code == 200
+    app.state.notification_scheduler_ready = lambda: False
+    assert client.post("/notify", headers=headers, json={"key": "old", "cancel": True}).status_code == 200
+    assert queue.list_scheduled_tasks(tmp_path)["tasks"] == []
+
+
 def test_notify_requires_the_notify_owner_grant(tmp_path: pathlib.Path) -> None:
     client, _app = _notify_client(tmp_path, granted=False)
     resp = client.post("/notify", headers={"X-Skill-Token": "tok"}, json={"text": "hi"})

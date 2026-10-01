@@ -63,6 +63,12 @@ async def _api_notify(request: Request) -> JSONResponse:
         return _json_error(f"key must be at most {OWNER_NOTIFICATION_KEY_CHARS} characters", 400)
     at_raw = payload.get("at")
     cron_raw = payload.get("cron")
+    if not cancel and (at_raw is not None or cron_raw is not None):
+        scheduler_ready = getattr(request.app.state, "notification_scheduler_ready", None)
+        if scheduler_ready is not None and not scheduler_ready():
+            return JSONResponse({"ok": False, "scheduled": False, "status": "scheduler_unavailable",
+                                 "error": "notification scheduler is not running yet; retry after startup (configure a provider if absent)"},
+                                status_code=503)
     if at_raw is not None or cron_raw is not None or cancel:
         return await run_sync_to_completion(
             _schedule_owner_notification, ctx, skill_name, text, key,
