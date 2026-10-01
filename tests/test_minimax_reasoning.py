@@ -9,6 +9,8 @@ import asyncio
 import copy
 import json
 import queue
+import threading
+from types import SimpleNamespace
 
 import httpx
 import openai
@@ -56,6 +58,8 @@ def make_client(monkeypatch):
                     "type": "invalid_request_error", "code": "fixture_contract",
                     "message": "split output and unchanged continuation are required"}})
             result = script.pop(0)
+            if callable(result):
+                result = result(payload)
             if isinstance(result, httpx.Response):
                 return result
             if isinstance(result, WireResponse):
@@ -157,6 +161,30 @@ def test_unknown_and_empty_shapes_are_retained_without_display_coercion(isolated
     assert body == original
 
 
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("stream", [False, True])
+def test_host_capsules_are_removed_without_editing_opaque_carriers(isolated, make_client, asynchronous, stream):
+    raw = {"opaque": {"_context_capsule": {"signature": "provider-owned=="}, "keep": [False, "π"]}}
+    reasoning = {"reasoning_details": copy.deepcopy(raw), "reasoning_content": copy.deepcopy(raw)}
+    first = {"role": "assistant", "content": "", "tool_calls": [CALL], **reasoning}
+    response = _response(first)
+    if stream:
+        response = WireResponse(sse(chunk({**first, "tool_calls": [{"index": 0, **CALL}]}),
+                                    chunk(finish="tool_calls", usage=completion()["usage"])))
+    client, sent = make_client([response, _response({"role": "assistant", "content": "done"}, "stop")],
+                               asynchronous=asynchronous, expected_replay=reasoning)
+    history = [{"role": "user", "content": "lookup", "_context_capsule": {"generation": 1}}]
+    msg, _ = _call(client, history, stream=stream, asynchronous=asynchronous)
+    history.extend([msg, {"role": "tool", "tool_call_id": CALL["id"], "content": "ok"}])
+    canonical = copy.deepcopy(history)
+    _call(client, history, asynchronous=asynchronous)
+    assert history == canonical
+    assert "_context_capsule" not in sent[0]["messages"][0]
+    assert "_context_capsule" not in sent[1]["messages"][0]
+    assert {key: sent[1]["messages"][1][key] for key in reasoning} == reasoning
+    assert len(sent) == 2
+
+
 @pytest.mark.parametrize("carrier", ["reasoning_content", "reasoning_details"])
 def test_existing_details_narration_stays_display_only(isolated, make_client, carrier):
     reasoning = {carrier: "Check the weather." if carrier == "reasoning_content" else DETAILS}
@@ -208,6 +236,87 @@ def test_loop_retains_continuation_and_delivers_only_final_content(isolated, mon
     assistant = next(msg for msg in sent[1]["messages"] if msg.get("tool_calls"))
     assert assistant["reasoning_content"] == "Check first."
     assert next(msg for msg in history if msg.get("tool_calls"))["reasoning_content"] == "Check first."
+
+
+def test_owner_followups_keep_each_held_rounds_own_continuation(isolated, monkeypatch, make_client):
+    from ouroboros import loop
+    from ouroboros.tools.registry import ToolRegistry
+
+    incoming = queue.Queue()
+    originals = [{"role": "assistant", "content": "Same answer.",
+                  "reasoning_content": f" Private continuation {index}. ",
+                  "reasoning_details": [{"type": "future.continuation", "data": [index, None, False]}]}
+                 for index in (1, 2)]
+
+    def held(payload):
+        index = 0 if not any(m.get("role") == "assistant" for m in payload["messages"]) else 1
+        incoming.put({"text": "Include the next requirement.", "client_message_id": f"followup-{index}"})
+        message = copy.deepcopy(originals[index])
+        return (WireResponse(sse(chunk(message), chunk(finish="stop", usage=completion()["usage"])))
+                if payload.get("stream") else _response(message, "stop"))
+
+    final = WireResponse(sse(chunk({"role": "assistant", "content": "Updated answer."}),
+                             chunk(finish="stop", usage=completion()["usage"])))
+    client, sent = make_client([held, held, final])
+    monkeypatch.setattr(client, "default_model", lambda: "minimax::MiniMax-M3.1")
+    monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
+    registry = ToolRegistry(repo_dir=isolated, drive_root=isolated)
+    registry._ctx.owner_message_admission_lock = threading.Lock()
+    registry._ctx.owner_message_admission_agent = SimpleNamespace(
+        _busy=True, _current_task_id="minimax-followup", _accepting_owner_messages=True)
+    history, progress = [{"role": "user", "content": "Initial request"}], []
+    result, _, trace = loop.run_llm_loop(
+        messages=history, tools=registry, llm=client, drive_logs=isolated,
+        emit_progress=lambda text, **meta: progress.append(text), incoming_messages=incoming,
+        task_id="minimax-followup", drive_root=isolated,
+    )
+    assert result == "Updated answer." and len(sent) == 3
+    canonical = [m for m in history if m.get("role") == "assistant"]
+    replay = [m for m in sent[2]["messages"] if m.get("role") == "assistant"]
+    assert len(canonical) == len(replay) == 2
+    for index, expected in enumerate(originals):
+        assert {key: canonical[index][key] for key in expected} == expected
+        assert {key: replay[index][key] for key in expected} == expected
+        assert expected["reasoning_content"] not in progress + trace["reasoning_notes"]
+    assert [row["state"] for row in rows(isolated)] == ["reserved", "dispatched", "settled"] * 3
+
+
+def test_completion_control_hold_preserves_its_row_before_next_http(isolated, make_client):
+    from tests.test_delivery_forced_finalization import _arm_latch_with_candidate, _forced_test_context
+
+    loop, registry, ctx, trace = _forced_test_context(isolated, incoming=queue.Queue())
+    _arm_latch_with_candidate(loop, registry, ctx, trace)
+    earlier = {"role": "assistant", "content": "Still working.", "reasoning_content": "Earlier reasoning."}
+    ctx.messages.append(earlier)
+    original = {"role": "assistant", "content": "Still working.", "reasoning_content": " Current reasoning. ",
+                "reasoning_details": {"opaque": [0, None, False]}}
+    assert loop._finalize_loop_candidate(original["content"], ctx, registry, lambda *a, **k: None,
+                                         assistant_message=original) is None
+    retained = [m for m in ctx.messages if m.get("role") == "assistant"]
+    assert retained == [earlier, original]
+    assert earlier["reasoning_content"] == "Earlier reasoning."
+    client, sent = make_client([_response({"role": "assistant", "content": "done"}, "stop")])
+    _call(client, ctx.messages)
+    assert [m for m in sent[0]["messages"] if m.get("role") == "assistant"] == retained
+
+
+def test_held_selected_answer_does_not_borrow_a_later_responses_continuation(isolated, monkeypatch):
+    from tests.test_delivery_forced_finalization import _forced_test_context, _select_completion
+
+    monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
+    incoming = queue.Queue()
+    loop, registry, ctx, trace = _forced_test_context(isolated, incoming=incoming)
+    registry._ctx.owner_message_admission_lock = threading.Lock()
+    registry._ctx.owner_message_admission_agent = SimpleNamespace(
+        _busy=True, _current_task_id="parent1", _accepting_owner_messages=True)
+    _select_completion(registry, ctx, trace, answer="Previously selected answer.")
+    incoming.put({"text": "Another requirement.", "client_message_id": "selected-followup"})
+    response = {"role": "assistant", "content": "Later response.", "reasoning_content": "Later reasoning."}
+    assert loop._finalize_loop_candidate(response["content"], ctx, registry, lambda *a, **k: None,
+                                         assistant_message=response) is None
+    retained = [m for m in ctx.messages if m.get("role") == "assistant"]
+    assert retained and all(m["content"] == "Previously selected answer." for m in retained)
+    assert all("reasoning_content" not in m for m in retained)
 
 
 def test_repeated_reasoning_fragments_are_not_guessed_duplicates(isolated, make_client):
