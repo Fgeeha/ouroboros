@@ -264,6 +264,85 @@ def _snapshot_is_stale(snapshot: Dict[str, Any]) -> bool:
     return not queue_snapshot_observation(snapshot)["fresh"]
 
 
+def execution_owner_record(drive_root: Any, task: Dict[str, Any], kind: str) -> Dict[str, Any]:
+    """Bind the actual execution class to its existing task-result attempt.
+
+    Assignment replaces this fact when an inline turn resumes in the pool; it
+    is ownership provenance, never a process-death or replay authorization.
+    """
+    return {"kind": kind, "data_root": str(pathlib.Path(drive_root).resolve()),
+            "task_id": str(task.get("id") or task.get("task_id") or ""),
+            "task_attempt": int(task.get("_attempt") or task.get("task_attempt") or 0)}
+
+
+def task_execution_observation(
+    drive_root: Any, result: Dict[str, Any], *, queue_snapshot: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Recorded ownership and a separately dated positive live observation.
+
+    Missing inline evidence is unknown, never pooled death. Local observations
+    are root-bound. The direct fragment lists addressable turns, not every live
+    stack, so absence cannot settle a task. No observation authorizes replay.
+    """
+    root = pathlib.Path(drive_root).resolve()
+    tid = str(result.get("task_id") or result.get("id") or "")
+    owner = result.get("execution_owner")
+    metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+    kind, reason = "unknown", "execution_owner_unavailable"
+    if isinstance(owner, dict):
+        if (owner.get("data_root") == str(root) and owner.get("task_id") == tid
+                and owner.get("task_attempt") == (result.get("task_attempt") or result.get("_attempt") or 0)
+                and owner.get("kind") in {"pooled", "direct", "presence"}):
+            kind, reason = owner["kind"], "live_execution_unobserved"
+        else:
+            reason = "execution_owner_binding_mismatch"
+    elif owner is None:
+        # A consumed exact Resume proves the pool took over, unlike origin.
+        pause = result.get("budget_pause") if isinstance(result.get("budget_pause"), dict) else {}
+        grant = pause.get("grant") if isinstance(pause.get("grant"), dict) else {}
+        if pause.get("state") == "resumed" or grant.get("consumed_at"):
+            kind = "pooled"
+        elif result.get("_is_direct_chat") or metadata.get("source") == "presence":
+            kind = "presence" if isinstance(metadata.get("presence"), dict) else "direct"
+        else:
+            kind = "pooled"  # legacy managed-task rows keep their existing custody path
+        reason = "legacy_execution_owner"
+    observation = {"kind": kind, "state": "unknown", "source": "task_result", "reason": reason}
+    if str(result.get("status") or "").lower() in FINAL_STATUSES:
+        return {**observation, "state": "terminal", "reason": "recorded_terminal"}
+    if kind == "unknown":
+        return observation
+    snapshot = queue_snapshot if queue_snapshot is not None else _load_queue_snapshot(root)
+    queue_seen = queue_snapshot_observation(snapshot)
+    queued, _task = _queue_task_status(snapshot, tid)
+    if queue_seen["fresh"] and queued in {STATUS_RUNNING, STATUS_SCHEDULED}:
+        return {**observation, **queue_seen, "kind": "pooled", "state": "active",
+                "reason": "queue_ownership", "status": queued}
+    try:
+        from ouroboros.presence_runner import presence_turn_is_live
+        from supervisor.active_activity import get_direct_activity_registry
+
+        if presence_turn_is_live(tid, drive_root=root):
+            return {**observation, "kind": "presence", "state": "active", "source": "local_presence", "reason": "local_execution"}
+        entry = get_direct_activity_registry().get(tid)
+        actor_root = getattr(getattr(getattr(entry, "actor", None), "env", None), "drive_root", None)
+        if actor_root is not None and pathlib.Path(actor_root).resolve() == root:
+            return {**observation, "kind": "direct", "state": "active", "source": "local_direct", "reason": "local_execution"}
+    except Exception:
+        pass  # absence of a positive witness is never a negative observation
+    fragment = read_json_dict(root / "state" / "direct_roots.json") or {}
+    # Both existing supervisor fragments use the same 10s ownership freshness
+    # (peer_roster._projection_observation); retain the distinct source name.
+    direct_seen = {**queue_snapshot_observation(fragment), "source": "state/direct_roots.json"}
+    rows = fragment.get("roots")
+    if direct_seen["fresh"] and isinstance(rows, list) and any(
+        isinstance(row, dict) and str(row.get("task_id") or "") == tid for row in rows
+    ):
+        return {**observation, **direct_seen, "kind": "direct", "state": "active", "reason": "listed_direct"}
+    return {**observation, "queue_snapshot": queue_seen,
+            "direct_roots": {**direct_seen, "incomplete": bool(fragment.get("incomplete"))}}
+
+
 def task_has_live_queue_ownership(drive_root: pathlib.Path, task_id: str) -> bool:
     """Worker-side half of the GR6-1 live-ownership predicate.
 
@@ -406,17 +485,18 @@ class _EventsTailIndex:
         return self._worker_boot
 
 
-def _still_orphan_at_write(task_id: str, observed: tuple, applied: List[bool], existing: Dict[str, Any],
+def _still_orphan_at_write(drive_root: pathlib.Path, task_id: str, observed: tuple, applied: List[bool], existing: Dict[str, Any],
                            fields: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Projector for the reconciler's terminal write (bound with ``partial``): the decision was taken
     outside the row lock, so a presence retry that went live meanwhile, or a row that moved on (requeued,
     restarted as a new attempt even under the same status, settled by another writer), cancels the write:
     ``observed`` is the row's attempt basis plus ``updated_at`` at decision time. ``applied`` gets True
     only on a real write."""
-    from ouroboros.presence_runner import presence_turn_is_live
     from ouroboros.task_custody import attempt_basis
 
-    if presence_turn_is_live(task_id):
+    execution = task_execution_observation(drive_root, existing)
+    inferred_orphan = fields.get("reason_code") in {"orphaned_running_after_worker_restart", "interrupted_retry_lost"}
+    if execution["state"] == "active" or (inferred_orphan and execution["kind"] != "pooled"):
         return None
     if (attempt_basis(existing), existing.get("updated_at")) != observed \
             or str(existing.get("status") or "").lower() not in {STATUS_RUNNING, STATUS_INTERRUPTED}:
@@ -432,28 +512,16 @@ def _is_stale_orphan_running_task(
     events_index: Optional[_EventsTailIndex] = None,
     queue_snapshot: Optional[Dict[str, Any]] = None,
 ) -> bool:
-    # Direct-chat actors are deliberately absent from PENDING/RUNNING.  The
-    # process-local registry is the authoritative owner for that execution;
-    # queue snapshots and pooled worker_boot rows cannot prove it dead.
-    try:
-        from supervisor.active_activity import get_direct_activity_registry
-
-        if get_direct_activity_registry().get(str(task_id or "")) is not None:
-            return False
-    except Exception:
-        # This helper is also imported by worker-side readers where the server's
-        # direct registry is not available.  Absence of that optional observation
-        # is not itself evidence of liveness, so retain the existing pooled path.
-        pass
-    try:
-        from ouroboros.presence_runner import presence_turn_is_live
-
-        # A presence turn executing in this process has no registry actor (owner
-        # routing never addresses a correspondent's turn) but is not an orphan.
-        if presence_turn_is_live(str(task_id or "")):
-            return False
-    except ImportError:
-        pass
+    observation = task_execution_observation(
+        drive_root, {**result, "task_id": task_id}, queue_snapshot=queue_snapshot,
+    )
+    if observation["state"] == "active" or observation["kind"] != "pooled":
+        return False
+    pause = result.get("budget_pause") if isinstance(result.get("budget_pause"), dict) else {}
+    if pause.get("state") in LIVE_PAUSE_STATES:
+        # Unconsumed Resume belongs to pause custody, which revokes/reparks it
+        # after confirmed worker death. A generic orphan must not spend that grant.
+        return False
     status = str(result.get("status") or "").lower()
     # ``interrupted`` is the transient pre-requeue marker (A.11): a record still
     # carrying it with no queued retry after a worker restart is the same orphan
@@ -697,9 +765,11 @@ def reconcile_orphaned_running_tasks(
             with (write_guard(task_id) if write_guard else nullcontext(True)) as allowed:
                 if not allowed:
                     continue
+                # The projection is this write's replica: a child terminal lends the occurrence
+                # its canonical attempt matches, as copyback would; a recovery projection has none.
                 write_task_result(root, task_id, status=eff_status,
-                                  _field_projector=partial(_still_orphan_at_write, task_id, observed, applied),
-                                  **persist_fields)
+                                  _field_projector=partial(_still_orphan_at_write, root, task_id, observed, applied),
+                                  _terminal_time_source=effective, **persist_fields)
                 if not applied:
                     continue  # the row moved on between the effective read and this write: nothing was settled here
                 healed += 1
@@ -875,6 +945,10 @@ def effective_task_result(
             else set()
         )
         parent_authoritative_fields = parent_authoritative_fields | _parent_workspace_artifact_lifecycle_fields(result)
+        # Pool assignment can rebind a paused direct turn before its old child
+        # replica receives the new start. Owner and its attempt remain one fact.
+        if "execution_owner" in result:
+            parent_authoritative_fields = parent_authoritative_fields | {"execution_owner", "task_attempt", "_attempt"}
         canonical_pause = result.get("budget_pause") if isinstance(result.get("budget_pause"), dict) else {}
         # Only a STALE nonterminal replica (the worker's pre-pause ``running``
         # row) yields to the live pause; a replica that already reached a
@@ -900,12 +974,17 @@ def effective_task_result(
 
     merged = _normalize_workspace_artifact_status(merged)
 
+    queue_snapshot = None
+    terminal_projection = ""
     parent_status = str(merged.get("status") or "").lower()
     if parent_status not in FINAL_STATUSES:
         queue_snapshot = _load_queue_snapshot(pathlib.Path(drive_root))
         queue_status, queue_task = _queue_task_status(queue_snapshot, task_id)
         if queue_status and queue_status != "unknown":
             merged["status"] = _merge_queue_status(parent_status, queue_status, queue_task)
+            from ouroboros.project_admission import project_hold_fact
+
+            merged["project_admission_hold"] = project_hold_fact(queue_task)
             for key in (
                 "parent_task_id",
                 "root_task_id",
@@ -925,6 +1004,7 @@ def effective_task_result(
             if queue_status == "unknown":
                 merged["queue_reconciliation_warning"] = "queue snapshot missing or invalid"
             elif _terminal_failure_from_outcome(merged):
+                terminal_projection = "recorded_outcome"
                 merged["status"] = STATUS_CANCELLED if str(merged.get("status") or "").strip().lower() == STATUS_CANCELLED else STATUS_FAILED
                 merged["status_reconciled_from"] = parent_status
                 artifact_status = str(merged.get("artifact_status") or "").strip().lower()
@@ -939,6 +1019,7 @@ def effective_task_result(
                 pathlib.Path(drive_root), task_id, merged, _events_index,
                 queue_snapshot=queue_snapshot,
             ):
+                terminal_projection = "pooled_worker_restart"
                 orphan_reason = (
                     "interrupted_retry_lost"
                     if parent_status == STATUS_INTERRUPTED
@@ -967,6 +1048,12 @@ def effective_task_result(
     # A legacy ``cancel_requested`` status (old files awaiting boot migration)
     # projects the same pending state.
     _apply_cancel_state_projection(pathlib.Path(drive_root), task_id, merged)
+    merged["execution_observation"] = task_execution_observation(drive_root, merged, queue_snapshot=queue_snapshot)
+    if terminal_projection:
+        # This read inferred a terminal; a later persisted terminal is a recorded
+        # fact even when its historical status_reconciled_from marker survives.
+        merged["execution_observation"].update(
+            source="effective_task_result", reason="projected_terminal", basis=terminal_projection)
 
     if not materialize_artifacts:
         # Status/cost projection only: no artifact view (no store listing) and no

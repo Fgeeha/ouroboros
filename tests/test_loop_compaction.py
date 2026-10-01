@@ -726,6 +726,7 @@ def test_overflow_retry_is_skipped_while_the_round_holds_an_unresolved_attempt(t
 
     context = _ctx(tmp_path)
     context.llm = _DeathThenOverflow()
+    context.task_type = "presence"  # inline Presence alone keeps the paid transport-death repeat
     fits = iter([_fit(), _fit(profile="task_local_low", mode="low")])
     reclaims = []
 

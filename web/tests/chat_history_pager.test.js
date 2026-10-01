@@ -118,7 +118,7 @@ test('a re-read page keeps its frozen boundaries while its row count is refreshe
     // is released at once, like any other empty page.
     assert.deepEqual({ ...h.pager.exportResume().pages.find(item => item.index === 0) },
         { id: 'history-page-1-0', chain: 1, index: 0, requestCursor: 'replay:A:0',
-            nextCursor: 'before:A:1', hasMore: true, rows: 0 });
+            nextCursor: 'before:A:1', hasMore: true, rows: 0, loaded: true, coverage: null });
     assert.equal(h.pager.getState().cachedPages.some(item => item.index === 0), false);
     assert.equal(h.pager.getState().pageCount, 4, 'a refreshed row count mints no extra descriptor');
     assert.equal(h.pager.getState().canNewer, false);
@@ -236,6 +236,34 @@ test('latest starts a new frozen chain after success, retaining old protected co
     assert.deepEqual(h.pager.trim(), [initial.page.id]);
     await h.pager.older();
     assert.equal(h.calls.at(-1).cursor, 'before:B:1');
+});
+
+test('a protected old page remains the bookmark source after latest rebases the chain', async () => {
+    const coverage = { v: 1, view: 'bound-A', spans: { chat: { from: 10, to: 20 } } };
+    const h = harness({ fetch: cursor => cursor === null ? page(0, { chain: 'B' })
+        : cursor === 'before:A:1' ? { ...page(1), coverage }
+            : page(Number(cursor.split(':').at(-1)), { chain: cursor.split(':')[1] }) });
+    h.pager.acceptRecent(page(0));
+    const old = await h.pager.older();
+    h.protectedIds.add(old.page.id);
+    await h.pager.latest();
+    assert.equal(h.pager.getState().firstPage.requestCursor, 'replay:B:0');
+    assert.ok(h.pager.getState().cachedPages.some(item => item.id === old.page.id));
+
+    const saved = h.pager.exportResume(old.page.id);
+    assert.deepEqual(saved, { pages: [old.page], focus: 0 },
+        'the retained descriptor carries its own replay cursor, continuation and bound coverage');
+
+    const reopened = harness({ fetch: cursor => cursor === 'replay:A:1'
+        ? { ...page(1), coverage } : page(2) });
+    assert.equal((await reopened.pager.restore(saved)).status, 'applied');
+    assert.equal(reopened.calls[0].cursor, 'replay:A:1');
+    assert.equal(reopened.pager.getState().firstPage.id, old.page.id);
+    assert.deepEqual(reopened.pager.getState().firstPage.coverage, coverage);
+    await reopened.pager.older();
+    assert.equal(reopened.calls[1].cursor, 'before:A:2');
+    assert.equal(new Set(reopened.pager.getState().cachedPages.map(item => item.id)).size, 2,
+        'the continuation cannot overwrite the retained page after indices are rebased');
 });
 
 test('a failed latest read leaves the old chain available and retries the same request', async () => {

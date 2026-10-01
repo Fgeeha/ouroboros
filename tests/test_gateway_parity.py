@@ -368,10 +368,10 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
         "ActiveDirectTurn keeps its required base; waits and attempt are optional live-owner facts"
     )
     assert _notrequired_fields(ActiveChatActivity) == {
-        "model_waits", "task_attempt", "required_question", "required_question_unavailable",
+        "model_waits", "task_attempt", "required_question", "required_question_unavailable", "project_admission_hold",
     }, "ActiveChatActivity keeps the same required base and optional wait/attempt/question facts"
     activity_fields = get_type_hints(ActiveChatActivity, include_extras=True)
-    question_keys = {"required_question", "required_question_unavailable"}
+    question_keys = {"required_question", "required_question_unavailable", "project_admission_hold"}
     assert {key: value for key, value in activity_fields.items() if key not in question_keys} == get_type_hints(ActiveDirectTurn, include_extras=True), (
         "ActiveChatActivity must mirror ActiveDirectTurn's field shape so one client reducer hydrates both"
     )
@@ -380,6 +380,7 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
     activity_schema = json_schema_for(ActiveChatActivity)
     assert activity_schema["properties"].pop("required_question")["type"] == "object"
     assert activity_schema["properties"].pop("required_question_unavailable")["type"] == "boolean"
+    assert activity_schema["properties"].pop("project_admission_hold")["type"] == "object"
     assert not question_keys & set(activity_schema["required"])
     assert activity_schema == json_schema_for(ActiveDirectTurn), (
         "the shared activity shape must preserve flat keys, types and requiredness"

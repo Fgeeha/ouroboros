@@ -33,7 +33,7 @@ REFUSAL_REASONS = (
     "worker_pool_state_unavailable", "duplicate_task_id", "admission_reservation_owned",
     "admission_reservation_lost", "admission_reservation_failed", "admission_fence",
     "admission_rejected", "invalid_admission_reservation", "task_id_lookup_failed",
-    "empty_objective", "project_routing_fence", "project_routing_fence_lookup_failed",
+    "empty_objective", "project_routing_fence", "project_routing_fence_changed", "project_routing_fence_lookup_failed",
     "project_binding_failed", "project_registration_failed", "project_source_error",
     "attachment_admission_rejected", "staging_unavailable",
     "queue_snapshot_persist_unavailable", "queue_snapshot_persist_failed",
@@ -75,6 +75,7 @@ EXEMPT = {
     # snapshot-persist / rollback reasons (a persist call's audit label, never a receipt)
     "promote_chat_to_task_rejected", "promote_chat_to_task_failed", "promote_chat_to_task",
     "drain_all_pending", "acceptance_fence_owner_message", "evolve_off", "deep_self_review_enqueued",
+    "project_hold_revalidated",
     # the bind-failure events.jsonl row's reason (project_binding_unreadable), never a receipt
     "project_binding_unreadable",
     # success / pseudo reasons on a delivered ensure_project_scope receipt

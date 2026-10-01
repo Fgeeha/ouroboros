@@ -142,6 +142,19 @@
             "cache_write_tokens": 25,
             "provider": "anthropic",
             "resolved_model": "anthropic/claude-sonnet-4-6",
+            "effort": {
+              "requested": "high",
+              "sent": {
+                "thinking": {
+                  "type": "adaptive"
+                },
+                "output_config.effort": "high"
+              },
+              "sent_state": "explicit",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            },
             "prompt_cache_ttl": "1h",
             "cache_write_tokens_by_ttl": {
               "5m": 5,
@@ -153,6 +166,11 @@
             "request_wire": {
               "requested_effort": "high",
               "applied_effort": "high",
+              "original_requested_effort": "high",
+              "requested_effort_source": "provider_projection",
+              "applied_effort_source": "sent_candidate",
+              "reported_effort": null,
+              "reported_effort_source": null,
               "requested_tool_dialect": "function",
               "applied_tool_dialect": "function",
               "reason_code": "requested_wire_form",
@@ -409,6 +427,19 @@
             "cache_write_tokens": 0,
             "provider": "anthropic",
             "resolved_model": "anthropic/claude-sonnet-4-6",
+            "effort": {
+              "requested": "medium",
+              "sent": {
+                "thinking": {
+                  "type": "adaptive"
+                },
+                "output_config.effort": "medium"
+              },
+              "sent_state": "explicit",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            },
             "prompt_cache_ttl": "1h",
             "cost": 0.001,
             "cost_estimated": true,
@@ -416,6 +447,11 @@
             "request_wire": {
               "requested_effort": "medium",
               "applied_effort": "medium",
+              "original_requested_effort": "medium",
+              "requested_effort_source": "provider_projection",
+              "applied_effort_source": "sent_candidate",
+              "reported_effort": null,
+              "reported_effort_source": null,
               "requested_tool_dialect": "function",
               "applied_tool_dialect": "function",
               "reason_code": "requested_wire_form",
@@ -665,6 +701,19 @@
             "cache_write_tokens": 0,
             "provider": "anthropic",
             "resolved_model": "anthropic/claude-sonnet-4-6",
+            "effort": {
+              "requested": "minimal",
+              "sent": {
+                "thinking": {
+                  "type": "adaptive"
+                },
+                "output_config.effort": "low"
+              },
+              "sent_state": "explicit",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            },
             "prompt_cache_ttl": "1h",
             "cost": 0.0002,
             "cost_estimated": true,
@@ -672,6 +721,11 @@
             "request_wire": {
               "requested_effort": "low",
               "applied_effort": "low",
+              "original_requested_effort": "minimal",
+              "requested_effort_source": "provider_projection",
+              "applied_effort_source": "sent_candidate",
+              "reported_effort": null,
+              "reported_effort_source": null,
               "requested_tool_dialect": "function",
               "applied_tool_dialect": "function",
               "reason_code": "requested_wire_form",
@@ -852,12 +906,30 @@
             "cache_write_tokens": 0,
             "provider": "anthropic",
             "resolved_model": "anthropic/claude-sonnet-4-6",
+            "effort": {
+              "requested": "medium",
+              "sent": {
+                "thinking": {
+                  "type": "adaptive"
+                },
+                "output_config.effort": "medium"
+              },
+              "sent_state": "explicit",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            },
             "cost": 0.0002,
             "cost_estimated": true,
             "cost_final": false,
             "request_wire": {
               "requested_effort": "medium",
               "applied_effort": "medium",
+              "original_requested_effort": "medium",
+              "requested_effort_source": "provider_projection",
+              "applied_effort_source": "sent_candidate",
+              "reported_effort": null,
+              "reported_effort_source": null,
               "requested_tool_dialect": "none",
               "applied_tool_dialect": "none",
               "reason_code": "requested_wire_form",
@@ -1015,12 +1087,30 @@
             "cache_write_tokens": 0,
             "provider": "anthropic",
             "resolved_model": "anthropic/claude-sonnet-4-6",
+            "effort": {
+              "requested": "medium",
+              "sent": {
+                "thinking": {
+                  "type": "adaptive"
+                },
+                "output_config.effort": "medium"
+              },
+              "sent_state": "explicit",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            },
             "cost": 0.0002,
             "cost_estimated": true,
             "cost_final": false,
             "request_wire": {
               "requested_effort": "medium",
               "applied_effort": "medium",
+              "original_requested_effort": "medium",
+              "requested_effort_source": "provider_projection",
+              "applied_effort_source": "sent_candidate",
+              "reported_effort": null,
+              "reported_effort_source": null,
               "requested_tool_dialect": "none",
               "applied_tool_dialect": "none",
               "reason_code": "provider_unsupported_field",
@@ -1333,12 +1423,30 @@
             "cache_write_tokens": 0,
             "provider": "anthropic",
             "resolved_model": "anthropic/claude-sonnet-4-6",
+            "effort": {
+              "requested": "medium",
+              "sent": {
+                "thinking": {
+                  "type": "adaptive"
+                },
+                "output_config.effort": "medium"
+              },
+              "sent_state": "explicit",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            },
             "cost": 0.0003,
             "cost_estimated": true,
             "cost_final": false,
             "request_wire": {
               "requested_effort": "medium",
               "applied_effort": "medium",
+              "original_requested_effort": "medium",
+              "requested_effort_source": "provider_projection",
+              "applied_effort_source": "sent_candidate",
+              "reported_effort": null,
+              "reported_effort_source": null,
               "requested_tool_dialect": "none",
               "applied_tool_dialect": "none",
               "reason_code": "requested_wire_form",
@@ -1516,6 +1624,19 @@
             "cache_write_tokens": 0,
             "provider": "anthropic",
             "resolved_model": "anthropic/claude-sonnet-4-6",
+            "effort": {
+              "requested": "medium",
+              "sent": {
+                "thinking": {
+                  "type": "adaptive"
+                },
+                "output_config.effort": "medium"
+              },
+              "sent_state": "explicit",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            },
             "prompt_cache_ttl": "1h",
             "cost": 0.0004,
             "cost_estimated": true,
@@ -1523,6 +1644,11 @@
             "request_wire": {
               "requested_effort": "medium",
               "applied_effort": "medium",
+              "original_requested_effort": "medium",
+              "requested_effort_source": "provider_projection",
+              "applied_effort_source": "sent_candidate",
+              "reported_effort": null,
+              "reported_effort_source": null,
               "requested_tool_dialect": "function",
               "applied_tool_dialect": "function",
               "reason_code": "requested_wire_form",

@@ -145,27 +145,44 @@ def test_session_consumer_reads_exact_retained_file_without_attachments(monkeypa
     This is consumer wiring evidence, not a subscription-harness read receipt.
     The opt-in canary exercises that last boundary with an actual session.
     """
+    # Force JSON path escaping on POSIX too; on Windows this is a separator.
+    tmp_path = tmp_path / "retained\\source-ñ"
+    tmp_path.mkdir(parents=True)
     fake = _fake_session(monkeypatch)  # no attachmentInputs advertised
     original_start = fake.start_run
     observed = []
 
     def start(self, wire, **kw):
-        import gzip
+        from ouroboros.delegate_custody import START_REQUESTED
+        from ouroboros.observability import read_blob_ref, read_call_payload
+
         path = json.loads(re.search(r'absolute path ("(?:[^"\\]|\\.)*") with', wire["prompt"]).group(1))
         raw = Path(path).read_bytes()
         digest = hashlib.sha256(raw).hexdigest()
         assert digest in wire["prompt"]
         assert not Path(path).is_relative_to(workspace)
         assert wire["scope"] == {"kind": "project", "root": str(workspace)}
-        assert (Path(wire["scope"]["root"]) / "greeting.txt").read_text() == "hello native reviewer\n"
+        assert (Path(wire["scope"]["root"]) / "greeting.txt").read_text(encoding="utf-8") == "hello native reviewer\n"
         assert wire["access"] == "readonly" and wire["mode"] == "ask"
         assert "attachments" not in wire
         assert "TRAJECTORY-RESULT-3-passed" not in wire["prompt"]
         # Before POST, BOTH coordinator prompt and invocation custody carry the source identity.
-        saved = [p.read_text() for p in tmp_path.rglob("*.json")]
-        saved += [gzip.decompress(p.read_bytes()).decode() for p in tmp_path.rglob("*.json.gz")]
-        saved += [p.read_text() for p in tmp_path.rglob("*.jsonl")]
-        assert sum('"custody_source"' in text and digest in text and path in text for text in saved) >= 2
+        rows = [json.loads(line) for line in (tmp_path / "logs/events.jsonl").read_text(encoding="utf-8").splitlines()]
+        (invocation,) = [row for row in rows if row.get("type") == START_REQUESTED
+                         and row.get("task_id") == "root-delivery" and row.get("slot_id") == "t_sess"]
+        assert read_blob_ref(tmp_path, invocation["request_ref"]) == wire
+        _, prompt, _ = read_call_payload(tmp_path, task_id="root-delivery",
+                                         call_id=invocation["operation_id"] + "_prompt")
+        assert prompt["request"]["task_id"] == "root-delivery" and prompt["slot"]["slot_id"] == "t_sess"
+        deliveries = [prompt["request"]["slot_source_delivery"]["t_sess"], invocation["review_source_delivery"]]
+        for delivery in deliveries:
+            assert delivery["source_path"] == path
+            assert delivery["custody_root"] == str(tmp_path)
+            assert delivery["custody_source"]["sha256"] == digest
+            assert delivery["custody_source"]["size"] == len(raw)
+            assert delivery["custody_source"] == delivery["source"]
+            assert delivery["reader"] == "filesystem" and delivery["external_ref_closure"] == "retained"
+        assert deliveries[0]["reader_root"] == deliveries[1]["reader_root"]
         observed.append((raw, wire))
         return original_start(self, wire, **kw)
 
@@ -189,7 +206,7 @@ def test_session_consumer_reads_exact_retained_file_without_attachments(monkeypa
     assert delivery["first_send_chars"] == len(json.dumps(wire, ensure_ascii=False)) < delivery["first_send_ceiling"]
     assert delivery["first_send_bytes"] == len(json.dumps(wire, ensure_ascii=False).encode("utf-8"))
     (tmp_path / "consumer-evidence.json").write_text(json.dumps({"kind": "offline_real_consumer",
-        "live_session": False, "source_delivery": delivery, "wire_request": wire}, ensure_ascii=False, indent=2))
+        "live_session": False, "source_delivery": delivery, "wire_request": wire}, ensure_ascii=False, indent=2), encoding="utf-8")
     assert not (workspace / ".review-drive").exists() and not (workspace / ".gitignore").exists()
     if git_workspace:
         assert subprocess.check_output(["git", "status", "--porcelain"], cwd=workspace, text=True) == "?? greeting.txt\n"
@@ -253,7 +270,7 @@ def _prepared_request(tmp_path, *, session=True, huge=False):
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    (workspace / "greeting.txt").write_text("workspace-marker-ñ")
+    (workspace / "greeting.txt").write_text("workspace-marker-ñ", encoding="utf-8")
     author, canonical = tmp_path / "author-drive", tmp_path / "canonical"
     write_task_result(author, "source-reader", "running", result="original source-reader task")
     artifact = task_artifact_dir_path(author, "source-reader", create=True) / "report/summary.md"
@@ -304,7 +321,7 @@ def test_huge_fields_session_packet_and_named_closure_survive_cleanup(monkeypatc
     (wire,) = fake.instances[0].start_requests
     assert delivery["first_send_chars"] == len(json.dumps(wire, ensure_ascii=False))
     (tmp_path / "consumer-evidence.json").write_text(json.dumps({"kind": "offline_real_consumer",
-        "live_session": False, "source_delivery": delivery, "wire_request": wire}, ensure_ascii=False, indent=2))
+        "live_session": False, "source_delivery": delivery, "wire_request": wire}, ensure_ascii=False, indent=2), encoding="utf-8")
     # The landed closure owner retained named snapshots before dispatch; packet
     # custody is now revalidated on that root, not the deleted original drive.
     from ouroboros.acceptance_retrieving import retain_review_source
@@ -344,10 +361,21 @@ def test_session_consumer_refuses_unavailable_canonical_bytes_without_start(monk
     assert list(author.rglob("acceptance-packet-*"))
 
 
-def test_native_consumer_reports_lost_retained_reader_without_switching_to_packet_custody(monkeypatch, tmp_path):
+@pytest.mark.parametrize("fixture_encoding", ["utf-8", "cp1252"])
+def test_native_consumer_reports_lost_retained_reader_without_switching_to_packet_custody(monkeypatch, tmp_path, fixture_encoding):
     from ouroboros.review_substrate import run_review_request
 
-    request, slot, author, canonical, workspace = _prepared_request(tmp_path, session=False)
+    write_text = Path.write_text
+
+    def fixture_write(path, data, encoding=None, **kwargs):
+        # Model the Windows default ONLY for the fixture's greeting write.
+        if path == tmp_path / "workspace/greeting.txt" and encoding is None:
+            encoding = fixture_encoding
+        return write_text(path, data, encoding=encoding, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "write_text", fixture_write)
+        request, slot, author, canonical, workspace = _prepared_request(tmp_path, session=False)
 
     class ReadingAfterCleanup(_EpisodeLLM):
         def _reply(self, kwargs):

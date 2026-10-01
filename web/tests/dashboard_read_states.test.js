@@ -154,6 +154,20 @@ function emptyActivity(routes) {
     routes.set(schedulesUrl, response({ tasks: [] }));
 }
 
+test('Activity names known non-Project scope waits without implying a Project', async (t) => {
+    const { mount, routes, ws } = setup(t);
+    emptyActivity(routes);
+    routes.set(queueUrl, response({ queue: { running: [], pending: [{ id: 'main', task: {
+        title: 'Original work', _project_scope_none: true,
+        project_admission_hold: { label: 'Waiting for task scope verification', detail: '<bindings unavailable>' },
+    } }] } }));
+    const activity = initActivity({ mount, ws });
+    await activity.refresh();
+    assert.match(mount.textContent, /Waiting for task scope verification/);
+    assert.doesNotMatch(mount.textContent, /Waiting for Project verification/);
+    assert.match(mount.textContent, /&lt;bindings unavailable&gt;/);
+});
+
 test('Activity failed reads stay unknown; independent successful empty state stays empty', async (t) => {
     const { mount, routes, ws } = setup(t);
     emptyActivity(routes);
@@ -297,7 +311,7 @@ test('Activity reports what a lifecycle action actually did, delete included', a
     await click('schedule-toggle', 'active');
     assert.match(toasts().at(-1), /audit record is incomplete: the change is durable/);
     await click('schedule-toggle', 'active');
-    assert.match(toasts().at(-1), /still running and was not stopped/);
+    assert.match(toasts().at(-1), /queued or running and was not cancelled/);
     await click('schedule-toggle', 'active');
     assert.match(toasts().at(-1), /is unknown/);
     // A clean change with nothing in flight has nothing to disclose.

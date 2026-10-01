@@ -294,7 +294,7 @@ def _drift_refusal(
 def _locked_apply(
     ctx: ToolContext, target: pathlib.Path, patch_path: pathlib.Path,
     ordered_touched: List[str], baseline_sha: str, *, file_changes=None, file_baseline=None,
-    admission_check=None,
+    admission_check=None, three_way: bool = False,
 ) -> Dict[str, Any]:
     """Apply one captured patch under the repo git lock — mechanics only.
 
@@ -323,15 +323,17 @@ def _locked_apply(
         # target that moved since the snapshot can still take the patch — at a
         # shifted position, silently. Under the same lock that serializes the
         # mutation, every touched path is compared against the run's baseline commit
-        # first; ANY difference is the typed conflict the nanny owns, and nothing is
-        # applied.
+        # first. Dirty-source copies refuse drift; proven clean task copies
+        # retain Git three-way synthesis and its explicit conflicts.
         try:
             result["drifted"], result["drift_error"] = _si()._baseline_drifted_paths(
                 target, baseline_sha, [path for path in ordered_touched if path not in (file_baseline or {})])
         except Exception as exc:
             result["drifted"], result["drift_error"] = [], f"{type(exc).__name__}: {exc}"
-        if result["drift_error"] or result["drifted"]:
+        if result["drift_error"] or (result["drifted"] and not three_way):
             return result
+        if three_way:
+            result["drifted"] = []  # Git's 3-way merge reconciles clean-base contributions.
         if file_changes:
             try:
                 prepared = temporary.enter_context(prepare_file_outputs(
@@ -342,15 +344,13 @@ def _locked_apply(
         if admission_check and (refusal := admission_check()):
             result["admission_refusal"] = refusal
             return result
-        # WORKING-TREE apply, not --3way/--index: the baseline deliberately
-        # snapshots the target's DIRTY state (that is the whole point of C1), so the
-        # patch's preimage is the live working tree — while `--3way` implies index
-        # binding and refuses any file whose worktree differs from the index, i.e.
-        # refuses the normal shared-tree state. Touched paths are then staged
-        # explicitly so the result matches integrate_subagent_patch's staged contract.
+        # Dirty-source snapshots use working-tree apply: --3way implies index
+        # binding and would reject the source's pre-existing unstaged changes.
+        # A task copy recorded from clean HEAD/index instead keeps three-way
+        # synthesis. Both paths stage touched results and never commit.
         has_patch = patch_path.is_file() and patch_path.stat().st_size > 0
         proc = subprocess.run(
-            ["git", "apply", str(patch_path)],
+            ["git", "apply", *(["--3way", "--index"] if three_way else []), str(patch_path)],
             cwd=str(target), capture_output=True, text=True,
         ) if has_patch else subprocess.CompletedProcess([], 0, "", "")
         result["proc"] = proc

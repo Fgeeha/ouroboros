@@ -376,14 +376,16 @@ def presence_ceiling_allows_tool(ceiling: PresenceCapabilityCeiling, tool_name: 
     return any(grant.name == tool_name for grant in ceiling.tool_grants)
 
 
-def presence_ceiling_allows_delegated_surface(ctx: Any, surface: str) -> bool:
+def presence_ceiling_allows_delegated_surface(ctx: Any, surface: str, workspace_root: str = "") -> bool:
     """Keep mutative descendants inside an explicitly selected logical write root."""
 
     ceiling = presence_ceiling_from_context(ctx)
     if ceiling is None:
         return True
+    from ouroboros.workspace_copies import workspace_copy_source_is_system
+
     required_root = {
-        "self_worktree": "system_repo",
+        "self_worktree": ("system_repo" if workspace_copy_source_is_system(ctx, workspace_root) else "active_workspace"),
         "external_workspace": "active_workspace",
     }.get(str(surface or "").strip())
     return bool(required_root and any(

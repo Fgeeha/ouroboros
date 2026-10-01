@@ -1,5 +1,6 @@
 """Actual terminal sender/outbox, preparation owner and registered explicit consumers."""
 import copy
+import hashlib
 import json
 import queue
 import threading
@@ -204,6 +205,114 @@ def test_main_to_project_routing_is_host_proven_and_supplement_keeps_historical_
     notice = pending_deliveries(f.root)[0]
     chat._handle_send_message(notice, sender)
     assert sends[-1][0] == binding['project_chat_id']
+
+
+@pytest.mark.parametrize('first', ['preparation', 'callback'])
+@pytest.mark.parametrize('retry', [False, True])
+def test_overlapping_historical_collections_keep_the_queued_notice_room(late, tmp_path, monkeypatch, first, retry):
+    """Both real collectors can observe pending before either publishes its result."""
+    from ouroboros import acceptance_late, acceptance_settlement as settlement, review_dispatch
+    from ouroboros.contracts.chat_id_policy import WEB_UI_CHAT_ID
+    from ouroboros.gateway.task_archive import serve_task_source
+    from ouroboros.projects_registry import bind_task_to_project
+    from supervisor.log_addressing import bound_project_chat_id
+    from supervisor.terminal_delivery import pending_deliveries, terminal_answer_receipts
+
+    monkeypatch.setattr('ouroboros.pricing._fetch_live_rows', lambda *_a, **_kw: {})
+    f = delivered(tmp_path, monkeypatch, receipt='owed', chat_id=WEB_UI_CHAT_ID, retry=retry)
+    before = copy.deepcopy(load_task_result(f.root, f.tid))
+    binding = bind_task_to_project(f.root, f.tid, 'late-project', origin={'absent': 'post_hoc_unresolved'})
+    monkeypatch.setattr(chat, '_bound_project_chat_id', bound_project_chat_id)
+    transport = threading.Event()
+    late.gates.append(transport)
+    kinds = ('preparation', 'callback')
+    entered, collect, collected, release, published = (
+        {kind: threading.Event() for kind in kinds} for _ in range(5))
+    real_collect = review_dispatch.collect_task_acceptance_run
+    real_enqueue = settlement.enqueue_late_acceptance_settlement
+
+    def caller():
+        return 'preparation' if threading.current_thread().name.startswith('review-prepare-') else 'callback'
+
+    def held_collection(*args, **kwargs):
+        kind = caller()
+        entered[kind].set()
+        assert collect[kind].wait(10)
+        result = real_collect(*args, **kwargs)
+        collected[kind].set()
+        assert release[kind].wait(10)
+        return result
+
+    def observed_enqueue(*args, **kwargs):
+        result = real_enqueue(*args, **kwargs)
+        published[caller()].set()
+        return result
+
+    monkeypatch.setattr(review_dispatch, 'collect_task_acceptance_run', held_collection)
+    monkeypatch.setattr(settlement, 'enqueue_late_acceptance_settlement', observed_enqueue)
+    sends = []
+    sender = _send_ctx(f.root, sends)
+    sender.event_queue = queue.Queue()
+    try:
+        chat._handle_send_message(f.event, sender)
+        assert entered['preparation'].wait(10)
+        transport.set()
+        assert entered['callback'].wait(10)
+        # Each real collection reads the pending snapshot and all settled actors.
+        for kind in kinds:
+            collect[kind].set()
+            assert collected[kind].wait(10)
+        release[first].set()
+        assert published[first].wait(10)
+        other = next(kind for kind in kinds if kind != first)
+        release[other].set()
+        assert published[other].wait(10)
+    finally:
+        transport.set()
+        for gate in [*collect.values(), *release.values()]:
+            gate.set()
+        until(lambda: not review_operation._LIVE)
+
+    p = panel(f)
+    notice, = pending_deliveries(f.root)
+    assert notice['system_type'] == 'acceptance_late_settlement'
+    assert notice['progress_meta']['late_evidence']['source_ref'] != p['applied_source_ref']
+    # The notice's record link still opens the exact record it was sent with (#1369).
+    sent = notice['progress_meta']['late_evidence']['source_ref']
+    served = serve_task_source(f.root, [], load_task_result(f.root, f.tid), f.tid, sent['path'].rsplit('/', 1)[1],
+                               sent['path'])
+    assert served.status_code == 200 and hashlib.sha256(served.body).hexdigest() == sent['sha256']
+    assert notice['text'] == p['late_settlement']['note']
+    receipt, = terminal_answer_receipts(f.root, f.tid)['delivered']
+    assert p['late_settlement']['historical_delivery'] == {
+        key: receipt[key] for key in ('task_id', 'delivery_id', 'chat_id', 'text_sha256', 'source_ref')}
+    for key in ('result', 'status', 'review_status', 'outcome_axes', 'acceptance_debt'):
+        assert load_task_result(f.root, f.tid).get(key) == before.get(key), key
+    assert len(late.calls) == 3
+    assert all(scope.task_id == f.tid and scope.root_task_id == f.accounting and scope.root_limit_usd == 4
+               for scope, _ in late.calls)
+    assert len(load_task_result(f.root, f.accounting)['task_acceptance_review_accounting']['claims_by_binding']) == 1
+    # A caller-supplied stale pointer alone cannot claim the historical route.
+    for key, value in (('task_id', 'another-task'), ('delivery_id', 'another-delivery'),
+                       ('chat_id', 123), ('text', 'another note'), ('system_type', 'another-type')):
+        assert acceptance_late.supplement_chat(f.root, {**notice, key: value}) is None, key
+    altered = copy.deepcopy(notice)
+    altered['progress_meta']['late_evidence']['source_ref']['sha256'] = '0' * 64
+    assert acceptance_late.supplement_chat(f.root, altered) is None
+    with monkeypatch.context() as absent:
+        absent.setattr('supervisor.terminal_delivery.pending_deliveries', lambda _root: [])
+        assert acceptance_late.supplement_chat(f.root, notice) is None
+    monkeypatch.setattr(chat, '_bound_project_chat_id', lambda *_a: 99999)
+    chat._handle_send_message(notice, sender)
+    assert sends[-1][0] == binding['project_chat_id']
+    assert sends == [(binding['project_chat_id'], f.event['text']), (binding['project_chat_id'], notice['text'])]
+    chat._DELIVERED_MESSAGE_IDS.clear()
+    chat._handle_send_message(notice, sender)
+    for event in list(sender.event_queue.queue):
+        if event.get('system_type') == 'acceptance_late_settlement':
+            chat._handle_send_message(event, sender)
+    chat._handle_send_message(f.event, sender)
+    assert len(sends) == 2 and len(late.calls) == 3 and not pending_deliveries(f.root)
 
 
 @pytest.mark.parametrize('control', ['hurry', 'finalize_now', 'panic'])

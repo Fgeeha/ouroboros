@@ -51,7 +51,7 @@ from ouroboros.task_results import (
     task_result_path,
     write_task_result,
 )
-from ouroboros.task_status import reconcile_orphaned_running_tasks
+from ouroboros.task_status import execution_owner_record, reconcile_orphaned_running_tasks
 from ouroboros.tools.presence import _finish_presence
 from ouroboros.utils import append_jsonl
 from tests.test_host_service_api import _seed_presence_behavior, _seed_token
@@ -64,12 +64,16 @@ _OUTCOME_UNKNOWN = "presence_attempt_outcome_unknown"
 
 def _sweep(tmp_path, monkeypatch, task_id, status=STATUS_RUNNING, *, seed=True, boot="2026-05-28T00:00:02+00:00",
            metadata=_PRESENCE_METADATA, **fields):
-    """The real reconciler: a stale row, a later worker boot, a fresh empty queue, one sweep."""
+    """A managed Presence-related row with real pool ownership, then a worker restart.
+
+    Inline turns are exercised through the real producer in test_inline_execution_status.
+    """
     with monkeypatch.context() as patch:
         patch.setattr(time, "time", lambda: _NOW)
         if seed:
             write_task_result(tmp_path, task_id, status, result="Task is running.",
-                              ts="2026-05-28T00:00:00+00:00", metadata=dict(metadata), **fields)
+                              ts="2026-05-28T00:00:00+00:00", metadata=dict(metadata),
+                              execution_owner=execution_owner_record(tmp_path, {"id": task_id}, "pooled"), **fields)
         (tmp_path / "state").mkdir(exist_ok=True)
         (tmp_path / "state" / "queue_snapshot.json").write_text(
             '{"ts": "2027-01-15T08:00:00+00:00", "pending": [], "running": []}', encoding="utf-8")
@@ -81,8 +85,15 @@ def _sweep(tmp_path, monkeypatch, task_id, status=STATUS_RUNNING, *, seed=True, 
 
 
 def _reconciled(tmp_path, monkeypatch, task_id, status=STATUS_RUNNING, **kwargs):
-    healed, row = _sweep(tmp_path, monkeypatch, task_id, status, **kwargs)
-    assert healed == 1 and row["status"] == STATUS_FAILED and row["status_reconciled_from"] == status
+    # Historical placeholders must remain readable after the false inline-orphan
+    # inference is repaired. Seed their stored shape, not the now-invalid inference.
+    existing = load_task_result(tmp_path, task_id) or {}
+    reason = "interrupted_retry_lost" if status == STATUS_INTERRUPTED else "orphaned_running_after_worker_restart"
+    row = write_task_result(tmp_path, task_id, STATUS_FAILED, reason_code=reason,
+                           status_reconciled_from=status, outcome_axes=infra_failed_axes(reason),
+                           metadata=kwargs.get("metadata", existing.get("metadata", dict(_PRESENCE_METADATA))),
+                           result="Task is running.\n\nTASK_ORPHAN_RECONCILED: historical host placeholder")
+    assert row["status"] == STATUS_FAILED and row["status_reconciled_from"] == status
     assert row["reason_code"] == ("interrupted_retry_lost" if status == STATUS_INTERRUPTED
                                   else "orphaned_running_after_worker_restart")
     assert "TASK_ORPHAN_RECONCILED" in row["result"] and not row.get("terminal_origin")
@@ -110,7 +121,11 @@ def test_reopen_moves_the_host_mark_aside_exactly_once(tmp_path, monkeypatch, st
         "ts": row["ts"], "result": row["result"][-500:],
         # the failed transition's terminal-projection provenance goes aside with the mark
         "canonical_terminal_projection_origin": "terminal_transition",
+        "terminal_time": {"v": 1, "occurred_at": None, "source": "unknown",
+                          "attempt": dict.fromkeys(("task_attempt", "_attempt", "started_at",
+                                                    "metadata_attempt", "metadata_task_attempt"))},
     }
+    assert "terminal_time" not in reopened  # reopening cannot inherit the failed attempt's clock
     for cleared in ("reason_code", "outcome_axes", "artifact_status", "artifact_bundle", "result",
                     "status_reconciled_from", "canonical_terminal_projection_origin"):
         assert cleared not in reopened
@@ -746,7 +761,7 @@ def test_reconciler_skips_a_row_whose_retry_went_live_after_the_decision(tmp_pat
         if tid == task_id and not order:  # the retry goes live right after the sweep decided
             order.append("live")
             with presence_runner._LIVE_LOCK:
-                presence_runner._LIVE_PRESENCE_TASKS.add(task_id)
+                presence_runner._LIVE_PRESENCE_TASKS.add((str(tmp_path.resolve()), task_id))
         return effective
 
     monkeypatch.setattr(task_status, "load_effective_task_result", effective_then_retry_registers)
@@ -755,7 +770,7 @@ def test_reconciler_skips_a_row_whose_retry_went_live_after_the_decision(tmp_pat
         assert (healed, row["status"], order) == (0, STATUS_RUNNING, ["live"])  # decision dropped, row untouched
     finally:
         with presence_runner._LIVE_LOCK:
-            presence_runner._LIVE_PRESENCE_TASKS.discard(task_id)
+            presence_runner._LIVE_PRESENCE_TASKS.discard((str(tmp_path.resolve()), task_id))
     healed, row = _sweep(tmp_path, monkeypatch, task_id, seed=False)
     assert healed == 1 and row["status"] == STATUS_FAILED and row["status_reconciled_from"] == STATUS_RUNNING
 

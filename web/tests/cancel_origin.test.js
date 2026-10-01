@@ -49,3 +49,38 @@ test('retained origin does not replace a non-cancelled child frame', () => {
         assert.equal(view.phase, subagent_event === 'failed' ? 'error' : 'working');
     }
 });
+
+test('a saved end row says when the task ended when its line was added later', () => {
+    const at = value => new Date(value).toLocaleString(undefined, {
+        year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+    const row = (terminal_time, ts = '2026-09-26T19:21:43+00:00') => ({ task_id: 'late', system_type: 'task_summary',
+        status: 'failed', ts, text: '', ...(terminal_time === undefined ? {} : { terminal_time }) });
+    const known = { v: 1, source: 'executor_terminal', occurred_at: '2026-09-24T18:18:27+00:00', attempt: {} };
+    assert.match(taskTerminalSummary(row(known)).body,
+        new RegExp(`Task ended ${at(known.occurred_at)} · Notification added ${at('2026-09-26T19:21:43+00:00')}`));
+    assert.match(taskTerminalSummary(row({ ...known, source: 'unknown', occurred_at: null })).body,
+        /Task end time not recorded · Notification added /);
+    for (const prompt of [row(known, '2026-09-24T18:18:40+00:00'), row(undefined), row(null)]) {
+        assert.doesNotMatch(taskTerminalSummary(prompt).body, /Task end|Notification added/,
+            'a prompt or legacy row keeps its ordinary terminal line');
+    }
+    assert.doesNotMatch(taskTerminalSummary({ ...row(known), system_type: '' }).body, /Notification added/,
+        'a live task_done frame is not a saved notification');
+});
+
+test('an end row published an hour later across a DST fallback still says when the task ended', t => {
+    const zone = process.env.TZ;
+    t.after(() => { if (zone === undefined) delete process.env.TZ; else process.env.TZ = zone; });
+    process.env.TZ = 'America/New_York';
+    const at = (value, timeZoneName) => new Date(value).toLocaleString(undefined, {
+        year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', timeZoneName });
+    const [ended, added] = ['2026-11-01T05:30:10Z', '2026-11-01T06:30:40Z'];
+    assert.equal(at(ended), at(added), 'both instants read 01:30 on the local clock');
+    const row = ts => ({ task_id: 'late', system_type: 'task_summary', status: 'failed', ts, text: '',
+        terminal_time: { v: 1, source: 'executor_terminal', occurred_at: ended, attempt: {} } });
+    const body = taskTerminalSummary(row(added)).body;
+    assert.ok(body.includes(`Task ended ${at(ended, 'short')} · Notification added ${at(added, 'short')}`), body);
+    assert.notEqual(at(ended, 'short'), at(added, 'short'), 'their zone names tell them apart');
+    assert.doesNotMatch(taskTerminalSummary(row('2026-11-01T05:30:55Z')).body, /Task end|Notification added/,
+        'the same minute still keeps the ordinary line');
+});

@@ -261,10 +261,16 @@ def skip_on_provider_environmental_error(
         print(f"[{provider_id}] HTTP {status} body: {safe_body[:500]}", file=sys.stderr)
     if classification.kind is ProviderFailureKind.INCONCLUSIVE:
         detail = safe_body[:200] if safe_body else safe_message[:200]
-        pytest.skip(
-            f"[{provider_id}] inconclusive provider alarm "
-            f"({classification.reason}): {detail}"
-        )
+        try:
+            pytest.skip(
+                f"[{provider_id}] inconclusive provider alarm "
+                f"({classification.reason}): {detail}"
+            )
+        except pytest.skip.Exception as skipped:
+            # Carry the existing decision across pytest's outcome wrapper.
+            skipped.provider_failure_classification = classification
+            skipped.provider_failure_exception_type = type(exc).__name__
+            raise
 
 
 def official_provider_integration_job():
@@ -310,6 +316,31 @@ def delegate_start_canary_arguments(nonce: str):
     }
 
 
+def delegate_start_canary_context():
+    """Synthetic, non-executing roster that makes the requested selector well-defined.
+
+    delegate_start takes subagent_id only for a direct fresh start, as an exact
+    Agent-session actor id from Available subagents; asked for it with no roster,
+    the request leaves that premise unstated. This synthetic block borrows Main's
+    catalog heading and relevant row vocabulary; nothing is registered or started.
+    """
+    roster = {"rows": [{
+        "subagent_id": CANARY_SUBAGENT_ID,
+        "route_class": "Agent session",
+        "recommended_use": (
+            "Synthetic provider-contract canary actor. Nothing is registered or "
+            "started: the returned call is validated, never executed."
+        ),
+    }]}
+    return (
+        "## Available subagents\n\n"
+        + json.dumps(roster, ensure_ascii=False, indent=1)
+        + "\n\nNo configured session is running and nothing is being retried: this "
+        "is a direct fresh start of that Agent session actor, which requires its "
+        "subagent_id. "
+    )
+
+
 def _delegate_start_tool(tools):
     return next(
         tool
@@ -350,7 +381,8 @@ def _text_facts(value):
     return len(encoded), hashlib.sha256(encoded).hexdigest()
 
 
-def _canary_evidence(canary_or_model, message, usage, *, call=None, call_index=None, parse_error=None):
+def _canary_evidence(canary_or_model, message, usage, *, call=None, call_index=None, parse_error=None,
+                     key_diff=None):
     """Return bounded structural evidence; never copy provider payloads."""
     canary_id = canary_or_model.canary_id if isinstance(canary_or_model, ProviderCanary) else ""
     model = canary_or_model.model if isinstance(canary_or_model, ProviderCanary) else canary_or_model
@@ -405,6 +437,10 @@ def _canary_evidence(canary_or_model, message, usage, *, call=None, call_index=N
                 evidence["arguments_type"] = type(raw_arguments).__name__
         else:
             evidence["function_type"] = type(function).__name__
+    if key_diff is not None:
+        extra, missing = key_diff
+        evidence["extra_keys"] = [label for label in map(_bounded_diagnostic_label, extra) if label]
+        evidence["missing_keys"] = [label for label in map(_bounded_diagnostic_label, missing) if label]
     if parse_error is not None:
         evidence["parse_error"] = {"type": type(parse_error).__name__}
         for field in ("pos", "lineno", "colno"):
@@ -586,7 +622,17 @@ def _emit_canary_response_warnings(usage):
         )
 
 
-def _chat_canary_turn(client, *, canary: ProviderCanary, chat_kwargs):
+def _observe_canary(observer, event, **facts):
+    """A diagnostic observer cannot change the canary's calls or verdict."""
+    if observer is not None:
+        try:
+            observer.observe(event, **facts)
+        except Exception as exc:
+            # Never expose the exception's provider-controlled text.
+            print(f"provider diagnostics_incomplete: {type(exc).__name__}")
+
+
+def _chat_canary_turn(client, *, canary: ProviderCanary, chat_kwargs, observer=None, turn="tool"):
     """Retry one runtime-classified semantic-empty turn on the exact same route."""
     message = None
     usage = {}
@@ -595,7 +641,15 @@ def _chat_canary_turn(client, *, canary: ProviderCanary, chat_kwargs):
         attempts = attempt + 1
         attempt_kwargs = copy.deepcopy(chat_kwargs)
         attempt_kwargs["bypass_response_cache"] = attempt > 0
-        message, usage = client.chat(**attempt_kwargs)
+        try:
+            message, usage = client.chat(**attempt_kwargs)
+        except BaseException as exc:
+            _observe_canary(observer, "attempt", turn=turn, ordinal=attempts,
+                            request=attempt_kwargs, error=exc)
+            raise
+        _observe_canary(observer, "attempt", turn=turn, ordinal=attempts,
+                        request=attempt_kwargs, message=message, usage=usage,
+                        semantic_empty=_semantic_empty_canary_message(message))
         if not _semantic_empty_canary_message(message):
             return message, usage
 
@@ -619,11 +673,16 @@ def _chat_canary_turn(client, *, canary: ProviderCanary, chat_kwargs):
 def assert_normalized_canary_call(
     message,
     tools,
-    required_arguments,
+    requested_arguments,
     *,
     canary=None,
     usage=None,
 ):
+    """Every native call must be schema-valid and carry EXACTLY the requested object.
+
+    An extra declared key is a RED contract fact, not tolerated noise: a route that
+    forces optional properties (issue #1411) fills keys the prompt never asked for.
+    """
     from jsonschema import validators
 
     calls = message.get("tool_calls") if isinstance(message, dict) else None
@@ -697,7 +756,16 @@ def assert_normalized_canary_call(
                 canary or "", message, usage, "arguments_unknown_keys",
                 call=call, call_index=call_index,
             )
-        for key, expected in required_arguments.items():
+        if set(arguments) != set(requested_arguments):
+            # Only declared property names reach here, so naming them is safe evidence.
+            raise _canary_failure(
+                canary or "", message, usage, "arguments_exact_keys",
+                call=call, call_index=call_index, key_diff=(
+                    sorted(set(arguments) - set(requested_arguments)),
+                    sorted(set(requested_arguments) - set(arguments)),
+                ),
+            )
+        for key, expected in requested_arguments.items():
             if arguments.get(key) != expected:
                 raise _canary_failure(
                     canary or "", message, usage, f"arguments_{key}",
@@ -712,12 +780,14 @@ def run_provider_contract_canary(
     canary: ProviderCanary,
     tools,
     nonce: str,
+    observer=None,
 ):
     """Exercise the public chat seam without executing the returned tool call."""
     requested_arguments = delegate_start_canary_arguments(nonce)
-    required_arguments = {"prompt": requested_arguments["prompt"]}
     arguments_json = json.dumps(requested_arguments, ensure_ascii=False, sort_keys=True)
     final_marker = f"FULL_REGISTRY_CONTINUED_{nonce}"
+    _observe_canary(observer, "expected", arguments=requested_arguments,
+                    final_marker=final_marker if canary.continue_to_final else None)
     continuation_instruction = (
         "After its tool result, read the expected_final_marker field and reply "
         "with exactly that value. "
@@ -727,6 +797,7 @@ def run_provider_contract_canary(
     conversation = [{
         "role": "user",
         "content": (
+            f"{delegate_start_canary_context()}"
             f"Call {CANARY_TOOL_NAME} exactly once with exactly this JSON object "
             f"as its arguments: {arguments_json}. Do not add, omit, or change a field. "
             f"{continuation_instruction}"
@@ -737,6 +808,7 @@ def run_provider_contract_canary(
     message, usage = _chat_canary_turn(
         client,
         canary=canary,
+        observer=observer,
         chat_kwargs={
             "messages": conversation,
             "model": canary.model,
@@ -755,15 +827,14 @@ def run_provider_contract_canary(
             "timeout": CANARY_TIMEOUT_SEC,
         },
     )
-    # This is a provider schema-admission canary, not a duplicate of the
-    # runtime selector gate. The provider must preserve the nonce-bearing prompt
-    # and return declared, schema-valid native calls. Valid assistant text beside
-    # those calls is tolerated and recorded as bounded warning telemetry;
-    # subagent_id versus retry_of is enforced by the existing typed runtime tests.
+    # The provider must return schema-valid native calls whose arguments are
+    # exactly the requested object: the nonce-bearing prompt and the subagent_id
+    # selector, no omitted, substituted or provider-filled optional key. Valid
+    # assistant text beside those calls is tolerated as bounded warning telemetry.
     calls = assert_normalized_canary_call(
         message,
         tools,
-        required_arguments,
+        requested_arguments,
         canary=canary,
         usage=usage,
     )
@@ -793,6 +864,8 @@ def run_provider_contract_canary(
     final_message, final_usage = _chat_canary_turn(
         client,
         canary=canary,
+        observer=observer,
+        turn="continuation",
         chat_kwargs={
             "messages": continuation,
             "model": canary.model,

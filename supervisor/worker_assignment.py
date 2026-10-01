@@ -114,13 +114,17 @@ def _mirror_assigned_running_status(task: Dict[str, Any]) -> None:
     in memory and the snapshot is a ghost a stale or absent snapshot leaves
     forever. Never raises: a task that runs without its mirror is better than an
     assignment tick that stops."""
-    if not str(task.get("drive_root") or ""):
-        return
     try:
         from ouroboros.task_results import STATUS_RUNNING, write_task_result
+        from ouroboros.task_status import execution_owner_record
 
+        task["_execution_owner"] = execution_owner_record(
+            task.get("budget_drive_root") or _pool().DRIVE_ROOT, task, "pooled")
+        if not str(task.get("drive_root") or ""):
+            return  # no fork mirror: the actual native start publishes RUNNING
         _is_subagent = str(task.get("delegation_role") or "") == "subagent"
         _mirror = {
+            "execution_owner": task["_execution_owner"], "task_attempt": int(task.get("_attempt") or 0),
             "root_task_id": task.get("root_task_id"),
             "session_id": task.get("session_id"),
             "actor_id": task.get("actor_id"),
@@ -174,7 +178,7 @@ def _mirror_assigned_running_status(task: Dict[str, Any]) -> None:
             _mirror["chat_id"] = task.get("chat_id")
             _mirror = {key: value for key, value in _mirror.items() if value is not None}
         write_task_result(
-            _pool().DRIVE_ROOT,
+            task.get("budget_drive_root") or _pool().DRIVE_ROOT,
             str(task.get("id") or ""),
             STATUS_RUNNING,
             **_mirror,
@@ -197,13 +201,13 @@ def assign_tasks() -> None:
         # queue.  Then quarantine every malformed depth before budget, lease, or
         # capacity filters can leave it waiting indefinitely.
         if not _pool()._drop_cancelled_pending():
-            log.error(
-                "Task assignment blocked: cancellation authority or custody "
-                "state is indeterminate",
-            )
+            log.error("Task assignment blocked: cancellation authority or custody state is indeterminate")
             queue.persist_queue_snapshot(reason="cancellation_authority_indeterminate")
             return
         _pool()._retry_terminalization_pending_for_assignment(queue)
+        from supervisor.task_admission import revalidate_project_holds, record_project_dispatch_possible
+
+        revalidate_project_holds()
         invalid_ids, unresolved_invalid_ids = _pool()._quarantine_invalid_pending_depths()
         unresolved_invalid_id_set = set(unresolved_invalid_ids)
 
@@ -344,10 +348,9 @@ def assign_tasks() -> None:
 
         from ouroboros.project_lease import candidate_is_leasable, running_project_ids
         from ouroboros.config import get_max_active_subagents_per_root
-
-
+        deferred_proofs = set()  # one attempt per row per Q-held pass; retry next tick
         for w in _pool().WORKERS.values():
-            if (w.busy_task_id is None and not getattr(w, "reaping", False)
+            while (w.busy_task_id is None and not getattr(w, "reaping", False)
                     and getattr(w, "active_capacity", True) and _pool().PENDING):
                 # One-writer-per-project lease: recompute per assignment so a
                 # task assigned in THIS loop pass immediately occupies its lane.
@@ -356,7 +359,8 @@ def assign_tasks() -> None:
                 # and project-leased candidates)
                 chosen_idx = None
                 for i, candidate in enumerate(_pool().PENDING):
-                    if candidate.get("_owner_hold"):
+                    if (id(candidate) in deferred_proofs or candidate.get("_owner_hold")
+                            or candidate.get("_project_admission_restore_hold")):
                         continue
                     if remaining <= 0 and not candidate.get("_owner_wait_resume"):
                         continue
@@ -432,30 +436,29 @@ def assign_tasks() -> None:
                         dropped_ids = _pool()._drop_assignable_evolution_tasks(unresolved_invalid_id_set)
                         if dropped_ids:
                             queue.persist_queue_snapshot(reason="evolution_dropped_budget")
-                    continue
-                task = _pool().PENDING.pop(chosen_idx)
-                depth_error = _pool()._normalize_pending_task_depth(task)
-                if depth_error:
-                    if _pool()._terminalize_invalid_pending_depth(task, depth_error):
-                        queue.persist_queue_snapshot(reason="invalid_task_depth")
-                        continue
-                    # Keep failed terminalization in queue custody for retry.
-                    _pool().PENDING.insert(chosen_idx, task)
-                    log.error(
-                        "Assignment blocked: invalid task depth could not be terminalized for %s",
-                        task.get("id"),
-                    )
                     break
-                evolution_error = _pool()._evolution_assignment_error(task)
-                if evolution_error:
-                    if _pool()._cancel_unauthorized_evolution(task, evolution_error):
-                        queue.persist_queue_snapshot(reason="evolution_authority_rejected")
-                    else:
-                        _pool().PENDING.insert(chosen_idx, task)
+                task = _pool().PENDING[chosen_idx]
+                depth_error = _pool()._normalize_pending_task_depth(task)
+                evolution_error = "" if depth_error else _pool()._evolution_assignment_error(task)
+                if depth_error or evolution_error:
+                    terminalized = (_pool()._terminalize_invalid_pending_depth(task, depth_error) if depth_error
+                                    else _pool()._cancel_unauthorized_evolution(task, evolution_error))
+                    if terminalized:
+                        _pool().PENDING.pop(chosen_idx)
+                        queue.persist_queue_snapshot(reason="invalid_task_depth" if depth_error else "evolution_authority_rejected")
+                    elif depth_error:  # Keep failed terminalization in queue custody for retry.
+                        log.error("Assignment blocked: invalid task depth could not be terminalized for %s", task.get("id"))
+                        return
+                    break
+                # Keep the row in PENDING until durable pre-handoff evidence is
+                # visible. A failed write never permits the worker queue effect.
+                task["admitted_dispatch"] = "possible"
+                if (queue.persist_queue_snapshot(reason="worker_launch_claimed") is not True
+                        or not record_project_dispatch_possible(task)
+                        or not record_dispatch_possible(task)):  # schedule receipt must say it MAY run (#1315)
+                    deferred_proofs.add(id(task))
                     continue
-                if not record_dispatch_possible(task):  # its receipt must first say it MAY run (#1315)
-                    _pool().PENDING.insert(chosen_idx, task)
-                    continue
+                _pool().PENDING.pop(chosen_idx)
                 _mirror_assigned_running_status(task)
                 w.busy_task_id = task["id"]
                 w.in_q.put(task)
@@ -485,3 +488,4 @@ def assign_tasks() -> None:
                             f"{emoji} {task_type.capitalize()} task {task['id']} started.",
                             role="system", system_type="task_started")
                 queue.persist_queue_snapshot(reason="assign_task")
+                break

@@ -9,6 +9,7 @@ failed. Deterministic fake-model replay; no transport sends anything.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import queue
 from types import SimpleNamespace
@@ -37,7 +38,7 @@ def _presence(binding="a" * 32, version=1):
 
 
 def _forced(outcome=None, message=None, **extra):
-    body = {"delivery_control": "replace", "full_answer": RECORD, **extra}
+    body = {"action": "finish", "answer": RECORD, **extra}
     if outcome is not None:
         body["presence_finish"] = {"outcome": outcome, **({"message": message} if message is not None else {})}
     return json.dumps(body)
@@ -100,7 +101,7 @@ def _run(root, monkeypatch, forced, *, task=None, presence=True, handoff=None, f
     (_forced("maybe", "hi"), "silent", "", "invalid"),
     (_forced("silent", "but also this"), "silent", "", "invalid"),
     (_forced("deferred", "on it"), "silent", "", "invalid"),  # nothing was scheduled
-    (json.dumps({"delivery_control": "replace", "full_answer": RECORD,
+    (json.dumps({"action": "finish", "answer": RECORD,
                  "presence_finish": {"outcome": "message", "message": "x", "to": "y"}}), "silent", "", "invalid"),
 ], ids=["message", "chosen_limitation", "silent", "tool_delivered", "prose", "blank_message", "unknown_outcome", "silent_with_text",
         "unscheduled_deferred", "extra_key"])
@@ -122,7 +123,7 @@ def test_forced_final_speaks_only_what_it_declares(tmp_path, monkeypatch, forced
 
 
 def test_a_malformed_control_body_speaks_nothing_and_keeps_the_host_fallback(tmp_path, monkeypatch):
-    duplicate = ('{"delivery_control": "replace", "full_answer": "%s", "presence_finish": {"outcome": "silent"}, '
+    duplicate = ('{"action": "finish", "answer": "%s", "presence_finish": {"outcome": "silent"}, '
                  '"presence_finish": {"outcome": "message", "message": "dup"}}' % RECORD)
     result, stored, calls, _text = _run(tmp_path, monkeypatch, duplicate)
     assert len(calls) == 2
@@ -258,7 +259,7 @@ def test_a_child_holding_the_inherited_binding_authority_still_answers_only_its_
 
 
 def test_duplicate_subject_evidence_survives_the_presence_arm_and_declares_nothing(tmp_path, monkeypatch):
-    duplicated = ('{"delivery_control": "replace", "full_answer": "%s", "acceptance_subject": '
+    duplicated = ('{"action": "finish", "answer": "%s", "acceptance_subject": '
                   '{"owner_source_sha256": "aaa", "owner_source_sha256": "bbb"}, '
                   '"presence_finish": {"outcome": "message", "message": "Here are the figures."}}' % RECORD)
     traces = []
@@ -276,7 +277,7 @@ def test_duplicate_subject_evidence_survives_the_presence_arm_and_declares_nothi
 
 
 def test_a_duplicate_inside_the_declaration_voids_only_the_declaration(tmp_path, monkeypatch):
-    body = ('{"delivery_control": "replace", "full_answer": "%s", '
+    body = ('{"action": "finish", "answer": "%s", '
             '"presence_finish": {"outcome": "message", "message": "hi", "outcome": "silent"}}' % RECORD)
     result, stored, _calls, text = _run(tmp_path, monkeypatch, body)
     assert (result["outcome"], result["text"]) == ("silent", "")
@@ -396,17 +397,17 @@ EARLIER = "Earlier record: Q1 figures verified; Q2 not yet checked."
 
 
 @pytest.mark.parametrize("body,record,outcome,spoken,declaration", [
-    # A valid keep retains the earlier answer as the record and still speaks its declaration.
-    ({"delivery_control": "keep"}, EARLIER, "message", "Fresh reply", {"status": "declared"}),
-    ({"delivery_control": "replace", "full_answer": RECORD}, RECORD, "message", "Fresh reply", {"status": "declared"}),
+    # An offered exact hash selects the retained record and still speaks its fresh declaration.
+    ({"action": "finish", "answer_sha256": hashlib.sha256(EARLIER.encode()).hexdigest()}, EARLIER, "message", "Fresh reply", {"status": "declared"}),
+    ({"action": "finish", "answer": RECORD}, RECORD, "message", "Fresh reply", {"status": "declared"}),
     # A rejected envelope keeps the earlier answer as the record: its fresh reply is never spoken beside it.
-    ({"delivery_control": "replace", "full_answer": ""}, EARLIER, "silent", "",
+    ({"action": "finish", "answer": ""}, EARLIER, "silent", "",
      {"status": "invalid", "reason": "the delivery-control envelope was rejected"}),
-    ({"delivery_control": "revise", "full_answer": RECORD}, EARLIER, "silent", "",
+    ({"action": "revise", "answer": RECORD}, EARLIER, "silent", "",
      {"status": "invalid", "reason": "the delivery-control envelope was rejected"}),
-    ({"full_answer": RECORD}, EARLIER, "silent", "",
+    ({"answer": RECORD}, EARLIER, "silent", "",
      {"status": "invalid", "reason": "the delivery-control envelope was rejected"}),
-], ids=["keep", "replace", "empty_replace_rejected", "unknown_verb_rejected", "missing_verb_rejected"])
+], ids=["retained_hash", "complete_answer", "empty_answer_rejected", "unknown_action_rejected", "missing_action_rejected"])
 def test_a_declaration_speaks_only_beside_the_answer_its_own_envelope_authorized(
         tmp_path, monkeypatch, body, record, outcome, spoken, declaration):
     from tests.test_delivery_forced_finalization import _arm_latch_with_candidate, _forced_test_context

@@ -56,6 +56,8 @@ def task_tool_metrics(llm_trace: dict) -> dict:
         # a client list of tool names.
         "routing_tool_calls": None if unavailable else sum(
             1 for call in calls if isinstance(call, dict) and routing_action_for_tool(call.get("tool"))),
+        "completion_tool_calls": None if unavailable else sum(
+            1 for call in calls if isinstance(call, dict) and call.get("completion_control") is True and not call.get("is_error")),
         "tool_call_counts": None,
     }
     if unavailable or llm_trace.get("recovered_post_task_synthesis") or not isinstance(llm_trace.get("tool_calls"), list):

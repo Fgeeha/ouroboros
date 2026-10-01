@@ -1218,15 +1218,14 @@ def record_reviewer_slot_executions(surface: str, actors: Any, slots_by_id: Dict
                 # up as the applied one. An api row's sent model IS its applied one.
                 "model": (str(usage.get("resolved_model") or "") if session
                           else str(getattr(slot, "model", "") or "")),
-                # No "effort": no APPLIED effort exists anywhere upstream (no
-                # applied/resolved effort in any receipt or telemetry), so the only
-                # value available is the REQUESTED one — already recorded below. Echoing
-                # it here dressed the request up as the applied value, the exact thing
-                # the model rule above forbids.
+                # No scalar "effort": keep host-send evidence and the engine's
+                # sourced report separate from the requested row below.
                 "verdict_method": str(usage.get("verdict_method") or ""),
             }
             if isinstance(usage.get("processing"), dict):
                 effective["processing"] = dict(usage["processing"])
+            if isinstance(usage.get("effort_resolution"), dict):
+                effective["effort_resolution"] = dict(usage["effort_resolution"])
             # D29 applied account/access, verbatim from the engine receipt; absent
             # keys mean the telemetry predates the receipt — shown as absence.
             if usage.get("applied_profile"):
@@ -1252,6 +1251,7 @@ def record_reviewer_slot_executions(surface: str, actors: Any, slots_by_id: Dict
                     "processing_preference": str(getattr(slot, "processing_preference", "") or ""),
                 },
                 "effective": effective,
+                **({"effort": dict(usage["effort"])} if isinstance(usage.get("effort"), dict) else {}),
                 "capability_delta": usage.get("capability_delta") or [],
                 "status": str(getattr(actor, "status", "") or ""),
             }

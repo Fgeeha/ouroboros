@@ -120,6 +120,7 @@ class _OpenAICompatibleLaneMixin:
         bypass_response_cache: bool = False,
         stream: bool = False,
     ) -> Dict[str, Any]:
+        target["requested_reasoning_effort"] = normalize_reasoning_effort(reasoning_effort)
         messages = self._normalize_system_message_placement(messages)
         resolved_model = str(target.get("resolved_model") or "")
         provider = str(target.get("provider") or "")
@@ -364,6 +365,10 @@ class _OpenAICompatibleLaneMixin:
                 {k: v for k, v in tool.items() if k != "cache_control"}
                 for tool in self._sanitize_chat_completion_tools(tools)
             ]
+            for tool in prepared_tools:  # each "function" is the sanitizer's own copy
+                # The Responses API serving OpenAI models here tries strict mode for a
+                # tool WITHOUT `strict`, requiring every property; a set value stays.
+                tool["function"].setdefault("strict", False)
             if server_web_tool:
                 prepared_tools.append(server_web_tool)
             # Tool cache markers are placed once, at the send-time payload finalizer
@@ -435,10 +440,13 @@ class _OpenAICompatibleLaneMixin:
         # a blank finish_reason=null "incomplete response".
         _body_err = self._provider_body_error(resp_dict)
         if _body_err:
+            _body_message = str(_body_err.get("message") or "")
             usage["provider_error"] = {
                 "code": _body_err.get("code"),
                 "type": _body_err.get("type"),
-                "message": str(_body_err.get("message") or "")[:300],
+                "message": _body_message[:300],
+                # A cut sentence says so: the owner's quote must not read this prefix as whole.
+                **({"message_truncated": True} if len(_body_message) > 300 else {}),
                 "kind": "rate_limit" if self._is_transient_body_error(_body_err) and str(_body_err.get("code")) == "429"
                 else ("provider_transient" if self._is_transient_body_error(_body_err) else "provider_error"),
             }

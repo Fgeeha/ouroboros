@@ -61,6 +61,7 @@ _CAPTURE = _object({
     "processing_preference": _STRING,
     "submitted_processing_mode": _STRING,
     "processing_basis": {"type": ["object", "null"]},
+    "effort": {"type": ["object", "null"]},
 })
 _CUSTODY = _object({
     "operation_id": _STRING, "invocation_id": {"type": "string", "minLength": 1},

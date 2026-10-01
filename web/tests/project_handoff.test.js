@@ -255,3 +255,17 @@ test('effective retry detail selects its projected task_id, not the requested an
         assert.deepEqual(ids, ['t', 'r']); assert.equal(status.textContent, 'Done');
     } finally { h.done(); }
 });
+test('a painted Main card shows a budget pause and the Project wait together, then each clears alone', () => {
+    const h = setup(async () => null);
+    try {
+        const card = h.mount('t', 'h', { kind: 'card' });
+        const hold = { label: 'Waiting for Project verification', reason: 'project_routing_fence_lookup_failed' };
+        h.controller.snapshot(census([{ activity_id: 't', phase: 'budget_paused', project_admission_hold: hold }]));
+        assert.equal(card.status.textContent, `Paused · ${hold.label}`);
+        assert.equal(card.status.className, 'chat-live-phase warn');
+        h.controller.snapshot(census([{ activity_id: 't', phase: 'queued', project_admission_hold: hold }]));
+        assert.equal(card.status.textContent, hold.label);
+        h.controller.snapshot(census([{ activity_id: 't', phase: 'budget_paused' }]));
+        assert.equal(card.status.textContent, 'Paused');
+    } finally { h.done(); }
+});

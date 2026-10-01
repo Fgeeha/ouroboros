@@ -50,6 +50,8 @@ def build_scheduled_task_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
     configured_subagent = fields.get("configured_subagent") if isinstance(fields.get("configured_subagent"), dict) else {}
     parent_cognitive_route = fields.get("parent_cognitive_route") if isinstance(fields.get("parent_cognitive_route"), dict) else {}
     directory_options = {key: fields[key] for key in ("directory_strategy", "scope_paths") if key in fields}
+    source_bindings = {key: copy.deepcopy(fields[key]) for key in ("parent_workspace", "workspace_copy")
+                       if isinstance(fields.get(key), dict)}
     # A child of a consciousness turn/tree inherits its origin label, category and level.
     origin_metadata = fields.get("origin_metadata") if isinstance(fields.get("origin_metadata"), dict) else {}
     # A child of a Presence-bound task inherits only the binding it acts for, never the speaker's
@@ -97,6 +99,7 @@ def build_scheduled_task_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
         "configured_subagent": configured_subagent,
         "parent_cognitive_route": parent_cognitive_route,
         **directory_options,
+        **source_bindings,
         "metadata": {
             "resource_intent": copy.deepcopy(fields.get("resource_intent") or {}),
             "parent_task_id": parent_id,
@@ -124,6 +127,7 @@ def build_scheduled_task_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
             "configured_subagent": configured_subagent,
             "parent_cognitive_route": parent_cognitive_route,
             **directory_options,
+            **source_bindings,
             "root_cost_ceiling_usd": root_cost_ceiling_usd,
             **origin_metadata,
             **binding_authority,

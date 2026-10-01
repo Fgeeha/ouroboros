@@ -264,7 +264,7 @@ def project_origin_rows(drive_root: Any, project_chat_id: int) -> List[Dict[str,
         if identity in seen:
             continue
         seen.add(identity)
-        rows.append({"ref": dict(ref), "text": text})
+        rows.append({"ref": dict(ref), "text": text, "origin_id": project_origin_identity(ref)})
     return rows
 
 
@@ -293,7 +293,7 @@ def room_membership(chat_id: int, project_chat_ids: set, source_refs: list,
         # A routing refusal belongs to the issuing chat, even when the target
         # is bound to another Project. Its lineage must not move the notice.
         bound = 0 if row.get("type") in ORIGIN_ADDRESSED_NOTICE_TYPES else bound_room_chat(bindings, row)
-        lifecycle = row.get("type") in {"project_started", "project_handoff", "project_completion_summary"}
+        lifecycle = row.get("type") in MAIN_PINNED_ROW_TYPES
         if chat_id in project_chat_ids:
             return not lifecycle and (bound == chat_id or entry_chat == chat_id
                                       or entry_matches_source_ref(row, source_refs))
@@ -374,6 +374,16 @@ def entry_matches_source_ref(entry: Dict[str, Any], refs: Iterable[Dict[str, Any
         if (key := _source_ref_identity(ref)) is not None
     }
     return bool(_entry_source_identities(entry) & ref_keys)
+
+
+def project_origin_identity(ref: dict) -> str:
+    """Same binding identity on retained context and its eventual physical row."""
+    return _text_sha256(json.dumps(_source_ref_identity(ref), separators=(",", ":")))
+
+
+def matching_project_origin(entry: dict, refs: list) -> str:
+    keys = _entry_source_identities(entry)
+    return next((project_origin_identity(ref) for ref in refs if _source_ref_identity(ref) in keys), "")
 
 
 def resolve_owner_message_source(drive_root: Any, ref: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -613,6 +623,7 @@ ROUTING_REFUSAL_CAUSES: Dict[str, str] = {
     "task_id_lookup_failed": "the task record could not be read",
     "empty_objective": "the request was empty",
     "project_routing_fence": "the project no longer accepts new work",
+    "project_routing_fence_changed": "the project changed while the task was being prepared",
     "project_routing_fence_lookup_failed": "the project state could not be checked",
     "project_binding_failed": "the project could not be set up",
     "project_registration_failed": "the project could not be set up",
@@ -655,6 +666,13 @@ ROUTING_REFUSAL_CAUSES: Dict[str, str] = {
 # Host routing refusals stay in the issuing chat regardless of the target's
 # Project binding (room_membership); they are never terminal task facts.
 ORIGIN_ADDRESSED_NOTICE_TYPES = frozenset({"task_not_started", "task_start_unconfirmed", "steer_not_delivered"})
+
+# A root's deliberate plain-text notice to Main (send_user_message
+# destination="main"); never a task's final answer.
+MAIN_NOTICE_TYPE = "main_notice"
+# Rows pinned to Main whatever the sender's Project binding: the supervisor
+# send handler and room_membership replay read this one set.
+MAIN_PINNED_ROW_TYPES = frozenset({"project_started", "project_handoff", "project_completion_summary", MAIN_NOTICE_TYPE})
 
 # Statuses of an act that LANDED (or is still in flight): no cause sentence.
 _LANDED_ROUTING_STATUSES = frozenset({"scheduled", "delivered", "pending", "dispatch_pending", "accepted"})
@@ -1271,16 +1289,9 @@ def _join_cause_clauses(clauses: List[str]) -> str:
 def _completion_verdict(result: Dict[str, Any], event: Dict[str, Any]) -> str:
     """Every simultaneous cause this record holds, as ONE terminated host clause.
 
-    The primary cause is what ENDED the task. A deferred child, a plan review
-    still open at delivery and an unreconciled custody debt are standing
-    limitations of the SAME answer, so they are stated BESIDE it instead of
-    replacing it or being replaced by it: a card that can show one cause has to
-    choose, and choosing is why the host had to write the second fact as chat
-    prose. Nothing here ranks or folds; equivalent clauses state themselves once.
-    A held task (a blocking plan exit) speaks through its objective's own reason,
-    so it never reads "the work went on". The stored reviewer rationale never
-    reaches the row — it stays in the card, the task result and Logs. The Python
-    twin of ``taskReasonDetail``; callers add no punctuation.
+    Primary cause and standing limitations each appear once. Held tasks state
+    their objective's reason. Only the author's stop rationale reaches this line; reviewer
+    prose stays in review detail. Python twin of ``taskReasonDetail``.
     """
     from ouroboros.outcomes import (
         ACCEPTANCE_ACCEPTED, REASON_FINAL_MESSAGE, REASON_OWNER_REQUESTED_FINALIZATION, plan_review_awaiting,
@@ -1289,8 +1300,13 @@ def _completion_verdict(result: Dict[str, Any], event: Dict[str, Any]) -> str:
     decision: Dict[str, Any] = {}
     veto: Dict[str, Any] = {}
     objective: Dict[str, Any] = {}
+    completion: Dict[str, Any] = {}
     for source in (event, result):
         axes = source.get("outcome_axes") if isinstance(source.get("outcome_axes"), dict) else {}
+        execution = axes.get("execution") if isinstance(axes.get("execution"), dict) else {}
+        value = source.get("task_completion", execution.get("task_completion"))
+        if isinstance(value, dict):
+            completion = value
         objective = axes.get("objective") if isinstance(axes.get("objective"), dict) else objective
         if isinstance(objective.get("receipt_veto"), dict):
             veto = objective["receipt_veto"]
@@ -1323,8 +1339,8 @@ def _completion_verdict(result: Dict[str, Any], event: Dict[str, Any]) -> str:
         # A task HELD by a blocking plan review states the objective's own reason.
         clause = TASK_CAUSE_PHRASES.get(str(objective.get("reason") or ""), str(objective.get("reason") or ""))
     elif raw_reason in {REASON_FINAL_MESSAGE, ""}:
-        clause = (TASK_CAUSE_PHRASES["plan_review_awaiting"]
-                  if plan_review_awaiting(event, result) and phase == "done" else "")
+        clause = (TASK_CAUSE_PHRASES["author_stop"] if completion.get("action") == "stop" and phase != "cancelled"
+                  else TASK_CAUSE_PHRASES["plan_review_awaiting"] if plan_review_awaiting(event, result) and phase == "done" else "")
     else:
         # A healed debt is never restored here: naming the code again would
         # state a debt the same record shows as empty. The recorded open-review
@@ -1333,19 +1349,20 @@ def _completion_verdict(result: Dict[str, Any], event: Dict[str, Any]) -> str:
         key = _plan_review_key(result, event, reason) if reason == "plan_review_advisory" else reason
         clause = (" ".join(strip_markdown(str(detail)).split()) if detail
                   else TASK_CAUSE_PHRASES.get(key, key))
-    line = _join_cause_clauses([clause, _author_stop_rationale(decision),
+    line = _join_cause_clauses([clause, _author_stop_rationale(decision, completion),
                                 *incident_cause_clauses(decision, reason, TASK_CAUSE_PHRASES),
                                 *_terminal_limitations(result, event, reason, held=held),
                                 TASK_CAUSE_PHRASES.get(custody, custody) if custody else ""])
     return line if not line or line.endswith((".", "!", "?", "…", ")")) else line + "."
 
 
-def _author_stop_rationale(decision: Dict[str, Any]) -> str:
+def _author_stop_rationale(decision: Dict[str, Any], completion: Optional[Dict[str, Any]] = None) -> str:
     """The agent's own reason for an explicit stop, beside the typed sentence (TZ-2 C4).
 
     Only the AUTHOR's recorded rationale reaches the row: the reviewer rationale
     stays in the card; a finish carries none. The twin of ``authorStopRationale``."""
-    author = decision.get("author_disposition") if recorded_author_stop(decision) else None
+    author = completion if (completion or {}).get("action") == "stop" else (
+        decision.get("author_disposition") if recorded_author_stop(decision) else None)
     return " ".join(strip_markdown(str(author.get("rationale") or "")).split()) if isinstance(author, dict) else ""
 
 
@@ -1465,6 +1482,8 @@ def project_completion_delivery_outcome(
         lead = f"{verdict} " if verdict else ""
         if excerpt:
             excerpt = f"{excerpt} Open the Project for details."
+        from ouroboros.terminal_time import terminal_time_fact
+
         event = {
             "type": "send_message", "chat_id": 1, "task_id": tid,
             "text": (f"{snapshot['target_label']} · "
@@ -1476,6 +1495,7 @@ def project_completion_delivery_outcome(
                 "project_id": snapshot["project_id"],
                 "project_name": snapshot["project_name"],
                 "target_label": snapshot["target_label"], "status": status,
+                "terminal_time": terminal_time_fact(result),
                 **mirrored_answer(result, outcome_phase(result, task_done_event)),
             },
         }

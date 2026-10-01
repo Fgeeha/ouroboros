@@ -31,8 +31,9 @@ from ouroboros.loop_messages import (
     owner_source_sha256,
 )
 from ouroboros.owner_mailbox import write_owner_message, write_task_message
-from tests.test_acceptance_async_loop import ANSWER, call, keep
+from tests.test_acceptance_async_loop import ANSWER, call
 from tests.test_acceptance_async_loop import full_loop as _full_loop
+from tests.test_acceptance_async_loop import select_completion as _finish_reply
 from tests.test_acceptance_semantic_subject import case as _semantic_case
 from tests.test_delivery_control_lineage import _start_control_episode
 from tests.test_delivery_forced_finalization import _forced_test_context
@@ -41,6 +42,16 @@ full_loop = _full_loop  # noqa: F811 - pytest fixture re-export
 case = _semantic_case  # noqa: F811 - pytest fixture re-export
 
 INSPECT_FAILURE = TimeoutError("supervisor did not acknowledge acceptance fence")
+
+
+def _select(tools, ctx, trace, **request):
+    from ouroboros.loop_delivery import completion_observation, consume_completion_request
+    from ouroboros.tools.control_runtime import stage_completion_request
+
+    tools._ctx._completion_observation = completion_observation(tools._ctx, trace)
+    staged = stage_completion_request(tools._ctx, {"action": "finish", **request})
+    assert json.loads(staged)["status"] == "completion_requested"
+    return consume_completion_request(tools, ctx, trace)
 
 
 def _ack_rows(root):
@@ -183,15 +194,14 @@ def test_real_unread_owner_text_is_refused_with_its_typed_cause(case):
 
     tool_ctx._delivery_control_required = True
     candidate.finalization_control = "acceptance_feedback"
-    status, text = loop._resolve_delivery_control(json.dumps({
-        "delivery_control": "keep", "acceptance_subject": {"owner_source_sha256": observed["owner_source_sha256"]},
-    }), tools, ctx, trace)
-    assert (status, text) == ("retry", "")
-    repair = ctx.messages[-1]["content"]
-    assert "[DELIVERY_CONTROL_REPAIR]" in repair and "owner_input_unread" in repair and "owner_text" in repair
-    assert "Invalid finalization control" not in repair, "a valid control overtaken by owner input is not Main's error"
-    assert candidate.repair_attempted is False, "a host-caused refusal spends no repair"
-    assert candidate.finalization_control == "acceptance_feedback_repair_requested"
+    retained = candidate.full_text
+    assert not _select(tools, ctx, trace, answer_sha256=candidate.content_sha256,
+                       acceptance_subject={"owner_source_sha256": observed["owner_source_sha256"]})
+    refusal = trace["completion_refusals"][-1]["reason"]
+    assert "owner_input_unread" in refusal and "owner_text" in refusal
+    assert "source_not_observed" not in refusal, "an overtaken valid selection is not Main's error"
+    assert tools._ctx._delivery_candidate.full_text == retained
+    assert not getattr(tools._ctx, "_completion_selected", None)
 
 
 def test_a_stale_sha_after_a_rendered_selector_is_still_main_error(tmp_path):
@@ -199,12 +209,10 @@ def test_a_stale_sha_after_a_rendered_selector_is_still_main_error(tmp_path):
     loop_mod, registry, ctx, trace, candidate = _start_control_episode(tmp_path)
     loop_mod._arm_delivery_control(registry, ctx, trace)
     assert "[ACCEPTANCE_SUBJECT_OBSERVATION]" in str(ctx.messages)
-    status, text = loop_mod._resolve_delivery_control(json.dumps({
-        "delivery_control": "keep", "acceptance_subject": {"owner_source_sha256": "0" * 64},
-    }), registry, ctx, trace)
-    assert (status, text) == ("retry", "")
-    assert "Invalid finalization control: source_not_observed" in ctx.messages[-1]["content"]
-    assert candidate.repair_attempted is True
+    assert not _select(registry, ctx, trace, answer_sha256=candidate.content_sha256,
+                       acceptance_subject={"owner_source_sha256": "0" * 64})
+    assert "source_not_observed" in trace["completion_refusals"][-1]["reason"]
+    assert registry._ctx._delivery_candidate.full_text == candidate.full_text
     rows = _ack_rows(tmp_path)
     assert rows[-1]["cause"] == "source_not_observed" and rows[-1]["ok"] is False
 
@@ -261,8 +269,7 @@ def test_full_loop_unknown_inspect_at_round_start_delivers_a_valid_finish_withou
         assert "1 of 2 reviewer slot(s)" in str(messages)
         observation = f.ctx._acceptance_observation
         assert observation["owner_source_sha256"] in str(messages)
-        return {"content": json.dumps({"delivery_control": "replace", "full_answer": rewritten, "pending_review": "finish",
-                                       "acceptance_subject": {"owner_source_sha256": observation["owner_source_sha256"]}})}, 0.0
+        return _finish_reply(f, answer=rewritten, pending_review="finish"), 0.0
 
     monkeypatch.setattr(loop, "call_llm_with_retry", main)
     result, _usage, trace = f.run()
@@ -293,22 +300,18 @@ def test_full_loop_owner_message_during_the_call_is_refused_typed_and_delivered_
             assert f.entered.wait(5) and not f.release.is_set()
             observation = f.ctx._acceptance_observation
             assert write_owner_message(f.ctx.drive_root, owner_text, f.ctx.task_id, msg_id="late-owner")
-            return {"content": json.dumps({"delivery_control": "keep",
-                                           "acceptance_subject": {"owner_source_sha256": observation["owner_source_sha256"]}})}, 0.0
+            return _finish_reply(f), 0.0
         if f.model_step == 3:
             assert f.waits == [], "the host-owed repair round was parked behind the panel"
-            repair = next(str(row.get("content") or "") for row in reversed(messages)
-                          if "[DELIVERY_CONTROL_REPAIR]" in str(row.get("content") or ""))
-            assert "owner_input_unread" in repair and '"pending_kinds": ["owner_text"]' in repair
-            assert "Invalid finalization control" not in repair and "stale" not in repair
+            refusal = f.ctx._execution_trace["completion_refusals"][-1]["reason"]
+            assert "owner_input_unread" in refusal and '"pending_kinds": ["owner_text"]' in refusal
+            assert "source_not_observed" not in refusal and "stale" not in refusal
             assert owner_text in str(messages), "the owner message must reach Main in the repair round"
-            assert f.ctx._delivery_candidate.repair_attempted is False
             observation = f.ctx._acceptance_observation
-            assert observation["owner_source_sha256"] in str(messages[-1]), "the current selector is shown"
-            return {"content": json.dumps({"delivery_control": "replace", "full_answer": rewritten,
-                                           "acceptance_subject": {"owner_source_sha256": observation["owner_source_sha256"]}})}, 0.0
+            assert observation["owner_source_sha256"] in str(messages), "the current selector is shown"
+            return _finish_reply(f, answer=rewritten), 0.0
         assert f.model_step < 7, f.progress
-        return keep(f), 0.0
+        return _finish_reply(f), 0.0
 
     monkeypatch.setattr(loop, "call_llm_with_retry", main)
     result, _usage, trace = f.run()
@@ -326,16 +329,14 @@ def test_an_envelope_error_is_not_masked_by_the_owner_generation_notice(tmp_path
     loop_mod._arm_delivery_control(registry, ctx, trace)
     _record_owner_directive(registry._ctx, source="direct_incoming", content="Also cover Q3.", msg_id="followup")
     assert loop_mod._task_acceptance_owner_generation_changed(registry._ctx)
-    status, text = loop_mod._resolve_delivery_control(json.dumps({
-        "delivery_control": "keep",
+    result = registry.execute_result("finish_task", {
+        "action": "finish", "answer_sha256": candidate.content_sha256,
         "acceptance_subject": {"owner_source_sha256": owner_source_sha256(registry._ctx)},
         "effective_criteria": "misplaced at the top level",
-    }), registry, ctx, trace)
-    assert (status, text) == ("retry", "")
-    repair = ctx.messages[-1]["content"]
-    assert "control must be one exact JSON object" in repair
-    assert "owner input has not been acknowledged" not in repair
-    assert candidate.repair_attempted is True
+    })
+    assert result.status == "error" and "effective_criteria" in result.text
+    assert "owner input has not been acknowledged" not in result.text
+    assert not getattr(registry._ctx, "_completion_request", None)
 
 
 # T7 -----------------------------------------------------------------------------
@@ -370,12 +371,10 @@ def test_a_never_shown_selector_is_rendered_once_the_control_is_armed(tmp_path, 
 
     rows = [row for row in ctx.messages if row.get("acceptance_observation")]
     assert len(rows) == 1 and tool_ctx._acceptance_observation["owner_source_sha256"] in rows[0]["content"]
-    status, text = loop_mod._resolve_delivery_control(json.dumps({
-        "delivery_control": "keep",
-        "acceptance_subject": {"owner_source_sha256": tool_ctx._acceptance_observation["owner_source_sha256"]},
-    }), registry, ctx, trace)
-    assert (status, text) == ("resolved", "Child answer.")
-    assert candidate.finalization_control != "degraded_preserve" and not candidate.degraded
+    assert _select(registry, ctx, trace, answer_sha256=candidate.content_sha256,
+                   acceptance_subject={"owner_source_sha256": tool_ctx._acceptance_observation["owner_source_sha256"]})
+    assert registry._ctx._delivery_candidate.full_text == "Child answer."
+    assert not registry._ctx._delivery_candidate.degraded
 
 
 def test_an_unarmed_ineligible_turn_still_gets_no_selector(tmp_path, monkeypatch):
@@ -398,7 +397,12 @@ def test_a_turn_parks_only_when_the_host_appended_nothing(tmp_path, monkeypatch,
 
     loop_mod, registry, ctx, trace = _forced_test_context(tmp_path)
     ctx.llm_trace, ctx.tool_schemas, ctx.incoming_messages, ctx.owner_msg_seen = trace, [], queue.Queue(), set()
+    registry._ctx.messages = ctx.messages
     registry._ctx._task_acceptance_pending = "paid-binding"
+    loop_mod._replace_delivery_candidate(registry, ctx, trace, "answer", control="candidate")
+    registry._ctx._completion_selected = {"action": "finish", "observation": {
+        "owner_source_sha256": owner_source_sha256(registry._ctx),
+    }}
     observe_send(registry._ctx, ctx.messages, round_idx=1)
     ctx.messages.append({"role": "user", "content": "an unsent tail"})
     parked = []
@@ -406,13 +410,13 @@ def test_a_turn_parks_only_when_the_host_appended_nothing(tmp_path, monkeypatch,
 
     def final(_content, limit_ctx, *_a, **_k):
         if spoke == "append":
-            loop_mod._append_or_merge_user_message(limit_ctx.messages, "[DELIVERY_CONTROL_REPAIR] not applied.")
+            loop_mod._append_or_merge_user_message(limit_ctx.messages, "[SYSTEM NOTICE] Completion held.")
         elif spoke == "merge":
             loop_mod._append_or_merge_user_message(limit_ctx.messages, "merged into the unsent tail", slot=registry._ctx)
         return None
 
     monkeypatch.setattr(loop, "_no_tool_final_answer", final)
     rows_before = len(ctx.messages)
-    assert loop_mod._finalize_loop_candidate("answer", ctx, registry, lambda *_a, **_k: None) is None
-    assert (len(ctx.messages) == rows_before) is (spoke != "append")
+    assert loop_mod._finalize_loop_candidate("answer", ctx, registry, lambda *_a, **_k: None, after_tools=True) is None
+    assert (len(ctx.messages) == rows_before) is (spoke == "nothing")
     assert bool(parked) is (spoke == "nothing"), "park only when nothing was appended for the model in this pass"
