@@ -1121,8 +1121,11 @@ def _check_advisory_freshness(ctx: ToolContext, commit_message: str,
         )
 
     if latest and latest.status == "stale" and state.last_stale_from_edit_ts:
+        # Attribution only for a marker scoped to this checkout (or unscoped).
+        writer = (f" by {state.stale_marker_attribution_note(str(getattr(ctx, 'task_id', '') or ''))}"
+                  if state.last_stale_repo_key in ("", repo_key) else "")
         stale_reason = (f"Advisory invalidated by worktree edit at "
-                        f"{state.last_stale_from_edit_ts}. Re-run advisory after all edits.")
+                        f"{state.last_stale_from_edit_ts}{writer}. Re-run advisory after all edits.")
     elif latest:
         stale_reason = (f"Latest run: status={latest.status}, hash={latest.snapshot_hash[:12]}, "
                         f"ts={latest.ts}. Snapshot changed (files edited after advisory ran).")

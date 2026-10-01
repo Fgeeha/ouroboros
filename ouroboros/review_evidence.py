@@ -741,7 +741,9 @@ def collect_review_evidence(
     holds only rows this task owns (plus legacy rows with no recorded owner),
     while another task's rows on the same checkout are carried separately under
     ``foreign_advisory_runs`` so a reader cannot mistake them for this task's
-    own work.
+    own work. The repository stale marker is attributed the same way: shown to
+    every task on the checkout, with ``stale_task_id``/``stale_attribution``
+    naming whose mutation or review wrote it.
     """
     from ouroboros.review_state import (
         _LEGACY_CURRENT_REPO_KEY,
@@ -792,12 +794,6 @@ def collect_review_evidence(
         scoped_continuations = continuations
     scoped_continuations.sort(key=lambda item: str(item.updated_ts or item.created_ts or ""), reverse=True)
     stale_matches_repo = not repo_key or state.last_stale_repo_key in ("", repo_key)
-    # ibl-00615dbd1a16: a different task on the shared repo tree that recorded
-    # its own stale marker must NOT show up in this task's `current_repo` panel.
-    # An empty stored task_id (legacy/unattributed) still matches any caller so
-    # every pre-existing record stays effective; a non-empty stored task_id
-    # only matches itself or an unset task_id query.
-    stale_matches_task = (not task_id) or str(getattr(state, "last_stale_task_id", "") or "") in ("", task_id)
 
     evidence = {
         "task_id": task_id,
@@ -811,8 +807,10 @@ def collect_review_evidence(
                 matching_run=current_run if getattr(current_run, "repo_key", None) == repo_key and repo_key else None,
             ),
             "bypass_reason": str(getattr(current_run, "bypass_reason", "") or ""),
-            "stale_reason": str(getattr(state, "last_stale_reason", "") or "") if (stale_matches_repo and stale_matches_task) else "",
-            "stale_ts": str(getattr(state, "last_stale_from_edit_ts", "") or "") if (stale_matches_repo and stale_matches_task) else "",
+            "stale_reason": str(getattr(state, "last_stale_reason", "") or "") if stale_matches_repo else "",
+            "stale_ts": str(getattr(state, "last_stale_from_edit_ts", "") or "") if stale_matches_repo else "",
+            # Whose mutation or review wrote the marker; it never hides the marker.
+            **{key: value if stale_matches_repo else "" for key, value in state.stale_marker_provenance(task_id).items()},
         },
         "recent_attempts": [_attempt_to_dict(item) for item in (scoped_attempts[-max_attempts:] if max_attempts > 0 else [])],
         "omitted_attempts": max(0, len(scoped_attempts) - max_attempts) if max_attempts > 0 else len(scoped_attempts),

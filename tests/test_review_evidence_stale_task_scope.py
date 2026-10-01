@@ -1,9 +1,8 @@
-"""ibl-00615dbd1a16: `review_evidence.current_repo.stale_reason` / `.stale_ts`
-must be scoped to the querying task. On the shared /opt/ouroboros tree a task
-that recorded its own stale marker used to leak into every other task's
-`current_repo` panel (only `last_stale_repo_key` gated it). A `last_stale_task_id`
-now gates the displayed marker; an empty stored id (legacy / unattributed)
-still matches every caller so pre-existing records stay effective."""
+"""Stale provenance survives the original contributor's persistence paths.
+
+Every task on a shared checkout sees its stale marker, with the writer named
+separately. Unknown legacy ownership never changes freshness.
+"""
 from __future__ import annotations
 
 import pathlib
@@ -39,7 +38,7 @@ def _seed_state_with_stale(drive_root, repo_key, *, stale_task_id):
     save_state(drive_root, st)
 
 
-def test_stale_marker_hidden_from_a_different_task(tmp_path):
+def test_stale_marker_attributes_a_different_task_without_hiding_the_edit(tmp_path):
     drive = tmp_path / "drive"
     (drive / "state").mkdir(parents=True)
     repo = _repo(tmp_path)
@@ -47,8 +46,10 @@ def test_stale_marker_hidden_from_a_different_task(tmp_path):
     _seed_state_with_stale(drive, rk, stale_task_id="taskA")
 
     ev = collect_review_evidence(drive, task_id="taskB", repo_dir=repo)
-    assert ev["current_repo"]["stale_reason"] == ""
-    assert ev["current_repo"]["stale_ts"] == ""
+    assert ev["current_repo"]["stale_reason"] == "edit_text mutated the worktree"
+    assert ev["current_repo"]["stale_ts"] == "2026-08-31T12:00:00"
+    assert ev["current_repo"]["stale_task_id"] == "taskA"
+    assert ev["current_repo"]["stale_attribution"] == "other_task"
 
 
 def test_stale_marker_visible_to_the_task_that_set_it(tmp_path):
