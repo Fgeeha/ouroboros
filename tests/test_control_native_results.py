@@ -86,7 +86,7 @@ def test_subagent_constraint_denials_publish_their_adapter_code(tmp_path, monkey
     """
     import ouroboros.config as config
 
-    monkeypatch.setattr(config, "get_allow_mutative_subagents", lambda _surface: False)
+    monkeypatch.setattr(config, "get_allow_mutative_subagents", lambda _surface, **_facts: False)
     ctx = _ctx(tmp_path)
 
     toggled_off = _published(
@@ -125,7 +125,7 @@ def test_a_direct_selector_call_without_an_invocation_still_returns_its_text(tmp
     """
     import ouroboros.config as config
 
-    monkeypatch.setattr(config, "get_allow_mutative_subagents", lambda _surface: False)
+    monkeypatch.setattr(config, "get_allow_mutative_subagents", lambda _surface, **_facts: False)
 
     refusal = control_scheduling._select_subagent_constraint("self_worktree", "", False, [], "")
 

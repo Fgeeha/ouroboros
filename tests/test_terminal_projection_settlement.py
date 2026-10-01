@@ -261,9 +261,12 @@ class TestPartialWritesAndRetry:
 
         monkeypatch.setattr(dialogue, "append_canonical_task_summary", append_then_crash)
         assert settle_terminal_projection(project_root.root, "root-1", task=project_root.task) == SETTLEMENT_DEFERRED
+        published_at = _project_rows(project_root.root, "root-1")[0]["ts"]
+        monkeypatch.setattr(projection, "utc_now_iso", lambda: "2099-01-01T00:00:00Z")
         monkeypatch.setattr(dialogue, "append_canonical_task_summary", original)
         assert projection.reconcile_terminal_projections(project_root.root) == 1
         assert len(_project_rows(project_root.root, "root-1")) == 1
+        assert load_task_result(project_root.root, "root-1")["canonical_terminal_projection"]["written_at"] == published_at
 
     def test_queue_failure_after_registration_retires_readiness_to_durable_disposition(self, project_root, monkeypatch):
         from supervisor.terminal_delivery import pending_deliveries

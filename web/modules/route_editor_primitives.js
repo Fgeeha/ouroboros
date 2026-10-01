@@ -579,7 +579,7 @@ export function effortSelectHtml(attrs, selected, surfaceDefault = 'route defaul
         ...EFFORT_CHOICES.map((effort) => ({ value: effort, label: effort })),
     ];
     return selectHtml(
-        `${attrs} title="Reasoning effort — default: ${escapeHtml(surfaceDefault)}"`,
+        `${attrs} title="Preferred reasoning effort — default: ${escapeHtml(surfaceDefault)}"`,
         [{ label: '', options }],
         selected || '',
     );

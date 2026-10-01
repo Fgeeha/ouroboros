@@ -362,6 +362,8 @@ def test_outage_wrap_keeps_older_wire_death_custody_without_summary(tmp_path, mo
         monkeypatch.setattr(loop_transport, "interruptible_wait_sleep", release_wait_after_control_check)
     kwargs = _loop_kwargs(tmp_path, ControlledLLM(), [])
     kwargs["tools"]._ctx.is_direct_chat = interactive
+    if interactive:  # inline Presence, the one direct caller that keeps the paid-repeat rail
+        kwargs["task_type"] = kwargs["tools"]._ctx.current_task_type = "presence"
     with model_wait.task_model_wait_scope(task={"id": "t-death"}, drive_root=tmp_path,
             event_queue=None, worker_slot_held=not interactive) as owner:
         owner.tool_context = kwargs["tools"]._ctx
@@ -396,7 +398,8 @@ def test_real_main_control_preserves_candidate_without_new_summary(main_call, mo
     gateway.dispatch = ["response_received", "not_started"]
     held = []
 
-    def hold(content, limit, trace, actual_tools, *_args):
+    def hold(content, limit, trace, actual_tools, *_args, explicit_candidate=False):
+        assert explicit_candidate is False, "this fixture holds the first ordinary answer"
         held.append(loop._replace_delivery_candidate(actual_tools, limit, trace, content, control="hold_for_verification"))
         if stop == "wrap_unknown":
             gateway.pending = True

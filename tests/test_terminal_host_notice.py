@@ -376,6 +376,7 @@ def test_batch_wait_without_notice_keeps_the_original_projection(tmp_path, monke
         "child_result_sha256": _child_result_sha256(current),
         "outcome_axes": normalize_outcome_axes(current),
         "result": ANSWER, "trace_summary": current.get("trace_summary"),
+        "execution_observation": current["execution_observation"],
     }
     assert load_task_result(tmp_path, task["id"]) == stored
 

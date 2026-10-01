@@ -85,6 +85,7 @@
 
 /**
  * @typedef {Object} ActiveChatActivity
+ * @property {Object=} project_admission_hold  // accepted unstarted work waiting for original Project authority
  * @property {Object=} required_question  // read-only pointer to the current required Project quiz
  * @property {boolean=} required_question_unavailable  // a recorded owner-question wait whose detail could not be read: possibly blocked, never "no question"
  * @property {Object.<string,Object>=} model_waits
@@ -485,10 +486,14 @@
  *   ordinary row.
  * @property {string=} card_row_id  // the row's stable identity across live delivery, outbox replay and history
  * @property {number=} card_row_revision  // canonical source order, independent of delivery timestamp
+ * @property {Object=} late_evidence
+ *   Late-review identity, reviewed revision and exact applied source_ref served by
+ *   taskSourceDownloadUrl; not an original reviewer transcript or a copy of the row.
  * @property {string=} target_label
  * @property {string=} project_id
  * @property {string=} project_name
  * @property {string=} handoff_id  // immutable origin/destination receipt identity
+ * @property {Object=} terminal_time  // host-owned occurrence; ts remains publication time
  * @property {string=} completion_answer  // a Project root's model-authored final answer, mirrored into Main
  * @property {number=} chat_id
  * @property {boolean=} project_thread  // server-stamped: chat_id is a reserved Project thread; Main never adopts it even before projectChatIds learns the project
@@ -743,6 +748,7 @@
  * @property {boolean=} outcome_final  // true only after the canonical task outcome settles; false marks a pre-finalization narrative
  * @property {{status: string, phase: string, ts: string, provenance: string, model_execution?: Object}=} historical_terminal
  * @property {Object=} model_execution
+ * @property {{v: 1, occurred_at: ?string, source: "executor_terminal"|"unknown", attempt: Object}=} terminal_time  // a task_summary row's host end fact; `ts` stays its publication time
  */
 
 /**
@@ -1192,6 +1198,8 @@
  * @property {string=} stop_policy
  * @property {OwnerHurryProjection=} owner_hurry
  * @property {OwnerHurryProjection[]=} owner_hurry_history
+ * @property {{reason?:string, detail?:string, label?:string}=} project_admission_hold
+ *   While the queue snapshot lists the row: its wait for original Project/scope evidence, or {}.
  * @property {string=} error
  */
 
@@ -1425,6 +1433,7 @@
  * @property {number} sidebar_width  // px; 0 = CSS default (v6.33.0)
  * @property {number} project_panel_width  // px; 0 = CSS default
  * @property {Object.<string,number>} project_seen_revision  // monotonic paint ACK
+ * @property {{mode:'default'|'hidden'|'custom',text:string}} welcome  // install-wide empty-Main UI copy, not chat history
  * @property {boolean=} ok
  */
 
@@ -1557,7 +1566,18 @@ export const GATEWAY_CONTRACT_VERSION = '7.5.1';
  * @property {boolean} has_more Older bytes remain or a disclosed source gap prevents establishing EOF.
  * @property {string|null} next_cursor Opaque room-bound older continuation.
  * @property {string|null} page_cursor Replays a frozen page; null for an unavailable source boundary.
- * @property {{complete:boolean,truncated_by:Array<string>}} window Whole-history coverage.
+ * @property {{complete:boolean,truncated_by:Array<string>,latest_message?:({history_id:string,out_of_order:boolean}|null),latest_before?:number,latest_absent?:true}} window
+ *   Bounds/gaps of this response. A recent Project read also names the standalone message that
+ *   arrived last (null: its arrival is unknown, as while the live chat's last line is
+ *   unfinished, and on a replayed page, frozen before later arrivals), which must itself be
+ *   on screen for the room's read receipt, in its ordinary place too;
+ *   out_of_order: the bottom is not where it is (it sorts above earlier arrivals, or lies
+ *   before the recent read). latest_before: with null, its bounded search ran out first and
+ *   found none at or after this chat offset; the older pages of its chain carry the search on,
+ *   and the one holding the message names it here, the newest below its coverage.upper;
+ *   latest_absent: the one reaching the chat's start without a gap holds none, so none exists
+ *   below that upper. A room an unreadable Project registry's readable rows omit is null (not Main).
+ * @property {{v:1,view:string,upper:Object,spans:Object}=} coverage Delivered physical byte spans, after deferrals.
  * @property {string} [next_before_ts] Legacy field retained for compatibility.
  * @property {string} [error]
  * @property {string} [reason_code]

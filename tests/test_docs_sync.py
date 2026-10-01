@@ -308,9 +308,9 @@ def test_chat_id_addressing_docs_match_the_code_that_routes_it():
     # A degraded delivery names its own cause. The doc must keep saying which
     # code each rail actually produces — the forced rail keeps its own — rather
     # than renaming one after the other.
-    assert "which is this" in arch and "forced rail's own code" in arch
-    assert "the ordinary repair path records `invalid_delivery_control_after_repair`" in arch
-    assert "falls back to `delivery_control_degraded` only for a" in arch
+    assert 'finish_task(action="finish"|"stop", answer=...|answer_sha256=...)' in arch
+    assert "reminders no longer force completion" in arch
+    assert "host_salvage" in arch and "provider-death rail" in arch
     design = _read("docs/DESIGN.md")
     assert "Where a card does show a cause, it says it in the owner's" in design
     assert "the record keeps the machine code" in design

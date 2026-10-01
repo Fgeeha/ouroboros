@@ -151,6 +151,8 @@ def _handle_llm_usage(evt: Dict[str, Any], ctx: Any) -> None:
         **({"web_search_sources": web_search_sources} if isinstance(web_search_sources, list) and web_search_sources else {}),
         **({"reasoning_pin": reasoning_pin} if isinstance(reasoning_pin, dict) and reasoning_pin else {}),
         **({"reasoning_effort_clamped": effort_clamped} if isinstance(effort_clamped, dict) and effort_clamped else {}),
+        **{key: usage[key] for key in ("effort", "request_wire", "effort_resolution", "claudexor")
+           if isinstance(usage.get(key), dict)},
     }
     _address_ctx(ctx, usage_event)
     try:

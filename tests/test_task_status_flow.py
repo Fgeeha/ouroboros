@@ -35,7 +35,10 @@ def test_schedule_task_live_emits_strict_contract_and_requested_status(tmp_path,
 
     _configure_test_subagent(monkeypatch)
     event_queue = _FakeEventQueue(status_root=tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
     ctx = SimpleNamespace(
+        repo_dir=repo,
         task_depth=0,
         pending_events=[],
         event_queue=event_queue,
@@ -96,7 +99,10 @@ def test_schedule_task_falls_back_to_pending_events_when_live_queue_unavailable(
     from ouroboros.tools.control import _schedule_task
 
     _configure_test_subagent(monkeypatch)
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
     ctx = SimpleNamespace(
+        repo_dir=repo,
         task_depth=0,
         pending_events=[],
         event_queue=_FakeEventQueue(fail=True),
@@ -323,7 +329,10 @@ def test_schedule_task_memory_modes_prepare_declared_drive_shape(tmp_path, monke
     (parent_memory / "knowledge" / "pattern.md").write_text("stable pattern", encoding="utf-8")
 
     event_queue = _FakeEventQueue()
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
     ctx = SimpleNamespace(
+        repo_dir=repo,
         task_depth=0,
         pending_events=[],
         event_queue=event_queue,
@@ -382,7 +391,10 @@ def test_configured_session_child_materializes_initial_and_steered_attachments(t
         attachment_manifest=steered_manifest,
     )
     event_queue = _FakeEventQueue()
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
     ctx = SimpleNamespace(
+        repo_dir=repo,
         task_depth=0, pending_events=[], event_queue=event_queue,
         drive_root=tmp_path, task_id="parent-attachments",
         task_contract={"attachment_manifest": [dict(row) for row in parent_manifest]},
@@ -422,7 +434,10 @@ def test_schedule_task_rejects_legacy_description_schema(tmp_path, monkeypatch):
     from ouroboros.tools.control import _schedule_task
 
     _configure_test_subagent(monkeypatch)
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
     ctx = SimpleNamespace(
+        repo_dir=repo,
         task_depth=0,
         pending_events=[],
         event_queue=None,
@@ -1372,12 +1387,12 @@ def test_wait_for_tasks_flags_unknown_ids_and_attaches_children_roster(tmp_path)
     assert real["status"] == STATUS_COMPLETED
     assert "unknown_task_id" not in real
 
-    # The repair surface: the ACTUAL direct children, compact v6.71.2 field set
-    # only — no result/trace envelope fields, absent accounting projects null.
+    # Actual children stay compact, with execution evidence and honest accounting.
     roster = payload["children_roster"]
     assert [row["task_id"] for row in roster] == ["realchild1"]
     assert set(roster[0]) == {"task_id", "status", "accounted_upper_bound_usd",
-                              "child_result_sha256", "outcome_axes"}
+                              "child_result_sha256", "outcome_axes", "execution_observation"}
+    assert roster[0]["execution_observation"]["state"] == "terminal"
     assert roster[0]["accounted_upper_bound_usd"] == 0.55
     # Nothing was capped away, and the projection SAYS so (BIBLE P1).
     assert payload["children_roster_omitted"] == 0
@@ -1414,8 +1429,8 @@ def test_children_roster_projection_discloses_the_capped_tail(tmp_path):
     assert projected["children_roster_omitted"] == total - 30  # …and is disclosed
     assert all(
         set(row) == {"task_id", "status", "accounted_upper_bound_usd",
-                     "child_result_sha256", "outcome_axes"}
-        for row in roster
+                     "child_result_sha256", "outcome_axes", "execution_observation"}
+        and row["execution_observation"]["state"] == "terminal" for row in roster
     )
 
 
@@ -2045,7 +2060,8 @@ def test_handle_schedule_task_accepts_unique_subagent_with_lineage_and_constrain
             sent.append((chat_id, text, kwargs))
 
         def enqueue_task(self, task):
-            enqueued.append(task)
+            enqueued.append(dict(task))
+            return enqueued[-1]
 
         def persist_queue_snapshot(self, reason=""):
             self.snapshot_reason = reason
@@ -2161,7 +2177,8 @@ def test_handle_schedule_task_uses_event_chat_id_without_owner(tmp_path, monkeyp
             sent.append((chat_id, text, kwargs))
 
         def enqueue_task(self, task):
-            enqueued.append(task)
+            enqueued.append(dict(task))
+            return enqueued[-1]
 
         def persist_queue_snapshot(self, reason=""):
             self.snapshot_reason = reason
@@ -2312,7 +2329,8 @@ def test_configured_zero_subagent_depth_truly_disables_delegation(tmp_path, monk
             pass
 
         def enqueue_task(self, task):
-            enqueued.append(task)
+            enqueued.append(dict(task))
+            return enqueued[-1]
 
         def persist_queue_snapshot(self, reason=""):
             pass
@@ -2443,7 +2461,8 @@ def test_handle_schedule_task_queues_when_active_subagent_cap_is_full(tmp_path, 
             sent.append((chat_id, text, kwargs))
 
         def enqueue_task(self, task):
-            enqueued.append(task)
+            enqueued.append(dict(task))
+            return enqueued[-1]
 
         def persist_queue_snapshot(self, reason=""):
             pass
@@ -2815,7 +2834,7 @@ def test_assign_tasks_mirrors_running_subagent_status_to_parent_drive(tmp_path, 
     monkeypatch.setattr(workers_module, "WORKERS", {1: SimpleNamespace(wid=1, busy_task_id=None, in_q=FakeWorkerQueue())})
     monkeypatch.setattr(workers_module, "load_state", lambda: {})
     monkeypatch.setattr(state_module, "budget_remaining", lambda _state, **_kwargs: 100.0)
-    monkeypatch.setattr(queue_module, "persist_queue_snapshot", lambda reason="": None)
+    monkeypatch.setattr(queue_module, "persist_queue_snapshot", lambda reason="": True)
 
     workers_module.assign_tasks()
 
@@ -2907,7 +2926,7 @@ def test_assign_tasks_honors_depth_reservation_for_first_grandchild(tmp_path, mo
     monkeypatch.setattr(workers_module, "WORKERS", {1: SimpleNamespace(wid=1, busy_task_id=None, in_q=FakeWorkerQueue())})
     monkeypatch.setattr(workers_module, "load_state", lambda: {})
     monkeypatch.setattr(state_module, "budget_remaining", lambda _state, **_kwargs: 100.0)
-    monkeypatch.setattr(queue_module, "persist_queue_snapshot", lambda reason="": None)
+    monkeypatch.setattr(queue_module, "persist_queue_snapshot", lambda reason="": True)
 
     workers_module.assign_tasks()
 
@@ -2921,11 +2940,7 @@ def test_assignment_depth_fact_reaches_worker_and_survives_child_copyback(tmp_pa
     from supervisor import state as state_module
     from ouroboros.contracts.task_contract import build_task_contract
     from ouroboros.headless import copy_child_task_result
-    from ouroboros.task_results import (
-        STATUS_COMPLETED,
-        load_task_result,
-        write_task_result,
-    )
+    from ouroboros.task_results import STATUS_COMPLETED, load_task_result, write_task_result
 
     delivered = []
 
@@ -2971,7 +2986,7 @@ def test_assignment_depth_fact_reaches_worker_and_survives_child_copyback(tmp_pa
     )
     monkeypatch.setattr(workers_module, "load_state", lambda: {})
     monkeypatch.setattr(state_module, "budget_remaining", lambda _state, **_kwargs: 100.0)
-    monkeypatch.setattr(queue_module, "persist_queue_snapshot", lambda reason="": None)
+    monkeypatch.setattr(queue_module, "persist_queue_snapshot", lambda reason="": True)
 
     workers_module.assign_tasks()
 
@@ -3212,7 +3227,8 @@ def test_orphan_reconcile_never_terminalizes_a_live_direct_activity(tmp_path, mo
     _orphan_shaped_running_task(tmp_path, "direct-live", snapshot_ts="2027-01-15T08:00:00+00:00")
 
     registry = get_direct_activity_registry()
-    registry.register("direct-live", chat_id=1)
+    from types import SimpleNamespace
+    registry.register("direct-live", chat_id=1, actor=SimpleNamespace(env=SimpleNamespace(drive_root=tmp_path)))
     assert reconcile_orphaned_running_tasks(tmp_path) == 0
     assert load_effective_task_result(tmp_path, "direct-live")["status"] == STATUS_RUNNING
     assert load_task_result(tmp_path, "direct-live")["status"] == STATUS_RUNNING

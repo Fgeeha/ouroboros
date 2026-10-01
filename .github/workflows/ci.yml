@@ -359,6 +359,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-python-env
       - name: Run integration tests
+        id: provider_tests
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -368,7 +369,45 @@ jobs:
           CLOUDRU_FOUNDATION_MODELS_API_KEY: ${{ secrets.CLOUDRU_FOUNDATION_MODELS_API_KEY }}
           CLOUDRU_FOUNDATION_MODELS_BASE_URL: ${{ secrets.CLOUDRU_FOUNDATION_MODELS_BASE_URL }}
           GIGACHAT_CREDENTIALS: ${{ secrets.GIGACHAT_CREDENTIALS }}
-        run: python -m pytest tests/test_provider_integration.py -m integration -q -rs --tb=short
+        run: >-
+          python -m pytest tests/test_provider_integration.py -m integration -q -rs --tb=short
+          --junitxml="${{ runner.temp }}/ci-private/provider/results.xml"
+          --ci-evidence-dir="${{ runner.temp }}/ci-evidence/provider"
+      - name: Upload provider test evidence
+        id: provider_evidence
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: provider-ci-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ci-evidence/provider/
+          retention-days: 30
+          if-no-files-found: warn
+      - name: Summarize provider test results
+        id: provider_summary
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        env:
+          PRODUCER_OUTCOME: ${{ steps.provider_tests.outcome }}
+          ARTIFACT_OUTCOME: ${{ steps.provider_evidence.outcome }}
+          ARTIFACT_URL: ${{ steps.provider_evidence.outputs.artifact-url }}
+        run: >-
+          python -m tests.ci_evidence summarize
+          --evidence-dir "${{ runner.temp }}/ci-evidence/provider"
+          --producer-outcome "$PRODUCER_OUTCOME"
+          --artifact-outcome "$ARTIFACT_OUTCOME"
+          --artifact-url "$ARTIFACT_URL"
+          --summary "$GITHUB_STEP_SUMMARY"
+      - name: Disclose incomplete provider diagnostics
+        continue-on-error: true
+        if: >-
+          ${{ !cancelled() &&
+          (steps.provider_summary.outcome != 'success' ||
+           steps.provider_evidence.outcome != 'success' ||
+           steps.provider_evidence.outputs.artifact-url == '') }}
+        run: |
+          echo "::warning::Provider diagnostics are incomplete; see the original test and reporting steps."
+          echo "Provider diagnostics_incomplete. The original test outcome is unchanged." >> "$GITHUB_STEP_SUMMARY"
 
   # ──────────────────────────────────────────────────────────────────
   # Tier 2.6: Official-skill install smoke against the LIVE OuroborosHub

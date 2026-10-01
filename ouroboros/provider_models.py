@@ -242,11 +242,13 @@ def resolve_model_target(
     )
 
 
-def fallback_candidate_targets(active_model: str = "") -> tuple[ResolvedModelTarget, ...]:
+def fallback_candidate_targets(active_model: str = "", *, preserve_slots: bool = False) -> tuple[ResolvedModelTarget, ...]:
     """The cross-model fallback candidate ladder as typed targets (ABI-4).
 
     Same membership and order as ``model_slots.get_fallback_models`` — a typed
-    view over the ONE chain SSOT, not a second resolver. Effort stays the ""
+    view over the ONE chain SSOT, not a second resolver. ``preserve_slots`` keeps
+    repeated model ids so callers can compare their distinct configured account bindings.
+    Effort stays the ""
     sentinel: the ladder resolves destinations, the dispatching round owns the
     active effort. ``provider_route`` stays the ``""`` sentinel DELIBERATELY:
     the chain's local-vs-remote dispatch lane is the loop's single global
@@ -254,11 +256,11 @@ def fallback_candidate_targets(active_model: str = "") -> tuple[ResolvedModelTar
     through the ABI-4 sweep), so a per-candidate route here would be a
     fabricated fact no dispatcher consumes.
     """
-    from ouroboros.model_slots import get_fallback_models
+    from ouroboros.model_slots import get_fallback_models, parse_fallback_chain
 
     return tuple(
         ResolvedModelTarget(model_id=model, provider_route="")
-        for model in get_fallback_models(active_model)
+        for model in (parse_fallback_chain() if preserve_slots else get_fallback_models(active_model))
     )
 
 

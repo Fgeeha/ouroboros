@@ -2,10 +2,10 @@
 
 Only what needs no network: the PATH scrub, the process rebinding done before the
 runtime is imported, the refusals that precede any install, the harness receipt and
-doctor verdicts, the doctor daemon's cleanup, the vendor probes' process custody, and
-the CI wiring. The download, extraction, npm runs and the real Codex install are what
-the `toolchain` and Windows `consumer` CI jobs exercise for real; repeating them here
-would mean mocking the thing under test.
+doctor verdicts, daemon cleanup, process custody, CI wiring, and Node repair's
+directory transaction under injected sharing refusals. Real downloads, Node/npm
+execution and the pinned Codex install belong to the `toolchain` and Windows
+`consumer` CI jobs. Local repair tests use archive fixtures, not an executable Node.
 """
 
 from __future__ import annotations
@@ -487,3 +487,79 @@ def test_the_harness_summary_carries_its_own_limits(tmp_path, monkeypatch):
     assert "No vendor harness was installed" not in written
     with pytest.raises(SystemExit):
         witness.main(["--root", str(tmp_path / "other"), "--harness-install", "claude"])
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("fault", [
+    "none", "displacement", "promotion", "rollback",
+    "persistent_displacement", "persistent_promotion", "non_permission",
+])
+def test_node_repair_directory_transaction_preserves_success_and_failure(tmp_path, monkeypatch, fault):
+    """The real repair transaction retries shared-handle refusals, including undo."""
+    import zipfile
+    from ouroboros import claudexor_runtime as runtime, platform_layer as platform, utils
+    from tests.test_claudexor_runtime_delivery import _archive, _data_plane, _node_artifacts, _pin, NODE_VERSION
+
+    _data_plane(monkeypatch, tmp_path)
+    distribution = f"node-v{NODE_VERSION}-win-x64"
+    archive = tmp_path / f"{distribution}.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr(f"{distribution}/node.exe", b"node fixture\n")
+        bundle.writestr(f"{distribution}/node_modules/npm/bin/npm-cli.js", b"npm fixture\n")
+    pin = _pin(_archive(tmp_path / "closure.tar.gz"),
+               node_artifacts=_node_artifacts(exact_key="win32-x64", exact_archive=archive))
+    manager = runtime.ClaudexorRuntimeManager(pin)
+    monkeypatch.setattr(platform, "embedded_node_candidates",
+                        lambda base: [pathlib.Path(base) / "node-standalone" / "node.exe"])
+    monkeypatch.setattr(platform, "probe_node_version", lambda path: NODE_VERSION if pathlib.Path(path).is_file() else "")
+    artifact = pin.node_artifacts["win32-x64"]
+    manager._promote_node(pin, "win32-x64", artifact, archive, include_npm=True)
+    root = runtime.managed_node_dir(pin, "win32-x64")
+    npm_cli = root / "node-standalone" / "node_modules" / "npm" / "bin" / "npm-cli.js"
+    npm_cli.unlink()  # The same deliberate missing-entry repair as the CI witness.
+    old_tree = {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+    original_archive = archive.read_bytes()
+    real_replace = runtime.os.replace
+    calls = {"displacement": 0, "promotion": 0, "rollback": 0}
+    denied = PermissionError(13, "fixture Windows sharing refusal")
+    denied.winerror = 5
+    original_failure = OSError("fixture final promotion failure")
+
+    def sharing_replace(src, dst):
+        src, dst = pathlib.Path(src), pathlib.Path(dst)
+        phase = ("displacement" if src == root and dst.name.startswith(".old-") else
+                 "promotion" if src.name.startswith(".tmp-") and dst == root else
+                 "rollback" if src.name.startswith(".old-") and dst == root else "")
+        if phase:
+            calls[phase] += 1
+            if phase == "promotion" and fault in {"rollback", "non_permission"}:
+                raise original_failure
+            if fault == f"persistent_{phase}" or (fault == phase and calls[phase] <= 2):
+                raise denied
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(runtime.os, "replace", sharing_replace)
+    monkeypatch.setattr(utils.time, "sleep", lambda _seconds: None)
+    fails = fault in {"rollback", "non_permission", "persistent_displacement", "persistent_promotion"}
+    if fails:
+        with pytest.raises(runtime.ClaudexorRuntimeError) as caught:
+            manager._promote_node(pin, "win32-x64", artifact, archive, include_npm=True)
+        expected = denied if fault.startswith("persistent_") else original_failure
+        assert caught.value.code == "runtime_node_install_failed"
+        assert caught.value.__cause__ is expected
+        assert str(expected) in str(caught.value)
+        assert {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()} == old_tree
+        assert not npm_cli.exists()
+    else:
+        manager._promote_node(pin, "win32-x64", artifact, archive, include_npm=True)
+        assert npm_cli.read_bytes() == b"npm fixture\n"
+        assert (root / "node-standalone" / "node.exe").read_bytes() == b"node fixture\n"
+        assert json.loads((root / "managed-node.json").read_text(encoding="utf-8"))["schema_version"] == 2
+    if fault.startswith("persistent_"):
+        assert calls[fault.removeprefix("persistent_")] == utils._REPLACE_RETRY_ATTEMPTS
+    elif fault in calls:
+        assert calls[fault] == 3
+    if fault == "non_permission":
+        assert calls["promotion"] == calls["rollback"] == 1
+    assert archive.read_bytes() == original_archive
+    assert not list(root.parent.glob(".tmp-*")) and not list(root.parent.glob(".old-*"))

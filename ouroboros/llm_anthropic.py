@@ -448,6 +448,7 @@ class _AnthropicLaneMixin:
                 target, messages, reasoning_effort, max_tokens, tool_choice,
                 temperature, tools, **remote_kwargs,
             )
+        target["requested_reasoning_effort"] = normalize_reasoning_effort(reasoning_effort)
         system, messages = self._build_anthropic_messages(messages, target)
         payload: Dict[str, Any] = {
             "model": str(target.get("resolved_model") or ""),

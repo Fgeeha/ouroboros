@@ -181,6 +181,10 @@ def _owner_lane_allows(ctx: Any, task: Dict[str, Any], target: str, chat_id: int
     Project room, and -- from the Main lane, which sees the global manifest --
     every root. The lane is the host registry's answer for the issuing chat, so
     a Swarm root (no routing contract) and a picker click read the same rule."""
+    from ouroboros.server_routing_context import _main_lane_chat
+
+    if _main_lane_chat(chat_id):
+        return True  # Main, including the bound external owner, needs no registry read.
     try:
         if int(task.get("chat_id") or 0) == chat_id:
             return True
@@ -190,11 +194,11 @@ def _owner_lane_allows(ctx: Any, task: Dict[str, Any], target: str, chat_id: int
     # but belong to a project thread — match via the durable binding.
     try:
         from ouroboros.projects_registry import project_chat_for_task
-        from ouroboros.server_routing_context import _project_id_for_registered_chat
+        from ouroboros.server_routing_context import _reserved_project_for_chat
 
         if int(project_chat_for_task(ctx.DRIVE_ROOT, target) or 0) == chat_id:
             return True
-        return not _project_id_for_registered_chat(ctx, chat_id)
+        return not _reserved_project_for_chat(ctx, chat_id)
     except Exception:
         return False
 

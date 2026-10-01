@@ -200,8 +200,18 @@ def _drive_hard_timeout(tmp_path, monkeypatch, *, evolution_enabled):
     monkeypatch.setattr(services_mod, "archive_task_service_logs", lambda *a, **k: None)
 
     enqueued = []
-    monkeypatch.setattr(q, "enqueue_task", lambda t, front=False: enqueued.append(t))
-    monkeypatch.setattr(q, "persist_queue_snapshot", lambda reason="": None)
+    for key, value in {"PENDING": [], "QUEUE_SEQ_COUNTER_REF": {"value": 0},
+                       "ADMISSION_RESERVATIONS": {}, "ACCEPTANCE_FENCES": {},
+                       "BUDGET_ROOT_FENCES": {}}.items():
+        monkeypatch.setattr(q, key, value)
+    real_enqueue = q.enqueue_task
+    def enqueue(task, front=False):
+        admitted = real_enqueue(task, front=front)
+        assert not admitted.get("_admission_blocked"), admitted
+        assert any(row is admitted for row in q.PENDING)
+        enqueued.append(admitted)
+        return admitted
+    monkeypatch.setattr(q, "enqueue_task", enqueue)
     monkeypatch.setattr(q, "send_with_budget", lambda *a, **k: None)
     monkeypatch.setattr(q, "load_state", lambda: {"evolution_mode_enabled": evolution_enabled, "owner_chat_id": 0})
 
@@ -327,7 +337,7 @@ def test_hard_timeout_evolution_enabled_requeues(tmp_path, monkeypatch):
     # Campaign still enabled: the timed-out task is re-enqueued (one retry).
     assert len(enqueued) == 1
     assert enqueued[0].get("type") == "evolution"
-    assert enqueued[0].get("_attempt") == 2
+    assert enqueued[0].get("_attempt") == 2 and enqueued[0]["id"] == "evo1"
     # A retry keeps the live card active, so no terminal task_done is emitted.
     assert [e for e in emitted if e.get("type") == "task_done"] == []
     # The interrupted rollup still records reconstructed cost (not zeros).

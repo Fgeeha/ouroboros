@@ -42,7 +42,9 @@ class ScheduleActionResponse(TypedDict, total=False):
     ``changed`` is the durable fact; ``ok`` means the requested lifecycle state
     was achieved and both audit records landed. A ``restored_not_ready`` result
     can change suppression with a recorded audit while ``ok`` remains false.
-    ``status`` names what happened (``updated``, ``deleted``,
+    ``status`` names what happened (``updated``, ``deleted`` (the row was removed),
+    ``delete_deferred`` (future dispatch disabled; the row retains accepted work
+    or unresolved evidence, explained by ``detail``; a recorded intent is ``ok``),
     ``suppressed``, ``restored_not_ready``, ``consumed_not_rearmed``,
     ``manifest_absent`` (restore over a skill schedule its manifest no longer
     declares: suppression KEPT, nothing changed), ``not_suppressed`` (restore

@@ -96,10 +96,12 @@ export function initActivity({ mount, ws } = {}) {
             const paused = rowBudgetPaused(q, t, kind);
             const kindLabel = paused ? 'paused (budget)' : kind;
             const meta = `${esc(kindLabel)}${q.type ? ` · ${esc(q.type)}` : ''}${rt}`;
+            const hold = t.project_admission_hold;
+            const projectWait = hold?.label ? ` · ${esc(hold.label)}: ${esc(hold.detail || hold.reason)}` : '';
             return `<div class="activity-row">
                 <div class="activity-row-main">
                     <span class="activity-name">${label}</span>
-                    <span class="activity-sub">${meta}</span>
+                    <span class="activity-sub">${meta}${projectWait}</span>
                 </div>
                 <div class="activity-row-actions">
                     <button type="button" class="btn btn-xs btn-danger" data-act="task-control" data-id="${id}"${paused ? ' data-budget-paused="1"' : ''}>${esc(TASK_CONTROL_TRIGGER_LABEL)}</button>
@@ -339,6 +341,10 @@ export function initActivity({ mount, ws } = {}) {
             showToast(`Schedule ${action} applied, but its audit record is incomplete: ${detail}`, 'warn');
             return;
         }
+        if (outcome.status === 'delete_deferred') {
+            showToast(`Schedule deletion is pending: ${detail}`, 'info');
+            return;
+        }
         if (outcome.status === 'restored_not_ready') {
             showToast(`Schedule suppression lifted, but it is not ready to run: ${detail}`, 'warn');
         } else if (outcome.ok !== true) {
@@ -350,7 +356,7 @@ export function initActivity({ mount, ws } = {}) {
         // Lifecycle actions govern FUTURE dispatch; a run already admitted keeps
         // going. Silence here would let the owner read the button as a stop.
         if (outcome.running_or_queued === true) {
-            showToast(`Schedule ${done}. A task it already started is still running and was not stopped.`, 'info');
+            showToast(`Schedule ${done}. A task it already admitted is queued or running and was not cancelled.`, 'info');
         } else if (outcome.running_or_queued === null || outcome.running_or_queued === undefined) {
             showToast(`Schedule ${done}. Whether a task it already started is still running is unknown.`, 'info');
         } else if (outcome.status === 'suppressed') {

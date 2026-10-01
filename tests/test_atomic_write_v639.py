@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import pathlib
 
 import pytest
 
@@ -130,6 +131,34 @@ def test_replace_atomic_does_not_retry_other_oserrors(tmp_path, monkeypatch):
     with pytest.raises(OSError):
         utils.replace_atomic(tmp_path / "a", tmp_path / "b")
     assert calls["n"] == 1
+
+
+@pytest.mark.parametrize("failure,denials,expected_calls", [
+    (PermissionError, 3, 4),  # a reader that met the writer's replace: absorbed
+    (PermissionError, None, utils._REPLACE_RETRY_ATTEMPTS),  # outlasts the bound: surfaces
+    (FileNotFoundError, None, 1),  # absence is an answer, never retried
+])
+def test_read_across_replace_retries_only_the_bounded_sharing_violation(
+        tmp_path, monkeypatch, failure, denials, expected_calls):
+    target = tmp_path / "result.json"
+    target.write_text("INTACT", encoding="utf-8")
+    read_text = pathlib.Path.read_text
+    calls = {"n": 0}
+
+    def _denied(path, *args, **kwargs):
+        calls["n"] += 1
+        if denials is None or calls["n"] <= denials:
+            raise failure(13 if failure is PermissionError else 2, "denied", str(path))
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "read_text", _denied)
+    monkeypatch.setattr(utils.time, "sleep", lambda _s: None)
+    if denials is None:
+        with pytest.raises(failure):
+            utils.read_text_across_replace(target)
+    else:
+        assert utils.read_text_across_replace(target) == "INTACT"
+    assert calls["n"] == expected_calls
 
 
 @pytest.mark.parametrize("writer,payload,read", [

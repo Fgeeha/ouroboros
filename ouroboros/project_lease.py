@@ -62,30 +62,29 @@ def candidate_is_leasable(candidate: Dict[str, Any], running_ids: Set[str]) -> b
     return _task_project_id(candidate) not in running_ids
 
 
-def task_lane_project_id(running: Any, pending: Any, tid: Any) -> str:
-    """The project id the live queue copy of ``tid`` carries right now, "" when the
-    task holds no lane or is neither running nor pending.
+def task_lane_project_state(running: Any, pending: Any, tid: Any) -> dict:
+    """Scope and exact carrier (including absence) for a conversion rollback.
 
     Walks the same RUNNING map and PENDING list as ``mark_task_project``, so the two
-    can never disagree about where a task's in-memory project id lives. The UI
-    conversion reads it under the queue lock right before it marks, so a durable bind
-    that is then refused can put the lane back instead of leaving it on a project the
-    binding does not name. The caller MUST hold the queue lock."""
+    can never disagree about where a task's in-memory scope lives. The caller MUST
+    hold the queue lock from this read through the mark. Carrier values are replaced,
+    never mutated, so the saved evidence remains the original preparation's."""
     key = str(tid or "")
     if not key:
-        return ""
+        return {}
     meta = running.get(key) if hasattr(running, "get") else None
     rtask = _as_task(meta) if isinstance(meta, dict) else None
     if isinstance(rtask, dict):
-        return _task_project_id(rtask)
+        return {k: rtask[k] for k in ("project_id", "_project_admission") if k in rtask}
     for item in (pending or ()):
         ptask = _as_task(item)
         if isinstance(ptask, dict) and str(ptask.get("id") or "") == key:
-            return _task_project_id(ptask)
-    return ""
+            return {k: ptask[k] for k in ("project_id", "_project_admission") if k in ptask}
+    return {}
 
 
-def mark_task_project(running: Any, pending: Any, tid: Any, pid: Any, *, authority: str = "") -> bool:
+def mark_task_project(running: Any, pending: Any, tid: Any, pid: Any, *, authority: str = "",
+                      project: dict | None = None, restore: dict | None = None) -> bool:
     """Set a task's ``project_id`` wherever it currently lives in the supervisor queue
     state — the live RUNNING map (``{tid: {"task": {...}}}``) AND the PENDING list (bare
     task dicts) — so a POST-HOC project conversion/scope makes it a one-writer lane
@@ -113,10 +112,16 @@ def mark_task_project(running: Any, pending: Any, tid: Any, pid: Any, *, authori
     carries the rollback: an EMPTY ``pid`` clears the lane, so a conversion whose
     durable bind was refused after the mark can restore the value the lane held
     (including none) instead of leaving it on a project no binding names. Without
-    the authority an empty ``pid`` stays the no-op it has always been."""
+    the authority an empty ``pid`` stays the no-op it has always been.
+
+    Conversion passes the actual chosen ``project`` row: scope and frozen evidence
+    change together, without touching the prepared workspace or drive. Rollback
+    passes the saved ``restore`` state, preserving even absent/null evidence.
+    Legacy lane-only callers omit both; recovery never captures a replacement row.
+    """
     key = str(tid or "")
-    project = str(pid or "").strip()
-    if not key or (not project and authority != "binding"):
+    scope = str(pid or "").strip()
+    if not key or (not scope and authority != "binding"):
         return False
     rows = []
     meta = running.get(key) if hasattr(running, "get") else None
@@ -128,12 +133,23 @@ def mark_task_project(running: Any, pending: Any, tid: Any, pid: Any, *, authori
         if isinstance(ptask, dict) and str(ptask.get("id") or "") == key:
             rows.append(ptask)
     if authority != "binding" and any(
-        str(row.get("project_id") or "").strip() not in ("", project) for row in rows
+        str(row.get("project_id") or "").strip() not in ("", scope) for row in rows
     ):
         return False
     updated = False
+    if project is not None:
+        from ouroboros.project_admission import project_admission_basis, validate_project_admission
+
+        basis = validate_project_admission(project_admission_basis(scope, project, frozen=True))
     for row in rows:
-        row["project_id"] = project
+        row["project_id"] = scope
+        if restore is not None:
+            for field in ("project_id", "_project_admission"):
+                row.pop(field, None)
+                if field in restore:
+                    row[field] = restore[field]
+        elif project is not None:
+            row["_project_admission"] = basis
         updated = True
     return updated
 
@@ -142,5 +158,5 @@ __all__ = [
     "candidate_is_leasable",
     "mark_task_project",
     "running_project_ids",
-    "task_lane_project_id",
+    "task_lane_project_state",
 ]

@@ -1,8 +1,6 @@
-"""Descriptive HTTP + WebSocket Gateway Boundary contracts (v1).
+"""Gateway HTTP/WebSocket contracts (v1): descriptive, not runtime validation.
 
-TypedDicts document payloads, not runtime validation. Keep discriminating
-``type`` keys required; mark genuinely optional fields with ``NotRequired``.
-"""
+Keep discriminating ``type`` keys required; optional fields use ``NotRequired``."""
 
 from __future__ import annotations
 
@@ -222,10 +220,8 @@ class ChatOutbound(TypedDict):
     # v6.87.48: count of OPEN ledger rows — the disclosed cause of
     # ``cost_final: false``, which can hold with every dollar bucket at zero.
     non_final_rows: NotRequired[Optional[int]]
-    # C12: the ledger's own INTEGRITY marker. The cost authority has always
-    # produced it (`reconstruct_task_cost`), but no carry list named it, so an
-    # amount computed over a degraded ledger reached every surface looking exactly
-    # like one computed over a sound ledger.
+    # C12: the ledger's own INTEGRITY marker from the cost authority (`reconstruct_task_cost`), carried so an
+    # amount computed over a degraded ledger never reaches a surface looking like one over a sound ledger.
     ledger_integrity_degraded: NotRequired[Optional[bool]]
     # Closed shape owned by the cost producer; null means ledger unavailable.
     cost_presentation: NotRequired[Optional[CostPresentation]]
@@ -253,14 +249,15 @@ class ChatOutbound(TypedDict):
     card_row: NotRequired[Literal["timeline", "reviews"]]
     card_row_id: NotRequired[str]
     card_row_revision: NotRequired[int]  # canonical source order, independent of delivery timestamp
+    late_evidence: NotRequired[Dict[str, Any]]  # late review identity/revision + exact applied source; no transcript
     # Event-time human presentation; raw task/project ids remain machine keys.
     target_label: NotRequired[str]
     project_id: NotRequired[str]
     project_name: NotRequired[str]
     handoff_id: NotRequired[str]  # immutable origin/destination receipt identity
+    terminal_time: NotRequired[Dict[str, Any]]  # host-owned occurrence, separate from publication ts
     completion_answer: NotRequired[str]  # a Project root's model-authored final answer, mirrored into Main (DESIGN)
-    # Present on some transport re-broadcast paths.
-    chat_id: NotRequired[int]
+    chat_id: NotRequired[int]  # present on some transport re-broadcast paths
     # Server-stamped when chat_id is a reserved Project thread: Main never
     # adopts it, even before the browser has learned the project.
     project_thread: NotRequired[bool]
@@ -736,6 +733,7 @@ class ActiveChatActivity(ActiveDirectTurn):
 
     required_question: NotRequired[Dict[str, Any]]
     required_question_unavailable: NotRequired[bool]
+    project_admission_hold: NotRequired[Dict[str, Any]]
 
 
 class StateResponse(TypedDict):
@@ -916,13 +914,13 @@ class UiPreferencesResponse(TypedDict):
     sidebar_width: int  # px; 0 = CSS default (resizable side sections, v6.33.0)
     project_panel_width: int  # px; 0 = CSS default
     project_seen_revision: dict[str, int]  # monotonic paint ACK per active Project
+    welcome: dict[str, str]  # install-wide empty-Main UI copy: mode default|hidden|custom and plain text
 
 
 class GitLogResponse(TypedDict):
     commits: list[Dict[str, Any]]
-    # Tag rows: {tag, date, sha (peeled commit), message} — the mirror said
-    # ``list[str]`` while ``list_versions`` has always emitted dicts; corrected
-    # (behavioural documentation) in the 2026-08-31 updates redesign.
+    # Tag rows: {tag, date, sha (peeled commit), message} — the mirror said ``list[str]`` while ``list_versions``
+    # has always emitted dicts; corrected (behavioural documentation) in the 2026-08-31 updates redesign.
     tags: list[Dict[str, Any]]
     branch: str
     sha: str
@@ -1152,6 +1150,7 @@ class TaskDetailResponse(TypedDict, total=False):
     # Current hurry plus prior same-id attempts; detail-only, absent if never hurried (S3/HQ1).
     owner_hurry: OwnerHurryProjection
     owner_hurry_history: list[OwnerHurryProjection]
+    project_admission_hold: Dict[str, Any]  # While the queue snapshot lists the row: its hold {reason, detail, label} or {}.
     error: str
 
 

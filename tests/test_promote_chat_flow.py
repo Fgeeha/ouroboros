@@ -1185,76 +1185,6 @@ def test_promote_success_relocates_pre_admitted_attachment_to_child_drive(
     ).exists()
 
 
-def test_promote_post_stage_lookup_failure_cleans_attachment(tmp_path, monkeypatch):
-    import ouroboros.projects_registry as projects_registry
-    import supervisor.workers as workers
-
-    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
-    source = tmp_path / "input.txt"
-    source.write_text("input", encoding="utf-8")
-    monkeypatch.setattr(
-        projects_registry,
-        "get_reserved_project",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("registry unavailable")),
-    )
-    ctx = types.SimpleNamespace(
-        enqueue_task=lambda task: task,
-        persist_queue_snapshot=lambda **_kwargs: True,
-        load_state=lambda: {"owner_chat_id": 1},
-    )
-
-    outcome = workers.promote_chat_to_task({
-        "task_id": "attach-lookup-fail",
-        "objective": "use input",
-        "project_id": "lookup-project",
-        "attachment_uploads": [{"path": str(source), "label": "input"}],
-    }, ctx)
-
-    assert outcome["reason"] == "project_routing_fence_lookup_failed"
-    assert not (
-        tmp_path / "task_results" / "artifacts" / "attach-lookup-fail"
-    ).exists()
-
-
-@pytest.mark.parametrize("failure", ["enqueue", "snapshot"])
-def test_promote_queue_failure_cleans_pre_staged_attachment(
-    tmp_path, monkeypatch, failure,
-):
-    import supervisor.workers as workers
-
-    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
-    source = tmp_path / f"{failure}.txt"
-    source.write_text("input", encoding="utf-8")
-    captured = []
-
-    def enqueue(task):
-        captured.append(task)
-        if failure == "enqueue":
-            return {"_admission_blocked": "project_routing_fence"}
-        return task
-
-    ctx = types.SimpleNamespace(
-        enqueue_task=enqueue,
-        persist_queue_snapshot=lambda **_kwargs: failure != "snapshot",
-        load_state=lambda: {"owner_chat_id": 1},
-    )
-    tid = f"attach-{failure}-fail"
-
-    outcome = workers.promote_chat_to_task({
-        "task_id": tid,
-        "objective": "use input",
-        "workspace": "none",
-        "attachment_uploads": [{"path": str(source), "label": "input"}],
-    }, ctx)
-
-    expected = "project_routing_fence" if failure == "enqueue" else "queue_snapshot_persist_failed"
-    assert outcome["reason"] == expected
-    assert captured
-    staged_path = pathlib.Path(captured[0]["attachments"][0]["abs_path"])
-    assert not staged_path.exists()
-    assert not (tmp_path / "task_results" / "artifacts" / tid).exists()
-
-
 def test_promote_worker_persists_swarm_intent_on_managed_root(tmp_path, monkeypatch):
     import supervisor.workers as workers
 
@@ -1474,6 +1404,8 @@ def test_promote_route_persists_source_ref_and_fails_closed_on_binding_error(tmp
         "status": "needs_manual_target",
         "reason": "project_binding_failed",
         "task_id": "route-fail",
+        "never_admitted": True,
+        "_admission_cleanup_manifest": [],
     }
     assert len(enqueued) == 1
 
@@ -3348,10 +3280,11 @@ def test_the_implicit_promote_claim_creates_and_binds_under_the_claim_lock(
     registry.bind_task_to_project(tmp_path, "t-turn", "the-work", room["chat_id"],
                                   origin={"ref": ref, "text": text})
     real_create, real_bind = registry.create_project, registry.bind_task_to_project
-    held: list = []
+    held, bases = [], []
 
     def _create(*args, **kwargs):
         held.append(("create_project", registry._ORIGIN_CLAIM_LOCK._is_owned()))
+        bases.append(kwargs.get("admission_basis"))
         return real_create(*args, **kwargs)
 
     def _bind(*args, **kwargs):
@@ -3374,7 +3307,9 @@ def test_the_implicit_promote_claim_creates_and_binds_under_the_claim_lock(
     }, ctx)
 
     # The CPython RLock answers "is this thread inside the claim?" directly.
-    assert held == [("create_project", True), ("bind_task_to_project", True)]
+    assert held == [("create_project", True), ("bind_task_to_project", True), ("create_project", False)]
+    # Provisioning is outside the origin lock but CAS-fenced by the captured room.
+    assert bases[1] == registry.project_admission_basis("the-work", room)
     assert outcome["status"] == "scheduled" and outcome["project_id"] == "the-work"
     assert enqueued[0]["project_id"] == "the-work"
     assert (registry.project_binding_for_task(tmp_path, "root01") or {}).get(

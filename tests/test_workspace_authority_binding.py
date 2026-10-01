@@ -34,7 +34,7 @@ def test_ordinary_top_level_presets_share_one_exact_principal_matrix():
 def test_shared_top_level_principal_does_not_widen_specialized_profiles():
     assert "shell" not in _POLICY["local_readonly_subagent"]["skill_payload"]
     assert "skill_repair" not in _POLICY
-    assert "skill_payload" not in _POLICY["acting_subagent"]
+    assert _POLICY["acting_subagent"]["skill_payload"] == {"read", "list", "search"}
     for profile in ("local_readonly_subagent", "acting_subagent"):
         assert {"read", "list", "search"} <= _POLICY[profile]["runtime_data"]
         assert not {"write", "edit"} & _POLICY[profile]["runtime_data"]

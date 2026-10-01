@@ -237,6 +237,7 @@ def test_registry_filters_schema_dispatch_and_resolved_targets(tmp_path):
 
     names = {schema["function"]["name"] for schema in registry.schemas()}
     assert names == {
+        "finish_task",  # ceiling-only work has no speaker metadata; local completion grants no resource
         "presence_finish",
         "presence_cancel_work",
         "read_file",

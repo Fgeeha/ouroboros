@@ -1109,3 +1109,70 @@ def test_existing_nonretry_reasons_and_cost_projection_survive_handoff(tmp_path,
     done = events.get_nowait()
     assert done['accounted_upper_bound_usd'] == 12.5 and done['rounds'] == 7
     q.enqueue_task.assert_not_called()
+
+
+@pytest.mark.parametrize("deleted", [False, True])
+@pytest.mark.parametrize("basis_kind", ["prepared", "legacy", "converted_main", "converted_derived"])
+def test_real_crash_retry_keeps_prepared_scope_across_registry_activity(tmp_path, monkeypatch, deleted, basis_kind):
+    from ouroboros import projects_registry as registry
+    from ouroboros.task_results import load_task_result, write_task_result
+    from supervisor import queue as q, workers as w
+
+    monkeypatch.setattr(q, "PENDING", [])
+    monkeypatch.setattr(q, "ACCEPTANCE_FENCES", {})
+    monkeypatch.setattr(q, "ADMISSION_RESERVATIONS", {})
+    monkeypatch.setattr(q, "BUDGET_ROOT_FENCES", {})
+    monkeypatch.setattr(w, "QUEUE_MAX_RETRIES", 1)
+    monkeypatch.setattr(w, "respawn_worker", lambda *a, **k: None)
+    done = []
+    monkeypatch.setattr(w, "_emit_task_done_terminal", lambda *a, **k: done.append((a, k)))
+    registry.create_project(tmp_path, "target")
+    registry.create_project(tmp_path, "other")
+    payload = {**_make_task("crash"), "project_id": "target", "workspace_root": "/synthetic/frozen-resource"}
+    if basis_kind.startswith("converted"):
+        basis = registry.project_scope_admission(tmp_path, workspace_root=(
+            payload["workspace_root"] if basis_kind == "converted_derived" else ""))
+        payload.update(project_id=basis["project_id"], _project_admission=basis)
+    admitted = q.enqueue_task(payload)
+    q.PENDING.clear()
+    if basis_kind == "legacy":
+        registry.bind_task_to_project(tmp_path, "crash", "target", origin={"absent": "system"})
+        admitted.pop("_project_admission")
+        admitted.pop("project_id")
+    monkeypatch.setattr(w, "PENDING", q.PENDING)
+    write_task_result(tmp_path, "crash", "running", result="working")
+    worker = _make_worker(busy_task_id="crash", exitcode=1)
+    monkeypatch.setattr(w, "WORKERS", {0: worker})
+    monkeypatch.setattr(w, "RUNNING", {"crash": {"task": admitted, "attempt": 1,
+        "started_at": time.time() - 5, "last_heartbeat_at": time.time() - 5}})
+    if basis_kind.startswith("converted"):
+        import asyncio
+        from ouroboros.gateway.projects import api_project_from_task
+        from tests.test_project_lease_ui_conversion import _request
+
+        response = asyncio.run(api_project_from_task(_request(tmp_path, {
+            "task_id": "crash", "id": "target", "name": "Target"})))
+        assert response.status_code == 200
+        assert admitted["_project_admission"] == registry.project_admission_basis(
+            "target", registry.get_reserved_project(tmp_path, "target"), frozen=True)
+    real_enqueue = q.enqueue_task
+    def enqueue(payload, **kwargs):
+        registry.touch_project(tmp_path, "other")
+        if deleted:
+            registry.begin_project_deletion(tmp_path, "target")
+        return real_enqueue(payload, **kwargs)
+    monkeypatch.setattr(q, "enqueue_task", enqueue)
+    _run_health_and_reap()
+    assert not w.RUNNING
+    if deleted:
+        assert not q.PENDING and done
+        result = load_task_result(tmp_path, "crash")
+        assert result["status"] == "failed" and result["reason_code"] == "worker_crash_retry_admission_blocked"
+    else:
+        [retry] = q.PENDING
+        assert retry["id"] == "crash" and retry["_attempt"] == 2
+        assert retry["_project_admission"]["project_id"] == "target"
+        if basis_kind != "legacy":
+            assert retry["_project_admission"] == admitted["_project_admission"]
+        assert retry["workspace_root"] == "/synthetic/frozen-resource"
+        assert not done

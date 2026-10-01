@@ -41,23 +41,21 @@ test('the pointer label names the card and caps a status-line title to one line 
     assert.ok(label.length <= 'Latest task · '.length + POINTER_NAME_CHARS);
 });
 
-test('the bound pointer hides itself and the coverage note without a represented card', () => {
+test('the bound pointer hides without a represented card and owns no competing history notice', () => {
     const { prior, mount } = installDom();
     try {
         const records = new Map();
-        let historyWindow = null;
         let navigated = null;
         const host = mount.ownerDocument.createElement('div');
         mount.appendChild(host);
         const pointer = bindProjectWorkPointer(host, {
-            records, getWindow: () => historyWindow, onNavigate: (root) => { navigated = root; },
+            records, onNavigate: (root) => { navigated = root; },
         });
         const button = host.querySelector('.project-work-pointer');
-        const note = host.querySelector('.project-work-coverage');
+        assert.equal(host.querySelector('.project-work-coverage'), null);
         const label = button.querySelector('.project-work-pointer-label');
         assert.equal(button.hidden, true);
         assert.equal(button.disabled, true);
-        assert.equal(note.hidden, true);
 
         const root = mount.ownerDocument.createElement('div');
         mount.appendChild(root);
@@ -68,14 +66,15 @@ test('the bound pointer hides itself and the coverage note without a represented
         assert.equal(button.disabled, false);
         assert.ok(label.textContent.startsWith('Latest task · xxx'));
         assert.ok(label.textContent.length <= 'Latest task · '.length + POINTER_NAME_CHARS);
-        assert.equal(note.hidden, false);
-        assert.equal(note.textContent, 'Loaded messages only');
 
-        historyWindow = { complete: true };
         pointer.update();
-        assert.equal(note.hidden, true);
         for (const fn of button.listeners.get('click') || []) fn();
         assert.equal(navigated, root);
+
+        records.clear();
+        pointer.update();
+        assert.equal(button.hidden, true);
+        pointer.update();
 
         pointer.destroy();
         assert.equal(host.children.length, 0);
