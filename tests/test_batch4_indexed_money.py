@@ -80,9 +80,11 @@ def test_group_hot_writers_and_off_context_binding_never_scan_history(root, monk
 
 @pytest.mark.parametrize("axis", ["root", "group", "global"])
 @pytest.mark.parametrize("asynchronous", [False, True])
-def test_pre_send_wait_revalidates_late_charge_on_each_axis(root, short_acquisitions, monkeypatch, axis, asynchronous):
+def test_pre_send_wait_revalidates_late_charge_on_each_axis(root, monkeypatch, axis, asynchronous):
+    from ouroboros import _usage_wait
     from ouroboros.task_results import write_task_result
     write_task_result(root, 'successor', 'running', root_task_id='successor')
+    write_task_result(root, 'child', 'running', root_task_id='successor', parent_task_id='successor')
     scope = group_scope(root, cap=2 if axis == "group" else 20, root_cap=2 if axis == "root" else 20)
     other_root = "successor" if axis == "root" else "original" if axis == "group" else "foreign"
     other_scope = group_scope(root, task=other_root, root_id=other_root, cap=scope.billing_group_limit_usd)
@@ -92,9 +94,20 @@ def test_pre_send_wait_revalidates_late_charge_on_each_axis(root, short_acquisit
         late = ua.reserve_attempt(request(root, task_id=other_root, root_task_id=other_root, reservation_usd=0))
         ua.mark_dispatched(late)
         ua.mark_unresolved(late, "late charge")
-    sent, prepared = [], []
+    sent, prepared, waits = [], [], []
+    lock_owner = contextlib.ExitStack()
+    original_hold = _usage_wait._hold
+    def observed_wait(wait_owner, phase, *args):
+        original_hold(wait_owner, phase, *args)
+        waits.append(phase)
+        if phase == "entered":
+            # Release only after actual contention is observed. The real lock
+            # keeps its production acquisition slice; setup/cleanup are not timed faults.
+            lock_owner.close()
+    monkeypatch.setattr(_usage_wait, "_hold", observed_wait)
     with contextlib.ExitStack() as stack:
-        stack.enter_context(owner(root))
+        stack.callback(lock_owner.close)
+        stack.enter_context(owner(root, task={"id": "child", "root_task_id": "successor"}))
         stack.enter_context(ua.usage_scope(scope))
         stack.enter_context(ua.physical_attempt_limit(1))
         def before(reservation):
@@ -102,10 +115,7 @@ def test_pre_send_wait_revalidates_late_charge_on_each_axis(root, short_acquisit
             # The same writer receives the original/sibling's delayed receipt after reservation.
             with ua.usage_scope(None):
                 ua.settle_attempt(late, cost_usd=1.5, cost_final=True)
-            release = stack.enter_context(held_lock(root))
-            timer = threading.Timer(.12, release.set)
-            timer.start()
-            stack.callback(timer.join, 2)
+            lock_owner.enter_context(held_lock(root))
         req = request(root, root_task_id="successor", global_limit_usd=2 if axis == "global" else 100)
         async def send():
             sent.append(1)
@@ -120,6 +130,7 @@ def test_pre_send_wait_revalidates_late_charge_on_each_axis(root, short_acquisit
         assert error.value.physical_attempt_capture.state == "released"
         assert ua._PHYSICAL_LIMIT.get().used == 0
     assert not sent and len(prepared) == 1
+    assert waits == ["entered", "ended"]
     assert ua.read_usage_records(root, final_only=True)[-1]["state"] == "released"
 
 
