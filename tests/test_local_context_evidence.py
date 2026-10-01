@@ -462,13 +462,52 @@ def test_actual_pooled_worker_reads_the_serving_instance_its_server_process_owns
             sock.bind(("127.0.0.1", 0))
             return sock.getsockname()[1]
 
+    health_events = []
+    original_health = offline_manager.health_check
+
+    def traced_health():
+        event = {"started": time.monotonic(), "port": offline_manager._port}
+        health_events.append(event)
+        try:
+            event["result"] = original_health()
+            return event["result"]
+        except Exception as error:
+            event["error_type"] = type(error).__name__
+            raise
+        finally:
+            event["finished"] = time.monotonic()
+
+    monkeypatch.setattr(offline_manager, "health_check", traced_health)
+
+    def readiness_failure():
+        import threading
+        import traceback
+
+        process = offline_manager._proc
+        facts = {**offline_manager.status_dict(), "pid": getattr(process, "pid", None),
+                 "returncode": process.poll() if process else None, "health_events": list(health_events),
+                 "stderr_tail": offline_manager._stderr_buf.decode("utf-8", errors="replace"), "threads": {}}
+        frames = sys._current_frames()
+        for thread in threading.enumerate():
+            frame = frames.get(thread.ident)
+            if frame is None or thread.name not in {"local-model-health", "local-model-stderr"}:
+                continue
+            facts["threads"][thread.name] = "".join(traceback.format_stack(frame))
+            while frame:
+                if frame.f_code.co_name == "_drain_stderr" and frame.f_locals.get("self") is offline_manager:
+                    facts["stderr_live_tail"] = frame.f_locals.get("buf", b"").decode("utf-8", errors="replace")
+                frame = frame.f_back
+        # Printed only on failure so short tracebacks retain the diagnostic, without environment values.
+        print("LOCAL_MODEL_STARTUP_DIAGNOSTIC " + json.dumps(facts, ensure_ascii=False), flush=True)
+        return facts
+
     def autostart(port, n_ctx):
         auto_start_local_model({"LOCAL_MODEL_SOURCE": str(model), "LOCAL_MODEL_PORT": port,
                                 "LOCAL_MODEL_CONTEXT_LENGTH": n_ctx})
         deadline = time.monotonic() + 30
         while not offline_manager.is_running and time.monotonic() < deadline:
             time.sleep(0.05)
-        assert offline_manager.is_running, offline_manager.status_dict()
+        assert offline_manager.is_running, readiness_failure()
         return offline_manager.serving_context_evidence()
 
     # The server process exports settings into the environment its pooled workers inherit.
@@ -589,3 +628,47 @@ def test_actual_pooled_worker_reads_the_serving_instance_its_server_process_owns
                 channel.close()
                 channel.cancel_join_thread()
         stop_socket_sharer()
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("worker", [False, True], ids=["server-owner", "pooled-worker"])
+def test_owned_local_health_never_consults_ambient_proxy_configuration(monkeypatch, worker):
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import requests
+    from ouroboros import utils
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            assert self.path == "/v1/models"
+            body = json.dumps({"data": [{"id": "local-fixture", "meta": {"n_ctx_train": 8192}}]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            pass
+
+    def unavailable_proxy_lookup(*_args, **_kwargs):
+        raise RuntimeError("ambient proxy lookup unavailable")
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        monkeypatch.setattr(utils, "in_worker_process", lambda: worker)
+        monkeypatch.setattr(requests.sessions, "get_environ_proxies", unavailable_proxy_lookup)
+        manager = local_model.LocalModelManager()
+        manager._port = server.server_port
+        assert manager.health_check() == {"ok": True, "model_name": "local-fixture", "context_length": 8192}
+        # Only this owned-loopback session bypasses discovery; global Requests policy is intact.
+        with requests.Session() as ordinary:
+            with pytest.raises(RuntimeError, match="ambient proxy lookup unavailable"):
+                ordinary.get(f"http://127.0.0.1:{server.server_port}/v1/models", timeout=5)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+        assert not thread.is_alive()

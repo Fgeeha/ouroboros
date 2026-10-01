@@ -263,7 +263,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── project_sources.py   ← Folder attach validation (realpath, not the home root, no repo/data overlap); opt-in `init_git`, NEVER auto-init; atomic server-side clone with `GIT_TERMINAL_PROMPT=0` and typed `auth_required`; attaching IS the trust grant (`trusted_at`)
       ├── promotion_source.py  ← Promoted-task source admission off the event-drain loop, only after an executor/id reservation
       ├── workspace_admission.py ← Shared admission for `/api/tasks` + promotion: disjoint git root, Project binding, `workspace="none"`, bounded preflight; typed `workspace_provisioning_failed`, never a system-repo fallback; `workspace_repair_hint` (§6 Owner routing verbs; CLI / Headless Boundary below)
-      ├── local_model.py       ← Local LLM lifecycle (llama-cpp-python); normalized launch settings become applied only after owned-process health (§3 Settings)
+      ├── local_model.py       ← llama-cpp lifecycle; settings apply after owned health over proxy-free loopback (§3 Settings)
       ├── local_model_autostart.py ← Local model startup helper
       ├── deep_self_review.py  ← Whole-system review on the configured `deep_review` row: every API row runs native inspection and every session row delegates retrieval; BIBLE, standing disclosures and memory arrive inline (§6 Deep self-review). Reports retain provenance and diagnostic reading gaps; typed failures leave `memory/deep_review.md` intact and `BudgetExceeded` reaches the budget-pause rail
       ├── review.py            ← Shared size inventory, code collection, complexity and informational headroom; official CI enforces the shrink-only ceilings while local findings remain warnings (§6 Structural gates)
