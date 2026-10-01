@@ -137,7 +137,8 @@ def _finalize_loop_candidate(content, limit_ctx, tools, emit_progress, *, after_
             # complete row comparison. Earlier equal answers keep their own continuation.
             for row in limit_ctx.messages[response_start:]:
                 if row == {"role": "assistant", "content": content}:
-                    row.update(assistant_message)
+                    row.update({key: assistant_message[key] for key in ("reasoning_details", "reasoning_content")
+                                if key in assistant_message})
         if can_park:
             wait_for_acceptance_feedback(tools, limit_ctx, limit_ctx.llm_trace,
                                          limit_ctx.tool_schemas, limit_ctx.owner_msg_seen)

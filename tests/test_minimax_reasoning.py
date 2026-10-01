@@ -275,6 +275,8 @@ def test_owner_followups_keep_each_held_rounds_own_continuation(isolated, monkey
     replay = [m for m in sent[2]["messages"] if m.get("role") == "assistant"]
     assert len(canonical) == len(replay) == 2
     for index, expected in enumerate(originals):
+        assert set(canonical[index]) == set(expected)
+        assert set(replay[index]) == set(expected)
         assert {key: canonical[index][key] for key in expected} == expected
         assert {key: replay[index][key] for key in expected} == expected
         assert expected["reasoning_content"] not in progress + trace["reasoning_notes"]
