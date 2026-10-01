@@ -288,6 +288,7 @@ _STAND_IN_SERVER = '''
 """Loopback stand-in for ouroboros.local_model_server; it loads no model."""
 import json, os, sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from socketserver import TCPServer
 
 from ouroboros.local_model_server import input_fingerprint
 
@@ -326,7 +327,14 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
-ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+class NumericLoopbackServer(ThreadingHTTPServer):
+    def server_bind(self):
+        # This numeric fixture needs no reverse DNS before it can listen.
+        TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address
+
+
+NumericLoopbackServer(("127.0.0.1", PORT), Handler).serve_forever()
 '''
 
 
