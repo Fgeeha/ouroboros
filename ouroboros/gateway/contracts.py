@@ -1,8 +1,6 @@
-"""Descriptive HTTP + WebSocket Gateway Boundary contracts (v1).
+"""Gateway HTTP/WebSocket contracts (v1): descriptive, not runtime validation.
 
-TypedDicts document payloads, not runtime validation. Keep discriminating
-``type`` keys required; mark genuinely optional fields with ``NotRequired``.
-"""
+Keep discriminating ``type`` keys required; optional fields use ``NotRequired``."""
 
 from __future__ import annotations
 
@@ -727,6 +725,7 @@ class ActiveChatActivity(ActiveDirectTurn):
 
     required_question: NotRequired[Dict[str, Any]]
     required_question_unavailable: NotRequired[bool]
+    project_admission_hold: NotRequired[Dict[str, Any]]
 
 
 class StateResponse(TypedDict):
@@ -1144,6 +1143,7 @@ class TaskDetailResponse(TypedDict, total=False):
     continuation_offer: ContinuationOffer
     owner_hurry: OwnerHurryProjection
     owner_hurry_history: list[OwnerHurryProjection]
+    project_admission_hold: Dict[str, Any]  # While the queue snapshot lists the row: its hold {reason, detail, label} or {}.
     error: str
 
 

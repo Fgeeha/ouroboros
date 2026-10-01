@@ -72,7 +72,7 @@ TERMINAL_WRITERS = {
     # preserves the current lifecycle; "running" is the writer's placeholder.
     ('ouroboros/delegate_terminal.py::refresh_disposed_reconciliation', '"running"'): 'dynamic',
     ('ouroboros/gateway/tasks.py::_admission_rejection_response', 'STATUS_FAILED'): 'terminal',
-    ('ouroboros/gateway/tasks.py::_complete_api_task_admission', '"failed"'): 'terminal',
+    # API refusal now belongs to _admission_rejection_response and its receipt writer.
     # Runtime707: CURRENT-ref retry publication moved out of observability's
     # locked sweep; terminal file-failure publication moved off event drain.
     # Both retain CURRENT lifecycle status rather than authoring completion.
@@ -131,6 +131,10 @@ TERMINAL_WRITERS = {
     ('supervisor/events_task_done.py::_refresh_terminal_task_cost', 'current["status"]'): 'dynamic',
     ('supervisor/queue_snapshot.py::restore_pending_from_snapshot', 'STATUS_CANCELLED'): 'terminal',
     ('supervisor/queue_snapshot.py::_refuse_restore_invalid_fences', 'STATUS_CANCELLED'): 'terminal',
+    # Positive never-admitted refusal; exact receipt readback precedes resource cleanup.
+    ('supervisor/task_admission.py::persist_never_admitted_refusal', 'STATUS_FAILED'): 'terminal',
+    # Accepted pending restore refusal; retain custody for retry until its terminal is durable.
+    ('supervisor/task_admission.py::restore_invalid_depth_admission', 'STATUS_FAILED'): 'terminal',
     ('supervisor/task_admission.py::terminalize_invalid_depth_restore', 'STATUS_FAILED'): 'terminal',
     ('supervisor/task_lifecycle.py::_finish_captured_pending', 'STATUS_CANCELLED'): 'terminal',
     ('supervisor/task_lifecycle.py::_finish_captured_running', 'STATUS_CANCELLED'): 'terminal',
@@ -179,6 +183,10 @@ NO_DELIVERABLE_LANES = {
     'supervisor/events_project_routing.py::_persist_promote_rejection':
         'a refused promotion never became a task with an answer',
     # upstream retry/depth lanes (bea08137 class), absent at the reference cut:
+    'supervisor/task_admission.py::persist_never_admitted_refusal':
+        'positively never admitted: the origin refusal receipt exists, no model answer exists',
+    'supervisor/task_admission.py::restore_invalid_depth_admission':
+        'restored pending work refused before assignment; terminalization retry retains custody, no answer exists',
     'supervisor/task_admission.py::terminalize_invalid_depth_restore':
         'an invalid-depth restore is refused at admission; no answer exists',
     'supervisor/task_reaper.py::_run_retry_admission_transaction':
@@ -208,20 +216,38 @@ def _sources():
 def _calls(source: str, target: str):
     """Every call to ``target`` with the enclosing lexical qualname."""
     stack: list[str] = []
+    aliases: list[set[str]] = [set()]
     found: list[tuple[str, ast.Call]] = []
 
     class Visitor(ast.NodeVisitor):
         def visit_FunctionDef(self, node):
             stack.append(node.name)
+            aliases.append(set())
             self.generic_visit(node)
+            aliases.pop()
             stack.pop()
 
         visit_AsyncFunctionDef = visit_FunctionDef
 
         def visit_ClassDef(self, node):
             stack.append(node.name)
+            aliases.append(set())
             self.generic_visit(node)
+            aliases.pop()
             stack.pop()
+
+        def visit_Assign(self, node):
+            def points_to_target(value):
+                if isinstance(value, ast.IfExp):
+                    return points_to_target(value.body) or points_to_target(value.orelse)
+                return isinstance(value, ast.Name) and (value.id == target or value.id in aliases[-1])
+            is_alias = points_to_target(node.value)
+            for binding in node.targets:
+                if isinstance(binding, ast.Name):
+                    aliases[-1].discard(binding.id)
+                    if is_alias:
+                        aliases[-1].add(binding.id)
+            self.generic_visit(node)
 
         def visit_Call(self, node):
             func = node.func
@@ -229,7 +255,7 @@ def _calls(source: str, target: str):
                 func.id if isinstance(func, ast.Name)
                 else func.attr if isinstance(func, ast.Attribute) else ""
             )
-            if name == target:
+            if name == target or name in aliases[-1]:
                 found.append((".".join(stack) or "<module>", node))
             self.generic_visit(node)
 
@@ -252,7 +278,18 @@ def _expression(source: str, node: ast.Call, index: int, keyword: str) -> str:
     for kw in node.keywords:
         if kw.arg == keyword:
             return " ".join((ast.get_source_segment(source, kw.value) or "").split())
-    return ""
+    # Conditional receipt writers pass status only to the ordinary writer via
+    # **(... if never_admitted else {"status": STATUS_FAILED}). Inspect the
+    # actual expressions; a wrapper must not disappear from the inventory.
+    expanded = []
+    for kw in node.keywords:
+        if kw.arg is None:
+            for mapping in ast.walk(kw.value):
+                if isinstance(mapping, ast.Dict):
+                    for key, value in zip(mapping.keys, mapping.values):
+                        if isinstance(key, ast.Constant) and key.value == keyword:
+                            expanded.append(" ".join((ast.get_source_segment(source, value) or "").split()))
+    return " | ".join(sorted(set(expanded)))
 
 
 def _function_source(path: pathlib.Path, qualname: str) -> str:
@@ -569,3 +606,22 @@ def test_c10_the_http_and_supervisor_roots_come_from_one_configured_value():
     assert pathlib.Path(str(request_drive_root(request))) == pathlib.Path("/pinned/root"), (
         "the ingress root is whatever the app was bound to, never a re-derivation"
     )
+
+
+def test_terminal_inventory_sees_conditional_writers_without_leaking_aliases():
+    source = '''
+def refusal():
+    writer = receipt_first if never_admitted else write_task_result
+    writer(root, tid, **({} if never_admitted else {"status": STATUS_FAILED}))
+    def nested(writer):
+        writer(root, tid, "not-a-result-writer")
+    writer = unrelated
+    writer(root, tid, "not-a-result-writer")
+def sibling():
+    writer(root, tid, "not-a-result-writer")
+    write_task_result(root, tid, status=status)
+'''
+    found = _calls(source, "write_task_result")
+    assert [(qualname, _expression(source, node, 2, "status")) for qualname, node in found] == [
+        ("refusal", "STATUS_FAILED"), ("sibling", "status"),
+    ]

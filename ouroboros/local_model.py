@@ -690,9 +690,7 @@ class LocalModelManager:
 
         url = f"http://127.0.0.1:{self._port}/v1/models"
         with requests.Session() as session:
-            # Owned loopback never needs a proxy; host proxy discovery precedes
-            # Requests' socket timeout and can stall even outside a worker.
-            session.trust_env = False
+            session.trust_env = False  # Owned loopback never needs proxy discovery, in any process.
             resp = session.get(url, timeout=5)
         resp.raise_for_status()
         data = resp.json()

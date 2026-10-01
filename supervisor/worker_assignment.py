@@ -233,6 +233,7 @@ def _claim_worker_launch(queue, candidate, worker):
     """Commit prepared work to the local worker queue under Pause's lock."""
     from types import SimpleNamespace
     from ouroboros.owner_pause import launch_admission, OwnerPauseRefused
+    from supervisor.task_admission import record_project_dispatch_possible
 
     try:
         from supervisor.followup_policy import scheduled_start
@@ -251,11 +252,13 @@ def _claim_worker_launch(queue, candidate, worker):
                     root_resume=resume if not latch or selected_child else None):
                 prior = candidate.get("admitted_dispatch")
                 candidate["admitted_dispatch"] = "possible"
-                if not queue.persist_queue_snapshot(reason="worker_launch_claimed"):
+                if queue.persist_queue_snapshot(reason="worker_launch_claimed") is not True:
                     candidate["admitted_dispatch"] = prior
                     return False
-                if not record_dispatch_possible(candidate):
-                    return False  # no physical handoff before verified occurrence custody
+                # Durable Project handoff evidence, then the schedule receipt
+                # (#1315): no physical handoff before both are verified.
+                if not record_project_dispatch_possible(candidate) or not record_dispatch_possible(candidate):
+                    return False
                 _mirror_assigned_running_status(candidate)
                 worker.in_q.put(candidate)
                 return True
@@ -277,13 +280,12 @@ def assign_tasks() -> None:
         st = _pool().load_state()
         # Custody wins; quarantine malformed depth before budget/lease filters.
         if not _pool()._drop_cancelled_pending():
-            log.error(
-                "Task assignment blocked: cancellation authority or custody "
-                "state is indeterminate",
-            )
+            log.error("Task assignment blocked: cancellation authority or custody state is indeterminate")
             queue.persist_queue_snapshot(reason="cancellation_authority_indeterminate")
             return
         _pool()._retry_terminalization_pending_for_assignment(queue)
+        from supervisor.task_admission import revalidate_project_holds
+        revalidate_project_holds()
         invalid_ids, unresolved_invalid_ids = _pool()._quarantine_invalid_pending_depths()
         unresolved_invalid_id_set = set(unresolved_invalid_ids)
 
@@ -426,7 +428,7 @@ def assign_tasks() -> None:
         from ouroboros.project_lease import candidate_is_leasable, running_project_ids
         from ouroboros.config import get_max_active_subagents_per_root
 
-        refused_this_pass = set()
+        refused_this_pass = set()  # one attempt per row per Q-held pass; retry next tick
         for w in _pool().WORKERS.values():
             while (w.busy_task_id is None and not getattr(w, "reaping", False)
                     and getattr(w, "active_capacity", True) and _pool().PENDING):
@@ -437,7 +439,8 @@ def assign_tasks() -> None:
                 # and project-leased candidates)
                 chosen_idx = None
                 for i, candidate in enumerate(_pool().PENDING):
-                    if str(candidate.get("id") or "") in refused_this_pass or candidate.get("_owner_hold"):
+                    if (str(candidate.get("id") or "") in refused_this_pass or candidate.get("_owner_hold")
+                            or candidate.get("_project_admission_restore_hold")):
                         continue
                     if remaining <= 0 and not candidate.get("_owner_wait_resume"):
                         continue

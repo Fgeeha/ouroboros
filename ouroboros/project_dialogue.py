@@ -623,6 +623,7 @@ ROUTING_REFUSAL_CAUSES: Dict[str, str] = {
     "task_id_lookup_failed": "the task record could not be read",
     "empty_objective": "the request was empty",
     "project_routing_fence": "the project no longer accepts new work",
+    "project_routing_fence_changed": "the project changed while the task was being prepared",
     "project_routing_fence_lookup_failed": "the project state could not be checked",
     "project_binding_failed": "the project could not be set up",
     "project_registration_failed": "the project could not be set up",

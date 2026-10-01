@@ -48,6 +48,8 @@ export function desiredLiveCardPhase(record = {}, terminalPhase = 'done') {
     if (record.modelWaiting) return {
         phase: 'working', text: 'Waiting for access', className: 'chat-live-phase working waiting',
     };
+    // A census Project/scope verification hold: an unfinished, static amber wait.
+    if (record.projectHold) return { phase: 'working', text: record.projectHold, className: 'chat-live-phase warn' };
     return { phase: 'working', text: 'Working', className: 'chat-live-phase working' };
 }
 
@@ -137,8 +139,8 @@ export function setLiveCardPhaseSecondary(record, text = '') {
 // remains unfinished without pretending the paused role is doing computation.
 export function setLiveCardTypingVisible(record, visible) {
     if (!record?.inlineTypingEl) return false;
-    const display = visible && !record.modelWaiting && !['budget_paused', 'unknown'].includes(record.parkedPhase) && !record.reviewAnchor
-        && !record.historicalUnavailable && !record.historicalUnconfirmed ? '' : 'none';
+    const display = visible && !record.modelWaiting && !record.projectHold && !['budget_paused', 'unknown'].includes(record.parkedPhase)
+        && !record.reviewAnchor && !record.historicalUnavailable && !record.historicalUnconfirmed ? '' : 'none';
     if (record.inlineTypingEl.style.display === display) return false;
     record.inlineTypingEl.style.display = display;
     return Boolean(record.inlineTypingEl.isConnected);
@@ -154,8 +156,15 @@ export function setInertCardPresentation(record, enabled) {
     setLiveCardTypingVisible(record, !enabled && !record.finished);
 }
 
-export function setHistoricalUnavailable(record, enabled) {
-    if (!record || (Boolean(record.historicalUnavailable) === enabled && !record.historicalUnconfirmed)) return false;
+// Census/queue reads carry the host's hold fact; {} clears it after recovery.
+// Undefined preserves the recorded fact across unrelated presentation writes.
+export function setHistoricalUnavailable(record, enabled, held) {
+    const label = typeof held === 'string' ? held : held?.label || '';
+    const detail = held?.detail || '';
+    const holdChanged = Boolean(record) && held !== undefined
+        && ((record.projectHold || '') !== label || (record.projectHoldDetail || '') !== detail);
+    if (holdChanged) Object.assign(record, { projectHold: label, projectHoldDetail: detail });
+    if (!record || (!holdChanged && Boolean(record.historicalUnavailable) === enabled && !record.historicalUnconfirmed)) return false;
     record.historicalUnavailable = enabled;
     record.historicalUnconfirmed = false;
     setInertCardPresentation(record, enabled || Boolean(record.reviewAnchor));

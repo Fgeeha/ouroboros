@@ -605,6 +605,7 @@ def _fake_ctx(tmp_path, enqueued):
 
         def enqueue_task(self, task):
             enqueued.append(task)
+            return task
 
         def persist_queue_snapshot(self, reason=""):
             return None

@@ -417,6 +417,8 @@ def _chat_activities_snapshot_safe(drive_root: Any, task_bindings: Any = None, *
                 return False
 
         def _activity(task_id: str, row: Dict[str, Any], phase: str, started_at: float) -> Dict[str, Any]:
+            from ouroboros.project_admission import project_hold_fact
+
             if phase == "unknown" and availability is not None:
                 availability["complete"] = False
             return {
@@ -429,6 +431,8 @@ def _chat_activities_snapshot_safe(drive_root: Any, task_bindings: Any = None, *
                 "started_at": started_at,
                 "task_attempt": int(row.get("_attempt") or 1),
                 **({"model_waits": row["model_waits"]} if row.get("model_waits") else {}),
+                **({"project_admission_hold": project_hold_fact(row)}
+                   if row.get("_project_admission_restore_hold") else {}),
             }
 
         from supervisor.queue_transitions import budget_pause_fact

@@ -205,14 +205,9 @@ def enqueue_evolution_task_if_needed() -> None:
             role="system", system_type="evolution_notice")
         return
 
-    # BUG3: pause if the SAME objective has been re-proposed and no-op'd
-    # OBJECTIVE_REPEAT_CAP times without ever absorbing. This is a SEPARATE
-    # breaker from consecutive_failures above: that counter is reset to 0 by
-    # ANY non-failing cycle (events.py), so it cannot catch a self-maintenance
-    # loop where a blocked objective is re-proposed NON-consecutively
-    # (interleaved with other no_op work). The per-objective count is keyed on
-    # the same canonical fingerprint the transaction stamps, accumulates across
-    # non-consecutive recurrence, and is cleared only on a genuine absorb.
+    # Objective repeats count non-consecutive no-ops by the transaction's canonical
+    # fingerprint, clearing only on absorption. The failure streak cannot catch
+    # these loops because every non-failing cycle resets it (events.py).
     objective_repeat_counts = campaign.get("objective_repeat_counts") or {}
     active_objective_fp = canonical_objective_fingerprint(
         str(campaign.get("objective") or ""),
@@ -263,6 +258,7 @@ def enqueue_evolution_task_if_needed() -> None:
             "🧬 Evolution stayed off: the campaign changed before its next task could be attached. Start it again when ready.",
             role="system", system_type="evolution_notice")
         return
+    tid = transaction["task_id"]  # only a positively refused attempt retains its identity
     task = {
         "id": tid, "type": "evolution",
         "chat_id": int(owner_chat_id),
@@ -270,20 +266,23 @@ def enqueue_evolution_task_if_needed() -> None:
         "metadata": {"evolution_transaction": transaction, **consciousness_origin_metadata(campaign)},
     }
     q.attach_task_contract(task)
-    admitted = q.enqueue_task(task)
+    def prepare_admission(row: Dict[str, Any]) -> bool:
+        refreshed = q.begin_evolution_transaction(tid, cycle=cycle, campaign=campaign, transaction=transaction)
+        if refreshed:
+            row["metadata"]["evolution_transaction"] = refreshed
+        return bool(refreshed)
+
+    admitted = q.enqueue_with_admission_receipt(task, prepare_admission=prepare_admission)
     if isinstance(admitted, dict) and admitted.get("_admission_blocked"):
-        # The ONE admission door refused the cycle (a consciousness campaign out of its
-        # allowance or concurrency, a closed pool): pause the campaign like the other
-        # breakers — once, with an owner line — instead of minting a transaction and
-        # bumping the cycle on every supervisor pass. /evolve start (or the agent at
-        # Full, once its allowance is back) resumes the SAME campaign; the minted
-        # transaction is archived as dispatch_not_persisted by the next one.
+        # Preserve positive no-handoff evidence, never infer it from an idle queue.
+        if admitted.get("_admission_never_admitted") is True:
+            refusal = {"reason": admitted["_admission_blocked"], "source": campaign["source"]}
+            update_evolution_transaction(tid, admission_refused=refusal)
         reason = str(admitted.get("_admission_blocked") or "admission_fence")
         detail = str(admitted.get("_admission_detail") or admitted.get("_worker_pool_disabled_reason") or "")
         if not reason.startswith("consciousness_"):
-            # Any other refusal clears itself (a pool, a reservation): no cycle is recorded
-            # and the next pass tries again, as before — never a pause of the owner's campaign.
-            log.warning("evolution cycle %s was not admitted (%s); retrying on the next pass", tid, reason)
+            if transaction.get("admission_refused", {}).get("reason") != reason:
+                log.warning("evolution cycle %s was not admitted (%s); retrying on the next pass", tid, reason)
             return
         q.pause_evolution_campaign(f"admission_refused:{reason}")
         q.disable_evolution_projection()
@@ -473,19 +472,13 @@ def pause_evolution_campaign(reason: str = "") -> Dict[str, Any]:
 def complete_evolution_campaign(
     reason: str = "", *, status: str = "stopped", cleanup_worktree: bool = True
 ) -> Dict[str, Any]:
-    """Terminally CLOSE the active campaign — the OWNER-stop counterpart of the
-    resumable pause. ``status`` is non-{active,paused}, so a later ``/evolve start``
-    mints a FRESH campaign instead of resurrecting this one. Archives + pops any
-    in-flight ``active_transaction`` (and ``post_task_backlog_id``) so a terminally
-    stopped campaign carries no dangling commit for a boot reconcile to absorb. The
-    durable gate against autonomous re-arm is the ``evolution_owner_stopped`` state
-    flag set at the owner-stop sites (read by ``apply_pending_request``); this terminal
-    status is the observability/audit marker plus a clean campaign. Never raises.
+    """Close rather than pause: a later owner start creates a fresh campaign.
 
-    ``cleanup_worktree`` (default True) runs the deterministic per-cycle worktree reset
-    for an in-flight transaction. PANIC passes ``False``: the Emergency Stop Invariant
-    (BIBLE) forbids delaying panic, so panic must NOT run git stash/reset work before its
-    hard exit — the panic flag + boot reconcile own that recovery instead."""
+    Archive/remove the active transaction and backlog claim so boot cannot absorb
+    a stopped cycle. The owner's sticky evolution_owner_stopped flag independently
+    prevents autonomous re-arm. Never raises. Panic passes cleanup_worktree=False:
+    no git work may delay its hard exit; boot custody owns later recovery.
+    """
     try:
         from supervisor import state
 
@@ -540,8 +533,20 @@ def complete_evolution_campaign(
         return {}
 
 
-def begin_evolution_transaction(task_id: str, *, cycle: int, campaign: Dict[str, Any]) -> Dict[str, Any]:
-    """Attach a compact self-modification transaction to the active campaign."""
+def begin_evolution_transaction(task_id: str, *, cycle: int, campaign: Dict[str, Any],
+                                transaction: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Attach a cycle, or refresh its base under Q immediately before its receipt.
+
+    Clear positive-refusal proof BEFORE admission; interruptions keep orphan custody.
+    """
+    previous = campaign.get("active_transaction")
+    previous = previous if isinstance(previous, dict) else {}
+    refusal = previous.get("admission_refused")
+    objective_fp = canonical_objective_fingerprint(str(campaign.get("objective") or ""))
+    if (transaction is None and isinstance(refusal, dict) and refusal.get("source") == campaign.get("source")
+            and previous.get("objective_fp") == objective_fp and not previous.get("commit_sha")):
+        return dict(previous)
+    expected_transaction = transaction
     try:
         from supervisor import git_ops
 
@@ -558,10 +563,7 @@ def begin_evolution_transaction(task_id: str, *, cycle: int, campaign: Dict[str,
         "campaign_id": str((campaign or {}).get("id") or ""),
         "task_id": str(task_id or ""),
         "cycle": int(cycle or 0),
-        # BUG3: capture the objective this cycle will run, at cycle START, as the SSOT
-        # per-cycle fingerprint. Read here (not at outcome time) because campaign["objective"]
-        # can be overwritten by a later promotion before the outcome is recorded.
-        "objective_fp": canonical_objective_fingerprint(str((campaign or {}).get("objective") or "")),
+        "objective_fp": objective_fp,  # cycle-start truth, not a later campaign objective
         "created_at": utc_now_iso(), "updated_at": utc_now_iso(),
         "base_head": base_head, "base_branch": base_branch,
         "preflight_status": "pending", "advisory_status": "pending", "triad_scope_status": "pending",
@@ -569,6 +571,10 @@ def begin_evolution_transaction(task_id: str, *, cycle: int, campaign: Dict[str,
         "restart_decision": "", "restart_required": False, "restart_verified": False, "restart_verified_at": "",
         "rescue_ref": "", "rescue_path": "", "recovery_hint": "",
     }
+    if expected_transaction is not None:
+        transaction = {**expected_transaction, **{key: transaction[key] for key in
+                       ("base_head", "base_branch", "objective_fp", "cycle")}}
+        transaction.pop("admission_refused", None)
     from supervisor import state
 
     state.assert_test_data_path(state.STATE_PATH)
@@ -585,11 +591,14 @@ def begin_evolution_transaction(task_id: str, *, cycle: int, campaign: Dict[str,
             or not state.control_is(live_state, "evolution_mode_enabled", True)
             or evolution_stop_reason(current)
             or current.get("status") != "active"
-            or str(current.get("id") or "") != str(campaign.get("id") or "")
+            or any(current.get(key) != campaign.get(key) for key in ("id", "source", "objective"))
+            or (expected_transaction is not None and existing_tx != expected_transaction)
             or bool(str(existing_tx.get("commit_sha") or "").strip())
         ):
             return {}
-        if existing_tx:
+        if expected_transaction is not None and existing_tx == transaction:
+            return transaction
+        if existing_tx and expected_transaction is None:
             existing_tx.update({
                 "cycle_outcome": "abandoned",
                 "abandoned_reason": "dispatch_not_persisted",
@@ -602,10 +611,7 @@ def begin_evolution_transaction(task_id: str, *, cycle: int, campaign: Dict[str,
             return {}
         stored = _read_evolution_campaign()
         stored_tx = stored.get("active_transaction")
-        if not isinstance(stored_tx, dict) or any(
-            str(stored_tx.get(key) or "") != str(transaction.get(key) or "")
-            for key in ("campaign_id", "transaction_id", "task_id")
-        ):
+        if stored_tx != transaction:
             return {}
         return transaction
     finally:
@@ -952,9 +958,10 @@ def update_evolution_transaction(task_id: str, **updates: Any) -> bool:
         tx = campaign.get("active_transaction")
         if not isinstance(tx, dict) or str(tx.get("task_id") or "") != str(task_id or ""):
             return False
-        for key, value in updates.items():
-            if value is not None:
-                tx[key] = value
+        updates = {key: value for key, value in updates.items() if value is not None}
+        if all(tx.get(key) == value for key, value in updates.items()):
+            return True
+        tx.update(updates)
         tx["updated_at"] = utc_now_iso()
         campaign["active_transaction"] = tx
         campaign["updated_at"] = utc_now_iso()
@@ -964,19 +971,16 @@ def update_evolution_transaction(task_id: str, **updates: Any) -> bool:
 
 
 def _cleanup_worktree_after_cycle(tx: Dict[str, Any], task_id: str) -> None:
-    """Deterministic worktree cleanup when a cycle closes WITHOUT absorption.
-
-    A no_op/abandoned evolution cycle must leave the repo at its recorded
-    ``base_head``: abandoned edits or unreviewed local commits otherwise leak
-    into the next cycle (and into unrelated tasks) as mystery state. Recovery
-    is never silent — dirty files go into a git stash and an ahead HEAD is
-    preserved as a local branch before the hard reset; both refs are recorded
-    on the transaction. Skipped (with a recorded reason) when other tasks are
-    running in the shared worktree or the base is unknown. Never raises.
-    Kill-switch: OUROBOROS_EVOLUTION_CYCLE_CLEANUP=false.
+    """Restore a no-op/abandoned admitted cycle's base, preserving dirty/ahead work
+    in recorded stash/local refs. Never reset a positively unadmitted cycle or
+    another live writer; unknown base, live tests and the cleanup kill-switch skip
+    cleanup with a reason. Never raises (OUROBOROS_EVOLUTION_CYCLE_CLEANUP=false).
     """
     if str(os.environ.get("OUROBOROS_EVOLUTION_CYCLE_CLEANUP", "true") or "true").lower() in {"0", "false", "no", "off"}:
         tx["cleanup_status"] = "disabled"
+        return
+    if tx.get("admission_refused") and not tx.get("commit_sha"):
+        tx["cleanup_status"] = "skipped_never_admitted"
         return
     base_head = str(tx.get("base_head") or "").strip()
     if not base_head:

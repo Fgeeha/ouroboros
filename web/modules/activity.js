@@ -240,10 +240,12 @@ export function initActivity({ mount, ws } = {}) {
                 : phase === 'budget_pausing' ? 'pausing' : restartHeld ? 'held after Restart'
                 : (paused ? (ownerPaused ? 'paused' : sleeping ? 'sleeping' : 'paused (budget)') : sleeping ? 'sleeping' : kind);
             const meta = `${esc(kindLabel)}${q.type ? ` · ${esc(q.type)}` : ''}${rt}`;
+            const hold = t.project_admission_hold;
+            const projectWait = hold?.label ? ` · ${esc(hold.label)}: ${esc(hold.detail || hold.reason)}` : '';
             return `<div class="activity-row">
                 <div class="activity-row-main">
                     <span class="activity-name">${label}</span>
-                    <span class="activity-sub">${meta}</span>
+                    <span class="activity-sub">${meta}${projectWait}</span>
                 </div>
                 <div class="activity-row-actions">
                     <button type="button" class="btn btn-xs btn-danger" data-act="task-control" data-id="${id}"${resumable ? ' data-budget-paused="1"' : ''}${isRootTaskRow(t, q.id || t.id) ? ' data-root="1"' : ''}>${esc(TASK_CONTROL_TRIGGER_LABEL)}</button>
