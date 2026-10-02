@@ -917,15 +917,12 @@ def _check_ci_status_after_push(repo_dir: pathlib.Path) -> str:
         local_sha = run_cmd(["git", "rev-parse", "HEAD"], cwd=repo_dir).strip()
         if not local_sha:
             return ""
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github+json",
-            "User-Agent": "ouroboros-ci-check",
-        }
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
+                   "User-Agent": "ouroboros-ci-check"}
         import urllib.parse
         runs_url = (
             f"https://api.github.com/repos/{repo}/actions/runs"
-            f"?per_page=10&branch={urllib.parse.quote(branch, safe='')}"
+            f"?per_page=50&branch={urllib.parse.quote(branch, safe='')}"
             f"&event=push&head_sha={urllib.parse.quote(local_sha, safe='')}"
         )
         with urllib.request.urlopen(urllib.request.Request(runs_url, headers=headers), timeout=8) as resp:
@@ -933,10 +930,9 @@ def _check_ci_status_after_push(repo_dir: pathlib.Path) -> str:
         runs = [r for r in (data.get("workflow_runs") or []) if r.get("head_sha") == local_sha]
         if not runs:
             return "\n\n⏳ CI: Run not yet registered — check GitHub Actions in ~30s."
-        # One push starts several workflows (code, browser lane, provider
-        # canaries), so each is reported under its own name and none stands for
-        # the others. The API lists newest first: the first row per workflow is
-        # the one for the latest push of this commit.
+        # One push starts several workflows (code, browser lane, provider canaries): each is
+        # reported under its own name and none stands for the others. The API lists newest
+        # first, so the first row per workflow belongs to the latest push of this commit.
         latest: Dict[str, dict] = {}
         for run in runs:
             latest.setdefault(str(run.get("name") or run.get("path") or "workflow"), run)
@@ -949,43 +945,31 @@ def _check_ci_status_after_push(repo_dir: pathlib.Path) -> str:
         settled = ("success", "skipped", "neutral")  # A workflow whose jobs all skip is not a failure.
         red = [name for name, run in latest.items()
                if run.get("status") == "completed" and states[name] not in settled]
-        failed = red[0] if red else None
-        if failed is None:
+        if not red:
             if all(state in settled for state in states.values()):
                 return f"\n\n✅ CI: registered push runs passed for this commit — {summary}."
             return f"\n\n⏳ CI: push runs in progress — {summary}. Check GitHub Actions for results."
-        completed, conclusion = latest[failed], states[failed]
-        run_number = completed.get("run_number", "?")
-        html_url = completed.get("html_url", "")
-        jobs_url = completed.get("jobs_url", "")
-        failed_summary = "unknown job"
-        if jobs_url:
+        broken = [name for name in red if states[name] == "failure"]
+        first = latest[(broken or red)[0]]  # The run whose number, jobs and URL the note carries.
+        headline = f"{', '.join(broken)} FAILED" if broken else f"{red[0]} {states[red[0]].upper()}"
+        lines = [f"\n\n⚠️ CI STATUS: {headline} for this commit (run #{first.get('run_number', '?')})",
+                 f"  Workflows: {summary}"]
+        if broken:
+            failed_summary = "unknown job"
             try:
-                with urllib.request.urlopen(urllib.request.Request(jobs_url, headers=headers), timeout=8) as jresp:
+                request = urllib.request.Request(first.get("jobs_url", ""), headers=headers)
+                with urllib.request.urlopen(request, timeout=8) as jresp:
                     jdata = json.loads(jresp.read().decode("utf-8"))
-                failed_parts = []
-                for job in jdata.get("jobs") or []:
-                    if job.get("conclusion") == "failure":
-                        failed_step = next((s.get("name", "?") for s in job.get("steps") or []
-                                            if s.get("conclusion") == "failure"), "?")
-                        failed_parts.append(f"{job.get('name', '?')} → {failed_step}")
-                if failed_parts:
-                    failed_summary = "; ".join(failed_parts)
+                failed_parts = [
+                    f"{job.get('name', '?')} → " + next((s.get("name", "?") for s in job.get("steps") or []
+                                                         if s.get("conclusion") == "failure"), "?")
+                    for job in jdata.get("jobs") or [] if job.get("conclusion") == "failure"]
+                failed_summary = "; ".join(failed_parts) or failed_summary
             except Exception:
-                pass  # Fall back to generic summary — run_number/html_url still surfaced below
-        if conclusion == "failure":
-            return (
-                f"\n\n⚠️ CI STATUS: {', '.join(red)} FAILED for this commit (run #{run_number})\n"
-                f"  Workflows: {summary}\n"
-                f"  Failed: {failed_summary}\n"
-                f"  Fix: investigate the failed jobs; push a fix commit when this commit caused them.\n"
-                f"  URL: {html_url}"
-            )
-        return (
-            f"\n\n⚠️ CI STATUS: {failed} {conclusion.upper()} for this commit (run #{run_number})\n"
-            f"  Workflows: {summary}\n"
-            f"  URL: {html_url}"
-        )
+                pass  # The run number and URL below still locate the failure.
+            lines += [f"  Failed: {failed_summary}",
+                      "  Fix: investigate the failed jobs; push a fix commit when this commit caused them."]
+        return "\n".join(lines + [f"  URL: {first.get('html_url', '')}"])
     except Exception:
         return ""
 

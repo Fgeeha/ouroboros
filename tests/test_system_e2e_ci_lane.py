@@ -167,7 +167,7 @@ def test_the_scheduled_lane_asks_for_no_secret():
 
 def test_the_daily_schedule_does_not_wake_the_paid_provider_lane():
     """A scheduled run reports the default branch in github.ref. The leading
-    event guard keeps both crons off the paid lane whatever ref conditions
+    event guard keeps the schedule off the paid lane whatever ref conditions
     follow it; the push workflow that serves branch pushes has no schedule."""
     condition = " ".join(str(_workflow()["jobs"]["integration-test"]["if"]).split())
     assert condition.startswith("github.event_name != 'schedule'"), condition

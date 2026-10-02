@@ -244,7 +244,9 @@ jobs:
   # ──────────────────────────────────────────────────────────────────
   # Tier 2: Windows/macOS for every PR and every landed `ouroboros` push (Ubuntu is
   # quick-test there); full 3-OS matrix for stable, manual runs and tags. The landed
-  # push is what tells a later PR that a Windows/macOS failure is inherited.
+  # push is what tells a later PR that a Windows/macOS failure is inherited. It runs
+  # in this repository only: an install that pushes its own commits to a private copy
+  # would pay Windows and macOS minutes for every self-modification.
   # ──────────────────────────────────────────────────────────────────
   full-test:
     if: |
@@ -252,7 +254,7 @@ jobs:
       || github.event_name == 'workflow_dispatch'
       || startsWith(github.ref, 'refs/tags/v')
       || (github.event_name == 'pull_request' && github.base_ref == 'ouroboros')
-      || (github.event_name == 'push' && github.ref == 'refs/heads/ouroboros')
+      || (github.event_name == 'push' && github.ref == 'refs/heads/ouroboros' && github.repository == 'razzant/ouroboros')
     strategy:
       fail-fast: false
       matrix:
@@ -392,7 +394,7 @@ jobs:
   # ──────────────────────────────────────────────────────────────────
   integration-test:
     # A scheduled run is neither a manual run nor a tag. The leading guard keeps
-    # the nightly crons above OFF this paid lane even if a branch-ref condition
+    # the nightly cron above OFF this paid lane even if a branch-ref condition
     # joins the group below: a scheduled run carries the default branch in
     # github.ref.
     if: |

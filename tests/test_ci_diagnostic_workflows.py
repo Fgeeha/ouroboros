@@ -120,9 +120,32 @@ def _canary_wiring_faults(ci, shared, push):
 
 def test_provider_canaries_share_one_body_between_the_code_workflow_and_the_push_wrapper():
     assert _canary_wiring_faults(*map(_workflow, ("ci.yml", CANARY, CANARY_PUSH))) == []
+    callers = []
     for path in sorted((ROOT / ".github/workflows").glob("*.yml")):
-        for job in _workflow(path.name)["jobs"].values():
+        for name, job in _workflow(path.name)["jobs"].items():
             assert job.get("secrets") != "inherit", path.name  # Would hand over signing and live-stand keys.
+            if str(job.get("uses", "")).endswith(f"/{CANARY}"):
+                callers.append((path.name, name))
+    # A third caller is a second paid run for some event.
+    assert callers == [("ci.yml", "integration-test"), (CANARY_PUSH, "integration-test")]
+
+
+def test_provider_canary_workflows_are_protected_exactly_like_ci_yml():
+    """`release-preflight` requires the provider-canary job, whose body and
+    branch-push trigger live in two workflow files beside ci.yml; an inventory
+    naming only the parent would leave the release canary editable."""
+    from ouroboros.runtime_mode_policy import RELEASE_INVARIANT_PATHS, protected_path_category
+    from scripts.run_external_review import _RELEASE_MACHINERY_PATHS
+
+    parent = protected_path_category(".github/workflows/ci.yml")
+    for name in (CANARY, CANARY_PUSH):
+        path = f".github/workflows/{name}"
+        assert (ROOT / path).is_file(), path
+        assert path in RELEASE_INVARIANT_PATHS, path
+        assert path in _RELEASE_MACHINERY_PATHS, path  # The contributor label follows the body too.
+        assert protected_path_category(path) == protected_path_category(f"./{path}") == parent, path
+    # The category follows the listed files, not the directory.
+    assert protected_path_category(".github/workflows/unlisted.yml") == ""
 
 
 CANARY_DRIFTS = {

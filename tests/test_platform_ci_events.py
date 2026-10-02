@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
 
 
-def _value(expression, *, event, ref, base="", schedule="", cancelled=False, attempt=1, e2e_live="false"):
+def _value(expression, *, event, ref, base="", schedule="", cancelled=False, attempt=1, repository="razzant/ouroboros", e2e_live="false"):
     """Evaluate the workflow's small expression vocabulary against real event shapes."""
     expression = expression.strip()
     if expression.startswith("$" + "{{"):
@@ -23,7 +23,7 @@ def _value(expression, *, event, ref, base="", schedule="", cancelled=False, att
     expression = " ".join(expression.split()).replace("&&", " and ").replace("||", " or ")
     expression = re.sub(r"!(?!=)", "not ", expression)
     github = SimpleNamespace(
-        event_name=event, ref=ref, base_ref=base, run_id=77, run_attempt=attempt,
+        event_name=event, ref=ref, base_ref=base, run_id=77, run_attempt=attempt, repository=repository,
         event=SimpleNamespace(
             schedule=schedule, inputs=SimpleNamespace(e2e_live=e2e_live), before="previous-tip",
             pull_request=SimpleNamespace(number=42, base=SimpleNamespace(sha="pr-base")),
@@ -156,3 +156,17 @@ def test_only_a_new_pull_request_head_cancels_a_run(event, attempt, group, cance
     facts = {"event": event, "ref": "refs/heads/candidate", "attempt": attempt}
     assert _value(concurrency["group"], **facts) == group
     assert bool(_value(concurrency["cancel-in-progress"], **facts)) is cancels
+
+
+def test_landed_push_desktop_matrix_runs_in_this_repository_only():
+    """A private copy that pushes its own commits keeps the Ubuntu quick job and pays no desktop minutes."""
+    job = WORKFLOW["jobs"]["full-test"]
+    push = {"event": "push", "ref": "refs/heads/ouroboros"}
+    assert _value(job["if"], **push)
+    assert not _value(job["if"], **push, repository="someone/private-copy")
+    assert _value(WORKFLOW["jobs"]["quick-test"]["if"], **push, repository="someone/private-copy")
+    # Pull requests, stable pushes, manual runs and tags keep their matrix in every repository.
+    for event, ref, base in (("pull_request", "refs/pull/42/merge", "ouroboros"),
+                             ("push", "refs/heads/ouroboros-stable", ""),
+                             ("workflow_dispatch", "refs/heads/candidate", ""), ("push", "refs/tags/v7.0.0", "")):
+        assert _value(job["if"], event=event, ref=ref, base=base, repository="someone/private-copy")

@@ -460,6 +460,10 @@ def test_ci_note_attributes_a_failure_to_its_workflow(monkeypatch):
     assert skipped.startswith("\n\n✅") and "Sync mirror: skipped" in skipped
     cancelled = _ci_note(monkeypatch, [{"name": "CI", "status": "completed", "conclusion": "cancelled"}])
     assert "⚠️ CI STATUS: CI CANCELLED for this commit (run #1)" in cancelled
+    # A cancelled workflow beside a failed one: only the failure is called FAILED, and its jobs are read.
+    mixed = _ci_note(monkeypatch, [{"name": "CI", "status": "completed", "conclusion": "cancelled"}, runs[1]], jobs)
+    assert "⚠️ CI STATUS: Provider canaries FAILED for this commit (run #2)" in mixed
+    assert "CI: cancelled" in mixed and "  Failed: integration-test / integration-test" in mixed
 
 
 def test_ci_note_stays_empty_when_github_is_unreachable(monkeypatch):
