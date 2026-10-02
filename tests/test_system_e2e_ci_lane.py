@@ -9,10 +9,10 @@ and the plan's §8 pull-request lane was replaced by a daily schedule (owner
 
 Two properties are load-bearing enough to pin. The job must stay OFF push and
 pull_request, or the lane it was made cheap for becomes the slowest thing in
-every PR. And the daily schedule must not wake the PAID provider lane: three
-of `integration-test`'s branch conditions match the default branch ref a
-scheduled run carries, so without an explicit event guard adding `schedule:`
-to this workflow would spend real provider credit every night.
+every PR. And the daily schedule must not wake the PAID provider lane: a
+scheduled run carries the default branch in its ref, so `integration-test`
+leads with an explicit event guard that holds whatever ref conditions follow
+it, and no cron spends real provider credit.
 """
 
 from __future__ import annotations
@@ -93,14 +93,15 @@ def _job_text(job: str) -> str:
 MOCK_CRON = "37 4 * * *"
 
 
-def test_the_workflow_carries_daily_off_peak_schedules_each_owned_by_one_job():
+def test_the_workflow_carries_one_daily_off_peak_schedule_owned_by_one_job():
     workflow = _workflow()
     schedule = _triggers(workflow).get("schedule") or []
     crons = [str(entry["cron"]) for entry in schedule]
-    # Two crons: this keyless lane and the paid `e2e-live` stand
-    # (tests/test_e2e_live_ci_lane.py). A cron nobody binds to is a second
-    # nightly wake-up of every job gated on the bare event name.
-    assert crons == [MOCK_CRON, "17 3 * * *"], schedule
+    # One cron: this keyless lane. The paid `e2e-live` stand runs only on its
+    # opt-in dispatch input (tests/test_e2e_live_ci_lane.py). A cron nobody
+    # binds to is a second nightly wake-up of every job gated on the bare
+    # event name.
+    assert crons == [MOCK_CRON], schedule
     for entry in schedule:
         minute, hour, day, month, weekday = str(entry["cron"]).split()
         assert (day, month, weekday) == ("*", "*", "*"), entry
@@ -108,12 +109,12 @@ def test_the_workflow_carries_daily_off_peak_schedules_each_owned_by_one_job():
         # On the hour is when everyone else's cron fires and GitHub's queue is
         # deepest; an off-peak minute is the documented way to avoid the backlog.
         assert int(minute) != 0, entry
-    # Every job that fires on `schedule` names ITS cron string, so neither cron
-    # wakes the other lane: a bare `github.event_name == 'schedule'` would.
+    # Every job that fires on `schedule` names ITS cron string, so a cron added
+    # for another lane never wakes it: a bare `github.event_name == 'schedule'` would.
     for name, job in workflow["jobs"].items():
         condition = " ".join(str(job.get("if", "")).split())
         if "github.event_name == 'schedule'" not in condition:
-            continue  # `!= 'schedule'` guards (integration-test) keep a lane OFF both crons
+            continue  # `!= 'schedule'` guards (integration-test) keep a lane OFF every cron
         assert "github.event.schedule ==" in condition, (name, condition)
         assert "github.event_name == 'schedule' ||" not in condition, (name, condition)
 
@@ -165,8 +166,10 @@ def test_the_scheduled_lane_asks_for_no_secret():
 
 
 def test_the_daily_schedule_does_not_wake_the_paid_provider_lane():
-    """`integration-test` fires on refs/heads/main|ouroboros|ouroboros-stable —
-    one of which is whatever default branch a scheduled run reports. Without
-    this guard the new cron would buy provider credit every night."""
+    """A scheduled run reports the default branch in github.ref. The leading
+    event guard keeps the schedule off the paid lane whatever ref conditions
+    follow it; the push workflow that serves branch pushes has no schedule."""
     condition = " ".join(str(_workflow()["jobs"]["integration-test"]["if"]).split())
     assert condition.startswith("github.event_name != 'schedule'"), condition
+    push = yaml.safe_load((CI_PATH.parent / "provider-canary-push.yml").read_text(encoding="utf-8"))
+    assert list(push.get("on", push.get(True))) == ["push"]

@@ -117,13 +117,12 @@ def test_pull_request_ci_is_fork_safe_and_does_not_enable_provider_jobs():
 
     assert "pull_request:\n    branches: [ouroboros]" in workflow
     assert "\n  pull_request_target:" not in workflow
-    # A schedule IS admitted now (owner 9A: the keyless system-e2e-mock lane),
-    # so what this used to say by banning the trigger outright it now says
-    # directly — the unattended run must not reach the paid provider job. Its
-    # branch conditions match the default branch ref a cron run carries, hence
-    # the explicit event guard, which has to come FIRST to gate the whole `||`.
+    # A schedule IS admitted (owner 9A: the keyless system-e2e-mock lane), so
+    # the unattended run must not reach the paid provider job. A cron run
+    # carries the default branch ref, hence the explicit event guard, which has
+    # to come FIRST to gate the whole `||` whatever ref conditions follow it.
     assert "github.event_name != 'schedule'" in workflow.partition(
-        "\n  integration-test:\n")[2].partition("\n    runs-on:")[0]
+        "\n  integration-test:\n")[2].partition("\n    uses:")[0]
     assert "permissions:\n  contents: read" in workflow
     assert "github.event_name == 'pull_request' && github.base_ref == 'ouroboros'" in workflow
     assert "secrets." not in quick_job
@@ -132,9 +131,12 @@ def test_pull_request_ci_is_fork_safe_and_does_not_enable_provider_jobs():
 
 
 def test_trusted_provider_ci_wires_full_secret_policy_and_release_dependency():
-    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
-        encoding="utf-8"
-    )
+    workflows = ROOT / ".github" / "workflows"
+    workflow = (workflows / "ci.yml").read_text(encoding="utf-8")
+    # The canary steps live in one reusable file; ci.yml calls it for manual
+    # runs and tags, the push workflow for the three shared branches.
+    shared = (workflows / "provider-canary.yml").read_text(encoding="utf-8")
+    push = (workflows / "provider-canary-push.yml").read_text(encoding="utf-8")
     integration_job = workflow.partition("\n  integration-test:\n")[2].partition(
         "\n  # ──────────────────────────────────────────────────────────────────"
     )[0]
@@ -143,15 +145,14 @@ def test_trusted_provider_ci_wires_full_secret_policy_and_release_dependency():
     )[0]
 
     assert integration_job
+    assert "uses: ./.github/workflows/provider-canary.yml" in integration_job
     assert "github.event_name == 'pull_request'" not in integration_job
     assert "github.event_name == 'workflow_dispatch'" in integration_job
-    for ref in (
-        "refs/heads/main",
-        "refs/heads/ouroboros",
-        "refs/heads/ouroboros-stable",
-        "refs/tags/v",
-    ):
-        assert ref in integration_job
+    assert "refs/tags/v" in integration_job
+    assert "refs/heads/" not in integration_job
+    assert "\n  push:\n    branches: [main, ouroboros, ouroboros-stable]\n" in push
+    assert "uses: ./.github/workflows/provider-canary.yml" in push
+    assert "pull_request" not in push
 
     for secret in (
         "OPENROUTER_API_KEY",
@@ -161,9 +162,10 @@ def test_trusted_provider_ci_wires_full_secret_policy_and_release_dependency():
         "CLOUDRU_FOUNDATION_MODELS_API_KEY",
         "GIGACHAT_CREDENTIALS",
     ):
-        assert f"{secret}: ${{{{ secrets.{secret} }}}}" in integration_job
+        for text in (integration_job, shared, push):
+            assert f"{secret}: ${{{{ secrets.{secret} }}}}" in text
 
-    assert " -rs " in integration_job
+    assert " -rs " in shared
     assert "needs: [full-test, integration-test, system-e2e-mock]" in release_preflight
 
 

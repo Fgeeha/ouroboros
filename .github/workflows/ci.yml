@@ -1,12 +1,12 @@
 # Ouroboros CI — Five-tier cross-platform testing and release pipeline
 #
-# Tier 1 (Quick):       Push to ouroboros or PR targeting ouroboros                   → Ubuntu-only tests (~1 min)
-# Tier 2 (Full):        Every PR → Windows/macOS; stable / manual / tag → full 3-OS matrix (~5 min)
-# Tier 2.5 (Integration): Push to main / ouroboros / ouroboros-stable / manual / tag  → Real-provider tests       (~2 min)
+# Tier 1 (Quick):       Push to ouroboros or PR targeting ouroboros                   → Ubuntu-only tests
+# Tier 2 (Full):        Every PR and every ouroboros push → Windows/macOS; stable / manual / tag → full 3-OS matrix
+# Tier 2.5 (Integration): Manual / tag (branch pushes: provider-canary-push.yml)       → Real-provider tests, reusable provider-canary.yml (~2 min)
 # Tier 2.6 (Skill smoke): Push to ouroboros-stable / manual / tag                     → LIVE OuroborosHub official-skill install smoke (3-OS, ~5 min) + review→grant→enable-persistence flow on one cheap reviewer slot (ubuntu-only step, OPENROUTER_API_KEY, ~$1.2/run)
 # Tier 3 (Build+Release): Tag v*                                                       → PyInstaller + GitHub Release (~15 min)
 # Scheduled (System E2E): Daily cron / manual                                          → KEYLESS tests/system_e2e/ scenario lane (Ubuntu, ≤40 min)
-# Scheduled (Live E2E):   Nightly cron 03:17 UTC (ouroboros tip) / dispatch input e2e_live=true → PAID devtools/e2e_live stand, $30 cap, OUROBOROS_E2E_LIVE_OPENROUTER_KEY (skipped honestly without it)
+# Manual (Live E2E):      Dispatch input e2e_live=true only (no schedule)                → PAID devtools/e2e_live stand, $30 cap, OUROBOROS_E2E_LIVE_OPENROUTER_KEY (skipped honestly without it)
 #
 # Tier 2.5 requires OPENROUTER_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY.
 # Optional MiniMax / DeepSeek / Cloud.ru / GigaChat rows run when their
@@ -67,16 +67,16 @@ on:
         description: 'Run the paid live E2E stand ($30 cap; needs the OUROBOROS_E2E_LIVE_OPENROUTER_KEY secret)'
         type: boolean
         default: false
-  # Two crons, each owned by exactly ONE job through `github.event.schedule`:
-  # 04:37 is the keyless system-e2e-mock lane, 03:17 the paid e2e-live stand.
-  # Off the hour deliberately: GitHub's cron queue is deepest at :00. NOTE for
-  # any job added later — a scheduled run reports the DEFAULT BRANCH in
-  # github.ref, so a job gated on a branch ref alone will fire on BOTH crons
-  # (see integration-test), and a job gated on the bare event name fires twice
-  # a night — bind it to its own cron string.
+  # One cron, owned by exactly ONE job through `github.event.schedule`: 04:37
+  # is the keyless system-e2e-mock lane (the paid e2e-live stand runs only on
+  # its opt-in dispatch input). Off the hour deliberately: GitHub's cron queue
+  # is deepest at :00. NOTE for any job added later — a scheduled run reports
+  # the DEFAULT BRANCH in github.ref, so a job gated on a branch ref alone fires
+  # on the schedule (integration-test carries the explicit event guard), and a
+  # job gated on the bare event name fires on every cron this block carries —
+  # bind a scheduled job to its own cron string.
   schedule:
     - cron: '37 4 * * *'
-    - cron: '17 3 * * *'
 
 # Note: GitHub Actions evaluates `branches` + `paths` together but `tags`
 # separately — a tag push matching `v*` will trigger regardless of paths.
@@ -85,6 +85,14 @@ on:
 # this narrowly with contents: write when publishing a tag.
 permissions:
   contents: read
+
+# A new push to a pull request cancels the run for its previous head. Every other
+# event, and every re-run, gets a group of its own: GitHub keeps one pending run per
+# group, so a shared group would let a re-run of an old head displace the new one,
+# and a release, a scheduled or a landed-commit run must never be cancelled.
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && github.run_attempt == 1 && format('ci-pr-{0}', github.event.pull_request.number) || format('ci-run-{0}-{1}', github.run_id, github.run_attempt) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.run_attempt == 1 }}
 
 jobs:
   # ──────────────────────────────────────────────────────────────────
@@ -152,12 +160,22 @@ jobs:
       # NOTE: a command-line `-m` REPLACES the pyproject `addopts` markexpr, so the default
       # `not integration and not browser ...` exclusions must be repeated here, then ANDed with
       # the serial split. --timeout guards against a hung test blocking the whole job.
+      # Each producer step also carries a wall-clock ceiling well above its slowest
+      # observed platform: the serial pass has no per-test timeout (the commit gate's
+      # serial pass has none either), so the ceiling is what bounds a hang there. Its
+      # expiry fails that step, and with it the job, without cancelling the job: the
+      # evidence step below still names the test. On Linux and macOS the killed step's
+      # pytest can linger beside the later steps until the runner cleans up the job.
       - name: Run tests (parallel — excludes the costly marker lanes AND the serial real-process suites)
+        id: tests_parallel
+        timeout-minutes: 90
         if: ${{ !cancelled() && steps.setup_python.outcome == 'success' }}
-        run: python -m pytest tests/ -m "not serial and not integration and not browser and not ui_browser and not ui_browser_docker and not portable_detail and not skill_smoke and not size_ratchet" -n auto --dist loadscope --max-worker-restart=0 --timeout=300 --timeout-method=thread -q --tb=short
+        run: python -m pytest tests/ -m "not serial and not integration and not browser and not ui_browser and not ui_browser_docker and not portable_detail and not skill_smoke and not size_ratchet" -n auto --dist loadscope --max-worker-restart=0 --timeout=300 --timeout-method=thread -q --tb=short --ci-evidence-dir="${{ runner.temp }}/ci-evidence/parallel"
       - name: Run tests (serial — real subprocess/port/global-state suites that flake under -n)
+        id: tests_serial
+        timeout-minutes: 60
         if: ${{ !cancelled() && steps.setup_python.outcome == 'success' }}
-        run: python -m pytest tests/ -m "serial and not integration and not browser and not ui_browser and not ui_browser_docker and not portable_detail and not skill_smoke and not size_ratchet" -q --tb=short
+        run: python -m pytest tests/ -m "serial and not integration and not browser and not ui_browser and not ui_browser_docker and not portable_detail and not skill_smoke and not size_ratchet" -q --tb=short --ci-evidence-dir="${{ runner.temp }}/ci-evidence/serial"
       # OFFICIAL-CI-ONLY enforcement of the repository size gates: manifest
       # exactness against this tree plus the pairwise base-vs-tip shrink-only
       # transition. Local runs exclude the `size_ratchet` marker and surface
@@ -169,13 +187,24 @@ jobs:
       # degrades to the tip's tree-verified parent manifest — never a skip;
       # a resolvable base without the manifest fails closed.
       - name: Run tests (size-ratchet lane — blocking here, warning-only locally)
+        id: tests_size
+        timeout-minutes: 20
         if: ${{ !cancelled() && steps.setup_python.outcome == 'success' }}
         env:
           OURO_SIZE_RATCHET_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
-        run: python -m pytest tests/ -m size_ratchet -q --tb=short
+        run: python -m pytest tests/ -m size_ratchet -q --tb=short --ci-evidence-dir="${{ runner.temp }}/ci-evidence/size"
       - name: Guard extracted transport imports stay out of core
         if: ${{ !cancelled() && steps.setup_python.outcome == 'success' }}
         run: python -m pytest tests/test_no_core_a2a_telegram_imports.py -q
+      # Names the failed, crashed and in-flight tests in the job summary and as
+      # annotations; a killed step still reports through its incremental journal.
+      - name: Publish test evidence
+        if: ${{ !cancelled() && steps.setup_python.outcome == 'success' }}
+        continue-on-error: true
+        uses: ./.github/actions/test-evidence
+        with:
+          name: quick-test
+          passes: parallel=${{ steps.tests_parallel.outcome }} serial=${{ steps.tests_serial.outcome }} size=${{ steps.tests_size.outcome }}
 
   # ──────────────────────────────────────────────────────────────────
   # Benchmark methodology tests (owner decision R42). The devtools/benchmarks
@@ -213,7 +242,11 @@ jobs:
         run: python -m pytest tests/test_devtools_benchmarks.py devtools/benchmarks -m "not integration and not browser and not ui_browser and not ui_browser_docker and not portable_detail and not skill_smoke and not size_ratchet" --timeout=300 --timeout-method=thread -q --tb=short
 
   # ──────────────────────────────────────────────────────────────────
-  # Tier 2: Ordinary tests on PR Windows/macOS; full 3-OS stable/manual/tag matrix
+  # Tier 2: Windows/macOS for every PR and every landed `ouroboros` push (Ubuntu is
+  # quick-test there); full 3-OS matrix for stable, manual runs and tags. The landed
+  # push is what tells a later PR that a Windows/macOS failure is inherited. It runs
+  # in this repository only: an install that pushes its own commits to a private copy
+  # would pay Windows and macOS minutes for every self-modification.
   # ──────────────────────────────────────────────────────────────────
   full-test:
     if: |
@@ -221,10 +254,11 @@ jobs:
       || github.event_name == 'workflow_dispatch'
       || startsWith(github.ref, 'refs/tags/v')
       || (github.event_name == 'pull_request' && github.base_ref == 'ouroboros')
+      || (github.event_name == 'push' && github.ref == 'refs/heads/ouroboros' && github.repository == 'razzant/ouroboros')
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(github.event_name == 'pull_request' && '["windows-latest","macos-latest"]' || '["ubuntu-latest","windows-latest","macos-latest"]') }}
+        os: ${{ fromJSON((github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/ouroboros')) && '["windows-latest","macos-latest"]' || '["ubuntu-latest","windows-latest","macos-latest"]') }}
     runs-on: ${{ matrix.os }}
     env:
       # Same contract as quick-test: this job provisions the parallel-pass
@@ -276,24 +310,39 @@ jobs:
       # A command-line `-m` REPLACES the pyproject addopts markexpr, so repeat the default
       # marker-lane exclusions and AND them with the serial split. --timeout guards hangs.
       - name: Run tests (parallel — excludes the costly marker lanes AND the serial real-process suites)
+        id: tests_parallel
+        timeout-minutes: 90
         if: ${{ !cancelled() && steps.setup_python.outcome == 'success' && (runner.os != 'Windows' || (steps.posix_tools.outcome == 'success' && steps.select_posix_tools.outcome == 'success')) }}
-        run: python -m pytest tests/ -m "not serial and not integration and not browser and not ui_browser and not ui_browser_docker and not portable_detail and not skill_smoke and not size_ratchet" -n auto --dist loadscope --max-worker-restart=0 --timeout=300 --timeout-method=thread -q --tb=short
+        run: python -m pytest tests/ -m "not serial and not integration and not browser and not ui_browser and not ui_browser_docker and not portable_detail and not skill_smoke and not size_ratchet" -n auto --dist loadscope --max-worker-restart=0 --timeout=300 --timeout-method=thread -q --tb=short --ci-evidence-dir="${{ runner.temp }}/ci-evidence/parallel"
       - name: Run tests (serial — real subprocess/port/global-state suites that flake under -n)
+        id: tests_serial
+        timeout-minutes: 60
         if: ${{ !cancelled() && steps.setup_python.outcome == 'success' && (runner.os != 'Windows' || (steps.posix_tools.outcome == 'success' && steps.select_posix_tools.outcome == 'success')) }}
-        run: python -m pytest tests/ -m "serial and not integration and not browser and not ui_browser and not ui_browser_docker and not portable_detail and not skill_smoke and not size_ratchet" -q --tb=short
+        run: python -m pytest tests/ -m "serial and not integration and not browser and not ui_browser and not ui_browser_docker and not portable_detail and not skill_smoke and not size_ratchet" -q --tb=short --ci-evidence-dir="${{ runner.temp }}/ci-evidence/serial"
       # Same size-ratchet enforcement contract as quick-test (see its comment).
-      # PRs carry their base SHA; stable pushes carry event.before; dispatch runs leave
+      # PRs carry their base SHA; branch pushes carry event.before; dispatch runs leave
       # the env empty and tag pushes carry an all-zeros before — both degrade to
       # the tip's parent manifest (never a skip: a skip would let a recreated
       # branch grandfather debt in one green run).
       - name: Run tests (size-ratchet lane — blocking here, warning-only locally)
+        id: tests_size
+        timeout-minutes: 20
         if: ${{ !cancelled() && steps.setup_python.outcome == 'success' && (runner.os != 'Windows' || (steps.posix_tools.outcome == 'success' && steps.select_posix_tools.outcome == 'success')) }}
         env:
           OURO_SIZE_RATCHET_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
-        run: python -m pytest tests/ -m size_ratchet -q --tb=short
+        run: python -m pytest tests/ -m size_ratchet -q --tb=short --ci-evidence-dir="${{ runner.temp }}/ci-evidence/size"
       - name: Guard extracted transport imports stay out of core
         if: ${{ !cancelled() && steps.setup_python.outcome == 'success' && (runner.os != 'Windows' || (steps.posix_tools.outcome == 'success' && steps.select_posix_tools.outcome == 'success')) }}
         run: python -m pytest tests/test_no_core_a2a_telegram_imports.py -q
+      # Names the failed, crashed and in-flight tests in the job summary and as
+      # annotations; a killed step still reports through its incremental journal.
+      - name: Publish test evidence
+        if: ${{ !cancelled() && steps.setup_python.outcome == 'success' }}
+        continue-on-error: true
+        uses: ./.github/actions/test-evidence
+        with:
+          name: full-test-${{ matrix.os }}
+          passes: parallel=${{ steps.tests_parallel.outcome }} serial=${{ steps.tests_serial.outcome }} size=${{ steps.tests_size.outcome }}
 
   # Fork-safe PR proof for the one native secret-scanner dependency. This job
   # carries no provider or repository secret: it exercises the explicit pinned
@@ -335,79 +384,35 @@ jobs:
 
   # ──────────────────────────────────────────────────────────────────
   # Tier 2.5: Integration tests against real provider APIs
-  # Triggered on push to main / ouroboros / ouroboros-stable, manual,
-  # or tag v*. OPENROUTER_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY
-  # are required in the official trusted job; MiniMax / DeepSeek / Cloud.ru /
-  # GigaChat credentials are optional and their absent rows remain visible as skips.
-  # The `integration` pytest marker controls inclusion via `-m integration`.
+  # The job body is the reusable `provider-canary.yml`. This workflow calls it
+  # for manual runs and `v*` tags, where `release-preflight` requires its
+  # result. Branch pushes are deliberately NOT matched here:
+  # `provider-canary-push.yml` owns that trigger and shares the job, so a
+  # provider outage on a landed commit never reddens this workflow.
   # Confirmed provider-contract failures block release-preflight; the test
   # classifier keeps quota/rate-limit/5xx/timeout outcomes inconclusive.
   # ──────────────────────────────────────────────────────────────────
   integration-test:
-    # The leading schedule guard is what keeps the nightly cron above OFF this
-    # paid lane: a scheduled run carries the default branch in github.ref, which
-    # three of the conditions below already match.
+    # A scheduled run is neither a manual run nor a tag. The leading guard keeps
+    # the nightly cron above OFF this paid lane even if a branch-ref condition
+    # joins the group below: a scheduled run carries the default branch in
+    # github.ref.
     if: |
       github.event_name != 'schedule'
       && (github.event_name == 'workflow_dispatch'
-      || github.ref == 'refs/heads/main'
-      || github.ref == 'refs/heads/ouroboros'
-      || github.ref == 'refs/heads/ouroboros-stable'
       || startsWith(github.ref, 'refs/tags/v'))
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup-python-env
-      - name: Run integration tests
-        id: provider_tests
-        env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-          CLOUDRU_FOUNDATION_MODELS_API_KEY: ${{ secrets.CLOUDRU_FOUNDATION_MODELS_API_KEY }}
-          CLOUDRU_FOUNDATION_MODELS_BASE_URL: ${{ secrets.CLOUDRU_FOUNDATION_MODELS_BASE_URL }}
-          GIGACHAT_CREDENTIALS: ${{ secrets.GIGACHAT_CREDENTIALS }}
-        run: >-
-          python -m pytest tests/test_provider_integration.py -m integration -q -rs --tb=short
-          --junitxml="${{ runner.temp }}/ci-private/provider/results.xml"
-          --ci-evidence-dir="${{ runner.temp }}/ci-evidence/provider"
-      - name: Upload provider test evidence
-        id: provider_evidence
-        if: ${{ !cancelled() }}
-        continue-on-error: true
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: provider-ci-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/ci-evidence/provider/
-          retention-days: 30
-          if-no-files-found: warn
-      - name: Summarize provider test results
-        id: provider_summary
-        if: ${{ !cancelled() }}
-        continue-on-error: true
-        env:
-          PRODUCER_OUTCOME: ${{ steps.provider_tests.outcome }}
-          ARTIFACT_OUTCOME: ${{ steps.provider_evidence.outcome }}
-          ARTIFACT_URL: ${{ steps.provider_evidence.outputs.artifact-url }}
-        run: >-
-          python -m tests.ci_evidence summarize
-          --evidence-dir "${{ runner.temp }}/ci-evidence/provider"
-          --producer-outcome "$PRODUCER_OUTCOME"
-          --artifact-outcome "$ARTIFACT_OUTCOME"
-          --artifact-url "$ARTIFACT_URL"
-          --summary "$GITHUB_STEP_SUMMARY"
-      - name: Disclose incomplete provider diagnostics
-        continue-on-error: true
-        if: >-
-          ${{ !cancelled() &&
-          (steps.provider_summary.outcome != 'success' ||
-           steps.provider_evidence.outcome != 'success' ||
-           steps.provider_evidence.outputs.artifact-url == '') }}
-        run: |
-          echo "::warning::Provider diagnostics are incomplete; see the original test and reporting steps."
-          echo "Provider diagnostics_incomplete. The original test outcome is unchanged." >> "$GITHUB_STEP_SUMMARY"
+    uses: ./.github/workflows/provider-canary.yml
+    secrets:
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      CLOUDRU_FOUNDATION_MODELS_API_KEY: ${{ secrets.CLOUDRU_FOUNDATION_MODELS_API_KEY }}
+      CLOUDRU_FOUNDATION_MODELS_BASE_URL: ${{ secrets.CLOUDRU_FOUNDATION_MODELS_BASE_URL }}
+      GIGACHAT_CREDENTIALS: ${{ secrets.GIGACHAT_CREDENTIALS }}
+    permissions:
+      contents: read
 
   # ──────────────────────────────────────────────────────────────────
   # Tier 2.6: Official-skill install smoke against the LIVE OuroborosHub
@@ -620,9 +625,9 @@ jobs:
   # ──────────────────────────────────────────────────────────────────
   system-e2e-mock:
     # Also on a release tag: the release bar must not skip the 57-scenario lane
-    # (owner decision, batch №13 item 4, 2026-09-02). Bound to ITS cron string:
-    # the 03:17 cron belongs to e2e-live and must not run this lane a second
-    # time each night.
+    # (owner decision, batch №13 item 4, 2026-09-02). Bound to ITS cron string,
+    # so a cron another job adds to the schedule block never runs this lane a
+    # second time each night.
     if: |
       (github.event_name == 'schedule' && github.event.schedule == '37 4 * * *')
       || github.event_name == 'workflow_dispatch'
@@ -660,20 +665,17 @@ jobs:
         run: python -m pytest tests/test_e2e_cancellation_scenarios.py -o addopts="" -o faulthandler_timeout=540 -q
 
   # ──────────────────────────────────────────────────────────────────
-  # Scheduled (paid): the LIVE E2E stand (devtools/e2e_live/run_live_lanes.py)
+  # Manual (paid): the LIVE E2E stand (devtools/e2e_live/run_live_lanes.py)
   # exactly as the operator runs it — a clean detached seed of the checked-out
   # commit, one isolated real server per lane, a real OpenRouter key, the
   # post-task evolution cycle with its re-exec restart (--self-mod), the same
-  # flag set as the operator launcher minus the run size. Two triggers only,
-  # never push, PR or tag: (1) a dispatch that OPTS IN through the `e2e_live`
-  # input — a plain `gh workflow run CI` (the pre-tag matrix) never runs this
-  # lane; (2) the nightly 03:17 UTC cron (its own cron string, see the schedule
-  # block). A scheduled run executes the workflow file of the DEFAULT branch
-  # (main, the promoted release line) and reports that branch in
-  # github.sha/github.ref, so the nightly checks out and seeds the `ouroboros`
-  # branch TIP — the development line the nightly is meant to certify — while
-  # a dispatch seeds the dispatched github.sha; the manifest's seed block names
-  # the resolved commit either way. The key is the repository secret
+  # flag set as the operator launcher minus the run size. One trigger only,
+  # never push, PR, tag or schedule: a dispatch that OPTS IN through the
+  # `e2e_live` input — a plain `gh workflow run CI` (the pre-tag matrix) never
+  # runs this lane. A run spends up to $30, so it happens only when someone
+  # asks for it. The stand seeds the dispatched github.sha (a dispatch with
+  # `--ref ouroboros` certifies the development line's tip); the manifest's
+  # seed block names the resolved commit. The key is the repository secret
   # OUROBOROS_E2E_LIVE_OPENROUTER_KEY
   # (the owner creates it; nothing in this repo writes a secret to GitHub):
   # without it the job is SKIPPED honestly — one step-summary line, exit 0 —
@@ -719,9 +721,7 @@ jobs:
   # ──────────────────────────────────────────────────────────────────
   e2e-live:
     name: e2e-live (SM1 x1 — largest subset feasible under the $30 cap)
-    if: |
-      (github.event_name == 'workflow_dispatch' && github.event.inputs.e2e_live == 'true')
-      || (github.event_name == 'schedule' && github.event.schedule == '17 3 * * *')
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.e2e_live == 'true'
     runs-on: ubuntu-latest
     # One SM1 lane: the task (--task-timeout 2400), the self-mod evolution cycle
     # as a second root task, the absorb wait with the re-exec restart, and two
@@ -732,9 +732,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # Nightly: the `ouroboros` branch tip (the schedule itself fires on
-          # the default branch, main); dispatch: the dispatched sha.
-          ref: ${{ github.event_name == 'schedule' && 'ouroboros' || github.sha }}
+          # The dispatched sha: the commit the stand seeds and the manifest names.
+          ref: ${{ github.sha }}
           # Full history + tags: the seed's `git describe` provenance and the
           # SM1 release admission gate read them.
           fetch-depth: 0
@@ -758,9 +757,8 @@ jobs:
       # The key reaches the stand by NAME (--key-env) and this step's env only;
       # the stand redacts the run-level settings template and writes the value
       # solely into the lane's 0600 settings file, disclosed by fingerprint.
-      # --seed HEAD is the checked-out commit (the ouroboros tip on schedule,
-      # the dispatched sha otherwise — GITHUB_SHA names the default branch on
-      # a schedule); the stand resolves it and records the sha in the manifest.
+      # --seed HEAD is the checked-out commit (the dispatched sha); the stand
+      # resolves it and records the sha in the manifest.
       - name: Run the live E2E stand (SM1 x1, $30 cap, self-mod)
         if: env.HAS_E2E_LIVE_KEY == 'true'
         env:

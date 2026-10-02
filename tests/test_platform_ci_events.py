@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
 
 
-def _value(expression, *, event, ref, base="", schedule="", cancelled=False):
+def _value(expression, *, event, ref, base="", schedule="", cancelled=False, attempt=1, repository="razzant/ouroboros", e2e_live="false"):
     """Evaluate the workflow's small expression vocabulary against real event shapes."""
     expression = expression.strip()
     if expression.startswith("$" + "{{"):
@@ -23,30 +23,32 @@ def _value(expression, *, event, ref, base="", schedule="", cancelled=False):
     expression = " ".join(expression.split()).replace("&&", " and ").replace("||", " or ")
     expression = re.sub(r"!(?!=)", "not ", expression)
     github = SimpleNamespace(
-        event_name=event, ref=ref, base_ref=base,
+        event_name=event, ref=ref, base_ref=base, run_id=77, run_attempt=attempt, repository=repository,
         event=SimpleNamespace(
-            schedule=schedule, inputs=SimpleNamespace(e2e_live="false"), before="previous-tip",
-            pull_request=SimpleNamespace(base=SimpleNamespace(sha="pr-base")),
+            schedule=schedule, inputs=SimpleNamespace(e2e_live=e2e_live), before="previous-tip",
+            pull_request=SimpleNamespace(number=42, base=SimpleNamespace(sha="pr-base")),
         ),
     )
     return eval(expression, {"__builtins__": {}}, {
         "github": github, "fromJSON": json.loads,
         "startsWith": lambda value, prefix: value.startswith(prefix),
         "always": lambda: True, "cancelled": lambda: cancelled,
+        "format": lambda template, *values: template.format(*values),
     })
 
 
 @pytest.mark.parametrize("event,ref,base,quick,platforms", [
     ("pull_request", "refs/pull/42/merge", "ouroboros", True, ["windows-latest", "macos-latest"]),
     ("pull_request", "refs/pull/42/merge", "main", False, []),
-    ("push", "refs/heads/ouroboros", "", True, []),
+    # A landed commit gets the same two desktop systems a pull request gets; Ubuntu is quick-test.
+    ("push", "refs/heads/ouroboros", "", True, ["windows-latest", "macos-latest"]),
     ("push", "refs/heads/main", "", False, []),
     ("push", "refs/heads/ouroboros-stable", "", False, ["ubuntu-latest", "windows-latest", "macos-latest"]),
     ("push", "refs/tags/v7.0.0", "", False, ["ubuntu-latest", "windows-latest", "macos-latest"]),
     ("workflow_dispatch", "refs/heads/candidate", "", True, ["ubuntu-latest", "windows-latest", "macos-latest"]),
     ("schedule", "refs/heads/main", "", False, []),
 ])
-def test_ordinary_matrix_expands_for_prs_without_changing_existing_events(event, ref, base, quick, platforms):
+def test_ordinary_matrix_covers_prs_and_landed_pushes_and_keeps_other_events(event, ref, base, quick, platforms):
     facts = {"event": event, "ref": ref, "base": base}
     assert bool(_value(WORKFLOW["jobs"]["quick-test"]["if"], **facts)) is quick
     job = WORKFLOW["jobs"]["full-test"]
@@ -74,12 +76,32 @@ def test_desktop_pr_matrix_keeps_merge_checkout_and_pr_base_evidence_secret_free
     assert _value(base, event="push", ref="refs/heads/ouroboros-stable") == "previous-tip"
 
 
-@pytest.mark.parametrize("cron", ["37 4 * * *", "17 3 * * *"])
+# "17 3 * * *" is a cron string this workflow does not carry: an event bearing
+# a stale cron still admits no ordinary job.
+@pytest.mark.parametrize("cron", ["37 4 * * *", pytest.param("17 3 * * *", id="foreign-cron")])
 def test_scheduled_main_runs_do_not_enter_the_ordinary_matrix(cron):
     for name in ("quick-test", "full-test"):
         assert not _value(
             WORKFLOW["jobs"][name]["if"], event="schedule", ref="refs/heads/main", schedule=cron,
         )
+
+
+@pytest.mark.parametrize("event,ref,schedule,e2e_live,admitted", [
+    ("workflow_dispatch", "refs/heads/ouroboros", "", "true", True),
+    ("workflow_dispatch", "refs/heads/candidate", "", "true", True),
+    ("workflow_dispatch", "refs/heads/ouroboros", "", "false", False),
+    ("schedule", "refs/heads/main", "37 4 * * *", "false", False),
+    ("schedule", "refs/heads/main", "17 3 * * *", "false", False),
+    ("push", "refs/heads/ouroboros", "", "false", False),
+    ("push", "refs/heads/main", "", "false", False),
+    ("push", "refs/tags/v7.0.0", "", "false", False),
+    ("pull_request", "refs/pull/42/merge", "", "false", False),
+])
+def test_the_paid_live_stand_runs_only_on_a_dispatch_that_opts_in(event, ref, schedule, e2e_live, admitted):
+    """The paid `e2e-live` job takes no schedule: only a dispatch with `e2e_live=true` admits it."""
+    job = WORKFLOW["jobs"]["e2e-live"]
+    facts = {"event": event, "ref": ref, "schedule": schedule, "e2e_live": e2e_live}
+    assert bool(_value(job["if"], base="ouroboros" if event == "pull_request" else "", **facts)) is admitted
 
 
 @pytest.mark.parametrize("name", [
@@ -92,6 +114,24 @@ def test_desktop_pr_coverage_does_not_admit_provider_or_release_jobs(name):
     assert not _value(job["if"], event="pull_request", ref="refs/pull/42/merge", base="ouroboros")
 
 
+@pytest.mark.parametrize("event,ref,schedule,called", [
+    ("push", "refs/heads/main", "", False),
+    ("push", "refs/heads/ouroboros", "", False),
+    ("push", "refs/heads/ouroboros-stable", "", False),
+    ("push", "refs/tags/v7.0.0", "", True),
+    ("workflow_dispatch", "refs/heads/candidate", "", True),
+    ("pull_request", "refs/pull/42/merge", "", False),
+    ("schedule", "refs/heads/main", "37 4 * * *", False),
+    ("schedule", "refs/heads/main", "17 3 * * *", False),
+])
+def test_provider_canaries_join_this_workflow_only_for_manual_runs_and_tags(event, ref, schedule, called):
+    """Branch pushes reach the canaries through provider-canary-push.yml, so a
+    provider outage on a landed commit leaves this workflow's result to the code."""
+    job = WORKFLOW["jobs"]["integration-test"]
+    assert job["uses"] == "./.github/workflows/provider-canary.yml"
+    assert bool(_value(job["if"], event=event, ref=ref, base="ouroboros", schedule=schedule)) is called
+
+
 @pytest.mark.parametrize(("event", "cancelled", "expected"), [
     ("pull_request", False, True), ("pull_request", True, False),
     ("schedule", False, False), ("schedule", True, False),
@@ -101,3 +141,32 @@ def test_status_checks_and_inequality_keep_independent_meanings(event, cancelled
         "${{ always() && !cancelled() && github.event_name != 'schedule' }}",
         event=event, ref="refs/heads/candidate", cancelled=cancelled,
     ) is expected
+
+
+@pytest.mark.parametrize("event,attempt,group,cancels", [
+    ("pull_request", 1, "ci-pr-42", True),
+    # GitHub keeps one pending run per group: a re-run of an old head must not share the new head's.
+    ("pull_request", 2, "ci-run-77-2", False),
+    ("push", 1, "ci-run-77-1", False),
+    ("schedule", 1, "ci-run-77-1", False),
+    ("workflow_dispatch", 1, "ci-run-77-1", False),
+])
+def test_only_a_new_pull_request_head_cancels_a_run(event, attempt, group, cancels):
+    concurrency = WORKFLOW["concurrency"]
+    facts = {"event": event, "ref": "refs/heads/candidate", "attempt": attempt}
+    assert _value(concurrency["group"], **facts) == group
+    assert bool(_value(concurrency["cancel-in-progress"], **facts)) is cancels
+
+
+def test_landed_push_desktop_matrix_runs_in_this_repository_only():
+    """A private copy that pushes its own commits keeps the Ubuntu quick job and pays no desktop minutes."""
+    job = WORKFLOW["jobs"]["full-test"]
+    push = {"event": "push", "ref": "refs/heads/ouroboros"}
+    assert _value(job["if"], **push)
+    assert not _value(job["if"], **push, repository="someone/private-copy")
+    assert _value(WORKFLOW["jobs"]["quick-test"]["if"], **push, repository="someone/private-copy")
+    # Pull requests, stable pushes, manual runs and tags keep their matrix in every repository.
+    for event, ref, base in (("pull_request", "refs/pull/42/merge", "ouroboros"),
+                             ("push", "refs/heads/ouroboros-stable", ""),
+                             ("workflow_dispatch", "refs/heads/candidate", ""), ("push", "refs/tags/v7.0.0", "")):
+        assert _value(job["if"], event=event, ref=ref, base=base, repository="someone/private-copy")

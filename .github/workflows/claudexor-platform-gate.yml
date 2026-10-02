@@ -44,7 +44,7 @@
 #             across three OSes, cold daemons, and someone else's rate limits. Paying
 #             that on every push would make PR feedback on the seam hostage to vendor
 #             availability, which is the same trade this repository already made for
-#             `integration-test` in ci.yml. So it runs where the other paid lanes run:
+#             `skill-smoke` in ci.yml. So it runs where that paid lane runs:
 #             ouroboros-stable, manual dispatch, and tags.
 #
 # A THIRD, NARROWER JOB: toolchain. The fixture lane installs the runtime for the daemon

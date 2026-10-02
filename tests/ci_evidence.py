@@ -2,6 +2,8 @@
 
 Registered after tests/conftest.py establishes isolation. The summary entrypoint
 uses only stdlib and trusts the supplied Actions producer outcome, not case totals.
+events.jsonl is the controller's incremental journal: it names the tests in flight
+when a session is killed before its final results.json export.
 """
 from __future__ import annotations
 
@@ -13,7 +15,10 @@ import math
 import os
 from pathlib import Path
 import platform
+import sys
 import tempfile
+
+_PHASES = frozenset({"setup", "call", "teardown"})
 
 
 def output_dir(config) -> Path | None:
@@ -60,27 +65,77 @@ def _case_outcomes(reports: list[dict]) -> dict[str, str]:
     return cases
 
 
-def render_summary(root: Path, *, producer_outcome: str, artifact_outcome: str,
-                   artifact_url: str = "", scope: str = "full") -> str:
-    """Reporter failure cannot replace producer truth; missing reports stay unknown."""
-    available = False
-    error = ""
+def _valid(row) -> bool:
+    return (isinstance(row, dict)
+            and all(isinstance(row.get(key), str) for key in ("nodeid", "phase", "outcome"))
+            and (row["phase"] in _PHASES or row["phase"] == "crash")
+            and row["outcome"] in {"passed", "failed", "skipped"})
+
+
+def _final(root: Path) -> tuple[dict, str]:
+    """The session's final projection, or the reason it cannot be trusted."""
     try:
-        data = json.loads((root / "results.json").read_text(encoding="utf-8"))
-        reports = data.get("reports") if isinstance(data, dict) else None
-        available = isinstance(reports, list) and all(
-            isinstance(row, dict) and all(isinstance(row.get(key), str)
-                                         for key in ("nodeid", "phase", "outcome"))
-            and row["phase"] in {"setup", "call", "teardown"}
-            and row["outcome"] in {"passed", "failed", "skipped"}
-            for row in reports)
-        if not available:
-            error = "invalid result projection"
-            data = {}
+        data = json.loads((Path(root) / "results.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        data, error = {}, "result projection unavailable"
+        return {}, "result projection unavailable"
+    reports = data.get("reports") if isinstance(data, dict) else None
+    if isinstance(reports, list) and all(map(_valid, reports)):
+        return data, ""
+    return {}, "invalid result projection"
+
+
+def _journal(root: Path) -> tuple[list[str], list[dict]] | None:
+    """Tests in flight and failed reports from a session without a final export.
+
+    A kill can tear the last line; unparsable and invalid rows are skipped.
+    """
+    try:
+        text = (Path(root) / "events.jsonl").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    running, failed = {}, []
+    for line in text.split("\n"):
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(row, dict) or not isinstance(row.get("nodeid"), str):
+            continue
+        if row.get("event") == "start":
+            running[row["nodeid"]] = None
+        elif row.get("event") == "finish":
+            running.pop(row["nodeid"], None)
+        elif row.get("event") == "report" and _valid(row):
+            if row["phase"] == "crash":
+                running.pop(row["nodeid"], None)  # A crashed worker never sends finish.
+            if row["outcome"] == "failed":
+                failed.append(row)
+    return list(running), failed
+
+
+def _flight_table(running: list[str]) -> list[str]:
+    if not running:
+        return []
+    return ["", "| Test in flight when the session ended |", "| --- |"] + [
+        f"| {_cell(node)} |" for node in running]
+
+
+def _failure_table(failed: list[dict]) -> list[str]:
+    if not failed:
+        return []
+    return ["", "| Test | Phase | Error type |", "| --- | --- | --- |"] + [
+        f"| {_cell(row['nodeid'])} | {_cell(row['phase'])} | "
+        f"{_cell(row.get('error_type') or 'see test step')} |" for row in failed]
+
+
+def render_summary(root: Path, *, producer_outcome: str, artifact_outcome: str,
+                   artifact_url: str = "", scope: str = "full", label: str = "") -> str:
+    """Reporter failure cannot replace producer truth; missing reports stay unknown."""
+    data, error = _final(root)
+    available = not error
     lines = [
-        "## CI test evidence" + (" — PARTIAL DIAGNOSTIC" if scope != "full" else ""),
+        "## CI test evidence" + (f" — {_cell(label)}" if label else "")
+        + (" — PARTIAL DIAGNOSTIC" if scope != "full" else ""),
         "",
         f"Producer step: **{_cell(producer_outcome)}**. Selection: **{_cell(scope)}**.",
         "Testcase results and diagnostic availability are separate from that process outcome.",
@@ -96,15 +151,25 @@ def render_summary(root: Path, *, producer_outcome: str, artifact_outcome: str,
         lines.append("Cases: " + ", ".join(f"{name}={counts[name]}" for name in
                                          ("passed", "failed", "skipped", "not_run")) + ".")
         lines.append(f"Observed pytest session exit: {_cell(data.get('session_exit_code', 'unknown'))}.")
-        failed = [row for row in data["reports"] if row["outcome"] == "failed"]
-        if failed:
-            lines.extend(["", "| Test | Phase | Error type |", "| --- | --- | --- |"])
-            lines.extend(f"| {_cell(row['nodeid'])} | {_cell(row['phase'])} | "
-                         f"{_cell(row.get('error_type') or 'see test step')} |" for row in failed)
+        collected = data.get("tests_collected")
+        if isinstance(collected, int) and collected > sum(counts.values()):
+            # A stopped session (dead worker, -x, session timeout) leaves its queue unreported.
+            lines.append(f"**{collected - sum(counts.values())} collected test(s) produced no report**: "
+                         "the session stopped before running them.")
+        lines.extend(_failure_table([row for row in data["reports"] if row["outcome"] == "failed"]))
+        # An interrupted session still exports; only its journal names what it left running.
+        lines.extend(_flight_table((_journal(root) or ([], []))[0]))
         if data.get("collection_failures"):
             lines.append(f"Collection failures: {len(data['collection_failures'])}.")
     else:
         lines.append("Case outcomes: **unknown**. No passing result is inferred.")
+        journal = _journal(root)
+        if journal is not None:
+            running, failed = journal
+            lines.extend(["", "The session ended before its final export. Its incremental journal "
+                          f"recorded {len(running)} test(s) in flight and {len(failed)} failed report(s)."])
+            lines.extend(_flight_table(running))
+            lines.extend(_failure_table(failed))
     providers = []
     for path in sorted(root.glob("provider-*.json")):
         try:
@@ -148,19 +213,75 @@ def render_summary(root: Path, *, producer_outcome: str, artifact_outcome: str,
     return "\n".join(lines) + "\n"
 
 
+def _escaped(value, *, property_value: bool = False) -> str:
+    """Workflow-command data: it cannot end the command line, nor a property its field."""
+    text = str(value).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    return text.replace(":", "%3A").replace(",", "%2C") if property_value else text
+
+
+def _annotation(title: str, message: str) -> str:
+    return f"::error title={_escaped(title, property_value=True)}::{_escaped(message)}"
+
+
+def render_annotations(roots, *, limit: int = 10) -> list[str]:
+    """At most `limit` error commands over all directories, failed tests first."""
+    failed, collection, running = [], [], []
+    for root in roots:
+        data, error = _final(root)
+        if not error:
+            failed += [row for row in data["reports"] if row["outcome"] == "failed"]
+            rows = data.get("collection_failures")
+            collection += [row["nodeid"] for row in (rows if isinstance(rows, list) else [])
+                           if isinstance(row, dict) and isinstance(row.get("nodeid"), str)]
+            running += (_journal(root) or ([], []))[0]
+        elif (journal := _journal(root)) is not None:
+            running += journal[0]
+            failed += journal[1]
+    lines = [_annotation("Failed test", f"{row['nodeid']} ("
+                         + ", ".join(str(part) for part in (row["phase"], row.get("error_type")) if part) + ")")
+             for row in failed]
+    lines += [_annotation("Collection failed", node) for node in collection]
+    lines += [_annotation("Test in flight when the session was killed", node) for node in running]
+    shown = lines[:max(limit, 0)]
+    if len(lines) > len(shown):
+        shown.append(f"::notice::{len(lines) - len(shown)} more failed tests are listed in the job summary")
+    return shown
+
+
 def _main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["summarize"])
-    parser.add_argument("--evidence-dir", type=Path, required=True)
-    parser.add_argument("--summary", type=Path, required=True)
-    parser.add_argument("--producer-outcome", required=True)
-    parser.add_argument("--artifact-outcome", required=True)
-    parser.add_argument("--artifact-url", default="")
-    parser.add_argument("--scope", default="full")
-    args = parser.parse_args(argv)
+    commands = parser.add_subparsers(dest="command", required=True)
+    summarize = commands.add_parser("summarize")
+    summarize.add_argument("--evidence-dir", type=Path, required=True)
+    summarize.add_argument("--summary", type=Path, required=True)
+    summarize.add_argument("--producer-outcome", required=True)
+    summarize.add_argument("--artifact-outcome", required=True)
+    summarize.add_argument("--artifact-url", default="")
+    summarize.add_argument("--scope", default="full")
+    summarize.add_argument("--label", default="")
+    annotate = commands.add_parser("annotate")
+    annotate.add_argument("--evidence-dir", type=Path, action="append", required=True)
+    annotate.add_argument("--limit", type=int, default=10)
+    argv = sys.argv[1:] if argv is None else list(argv)
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as stop:
+        if not stop.code or argv[:1] != ["annotate"]:
+            raise
+        # Annotations are advisory: neither usage nor unreadable evidence fails a step.
+        print("::warning::CI annotations are unavailable (usage error).")
+        return 0
+    if args.command == "annotate":
+        try:
+            lines = render_annotations(args.evidence_dir, limit=args.limit)
+            # Runners decode step output as UTF-8 whatever the console code page is.
+            sys.stdout.buffer.write("".join(line + "\n" for line in lines).encode("utf-8", "replace"))
+        except Exception as error:
+            print(f"::warning::CI annotations are unavailable ({type(error).__name__}).")
+        return 0
     text = render_summary(args.evidence_dir, producer_outcome=args.producer_outcome,
                           artifact_outcome=args.artifact_outcome, artifact_url=args.artifact_url,
-                          scope=args.scope)
+                          scope=args.scope, label=args.label)
     with args.summary.open("a", encoding="utf-8") as handle:
         handle.write(text)
     if "diagnostics_incomplete" in text:
@@ -186,6 +307,13 @@ def pytest_configure(config):
         config.pluginmanager.register(_Results(config), "ci_safe_results")
 
 
+def _redact(value, secrets):
+    from ouroboros.observability import redact_projection
+    from ouroboros.secret_masking import redact_known_values
+
+    return redact_projection(redact_known_values(value, secrets)).value
+
+
 class _Results:
     def __init__(self, config):
         from ouroboros.secret_masking import MASKED_SECRET_SETTING_KEYS
@@ -194,6 +322,50 @@ class _Results:
         self.reports = []
         self.collection_failures = []
         self.secrets = tuple(os.environ[key] for key in MASKED_SECRET_SETTING_KEYS if os.environ.get(key))
+        self.safe_text = {}
+        self.journal = None
+        if not hasattr(config, "workerinput"):  # xdist re-emits worker events on the controller.
+            try:
+                path = output_dir(config) / "events.jsonl"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                # Unbuffered: each row reaches the OS before a kill can lose it.
+                self.journal = path.open("wb", buffering=0)
+            except Exception as error:
+                self._journal_off(error)
+
+    def _journal_off(self, error=None):
+        journal, self.journal = self.journal, None
+        try:
+            if journal is not None:
+                journal.close()
+        except Exception as close_error:
+            error = error or close_error
+        if error is not None:  # One line, then silence: the session outcome is untouched.
+            print(f"CI_DIAGNOSTICS_INCOMPLETE: incremental journal disabled ({type(error).__name__})")
+
+    def _event(self, event, nodeid, **facts):
+        if self.journal is None:
+            return
+        try:
+            # A parametrized nodeid can carry a secret: every value is redacted
+            # before its first write; the cache keeps that to once per distinct text.
+            row = {"event": event, "nodeid": nodeid, **facts}
+            for key, value in row.items():
+                if value not in self.safe_text:
+                    self.safe_text[value] = _redact(value, self.secrets)
+                row[key] = self.safe_text[value]
+            self.journal.write((json.dumps(row) + "\n").encode("ascii"))
+        except Exception as error:
+            self._journal_off(error)
+
+    def pytest_unconfigure(self):
+        self._journal_off()  # A session that never reached sessionfinish still releases the file.
+
+    def pytest_runtest_logstart(self, nodeid):
+        self._event("start", nodeid)
+
+    def pytest_runtest_logfinish(self, nodeid):
+        self._event("finish", nodeid)
 
     @pytest.hookimpl(hookwrapper=True)
     def pytest_runtest_makereport(self, item, call):
@@ -206,12 +378,18 @@ class _Results:
 
     def pytest_runtest_logreport(self, report):
         duration = float(getattr(report, "duration", 0.0))
-        self.reports.append({
-            "nodeid": report.nodeid, "phase": report.when, "outcome": report.outcome,
+        # xdist reports a dead worker's test with when="???" and no worker-side attributes.
+        crashed = report.when not in _PHASES
+        row = {
+            "nodeid": report.nodeid, "phase": "crash" if crashed else report.when,
+            "outcome": report.outcome,
             "duration_seconds": duration if math.isfinite(duration) else None,
-            "error_type": getattr(report, "ci_error_type", ""),
+            "error_type": "WorkerCrash" if crashed else getattr(report, "ci_error_type", ""),
             "canary_id": getattr(report, "ci_canary_id", ""),
-        })
+        }
+        self.reports.append(row)
+        self._event("report", row["nodeid"], phase=row["phase"], outcome=row["outcome"],
+                    error_type=row["error_type"])
 
     def pytest_collectreport(self, report):
         if report.failed:
@@ -223,9 +401,6 @@ class _Results:
         if hasattr(self.config, "workerinput"):
             return  # xdist's controller receives the worker reports.
         try:
-            from ouroboros.observability import redact_projection
-            from ouroboros.secret_masking import redact_known_values
-
             facts = {
                 "format": 1, "session_exit_code": int(session.exitstatus),
                 "tests_collected": session.testscollected, "reports": self.reports,
@@ -237,8 +412,9 @@ class _Results:
                 "github": {name: os.environ.get("GITHUB_" + name.upper(), "")
                            for name in ("sha", "run_id", "run_attempt")},
             }
-            safe = redact_projection(redact_known_values(facts, self.secrets)).value
-            write_json(output_dir(self.config) / "results.json", safe)
+            write_json(output_dir(self.config) / "results.json", _redact(facts, self.secrets))
         except Exception as error:
             # Diagnostics alone never alter session.exitstatus or expose a body.
             print(f"CI_DIAGNOSTICS_INCOMPLETE: safe result export failed ({type(error).__name__})")
+        finally:
+            self._journal_off()
