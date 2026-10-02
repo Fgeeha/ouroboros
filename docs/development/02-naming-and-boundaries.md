@@ -220,8 +220,12 @@ in `tests/test_docs_sync.py`, which enforces only the case-sensitive matches in
 `DOC_RESIDUE_PATTERNS`, outside language-tagged fences and its declared skipped
 subsections ("Mutable external-fact inventory" and this one); the untagged
 module-tree fence in ARCHITECTURE §1 IS scanned, an owner decision. Each chapter
-also carries a byte budget in the official-CI `size_ratchet` lane, raised only
-in the diff that needs it, with a reason; local surfaces never block on it.
+also carries a byte budget in the official-CI `size_ratchet` lane: a base number
+plus its grant files under `tests/reference_book_grants/`. A change that grows a
+chapter adds one grant file holding that change's net growth and the reason,
+never an edit to a shared number; a compression pass folds the grants into the
+base. Local surfaces never block on the budget; a malformed grant file fails
+every default lane.
 Equivalent historical prose stays review-only under CHECKLISTS item 7.
 
 ### Generality and emergence (P13)

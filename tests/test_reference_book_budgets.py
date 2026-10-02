@@ -1,13 +1,28 @@
 """Per-chapter byte budgets for the two reference books.
 
 Official-CI ``size_ratchet`` lane only (local runs exclude the marker, like the repository size
-gates): a chapter may grow past its budget only in a diff that raises the number here and says
-why. The budget is the chapter's size after the compression pass plus roughly ten percent, so
-ordinary maintenance fits and accretion does not. The same maintenance margin applies to unchanged registry chapters.
+gates). A chapter's limit is its base number in ``CHAPTER_BYTE_BUDGETS`` plus the sum of its grant
+files. A change that needs more room adds its own file and edits no shared line:
+
+    tests/reference_book_grants/<book>/<chapter-stem>/<name>.grant    for docs/<book>/<chapter-stem>.md
+
+    first line    the bytes granted, a positive integer: this change's NET growth of the chapter
+    then          the reason, at least one non-blank line
+
+``<name>`` is free (suggested ``<YYYY-MM-DD>-<slug>``). More room later is another file: the growth
+rule counts only the files a change adds. A compression pass folds the grants back: it sets the
+chapter's base number to the measured size plus a margin and deletes that chapter's grant files in
+the same change. The layout check is unmarked, so a file the size lane would ignore fails every
+default lane instead of landing silently.
 """
 from __future__ import annotations
 
+import ast
+import os
 import pathlib
+import re
+import subprocess
+from typing import Iterable
 
 import pytest
 
@@ -15,7 +30,7 @@ from ouroboros.reference_books import BOOK_ENTRYPOINTS, load_reference_book
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 
-# UTF-8 bytes of each chapter source. Raise a value in the same diff that needs it, with a reason.
+# Base UTF-8 bytes of each chapter source. Growth is a grant file; a number changes only for a new chapter or a fold.
 CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 161453 -> 162200: the module tree gains the `schedule_lifecycle.py` leaf beside
     # queue_schedules.py and names Observe's argument-level narrowing on the
@@ -423,18 +438,202 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
 }
 
 
+GRANTS_TREE = "tests/reference_book_grants"
+BUDGETS_MODULE = "tests/test_reference_book_budgets.py"
+BASE_REF_ENV = "OURO_SIZE_RATCHET_BASE_REF"
+
+Grants = dict[str, list[tuple[str, int]]]
+
+
+def _grant_files(root: pathlib.Path) -> list[pathlib.Path]:
+    return sorted(path for path in root.rglob("*") if path.is_file()) if root.is_dir() else []
+
+
+def _parse_grant(path: pathlib.Path) -> tuple[int, str]:
+    """``(bytes, "")`` for a well-formed grant file, else ``(0, the rule it breaks)``."""
+    try:
+        # splitlines + strip: a CRLF checkout on Windows reads the same grant.
+        lines = [line.strip() for line in path.read_text(encoding="utf-8").splitlines()]
+    except (OSError, UnicodeDecodeError) as exc:
+        return 0, f"is not readable UTF-8 text ({type(exc).__name__})"
+    if not lines or not re.fullmatch(r"[1-9][0-9]*", lines[0]):
+        return 0, "its first line is the bytes granted, a positive integer and nothing else"
+    if not any(lines[1:]):
+        return 0, "the lines after the byte count give the reason, at least one non-blank line"
+    return int(lines[0]), ""
+
+
+def _suggested_grant(chapter: str) -> str:
+    return f"{GRANTS_TREE}/{chapter[len('docs/'):-len('.md')]}/<YYYY-MM-DD>-<slug>.grant"
+
+
+def read_grants(root: pathlib.Path) -> Grants:
+    """Well-formed grants by chapter path, each ``(path under root, bytes)``.
+
+    A misplaced or malformed file grants nothing; ``grant_layout_faults`` is what reports it.
+    """
+    grants: Grants = {}
+    for path in _grant_files(root):
+        rel = path.relative_to(root)
+        granted, fault = _parse_grant(path)
+        if len(rel.parts) == 3 and rel.suffix == ".grant" and not fault:
+            grants.setdefault(f"docs/{rel.parts[0]}/{rel.parts[1]}.md", []).append((rel.as_posix(), granted))
+    return grants
+
+
+def grant_layout_faults(root: pathlib.Path, chapters: Iterable[str]) -> list[str]:
+    """Every file under the grant tree is a well-formed grant of a current chapter, or is named here."""
+    current = set(chapters)
+    faults: list[str] = []
+    for path in _grant_files(root):
+        rel = path.relative_to(root)
+        where = rel.as_posix()
+        if len(rel.parts) != 3 or rel.suffix != ".grant":
+            faults.append(f"{where}: a grant file sits at <book>/<chapter-stem>/<name>.grant")
+            continue
+        book, stem = rel.parts[0], rel.parts[1]
+        if book not in BOOK_ENTRYPOINTS:
+            faults.append(f"{where}: {book!r} is not a reference book ({', '.join(sorted(BOOK_ENTRYPOINTS))})")
+        elif f"docs/{book}/{stem}.md" not in current:
+            faults.append(f"{where}: docs/{book}/{stem}.md is not a current chapter")
+        fault = _parse_grant(path)[1]
+        if fault:
+            faults.append(f"{where}: {fault}")
+    return faults
+
+
+def budget_faults(sizes: dict[str, int], numbers: dict[str, int], grants: Grants) -> list[str]:
+    """Every chapter has a base number and fits base plus grants; no number outlives its chapter."""
+    faults: list[str] = []
+    for chapter, size in sizes.items():
+        base = numbers.get(chapter)
+        if base is None:
+            faults.append(f"{chapter}: add a byte budget for the new chapter")
+            continue
+        granted = [count for _, count in grants.get(chapter, ())]
+        if size > base + sum(granted):
+            faults.append(
+                f"{chapter}: {size} bytes exceeds its budget {base + sum(granted)} (base {base} + {len(granted)} "
+                f"grant file(s) totalling {sum(granted)}); add {_suggested_grant(chapter)} holding this change's "
+                "NET growth of the chapter (first line the byte count, then the reason), or replace the "
+                "description you touched instead of appending"
+            )
+    stale = sorted(set(numbers) - set(sizes))
+    if stale:
+        faults.append(f"budgets for chapters that no longer exist: {stale}")
+    return faults
+
+
+def growth_faults(
+    base_sizes: dict[str, int],
+    tip_sizes: dict[str, int],
+    base_grants: Iterable[str],
+    tip_grants: Grants,
+    base_numbers: dict[str, int],
+    tip_numbers: dict[str, int],
+) -> list[str]:
+    """A change grows a chapter only by what it brings: the grant files it adds plus any raise of the base number."""
+    present_at_base = set(base_grants)
+    faults: list[str] = []
+    for chapter, tip_size in tip_sizes.items():
+        if chapter not in base_sizes:
+            continue  # new in this change: its base number alone bounds it
+        grew = tip_size - base_sizes[chapter]
+        added = sum(count for path, count in tip_grants.get(chapter, ()) if path not in present_at_base)
+        raised = max(0, tip_numbers.get(chapter, 0) - base_numbers.get(chapter, 0))
+        if grew > added + raised:
+            faults.append(
+                f"{chapter}: grew {grew} bytes in this change, {added + raised} covered ({added} by grant files "
+                f"it adds, {raised} by a raised base number), {grew - added - raised} uncovered; add "
+                f"{_suggested_grant(chapter)} for the uncovered bytes (first line the byte count, then the "
+                "reason), or replace the description you touched instead of appending"
+            )
+    return faults
+
+
+def _git(repo: pathlib.Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", *args], cwd=repo, check=check, capture_output=True)
+
+
+def growth_base(repo: pathlib.Path, ref: str | None) -> str:
+    """The commit this change is measured from; ``""`` when the growth rule does not apply.
+
+    The event base is the one the manifest transition uses (``test_size_ratchet_transition_against_explicit_base``),
+    and like it an all-zeros (new-branch/tag push) or unresolvable base degrades to HEAD's first
+    parent. Unlike it an unset or empty base skips: a local or dispatch run has no event base, and
+    HEAD's parent is not where a multi-commit change began.
+    """
+    ref = (ref or "").strip()
+    if not ref:
+        return ""
+    for candidate in ((ref,) if ref.strip("0") else ()) + ("HEAD^",):
+        resolved = _git(repo, "rev-parse", "--verify", "--quiet", f"{candidate}^{{commit}}", check=False)
+        if resolved.returncode == 0:
+            return resolved.stdout.decode("ascii").strip()
+    return ""
+
+
+def _budget_numbers(source: str) -> dict[str, int]:
+    for node in ast.parse(source).body:
+        if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if any(isinstance(target, ast.Name) and target.id == "CHAPTER_BYTE_BUDGETS" for target in targets):
+                return dict(ast.literal_eval(node.value))
+    return {}
+
+
+def base_facts(repo: pathlib.Path, base: str) -> tuple[dict[str, int], set[str], dict[str, int]]:
+    """Chapter blob sizes, grant paths and base numbers at ``base``; whatever it lacks is empty.
+
+    Blob sizes are bytes, never decoded text; ``.gitattributes`` pins ``docs/**/*.md`` to LF, so
+    they equal the checked-out sizes on every platform.
+    """
+    books = [f"docs/{book_id}" for book_id in BOOK_ENTRYPOINTS]
+    listing = _git(repo, "ls-tree", "-r", "-l", "-z", "--full-tree", base, "--", *books, GRANTS_TREE, BUDGETS_MODULE)
+    blobs: dict[str, int] = {}
+    for entry in listing.stdout.decode("utf-8").split("\0"):
+        meta, _, path = entry.partition("\t")
+        if path and meta.split()[1] == "blob":
+            blobs[path] = int(meta.split()[3])
+    sizes = {path: size for path, size in blobs.items() if path.startswith("docs/")}
+    grant_paths = {path[len(GRANTS_TREE) + 1:] for path in blobs if path.startswith(GRANTS_TREE + "/")}
+    numbers: dict[str, int] = {}
+    if BUDGETS_MODULE in blobs:
+        numbers = _budget_numbers(_git(repo, "show", f"{base}:{BUDGETS_MODULE}").stdout.decode("utf-8"))
+    return sizes, grant_paths, numbers
+
+
+def _chapter_sizes() -> dict[str, int]:
+    return {
+        chapter.source_path: len(chapter.raw)
+        for book_id in BOOK_ENTRYPOINTS
+        for chapter in load_reference_book(REPO, book_id).chapters
+    }
+
+
 @pytest.mark.size_ratchet
 def test_every_chapter_has_a_budget_and_stays_inside_it():
-    seen = set()
-    for book_id in BOOK_ENTRYPOINTS:
-        for chapter in load_reference_book(REPO, book_id).chapters:
-            seen.add(chapter.source_path)
-            budget = CHAPTER_BYTE_BUDGETS.get(chapter.source_path)
-            assert budget is not None, f"{chapter.source_path}: add a byte budget for the new chapter"
-            size = len(chapter.raw)
-            assert size <= budget, (
-                f"{chapter.source_path}: {size} bytes exceeds its budget {budget}; replace the description "
-                "you touched instead of appending, or raise the budget in this diff with a reason"
-            )
-    stale = set(CHAPTER_BYTE_BUDGETS) - seen
-    assert not stale, f"budgets for chapters that no longer exist: {sorted(stale)}"
+    faults = budget_faults(_chapter_sizes(), CHAPTER_BYTE_BUDGETS, read_grants(REPO / GRANTS_TREE))
+    assert not faults, "Reference-book chapter budgets:\n" + "\n".join(faults)
+
+
+@pytest.mark.size_ratchet
+def test_a_change_grows_a_chapter_only_by_what_it_grants():
+    """Official CI measures each chapter's growth against the event base, not only its size against the limit.
+
+    A grant sized only to the shortfall would let two changes that share the same leftover room land
+    over the limit with no merge conflict, so each change covers every byte it adds.
+    """
+    base = growth_base(REPO, os.environ.get(BASE_REF_ENV))
+    if not base:
+        pytest.skip(f"{BASE_REF_ENV} names no base commit, so this change's growth cannot be measured")
+    base_sizes, base_grants, base_numbers = base_facts(REPO, base)
+    faults = growth_faults(
+        base_sizes, _chapter_sizes(), base_grants, read_grants(REPO / GRANTS_TREE), base_numbers, CHAPTER_BYTE_BUDGETS
+    )
+    assert not faults, f"Reference-book chapter growth since {base[:12]}:\n" + "\n".join(faults)
+
+
+def test_every_grant_file_is_a_well_formed_grant_of_a_current_chapter():
+    faults = grant_layout_faults(REPO / GRANTS_TREE, _chapter_sizes())
+    assert not faults, f"Files under {GRANTS_TREE}/ that are not usable grants:\n" + "\n".join(faults)
