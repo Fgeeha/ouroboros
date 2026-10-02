@@ -257,21 +257,30 @@ def test_manual_ui_selection_is_fixed_partial_and_never_a_paid_or_full_check():
 
 
 @pytest.mark.parametrize("exported", [True, False], ids=["proof-present", "export-failed"])
-def test_a_shard_attempt_without_a_published_proof_is_red_itself(tmp_path, exported):
+@pytest.mark.parametrize("jobname, producer, proof_id, upload_id, directory", [
+    ("ui-shard", "ui_tests", "ui_proof", "ui_evidence", "ui"),
+    ("ui-manifest", "ui_manifest", "manifest_proof", "manifest_evidence", "ui-manifest"),
+])
+def test_an_attempt_without_a_published_proof_is_red_itself(tmp_path, jobname, producer, proof_id,
+                                                              upload_id, directory, exported):
     """An attempt whose export or upload failed must not leave `ui-smoke` an earlier attempt's proof to accept."""
-    job = _workflow("ui-browser.yml")["jobs"]["ui-shard"]
-    steps = _steps("ui-browser.yml", "ui-shard")
-    proof, upload = steps["ui_proof"], steps["ui_evidence"]
+    job = _workflow("ui-browser.yml")["jobs"][jobname]
+    steps = _steps("ui-browser.yml", jobname)
+    proof, upload = steps[proof_id], steps[upload_id]
     assert "continue-on-error" not in proof and "continue-on-error" not in upload
-    assert proof["if"] == "${{ !cancelled() && steps.ui_tests.outcome != 'skipped' }}"
-    assert upload["with"]["if-no-files-found"] == "error" and "!cancelled()" in upload["if"]
+    assert upload["with"]["if-no-files-found"] == "error"
+    if jobname == "ui-shard":  # The shard's later steps run after a red lane; the manifest job stops at its first.
+        assert proof["if"] == "${{ !cancelled() && steps.ui_tests.outcome != 'skipped' }}"
+        assert "!cancelled()" in upload["if"]
+    else:
+        assert "if" not in proof and "if" not in upload
     order = [step.get("id") for step in job["steps"]]
-    assert order.index("ui_tests") < order.index("ui_proof") < order.index("ui_evidence")
+    assert order.index(producer) < order.index(proof_id) < order.index(upload_id)
     bash = shutil.which("bash")
     if bash is None:
         pytest.skip("workflow shell unavailable on this host")
     if exported:
-        target = tmp_path / "ci-evidence" / "ui" / "host" / "results.json"
+        target = tmp_path / "ci-evidence" / directory / "host" / "results.json"
         target.parent.mkdir(parents=True)
         target.write_text("{}", encoding="utf-8")
     command = proof["run"].replace("${{ runner.temp }}", str(tmp_path))

@@ -193,7 +193,12 @@ jobs:
         run: >-
           python -I -S scripts/safe_test.py -- python -m pytest tests/ -m ui_browser --require-ui-browser --collect-only -q
           --ci-evidence-dir="${{ runner.temp }}/ci-evidence/ui-manifest/host"
-      # Mandatory proof, not a diagnostic: without it the aggregator cannot pass.
+      # Mandatory proof, not a diagnostic: an attempt whose export failed leaves only the
+      # journal behind, and the verdict would fall back to an earlier attempt's manifest.
+      - name: Require the lane manifest
+        id: manifest_proof
+        shell: bash
+        run: test -s "${{ runner.temp }}/ci-evidence/ui-manifest/host/results.json"
       - name: Upload the lane manifest
         id: manifest_evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
