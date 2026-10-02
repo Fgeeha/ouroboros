@@ -123,6 +123,7 @@ def test_a_crlf_checkout_reads_the_same_grant(tmp_path):
         ),
         pytest.param(GRANT, "0\n" + REASON, INTEGER, id="zero"),
         pytest.param(GRANT, "-500\n" + REASON, INTEGER, id="negative"),
+        pytest.param(GRANT, "+500\n" + REASON, INTEGER, id="plus-sign"),
         pytest.param(GRANT, "12.5\n" + REASON, INTEGER, id="non-integer"),
         pytest.param(GRANT, "500 bytes\n" + REASON, INTEGER, id="integer-with-words"),
         pytest.param(GRANT, REASON + "500\n", INTEGER, id="reason-first"),

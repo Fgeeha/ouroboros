@@ -10,7 +10,8 @@ files. A change that needs more room adds its own file and edits no shared line:
     then          the reason, at least one non-blank line
 
 ``<name>`` is free (suggested ``<YYYY-MM-DD>-<slug>``). More room later is another file: the growth
-rule counts only the files a change adds. A compression pass folds the grants back: it sets the
+rule counts the files a change adds, plus any raise of the base number (what a compression pass
+makes, and what a change written before grant files existed still does). A compression pass folds the grants back: it sets the
 chapter's base number to the measured size plus a margin and deletes that chapter's grant files in
 the same change. The layout check is unmarked, so a file the size lane would ignore fails every
 default lane instead of landing silently.
