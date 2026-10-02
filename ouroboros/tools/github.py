@@ -1,4 +1,4 @@
-"""GitHub tools: issues, comments, reactions."""
+"""GitHub tools: issues, pull requests, comments, checks."""
 
 from __future__ import annotations
 
@@ -51,7 +51,8 @@ class GhResult:
     text: str
     exit_code: int | None
     http_status: int | None
-    # "target" is a local refusal, not a subprocess exit or exception.
+    # "target" is a local refusal and "deadline" a request the checks reader never sent;
+    # neither is a subprocess exit or exception.
     failure: str
 
 
@@ -561,6 +562,14 @@ def _create_issue(ctx: ToolContext, title: str, body: str = "", labels: str = ""
         return raw
     return f"✅ Issue created: {raw}"
 
+
+def _get_checks(ctx: ToolContext, number: int = 0, sha: str = "", wait_seconds: int = 0, repo: str = "") -> str:
+    """``get_github_checks``: the reader lives in ``github_checks`` and calls this module's transport."""
+    from ouroboros.tools.github_checks import get_checks
+
+    return get_checks(ctx, number=number, sha=sha, wait_seconds=wait_seconds, repo=repo)
+
+
 def get_tools() -> List[ToolEntry]:
     tools = [
         ToolEntry("list_github_prs", {
@@ -591,6 +600,27 @@ def get_tools() -> List[ToolEntry]:
                 "number": {"type": "integer", "description": "PR number"},
             }, "required": ["number"]},
         }, _get_pr),
+
+        ToolEntry("get_github_checks", {
+            "name": "get_github_checks",
+            "description": (
+                "Read what GitHub records about the checks of one commit: every workflow run (its latest attempt) with its state, the state "
+                "counts of its jobs (for a pull request, of the rollup's jobs), the failed, unfinished and cancelled jobs and their steps, "
+                "failure annotations (test names when the workflow publishes them) and, for a pull request, third-party "
+                "checks and commit statuses. Read-only: pushes and dispatches nothing. Reports facts and names each source "
+                "it could not read; it gives no verdict, and a workflow that did not start has no record to report."
+            ),
+            "parameters": {"type": "object", "properties": {
+                "number": {"type": "integer", "default": 0,
+                           "description": "Pull request number; its head commit is read. Pass exactly one of number / sha."},
+                "sha": {"type": "string", "default": "",
+                        "description": "Full 40-hex commit SHA (resolve a branch or tag with `git rev-parse <ref>`)."},
+                "wait_seconds": {"type": "integer", "default": 0,
+                                 "description": "Poll until a workflow run is registered and every registered run is completed, "
+                                                "or this many seconds pass (max 240); the report states what is unfinished. "
+                                                "A run-list read that fails, also during the wait, ends the call with that error."},
+            }, "required": []},
+        }, _get_checks),
 
         ToolEntry("comment_on_pr", {
             "name": "comment_on_pr",

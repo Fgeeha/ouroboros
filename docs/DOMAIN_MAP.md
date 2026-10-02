@@ -565,7 +565,6 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/merge_receipts.py`
 - `ouroboros/repo_remotes.py`
 - `ouroboros/size_ratchet_manifest.py`
-- `ouroboros/tools/ci.py`
 - `ouroboros/tools/commit_gate.py`
 - `ouroboros/tools/git.py`
 - `ouroboros/tools/git_evolution.py`
@@ -576,6 +575,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/tools/git_rollback.py`
 - `ouroboros/tools/git_vcs_ops.py`
 - `ouroboros/tools/github.py`
+- `ouroboros/tools/github_checks.py`
 - `ouroboros/tools/release_sync.py`
 - `ouroboros/tools/review_revalidation.py`
 - `ouroboros/version.py`

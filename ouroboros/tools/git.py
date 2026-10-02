@@ -948,7 +948,7 @@ def _check_ci_status_after_push(repo_dir: pathlib.Path) -> str:
         if not red:
             if all(state in settled for state in states.values()):
                 return f"\n\n✅ CI: registered push runs passed for this commit — {summary}."
-            return f"\n\n⏳ CI: push runs in progress — {summary}. Check GitHub Actions for results."
+            return f"\n\n⏳ CI: push runs in progress — {summary}. Read the results later: get_github_checks(sha='{local_sha}', repo='{repo}')."
         broken = [name for name in red if states[name] == "failure"]
         first = latest[(broken or red)[0]]  # The run whose number, jobs and URL the note carries.
         headline = f"{', '.join(broken)} FAILED" if broken else f"{red[0]} {states[red[0]].upper()}"

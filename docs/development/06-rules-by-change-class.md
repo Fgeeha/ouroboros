@@ -172,6 +172,9 @@ Run roots are append-only outside `repo/` and live `data/`; the focused contract
   bucket=..., skill_name=...)` — and the api-route advisory successor is the
   native inspection episode (`review_native_episode.py`). Do not resurrect the
   name.
+- `run_ci_tests` is a retired tool name with no alias and no compatibility
+  shim; `get_github_checks` succeeds it for reading a commit's checks, and
+  `docs/CHECKLISTS_ARCHIVE.md` records the outcomes that have no successor.
 - Successor parity: a tool may be called replaced, retired or migrated only
   after a persistent golden test proves every user-visible target class the
   predecessor supported through the successor to the final outcome;

@@ -268,34 +268,6 @@ def test_ff_pull_fetch_is_bounded_with_repo_cwd_and_keeps_error_shape(tmp_path, 
     assert result.startswith("⚠️ PULL_ERROR: git fetch failed:")
 
 
-def test_ci_push_branch_is_bounded_with_repo_cwd_and_keeps_shape(tmp_path, monkeypatch):
-    from ouroboros.tools import ci
-
-    repo = _seed_repo(tmp_path / "repo")
-    captured = {}
-
-    def fake_bounded(args, *, cwd=None, timeout=None):
-        captured["args"] = list(args)
-        captured["cwd"] = cwd
-        return 0, "pushed", ""
-
-    monkeypatch.setattr(update_source, "_git_network_bounded", fake_bounded)
-    ok, message = ci._push_branch(str(repo), "feature")
-    assert ok is True
-    assert message == "pushed"
-    assert captured["args"] == ["push", "-u", "origin", "feature"]
-    assert captured["cwd"] == repo
-
-    monkeypatch.setattr(
-        update_source,
-        "_git_network_bounded",
-        lambda args, **_kw: (update_source.FETCH_TIMEOUT_RC, "", "git push exceeded 300s and was terminated"),
-    )
-    ok, message = ci._push_branch(str(repo), "feature")
-    assert ok is False
-    assert "exceeded" in message
-
-
 def test_run_git_network_cmd_failure_reports_stdout_when_stderr_is_empty(tmp_path, monkeypatch):
     """Some git failures report only on stdout; the run_cmd-shaped error must
     carry that text instead of an empty STDERR-only message."""
@@ -423,6 +395,8 @@ def test_ci_note_names_every_push_workflow_and_none_stands_for_the_others(monkey
         {"name": "UI browser (ouroboros push)", "status": "queued", "conclusion": None},
     ])
     assert note.startswith("\n\n⏳ CI: push runs in progress — ") and "✅" not in note
+    # The hint names the repository the push went to: a bare SHA is read in the Project's repository.
+    assert note.endswith(f". Read the results later: get_github_checks(sha='{'a' * 40}', repo='example/project').")
     assert "Provider canaries: success; CI: in progress; UI browser (ouroboros push): queued" in note
 
     note = _ci_note(monkeypatch, [{"name": "Provider canaries", **_DONE}, {"name": "CI", **_DONE}])

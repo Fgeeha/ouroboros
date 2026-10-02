@@ -209,7 +209,7 @@ def test_denylist_is_allowlist_complement_blocks_all_host_surfaces():
               "vcs_restore", "vcs_revert", "vcs_rollback", "update_identity",
               "update_scratchpad", "knowledge_write", "journal_write", "send_user_message",
               "toggle_evolution", "toggle_consciousness", "request_deep_self_review",
-              "comment_on_pr", "comment_on_issue", "promote_to_stable", "run_ci_tests",
+              "comment_on_pr", "comment_on_issue", "promote_to_stable", "get_github_checks",
               "browse_page", "browser_action", "web_search", "plan_task",
               # host filesystem/code reads are denied too — the isolated settings.json
               # holds provider API keys a prompt-injected task could exfiltrate.
