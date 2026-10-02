@@ -28,7 +28,8 @@ class FakeChecks:
         self.polls, self.heads = [list(poll) for poll in polls], list(heads)
         self.jobs, self.annotations = jobs or {}, annotations or {}
         self.rollup = None if rollup is None else list(rollup)  # None: GitHub answers null for the rollup.
-        self.failing, self.fork, self.state, self.calls = failing or {}, fork, state, []
+        self.failing, self.fork, self.calls = failing or {}, fork, []
+        self.states = [state] if isinstance(state, str) else list(state)  # One per pull request read, like the heads.
 
     def __call__(self, args, ctx, timeout=30, input_data=None, *, repo=github._GENERIC_TRANSPORT):
         self.calls.append((list(args), repo, timeout))
@@ -41,7 +42,8 @@ class FakeChecks:
             return failure
         if args[0] == "pr":
             head = self.heads.pop(0) if len(self.heads) > 1 else self.heads[0]
-            pr = {"headRefOid": head, "url": f"{BASE}/pull/7", "isCrossRepository": self.fork, "state": self.state}
+            state = self.states.pop(0) if len(self.states) > 1 else self.states[0]
+            pr = {"headRefOid": head, "url": f"{BASE}/pull/7", "isCrossRepository": self.fork, "state": state}
             return _answer({**pr, "statusCheckRollup": self.rollup} if source == "rollup" else pr)
         if source == "runs":
             return _answer(self.polls.pop(0) if len(self.polls) > 1 else self.polls[0])
@@ -156,11 +158,11 @@ def test_checks_report_names_the_failed_job_its_step_and_annotations(checks):
         "        annotation failure: Process completed with exit code 1.",
         "        annotations: 2 at failure level, 2 shown; 3 of all levels read",
         *_SKIPPED_RUN, *_SHA_TAIL]
-    # Every repository command carries the explicit target; the annotation read is the one literal
-    # API path, sent on the generic transport with the host GitHub returned.
+    # Every repository command carries the explicit target; the annotation read, sent once every run's jobs are
+    # known, is the one literal API path, sent on the generic transport with the host GitHub returned.
     assert [(args[0], repo) for args, repo, _timeout in fake.calls] == [
         ("run", "github.example/owner/selected"), ("run", "github.example/owner/selected"),
-        ("api", github._GENERIC_TRANSPORT), ("run", "github.example/owner/selected")]
+        ("run", "github.example/owner/selected"), ("api", github._GENERIC_TRANSPORT)]
     assert fake.sent("api") == [["api", "repos/owner/selected/check-runs/55/annotations?per_page=100",
                                  "--hostname", "github.example"]]
 
@@ -216,21 +218,58 @@ def test_checks_report_keeps_unfinished_and_unregistered_apart_from_results(chec
     assert odd[-3] == "    jobs: unavailable (the answer holds no jobs list)" and "jobs: 0 —" not in "\n".join(odd)
 
 
+_TIME_LIMIT = {"annotation_level": "failure", "title": "",
+               "message": "The job has exceeded the maximum execution time of 2h0m0s"}
+
+
 def test_checks_report_keeps_cancelled_and_skipped_under_their_own_names(checks):
+    """GitHub concludes a job stopped at its time limit `cancelled`, its step too, and names the cause only in a
+    failure annotation: the job keeps its line and that annotation, while a skipped job stays in the counts."""
     fake = FakeChecks(polls=[[_run(11, conclusion="cancelled"), _run(12, "Mirror", conclusion="skipped")]], jobs={
-        11: [_job(54, "quick-test", conclusion="cancelled", steps=[(3, "Run", "completed", "cancelled")]),
+        11: [_job(54, "ui-smoke", conclusion="cancelled", steps=[(7, "Run", "completed", "cancelled")]),
              _job(55, "build", conclusion="skipped")],
-        12: [_job(60, "redirect", conclusion="skipped", run_id=12)]})
+        12: [_job(60, "redirect", conclusion="skipped", run_id=12)]}, annotations={54: [_TIME_LIMIT]})
     lines = checks(fake, sha=SHA).text.splitlines()
     assert lines[5:] == [
         "Workflow runs: 2 — cancelled 1, skipped 1",
         "", "Runs not completed with success (2):",
-        f"- CI (pull_request) run 11 attempt 1: cancelled {_RUNS}/11",
-        "    jobs: 2 — cancelled 1, skipped 1",  # The counts line carries a cancelled job that holds no failed step.
+        f"- CI (pull_request) run 11 attempt 1: cancelled {_RUNS}/11",  # A cancelled step leaves no failed-step log.
+        "    jobs: 2 — cancelled 1, skipped 1",
+        f"    - job ui-smoke [54]: cancelled {_RUNS}/11/job/54",
+        "        step 7 Run: cancelled",
+        "        annotation failure: The job has exceeded the maximum execution time of 2h0m0s",
+        "        annotations: 1 at failure level, 1 shown; 1 of all levels read",
         f"- Mirror (pull_request) run 12 attempt 1: skipped {_RUNS}/12",
         "    jobs: 1 — skipped 1",
         *_SHA_TAIL]
-    assert "Runs completed with success" not in "\n".join(lines) and fake.sent("api") == []
+    assert "Runs completed with success" not in "\n".join(lines)
+    assert [args[1].split("/")[4] for args in fake.sent("api")] == ["54"]  # Skipped jobs cost no annotation read.
+
+
+def test_failed_jobs_of_every_run_are_annotated_before_cancelled_ones(checks):
+    # Within a run a cancelled job follows the failed and the unfinished ones.
+    jobs = [_job(54, "ui-smoke", conclusion="cancelled"), _job(55, "macos", **_RUNNING),
+            _job(56, "lint", conclusion="failure")]
+    lines = checks(FakeChecks(polls=[[_run(11, **_RUNNING)]], jobs={11: jobs}), sha=SHA).text.splitlines()
+    assert [line.split()[2] for line in lines if line.startswith("    - job ")] == ["lint", "macos", "ui-smoke"]
+
+    # Fifteen cancelled jobs of a run listed first leave a failed job of a later run its annotations.
+    cancelled = [_job(100 + index, f"shard {index}", conclusion="cancelled", steps=[(7, "Run", "completed", "cancelled")])
+                 for index in range(15)]
+    fake = FakeChecks(polls=[[_run(11, conclusion="cancelled"), _run(12, "Lint")]],
+                      jobs={11: cancelled, 12: [{**_CONTINUED[3], "url": f"{_RUNS}/12/job/57"}]},
+                      annotations={**_LINT_ANNOTATION, **{100 + index: [_TIME_LIMIT] for index in range(15)}})
+    lines = checks(fake, sha=SHA).text.splitlines()
+    assert lines.index(f"- CI (pull_request) run 11 attempt 1: cancelled {_RUNS}/11") < lines.index(
+        f"- Lint (pull_request) run 12 attempt 1: success {_RUNS}/12")
+    read = [args[1].split("/")[4] for args in fake.sent("api")]
+    assert read == ["57"] + [str(100 + index) for index in range(9)]
+    lint = lines.index(f"    - job lint [57]: failure {_RUNS}/12/job/57")
+    assert lines[lint + 2] == "        annotation failure: ruff: F821"
+    assert lines.count("        annotation failure: The job has exceeded the maximum execution time of 2h0m0s") == 9
+    assert lines[lines.index(f"    - job shard 9 [109]: cancelled {_RUNS}/11/job/109") + 2] == (
+        "        annotations: not read (one call reads the annotations of 10 jobs)")
+    assert "    5 more jobs not shown: cancelled 5" in lines
 
 
 def test_checks_report_lists_third_party_checks_and_statuses_of_a_pull_request(checks):
@@ -362,11 +401,11 @@ def test_one_deadline_bounds_every_request(checks):
     fake = _failed_world()
     checks.clock.request_cost = 40.0  # Each request spends 40 s of the 90 s a call without a wait has.
     lines = checks(fake, sha=SHA).text.splitlines()
-    # The runs and the first jobs read get the per-request ceiling, the annotation read gets what is left,
-    # and the jobs read of the second run is never sent.
-    assert [(args[0], timeout) for args, _repo, timeout in fake.calls] == [("run", 30), ("run", 30), ("api", 10)]
-    assert "Sources unavailable: jobs (runs: 1; deadline)" in lines and lines[-4:-2] == [
-        _SKIPPED_RUN[0], "    jobs: unavailable (deadline)"]
+    # The runs and the first jobs read get the per-request ceiling, the jobs read of the second run gets what is
+    # left, and the annotation read, which waits for every run's jobs, is never sent.
+    assert [(args[0], timeout) for args, _repo, timeout in fake.calls] == [("run", 30), ("run", 30), ("run", 10)]
+    assert "Sources unavailable: annotations (jobs: 1; deadline)" in lines and lines[-4:-2] == _SKIPPED_RUN
+    assert "        annotations: unavailable (deadline)" in lines
     assert lines[:2] == _HEADER and "Workflow runs: 2 — failure 1, skipped 1" in lines
     # With time left every request is sent under the per-request ceiling.
     checks.clock.now, checks.clock.request_cost, fake = 0.0, 0.0, _failed_world()
@@ -376,9 +415,12 @@ def test_one_deadline_bounds_every_request(checks):
 
 def test_a_head_that_moves_during_the_wait_is_named(checks):
     fake = FakeChecks(polls=[[_run(11, **_RUNNING)], [_run(11, conclusion="cancelled")]], heads=[SHA, MOVED],
-                      rollup=_ACTIONS_ROLLUP, jobs={11: [_job(55, "full-test", conclusion="cancelled")]})
+                      rollup=_ACTIONS_ROLLUP, jobs={11: [_job(55, "full-test", conclusion="cancelled")]},
+                      state=["OPEN", "CLOSED"])
     lines = checks(fake, number=7, wait_seconds=60).text.splitlines()
-    assert lines[:3] == [*_HEADER, f"{_PR_LINE}; head moved to {MOVED} during the wait; this report is for {SHA}"]
+    # The state is the one read after the wait.
+    assert lines[:3] == [*_HEADER, f"Pull request: #7 {BASE}/pull/7 (closed); head moved to {MOVED} during the wait; "
+                                   f"this report is for {SHA}"]
     assert "Sources unavailable: pull request check rollup (GitHub's rollup describes the moved head)" in lines
     assert lines[-1] == "Other checks: not read — the pull request check rollup is unavailable."
     assert all(args[3] == SHA for args in fake.sent("run") if args[1] == "list")  # The SHA is fixed at the start.
@@ -399,6 +441,22 @@ def test_a_head_that_moves_during_the_wait_is_named(checks):
     assert lines[-1] == "Other checks: not read — the pull request check rollup is unavailable."
 
 
+def test_the_source_lines_name_every_source_and_the_other_header_lines_are_clipped(checks):
+    words = "gh: " + "Resource not accessible by integration " * 6 + "(HTTP 403)"
+    refused = github.GhResult(False, "⚠️ GH_ERROR: " + words, 1, 403, "exit")
+    fake = FakeChecks(polls=[[_run(11, **_RUNNING)], [_run(11, conclusion="failure"), _run(12, "Docs", conclusion="failure"),
+                                                      _run(13, "Odd", conclusion="x" * 600)]],
+                      jobs={12: [_job(60, "build", conclusion="failure", run_id=12)]}, rollup=_ACTIONS_ROLLUP,
+                      failing={"rollup": refused, "pr": [None, refused], "jobs": [refused, None], "annotations": refused})
+    lines = checks(fake, number=7, wait_seconds=60).text.splitlines()
+    gap = f"HTTP 403: {words[:159]}…"  # Each named failure is cut at 160 characters; the line is not cut again.
+    assert lines[5] == (f"Sources unavailable: pull request check rollup ({gap}); pull request head after the wait ({gap}); "
+                        f"jobs (runs: 1; {gap}); annotations (jobs: 1; {gap})")
+    # A header line built from GitHub's free text is cut at 500 characters.
+    counts = next(line for line in lines if line.startswith("Workflow runs: 3 — failure 2, xxx"))
+    assert len(counts) == 500 and counts.endswith("…")
+
+
 @pytest.mark.parametrize("args", [{"sha": "main"}, {"sha": SHA[:12]}, {"sha": SHA, "number": 7}, {}, {"number": -1}])
 def test_checks_target_is_one_pull_request_or_one_full_sha(checks, args):
     fake = FakeChecks(polls=[[_run(11)]])
@@ -409,9 +467,9 @@ def test_checks_target_is_one_pull_request_or_one_full_sha(checks, args):
     assert checks(fake, sha=SHA).status == "ok" and checks(fake, number=7).status == "ok"
 
 
-@pytest.mark.parametrize("args", [{"number": True}, {"number": 7.5}, {"number": "seven"}, {"number": [7]},
+@pytest.mark.parametrize("args", [{"number": True}, {"number": 7.5}, {"number": "7.5"}, {"number": "seven"}, {"number": [7]},
                                   {"sha": SHA, "wait_seconds": True}, {"sha": SHA, "wait_seconds": 0.4},
-                                  {"sha": SHA, "wait_seconds": "soon"}])
+                                  {"sha": SHA, "wait_seconds": "7.5"}, {"sha": SHA, "wait_seconds": "soon"}])
 def test_checks_number_and_wait_are_whole_numbers(checks, args):
     fake = FakeChecks(polls=[[_run(11)]])
     result = checks(fake, **args)
@@ -538,6 +596,12 @@ def test_rollup_facts_reach_the_header_and_a_job_no_listed_run_explains_is_shown
     text = checks(FakeChecks(polls=[[_run(11, conclusion="failure")]], rollup=[inside]), number=7).text
     assert "Pull request rollup, GitHub Actions jobs: 1 — failure 1\n" in text
     assert stray not in text and "Other checks, outside GitHub Actions" not in text
+    # A job still running in a run no listed run explains is listed too, after the failed one GitHub returned later.
+    running = {**failed_job, "name": "ui-smoke", "status": "IN_PROGRESS", "conclusion": "", "detailsUrl": f"{_RUNS}/98/job/6"}
+    lines = checks(FakeChecks(polls=[[_run(11)]], rollup=[running, failed_job]), number=7).text.splitlines()
+    assert lines[-4:-1] == [f"GitHub Actions jobs of the rollup {stray} (2) — failure 1, in_progress 1:",
+                            f"- job CI / full-test: failure {_RUNS}/99/job/5",
+                            f"- job CI / ui-smoke: in_progress {_RUNS}/98/job/6"]
 
 
 def test_failure_class_runs_are_listed_and_expanded_first(checks):
@@ -563,7 +627,7 @@ def test_failure_class_runs_are_listed_and_expanded_first(checks):
     at = lines.index(f"- CI (pull_request) run 100 attempt 1: cancelled {_RUNS}/100")
     assert lines[at + 1:at + 5] == [hint.format(100), "    jobs: 2 — failure 1, cancelled 1",
                                     f"    - job build [1]: failure {_RUNS}/100/job/1", "        step 4 Compile: failure"]
-    assert not any(line.startswith("    - job test ") for line in lines)  # The cancelled sibling stays in the counts.
+    assert lines[at + 6] == f"    - job test [2]: cancelled {_RUNS}/100/job/2"  # The cancelled sibling comes after.
     at = lines.index(f"- CI (pull_request) run 101 attempt 1: cancelled {_RUNS}/101")
     assert lines[at + 1] == "    jobs: 1 — cancelled 1" and hint.format(101) not in lines
 
@@ -596,7 +660,7 @@ def test_a_failed_step_is_shown_whatever_its_job_concluded(checks):
                    _job(56, "build", conclusion="cancelled", steps=[(3, "Compile", "completed", "cancelled")])]},
         annotations={55: [{"annotation_level": "failure", "title": "Failed test", "message": "tests/test_x.py::test_y"}]})
     assert checks(fake, sha=SHA).text.splitlines()[3:] == [
-        "Sources read: workflow runs; jobs (runs: 1); annotations (jobs: 1)",
+        "Sources read: workflow runs; jobs (runs: 1); annotations (jobs: 2)",
         "Sources unavailable: none",
         "Workflow runs: 1 — cancelled 1",
         "", "Runs not completed with success (1):",
@@ -608,8 +672,11 @@ def test_a_failed_step_is_shown_whatever_its_job_concluded(checks):
         "        step 9 Cleanup: cancelled",
         "        annotation failure [Failed test]: tests/test_x.py::test_y",
         "        annotations: 1 at failure level, 1 shown; 1 of all levels read",
+        f"    - job build [56]: cancelled {_RUNS}/11/job/56",
+        "        step 3 Compile: cancelled",
+        "        annotations: 0 at failure level, 0 shown; 0 of all levels read",
         *_SHA_TAIL]
-    assert [args[1].split("/")[4] for args in fake.sent("api")] == ["55"]  # The plain cancelled job is not read.
+    assert [args[1].split("/")[4] for args in fake.sent("api")] == ["55", "56"]  # The job with the failed step first.
 
     # A step that failed inside a job still in progress is shown with its annotations; the run has no log yet.
     steps = [(2, "Run tests", "completed", "failure"), (3, "Upload", "in_progress", "")]
@@ -699,6 +766,13 @@ def test_step_annotation_and_rollup_lists_state_what_they_leave_out(checks):
     lines = checks(FakeChecks(polls=[[_run(11)]], rollup=pending + [errored]), number=7).text.splitlines()
     at = lines.index("Other checks, outside GitHub Actions (13) — pending 12, error 1:")
     assert lines[at + 1] == "- commit status ci/legacy: error https://scan.example/7"
+    # A required commit status that has not reported yet (`expected`) sorts with the unfinished ones, ahead of neutral.
+    neutral = [{"__typename": "CheckRun", "name": f"optional/{index}", "workflowName": "", "status": "COMPLETED",
+                "conclusion": "NEUTRAL", "detailsUrl": ""} for index in range(12)]
+    required = {**red, "context": "ci/required", "state": "EXPECTED", "targetUrl": ""}
+    lines = checks(FakeChecks(polls=[[_run(11)]], rollup=neutral + [required]), number=7).text.splitlines()
+    assert lines[lines.index("Other checks, outside GitHub Actions (13) — neutral 12, expected 1:") + 1] == (
+        "- commit status ci/required: expected")
 
 
 @pytest.mark.parametrize("rollup", [[], None])

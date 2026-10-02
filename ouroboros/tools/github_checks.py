@@ -9,15 +9,16 @@ import json
 import re
 import time
 from collections import Counter
-from typing import Callable, List, Optional
+from typing import Dict, List, Optional
 
 from ouroboros.tool_capabilities import tool_result_limit
 from ouroboros.tools.github import GhResult, _gh_run, _refuse
 from ouroboros.tools.registry import ToolContext
 from ouroboros.utils import utc_now_iso
 
-# GitHub's states in report order: the finished ones, then the unfinished ones.
-_CHECKS_UNFINISHED = ("queued", "in_progress", "waiting", "requested", "pending")
+# GitHub's states in report order: the finished ones, then the unfinished ones (`expected`: a required commit status
+# that has not reported yet).
+_CHECKS_UNFINISHED = ("queued", "in_progress", "waiting", "requested", "pending", "expected")
 _CHECK_STATES = ("success", "failure", "cancelled", "timed_out", "startup_failure", "action_required", "stale",
                  "skipped", "neutral", *_CHECKS_UNFINISHED)
 _CHECKS_QUIET = ("success", "skipped", "neutral")  # These carry no failed step.
@@ -94,17 +95,28 @@ def _job_failed(job: dict) -> bool:
                for item in (job, *(step for step in job.get("steps") or [] if isinstance(step, dict))))
 
 
-def _job_lines(jobs: List[dict], annotations: Callable[[dict], List[str]]) -> List[str]:
-    """The lines of one run: job counts first, then its failed and unfinished jobs with their steps.
+def _loud_jobs(jobs: List[dict]) -> List[dict]:
+    """The jobs with a line of their own, by their own states: failed ones first, cancelled ones last.
+
+    A skipped job adds nothing to the counts line. A cancelled one keeps its line: GitHub concludes a job stopped at its
+    time limit `cancelled`, and only a failure annotation of that job names the cause."""
+    return sorted((job for job in jobs if _job_failed(job) or _check_state(job) not in _CHECKS_QUIET), key=lambda job: (
+        not _job_failed(job), _check_state(job) == "cancelled", job.get("status") != "completed"))
+
+
+def _annotated(job: dict) -> bool:
+    """A job whose annotations are read: a completed one, or one that holds a failed step while it runs."""
+    return _job_failed(job) or job.get("status") == "completed"
+
+
+def _job_lines(jobs: List[dict], notes: Dict[int, List[str]]) -> List[str]:
+    """The lines of one run: job counts first, then its jobs with a line of their own, their steps and annotations.
 
     Chosen by the jobs' own states: a `continue-on-error` job fails inside a run GitHub calls success."""
     if not jobs:
         return ["    jobs: 0 — GitHub lists no job for this run"]
     lines = [f"    jobs: {len(jobs)} — {_state_counts(jobs)}"]
-    # A cancelled or skipped job that holds no failed step adds nothing to the counts line.
-    loud = sorted(
-        (job for job in jobs if _job_failed(job) or _check_state(job) not in (*_CHECKS_QUIET, "cancelled")),
-        key=lambda job: (not _job_failed(job), job.get("status") != "completed"))
+    loud = _loud_jobs(jobs)
     for job in loud[:_CHECKS_JOB_LINES]:
         state = _check_state(job)
         lines.append(f"    - job {_one_line(job.get('name'))} [{job.get('databaseId')}]: {state} "
@@ -116,8 +128,7 @@ def _job_lines(jobs: List[dict], annotations: Callable[[dict], List[str]]) -> Li
         if len(steps) > _CHECKS_STEP_LINES:
             lines.append(f"        {len(steps) - _CHECKS_STEP_LINES} more steps of this job: "
                          f"{_state_counts(steps[_CHECKS_STEP_LINES:])}")
-        if _job_failed(job) or job.get("status") == "completed":
-            lines += ["        " + line for line in annotations(job)]
+        lines += ["        " + line for line in notes.get(id(job), [])]
     if len(loud) > _CHECKS_JOB_LINES:
         lines.append(f"    {len(loud) - _CHECKS_JOB_LINES} more jobs not shown: {_state_counts(loud[_CHECKS_JOB_LINES:])}")
     return lines
@@ -365,20 +376,25 @@ def get_checks(ctx: ToolContext, number: object = 0, sha: object = "", wait_seco
                and check.get("__typename") == "CheckRun" and _check_state(check) in _CHECKS_FAILED}
     wanted = [run for run in runs if _check_state(run) != "success" or "statusCheckRollup" not in pr
               or str(run.get("databaseId")) in flagged]
-    expanded = {id(run) for run in wanted[:_CHECKS_EXPANDED_RUNS]}
+    expanded = {id(run): src.jobs(run) for run in wanted[:_CHECKS_EXPANDED_RUNS]}
     unread = {id(run) for run in wanted[_CHECKS_EXPANDED_RUNS:]}
+    # Annotations are read once every run's jobs are known, failed jobs first: the cancelled jobs of a run listed
+    # earlier never use up the annotation reads a failed job of a later run needs.
+    shown = [job for jobs, _line in expanded.values()
+             for job in _loud_jobs(jobs or [])[:_CHECKS_JOB_LINES] if _annotated(job)]
+    notes = {id(job): src.annotations(job) for job in sorted(shown, key=lambda job: not _job_failed(job))}
     blocks = []
     for run in runs:
-        jobs_line, detail, failed_job = "", [], False
-        if id(run) in expanded:
-            jobs, jobs_line = src.jobs(run)
-            if jobs is not None:
-                jobs_line, *detail = _job_lines(jobs, src.annotations)
-                failed_job = any(_job_failed(job) for job in jobs)
+        jobs, jobs_line = expanded.get(id(run), (None, ""))
+        detail: List[str] = []
+        if jobs is not None:
+            jobs_line, *detail = _job_lines(jobs, notes)
         elif id(run) in unread:
             jobs_line = f"    jobs: not read (one call expands {_CHECKS_EXPANDED_RUNS} runs)"
-        # A step log exists for a completed run that failed, timed out or holds a failed job or step.
-        log_failed = run.get("status") == "completed" and (_check_state(run) in _CHECKS_FAILED or failed_job)
+        # A step log exists for a completed run that failed or timed out, or whose jobs read here hold a failed
+        # job or step.
+        log_failed = run.get("status") == "completed" and (
+            _check_state(run) in _CHECKS_FAILED or any(_job_failed(job) for job in jobs or []))
         blocks.append((run, _run_block(run, slug, log_failed, jobs_line), detail))
     over = len(unread)
     read = ["workflow runs", f"jobs (runs: {len(expanded) - len(src.job_failures)}" + (
@@ -404,11 +420,15 @@ def get_checks(ctx: ToolContext, number: object = 0, sha: object = "", wait_seco
         read.append("pull request check rollup")
         rollup_facts, lists, closing = _rollup_report(pr["statusCheckRollup"], runs)
         facts += rollup_facts
-    head += [f"Observed: {utc_now_iso()}" + (f"; waited {waited}s of {wait}s for the runs to complete" if wait else ""),
-             "Sources read: " + "; ".join(read), "Sources unavailable: " + src.unavailable(), *facts]
+    head += [f"Observed: {utc_now_iso()}" + (f"; waited {waited}s of {wait}s for the runs to complete" if wait else "")]
+    # The two source lines are bounded by construction (a named failure is cut at 160 characters), and a clip
+    # would drop the last source named: they are kept whole.
+    head = [_one_line(line, _CHECKS_HEAD_LINE) for line in head] + [
+        "Sources read: " + "; ".join(read), "Sources unavailable: " + src.unavailable()] + [
+        _one_line(line, _CHECKS_HEAD_LINE) for line in facts]
     done = [block for block in blocks if _check_state(block[0]) == "success"]
     open_ = [block for block in blocks if _check_state(block[0]) != "success"]
-    return _render([_one_line(line, _CHECKS_HEAD_LINE) for line in head],
+    return _render(head,
                    [(f"\n{title} ({len(group)}):", group) for title, group in (
                        ("Runs not completed with success", open_), ("Runs completed with success", done)) if group],
                    [(f"{title} ({len(checks)}) — {_state_counts(checks)}:", checks) for title, checks in lists], closing)
