@@ -3,9 +3,9 @@
 # Two pull requests can each be green against the same base and still break the
 # interface once merged sequentially; only the merged commit proves otherwise.
 # This trigger therefore carries NO path filter — a Makefile-, `Ouroboros.spec`-
-# or requirements-only push reaches the lane too, and `ci.yml` keeps its narrower
-# path filter for every other job. The documentation-only skip is decided inside
-# the shared lane from the event diff, not here.
+# or requirements-only push reaches the lane too, as it reaches every push job
+# of `ci.yml`. The documentation-only skip is decided inside the shared lane from
+# the event diff, not here.
 #
 # No schedule and no new cron. A push and a manual `full` run call the shared lane,
 # the same one the manual/tag checks in ci.yml call. This manual entry is also the

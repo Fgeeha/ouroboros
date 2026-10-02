@@ -417,8 +417,10 @@ def test_terminal_bench_claim_applies_disclosed_reward_hack_correction():
 
 def test_site_changes_trigger_branch_ci():
     workflow = (REPO / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-    for path_filter in ("site/**", "docs/**", "assets/**"):
-        assert f"- '{path_filter}'" in workflow
+    # No path filter on the push trigger: a site-, docs- or assets-only push runs the code workflow.
+    push = yaml.load(workflow, Loader=yaml.BaseLoader)["on"]["push"]
+    assert push["branches"] == ["main", "ouroboros", "ouroboros-stable"]
+    assert "paths" not in push and "paths-ignore" not in push
     assert "pnpm --dir site build" in workflow
     assert "git status --porcelain --untracked-files=all -- docs/" in workflow
     assert "git diff --exit-code -- docs/" in workflow
