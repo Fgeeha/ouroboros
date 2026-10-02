@@ -363,6 +363,7 @@ def test_actual_producer_shell_preserves_success_and_failure_exit(tmp_path, work
 OFFICIAL, FORK, TAG = "razzant/ouroboros", "someone/private-copy", "refs/tags/v7.5.2"
 
 
+@pytest.mark.serial
 @pytest.mark.parametrize("event,ref,repository,flag", [
     ("push", TAG, OFFICIAL, "--enforce"),
     ("workflow_dispatch", TAG, OFFICIAL, "--enforce"),  # A manual run on a tag ref can publish too.
