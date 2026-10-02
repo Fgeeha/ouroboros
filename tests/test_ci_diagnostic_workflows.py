@@ -8,12 +8,18 @@ import re
 import shutil
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 UPLOAD_ACTION = "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+CANARY, CANARY_PUSH = "provider-canary.yml", "provider-canary-push.yml"
+PROVIDER_SECRETS = (
+    "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "MINIMAX_API_KEY", "DEEPSEEK_API_KEY",
+    "CLOUDRU_FOUNDATION_MODELS_API_KEY", "CLOUDRU_FOUNDATION_MODELS_BASE_URL", "GIGACHAT_CREDENTIALS",
+)
 
 
 def _workflow(name):
@@ -26,10 +32,11 @@ def _steps(name, job):
 
 def test_provider_diagnostics_stay_outside_test_and_release_authority():
     workflow = _workflow("ci.yml")
-    job = workflow["jobs"]["integration-test"]
-    steps = _steps("ci.yml", "integration-test")
+    job = _workflow(CANARY)["jobs"]["integration-test"]
+    steps = _steps(CANARY, "integration-test")
     producer = steps["provider_tests"]
     assert "continue-on-error" not in job and "continue-on-error" not in producer
+    assert "continue-on-error" not in workflow["jobs"]["integration-test"]
     assert "pytest tests/test_provider_integration.py -m integration -q -rs --tb=short" in producer["run"]
     assert "--ci-evidence-dir=" in producer["run"] and "--junitxml=" in producer["run"]
     assert "ci-private/provider/results.xml" in producer["run"]
@@ -54,7 +61,7 @@ def test_provider_diagnostics_stay_outside_test_and_release_authority():
 
 
 def test_only_informational_steps_tolerate_errors_and_report_missing_uploads():
-    for name, jobname in (("ci.yml", "integration-test"), ("ui-browser.yml", "ui-smoke")):
+    for name, jobname in ((CANARY, "integration-test"), ("ui-browser.yml", "ui-smoke")):
         job = _workflow(name)["jobs"][jobname]
         for step in job["steps"]:
             if step.get("continue-on-error"):
@@ -67,6 +74,76 @@ def test_only_informational_steps_tolerate_errors_and_report_missing_uploads():
         assert "outputs.artifact-url == ''" in warning["if"]
         assert "summary.outcome != 'success'" in warning["if"]
         assert "::warning::" in warning["run"] and "$GITHUB_STEP_SUMMARY" in warning["run"]
+
+
+def _triggers(workflow):
+    return workflow.get("on", workflow.get(True))  # PyYAML's YAML 1.1 spelling of "on".
+
+
+def _canary_wiring_faults(ci, shared, push):
+    """Name every way the canary body and its two callers can drift apart."""
+    faults = []
+    passed = {name: f"${{{{ secrets.{name} }}}}" for name in PROVIDER_SECRETS}
+    for label, jobs in (("ci.yml", ci["jobs"]), (CANARY_PUSH, push["jobs"])):
+        caller = jobs["integration-test"]
+        if caller.get("uses") != f"./.github/workflows/{CANARY}":
+            faults.append(f"{label} does not call the shared job")
+        if caller.get("secrets") != passed:
+            faults.append(f"{label} does not pass exactly the eight provider secrets by name")
+        if caller.get("permissions") != {"contents": "read"}:
+            faults.append(f"{label} widens the called job's permissions")
+    declared = {name: {"required": False} for name in PROVIDER_SECRETS}
+    if _triggers(shared) != {"workflow_call": {"secrets": declared}}:
+        faults.append("the shared job is not call-only with eight optional secrets")
+    # Same branches and path filter as the code workflow's push trigger: one paid run per push.
+    code_push = _triggers(ci)["push"]
+    if _triggers(push) != {"push": {"branches": code_push["branches"], "paths": code_push["paths"]}}:
+        faults.append("the push wrapper's trigger differs from ci.yml's branch pushes")
+    if code_push["branches"] != ["main", "ouroboros", "ouroboros-stable"]:
+        faults.append("ci.yml's branch pushes are not the three shared branches")
+    for label, workflow in ((CANARY, shared), (CANARY_PUSH, push)):
+        if list(workflow["jobs"]) != ["integration-test"]:
+            faults.append(f"{label} holds more than the canary job")
+        if workflow.get("permissions") != {"contents": "read"}:
+            faults.append(f"{label} does not default to read-only permissions")
+        # A group would cancel or replace a paid run that belongs to another commit.
+        if any("concurrency" in scope for scope in (workflow, *workflow["jobs"].values())):
+            faults.append(f"{label} declares a concurrency group")
+    return faults
+
+
+def test_provider_canaries_share_one_body_between_the_code_workflow_and_the_push_wrapper():
+    assert _canary_wiring_faults(*map(_workflow, ("ci.yml", CANARY, CANARY_PUSH))) == []
+    for path in sorted((ROOT / ".github/workflows").glob("*.yml")):
+        for job in _workflow(path.name)["jobs"].values():
+            assert job.get("secrets") != "inherit", path.name  # Would hand over signing and live-stand keys.
+
+
+CANARY_DRIFTS = {
+    "wrapper also fires on tags": lambda w: _triggers(w.push)["push"].update(tags=["v*"]),
+    "wrapper gains a second trigger": lambda w: _triggers(w.push).update(workflow_dispatch=None),
+    "wrapper drops a branch": lambda w: _triggers(w.push)["push"]["branches"].remove("main"),
+    "wrapper drops a path": lambda w: _triggers(w.push)["push"]["paths"].pop(),
+    "ci.yml gains a path": lambda w: _triggers(w.ci)["push"]["paths"].append("Makefile"),
+    "wrapper concurrency": lambda w: w.push.update(concurrency="canary"),
+    "shared job concurrency": lambda w: w.shared["jobs"]["integration-test"].update(concurrency="canary"),
+    "inherited secrets": lambda w: w.ci["jobs"]["integration-test"].update(secrets="inherit"),
+    "caller drops a secret": lambda w: w.push["jobs"]["integration-test"]["secrets"].pop("OPENAI_API_KEY"),
+    "required secret": lambda w: _triggers(w.shared)["workflow_call"]["secrets"]["OPENAI_API_KEY"].update(
+        required=True),
+    "undeclared ninth secret": lambda w: _triggers(w.shared)["workflow_call"]["secrets"].update(EXTRA={}),
+    "shared job self-triggers": lambda w: _triggers(w.shared).update(push=None),
+    "caller leaves the shared job": lambda w: w.ci["jobs"]["integration-test"].update(uses="./other.yml"),
+    "shared job loses its read-only default": lambda w: w.shared.pop("permissions"),
+    "caller widens permissions": lambda w: w.push["jobs"]["integration-test"].update(permissions="write-all"),
+}
+
+
+@pytest.mark.parametrize("drift", CANARY_DRIFTS.values(), ids=list(CANARY_DRIFTS))
+def test_each_provider_canary_wiring_drift_is_named(drift):
+    files = SimpleNamespace(ci=_workflow("ci.yml"), shared=_workflow(CANARY), push=_workflow(CANARY_PUSH))
+    drift(files)
+    assert _canary_wiring_faults(files.ci, files.shared, files.push)
 
 
 def test_manual_ui_selection_is_fixed_partial_and_never_a_paid_or_full_check():
@@ -129,7 +206,7 @@ def _run_shell(step, tmp_path, *, diagnostic="viewport", result=0):
 
 @pytest.mark.parametrize("result", [0, 17])
 @pytest.mark.parametrize("workflow,job,step", [
-    ("ci.yml", "integration-test", "provider_tests"),
+    (CANARY, "integration-test", "provider_tests"),
     ("ui-browser.yml", "ui-smoke", "ui_tests"),
     ("ui-browser.yml", "ui-smoke", "ui_diagnostic"),
     ("ui-browser.yml", "ui-smoke", "browser_tools"),
@@ -163,7 +240,7 @@ def test_unknown_or_shell_like_selection_cannot_execute_or_silently_run_full(tmp
 
 def test_every_added_outcome_reference_names_an_already_declared_step():
     pattern = re.compile(r"steps\.([A-Za-z_][A-Za-z0-9_]*)\.")
-    for workflow, job in (("ci.yml", "integration-test"), ("ui-browser.yml", "ui-smoke")):
+    for workflow, job in ((CANARY, "integration-test"), ("ui-browser.yml", "ui-smoke")):
         known = set()
         for step in _workflow(workflow)["jobs"][job]["steps"]:
             references = pattern.findall(str(step))

@@ -94,6 +94,24 @@ def test_desktop_pr_coverage_does_not_admit_provider_or_release_jobs(name):
     assert not _value(job["if"], event="pull_request", ref="refs/pull/42/merge", base="ouroboros")
 
 
+@pytest.mark.parametrize("event,ref,schedule,called", [
+    ("push", "refs/heads/main", "", False),
+    ("push", "refs/heads/ouroboros", "", False),
+    ("push", "refs/heads/ouroboros-stable", "", False),
+    ("push", "refs/tags/v7.0.0", "", True),
+    ("workflow_dispatch", "refs/heads/candidate", "", True),
+    ("pull_request", "refs/pull/42/merge", "", False),
+    ("schedule", "refs/heads/main", "37 4 * * *", False),
+    ("schedule", "refs/heads/main", "17 3 * * *", False),
+])
+def test_provider_canaries_join_this_workflow_only_for_manual_runs_and_tags(event, ref, schedule, called):
+    """Branch pushes reach the canaries through provider-canary-push.yml, so a
+    provider outage on a landed commit leaves this workflow's result to the code."""
+    job = WORKFLOW["jobs"]["integration-test"]
+    assert job["uses"] == "./.github/workflows/provider-canary.yml"
+    assert bool(_value(job["if"], event=event, ref=ref, base="ouroboros", schedule=schedule)) is called
+
+
 @pytest.mark.parametrize(("event", "cancelled", "expected"), [
     ("pull_request", False, True), ("pull_request", True, False),
     ("schedule", False, False), ("schedule", True, False),

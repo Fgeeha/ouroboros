@@ -9,10 +9,10 @@ and the plan's §8 pull-request lane was replaced by a daily schedule (owner
 
 Two properties are load-bearing enough to pin. The job must stay OFF push and
 pull_request, or the lane it was made cheap for becomes the slowest thing in
-every PR. And the daily schedule must not wake the PAID provider lane: three
-of `integration-test`'s branch conditions match the default branch ref a
-scheduled run carries, so without an explicit event guard adding `schedule:`
-to this workflow would spend real provider credit every night.
+every PR. And the daily schedule must not wake the PAID provider lane: a
+scheduled run carries the default branch in its ref, so `integration-test`
+leads with an explicit event guard that holds whatever ref conditions follow
+it, and no cron spends real provider credit.
 """
 
 from __future__ import annotations
@@ -165,8 +165,10 @@ def test_the_scheduled_lane_asks_for_no_secret():
 
 
 def test_the_daily_schedule_does_not_wake_the_paid_provider_lane():
-    """`integration-test` fires on refs/heads/main|ouroboros|ouroboros-stable —
-    one of which is whatever default branch a scheduled run reports. Without
-    this guard the new cron would buy provider credit every night."""
+    """A scheduled run reports the default branch in github.ref. The leading
+    event guard keeps both crons off the paid lane whatever ref conditions
+    follow it; the push workflow that serves branch pushes has no schedule."""
     condition = " ".join(str(_workflow()["jobs"]["integration-test"]["if"]).split())
     assert condition.startswith("github.event_name != 'schedule'"), condition
+    push = yaml.safe_load((CI_PATH.parent / "provider-canary-push.yml").read_text(encoding="utf-8"))
+    assert list(push.get("on", push.get(True))) == ["push"]

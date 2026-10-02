@@ -72,8 +72,8 @@ on:
   # Off the hour deliberately: GitHub's cron queue is deepest at :00. NOTE for
   # any job added later — a scheduled run reports the DEFAULT BRANCH in
   # github.ref, so a job gated on a branch ref alone will fire on BOTH crons
-  # (see integration-test), and a job gated on the bare event name fires twice
-  # a night — bind it to its own cron string.
+  # (integration-test carries the explicit event guard), and a job gated on the
+  # bare event name fires twice a night — bind it to its own cron string.
   schedule:
     - cron: '37 4 * * *'
     - cron: '17 3 * * *'
@@ -382,79 +382,35 @@ jobs:
 
   # ──────────────────────────────────────────────────────────────────
   # Tier 2.5: Integration tests against real provider APIs
-  # Triggered on push to main / ouroboros / ouroboros-stable, manual,
-  # or tag v*. OPENROUTER_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY
-  # are required in the official trusted job; MiniMax / DeepSeek / Cloud.ru /
-  # GigaChat credentials are optional and their absent rows remain visible as skips.
-  # The `integration` pytest marker controls inclusion via `-m integration`.
+  # The job body is the reusable `provider-canary.yml`. This workflow calls it
+  # for manual runs and `v*` tags, where `release-preflight` requires its
+  # result. Branch pushes are deliberately NOT matched here:
+  # `provider-canary-push.yml` owns that trigger and shares the job, so a
+  # provider outage on a landed commit never reddens this workflow.
   # Confirmed provider-contract failures block release-preflight; the test
   # classifier keeps quota/rate-limit/5xx/timeout outcomes inconclusive.
   # ──────────────────────────────────────────────────────────────────
   integration-test:
-    # The leading schedule guard is what keeps the nightly cron above OFF this
-    # paid lane: a scheduled run carries the default branch in github.ref, which
-    # three of the conditions below already match.
+    # A scheduled run is neither a manual run nor a tag. The leading guard keeps
+    # the nightly crons above OFF this paid lane even if a branch-ref condition
+    # joins the group below: a scheduled run carries the default branch in
+    # github.ref.
     if: |
       github.event_name != 'schedule'
       && (github.event_name == 'workflow_dispatch'
-      || github.ref == 'refs/heads/main'
-      || github.ref == 'refs/heads/ouroboros'
-      || github.ref == 'refs/heads/ouroboros-stable'
       || startsWith(github.ref, 'refs/tags/v'))
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup-python-env
-      - name: Run integration tests
-        id: provider_tests
-        env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-          CLOUDRU_FOUNDATION_MODELS_API_KEY: ${{ secrets.CLOUDRU_FOUNDATION_MODELS_API_KEY }}
-          CLOUDRU_FOUNDATION_MODELS_BASE_URL: ${{ secrets.CLOUDRU_FOUNDATION_MODELS_BASE_URL }}
-          GIGACHAT_CREDENTIALS: ${{ secrets.GIGACHAT_CREDENTIALS }}
-        run: >-
-          python -m pytest tests/test_provider_integration.py -m integration -q -rs --tb=short
-          --junitxml="${{ runner.temp }}/ci-private/provider/results.xml"
-          --ci-evidence-dir="${{ runner.temp }}/ci-evidence/provider"
-      - name: Upload provider test evidence
-        id: provider_evidence
-        if: ${{ !cancelled() }}
-        continue-on-error: true
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: provider-ci-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/ci-evidence/provider/
-          retention-days: 30
-          if-no-files-found: warn
-      - name: Summarize provider test results
-        id: provider_summary
-        if: ${{ !cancelled() }}
-        continue-on-error: true
-        env:
-          PRODUCER_OUTCOME: ${{ steps.provider_tests.outcome }}
-          ARTIFACT_OUTCOME: ${{ steps.provider_evidence.outcome }}
-          ARTIFACT_URL: ${{ steps.provider_evidence.outputs.artifact-url }}
-        run: >-
-          python -m tests.ci_evidence summarize
-          --evidence-dir "${{ runner.temp }}/ci-evidence/provider"
-          --producer-outcome "$PRODUCER_OUTCOME"
-          --artifact-outcome "$ARTIFACT_OUTCOME"
-          --artifact-url "$ARTIFACT_URL"
-          --summary "$GITHUB_STEP_SUMMARY"
-      - name: Disclose incomplete provider diagnostics
-        continue-on-error: true
-        if: >-
-          ${{ !cancelled() &&
-          (steps.provider_summary.outcome != 'success' ||
-           steps.provider_evidence.outcome != 'success' ||
-           steps.provider_evidence.outputs.artifact-url == '') }}
-        run: |
-          echo "::warning::Provider diagnostics are incomplete; see the original test and reporting steps."
-          echo "Provider diagnostics_incomplete. The original test outcome is unchanged." >> "$GITHUB_STEP_SUMMARY"
+    uses: ./.github/workflows/provider-canary.yml
+    secrets:
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      CLOUDRU_FOUNDATION_MODELS_API_KEY: ${{ secrets.CLOUDRU_FOUNDATION_MODELS_API_KEY }}
+      CLOUDRU_FOUNDATION_MODELS_BASE_URL: ${{ secrets.CLOUDRU_FOUNDATION_MODELS_BASE_URL }}
+      GIGACHAT_CREDENTIALS: ${{ secrets.GIGACHAT_CREDENTIALS }}
+    permissions:
+      contents: read
 
   # ──────────────────────────────────────────────────────────────────
   # Tier 2.6: Official-skill install smoke against the LIVE OuroborosHub
