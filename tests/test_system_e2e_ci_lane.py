@@ -61,13 +61,12 @@ def test_pull_requests_and_ouroboros_pushes_share_one_full_browser_lane():
     # The complete lane runs in the shard job; `ui-smoke` is the aggregator that judges it.
     steps = {step.get("name"): step for step in shared["jobs"]["ui-shard"]["steps"] if step.get("name")}
     full = steps["Run complete host UI lane with collection and availability guards"]
-    assert full["if"] == "${{ !cancelled() && steps.install_browsers.outcome == 'success' && inputs.diagnostic == 'full' }}"
+    assert full["if"] == "${{ !cancelled() && steps.install_browsers.outcome == 'success' }}"
     assert "python -m pytest tests/ -m ui_browser --require-ui-browser -vv --tb=short" in full["run"]
     assert full["env"]["OUROBOROS_RUN_UI_SMOKE"] == "1"
     assert full["env"]["OUROBOROS_EXPECT_BROWSER_ENGINES"] == "chromium,webkit"
     assert steps["Run browser tools Chromium/WebKit smoke"]["if"] == (
         "${{ !cancelled() && steps.install_browsers.outcome == 'success'"
-        " && inputs.diagnostic == 'full'"
         " && (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v'))"
         " && matrix.shard == 1 }}")
     for text in (_job_text("ui-smoke"), shared_path.read_text(encoding="utf-8"),

@@ -53,8 +53,9 @@ def test_one_browser_lane_serves_pull_requests_manual_tags_and_ouroboros_pushes(
     full = next(step for step in job["steps"] if "--require-ui-browser" in step.get("run", ""))
     assert "pytest tests/ -m ui_browser" in full["run"]
     assert "safe_test.py" in full["run"]
-    for name in ("ui-shard", "ui-manifest", "ui-diagnostic"):  # Exact candidate, never an editable install.
-        setup = next(step for step in shared["jobs"][name]["steps"]
+    push, push_triggers = _workflow("ui-browser-push.yml")
+    for producer in (job, shared["jobs"]["ui-manifest"], push["jobs"]["ui-diagnostic"]):
+        setup = next(step for step in producer["steps"]  # Exact candidate, never an editable install.
                      if step.get("uses") == "./.github/actions/setup-python-env")
         assert setup["with"]["install-project"] == "false"
 
@@ -69,12 +70,14 @@ def test_one_browser_lane_serves_pull_requests_manual_tags_and_ouroboros_pushes(
     assert "push" not in caller["if"] and "schedule" not in caller["if"]
     assert ci_triggers["schedule"] == [{"cron": "37 4 * * *"}]
 
-    push, push_triggers = _workflow("ui-browser-push.yml")
     assert list(push_triggers) == ["push", "workflow_dispatch"]
     assert push_triggers["workflow_dispatch"]["inputs"]["diagnostic"]["options"] == [
         "full", "viewport", "inflight"]
     assert push_triggers["push"] == {"branches": ["ouroboros"]}
     assert push["jobs"]["ui-smoke"]["uses"] == caller["uses"]
+    # Both callers hand the lane nothing: it has no input to select a part of it with.
+    assert "with" not in caller and "with" not in push["jobs"]["ui-smoke"]
+    assert triggers["workflow_call"] is None
 
 
 def test_a_later_docs_only_push_cannot_supersede_an_untested_code_push():
