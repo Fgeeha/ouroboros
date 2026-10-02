@@ -526,42 +526,21 @@ def check_budget(env: Any) -> Tuple[dict, int]:
 def check_review_continuations(env: Any) -> Tuple[dict, int]:
     try:
         from ouroboros.task_continuation import list_review_continuations
-        from ouroboros.task_results import (
-            STATUS_CANCELLED,
-            STATUS_COMPLETED,
-            STATUS_FAILED,
-            STATUS_INTERRUPTED,
-            STATUS_REJECTED_DUPLICATE,
-            STATUS_REQUESTED,
-            STATUS_RUNNING,
-            STATUS_SCHEDULED,
-            list_task_results,
-        )
+        from ouroboros.task_results import STATUS_INTERRUPTED, load_task_result
 
         continuations, corrupt = list_review_continuations(env.drive_root)
-        task_rows = list_task_results(
-            env.drive_root,
-            statuses=[
-                STATUS_REQUESTED,
-                STATUS_SCHEDULED,
-                STATUS_RUNNING,
-                STATUS_INTERRUPTED,
-                STATUS_COMPLETED,
-                STATUS_FAILED,
-                STATUS_CANCELLED,
-                STATUS_REJECTED_DUPLICATE,
-            ],
-        )
-        task_by_id = {
-            str(item.get("task_id") or ""): item
-            for item in task_rows
-            if str(item.get("task_id") or "").strip()
-        }
+
+        def _status(task_id: str) -> str:
+            # One row read per continuation (TZ-1 A): a startup check never walks the store.
+            try:
+                return str((load_task_result(env.drive_root, task_id) or {}).get("status") or "")
+            except (OSError, ValueError):
+                return ""
 
         rows = []
         interrupted = []
         for item in continuations:
-            task_status = str((task_by_id.get(item.task_id) or {}).get("status") or "")
+            task_status = _status(item.task_id)
             row = {
                 "task_id": item.task_id,
                 "task_status": task_status or "missing",
@@ -747,9 +726,9 @@ def _hot_store_thresholds() -> Tuple[Tuple[str, int, str], ...]:
         (
             "state/usage_attempts.jsonl",
             USAGE_LEDGER_WARN_BYTES,
-            "Every reservation re-reads the ledger under the monetary lock "
-            "(~0.5s hold at 20MB — see usage_ledger.py); size-triggered "
-            "compaction (usage_compaction.py, CPL4-C6) should hold the file "
+            "Warm reservations validate only appended rows under the monetary lock; "
+            "cold/replaced views prepare history outside it (_usage_rows_memo.py). "
+            "Size-triggered compaction (usage_compaction.py, CPL4-C6) should hold the file "
             "far below this — growth can mean broken compaction, a large "
             "unfoldable residue, a policy abort, refusal on the name tier "
             "(no kernel locks), or a file that has not yet outgrown the floor "
@@ -849,11 +828,12 @@ def hot_store_growth_notes(env: Any) -> list:
         notes.append(
             "WARNING: HOT STORE GROWTH — the events chain (logs/events.jsonl + "
             f"archive/events_*.jsonl) totals {events_chain_size / 1_000_000:.1f} MB "
-            f"(threshold {EVENTS_ARCHIVE_SCAN_WARN_BYTES // 1_000_000} MB). Custody "
-            "replay scans this chain on ownership questions. Legacy segments retain "
-            "inline delegated request bodies; new start rows reference the observability "
-            "store, without shrinking existing history. Investigate chain "
-            "indexing/compaction; archives are durable history and are never deleted."
+            f"(threshold {EVENTS_ARCHIVE_SCAN_WARN_BYTES // 1_000_000} MB). Each process's "
+            "first custody read folds this whole chain into its row memo (later reads fold "
+            "only appended bytes); forensic and retirement scans still walk it. Legacy "
+            "segments retain inline delegated request bodies; new start rows reference the "
+            "observability store, without shrinking existing history. Investigate a durable "
+            "compact custody projection; archives are durable history and are never deleted."
         )
     from ouroboros.context_budget import RETAINED_EXECUTION_DRIVES_WARN_COUNT
     from ouroboros.headless import HEADLESS_TASKS_DIR, TASK_DRIVES_DIR
@@ -981,9 +961,8 @@ def verify_system_state(env: Any, git_sha: str) -> None:
         "git_sha": git_sha,
     }
     append_jsonl(drive_logs / "events.jsonl", event)
-
-    if issues > 0:
-        log.warning(f"Startup verification found {issues} issue(s): {checks}")
+    # No stdlib WARNING beside the durable ``startup_verification`` row: the row and the Logs
+    # panel carry every check (#1184); a fact with a durable row gets no second line.
 
 
 def _reconcile_review_attempts_on_startup(env: Any) -> Dict[str, Any]:
@@ -1191,9 +1170,12 @@ def verify_restart(env: Any, git_sha: str) -> None:
             def _mutate(campaign: Dict[str, Any]):
                 if not isinstance(campaign, dict):
                     return None
-                live_state = read_json_dict(state_path) or {}
+                from supervisor.state import control_in_copy
+
+                stop_known, stopped = control_in_copy(state_path, "evolution_owner_stopped")
                 if (
-                    bool(live_state.get("evolution_owner_stopped"))
+                    not stop_known or bool(stopped)  # an unknown owner stop is not "not stopped" (#1307)
+                    or isinstance(campaign.get("stop_intent"), dict)  # a Stop recorded beside state (#1307)
                     or campaign.get("status") not in {"active", "paused"}
                 ):
                     return None
@@ -1352,8 +1334,10 @@ def verify_restart(env: Any, git_sha: str) -> None:
                     return False
                 mark_error["durable"] = "1"
                 return bool(ok and not mark_error.get("reason"))
-            live_state = read_json_dict(env.drive_path("state") / "state.json") or {}
-            if bool(live_state.get("evolution_owner_stopped")):
+            from supervisor.state import control_in_copy
+
+            stop_known, stopped = control_in_copy(env.drive_path("state") / "state.json", "evolution_owner_stopped")
+            if not stop_known or bool(stopped) or isinstance(campaign.get("stop_intent"), dict):
                 mark_error["reason"] = "owner_stopped"
                 mark_error["durable"] = "1"
                 return False

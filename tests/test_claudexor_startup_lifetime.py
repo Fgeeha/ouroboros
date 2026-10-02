@@ -193,6 +193,9 @@ def test_two_python_consumers_join_one_elected_startup_after_prepare_barrier(sta
                for name in ("first", "second")]
     assert [row["code"] for row in results] == ["daemon_starting", "daemon_starting"]
     elected = _wait_for(lambda: _read_json(startup.home / "elected.json"))
+    # A caller's readiness wait can expire before the election loser exits.
+    contenders = process_custody.live_daemon_root_pids(startup.root, purposes={owned.CUSTODY_PURPOSE}, strict=True)
+    _wait_for(lambda: all(_gone(pid) for pid in contenders - {elected["pid"]}))
     live = process_custody.live_daemon_root_pids(startup.root, purposes={owned.CUSTODY_PURPOSE}, strict=True)
     assert live == {elected["pid"]}, "the losing physical contender must not count as an owner"
     assert first.poll() is None and second.poll() is None
@@ -243,7 +246,9 @@ def test_peer_stop_works_before_readiness_and_reaps_the_owned_child(startup, mon
     if action == "panic":
         from tests.test_server_control_panic_daemon import _run_panic
         with monkeypatch.context() as patch:
-            assert _run_panic(patch, startup.root, daemon_stop=stop)
+            # Panic no longer invokes the legacy cooperative worker callback;
+            # the real owned daemon + its child must be gone below.
+            _run_panic(patch, startup.root, daemon_stop=stop)
     else:
         assert stop() is True
     assert time.monotonic() - started < 5

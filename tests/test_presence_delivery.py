@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -14,7 +16,7 @@ from starlette.testclient import TestClient
 import ouroboros.presence_delivery as delivery
 from ouroboros.gateway.host_service import create_host_service_app
 from ouroboros.utils import atomic_write_json
-from tests.test_host_service_api import _seed_presence_behavior, _seed_token
+from tests.test_host_service_api import FakeBridge, _seed_presence_behavior, _seed_token
 
 
 @pytest.fixture(autouse=True)
@@ -64,7 +66,8 @@ def _rows(tmp_path):
 def test_http_records_exact_facts_with_nonterminal_history_type(tmp_path, state, direction):
     client = _client(tmp_path)
     payload = _payload(state=state, message={"provider_message_id": "100.2", "subject": "Café", "to": ["reader@example.test"]})
-    assert _post(client, payload).json() == {"ok": True, "recorded": True, "duplicate": False}
+    assert _post(client, payload).json() == {"ok": True, "recorded": True, "duplicate": False,
+                                            "history_coverage": "indexed"}
     row, = _rows(tmp_path)
     assert row["direction"] == direction
     assert row["text"] == payload["text"] and row["format"] == payload["format"]
@@ -191,12 +194,49 @@ def test_ambiguous_write_failure_invalidates_projection_before_retry(tmp_path, m
     assert len(_rows(tmp_path)) == 1
 
 
-def test_unreadable_retained_chain_is_not_empty_history(tmp_path):
+def test_gapped_retained_chain_accepts_with_explicit_uncertainty(tmp_path):
     client = _client(tmp_path)
     (tmp_path / "logs").mkdir(exist_ok=True)
     (tmp_path / "logs/chat.jsonl").write_text("{broken\n", encoding="utf-8")
-    assert _post(client, _payload()).status_code == 503
-    assert (tmp_path / "logs/chat.jsonl").read_text(encoding="utf-8") == "{broken\n"
+    response = _post(client, _payload())
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "recorded": True, "duplicate": False,
+                               "history_coverage": "gapped"}
+    lines = (tmp_path / "logs/chat.jsonl").read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "{broken"
+    assert json.loads(lines[1])["type"] == "presence_delivery"
+    # A readable later receipt keeps its exact identity even across a gap.
+    restarted = delivery.PresenceDeliveryRecorder(tmp_path)
+    assert restarted.record("transport", _payload())["duplicate"] is True
+    with pytest.raises(delivery.PresenceDeliveryConflict):
+        restarted.record("transport", _payload(text="changed"))
+
+
+def test_readable_history_conflict_still_refuses_even_when_other_rows_are_gapped(tmp_path):
+    client = _client(tmp_path)
+    assert _post(client, _payload()).status_code == 200
+    path = tmp_path / "logs/chat.jsonl"
+    original = path.read_text(encoding="utf-8")
+    row = json.loads(original)
+    row["text"] = "conflicting retained text"
+    path.write_text(original + "{broken\n" + json.dumps(row) + "\n", encoding="utf-8")
+    with pytest.raises(OSError, match="conflicting retained"):
+        delivery.PresenceDeliveryRecorder(tmp_path).record("transport", _payload(delivery_id="later"))
+
+
+def test_receipt_after_torn_tail_starts_a_new_parseable_record(tmp_path):
+    recorder = delivery.PresenceDeliveryRecorder(tmp_path)
+    assert recorder.record("transport", _payload())["recorded"] is True
+    path = tmp_path / "logs/chat.jsonl"
+    with path.open("ab") as handle:
+        handle.write(b'{"interrupted":')
+    assert recorder.record("transport", _payload(delivery_id="next"))["recorded"] is True
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert lines[-2] == '{"interrupted":'
+    assert json.loads(lines[-1])["transport"]["delivery"]["delivery_id"] == "next"
+    # Cold reconstruction cannot prove whether the broken row was a receipt.
+    late = delivery.PresenceDeliveryRecorder(tmp_path).record("transport", _payload(delivery_id="third"))
+    assert late["history_coverage"] == "gapped"
 
 
 def test_required_writer_refusal_does_not_ack_or_fill_index(tmp_path, monkeypatch):
@@ -301,3 +341,136 @@ def test_deferred_work_echoes_original_persisted_mode(tmp_path, status, version)
     )
     assert response.status_code == (202 if status == "running" else 200)
     assert response.json()["delivery_reporting_version"] == (version or 0)
+
+
+def test_inbound_initiated_and_receipt_paths_derive_one_conversation_identity(tmp_path, monkeypatch):
+    from ouroboros.presence_bindings import PresenceBinding, PresenceEndpoint, new_presence_binding_id, save_presence_binding
+    from ouroboros.presence_runner import _stable_numeric_id
+    from ouroboros.tools.presence import get_tools
+    from ouroboros.tools.registry import ToolContext
+
+    _seed_token(tmp_path, skill="telegram-bot", token="receipt-token",
+                permissions=["presence"], manifest_permissions=["presence"])
+    inbound_binding = _seed_presence_behavior(tmp_path, account_wide=True)
+    events = []
+
+    def runner(**kwargs):
+        events.append(kwargs["event"])
+        return SimpleNamespace(outcome="silent", text="", task_id="turn", work_ref="")
+
+    monkeypatch.setattr("ouroboros.presence_runner.run_presence_turn", runner)  # the initiate path's runner
+    client = TestClient(create_host_service_app(tmp_path, presence_runner=runner))
+    initiate = next(item for item in get_tools() if item.name == "initiate_presence")
+    identities = {}
+    for thread in ("", "topic-1"):
+        payload = _turn_payload(inbound_binding)
+        payload["event"].update(source_event_id=f"in-{thread}", thread_id=thread)
+        assert client.post("/presence/turn", json=payload, headers={"X-Skill-Token": "receipt-token"}).status_code == 200
+        endpoint = PresenceEndpoint("telegram", "bot-1", "room-1", thread)
+        binding = save_presence_binding(tmp_path, PresenceBinding(
+            new_presence_binding_id(), "telegram-bot", "community-helper", endpoint, endpoint))
+        ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+        assert json.loads(initiate.handler(ctx, binding.binding_id, "Say hello.", f"wake-{thread}"))["ok"] is True
+        receipt = _payload(provider="telegram", account_id="bot-1", conversation_id="room-1", thread_id=thread,
+                           delivery_id=f"send:{thread}")
+        assert _post(client, receipt).status_code == 200
+        inbound, initiated = events[-2:]
+        row = _rows(tmp_path)[-1]
+        key = f"telegram:bot-1:room-1:{thread or '0'}"
+        assert inbound.conversation_key == initiated.conversation_key == row["transport"]["conversation_key"] == key
+        assert row["chat_id"] == _stable_numeric_id("presence-conversation", key)
+        identities[thread] = (key, row["chat_id"])
+    assert identities[""][0] != identities["topic-1"][0] and identities[""][1] != identities["topic-1"][1]
+
+
+def _hub(tmp_path, runner):
+    _seed_token(tmp_path, skill="telegram-bot", token="receipt-token", permissions=["presence", "inject_chat"],
+                manifest_permissions=["presence", "inject_chat"])
+    binding = _seed_presence_behavior(tmp_path)
+    bridge = FakeBridge()
+    client = TestClient(create_host_service_app(tmp_path, presence_runner=runner, bridge_getter=lambda: bridge))
+    return client, binding, client.app.state.host_service_context
+
+
+def _turn(client, binding, index):
+    payload = _turn_payload(binding)
+    payload["event"]["source_event_id"] = f"event-{index}"
+    return client.post("/presence/turn", json=payload, headers={"X-Skill-Token": "receipt-token"})
+
+
+def _inject(client):
+    return client.post("/chat/inject", json={"text": "hello", "chat_id": 1234},
+                       headers={"X-Skill-Token": "receipt-token"})
+
+
+def _silent(**_kwargs):
+    return SimpleNamespace(outcome="silent", text="", task_id="turn", work_ref="")
+
+
+def test_five_open_turns_leave_receipts_and_inject_admitted(tmp_path):
+    entered, release = threading.Semaphore(0), threading.Event()
+
+    def runner(**kwargs):
+        entered.release()
+        release.wait(10)
+        return _silent(**kwargs)
+
+    client, binding, ctx = _hub(tmp_path, runner)
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        turns = [pool.submit(_turn, client, binding, index) for index in range(5)]
+        try:
+            # One conversation: the Host gate runs one turn; the other four queue, holding their budget.
+            assert entered.acquire(timeout=10)
+            deadline = time.monotonic() + 10
+            while len(ctx.presence_turns.live()) < 5 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert len(ctx.presence_turns.live()) == 5
+            assert _turn(client, binding, 5).status_code == 429  # the turn budget itself still binds
+            assert _post(client, _payload()).status_code == 200
+            assert _inject(client).status_code == 202
+        finally:
+            release.set()
+        assert [future.result().status_code for future in turns] == [200] * 5
+    assert not any(ctx._inflight.values())
+
+
+def test_five_open_receipts_leave_turns_and_inject_admitted(tmp_path, monkeypatch):
+    entered, release = threading.Semaphore(0), threading.Event()
+    client, binding, ctx = _hub(tmp_path, _silent)
+    record = ctx.presence_deliveries.record
+
+    def slow_record(skill, payload):
+        entered.release()
+        release.wait(10)
+        return record(skill, payload)
+
+    monkeypatch.setattr(ctx.presence_deliveries, "record", slow_record)
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        receipts = [pool.submit(_post, client, _payload(part_id=str(index), text=f"Part {index}"))
+                    for index in range(5)]
+        try:
+            assert all(entered.acquire(timeout=10) for _ in range(5))
+            assert _post(client, _payload(part_id="5", text="Part 5")).status_code == 429
+            assert _turn(client, binding, 0).status_code == 200
+            assert _inject(client).status_code == 202
+        finally:
+            release.set()
+        assert [future.result().status_code for future in receipts] == [200] * 5
+    assert not any(ctx._inflight.values())
+
+
+def test_receipt_and_turn_slots_return_on_success_and_on_exceptions(tmp_path, monkeypatch):
+    def crashing_runner(**_kwargs):
+        raise RuntimeError("runner crashed")
+
+    client, binding, ctx = _hub(tmp_path, crashing_runner)
+    assert [_post(client, _payload(part_id=str(index), text=f"Part {index}")).status_code
+            for index in range(7)] == [200] * 7  # more than five sequential receipts
+    assert [_turn(client, binding, index).status_code for index in range(7)] == [500] * 7
+
+    def failing_record(_skill, _payload):
+        raise RuntimeError("history write failed")
+
+    monkeypatch.setattr(ctx.presence_deliveries, "record", failing_record)
+    assert [_post(client, _payload(part_id="9")).status_code for _ in range(7)] == [503] * 7
+    assert not any(ctx._inflight.values())

@@ -495,6 +495,7 @@ def write_letter(
         scope = UsageScope(
             drive_root=data_root, task_id=SYSTEM_TASK_ID, root_task_id=SYSTEM_TASK_ID,
             category=USAGE_CATEGORY, source=USAGE_CATEGORY,
+            non_task_operation=True,
             global_limit_usd=resolve_total_budget_usd(),
         )
         client = llm_client or LLMClient()

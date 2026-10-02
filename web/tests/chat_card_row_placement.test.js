@@ -41,7 +41,7 @@ function openCardChat(fetchImpl) {
     };
     const instance = createChatInstance({
         ws, state: { activePage: 'chat', projectChatIds: new Set(), unreadCount: 0 },
-        updateUnreadBadge() {}, stateSnapshots: { begin: () => ({ generation: 1, requestedAt: Date.now() }),
+        updateUnreadBadge() {}, stateSnapshots: { begin: () => ({ generation: 1, requestedAt: Date.now() }), gate() { return Promise.resolve(this.begin()); },
             isCurrent: () => true, apply() {} },
         chatId: 2, idPrefix: 'chat', mountEl: mount, asPanel: true,
     });
@@ -151,7 +151,7 @@ test('history replay places stamped rows on their cards and keeps unplaceable on
     let instance;
     try {
         instance = createChatInstance({ ws, state: { activePage: 'chat', projectChatIds: new Set(), unreadCount: 0 },
-            updateUnreadBadge() {}, stateSnapshots: { begin: () => ({ generation: 1, requestedAt: Date.now() }),
+            updateUnreadBadge() {}, stateSnapshots: { begin: () => ({ generation: 1, requestedAt: Date.now() }), gate() { return Promise.resolve(this.begin()); },
                 isCurrent: () => true, apply() {} }, chatId: 1, idPrefix: 'chat', mountEl: mount });
         await instance.refreshHistory({ revision: 1 });
         const messages = globalThis.document.byId.get('chat-messages');
@@ -169,6 +169,48 @@ test('history replay places stamped rows on their cards and keeps unplaceable on
         // The replayed item keeps its history identity, so it sorts by its source
         // position and leaves the card when its page is released.
         assert.equal(phasedLines(card, 'warn')[0].dataset.liveLineKey, 'history-h-r1-custody');
+    } finally { instance?.destroy(); restoreDom(prior); }
+});
+
+test('cold page restore admits its recent owner before the bookmarked content-only row', async () => {
+    const recent = { task_id: 'r1', is_progress: true, text: 'Recent owner progress',
+        ts: '2026-09-16T01:00:00Z', history_id: 'progress:90' };
+    const receipt = { task_id: 'r1', role: 'system', system_type: 'host_progress',
+        is_progress: true, narration: false, card_row: 'reviews', card_row_id: 'merge-receipt:source',
+        card_row_revision: 3, text: 'PR #1347 merge: merged', ts: '2026-09-16T00:01:00Z',
+        history_id: 'progress:0', history_position: { source: 'progress', offset: 0 } };
+    const calls = [];
+    const { prior, mount } = installDom(async url => {
+        if (!String(url).startsWith('/api/chat/history')) return { ok: true, json: async () => ({ active_direct_turns: [] }) };
+        const cursor = new URL(url, 'http://local').searchParams.get('cursor');
+        calls.push(cursor);
+        return { ok: true, json: async () => ({ messages: cursor ? [receipt] : [recent],
+            page_cursor: cursor || 'page:0', next_cursor: cursor ? null : 'page:1', has_more: !cursor }) };
+    });
+    let instance;
+    try {
+        instance = createChatInstance({
+            ws: { on() { return () => {}; }, isConnected: () => true, send() {} },
+            state: { activePage: 'chat', projectChatIds: new Set(), unreadCount: 0 }, updateUnreadBadge() {},
+            stateSnapshots: { begin: () => ({ generation: 1 }), gate() { return Promise.resolve(this.begin()); },
+                isCurrent: () => true, apply() {} }, chatId: 2, idPrefix: 'chat', mountEl: mount, asPanel: true,
+            initialScrollState: { scrollTop: 80, stick: false,
+                historyAnchor: { historyId: 'progress:0', lineKey: 'old-live-key',
+                    lineLifecycleKey: 'cardrow|merge-receipt:source', cardChain: [{ taskId: 'r1', offset: 0 }], offset: 20 },
+                disclosures: { cards: [['r1', true]] },
+                history: { focus: 1, pages: [0, 1].map(index => ({ id: `history-page-1-${index}`,
+                    chain: 1, index, requestCursor: `page:${index}`, nextCursor: index ? null : 'page:1',
+                    hasMore: !index, rows: 1 })) } },
+        });
+        await instance.refreshHistory({ revision: 1 });
+        const messages = globalThis.document.byId.get('chat-messages');
+        const card = walkCard(messages, 'r1');
+        assert.deepEqual(calls, [null, 'page:1']);
+        assert.ok(card);
+        assert.equal(card.dataset.expanded, '1');
+        assert.equal(phasedLines(card, 'result').filter(line => line.dataset.liveLineKey === 'history-progress-0').length, 1,
+            'the exact supplying page must place its receipt inside the recent owner');
+        assert.equal(systemBubbles(messages).length, 0, 'the receipt never falls back to an orphan bubble');
     } finally { instance?.destroy(); restoreDom(prior); }
 });
 
@@ -194,7 +236,7 @@ async function replayChat(rows) {
         String(url).startsWith('/api/chat/history') ? { messages: rows } : { active_direct_turns: [] } }));
     const ws = { on() { return () => {}; }, isConnected: () => true, send() {} };
     const instance = createChatInstance({ ws, state: { activePage: 'chat', projectChatIds: new Set(), unreadCount: 0 },
-        updateUnreadBadge() {}, stateSnapshots: { begin: () => ({ generation: 1, requestedAt: Date.now() }),
+        updateUnreadBadge() {}, stateSnapshots: { begin: () => ({ generation: 1, requestedAt: Date.now() }), gate() { return Promise.resolve(this.begin()); },
             isCurrent: () => true, apply() {} }, chatId: 1, idPrefix: 'chat', mountEl: mount });
     return { prior, instance, messages: () => globalThis.document.byId.get('chat-messages') };
 }
@@ -274,4 +316,57 @@ test('a second history sync redraws a child System row whose old bubble it relea
         assert.notEqual(bubbles[0], first, 'as a redrawn node: the old one was released');
         assert.match(bubbles[0].innerHTML, /model-provider outage/);
     } finally { instance?.destroy(); restoreDom(prior); }
+});
+
+// Optional stdin fixture comes from the real Python outbox/dedup/history test.
+// The standalone node lane uses the same adversarial revision/timestamp shape.
+test('canonical receipt revisions keep one merged row through live and history replay', async () => {
+    const supplied = process.env.MERGE_RECEIPT_PROJECTION
+        ? JSON.parse((await import('node:fs')).readFileSync(process.env.MERGE_RECEIPT_PROJECTION, 'utf8')) : null;
+    const base = { chat_id: 7, task_id: 'merge-task', role: 'system', system_type: 'host_progress',
+        is_progress: true, narration: false, card_row: 'reviews', card_row_id: 'merge-receipt:r' };
+    const merged = { ...base, card_row_revision: 3, content: 'PR #7 merge: merged', ts: '2026-09-16T00:01:00Z' };
+    const queued = { ...base, card_row_revision: 2, content: 'PR #7 merge: queued', ts: '2026-09-16T00:02:00Z' };
+    const live = supplied?.live || [merged, queued, merged];
+    const history = supplied?.history || [merged, queued].map((row, i) => ({ ...row, text: row.content,
+        history_id: `h-receipt-${i}`, history_position: { source: 'progress', offset: i } }));
+    const opened = openCardChat();
+    try {
+        opened.working('merge-task');
+        const markup = captureRenderedLines();
+        for (const row of live) opened.handlers.get('chat')({ ...row, chat_id: 2 });
+        // Older unversioned rows (e.g. an old outbox) cannot overwrite a revision either.
+        opened.handlers.get('chat')({ ...live[0], card_row_revision: undefined, chat_id: 2,
+            content: 'PR #7 merge: queued', ts: '2099-01-01T00:00:00Z' });
+        assert.match(markup().at(-1), /merge: merged/);
+        assert.equal(phasedLines(walkCard(opened.messages(), 'merge-task'), 'result').length, 1);
+    } finally { opened.instance.destroy(); restoreDom(opened.prior); }
+    for (const rows of [history, [...history].reverse()]) {
+        const replay = await replayChat([{ task_id: 'merge-task', is_progress: true,
+            text: 'Reading the PR.', ts: '2026-09-16T00:00:00Z' }, ...rows.map(row => ({ ...row, chat_id: 1 }))]);
+        try {
+            const markup = captureRenderedLines();
+            await replay.instance.refreshHistory({ revision: 1 });
+            assert.match(markup().at(-1), /merge: merged/);
+            assert.equal(phasedLines(walkCard(replay.messages(), 'merge-task'), 'result').length, 1);
+        } finally { replay.instance.destroy(); restoreDom(replay.prior); }
+    }
+});
+
+// This test needs the real endpoint's bounded selection, not hand-reordered frames.
+test('cold bounded receipt history renders canonical truth in a new Chat', {
+    skip: !process.env.COLD_RECEIPT_PROJECTION,
+}, async () => {
+    const { payload, selected } = JSON.parse((await import('node:fs'))
+        .readFileSync(process.env.COLD_RECEIPT_PROJECTION, 'utf8'));
+    assert.equal(selected.length, 60);
+    assert.deepEqual(selected.filter(row => row.card_row_id).map(row => row.card_row_revision), [2]);
+    const replay = await replayChat(payload.messages);
+    try {
+        const markup = captureRenderedLines();
+        await replay.instance.refreshHistory({ revision: 1 });
+        assert.match(markup().join('\n'), /merge: merged/);
+        assert.doesNotMatch(markup().join('\n'), /merge: queued/);
+        assert.equal(phasedLines(walkCard(replay.messages(), 'merge-task'), 'result').length, 1);
+    } finally { replay.instance.destroy(); restoreDom(replay.prior); }
 });

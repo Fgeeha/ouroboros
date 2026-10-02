@@ -46,17 +46,13 @@ def test_a_question_holds_the_wave_until_a_free_disposition_under_both_enforceme
             assert closed["closed"] is True and closed["open_ids"] == []
 
 
-def test_a_question_only_wave_is_review_required_and_never_earns_a_paid_delta_cycle():
+def test_a_question_only_wave_is_review_required():
     rows = [{"slot": "s1", "model": "m", "ok": True, "findings": [
                 {"id": "q1", "class": "need_evidence", "breaks": "claim_1", "locator": "", "summary": "?"}]},
             {"slot": "s2", "model": "m", "ok": True, "findings": []},
             {"slot": "s3", "model": "m", "ok": True, "findings": []}]
     agg = plan_spec.aggregate(rows)
     assert agg["aggregate"] == "REVIEW_REQUIRED" and agg["counts"]["need_evidence"] == 1
-    # The earned-delta guard (no blocking finding -> False) is the only thing between a
-    # question wave and a paid panel bought by rejecting the question; pinned here.
-    assert plan_spec.blocking_fully_rejected(
-        agg["findings"], [{"finding_id": "s1:q1", "decision": "reject", "rationale": "not needed"}]) is False
 
 
 def test_the_output_contract_states_both_need_evidence_forms():

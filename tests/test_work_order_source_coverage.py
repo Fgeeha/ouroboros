@@ -6,6 +6,8 @@ import json
 import hashlib
 from types import SimpleNamespace
 
+import pytest
+
 
 def _fixture(tmp_path):
     from ouroboros.subagent_work_order import (
@@ -76,7 +78,6 @@ def _started_entry(tmp_path, request, sha):
         work_order_fingerprint=sha,
         work_order_coverage="partial",
         work_order_source_request=request,
-        settled=True,
         execution_root=str(tmp_path / "snapshot"),
         target_root=str(tmp_path / "repo"),
     )
@@ -394,17 +395,30 @@ def test_invalid_source_answer_never_posts_to_engine(tmp_path, monkeypatch):
     assert calls == []
 
 
-def test_terminal_partial_is_cannot_verify_and_apply_is_refused_but_reject_remains(tmp_path):
+@pytest.mark.parametrize("resolution", ["reject", "complete_then_apply"])
+def test_terminal_partial_is_cannot_verify_and_apply_is_refused_but_reject_remains(tmp_path, resolution):
     from ouroboros import delegate_custody as custody
+    from ouroboros.headless import ARTIFACT_STATUS_READY_NO_CHANGES
     from ouroboros.tools.delegate import _delivered_terminal_payload
     from ouroboros.tools.subagent_integration import _integrate_delegated_patch
 
     ctx, request, _full_text, _prompt = _fixture(tmp_path)
     entry = _started_entry(tmp_path, request, request["complete_sha256"])
+    detail = {"summary": {"state": "succeeded", "model": "claude-fable-5", "effectiveAccess": "readonly"}, "lastSeq": 1}
+    assert custody.settle_run(tmp_path, None, entry, detail)["settled"]
+    # Disposition replays custody under its lock. A process-local settled flag
+    # is not terminal proof, and rejecting a result needs a usable capture.
+    cap_dir = custody.delegated_capture_dir(tmp_path, entry.task_id, entry.run_id)
+    cap_dir.mkdir(parents=True, exist_ok=True)
+    (cap_dir / "workspace_patch.json").write_text(json.dumps({"status": ARTIFACT_STATUS_READY_NO_CHANGES}))
+    assert custody.record_patch_captured(tmp_path, entry)
+    custody._CUSTODY.clear()
+    entry = custody.replay(tmp_path)[entry.run_id]
+    assert entry.settled and entry.terminal_state == "succeeded"
     terminal = _delivered_terminal_payload(
         ctx,
         entry.run_id,
-        {"summary": {"state": "succeeded", "model": "claude-fable-5", "effectiveAccess": "readonly"}, "lastSeq": 1},
+        detail,
         SimpleNamespace(access="readonly", delegated=False),
         entry,
         None,
@@ -413,8 +427,12 @@ def test_terminal_partial_is_cannot_verify_and_apply_is_refused_but_reject_remai
     assert terminal["acceptance_status"] == "cannot_verify"
     apply_out = _integrate_delegated_patch(ctx, entry.run_id, "apply", "")
     assert "SOURCE_UNRESOLVED" in apply_out
-    reject_out = _integrate_delegated_patch(ctx, entry.run_id, "reject", "not accepted")
-    assert "SOURCE_UNRESOLVED" not in reject_out
+    assert not custody.replay(tmp_path)[entry.run_id].patch_disposed
+    if resolution == "reject":
+        reject_out = _integrate_delegated_patch(ctx, entry.run_id, "reject", "not accepted")
+        assert "Rejected delegated run" in reject_out
+        assert custody.replay(tmp_path)[entry.run_id].patch_disposed == "rejected"
+        return
     # Once the durable interval union is complete, the source gate opens and the
     # normal capture/apply guards own the next answer (there is no false permanent
     # refusal just because this was once over budget).
@@ -429,5 +447,6 @@ def test_terminal_partial_is_cannot_verify_and_apply_is_refused_but_reject_remai
         text_chars=request["complete_chars"],
     )
     apply_after_complete = _integrate_delegated_patch(ctx, entry.run_id, "apply", "")
-    assert "SOURCE_UNRESOLVED" not in apply_after_complete
+    assert "no captured file changes to apply" in apply_after_complete
+    assert custody.replay(tmp_path)[entry.run_id].patch_disposed == "applied"
     custody._CUSTODY.clear()

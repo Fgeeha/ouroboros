@@ -50,7 +50,8 @@ def test_chat_resyncs_history_after_reconnect():
     # window constants govern; the dead `?limit=1000` placebo is gone.
     client = _read("web/modules/api_client.js")
     history = client[client.index("chatHistory:"):client.index("health:")]
-    assert "await apiClient.chatHistory({ chatId })" in source
+    assert "await fetchHistory(null)" in source
+    assert "apiClient.chatHistory({ chatId, cursor, ...options })" in source
     assert "if (chatId !== 1) params.set('chat_id', String(chatId));" in history
     assert "const query = params.toString();" in history
     assert "fetchJson(`/api/chat/history${query ? `?${query}` : ''}`" in history
@@ -307,18 +308,21 @@ def test_no_severity_keyed_visibility_writer_survives_restart_paths():
 
 
 def test_chat_scrolls_to_bottom_after_first_history_load():
-    """syncHistory must scroll to bottom on first load (restart/open) but
-    respect user scroll position on subsequent reconnect syncs."""
+    """Fresh first load follows latest; saved reading intent and reconnect
+    use the shared position owner rather than unconditional first-load pinning."""
     source = _read("web/modules/chat.js")
     media_source = _read("web/modules/chat_media.js")
     # First-load guard: wasFirstLoad captures pre-call state
     assert "wasFirstLoad = !historyLoaded" in source, \
         "Missing first-load detection before setting historyLoaded"
-    # Conditional scroll: first load always scrolls, reconnect only when near bottom
-    assert "if (wasFirstLoad || (fromReconnect ? scrollBeforeSync.nearBottom : isNearBottom()))" in source, \
-        "Missing conditional scroll-to-bottom after history sync"
-    assert "anchor: captureVisibleTimelineAnchor()" in source
-    assert "restoreVisibleTimelineAnchor(scrollBeforeSync.anchor)" in source, \
+    # Pending data-aware restore wins over first-load/latest following.
+    assert "if (reading.pending)" in source and "reading.position();" in source
+    assert "else if (wasFirstLoad && reading.stick)" in source
+    assert "reading.followAfterLayout();" in source
+    position = _read("web/modules/chat_reading_position.js")
+    assert "const follow = forceFollow || (state.stick && state.nearBottom());" in position
+    assert "const anchor = follow ? null : anchors.capture(excludeAnchorNode);" in position
+    assert "else anchors.restore(anchor);" in position, \
         "Reconnect must restore a visible DOM anchor, not apply total height growth"
     # The anchor pair lives in chat_render_batch.js (extracted verbatim from
     # chat.js at the byte ratchet); the identity contract is unchanged.
@@ -343,8 +347,8 @@ def test_chat_scrolls_to_bottom_after_first_history_load():
     assert "const parent = liveCardRecords.get(record.parentGroupId);" in source
     assert "seen.has(record.groupId)" in source, \
         "Nested subagent timestamps must propagate to the top-level ancestor safely"
-    assert "if (wasFirstLoad) scrollToBottomAfterLayout();" in source, \
-        "First load must pin the fresh feed to the newest message explicitly"
+    assert "stick: initial ? initial.stick !== false : true" in position, \
+        "Only a fresh feed defaults to following latest; an archived bookmark must not be overwritten"
     # The shared photo/video builder and the separate document builder must
     # each stamp sortable data-ts from the raw source timestamp.
     bubble_frame = media_source.split("function bubbleFrame", 1)[1].split(
@@ -388,7 +392,7 @@ def test_owner_restart_copy_is_explicit_about_stopped_task(tmp_path, monkeypatch
     assert "stable_skip_flag.unlink(missing_ok=True)" in source
     # Checkout gate first (a refusal leaves the server intact), then the durable
     # no-resume intent, then the owned-work stop, then the owner's stop notice.
-    owner_restart = _read("server.py").split('elif lowered.startswith("/restart"):', 1)[1].split(
+    owner_restart = _read("server.py").split('lowered.startswith("/restart"):', 1)[1].split(
         'elif lowered == "/review"', 1
     )[0]
     assert "_perform_owner_restart(ctx, reply)" in owner_restart

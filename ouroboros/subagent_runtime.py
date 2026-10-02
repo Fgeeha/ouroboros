@@ -790,7 +790,9 @@ def exact_start(ctx: Any, prompt: str, spec: Optional[dict[str, Any]] = None) ->
     except SubagentSelectionError as exc:
         from ouroboros.delegate_shared import _fail
 
-        return _fail("delegate_start", exc.code, exc.detail)
+        # Selector validation has not entered the physical-start producer yet.
+        return _replace_tool_result(_fail("delegate_start", exc.code, exc.detail),
+                                    meta_updates={"operation_outcome": "completed_no_effect"})
 
     token = _EXACT_START_SELECTION.set({
         "snapshot": selected_snapshot,
@@ -807,7 +809,7 @@ def exact_start(ctx: Any, prompt: str, spec: Optional[dict[str, Any]] = None) ->
             _canonical_work_order_fingerprint=canonical_work_order_fingerprint,
             _work_order_source_request=work_order_source_request,
             _coordination_context=coordination_context,
-            **{key: options.pop(key) for key in ("directory_strategy", "scope_paths")
+            **{key: options.pop(key) for key in ("directory_strategy", "scope_paths", "continue_from")
                if key in options},
         )
         # Every configured-session start lands here — the host's pre-start

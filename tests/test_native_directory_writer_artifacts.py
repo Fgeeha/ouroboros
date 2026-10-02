@@ -10,7 +10,7 @@ import subprocess
 import pytest
 
 from ouroboros.artifacts import collect_task_artifact_records
-from ouroboros.headless import copy_child_task_result, finalize_task_artifacts, task_artifacts_dir
+from ouroboros.headless import copy_child_task_result, finalize_task_artifacts, task_artifacts_dir, retry_child_task_refs
 from ouroboros.task_results import load_task_result, write_task_result
 from ouroboros.task_status import load_effective_task_result
 from ouroboros.tools.registry import ToolContext, ToolRegistry
@@ -47,6 +47,7 @@ def _finish(ctx, task, parent):
                       parent_task_id="parent1", root_task_id="parent1", delegation_role="subagent",
                       artifacts=collect_task_artifact_records(ctx.drive_root, ctx.task_id))
     copied = copy_child_task_result(parent, task)
+    copied = retry_child_task_refs(parent, ctx.drive_root, ctx.task_id)
     assert copied and copied["child_ref_promotion"]["status"] == "complete"
     finalize_task_artifacts(parent, task)
     shutil.rmtree(ctx.drive_root)

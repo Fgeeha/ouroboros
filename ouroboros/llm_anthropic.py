@@ -448,6 +448,7 @@ class _AnthropicLaneMixin:
                 target, messages, reasoning_effort, max_tokens, tool_choice,
                 temperature, tools, **remote_kwargs,
             )
+        target["requested_reasoning_effort"] = normalize_reasoning_effort(reasoning_effort)
         system, messages = self._build_anthropic_messages(messages, target)
         payload: Dict[str, Any] = {
             "model": str(target.get("resolved_model") or ""),
@@ -512,7 +513,7 @@ class _AnthropicLaneMixin:
 
         def _send(candidate: Dict[str, Any]):
             nonlocal prior_capture
-            candidate = _finalized_physical_candidate(target, candidate, "messages")
+            candidate = _finalized_physical_candidate(target, candidate, "messages", fresh_clock=True)
             request = _attempt_request(target, candidate, source="llm.anthropic")
 
             def _post():
@@ -530,8 +531,10 @@ class _AnthropicLaneMixin:
                     return consume_stream(sent, native=True) if candidate.get("stream") else sent
 
                 def post(sender):
+                    from ouroboros.net_transport import requests_verify_kwargs
                     return receive(sender(url, headers={**headers, **processing_contract_headers(target, candidate)}, json=candidate,
                                           timeout=physical_dispatch_timeout(request_timeout),
+                                          **requests_verify_kwargs(),
                                           **({"stream": True} if candidate.get("stream") else {})))
 
                 if no_proxy:
@@ -625,6 +628,12 @@ def anthropic_web_search_server_tool(
     headers = processing_contract_headers(target, payload)
     if headers:
         client_kwargs["default_headers"] = headers
+    from ouroboros.net_transport import trust_ssl_context
+    trust = trust_ssl_context()
+    http_cls = getattr(anthropic, "DefaultHttpxClient", None)
+    if trust is not None and http_cls is not None:
+        # The SDK's own Default client keeps env proxies and takes the trust bundle as ``verify``.
+        client_kwargs["http_client"] = http_cls(verify=trust)
     client = anthropic.Anthropic(**client_kwargs)
     def send(**candidate):
         # The stable Messages SDK exposes beta speed only through extra_body.

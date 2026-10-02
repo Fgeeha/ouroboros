@@ -75,6 +75,27 @@ def test_partial_quorum_stays_open_while_one_paid_slot_is_in_flight(harness, mon
     assert _control(second) == {"outcome": "GREEN", "closed": True}
 
 
+def test_paid_plan_rejoins_frozen_delivery_after_settings_change(harness, monkeypatch):
+    import dataclasses
+    from ouroboros.tools.plan_review_artifacts import authority_wave
+
+    calls = []
+    _install_two_turn_substrate(monkeypatch, calls, pending_ids={"s3"})
+    harness.state["slots"][0] = dataclasses.replace(harness.state["slots"][0], native_retrieval_override=True)
+    ctx = harness.make_ctx()
+    assert _control(_call(ctx))["closed"] is False
+    before = authority_wave(harness.drive, ctx.task_id, _state(harness)["waves"][-1])
+    assert before["slots"][0]["delivery"] == "native"
+    harness.state["slots"] = [dataclasses.replace(s, model="changed/model", native_retrieval_override=False)
+                              for s in harness.state["slots"]]
+    monkeypatch.setenv("OUROBOROS_REVIEWER_SLOTS", "malformed current settings")
+    assert _control(_call(ctx)) == {"outcome": "GREEN", "closed": True}
+    after = authority_wave(harness.drive, ctx.task_id, _state(harness)["waves"][-1])
+    assert after["slots"] == before["slots"]
+    assert after["reviewer_outputs"][0]["session_task"] == before["reviewer_outputs"][0]["session_task"]
+    assert _state(harness)["cycles_paid"] == 1
+
+
 def test_expired_deadline_still_reconciles_existing_paid_wave(harness, monkeypatch):
     """An owner deadline must not strand a reviewer cycle already in flight."""
     monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "1")
@@ -468,7 +489,8 @@ def test_missing_substrate_actor_stays_paid_and_custody_lost(harness, monkeypatc
 # ------------------------------------------------------------- collection (P1-3)
 
 
-def _install_barrier_substrate(monkeypatch, calls, *, texts=None, still_pending=(), refused=(), pending_waves=()):
+def _install_barrier_substrate(monkeypatch, calls, *, texts=None, still_pending=(), refused=(), pending_waves=(),
+                               pending_by_wave=None):
     """A substrate that honours the event route: a fresh dispatch released at its
     drain deadline returns ``pending_dispatch`` rows; a reconcile returns the settled
     rows (except ``still_pending`` slots, which are still running, and ``refused``
@@ -486,7 +508,8 @@ def _install_barrier_substrate(monkeypatch, calls, *, texts=None, still_pending=
         wave_fp = str((request.reconciliation_identity or {}).get("subject_hash") or "")
         actors = []
         for slot in slots:
-            pending = fresh or slot.slot_id in still_pending or wave_fp in pending_waves
+            pending = (fresh or slot.slot_id in still_pending or wave_fp in pending_waves
+                       or slot.slot_id in (pending_by_wave or {}).get(wave_fp, ()))
             refuse = not pending and slot.slot_id in refused
             actors.append({
                 "slot_id": slot.slot_id, "model": slot.model,
@@ -678,9 +701,9 @@ def test_disposition_items_are_recorded_on_a_wave_that_stays_custody_pending(har
     _install_barrier_substrate(monkeypatch, calls, texts={"s1": question})
     final = _collect(ctx, fingerprint)
     wave = _state(harness)["waves"][-1]
-    assert wave["custody_pending"] is False and wave["aggregate"] == "REVIEW_REQUIRED"
+    assert wave["custody_pending"] is False and wave["aggregate"] == "GREEN"  # the answered question emptied the open set
     assert [(d["finding_id"], d["decision"]) for d in wave["dispositions"]] == [("s1:q1", "accept")]
-    assert _control(final) == {"outcome": "REVIEW_REQUIRED", "closed": True}
+    assert _control(final) == {"outcome": "GREEN", "closed": True}
     assert _state(harness)["cycles_paid"] == 1
 
 

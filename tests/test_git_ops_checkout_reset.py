@@ -34,6 +34,7 @@ def test_checkout_and_reset_removes_stale_index_lock(monkeypatch, tmp_path):
 
     saved_state = {}
     monkeypatch.setattr(git_ops, "save_state", lambda state: saved_state.update(state))
+    monkeypatch.setattr(git_ops, "update_state", lambda mutator, **_kw: mutator(saved_state) or saved_state)
 
     calls = {"checkout": 0}
 
@@ -81,6 +82,7 @@ def test_checkout_and_reset_continues_when_fetch_fails(monkeypatch, tmp_path, fe
 
     saved_state = {}
     monkeypatch.setattr(git_ops, "save_state", lambda state: saved_state.update(state))
+    monkeypatch.setattr(git_ops, "update_state", lambda mutator, **_kw: mutator(saved_state) or saved_state)
 
     events = []
     monkeypatch.setattr(git_ops, "append_jsonl", lambda path, payload: events.append(payload))
@@ -232,6 +234,7 @@ def test_checkout_and_reset_preserves_local_head_on_managed_restart(monkeypatch,
 
     saved_state = {}
     monkeypatch.setattr(git_ops, "save_state", lambda state: saved_state.update(state))
+    monkeypatch.setattr(git_ops, "update_state", lambda mutator, **_kw: mutator(saved_state) or saved_state)
 
     def fake_git_capture(cmd):
         raise AssertionError(cmd)
@@ -560,6 +563,7 @@ def test_checkout_and_reset_applies_explicit_update_intent(monkeypatch, tmp_path
 
     saved_state = {}
     monkeypatch.setattr(git_ops, "save_state", lambda state: saved_state.update(state))
+    monkeypatch.setattr(git_ops, "update_state", lambda mutator, **_kw: mutator(saved_state) or saved_state)
 
     def fake_git_capture(cmd):
         if cmd == ["git", "rev-parse", "--verify", "remote-sha^{commit}"]:

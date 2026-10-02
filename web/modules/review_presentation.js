@@ -1,3 +1,5 @@
+import { acceptanceGroupWithIncident, acceptanceIncidentFromTaskDetail } from './acceptance_incident_presentation.js';
+export { acceptanceIncidentFromTaskDetail } from './acceptance_incident_presentation.js';
 import { setInertCardPresentation } from './task_phase_chip.js';
 import { escapeHtmlAttr, sinceLocalTime } from './utils.js';
 import { taskSourceDownloadUrl } from './api_client.js';
@@ -61,7 +63,7 @@ export function setReviewAnchor(record, enabled, writePhase) {
     } else {
         writePhase(record, 'working');
         if (!record.suggestedName && !record.lastHumanHeadline) {
-            record.titleEl.textContent = 'Working...';
+            record.titleEl.textContent = '';  // the chip says Working; the title waits for a name (#1369)
         }
         record.inlineTypingEl.style.display = '';
     }
@@ -420,16 +422,18 @@ function planAttempt(wave, index, isCurrent, live) {
     const state = custodyPending && live ? 'running' : superseded ? 'superseded' : 'terminal';
     const roster = (Array.isArray(wave.actors) ? wave.actors : [])
         .filter((actor) => actor && typeof actor === 'object');
-    // A wave whose reviewers may still answer reports how far it got; the
-    // verdict token speaks only for a wave that is no longer collecting.
-    const [progress, heldTone] = custodyPending ? heldProgress(
-        roster.some(actorUnresolved) && !roster.some(actorAwaiting) ? 'unresolved' : (live ? 'in progress' : 'no verdict'), roster, (actor) => actor.ok === true) : ['', ''];
+    // A wave whose reviewers may still answer reports how far it got; a settled wave
+    // whose reviewers were too few for a verdict reports the same counts in the neutral
+    // tone (the stored DEGRADED word is the host's placeholder and never paints).
+    const settledNoQuorum = !custodyPending && verdict === 'DEGRADED';
+    const [progress, heldTone] = custodyPending || settledNoQuorum ? heldProgress(
+        custodyPending && roster.some(actorUnresolved) && !roster.some(actorAwaiting) ? 'unresolved' : (custodyPending && live ? 'in progress' : 'no verdict'), roster, (actor) => actor.ok === true) : ['', ''];
     return {
         id,
         surface: 'plan',
         state,
         progress,
-        tone: heldTone || statusTone(state, custodyPending ? '' : verdict),
+        tone: settledNoQuorum ? 'neutral' : heldTone || statusTone(state, custodyPending ? '' : verdict),
         verdict,
         timestamp: text(wave.reviewed_at || wave.ts || wave.timestamp || wave.closed_at),
         ordinal: index,
@@ -529,20 +533,18 @@ function planFindingLines(wave) {
 
 function planActorAvailabilityLines(wave) {
     // The bug report's own bar: a result that was never received must say so
-    // explicitly instead of contributing silently-zero findings.
+    // explicitly instead of contributing silently-zero findings. A row names the model and
+    // quotes the engine's sentence; failure code and slot id stay in the task detail and Logs.
     const lines = [];
     for (const actor of (Array.isArray(wave.actors) ? wave.actors : [])) {
         if (!actor || typeof actor !== 'object' || actor.ok !== false) continue;
-        const identity = [text(actor.slot_id), text(actor.model)].filter(Boolean).join(' · ') || 'reviewer';
-        const gap = actorAwaiting(actor)
-            ? `Awaiting answer: ${identity}${sinceLocalTime(actor.awaiting_since)}`
-            : (actorUnresolved(actor) ? `No answer: ${identity} — ${[text(actor.operation_state), text(actor.failure_code) || text(actor.error)].filter(Boolean).join(': ')}${sinceLocalTime(actor.awaiting_since)}` : '');
-        if (gap) {
-            lines.push(gap);
-            continue;
-        }
-        const cause = text(actor.failure_code) || text(actor.error) || 'no parseable verdict';
-        lines.push(`Reviewer unavailable: ${identity} — ${cause}`);
+        const model = text(actor.model) || 'reviewer';
+        const cause = text(actor.reported_cause).split(/\s+/).join(' ');
+        const carried = finiteCount(actor.carried_findings) ? '; its earlier finding is still listed' : '';
+        if (actorAwaiting(actor)) lines.push(`${model} · awaiting${sinceLocalTime(actor.awaiting_since)}`);
+        else if (actorUnresolved(actor)) lines.push(`${model} · no answer${cause ? ` — "${cause}"` : ''}${sinceLocalTime(actor.awaiting_since)}`);
+        else if (text(actor.operation_state) === 'not_dispatched') lines.push(`${model} · not sent${carried}`);
+        else lines.push(`${model} · unavailable${cause ? ` — "${cause}"` : ''}${carried ? ` · did not answer${carried}` : ''}`);
     }
     return lines;
 }
@@ -551,7 +553,7 @@ function planWaveDetail(wave) {
     const lines = [
         wave.custody_pending === true
             ? 'Verdict: none (wave held open)'
-            : (wave.aggregate ? `Verdict: ${wave.aggregate}` : ''),
+            : (text(wave.aggregate) === 'DEGRADED' ? 'Verdict: none — fewer reviewers answered than needed' : (wave.aggregate ? `Verdict: ${wave.aggregate}` : '')),
         wave.closed != null ? `Closed: ${wave.closed ? 'yes' : 'no'}` : '',
         wave.paid != null ? `Reviewer panel dispatched: ${wave.paid ? 'yes' : 'no'}` : '',
         wave.quorum_unreachable ? 'Quorum unavailable' : '',
@@ -559,6 +561,14 @@ function planWaveDetail(wave) {
         wave.reason ? `Reason: ${text(wave.reason)}` : '',
     ];
     const counts = wave.counts && typeof wave.counts === 'object' ? wave.counts : {};
+    // A panel ordered weaker than the owner's setting says so seat by seat (typed fact; the
+    // verdict token is never recoloured), on compact waves too since compaction keeps the fact.
+    const weaker = wave.ordered_weaker && typeof wave.ordered_weaker === 'object'
+        ? Object.entries(wave.ordered_weaker).filter(([, row]) => row && typeof row === 'object') : [];
+    if (weaker.length) {
+        lines.push(`Reviewers ordered weaker than your setting: ${weaker
+            .map(([sid, row]) => `${sid} ${text(row.effort) || '?'} (setting ${text(row.owner_effort) || '?'})`).join(', ')}`);
+    }
     if (wave.compact) {
         // A compacted wave keeps counts while its finding bodies moved to the
         // immutable wave artifact; name that remainder instead of rendering a
@@ -667,8 +677,13 @@ export function planReviewGroupFromTaskDetail(detail, ownerTaskId = '') {
     const authorSubject = current.author_subject;
     const author = authorDispositionText(authorSubject?.author_disposition);
     const reviewFingerprint = author ? text(authorSubject.review_fingerprint) : currentFingerprint;
+    // The critic reviewed the EARLIER plan when the author selected a revised one: the group
+    // is labelled as that plan's review and the selected plan is named unreviewed — the same
+    // `historical_critic` fact the gate projection carries, never a synthesized verdict.
+    const historicalCritic = Boolean(author) && Boolean(reviewFingerprint) && reviewFingerprint !== currentFingerprint;
     const authorDecisionText = author ? [author,
         `Critic plan: ${reviewFingerprint}`,
+        historicalCritic ? `The verdict shown is the earlier plan's review; the selected plan ${currentFingerprint} has no verdict of its own` : '',
         authorSubject.source_ref?.path ? `Current plan source: ${text(authorSubject.source_ref.root)}:${text(authorSubject.source_ref.path)}` : '',
         authorSubject.source_ref?.sha256 ? `Source sha256=${text(authorSubject.source_ref.sha256)}` : '',
     ].filter(Boolean).join('\n') : '';
@@ -736,7 +751,8 @@ export function planReviewGroupFromTaskDetail(detail, ownerTaskId = '') {
     return {
         id: `plan:${owner}`,
         surface: 'plan',
-        label: 'Plan review',
+        label: historicalCritic ? 'Plan review · earlier plan' : 'Plan review',
+        historicalCritic,
         subject: '',
         presentationOwnerTaskId: owner,
         subjectTaskId: owner,
@@ -827,10 +843,10 @@ export function formatReviewProjection(projection) {
 }
 
 function authorDispositionText(author, label = '') {
-    if (!author || typeof author !== 'object' || !text(author.disposition)) return '';
+    if (!author || typeof author !== 'object' || (!text(author.disposition) && !text(author.action))) return '';
     const actionLabel = label || `Author ${author.action === 'stop' ? 'stop' : 'finish'}`;
     return [
-        `${actionLabel}: ${text(author.disposition)}`,
+        `${actionLabel}${text(author.disposition) ? `: ${text(author.disposition)}` : ''}`,
         text(author.reviewer_signal) ? `reviewer signal=${text(author.reviewer_signal)}` : '',
         text(author.rationale),
         text(author.subject_hash) ? `subject_hash=${text(author.subject_hash)}` : '',
@@ -843,7 +859,10 @@ export function taskAcceptanceGroupFromTaskDetail(detail, ownerTaskId = '') {
     const projection = detail?.review_projection;
     const panels = (Array.isArray(projection?.panels) ? projection.panels : [])
         .filter((panel) => text(panel?.surface) === 'task_acceptance');
-    if (!owner || !panels.length) return null;
+    const incident = acceptanceIncidentFromTaskDetail(detail);
+    // A local preparation failure produces NO panel: the group has to exist on
+    // the incident alone, or the owner sees nothing at all.
+    if (!owner || (!panels.length && !incident)) return null;
     const acceptanceDecision = detail?.outcome_axes?.review?.acceptance_decision
         || detail?.review_status?.acceptance_decision;
     const decisionAuthor = acceptanceDecision?.author_disposition;
@@ -861,11 +880,11 @@ export function taskAcceptanceGroupFromTaskDetail(detail, ownerTaskId = '') {
         const verdict = text(panel?.aggregate_signal || 'UNKNOWN');
         const roster = (Array.isArray(panel?.actors) ? panel.actors : []).filter((actor) => actor && typeof actor === 'object');
         const awaited = roster.some(actorAwaiting);
-        // An awaited panel is activity only while its own task still runs to collect it;
-        // afterwards an unanswered slot is a recorded gap, not a degraded verdict.
+        // An awaited panel is activity only while its own task still runs to collect it; afterwards an unanswered
+        // slot is a recorded gap. A settled panel without a verdict says so in words; DEGRADED stays in its detail.
         const live = awaited && text(detail?.status).toLowerCase() === 'running' && !panel?.superseded && index === panels.length - 1;
         const held = { FAIL: 'FAIL', PASS: live ? 'PASS so far' : 'PASS' }[verdict.toUpperCase()] || (live ? 'in progress' : 'no verdict');
-        const [progress, heldTone] = awaited ? heldProgress(held, roster, (actor) => text(actor.transport_status) === 'success') : ['', ''];
+        const [progress, heldTone] = awaited || verdict.toUpperCase() === 'DEGRADED' ? heldProgress(held, roster, (actor) => text(actor.transport_status) === 'success') : ['', ''];
         // The host composed this sentence; the card prints it verbatim and
         // leads the detail with it, because the renderer shows detailText over
         // summary. The panel's own verdict and identity are untouched.
@@ -897,26 +916,7 @@ export function taskAcceptanceGroupFromTaskDetail(detail, ownerTaskId = '') {
                 authorDispositionText(panel.author_disposition), 'Cost unavailable'].filter(Boolean).join('\n'),
         };
     });
-    const latest = attempts.at(-1);
-    return {
-        id: `task_acceptance:${owner}`,
-        surface: 'task_acceptance',
-        label: 'Task acceptance',
-        subject: '',
-        presentationOwnerTaskId: owner,
-        subjectTaskId: owner,
-        initiatorTaskId: owner,
-        state: latest?.state === 'running' ? 'running' : 'terminal',
-        progress: text(latest?.progress),
-        tone: latest?.tone || statusTone('terminal', latest?.verdict),
-        verdict: text(latest?.verdict),
-        summary: text(latest?.summary),
-        authorDecisionText,
-        activeCount: latest?.state === 'running' ? 1 : 0,
-        attemptCount: attempts.length,
-        countIsAuthoritative: true,
-        attempts,
-    };
+    return acceptanceGroupWithIncident({ owner, attempts, incident, authorDecisionText, statusTone });
 }
 
 export function reviewGroupsFromTaskDetail(detail, ownerTaskId = '') {
@@ -1158,9 +1158,8 @@ function reviewRevision(value) {
 }
 
 // Revisions are opaque SHA-256 tokens; one distinct token may trail a live GET.
-export function createReviewHydrator({ fetchDetail, applyDetail, onState = () => {} } = {}) {
+export function createReviewHydrator({ fetchDetail, applyDetail, onState = () => {}, onSettled = () => {} } = {}) {
     const states = new Map();
-
     const start = (taskId, state, revision, onDomWrite) => {
         const generation = ++state.generation;
         state.inFlightRevision = revision;
@@ -1191,7 +1190,7 @@ export function createReviewHydrator({ fetchDetail, applyDetail, onState = () =>
                 return false;
             })
             .finally(() => {
-                if (state.inFlight !== request || state.generation !== generation) return;
+                if (states.get(taskId) !== state || state.inFlight !== request || state.generation !== generation) return;
                 state.inFlight = null;
                 state.inFlightRevision = null;
                 const pending = state.pending;
@@ -1199,12 +1198,18 @@ export function createReviewHydrator({ fetchDetail, applyDetail, onState = () =>
                 if (pending && pending.revision !== state.appliedRevision) {
                     start(taskId, state, pending.revision, pending.onDomWrite);
                 }
+                onSettled(taskId);
             });
         state.inFlight = request;
         return request;
     };
 
     return {
+        // Saved Review: errors await Retry; a successful empty/404 permits fallback.
+        ready(taskId) {
+            const state = states.get(taskId);
+            return !state || (!state.inFlight && state.lastStatus !== 'error');
+        },
         hydrate(taskIdValue, revisionValue = null, { onDomWrite = null } = {}) {
             const taskId = text(taskIdValue);
             if (!taskId) return Promise.resolve(false);
@@ -1229,10 +1234,7 @@ export function createReviewHydrator({ fetchDetail, applyDetail, onState = () =>
                 if (revision !== null && revision === state.pending?.revision) {
                     return state.inFlight.then(() => state.inFlight || false);
                 }
-                if (
-                    revision !== null
-                    && revision !== state.inFlightRevision
-                ) {
+                if (revision !== null && revision !== state.inFlightRevision) {
                     state.pending = { revision, onDomWrite };
                     return state.inFlight.then(() => state.inFlight || false);
                 }
@@ -1247,9 +1249,7 @@ export function createReviewHydrator({ fetchDetail, applyDetail, onState = () =>
                 if (state) state.appliedRevision = null;
                 return;
             }
-            // A full DOM rebuild discards the projection that an applied
-            // revision hydrated, but it must retain and join any physical GET
-            // already in flight. Reset only the applied presentation receipt.
+            // Reset the presentation receipt after rebuild; keep joining any physical GET.
             for (const state of states.values()) state.appliedRevision = null;
         },
         clear() {
@@ -1498,6 +1498,9 @@ export function createReviewPresentationController({
         summary.textContent = groupCount
             ? `Reviews ${groupCount}${activeCount ? ` · ${activeCount} active` : ''}`
             : (failedEmpty ? 'Reviews' : '');
+        const warnings = [...groups.values()].map(group => text(group.warning)).filter(Boolean);
+        summary.dataset.warning = warnings.length ? '1' : '0';
+        if (warnings.length) summary.textContent += ' · Acceptance unavailable: evidence preparation failed; no new reviewers.';
         const reconciled = reconcileReviewMarkup(host, renderReviewsSection(groups, state));
         const active = host?.ownerDocument?.activeElement;
         if (!reconciled || !active || !host.contains?.(active)) restoreFocus(focused);

@@ -1,6 +1,6 @@
 """A filled optional argument that asks for nothing is not a refusal.
 
-Models fill every key of a tool schema. These tests pin, through the REAL registry,
+Models may fill every key of a tool schema. These tests pin, through the REAL registry,
 that such a value takes the omitted path with one disclosure line, and that a
 genuine argument mistake is refused once, typed, naming the value it received.
 """

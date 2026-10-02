@@ -320,11 +320,17 @@ def test_a_panel_that_settles_after_the_task_ended_is_attached_and_announced_onc
     event = rows[0]
     assert event["type"] == "send_message" and event["role"] == "system"
     assert event["chat_id"] == 1 and event["task_id"] == "late-root"
-    assert event["text"].startswith("Reviewers later passed this answer. They reviewed the earlier version")
-    assert "- a: PASS — model/a says PASS" in event["text"]
+    # Version first, then the verdict. The trace recorded a rewrite, but a
+    # supersession is not delivery proof: with no send receipt the version is unknown.
+    assert event["text"].startswith("On the reviewed version of this answer (whether it was the delivered one "
+                                    "is unknown), reviewers later passed it.")
+    # The owner row names the reviewer by model and says the verdict in words;
+    # the slot id and the token stay in the typed evidence (#1369).
+    assert "- model/a (requested): passed it — model/a says PASS" in event["text"]
+    assert "- a: PASS" not in event["text"]
     assert event["delivery_id"] == "acceptance-late:acceptance-subject-one"
-    assert event["progress_meta"] == {"card_row": "reviews",
-                                      "card_row_id": "acceptance-late:acceptance-subject-one"}
+    assert {key: event["progress_meta"][key] for key in ("card_row", "card_row_id")} == {
+        "card_row": "reviews", "card_row_id": "acceptance-late:acceptance-subject-one"}
     assert not acceptance_run_pending(run) and run["actors"][0]["parsed"]["verdict"] == "PASS"
     stored = load_task_result(tmp_path, "late-root")
     assert stored["status"] == "completed", "the supplement never moves a terminal status"
@@ -334,8 +340,18 @@ def test_a_panel_that_settles_after_the_task_ended_is_attached_and_announced_onc
     # The panel of THIS wave carries the host's sentence verbatim; the sibling
     # that settled in time carries no settlement at all.
     assert len(panels) == 2 and panels[1]["panel_id"] == "panel_in_time"
-    assert panels[0]["late_settlement"] == {"note": event["text"], "reviewed_revision": "earlier",
-                                            "settled_after_terminal": True}
+    late = panels[0]["late_settlement"]
+    assert {key: late[key] for key in ("note", "reviewed_revision", "settled_after_terminal")} == {
+        "note": event["text"], "reviewed_revision": "unknown", "settled_after_terminal": True}
+    assert late["reviewed_superseded"] is True, "the recorded rewrite stays its own fact"
+    # Neutral evidence: when it settled, which exact subject was read, and what the host
+    # can prove it emitted (nothing here: no delivery record, so unknown, never inferred).
+    assert late["settled_at"] and late["reviewed_subject"]["retry_key"] == "acceptance-subject-one"
+    assert late["emitted_answer"]["state"] == "unknown" and late["reviewed_is_emitted"] is None
+    assert [row["slot_id"] for row in late["reviewer_outputs"]] == ["a"]
+    pointer = event["progress_meta"]["late_evidence"]
+    assert pointer["settled_at"] == late["settled_at"] and pointer["panel_id"] == "panel_1"
+    assert pointer["source_ref"] == panels[0]["applied_source_ref"] and pointer["reviewed_is_emitted"] is None
     assert "late_settlement" not in panels[1]
     assert len(model.calls) == 1, "collection is free"
     # A second settlement of the same wave finds nothing to reconcile, announces
@@ -359,24 +375,36 @@ def test_the_late_row_never_reports_a_reviewer_whose_outcome_is_unknown_as_answe
     wave = {"slots": {"a": "ok", "b": "ok", "c": ""},
             "verdicts": {"a": {"verdict": "PASS"}, "b": {"verdict": "DEGRADED"}}}
     incident = {"aggregate_signal": "DEGRADED", "actors": [
-        {"operation_state": "settled", "parsed": {"verdict": "PASS"}},
-        {"operation_state": "settled", "parsed": {"verdict": "DEGRADED"}},
-        {"operation_state": "custody_lost", "late_result_pending": True}]}
+        {"slot_id": "a", "operation_state": "settled", "parsed": {"verdict": "PASS"}},
+        {"slot_id": "b", "operation_state": "settled", "parsed": {"verdict": "DEGRADED"}},
+        {"slot_id": "c", "operation_state": "custody_lost", "late_result_pending": True}]}
     text = _late_settlement_text(incident, wave)
-    assert text.startswith("Reviewers later returned no settled verdict on this answer — 1 reviewer's outcome "
-                           "is still unknown. They reviewed the answer that was delivered.")
+    unknown_version = "On the reviewed version of this answer (whether it was the delivered one is unknown), "
+    assert text.startswith(unknown_version + "reviewers later returned no settled verdict — 1 reviewer's outcome "
+                           "is still unknown.")
     assert "no quorum" not in text
-    assert "- a: PASS" in text and "- c: pending" in text
+    # Owner wording (#1369): a settled PASS, a reviewer's own DEGRADED and an
+    # unanswered seat read as words; with no roster identity the reviewer is unknown.
+    assert "- unknown reviewer (seat 1): passed it" in text
+    assert "- unknown reviewer (seat 2): inconclusive" in text
+    assert "- unknown reviewer (seat 3): still awaited" in text
+    assert "PASS" not in text.split("\n", 1)[1] and "DEGRADED" not in text and "pending" not in text
     assert "— 2 reviewers' outcomes are still unknown." in _late_settlement_text(
         {**incident, "actors": [incident["actors"][2], {"operation_state": "pending_dispatch"}]}, wave)
     answered = {**incident, "actors": incident["actors"][:2]}
     assert _late_settlement_text(answered, wave).startswith(
-        "Reviewers later returned no settled verdict on this answer. They reviewed")
+        unknown_version + "reviewers later returned no settled verdict.")
     assert _late_settlement_text({**answered, "aggregate_signal": "PASS"}, wave).startswith(
-        "Reviewers later passed this answer. They reviewed the answer that was delivered.")
+        unknown_version + "reviewers later passed it.")
     assert _late_settlement_text(
         {**answered, "aggregate_signal": "FAIL", "superseded_by_revision": True}, wave).startswith(
-        "Reviewers later rejected this answer. They reviewed the earlier version,")
+        unknown_version + "reviewers later rejected it."), "a recorded rewrite proves no delivered bytes"
+    assert _late_settlement_text({**answered, "aggregate_signal": "FAIL"}, wave,
+                                 {"reviewed_revision": "different"}).startswith(
+        "On a version of this answer other than the one delivered, reviewers later rejected it.")
+    assert _late_settlement_text({**answered, "aggregate_signal": "PASS"}, wave,
+                                 {"reviewed_revision": "delivered"}).startswith(
+        "On the delivered version of this answer, reviewers later passed it.")
 
 
 def test_a_terminal_task_gets_one_row_at_completion_not_at_quorum(tmp_path, monkeypatch):
@@ -424,8 +452,9 @@ def test_a_terminal_task_gets_one_row_at_completion_not_at_quorum(tmp_path, monk
         with settled:
             settled.wait_for(lambda: count["n"] >= 2, timeout=10)
     rows = [e for e in events if e.get("system_type") == "acceptance_late_settlement"]
-    assert len(rows) == 1 and "- a: PASS" in rows[0]["text"] and "- b: PASS" in rows[0]["text"]
-    assert "pending" not in rows[0]["text"] and _mailbox_rows(tmp_path, "late-two") == []
+    assert len(rows) == 1
+    assert "- model/a (requested): passed it" in rows[0]["text"] and "- model/b (requested): passed it" in rows[0]["text"]
+    assert "still awaited" not in rows[0]["text"] and _mailbox_rows(tmp_path, "late-two") == []
 
 
 def test_two_late_panels_of_one_task_each_announce_their_own_row(tmp_path, monkeypatch):
@@ -526,7 +555,7 @@ def test_a_late_settlement_for_another_task_is_never_published(tmp_path):
     assert json.dumps(load_task_result(tmp_path, "other-root"), sort_keys=True) == before
 
 
-def test_every_acceptance_wake_reoffers_a_changed_keep_contract(tmp_path, monkeypatch):
+def test_every_acceptance_wake_reoffers_the_changed_answer_selector(tmp_path, monkeypatch):
     """A replacement candidate inherits ``control_episode_seen``; the contract for
     the NEW candidate must still be shown, while identical bytes are not repeated."""
     from ouroboros.loop_acceptance_review import wait_for_acceptance_feedback
@@ -550,11 +579,8 @@ def test_every_acceptance_wake_reoffers_a_changed_keep_contract(tmp_path, monkey
     assert blocks() == 2 and second.content_sha256[:12] in str(ctx.messages)
 
 
-def test_the_acceptance_wake_keeps_the_one_repair_already_spent(tmp_path, monkeypatch):
-    """Scope review round 1: re-arming on every wake reset ``repair_attempted``,
-    so a candidate could burn one malformed-control repair per wake instead of
-    one per episode. The wake's re-offer preserves the spent repair; an ordinary
-    arm (something changed) still opens a fresh episode."""
+def test_acceptance_wakes_never_spend_a_counter_to_discard_the_answer(tmp_path, monkeypatch):
+    """Repeated wakes and interim replies retain the answer until an explicit selection."""
     from ouroboros.loop_acceptance_review import wait_for_acceptance_feedback
     from tests.test_delivery_forced_finalization import _forced_test_context
 
@@ -563,11 +589,18 @@ def test_the_acceptance_wake_keeps_the_one_repair_already_spent(tmp_path, monkey
     registry._ctx._task_acceptance_pending = "binding-one"
     candidate = loop._replace_delivery_candidate(registry, ctx, trace, "Complete answer.", control="candidate")
     wait_for_acceptance_feedback(registry, ctx, trace, [], set())
-    candidate.repair_attempted = True  # the one repair was spent on a malformed control
-    wait_for_acceptance_feedback(registry, ctx, trace, [], set())
-    assert candidate.repair_attempted is True, "the wake re-offer must not refund the repair"
-    loop._arm_delivery_control(registry, ctx, trace)
-    assert candidate.repair_attempted is False, "an ordinary arm opens a new episode"
+    for interim in ("Still waiting.", "The critic is working.", "No new review result yet."):
+        wait_for_acceptance_feedback(registry, ctx, trace, [], set())
+        status, text = loop._resolve_delivery_control(interim, registry, ctx, trace)
+        assert (status, text) == ("retry", "Complete answer.")
+        assert registry._ctx._delivery_candidate.full_text == "Complete answer."
+        assert registry._ctx._delivery_control_required
+        assert not registry._ctx._delivery_candidate.degraded
+        assert not getattr(registry._ctx, "_completion_selected", None)
+    from tests.test_delivery_forced_finalization import _select_completion
+    _select_completion(registry, ctx, trace, answer_sha256=candidate.content_sha256)
+    assert registry._ctx._completion_selected["action"] == "finish"
+    assert registry._ctx._delivery_candidate.full_text == "Complete answer."
 
 
 def test_the_rearmed_contract_never_rewrites_an_already_sent_row(tmp_path):
@@ -602,23 +635,29 @@ def test_pending_review_rides_beside_the_verb_and_is_recorded_on_every_answer(tm
     never an extra key that invalidates the body, and every control answer records
     it (an answer without the key means wait)."""
     from tests.test_delivery_control_lineage import _start_control_episode
+    from ouroboros.loop_delivery import completion_observation, consume_completion_request
+    from ouroboros.tools.control_runtime import stage_completion_request
 
     loop, registry, ctx, trace, candidate = _start_control_episode(tmp_path)
     loop._arm_delivery_control(registry, ctx, trace)
-    status, text = loop._resolve_delivery_control(
-        json.dumps({"delivery_control": "keep", "pending_review": choice}), registry, ctx, trace,
-    )
-    assert (status, text) == ("resolved", candidate.full_text)
+    registry._ctx._completion_observation = completion_observation(registry._ctx, trace)
+    assert json.loads(stage_completion_request(registry._ctx, {
+        "action": "finish", "answer_sha256": candidate.content_sha256, "pending_review": choice,
+    }))["status"] == "completion_requested"
+    assert consume_completion_request(registry, ctx, trace)
+    assert registry._ctx._delivery_candidate.full_text == candidate.full_text
     assert registry._ctx._acceptance_pending_review_choice == choice
     loop._arm_delivery_control(registry, ctx, trace)
-    status, _text = loop._resolve_delivery_control(
-        json.dumps({"delivery_control": "keep"}), registry, ctx, trace,
-    )
-    assert status == "resolved" and registry._ctx._acceptance_pending_review_choice == "wait"
+    registry._ctx._completion_observation = completion_observation(registry._ctx, trace)
+    assert json.loads(stage_completion_request(registry._ctx, {
+        "action": "finish", "answer_sha256": candidate.content_sha256,
+    }))["status"] == "completion_requested"
+    assert consume_completion_request(registry, ctx, trace)
+    assert registry._ctx._acceptance_pending_review_choice == "wait"
 
 
 @pytest.mark.parametrize("content", ["", [{"type": "thinking", "thinking": "reasoning only"}], "invalid control"])
-def test_delivery_repair_keeps_the_sent_control_prefix(tmp_path, content):
+def test_held_prose_keeps_the_sent_control_prefix(tmp_path, content):
     import copy
     from ouroboros.transcript_prefix import observe_send
     from tests.test_delivery_forced_finalization import _forced_test_context
@@ -632,9 +671,9 @@ def test_delivery_repair_keeps_the_sent_control_prefix(tmp_path, content):
 
     status, text = loop._resolve_delivery_control(content, registry, ctx, trace)
 
-    assert (status, text) == ("retry", "")
+    assert (status, text) == ("retry", "Complete retained answer.")
     assert ctx.messages[:len(sent)] == sent
-    assert "[DELIVERY_CONTROL_REPAIR]" in ctx.messages[-1]["content"]
+    assert "No completion selection was made" in ctx.messages[-1]["content"]
     assert ctx.messages[-1]["role"] == "user"
     assert observe_send(registry._ctx, ctx.messages, round_idx=2) is None
     assert candidate.full_text == "Complete retained answer."

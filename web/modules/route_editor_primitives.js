@@ -84,13 +84,13 @@ export function composeModelSource(source, model) {
 // Owner-facing order of the direct API providers. OpenRouter first because an
 // unprefixed model id routes through it; the rest follow the settings order.
 export const API_PROVIDER_ORDER = ['openrouter', 'openai', 'anthropic', 'deepseek',
-    'minimax', 'cloudru', 'gigachat', 'openai-compatible'];
+    'zai', 'minimax', 'cloudru', 'gigachat', 'openai-compatible'];
 
 // Fallback names for providers the setup contract does not describe (GigaChat
 // has no profile spec). The contract's label wins whenever it exists.
 const API_PROVIDER_LABELS = {
     openrouter: 'OpenRouter', openai: 'OpenAI', anthropic: 'Anthropic', deepseek: 'DeepSeek',
-    minimax: 'MiniMax', cloudru: 'Cloud.ru Foundation Models', gigachat: 'GigaChat',
+    zai: 'Z.ai (GLM)', minimax: 'MiniMax', cloudru: 'Cloud.ru Foundation Models', gigachat: 'GigaChat',
     'openai-compatible': 'OpenAI-compatible endpoint',
 };
 
@@ -103,6 +103,7 @@ const API_PROVIDER_CREDENTIALS = {
     openai: [['OPENAI_API_KEY']],
     anthropic: [['ANTHROPIC_API_KEY']],
     deepseek: [['DEEPSEEK_API_KEY']],
+    zai: [['ZAI_API_KEY']],
     minimax: [['MINIMAX_API_KEY']],
     cloudru: [['CLOUDRU_FOUNDATION_MODELS_API_KEY']],
     gigachat: [['GIGACHAT_CREDENTIALS'], ['GIGACHAT_USER', 'GIGACHAT_PASSWORD']],
@@ -201,18 +202,27 @@ function routeCatalogItems(route, items = []) {
 /**
  * One suggestion per model: the label names the model and makes no account claim
  * (DESIGN.md §7). Availability, the reading account and its observation time are
- * account facts, so they never travel on a model option.
+ * account facts, so they never travel on a model option. Two row facts do: what an
+ * alias resolves to (`resolved_model`, shown only while every supplying row agrees)
+ * and a row known only from the engine's frozen list (`origin: "hint"` on every
+ * supplying row; absent origin is live). The value stays the row id either way.
  */
 export function catalogModelOptions(items = []) {
     const values = new Map();
     for (const item of items) {
         const value = String(item?.value || item?.id || item);
         const name = String(item?.name || item?.label || '');
+        if (!values.has(value)) values.set(value, { value, label: value, named: false, live: false, resolved: new Set() });
         const current = values.get(value);
-        if (!current) values.set(value, { value, label: name || value, named: Boolean(name) });
-        else if (name && !current.named) Object.assign(current, { label: name, named: true });
+        if (name && !current.named) Object.assign(current, { label: name, named: true });
+        if (item?.origin !== 'hint') current.live = true;
+        const resolved = item?.resolved_model;
+        if (typeof resolved === 'string' && resolved && resolved !== value) current.resolved.add(resolved);
     }
-    return [...values.values()].map(({ value, label }) => ({ value, label }));
+    return [...values.values()].map(({ value, label, live, resolved }) => {
+        const named = resolved.size === 1 ? `${value} → ${[...resolved][0]}` : label;
+        return { value, label: live ? named : `${named} (shipped list)` };
+    });
 }
 
 /** Suggestions carry the model alone; the source select already names the provider. */
@@ -412,7 +422,7 @@ function undiscoveredLabel(value, known) {
 export function routeChoiceGroups({
     harnesses = [], modelSources = [], providers = [], currentChoice = '',
     catalogKnown = true, accountsKnown = true, includeSessions = true,
-    includeSubscriptions = true, providerProfiles = {},
+    includeSubscriptions = true, providerProfiles = {}, hasConfiguredAccounts = false,
 } = {}) {
     const sessionValues = (harnesses || [])
         .filter((harness) => harness && harness.id)
@@ -452,7 +462,9 @@ export function routeChoiceGroups({
         ...(includeSubscriptions ? [{ label: 'Subscriptions · models', options: modelValues.length
             ? modelValues
             : [{ value: '', disabled: true, label: catalogKnown && accountsKnown
-                ? 'No model sources listed — connect one in Accounts'
+                ? (hasConfiguredAccounts
+                    ? 'No model sources listed — refresh Model Catalog'
+                    : 'No model sources listed — connect one in Accounts')
                 : catalogKnown ? 'No model sources listed; accounts have not been checked'
                     : 'Model sources have not been read — use Refresh Model Catalog' }] }] : []),
         { label: 'API keys', options: apiValues },
@@ -567,7 +579,7 @@ export function effortSelectHtml(attrs, selected, surfaceDefault = 'route defaul
         ...EFFORT_CHOICES.map((effort) => ({ value: effort, label: effort })),
     ];
     return selectHtml(
-        `${attrs} title="Reasoning effort — default: ${escapeHtml(surfaceDefault)}"`,
+        `${attrs} title="Preferred reasoning effort — default: ${escapeHtml(surfaceDefault)}"`,
         [{ label: '', options }],
         selected || '',
     );

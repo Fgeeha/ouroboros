@@ -525,3 +525,23 @@ def test_idle_timeout_never_clones_a_checkpointed_attempt(pool, monkeypatch, sta
     expected_retry = stage in ("ordinary", "other_attempt")
     assert job["will_retry"] is expected_retry
     assert bool(workers.PENDING) is expected_retry
+
+
+def test_the_wait_stamp_rides_park_grant_and_restart_handoff_beside_the_task_start(pool):
+    """``parked_at`` dates THIS wait; the supervisor still owns ``started_at``
+    (the lifetime clock) and every later write carries the stamp unchanged."""
+    from ouroboros.owner_wait import prepare_owner_wait_handoffs
+
+    stamped = {**pool.wait, "parked_at": "2026-09-26T11:30:00+00:00"}
+    worker_owner_wait.handle_owner_wait({**pool.event, "checkpoint": stamped}, workers)
+    assert pool.original.in_q.get_nowait()["phase"] == "parked"
+    saved = load_task_result(pool.root, "owner")["owner_wait"]
+    assert saved["parked_at"] == "2026-09-26T11:30:00+00:00"
+    assert saved["started_at"] == pool.meta["started_at"] != saved["parked_at"]
+    selected = prepare_owner_wait_handoffs(pool.root, workers.RUNNING, "tx1")
+    assert selected == {"owner"}
+    assert pool.meta["task"]["_owner_wait_resume"]["parked_at"] == "2026-09-26T11:30:00+00:00"
+    worker_owner_wait.handle_owner_wait({**pool.event, "phase": "resume"}, workers)
+    worker_owner_wait.maintain_owner_wait_capacity()
+    resumed = load_task_result(pool.root, "owner")["owner_wait"]
+    assert resumed["state"] == "resumed" and resumed["parked_at"] == "2026-09-26T11:30:00+00:00"

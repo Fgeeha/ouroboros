@@ -44,6 +44,7 @@ TOOL_POLICY: Dict[str, str] = {
     "vcs_diff": POLICY_SKIP,
     "chat_history": POLICY_SKIP,
     "recent_tasks": POLICY_SKIP,
+    "live_roots": POLICY_SKIP,
     "knowledge_read": POLICY_SKIP,
     "knowledge_list": POLICY_SKIP,
     "journal_read": POLICY_SKIP,
@@ -64,15 +65,18 @@ TOOL_POLICY: Dict[str, str] = {
     "browser_action": POLICY_SKIP,
     "list_github_prs": POLICY_SKIP,
     "get_github_pr": POLICY_SKIP,
+    "get_github_checks": POLICY_SKIP,
     "list_github_issues": POLICY_SKIP,
     "get_github_issue": POLICY_SKIP,
     "plan_task": POLICY_SKIP,
     "task_acceptance_review": POLICY_SKIP,
+    "finish_task": POLICY_SKIP,
     "review_status": POLICY_SKIP,
     "get_task_result": POLICY_SKIP,
     "peek_task": POLICY_SKIP,
     "wait_task": POLICY_SKIP,
     "wait_tasks": POLICY_SKIP,
+    "await_messages": POLICY_SKIP,
     "list_projects": POLICY_SKIP,
     "switch_model": POLICY_SKIP,
     "service_status": POLICY_SKIP,
@@ -88,6 +92,7 @@ TOOL_POLICY: Dict[str, str] = {
     "knowledge_write": POLICY_SKIP,
     "journal_write": POLICY_SKIP,
     "workpad_write": POLICY_SKIP,
+    "update_focus": POLICY_SKIP,
     # Bounded tree-scoped coordination. Tagged child-result dispositions are validated
     # and persisted only by join_ledger; neither branch has an external/repo effect.
     "tree_note": POLICY_SKIP,
@@ -106,6 +111,9 @@ TOOL_POLICY: Dict[str, str] = {
 
     # Control / messaging / internal side effects.
     "schedule_subagent": POLICY_SKIP,
+    # Owner-governed schedule inspection/mutation is narrow, reasoned and audited;
+    # it never edits task payloads or cancels an admitted task.
+    "manage_schedules": POLICY_SKIP,
     # One-shot deferred follow-up through the existing supervisor scheduler: the
     # future task re-enters normal admission/safety, so registration itself has
     # no reach beyond what the task already has (same reasoning as schedule_subagent).
@@ -119,7 +127,14 @@ TOOL_POLICY: Dict[str, str] = {
     # Answering a run's question is custody-gated to the task that started it and
     # carries no authority the task lacks (same reasoning as the verbs above).
     "delegate_answer": POLICY_SKIP,
+    "delegate_message": POLICY_SKIP,
     "cancel_task": POLICY_SKIP,
+    # The other half of the same nanny authority (#1196, owner Q9): selecting ONE
+    # of this task's OWN budget-paused descendants to continue under its same id.
+    # The tool only REQUESTS; the supervisor re-checks lineage, the root's live
+    # owner Resume grant, money, Stop/cancel, deadline and lifetime through the
+    # seam the owner's own Resume uses, so it adds no reach the task lacks.
+    "resume_child_task": POLICY_SKIP,
     # Parent's explicit decision to abandon a child result: stamps parent_decision +
     # records the reason on the tree ledger; tree-scoped, no external effect (like cancel_task).
     "discard_child_result": POLICY_SKIP,
@@ -181,10 +196,10 @@ TOOL_POLICY: Dict[str, str] = {
     "cherry_pick_pr_commits": POLICY_CHECK,
     "stage_adaptations": POLICY_CHECK,
     "stage_pr_merge": POLICY_CHECK,
-    "run_ci_tests": POLICY_CHECK,
     "generate_evolution_stats": POLICY_CHECK,
     "submit_skill_to_hub": POLICY_CHECK,
     "comment_on_pr": POLICY_CHECK,
+    "pr_merge": POLICY_CHECK,
     "comment_on_issue": POLICY_CHECK,
     "close_github_issue": POLICY_CHECK,
     "create_github_issue": POLICY_CHECK,
@@ -613,6 +628,7 @@ _REMOTE_PROVIDER_KEYS = (
     "ANTHROPIC_API_KEY",
     "MINIMAX_API_KEY",
     "DEEPSEEK_API_KEY",
+    "ZAI_API_KEY",
     "OPENAI_COMPATIBLE_API_KEY",
     "CLOUDRU_FOUNDATION_MODELS_API_KEY",
     "GIGACHAT_CREDENTIALS",
@@ -634,6 +650,7 @@ _PROVIDER_KEY_ENV = {
     "anthropic": "ANTHROPIC_API_KEY",
     "minimax": "MINIMAX_API_KEY",
     "deepseek": "DEEPSEEK_API_KEY",
+    "zai": "ZAI_API_KEY",
     "openai-compatible": "OPENAI_COMPATIBLE_API_KEY",
     "cloudru": "CLOUDRU_FOUNDATION_MODELS_API_KEY",
     "gigachat": "GIGACHAT_CREDENTIALS",
@@ -1301,7 +1318,6 @@ def _emit_safety_mode_skip(ctx: Optional[Any], tool_name: str, mode: str, policy
 
     P3: an advisory/off mode is legitimate ONLY while every decision it waves
     through leaves a loud, durable trace at the moment it happens (review round 1)."""
-    log.warning("Safety mode=%s waved through LLM check for %s (policy=%s)", mode, tool_name, policy)
     _emit_durable_safety_event(ctx, {
         "type": "safety_mode_skip",
         "tool": tool_name,

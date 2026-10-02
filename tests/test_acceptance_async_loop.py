@@ -56,6 +56,11 @@ def full_loop(tmp_path, monkeypatch):
     monkeypatch.setattr(review_substrate, "triad_delivery_slots", lambda **_kw: slots)
     registry = ToolRegistry(repo_dir=tmp_path / "repo", drive_root=tmp_path / "data")
     registry._ctx.repo_dir.mkdir()
+    # Acceptance now distinguishes an unreadable repository from a clean one.
+    import subprocess
+    for args in (["init"], ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                           "commit", "--allow-empty", "-m", "fixture baseline"]):
+        subprocess.run(["git", *args], cwd=registry._ctx.repo_dir, check=True, capture_output=True)
     ctx = registry._ctx
     task_id = "async-loop-root"
     _seed_acceptance_root(ctx.drive_root, task_id, ctx)
@@ -166,12 +171,20 @@ def full_loop(tmp_path, monkeypatch):
         assert fixture.settled.wait(10)
 
 
-def keep(f):
+def select_completion(f, answer=None, **options):
+    """Main explicitly selects complete bytes using the source it actually received."""
     observation = f.ctx._acceptance_observation
     assert observation["owner_source_sha256"] in str(f.model_inputs[-1])
-    return {"content": json.dumps({"delivery_control": "keep", "acceptance_subject": {
+    selected = ({"answer": answer} if answer is not None else
+                {"answer_sha256": f.ctx._delivery_candidate.content_sha256})
+    arguments = {"action": "finish", **selected, "acceptance_subject": {
         "owner_source_sha256": observation["owner_source_sha256"],
-    }})}
+    }, **options}
+    return {"content": None, "tool_calls": [call("finish_task", arguments, f"finish-{f.model_step}")]}
+
+
+def keep(f, **options):
+    return select_completion(f, **options)
 
 
 def test_full_loop_explicit_batch_owner_status_and_free_collection(full_loop, monkeypatch):
@@ -371,7 +384,7 @@ def _terminal_record(trace):
 def test_a_rewritten_answer_delivers_under_the_running_panel_instead_of_buying_one(full_loop, monkeypatch):
     """The live incident shape (task 4525349b, cap 1) under owner D4=A and fork 1=B:
     Main nominates, the reviewers are still reading when it rewrites the answer
-    through the delivery control (round 7 of the incident). The rewrite is a
+    through explicit completion selection (round 7 of the original incident). The rewrite is a
     DELIVERY, not a nomination: it buys nothing and is refused nothing; the host
     waits for the panel it already paid for, and when that panel PASSES the earlier
     revision the task is accepted on the reviewers' word and the row says so."""
@@ -388,9 +401,7 @@ def test_a_rewritten_answer_delivers_under_the_running_panel_instead_of_buying_o
             return {"content": "", "tool_calls": [call("task_acceptance_review", {"claim": ANSWER}, "first-review")]}, 0.0
         if f.model_step == 2:
             assert f.entered.wait(5) and not f.release.is_set(), "the panel must still be running"
-            observation = f.ctx._acceptance_observation
-            return {"content": json.dumps({"delivery_control": "replace", "full_answer": reauthored,
-                                           "acceptance_subject": {"owner_source_sha256": observation["owner_source_sha256"]}})}, 0.0
+            return select_completion(f, reauthored), 0.0
         assert f.model_step < 6, f.progress
         return keep(f), 0.0
 
@@ -437,9 +448,7 @@ def test_a_rejected_earlier_revision_is_not_a_verdict_on_the_rewrite(full_loop, 
             return {"content": "", "tool_calls": [call("task_acceptance_review", {"claim": ANSWER}, "first-review")]}, 0.0
         if f.model_step == 2:
             assert f.entered.wait(5) and not f.release.is_set()
-            observation = f.ctx._acceptance_observation
-            return {"content": json.dumps({"delivery_control": "replace", "full_answer": reauthored,
-                                           "acceptance_subject": {"owner_source_sha256": observation["owner_source_sha256"]}})}, 0.0
+            return select_completion(f, reauthored), 0.0
         assert f.model_step < 6, f.progress
         return keep(f), 0.0
 
@@ -461,7 +470,7 @@ def _advisory(monkeypatch):
 
 def test_a_conscious_finish_releases_the_answer_while_the_panel_runs(full_loop, monkeypatch):
     """Owner D4=A point 3: under advisory enforcement Main chooses explicitly.
-    ``"pending_review":"finish"`` on the delivery control delivers now, without a
+    ``pending_review="finish"`` on finish_task delivers now, without a
     park; the verdict reaches Main as advice when it settles."""
     f = full_loop
     _advisory(monkeypatch)
@@ -473,9 +482,8 @@ def test_a_conscious_finish_releases_the_answer_while_the_panel_runs(full_loop, 
         if f.model_step == 1:
             return {"content": "", "tool_calls": [call("task_acceptance_review", {"claim": ANSWER}, "nominate")]}, 0.0
         assert f.model_step == 2 and f.entered.wait(5) and not f.release.is_set()
-        control = json.loads(keep(f)["content"])
-        assert '"pending_review":"finish"' in str(messages), "the choice is offered while the panel runs"
-        return {"content": json.dumps({**control, "pending_review": "finish"})}, 0.0
+        assert "Pending critics: choose pending_review=wait" in str(messages), "the choice is offered while the panel runs"
+        return keep(f, pending_review="finish"), 0.0
 
     monkeypatch.setattr(loop, "call_llm_with_retry", main)
     result, _usage, trace = f.run()
@@ -504,15 +512,19 @@ def test_a_panel_that_settles_after_the_loop_exited_is_attached_through_the_reme
         if f.model_step == 1:
             return {"content": "", "tool_calls": [call("task_acceptance_review", {"claim": ANSWER}, "nominate")]}, 0.0
         assert f.model_step == 2 and f.entered.wait(5) and not f.release.is_set()
-        control = json.loads(keep(f)["content"])
-        return {"content": json.dumps({**control, "pending_review": "finish"})}, 0.0
+        return keep(f, pending_review="finish"), 0.0
 
     monkeypatch.setattr(loop, "call_llm_with_retry", main)
     result, _usage, trace = f.run()
     assert result == ANSWER and trace["review_decision"]["review_pending"] is True
     assert getattr(f.ctx, "_execution_trace", None) is None, "the loop exit detached the live trace"
-    # The pipeline seals the task before the straggler answers.
+    # The pipeline seals the task before the straggler answers, and the send
+    # handler's receipt of the bytes it sent (text, routed chat) is the proof.
     write_task_result(f.ctx.drive_root, f.ctx.task_id, "completed", chat_id=1, result=ANSWER)
+    from supervisor.terminal_delivery import delivery_id_for, register_delivery
+
+    assert register_delivery(f.ctx.drive_root, delivery_id_for(f.ctx.task_id, ANSWER),
+                             emitted={"text": ANSWER, "chat_id": 1, "task_id": f.ctx.task_id})
     f.release.set()
     with f.condition:
         assert f.condition.wait_for(lambda: f.settled_count >= 1, timeout=10)
@@ -520,16 +532,20 @@ def test_a_panel_that_settles_after_the_loop_exited_is_attached_through_the_reme
     rows = [e for e in events if e.get("system_type") == "acceptance_late_settlement"]
     assert len(rows) == 1, [e.get("type") for e in events]
     assert rows[0]["task_id"] == f.ctx.task_id and rows[0]["chat_id"] == 1
-    assert rows[0]["text"].startswith("Reviewers later passed this answer. They reviewed the answer that was delivered.")
-    assert "- acceptance-one: PASS" in rows[0]["text"]
+    assert rows[0]["text"].startswith("On the delivered version of this answer, reviewers later passed it.")
+    # The owner row names the model, not the slot id, and says the verdict in words (#1369).
+    assert "- fixture/reviewer (requested): passed it — Independent review" in rows[0]["text"]
+    assert "acceptance-one" not in rows[0]["text"]
     stored = load_task_result(f.ctx.drive_root, f.ctx.task_id)
     assert stored["status"] == "completed"
     panel = stored["review_projection"]["panels"][-1]
     actor = panel["actors"][0]
     assert actor["transport_status"] == "success" and actor["parse_status"] == "valid"
     # The panel reviewed the bytes that shipped, so its settlement says so.
-    assert panel["late_settlement"] == {"note": rows[0]["text"], "reviewed_revision": "delivered",
-                                        "settled_after_terminal": True}
+    late = panel["late_settlement"]
+    assert {key: late[key] for key in ("note", "reviewed_revision", "settled_after_terminal")} == {
+        "note": rows[0]["text"], "reviewed_revision": "delivered", "settled_after_terminal": True}
+    assert late["reviewed_is_emitted"] is True and late["emitted_answer"]["state"] == "delivered"
     assert rows[0]["progress_meta"]["card_row"] == "reviews"
     assert len(f.review_sends) == 1, "the supplement bought nothing"
     assert not getattr(f.ctx, "_acceptance_settlement_traces", {}), "a settled wave releases its remembered trace"
@@ -551,9 +567,7 @@ def test_a_rejected_earlier_revision_buys_a_panel_on_the_rewrite_when_the_cap_al
             return {"content": "", "tool_calls": [call("task_acceptance_review", {"claim": ANSWER}, "first-review")]}, 0.0
         if f.model_step == 2:
             assert f.entered.wait(5) and not f.release.is_set()
-            observation = f.ctx._acceptance_observation
-            return {"content": json.dumps({"delivery_control": "replace", "full_answer": reauthored,
-                                           "acceptance_subject": {"owner_source_sha256": observation["owner_source_sha256"]}})}, 0.0
+            return select_completion(f, reauthored), 0.0
         # The park released panel 1 (FAIL) before this round; the rewrite addresses the notes.
         f.reviewer_verdict = "PASS"
         assert f.model_step < 8, f.progress
@@ -603,9 +617,7 @@ def test_an_older_fail_never_outvotes_the_pass_that_accepted_the_task(full_loop,
             # This scenario rewrites under B's settled PASS, not while B runs.
             with f.condition:
                 assert f.condition.wait_for(lambda: f.settled_count >= 2, timeout=10)
-            observation = f.ctx._acceptance_observation
-            return {"content": json.dumps({"delivery_control": "replace", "full_answer": third,
-                                           "acceptance_subject": {"owner_source_sha256": observation["owner_source_sha256"]}})}, 0.0
+            return select_completion(f, third), 0.0
         assert f.model_step < 8, f.progress
         return keep(f), 0.0
 
@@ -630,7 +642,7 @@ def test_an_older_fail_never_outvotes_the_pass_that_accepted_the_task(full_loop,
 
 def test_an_owner_followup_acknowledged_through_the_control_sets_the_panel_aside(full_loop, monkeypatch):
     """Astra review round 5: the owner changes the requirements while the panel
-    runs; Main reads the message, acknowledges its source on the delivery control
+    runs; Main reads the message, acknowledges its source on finish_task
     and rewrites. The rewrite is NOT a delivery under the old panel (it judged the
     old premises): the ordinary path buys a panel on the new answer and the old
     PASS never accepts it."""
@@ -649,9 +661,7 @@ def test_an_owner_followup_acknowledged_through_the_control_sets_the_panel_aside
             return {"content": "", "tool_calls": [call("send_user_message", {"text": "Adding the timeline."}, "ack")]}, 0.0
         if f.model_step == 3:
             assert followup in str(messages), "the owner follow-up reached the model"
-            observation = f.ctx._acceptance_observation
-            return {"content": json.dumps({"delivery_control": "replace", "full_answer": rewritten,
-                                           "acceptance_subject": {"owner_source_sha256": observation["owner_source_sha256"]}})}, 0.0
+            return select_completion(f, rewritten), 0.0
         assert f.model_step < 8, f.progress
         return keep(f), 0.0
 
@@ -686,17 +696,14 @@ def test_waiting_is_the_default_and_blocking_enforcement_never_offers_the_choice
             return {"content": "", "tool_calls": [call("task_acceptance_review", {"claim": ANSWER}, "nominate")]}, 0.0
         if f.model_step == 2:
             assert f.entered.wait(5)
-            control = json.loads(keep(f)["content"])
-            if install == "blocking_finish":
-                control["pending_review"] = "finish"
-            return {"content": json.dumps(control)}, 0.0
+            return keep(f, **({"pending_review": "finish"} if install == "blocking_finish" else {})), 0.0
         assert f.model_step < 6, f.progress
         return keep(f), 0.0
 
     monkeypatch.setattr(loop, "call_llm_with_retry", main)
     result, _usage, trace = f.run()
     assert result == ANSWER and len(f.review_sends) == 1
-    offered = any('"pending_review":"finish"' in str(inputs) for inputs in f.model_inputs)
+    offered = any("Pending critics: choose pending_review=wait" in str(inputs) for inputs in f.model_inputs)
     if install == "advisory_default":
         assert offered and f.waits and f.waits[0]["reason"] == "review"
         assert trace["acceptance_decision"]["status"] == "accepted"
@@ -941,6 +948,10 @@ def test_cyber_final_response_never_waits_for_or_obeys_critic_veto(full_loop, mo
     result, _usage, trace = f.run()
     assert result == ANSWER
     assert trace["acceptance_decision"]["status"] == "finalized_unaccepted"
+    if failure == "evidence_unavailable":
+        assert trace["acceptance_decision"]["reason"] == "acceptance_preparation_failed"
+        assert not trace.get("review_runs") and not f.waits
+        return  # local preparation is not a synthetic DEGRADED critic
     assert trace["acceptance_decision"]["reason"] == "author_finish"
     assert trace["acceptance_decision"]["author_disposition"]["source"] == "author_final_response"
     assert not f.waits

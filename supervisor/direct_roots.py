@@ -17,6 +17,7 @@ import pathlib
 from typing import Any, Dict
 
 from ouroboros.utils import atomic_write_json, read_json_dict, utc_now_iso
+from ouroboros.focus import compact_focus as _compact_focus
 
 log = logging.getLogger(__name__)
 
@@ -25,6 +26,23 @@ FRAGMENT_NAME = pathlib.Path("state") / "direct_roots.json"
 
 def _fragment_path(drive_root: Any) -> pathlib.Path:
     return pathlib.Path(drive_root) / FRAGMENT_NAME
+
+
+def direct_turn_facts(turn: Dict[str, Any]) -> Dict[str, Any]:
+    """The live turn's suggested name, start and typed origin; absent stays absent."""
+    from ouroboros.peer_roster import iso_from_epoch, typed_origin
+
+    facts: Dict[str, Any] = {}
+    suggested = str(turn.get("suggested_name") or "").strip()
+    if suggested:
+        facts["suggested_name"] = suggested
+    started = iso_from_epoch(turn.get("_started_at"))
+    if started:
+        facts["started_at"] = started
+    origin = typed_origin(turn)
+    if origin:
+        facts["origin"] = origin
+    return facts
 
 
 def publish_direct_roots(drive_root: Any) -> Dict[str, Any]:
@@ -47,12 +65,19 @@ def publish_direct_roots(drive_root: Any) -> Dict[str, Any]:
             finally:
                 lock.release()
             if turn is not None:
-                rows.append({
+                row = {
                     "task_id": str(turn.get("id") or ""),
                     "title": str(turn.get("title") or "").strip(),
                     "chat_id": turn.get("chat_id"),
                     "project_id": str(turn.get("project_id") or ""),
-                })
+                }
+                # Host facts the live actor already holds, carried until the
+                # turn's durable result exists (the roster prefers that result).
+                row.update(direct_turn_facts(turn))
+                focus = _compact_focus(turn.get("focus"))
+                if focus is not None:
+                    row["focus"] = focus
+                rows.append(row)
     except Exception:
         log.debug("direct roots projection failed", exc_info=True)
         incomplete = True

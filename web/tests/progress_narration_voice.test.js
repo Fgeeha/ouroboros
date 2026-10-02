@@ -41,7 +41,7 @@ function fixture(history = []) {
             isConnected: () => true, send() {} },
         state: { activePage: 'chat', projectChatIds: new Set(), unreadCount: 0 },
         updateUnreadBadge() {}, chatId: 1, idPrefix: 'chat', mountEl: env.mount,
-        stateSnapshots: { begin: () => ({ generation: ++generation, requestedAt: Date.now() }),
+        stateSnapshots: { begin: () => ({ generation: ++generation, requestedAt: Date.now() }), gate() { return Promise.resolve(this.begin()); },
             isCurrent: () => true, apply() {} },
     });
     const messages = document.byId.get('chat-messages');
@@ -90,8 +90,23 @@ test('host notes are rows the card shows, never its title', () => {
         f.emit({ content: 'Task acceptance review: PASS (clean acceptance).', narration: false });
         assert.ok(f.card(), 'the notes are content: the block exists');
         assert.equal(f.rows().length, 2, 'both notes are visible rows');
-        assert.equal(f.title(), 'Working...', 'the running placeholder, not the last host note');
+        assert.equal(f.title(), '', 'no title: neither the last host note nor a placeholder repeating the chip (#1369)');
     } finally { f.close(); }
+});
+
+test('only the host placeholder left: authored words that say Working keep the title (#1369)', () => {
+    const f = fixture();
+    try {
+        f.census(direct());
+        f.emit({ content: 'Working…', narration: true });
+        assert.equal(f.title(), 'Working…', 'the model narrated these words; they are its own');
+    } finally { f.close(); }
+    const g = fixture();
+    try {
+        g.census(direct());
+        g.emit({ content: NOTE, narration: false, suggested_name: 'Working...' });
+        assert.equal(g.title(), 'Working...', 'a coined name is the author\'s, whatever it says');
+    } finally { g.close(); }
 });
 
 test('a host-notes-only turn keeps its coined name and an empty activity line', () => {
@@ -182,4 +197,25 @@ test('finalizing outcome overlay keeps narration as title while publishing phase
             outcome_final: true, outcome_phase: 'done', outcome_axes: { execution: { status: 'ok' } } });
         assert.equal(f.title(), 'still working');
     } finally { f.close(); }
+});
+
+test('the collapsed line states the terminal cause, and a clean ending keeps the last narration', () => {
+    const f = fixture();
+    try {
+        f.census(direct());
+        f.emit({ content: '💬 reading the failing test first', narration: true, suggested_name: 'Flake hunt' });
+        assert.equal(f.activity(), 'reading the failing test first');
+        f.emit({ is_progress: false, role: 'system', system_type: 'task_summary', content: 'Done with warnings.',
+            outcome_final: true, outcome_phase: 'warn', reason_code: 'plan_review_advisory',
+            outcome_axes: { execution: { status: 'degraded', reason_code: 'plan_review_advisory', plan_review: 'unanswered' } } });
+        assert.equal(f.activity(), 'Only some of the plan reviewers answered; the work went on with their notes.');
+    } finally { f.close(); }
+    const g = fixture();
+    try {
+        g.census(direct());
+        g.emit({ content: '💬 reading the failing test first', narration: true, suggested_name: 'Flake hunt' });
+        g.emit({ is_progress: false, role: 'system', system_type: 'task_summary', content: 'Done.',
+            outcome_final: true, outcome_phase: 'done', outcome_axes: { execution: { status: 'ok' } } });
+        assert.equal(g.activity(), 'reading the failing test first');
+    } finally { g.close(); }
 });

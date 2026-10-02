@@ -18,6 +18,7 @@ from ouroboros.tools.registry import ToolContext
 from ouroboros.tool_access import ResolvedResourceBinding
 from ouroboros.tools.git_plumbing import _sanitize_git_error
 from ouroboros.tools.git_plumbing import _publish_git_error
+from ouroboros.tools.tool_result import ToolResult, LegacyTextResultAdapter, _publish_tool_result, _replace_tool_result
 
 
 def _git():
@@ -73,6 +74,13 @@ def _vcs_result(text: str, binding: ResolvedResourceBinding) -> str:
     return f"{rendered}\n\n{receipt}" if rendered else receipt
 
 
+def _vcs_validation_refusal(ctx: ToolContext, text: str) -> str:
+    """Only explicit argument checks before Git dispatch own no-effect proof."""
+    result = LegacyTextResultAdapter.from_text("vcs", text)
+    return _publish_tool_result(ctx, _replace_tool_result(
+        result, meta_updates={"operation_outcome": "completed_no_effect"}))
+
+
 def _binding_relative_path(binding: ResolvedResourceBinding, requested: str) -> str:
     if not str(requested or "").strip():
         return ""
@@ -122,9 +130,9 @@ def _git_diff(
         repo_dir = binding.base_path
         base, head = str(kwargs.get("base") or ""), str(kwargs.get("head") or "")
         if head and (not base or staged):
-            from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
             return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR",
-                text="⚠️ TOOL_ARG_ERROR (vcs_diff): head requires base and cannot be combined with staged=true."))
+                text="⚠️ TOOL_ARG_ERROR (vcs_diff): head requires base and cannot be combined with staged=true.",
+                meta={"operation_outcome": "completed_no_effect"}))
         comparison = {}
         revisions = []
         for name, ref in (("base", base), ("head", head)):
@@ -152,7 +160,6 @@ def _git_diff(
         text = _git()._vcs_result(_git()._limit_git_output(_git().run_cmd(cmd, cwd=repo_dir), max_chars), binding)
         if comparison:
             import json
-            from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
             comparison["kind"] = "tree_to_tree" if head else "tree_to_index" if staged else "tree_to_worktree"
             text += "\nComparison: " + json.dumps(comparison, ensure_ascii=False, sort_keys=True)
             return _publish_tool_result(ctx, ToolResult(status="ok", code="OK", text=text, meta={"comparison": comparison}))
@@ -236,24 +243,6 @@ def _restore_to_head(ctx: ToolContext, confirm: bool = False,
         binding = _git()._vcs_binding(ctx, _resolved_binding, root=root)
     except Exception as e:
         return f"⚠️ RESTORE_ERROR: {_sanitize_git_error(str(e))}"
-    repo_dir = binding.base_path
-    try:
-        # NUL-delimited porcelain via the shared review helper: run_cmd() strips
-        # its stdout, and a worktree-only modification renders as " M path", so
-        # the stripped first line lost its leading space and the column-based
-        # line parser dropped the first CHARACTER of that path — the protected
-        # gate then judged "IBLE.md" while the restore acted on BIBLE.md.
-        from ouroboros.tools.review_helpers import list_changed_paths_from_git_status
-
-        dirty_files = list_changed_paths_from_git_status(
-            pathlib.Path(repo_dir), include_sources_for_renames=True,
-        )
-    except Exception as e:
-        return _git()._vcs_result(f"⚠️ RESTORE_ERROR: git status failed: {e}", binding)
-    if not dirty_files:
-        return _git()._vcs_result("Nothing to restore — working directory is already clean.", binding)
-    targets_system = _git().binding_targets_system_repo(ctx, binding)
-    affected_protected = _git().protected_paths_in(dirty_files) if targets_system else []
     # Resolve each requested path to the SETTLED form git itself will act on, and
     # let both the protected-path gate below and the checkout/clean action consume
     # that identical value. A divergent normalizer was a protected-path bypass:
@@ -274,17 +263,35 @@ def _restore_to_head(ctx: ToolContext, confirm: bool = False,
             # Pathspec magic (":/", ":(glob)", ":!", ...) re-scopes or negates a
             # pathspec behind the gate's back; a plain repo-relative path never
             # needs it, so refuse rather than judge a string git reads differently.
-            return _git()._vcs_result(
+            return _vcs_validation_refusal(ctx, _git()._vcs_result(
                 f"⚠️ RESTORE_ERROR: pathspec magic is not supported: {_raw}", binding,
-            )
+            ))
         _collapsed = posixpath.normpath(_git().normalize_repo_path(_raw))
         if posixpath.isabs(_collapsed) or _collapsed == ".." or _collapsed.startswith("../"):
-            return _git()._vcs_result(
+            return _vcs_validation_refusal(ctx, _git()._vcs_result(
                 f"⚠️ RESTORE_ERROR: path escapes the repository root: {_raw}", binding,
-            )
+            ))
         normalized_paths.append(_collapsed)
     if paths and not normalized_paths:
-        return _git()._vcs_result("⚠️ RESTORE_ERROR: No valid paths provided.", binding)
+        return _vcs_validation_refusal(ctx, _git()._vcs_result("⚠️ RESTORE_ERROR: No valid paths provided.", binding))
+    repo_dir = binding.base_path
+    try:
+        # NUL-delimited porcelain via the shared review helper: run_cmd() strips
+        # its stdout, and a worktree-only modification renders as " M path", so
+        # the stripped first line lost its leading space and the column-based
+        # line parser dropped the first CHARACTER of that path — the protected
+        # gate then judged "IBLE.md" while the restore acted on BIBLE.md.
+        from ouroboros.tools.review_helpers import list_changed_paths_from_git_status
+
+        dirty_files = list_changed_paths_from_git_status(
+            pathlib.Path(repo_dir), include_sources_for_renames=True,
+        )
+    except Exception as e:
+        return _git()._vcs_result(f"⚠️ RESTORE_ERROR: git status failed: {e}", binding)
+    if not dirty_files:
+        return _git()._vcs_result("Nothing to restore — working directory is already clean.", binding)
+    targets_system = _git().binding_targets_system_repo(ctx, binding)
+    affected_protected = _git().protected_paths_in(dirty_files) if targets_system else []
     if normalized_paths and targets_system:
         # A pathspec is not a path: git expands directories, fnmatch wildcards,
         # and "." to a FILE SET, so judging the requested string alone let
@@ -408,7 +415,7 @@ def _revert_commit(
     repo_dir = binding.base_path
     sha = sha.strip()
     if not sha:
-        return _git()._vcs_result("⚠️ REVERT_ERROR: sha parameter is required.", binding)
+        return _vcs_validation_refusal(ctx, _git()._vcs_result("⚠️ REVERT_ERROR: sha parameter is required.", binding))
     try:
         full_sha = _git().run_cmd(
             ["git", "rev-parse", "--verify", sha], cwd=repo_dir,

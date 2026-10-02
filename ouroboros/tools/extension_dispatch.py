@@ -13,7 +13,8 @@ from ouroboros.tools.tool_context import ToolContext
 from ouroboros.tools.tool_result import (
     ToolResult,
     ToolStatus,
-    _compose_execute_result,
+    _compose_execute_result_result,
+    _replace_tool_result,
     _structured_failure,
 )
 
@@ -98,11 +99,10 @@ def _dispatch_mcp_tool_result(
         return ToolResult(status="error", code="TOOL_ERROR", text=text)
     if not safety_msg:
         return result
-    text = _compose_execute_result(result.text, "", safety_msg)
-    meta = {**dict(result.meta), "safety_warning": True}
-    if result.code == "OK":
-        return ToolResult(status="ok", code="SAFETY_WARNING", text=text, meta=meta)
-    return ToolResult(status=result.status, code=result.code, text=text, meta=meta)
+    return _replace_tool_result(
+        _compose_execute_result_result(name, result, "", safety_msg),
+        meta_updates={"safety_warning": True},
+    )
 
 
 def _extension_result(
@@ -128,7 +128,7 @@ def _extension_result(
     return ToolResult(status=status, code=code, text=text, meta=meta)
 
 
-def _extension_completion(result: str, safety_msg: str) -> ToolResult:
+def _extension_completion(result: str, safety_msg: str, *, handoff: Optional[Dict[str, Any]] = None) -> ToolResult:
     """Type one completed extension body, reading its own failure self-report.
 
     The dispatcher used to declare success without looking at the body, so a
@@ -138,21 +138,22 @@ def _extension_completion(result: str, safety_msg: str) -> ToolResult:
     structured check is the adapter's, so there is exactly one implementation of
     what a self-reported failure is."""
     reported_failure = _structured_failure(result)
+    base = _extension_result(
+        "error" if reported_failure else "ok",
+        "TOOL_REPORTED_FAILURE" if reported_failure else "OK",
+        result,
+        dispatched=True,
+    )
     if safety_msg:
-        # #447 H1: the warning TRAILS the payload — line 1 belongs to the
-        # extension, so a structured {"ok": false} answer (and any first-line
-        # marker) stays readable to every text-only consumer downstream.
-        text = f"{result}\n\n{safety_msg}"
-        return _extension_result(
-            "error" if reported_failure else "ok",
-            "TOOL_REPORTED_FAILURE" if reported_failure else "SAFETY_WARNING",
-            text,
-            safety_warning=True,
-            dispatched=True,
+        base = _replace_tool_result(
+            _compose_execute_result_result("", base, "", safety_msg),
+            meta_updates={"safety_warning": True},
         )
-    if reported_failure:
-        return _extension_result("error", "TOOL_REPORTED_FAILURE", result, dispatched=True)
-    return _extension_result("ok", "OK", result, dispatched=True)
+    if handoff is not None:
+        # Host-owned invocation sidechannel, never extension text/metadata.
+        # Only the supported local call ended; independent effects keep custody.
+        handoff["local_extension_returned"] = True
+    return base
 
 
 def _generation_digest_for(ext_tool: Dict[str, Any]) -> str:
@@ -185,6 +186,7 @@ def _dispatch_extension_tool_result(
     name: str,
     ext_tool: Dict[str, Any],
     args: Optional[Dict[str, Any]],
+    *, handoff: Optional[Dict[str, Any]] = None,
 ) -> ToolResult:
     """Dispatch once, stamping ABI-9 generation provenance on physical calls.
 
@@ -201,18 +203,17 @@ def _dispatch_extension_tool_result(
     disclosure gate, calling-convention resolution) is never stamped."""
     digest = _generation_digest_for(ext_tool)
     content_hash = str(ext_tool.get("content_hash") or "")
-    result = _dispatch_extension_tool_untagged(ctx, name, ext_tool, args)
+    result = _dispatch_extension_tool_untagged(
+        ctx, name, ext_tool, args, **({"handoff": handoff} if handoff is not None else {}))
     if (
         not isinstance(result, ToolResult)
         or not result.meta.get("physical_dispatch")
         or not digest
     ):
         return result
-    return ToolResult(
-        status=result.status,
-        code=result.code,
-        text=result.text,
-        meta={**dict(result.meta), "extension_generation": digest,
+    return _replace_tool_result(
+        result,
+        meta_updates={"extension_generation": digest,
               **({"content_hash": content_hash} if content_hash else {})},
     )
 
@@ -222,6 +223,7 @@ def _dispatch_extension_tool_untagged(
     name: str,
     ext_tool: Dict[str, Any],
     args: Optional[Dict[str, Any]],
+    *, handoff: Optional[Dict[str, Any]] = None,
 ) -> ToolResult:
     """Dispatch once while retaining host-owned extension outcome facts."""
     try:
@@ -289,7 +291,7 @@ def _dispatch_extension_tool_untagged(
                 # stamps physical_dispatch — the child never existed.
                 dispatched=extension_child_was_spawned(exc),
             )
-        return _extension_completion(result_str, _ext_safety_msg)
+        return _extension_completion(result_str, _ext_safety_msg, handoff=handoff)
 
     handler = ext_tool["handler"]
     try:
@@ -320,11 +322,12 @@ def _dispatch_extension_tool_untagged(
     except Exception as exc:
         text = f"⚠️ TOOL_ERROR ({name}): extension tool failed: {type(exc).__name__}: {exc}"
         return _extension_result("error", "EXTENSION_ERROR", text)
+    from ouroboros.owner_pause import run_operation, submit_async_operation, OwnerPauseRefused
+
     try:
-        if _wants:
-            result = handler(ctx, **call_args)
-        else:
-            result = handler(**call_args)
+        result = run_operation(ctx, handler, *((ctx,) if _wants else ()), **call_args)
+    except OwnerPauseRefused:
+        raise
     except Exception as exc:
         text = f"⚠️ TOOL_ERROR ({name}): extension tool failed: {type(exc).__name__}: {exc}"
         return _extension_result("error", "EXTENSION_ERROR", text, dispatched=True)
@@ -336,7 +339,11 @@ def _dispatch_extension_tool_untagged(
         def _runner() -> None:
             try:
                 async def _bounded():
-                    task = asyncio.create_task(result)
+                    try:
+                        task = submit_async_operation(ctx, lambda: result)
+                    except OwnerPauseRefused:
+                        result.close()
+                        raise
                     done, _pending = await asyncio.wait({task}, timeout=timeout)
                     if task not in done:
                         task.cancel()
@@ -349,7 +356,7 @@ def _dispatch_extension_tool_untagged(
                     box["value"] = value
                 else:
                     box["host_timeout"] = True
-            except Exception as exc:
+            except BaseException as exc:
                 box["error"] = exc
 
         # Preserve the admitted task settings snapshot across the async handler
@@ -384,10 +391,13 @@ def _dispatch_extension_tool_untagged(
             exc = box["error"]
             text = f"⚠️ TOOL_ERROR ({name}): extension async handler failed: {type(exc).__name__}: {exc}"
             return _extension_result("error", "EXTENSION_ERROR", text, dispatched=True)
-        result = box.get("value", "")
+        if "value" not in box:
+            return _extension_result("error", "EXTENSION_ERROR",
+                f"⚠️ TOOL_ERROR ({name}): extension async runner ended without a result", dispatched=True)
+        result = box["value"]
 
     result_str = result if isinstance(result, str) else str(result)
-    return _extension_completion(result_str, _ext_safety_msg)
+    return _extension_completion(result_str, _ext_safety_msg, handoff=handoff)
 
 
 def dispatch_extension_tool(

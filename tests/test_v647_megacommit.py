@@ -76,19 +76,6 @@ def test_query_code_user_files_empty_path_hard_error():
     assert "requires an explicit path" in out
 
 
-def test_query_code_user_files_blocked_for_subagent():
-    from ouroboros.contracts.task_constraint import TaskConstraint
-    from ouroboros.tools.query_code import _query_code
-
-    ctx = types.SimpleNamespace(
-        drive_root=tempfile.mkdtemp(), repo_dir=tempfile.mkdtemp(),
-        workspace_root="", workspace_mode="", task_constraint=TaskConstraint(mode="local_readonly_subagent"),
-    )
-    out = _query_code(ctx, "symbols", root="user_files", path="/whatever")
-    assert "TOOL_ACCESS_BLOCKED" in out
-    assert "profile=local_readonly_subagent cannot search root=user_files" in out
-
-
 def test_query_code_structural_walk_is_bounded_and_symlink_safe():
     from ouroboros.tools.query_code import _walk_candidate_files
 

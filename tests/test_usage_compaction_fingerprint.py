@@ -4,12 +4,10 @@ Companion to ``tests/test_usage_compaction.py`` (the pass itself) and
 ``tests/test_usage_compaction_archive.py`` (the archive reader). Two pins live
 here:
 
-1. the self-check compares the readers' NON-MONEY projection and leaves money
-   to the exact decimal totals — a float summary rounded at six places can
-   round a per-row sum and an exact per-group sum to different last digits,
-   which on the owner's live ledger aborted a CORRECT fold 240 times and held
-   the file at 77.8 MB against an 8 MB trigger. Counts, weights, tokens and
-   limits are still compared, and real money movement still aborts;
+1. the self-check compares the readers' NON-MONEY projection and independently
+   checks exact raw-Decimal money. The historical half-microdollar float
+   ordering regression now renders stable half-even buckets before and after
+   folding; counts, weights, tokens, limits and actual charge equality remain;
 2. every policy abort leaves a typed, deduplicated
    ``usage_ledger_compaction_skipped`` event naming its reason, so the 20 MB
    health tripwire's cause is recoverable afterwards instead of living only in
@@ -30,10 +28,9 @@ from tests.fixtures_usage_compaction import _compact, _ledger_rows, _settle
 data_root = _fixtures.data_root
 data_root_any_tier = _fixtures.data_root_any_tier
 
-# The two costs are VERBATIM from root 304db373 of the owner's live ledger:
-# their exact sum 2.4675885 sits on the six-place rounding boundary, so the
-# per-row float sum (2.4675884999999997) rounds down and the exact per-group
-# sum rounds up. One of the 51 buckets that aborted the live fold.
+# Regression pair from the previously reported incident: exact 2.4675885
+# exposed differing float ordering. Shared exact arithmetic rounds half-even
+# to 2.467588 both before and after compaction, without changing charges.
 _DRIFT_COSTS = (1.9542475, 0.513341)
 _DRIFT_EXACT_SUM = Decimal("2.4675885")
 
@@ -66,8 +63,8 @@ def _rewrite_one_group_row(monkeypatch, mutate):
     """Let ``mutate`` edit the single group row of the built candidate."""
     real_build = uc._build_candidate
 
-    def build(records, decimal_records, raw, beat):
-        candidate, receipt = real_build(records, decimal_records, raw, beat)
+    def build(records, decimal_records, raw, beat, **kwargs):
+        candidate, receipt = real_build(records, decimal_records, raw, beat, **kwargs)
         lines = candidate.decode("utf-8").splitlines()
         rebuilt = []
         for line in lines:
@@ -84,10 +81,7 @@ def _rewrite_one_group_row(monkeypatch, mutate):
 
 
 def test_one_ulp_float_rounding_drift_no_longer_aborts_the_fold(data_root):
-    """The live defect, reduced: two settled rows whose float money rounds one
-    unit away from their exact sum now FOLD. Money stays decimal-identical and
-    the non-money view is untouched; the disclosed price is that the rounded
-    float a reader displays may move by 1e-6 (a ten-thousandth of a cent)."""
+    """Exact half-even rendering is stable across folding; charges stay exact."""
     for cost in _DRIFT_COSTS:
         _settle(data_root, cost=cost, cost_final=True)
 
@@ -102,10 +96,10 @@ def test_one_ulp_float_rounding_drift_no_longer_aborts_the_fold(data_root):
     assert Decimal(groups[0]["cost_usd"]) == _DRIFT_EXACT_SUM
 
     after = ua._summary(_final_rows(after_rows))
-    # The drift this test exists for: real, one unit of the sixth place, and
-    # in the FLOAT view only.
+    # Exact decimal half-even rendering removes the historical one-microdollar
+    # float ordering artifact, before and after folding. Charges remain exact.
     assert before["settled_usd"] == 2.467588
-    assert after["settled_usd"] == 2.467589
+    assert after["settled_usd"] == 2.467588
     assert _exact_money(after_rows) == _exact_money(before_rows)
     assert _exact_money(after_rows)[0] == _DRIFT_EXACT_SUM
     # Everything the fold could actually have lost is still identical.

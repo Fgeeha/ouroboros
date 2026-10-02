@@ -222,9 +222,12 @@ def executor_blocked_outcome(
         "⚠️ EXECUTOR_UNAVAILABLE: this subagent was pinned to the delegated substrate "
         f"(executor='harness') and the route cannot run: {decision.reason}."
         + (f" It resets at {decision.reset_at}." if decision.reset_at else "")
+        # The producer's own words (a refused snapshot provision names the lock
+        # holder here), so the parent reads WHY, not only a reason code (#1241).
+        + (f" {availability['detail']}" if availability.get("detail") else "")
         + " The task was NOT run on metered API tokens, because that spend is exactly "
-        "what the pin exists to prevent. Reschedule once the route recovers, or "
-        "explicitly select another Available subagent."
+        "what the pin exists to prevent. The recorded cause describes this failed start; "
+        "no replacement executor was selected."
     )
     return text, {
         "execution_status": "infra_failed",

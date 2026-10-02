@@ -7,6 +7,7 @@ import {
     computeHydratedDirectActivities,
 } from '../modules/chat.js';
 import {
+    chatStatusCounts,
     createStateSnapshotSequencer,
     isForegroundLiveCard,
     routingAnnotationText,
@@ -341,10 +342,12 @@ test('computeDerivedChatStatus: priority order is preserved (offline > live card
     }).text, 'Online');
 });
 
-test('computeDerivedChatStatus: budget-paused work is not Working or Queued (#322)', () => {
+test('computeDerivedChatStatus: paused work is not Working or Queued (#322)', () => {
+    // The census phase is shared by a budget pause, the owner's Pause and a
+    // Restart hold (Batch4), so the header states the pause, not a cause.
     assert.deepEqual(
         computeDerivedChatStatus({ pausedManagedCount: 2 }),
-        { kind: 'online', text: 'Paused (budget)', showDots: false },
+        { kind: 'online', text: 'Paused', showDots: false },
     );
     // Runnable queued work outranks the paused disclosure.
     assert.equal(
@@ -357,3 +360,39 @@ test('computeDerivedChatStatus: budget-paused work is not Working or Queued (#32
         'Working...',
     );
 });
+
+test('sequenced failures stop stale replies without replacing a newer accepted census', () => {
+    const events = [];
+    const sequencer = createStateSnapshotSequencer(
+        (data) => events.push(data), () => 123, () => events.push('unavailable'));
+    const older = sequencer.begin();
+    const failed = sequencer.begin();
+    assert.equal(sequencer.fail(failed), true);
+    assert.equal(sequencer.apply(older, 'stale complete empty'), false);
+    assert.equal(sequencer.fail(failed), false);
+    const newer = sequencer.begin();
+    assert.equal(sequencer.apply(newer, 'fresh'), true);
+    assert.equal(sequencer.fail(older), false);
+    assert.deepEqual(events, ['unavailable', 'fresh']);
+});
+
+for (const kind of ['managed_task', 'direct_chat']) {
+test(`Batch4: a paused or pausing ${kind} card does not drive working header state`, () => {
+    const root = { isConnected: true };
+    const paused = { root, groupId: 'p', finished: false, parkedPhase: 'budget_paused' };
+    const pausing = { root, groupId: 's', finished: false, parkedPhase: 'budget_pausing' };
+    const both = chatStatusCounts(new Map([
+        ['p', { kind, phase: 'budget_paused' }],
+        ['s', { kind, phase: 'budget_pausing' }],
+    ]), [paused, pausing]);
+    assert.equal(both.hasActiveLiveCard, false);
+    assert.equal(computeDerivedChatStatus(both).text, 'Pausing…');
+    const saved = chatStatusCounts(new Map([['p', { kind, phase: 'budget_paused' }]]), [paused]);
+    assert.equal(computeDerivedChatStatus(saved).text, 'Paused');
+    assert.equal(computeDerivedChatStatus(saved).showDots, false);
+    // Resumed: the census says working again and the released card drives Working.
+    const resumed = chatStatusCounts(new Map([['p', { kind, phase: 'working' }]]),
+        [{ root, groupId: 'p', direct: kind === 'direct_chat', finished: false, parkedPhase: '' }]);
+    assert.equal(computeDerivedChatStatus(resumed).text, kind === 'direct_chat' ? 'Thinking...' : 'Working...');
+});
+}

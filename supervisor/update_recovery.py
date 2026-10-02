@@ -46,9 +46,10 @@ def rollback_to_version(tag_or_sha: str, reason: str = "manual_rollback") -> Tup
     rc, _out, error = _g.git_capture(["git", "reset", "--hard", target_sha])
     if rc != 0:
         return False, f"git reset failed: {error}"
-    state = _g.load_state()
-    state["current_sha"] = target_sha.strip()
-    _g.save_state(state)
+    from supervisor.git_ops_reset import _record_checkout_facts
+
+    state = {"current_sha": target_sha.strip()}
+    _record_checkout_facts(state)
 
     warning = ""
     branch = repo_state.get("current_branch") or _g.BRANCH_DEV

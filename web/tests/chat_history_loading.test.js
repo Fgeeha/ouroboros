@@ -41,7 +41,7 @@ function fixture(t, options = {}) {
         ws: { on(type, handler) { handlers.set(type, handler); return () => handlers.delete(type); },
             isConnected: () => true, send() {}, ws: { readyState: 1 } },
         state: { activePage: 'chat', projectChatIds: new Set(), unreadCount: 0 },
-        updateUnreadBadge() {}, stateSnapshots: { begin: () => ({ generation: 1, requestedAt: Date.now() }),
+        updateUnreadBadge() {}, stateSnapshots: { begin: () => ({ generation: 1, requestedAt: Date.now() }), gate() { return Promise.resolve(this.begin()); },
             isCurrent: () => true, apply() {} },
         chatId: 2, idPrefix: 'chat', mountEl: mount, asPanel: true, ...options,
     });
@@ -54,7 +54,7 @@ function fixture(t, options = {}) {
     return {
         instance, reads, messages, controls, logged,
         button: () => controls()?.querySelector('.chat-load-older-btn'),
-        note: () => controls()?.querySelector('.chat-load-older-note'),
+        note: () => (messages.parentNode.querySelector('.chat-panel-statusbar').querySelector('.chat-load-older-note') || messages.querySelector('.chat-load-older').querySelector('.chat-load-older-note')),
         bubbles: () => messages.children.filter(node => node.classList.contains('chat-bubble')
             && !node.classList.contains('typing-bubble')),
         async clickRetry() {
@@ -121,7 +121,7 @@ test('a failed refresh over a painted transcript keeps it as it is and is never 
     f.reads[1].http(500);
     assert.deepEqual(await second, { painted: false, revision: 2 }, 'a failed read is not a paint receipt');
     assert.deepEqual(f.bubbles(), painted);
-    assert.notEqual(f.button().textContent, 'Retry loading messages', 'no failure chrome over a transcript the reader has');
+    assert.equal(f.button().textContent, 'Retry loading messages', 'painted rows remain readable and failure stays retryable');
     assert.equal(f.logged.length, 1, 'the failure is still reported, not swallowed');
 });
 
@@ -140,7 +140,7 @@ for (const [name, fail] of [['a dropped connection', read => read.drop()], ['an 
         assert.equal(f.button().hidden, false);
         assert.equal(f.button().disabled, false);
         assert.equal(f.note().hidden, false);
-        assert.match(f.note().textContent, /^Could not load messages: /);
+        assert.match(f.note().textContent, /^Some saved history could not be loaded/);
         assert.equal(f.instance.hasPaintedHistory(), false);
 
         const retry = f.clickRetry();
@@ -197,4 +197,35 @@ test('closing the panel while its first read is in flight leaves no late write a
     assert.equal(f.bubbles().length, 0, 'a closed room consumes no late response');
     assert.equal(controls.querySelector('.chat-load-older-btn').textContent, 'Loading…',
         'destroy() makes late continuations no-ops instead of repainting a removed control');
+});
+
+test('delayed latest cannot certify newer retained recent rows until the physical gap is filled', async t => {
+    const f = fixture(t);
+    const covered = (from, to, upper, id, next = null) => ({
+        ...page([row(`chat:${id}`, `Row ${id}`)]), page_cursor: `p:${from}`, next_cursor: next, has_more: Boolean(next),
+        coverage: { v: 1, view: 'room', upper: { chat: upper, progress: 0 }, spans: {
+            chat: { from, to, chain: 'retained', gaps: [] },
+            progress: { from: 0, to: 0, chain: 'empty', gaps: [] },
+        } },
+    });
+    const first = f.instance.refreshHistory({ revision: 1 });
+    await settle(); f.reads[0].ok(covered(0, 80, 80, 70)); await first;
+    const second = f.instance.refreshHistory({ revision: 2 });
+    await settle(); f.reads[1].ok(covered(90, 100, 100, 95)); await second;
+    await settle(); assert.equal(f.reads.length, 3, 'latest rebase is held');
+    const third = f.instance.refreshHistory({ revision: 3 });
+    await settle(); f.reads[3].ok(covered(180, 200, 200, 190)); await third;
+    f.reads[2].ok(covered(0, 100, 100, 95, 'fill-gap'));
+    await settle(); await settle();
+    assert.ok(f.bubbles().some(node => node.dataset.historyId === 'chat:190'));
+    assert.match(f.note().textContent, /Shown messages may have gaps/);
+    assert.doesNotMatch(f.note().textContent, /Beginning/);
+    const stale = f.instance.refreshHistory({ revision: 4 });
+    await settle();
+    const fill = f.clickRetry();
+    await settle(); f.reads[5].ok(covered(100, 200, 200, 190)); await fill;
+    f.reads[4].ok(covered(180, 200, 200, 195)); await stale;
+    assert.equal(f.bubbles().some(node => node.dataset.historyId === 'chat:195'), false,
+        'an ordinary read superseded by latest cannot mount unowned stale rows');
+    assert.equal(f.note().textContent, 'Beginning of saved history');
 });

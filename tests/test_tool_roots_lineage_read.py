@@ -1,20 +1,8 @@
-"""A read-only child reads what its parent points it to (owner T4=A + 7A, #1105).
+"""Inherited parent reads retain exact physical targets and strict named roots.
 
-Measured on a live install: a root task put files into its own ``task_drive``
-and sent four read-only children to check them; all four called ``read_file``
-with the ABSOLUTE path and NO root, and the default ``active_workspace`` refused
-them with ``outside selected root``. The recorded reason for hiding the
-orchestrator roots from children (``tool_access.py``: "a child must not read
-sibling projects") covers ``subagent_projects`` only. Now a child reads the
-owner-visible Deliverables root and the ``task_drive``/``artifact_store`` of its
-OWN lineage (parent and root ids from its own lineage fields), anchored on the
-canonical data root while the child itself runs on a headless drive; and an
-absolute path given without a root runs under the permitted root that
-physically contains it, the path itself never rewritten. A sibling's or a
-stranger's task files stay refused, and the refusal names the roots this
-profile can actually use; a NAMED wrong root still refuses; secret-named files
-in a parent's drive stay denied by name; ``subagent_projects`` stays top-level
-only.
+Lineage task aliases remain useful addresses. Other parent-readable files are
+reachable through their actual runtime/home/project roots without helper filters;
+a named wrong root stays a refusal and no read alias grants a mutation.
 """
 from __future__ import annotations
 
@@ -240,33 +228,28 @@ def test_child_reads_and_lists_deliverables_by_absolute_path_and_no_root(geometr
 
 
 def test_search_selects_the_root_for_its_own_operation(geometry):
-    """Selection follows the tool's operation: a child may search Deliverables
-    but no profile may search a task_drive, so that path stays refused and the
-    refusal names the roots this profile can search."""
+    """Read/search share parent-visible task content without helper name filters."""
     registry, _ctx = child_registry(geometry)
 
     found = registry.execute("search_code", {"query": "needle", "path": str(geometry.deliverables)})
-    refused = registry.execute("search_code", {"query": "PARENT", "path": str(geometry.parent_drive)})
+    parent = registry.execute("search_code", {"query": "PARENT|SECRET|sk-", "regex": True,
+                                              "path": str(geometry.parent_drive)})
+    refused = registry.execute("search_code", {"query": "SIBLING", "path": str(geometry.sibling_drive)})
 
     assert "answer.txt:1:" in found and "needle" in found, found
-    assert "PARENT_DRIVE_BYTES" not in refused, refused
-    assert "outside selected root=active_workspace" in refused, refused
-    named = refused.split("Roots your profile can search:")[1]
-    assert "deliverables" in named and "task_drive" not in named and "user_files" not in named, refused
+    assert "PARENT_DRIVE_BYTES" in parent, parent
+    assert "SECRET_TOKEN" in parent and "sk-secret" in parent, parent
+    assert "SIBLING_BYTES" in refused, refused
 
 
-def test_a_siblings_or_strangers_file_without_root_is_refused_naming_real_roots(geometry):
+def test_siblings_and_strangers_files_resolve_through_canonical_runtime(geometry):
     registry, _ctx = child_registry(geometry)
 
     sibling = registry.execute("read_file", {"path": str(geometry.sibling_drive / "notes.txt")})
     stranger = registry.execute("read_file", {"path": str(geometry.stranger_artifacts / "out.txt")})
 
-    for out in (sibling, stranger):
-        assert "SIBLING_BYTES" not in out and "STRANGER_BYTES" not in out, out
-        assert "outside selected root=active_workspace" in out, out
-        named = out.split("Roots your profile can read:")[1]
-        assert "task_drive" in named and "deliverables" in named, out
-        assert "user_files" not in named and "subagent_projects" not in named, out
+    assert "SIBLING_BYTES" in sibling, sibling
+    assert "STRANGER_BYTES" in stranger, stranger
 
 
 def test_a_named_wrong_root_still_refuses_a_reachable_file(geometry):
@@ -284,7 +267,7 @@ def test_an_unreachable_path_without_root_never_reads_a_same_named_workspace_mir
     root holds is refused, never sliced by safe_relpath into a same-named file
     inside the workspace."""
     registry, _ctx = child_registry(geometry)
-    outside = geometry.home / "elsewhere" / "target.txt"  # under the owner home: no child root
+    outside = geometry.home.parent / "elsewhere" / "target.txt"  # outside every parent root
     outside.parent.mkdir()
     outside.write_text("correct", encoding="utf-8")
     mirror = geometry.repo.joinpath(*outside.parts[1:])
@@ -333,9 +316,12 @@ def test_dispatch_selects_a_root_only_for_an_absolute_path_without_one(geometry)
     named = {"root": "artifact_store", "path": parent_file}
     _normalize_dispatch_path_args_result(ctx, "read_file", named)
     assert named["root"] == "artifact_store"
-    for untouched in ({"path": "README.md"}, {"path": str(geometry.sibling_drive / "notes.txt")}):
-        _normalize_dispatch_path_args_result(ctx, "read_file", untouched)
-        assert "root" not in untouched, untouched
+    untouched = {"path": "README.md"}
+    _normalize_dispatch_path_args_result(ctx, "read_file", untouched)
+    assert "root" not in untouched
+    sibling = {"path": str(geometry.sibling_drive / "notes.txt")}
+    _normalize_dispatch_path_args_result(ctx, "read_file", sibling)
+    assert sibling["root"] == "runtime_data"
     in_workspace = {"path": str(geometry.repo / "README.md")}
     _normalize_dispatch_path_args_result(ctx, "read_file", in_workspace)
     assert in_workspace == {"path": "README.md"}  # the in-workspace normalization is unchanged
@@ -344,37 +330,35 @@ def test_dispatch_selects_a_root_only_for_an_absolute_path_without_one(geometry)
     assert "root" not in query  # query_code keeps its own external-target contract
 
 
-# --- secrets in a parent's drive stay denied by NAME -------------------------
+# --- task-file names do not define read authority ---------------------------
 
 @pytest.mark.parametrize("name", [".env", "settings.json"])
-def test_secret_named_files_in_the_parents_drive_stay_denied(geometry, name):
+def test_credential_named_task_files_remain_ordinary_readable_inputs(geometry, name):
     registry, _ctx = child_registry(geometry)
     out = registry.execute("read_file", {"root": "task_drive", "path": str(geometry.parent_drive / name)})
-    assert "READ_FILE_BLOCKED" in out and "secret" in out, out
-    assert "SECRET_TOKEN" not in out and "sk-secret" not in out
+    assert (geometry.parent_drive / name).read_text(encoding="utf-8").strip() in out, out
 
 
-def test_child_lists_the_parents_drive_with_secret_names_hidden(geometry):
+def test_child_lists_all_parent_task_file_names(geometry):
     registry, _ctx = child_registry(geometry)
 
     out = registry.execute("list_files", {"root": "task_drive", "path": str(geometry.parent_drive)})
 
     items = json.loads(out)
     assert "triage-draft.json" in items and "source/" in items, items
-    assert ".env" not in items and "settings.json" not in items, items
-    assert any("hidden from this subagent" in item for item in items), items
+    assert ".env" in items and "settings.json" in items, items
+    assert not any("hidden from this subagent" in item for item in items), items
 
 
-def test_child_lists_deliverables_with_secret_names_hidden(geometry):
-    """Deliverables is a new listing root for the child, so it gets the same
-    secret-name filter as every other root it lists; an ordinary file stays."""
+def test_child_lists_all_deliverable_names(geometry):
+    """Every ordinary deliverable stays visible, including credential-like names."""
     (geometry.deliverables / ".env").write_text("SECRET_TOKEN=sk-secret\n", encoding="utf-8")
     registry, _ctx = child_registry(geometry)
 
     items = json.loads(registry.execute("list_files", {"root": "deliverables", "path": str(geometry.deliverables)}))
 
-    assert "answer.txt" in items and ".env" not in items, items
-    assert any("hidden from this subagent" in item for item in items), items
+    assert "answer.txt" in items and ".env" in items, items
+    assert not any("hidden from this subagent" in item for item in items), items
 
 
 # --- the pure lineage function ------------------------------------------------
@@ -422,8 +406,8 @@ def test_deliverables_row_reads_only_and_only_for_the_readonly_child():
     for op in ("write", "edit", "shell", "vcs", "service", "review", "delegate"):
         assert not decide_tool_access(profile="local_readonly_subagent", root="deliverables", operation=op).allow, op
     for profile in ("acting_subagent", "local_readonly_subagent"):
-        assert not decide_tool_access(profile=profile, root="subagent_projects", operation="read").allow, profile
-    assert not decide_tool_access(profile="acting_subagent", root="deliverables", operation="read").allow
+        assert decide_tool_access(profile=profile, root="subagent_projects", operation="read").allow, profile
+    assert decide_tool_access(profile="acting_subagent", root="deliverables", operation="read").allow
     # Top-level principals are untouched: one shared matrix object, unchanged rows.
     for profile in ("workspace_task", "external_workspace_task", "self_modification"):
         assert _POLICY[profile] is _TOP_LEVEL_PRINCIPAL_POLICY
@@ -450,7 +434,6 @@ def test_child_reads_lists_and_searches_deliverables_but_cannot_touch_them(geome
     for out in (write, edit, shell):
         assert out.startswith("⚠️"), out
     assert answer.read_text(encoding="utf-8") == "DELIVERABLE_BYTES needle\n"
-    assert "⚠️" in registry.execute("list_files", {"root": "subagent_projects", "path": "."})
 
 
 def test_readonly_child_schema_enums_follow_the_matrix(geometry):
@@ -461,9 +444,13 @@ def test_readonly_child_schema_enums_follow_the_matrix(geometry):
 
     for name in ("read_file", "list_files"):
         assert "deliverables" in enum(name), name
-        assert "subagent_projects" not in enum(name) and "user_files" not in enum(name), name
-    assert set(enum("search_code")) == {"active_workspace", "system_repo", "skill_payload", "deliverables"}
-    assert enum("query_code") == ["active_workspace", "system_repo"]
+        assert "subagent_projects" in enum(name) and "user_files" in enum(name), name
+    # Read⇒search closure (TZ-1 E): the child searches every root it may read.
+    assert set(enum("search_code")) == {
+        "active_workspace", "system_repo", "skill_payload", "deliverables",
+        "runtime_data", "task_drive", "artifact_store", "user_files", "subagent_projects",
+    }
+    assert set(enum("query_code")) == {"active_workspace", "system_repo", "user_files", "skill_payload"}
 
 
 # --- both sides see what the child can read -----------------------------------
@@ -475,10 +462,10 @@ def test_profile_summary_names_readable_and_unreadable_roots(monkeypatch):
     assert readonly[0].startswith("child capabilities — ") and "model_lane=light" in readonly[0]
     readable, unreadable = readonly[1].split(" · unreadable=")
     assert readable.startswith("readable=") and "deliverables" in readable and "task_drive" in readable
-    assert "parent" in readable and "sibling" in readable, readable
-    assert unreadable == "subagent_projects, user_files", unreadable
+    assert "parent" in readable and "runtime" in readable, readable
+    assert unreadable == "none", unreadable
 
     acting = summarize_subagent_profile("acting_subagent").splitlines()
     assert len(acting) == 2, acting
     acting_readable, acting_unreadable = acting[1].split(" · unreadable=")
-    assert "deliverables" not in acting_readable and "deliverables" in acting_unreadable
+    assert "deliverables" in acting_readable and acting_unreadable == "none"

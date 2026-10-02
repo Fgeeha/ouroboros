@@ -34,6 +34,9 @@ import logging
 import pathlib
 from typing import Any, Callable, Dict, List, Optional
 
+from ouroboros.review_projection import (
+    PLAN_REVIEW_ANSWERED_OPEN, PLAN_REVIEW_NONE_ANSWERED, PLAN_REVIEW_UNANSWERED,
+)
 from ouroboros.utils import update_json_locked, utc_now_iso
 
 log = logging.getLogger(__name__)
@@ -433,6 +436,8 @@ def acceptance_skip_applied(
         {"trigger": "owner_hurry", "skipped": "owner_hurry"},
     )
     set_decision(llm_trace, skip)
+    from ouroboros.acceptance_history import seed_acceptance_history
+    seed_acceptance_history(ctx, llm_trace, REASON_OWNER_HURRY)
     root = getattr(ctx, "budget_drive_root", "") or drive_root
     if root:
         record_effect(
@@ -461,9 +466,9 @@ def plan_wave_only_awaited(wave: Any) -> bool:
     (the census names no unresolved, uncollected, refused or failed slot), and the
     recorded answers hold no verdict of their own beneath the stored placeholder. A
     collected blocking or ``need_evidence`` finding keeps the wave open whatever the
-    awaited slots answer, and a quorum of answers that raised findings IS a critic
-    verdict the wait merely postpones — neither reads as a mere wait. A roster or a
-    quorum the typed facts cannot vouch for is never a mere wait either."""
+    awaited slots answer, so it never reads as a mere wait; notes are neutral (they
+    never move the verdict), so a quorum whose only findings are notes is still a mere
+    wait. A roster or a quorum the typed facts cannot vouch for is never a mere wait."""
     from ouroboros.tools.plan_review_runtime import plan_wave_slot_census
 
     if not isinstance(wave, dict) or not wave.get("custody_pending"):
@@ -477,10 +482,37 @@ def plan_wave_only_awaited(wave: Any) -> bool:
         return False
     counts = wave.get("counts") if isinstance(wave.get("counts"), dict) else {}
     quorum = counts.get("quorum")
-    if (type(quorum) is not int or quorum <= 0 or not isinstance(findings, list)
-            or any(not isinstance(item, dict) or item.get("class") != "note" for item in findings)):
-        return False
-    return len(census["answered"]) < quorum or not findings
+    return not (type(quorum) is not int or quorum <= 0 or not isinstance(findings, list)
+                or any(not isinstance(item, dict) or item.get("class") != "note" for item in findings))
+
+
+def plan_review_class_facts(wave: Any, *, awaited: bool) -> Dict[str, Any]:
+    """The typed outcome CLASS of an OPEN plan wave at delivery, with its answer counts.
+
+    Closed vocabulary (``review_projection``): ``answered_open`` — every slot
+    answered and the verdict was not closed; ``unanswered`` — at least one slot
+    answered and at least one failed, was refused at $0, expired or was never
+    collected; ``none_answered`` — nobody answered and at least one slot failed, was refused
+    or is unresolved (an awaited sibling does not hide that). The
+    awaited case is ``review_only_awaited`` and carries no class; the counts ride in
+    every case for the mind's own reading of the gate."""
+    from ouroboros.tools.plan_review_runtime import plan_wave_slot_census
+
+    census = plan_wave_slot_census(wave)
+    answered, configured = len(census["answered"]), int(census["configured"])
+    facts: Dict[str, Any] = {"reviewers_answered": answered, "reviewers_configured": configured}
+    silent = any(census[name] for name in ("failed", "skipped", "unresolved", "uncollected"))
+    if awaited or not configured:
+        return facts
+    if answered == configured:
+        facts["plan_review_class"] = PLAN_REVIEW_ANSWERED_OPEN
+    elif answered and silent:
+        facts["plan_review_class"] = PLAN_REVIEW_UNANSWERED
+    elif not answered and silent:
+        # Nobody answered and at least one reviewer failed, was refused or is unresolved:
+        # an awaited sibling does not turn that into "work went on with what they said".
+        facts["plan_review_class"] = PLAN_REVIEW_NONE_ANSWERED
+    return facts
 
 
 def force_plan_decision(
@@ -558,6 +590,10 @@ def force_plan_decision(
         if (decision.get("status") == "advisory_open" and not hard_rail
                 and not decision.get("review_capacity_reason") and plan_wave_only_awaited(wave)):
             decision["review_only_awaited"] = True
+    if wave:
+        # The open wave's typed outcome class and its answer counts ride the decision
+        # into the delivery record (outcomes.derive_loop_outcome) and the forced prompt.
+        decision.update(plan_review_class_facts(wave, awaited=bool(decision.get("review_only_awaited"))))
     if hurry_armed and str(enforcement or "").lower() == "blocking":
         # Attribution only (task detail); this changes no global enforcement.
         decision["owner_hurry_local_advisory"] = True
@@ -697,23 +733,25 @@ def plan_review_reminder(decision: Dict[str, Any]) -> str:
         )
     if outcome == "REVIEW_REQUIRED":
         return (
-            f"{tag} Blocking plan review remains REVIEW_REQUIRED. Re-call plan_task with a "
-            "complete review_disposition as the only field, naming the latest fingerprint, "
-            "then continue; do not rerun reviewers."
+            f"{tag} Blocking plan review remains REVIEW_REQUIRED. Open need_evidence requests close "
+            "with a $0 review_disposition naming the latest fingerprint; a blocking finding below quorum "
+            "stays open until its slot no longer raises it in a later paid cycle (the unchanged envelope "
+            "with your items asks only that slot) or a changed spec is reviewed without it. "
+            "Implementation stays held while the review is open."
         )
     if outcome == "REVISE_PLAN":
         return (
-            f"{tag} Blocking plan review requires a revised spec. Change the spec — it carries "
-            "affected_paths, the files the work will change ([] when none) — and call "
-            "plan_task again (or reject the blocking findings with a rationale via "
-            "review_disposition). Continue analysis and non-mutating preparation, but do not "
-            "begin the work before the review closes or a real task-wide rail fires."
+            f"{tag} Blocking plan review is REVISE_PLAN. A changed spec — with affected_paths, the files "
+            "the work will change ([] when none) — is a new envelope every slot reviews; the unchanged "
+            "envelope with review_disposition items asks only the slots those items name. Analysis and "
+            "non-mutating preparation remain open; the work starts after the review closes — a task-wide "
+            "rail releases finalization, never implementation."
         )
     return (
         f"{tag} Call plan_task with a concrete goal, plan and spec, whose affected_paths lists "
         "the files the work will change ([] when none). If review infrastructure "
         "is unavailable, continue analysis and non-mutating preparation, but do not begin the "
-        "work before the review closes or a real task-wide rail fires."
+        "work before the review closes; a task-wide rail releases finalization, never implementation."
     )
 
 

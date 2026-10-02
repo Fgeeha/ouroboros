@@ -162,6 +162,27 @@ def test_type_scale_tokens_are_declared_once_in_the_root_block() -> None:
     )
 
 
+def test_chat_reading_ladder_is_relative_and_read_only_by_chat_headings() -> None:
+    """The one exception to the closed scale (docs/DESIGN.md §1): Markdown
+    headings in a full rich chat answer step up from the bubble's own reading
+    text. The steps are relative, so they cannot become a fifth UI size, and
+    only the rich answer's heading rules may read them: compact Markdown in a
+    bubble (a Skill Review report) keeps its --type-body labels."""
+    root = _root_declarations("web/ui.css")
+    ladder = {"--md-heading-major": "1.25em", "--md-heading-minor": "1.125em"}
+    assert {name: root.get(name) for name in ladder} == ladder
+    css = _decommented(_read("web/style.css"))
+    readers = [
+        " ".join(selector.split())
+        for selector, body in RULE.findall(css)
+        if any(f"var({name})" in body for name in ladder)
+    ]
+    assert readers == [
+        ".chat-bubble .message:where(.ui-rich-content) :is(.md-h1, .md-h2)",
+        ".chat-bubble .message:where(.ui-rich-content) .md-h3",
+    ], readers
+
+
 def _root_declarations(rel: str) -> dict[str, str]:
     """The ``:root`` block of a stylesheet as ``{token: value}``.
 
@@ -535,6 +556,15 @@ def test_webkit_scrollbar_recipe_covers_both_axes() -> None:
         f"width {declarations['width']} vs height {declarations['height']}"
     )
 
+
+def test_every_mask_keeps_its_webkit_companion() -> None:
+    """A fade is a mask (`.scroll-fade-y`, the sideways table fade): each rule that
+    sets `mask-image` also sets `-webkit-mask-image`, as the file's first fade does,
+    so a WebKit view that reads only the prefixed property still fades and unfades."""
+    css = _decommented(_read("web/style.css"))
+    unpaired = [selector.strip() for selector, body in RULE.findall(css)
+                if re.search(r"(?<![-\w])mask-image\s*:", body) and "-webkit-mask-image" not in body]
+    assert not unpaired, f"mask-image without its -webkit- companion: {unpaired}"
 
 def test_chat_transcript_reserves_composer_space_as_one_flex_spacer():
     """End space is a flex item; keyboard flow removes it and its extra gap."""

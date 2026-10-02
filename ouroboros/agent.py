@@ -29,6 +29,7 @@ from ouroboros.utils import (
     truncate_for_log,
     utc_now_iso,
 )
+from ouroboros.budget_pause import BudgetPauseRequested
 from ouroboros.usage_accounting import BudgetExceeded
 from ouroboros.llm import LLMClient
 from ouroboros.tools import ToolRegistry
@@ -46,6 +47,7 @@ from ouroboros.agent_startup_checks import (
 from ouroboros.agent_task_pipeline import (
     emit_task_results, build_review_context,
 )
+from ouroboros.task_finalization import TERMINAL_ORIGIN_HOST_NOTICE
 from ouroboros.task_results import STATUS_RUNNING, write_task_result
 from ouroboros.contracts.task_constraint import normalize_task_constraint
 from ouroboros.consciousness_authority import apply_consciousness_authority
@@ -86,7 +88,7 @@ def _authority_source_terminal(refusal: Dict[str, Any]):
     ).strip()
     usage = {
         "execution_status": "infra_failed", "reason_code": "authority_source_unavailable",
-        "authority_source_unavailable": refusal,
+        "authority_source_unavailable": refusal, "terminal_origin": TERMINAL_ORIGIN_HOST_NOTICE,
     }
     return text, usage, {"reasoning_notes": ["authority_source_unavailable"], "tool_calls": []}
 
@@ -104,7 +106,8 @@ def _task_exception_terminal(env: Any, task: Dict[str, Any], exc: Exception, dri
     llm_trace = captured_trace if isinstance(captured_trace, dict) else {
         "reasoning_notes": [], "tool_calls": [], "loop_evidence_unavailable": True,
     }
-    usage.update(execution_status="infra_failed", reason_code="task_exception")
+    usage.update(execution_status="infra_failed", reason_code="task_exception",
+                 terminal_origin=TERMINAL_ORIGIN_HOST_NOTICE)
     text = f"⚠️ Error during processing: {type(exc).__name__}: {exc}"
     append_jsonl(drive_logs / "events.jsonl", {
         "ts": utc_now_iso(), "type": "task_error", "task_id": task.get("id"),
@@ -118,7 +121,7 @@ def _task_exception_terminal(env: Any, task: Dict[str, Any], exc: Exception, dri
         loop_outcome = derive_loop_outcome(text, usage, llm_trace)
         write_task_result(
             env.drive_root, str(task.get("id") or ""), STATUS_FAILED,
-            result=text, reason_code="task_exception", loop_outcome=loop_outcome,
+            _terminal_observed=True, result=text, reason_code="task_exception", loop_outcome=loop_outcome,
             outcome_axes=loop_outcome.get("outcome_axes") or infra_failed_axes(
                 "task_exception", review_trigger="agent_exception"),
             trace_summary=build_trace_summary(llm_trace),
@@ -343,7 +346,7 @@ class OuroborosAgent:
             return
 
     def _persist_running_record(self, task: Dict[str, Any]) -> None:
-        """Record actual start on the execution drive and bind split roots canonically.
+        """Record actual start on the execution drive and bind split tasks canonically.
 
         For a delegated child every derived field here was stamped onto ``task`` by
         `resolve_dispatch_axes` moments earlier, so model, effort, route, tool
@@ -351,11 +354,34 @@ class OuroborosAgent:
         atomic record instead of being minted by whichever surface writes next.
         """
         try:
+            from ouroboros.task_status import execution_owner_record
+
+            canonical = pathlib.Path(task.get("budget_drive_root") or getattr(self.env, "budget_drive_root", None)
+                                     or self.env.drive_root)
+            assigned_owner = task.get("_execution_owner") or {}
+            execution_kind = assigned_owner.get("kind") or (
+                "presence" if task.get("_presence_turn") else "direct" if task.get("_is_direct_chat") else "pooled")
+            execution_owner = execution_owner_record(canonical, task, execution_kind)
             started = getattr(self, "_task_started_ts", None)
+            # A queue row's focus is a REPLAY (retry clone, owner-wait restart
+            # handoff): it may be older than the focus the same task id already
+            # published durably, so it is accepted only when it is newer.
+            focus_kw: Dict[str, Any] = {}
+            if task.get("focus"):
+                from ouroboros.focus import compact_focus
+                from ouroboros.task_results import load_task_result
+
+                incoming = compact_focus(task.get("focus"))
+                current = load_task_result(self.env.drive_root, str(task.get("id") or ""))
+                durable = compact_focus(current.get("focus")) if isinstance(current, dict) else None
+                if incoming and (durable is None or str(durable.get("authored_at") or "") < str(incoming.get("authored_at") or "")):
+                    focus_kw = {"focus": incoming}
             running = write_task_result(
                 self.env.drive_root,
                 str(task.get("id") or ""),
                 STATUS_RUNNING,
+                execution_owner=execution_owner,
+                task_attempt=task.get("_attempt", 0),
                 **({"started_at": datetime.fromtimestamp(started, timezone.utc).isoformat()}
                    if isinstance(started, (int, float)) and started > 0 else {}),
                 **({"queued_at": task["queued_at"]} if task.get("queued_at") is not None else {}),
@@ -366,6 +392,9 @@ class OuroborosAgent:
                 session_id=task.get("session_id"),
                 actor_id=task.get("actor_id"),
                 delegation_role=task.get("delegation_role"),
+                # The producer's raw origin marker (promote_chat_to_task, presence_promote,
+                # api, ...): the acceptance packet reads run_origin from this record.
+                source=task.get("source"),
                 project_id=str(task.get("project_id") or ""),
                 role=task.get("role"),
                 description=task.get("description"),
@@ -381,6 +410,8 @@ class OuroborosAgent:
                 workspace_mode=task.get("workspace_mode"),
                 task_constraint=task.get("task_constraint"),
                 task_contract=task.get("task_contract"),
+                **({"acceptance_original_root_cap": task["_acceptance_original_root_cap"]}
+                   if "_acceptance_original_root_cap" in task else {}),
                 model_lane=task.get("model_lane"),
                 requested_model_lane=task.get("requested_model_lane"),
                 parent_model_lane=task.get("parent_model_lane"),
@@ -397,6 +428,10 @@ class OuroborosAgent:
                 task_group=task.get("task_group"),
                 subagent_envelope=task.get("subagent_envelope"), configured_subagent=task.get("configured_subagent"), parent_cognitive_route=task.get("parent_cognitive_route"), subagent_availability=task.get("subagent_availability"),
                 metadata=task.get("metadata") if isinstance(task.get("metadata"), dict) else {},
+                # A queue row without a focus (a retry clone, a fresh task) must not
+                # erase the durable focus the same task id already authored, and a
+                # replayed older focus must not replace a newer durable one.
+                **focus_kw,
                 # Ingress-captured owner-message identity (v6.73.0): persisted on the
                 # durable record so a post-hoc "Turn into project" binds the start
                 # message by value, never by content lookup.
@@ -404,19 +439,18 @@ class OuroborosAgent:
                 origin_message_text=task.get("origin_message_text"),
                 result="Task is running.",
             )
-            canonical = pathlib.Path(task.get("budget_drive_root") or getattr(self.env, "budget_drive_root", None)
-                                     or self.env.drive_root)
-            if (str(task.get("delegation_role") or "") != "subagent"
-                    and canonical.resolve() != self.env.drive_root.resolve()
-                    and running.get("status") == STATUS_RUNNING):
-                # Queue snapshots are transient. A split root must retain its
-                # real start and child location after the worker/OS disappears.
-                # The existing writer refuses a late start over a terminal row.
+            if canonical.resolve() != self.env.drive_root.resolve() and running.get("status") == STATUS_RUNNING:
+                # Queue snapshots are transient. A split root or subagent must
+                # retain its real start, attempt and child location after the
+                # worker/OS disappears: copyback accepts the child's end time
+                # only for the attempt the canonical row already names. The
+                # existing writer refuses a late start over a terminal row.
                 write_task_result(
                     canonical, str(task.get("id") or ""), STATUS_RUNNING,
+                    execution_owner=execution_owner,
                     child_drive_root=str(self.env.drive_root), budget_drive_root=str(canonical),
                     _is_direct_chat=bool(task.get("_is_direct_chat")),
-                    **{key: running[key] for key in ("started_at", "ts") if key in running},
+                    **{key: running[key] for key in ("started_at", "ts", "task_attempt", "acceptance_original_root_cap") if key in running},
                 )
         except Exception:
             log.warning("Failed to persist running task status", exc_info=True)
@@ -518,25 +552,11 @@ class OuroborosAgent:
 
         task_metadata = dict(task.get("metadata") or {}) if isinstance(task.get("metadata"), dict) else {}
         for key in (
-            "parent_task_id",
-            "root_task_id",
-            "session_id",
-            "actor_id",
-            "delegation_role",
-            "role",
-            "workspace_root",
-            "workspace_mode",
-            "memory_mode",
-            "drive_root",
-            "child_drive_root",
-            "budget_drive_root",
-            "root_cost_ceiling_usd",
-            "model_lane",
-            "requested_model_lane",
-            "effective_model_lane",
-            "model",
-            "use_local_model",
-            "requested_executor",
+            "parent_task_id", "root_task_id", "session_id", "actor_id", "delegation_role", "role",
+            "workspace_root", "workspace_mode", "memory_mode", "parent_workspace", "workspace_copy",
+            "drive_root", "child_drive_root", "budget_drive_root", "root_cost_ceiling_usd",
+            "model_lane", "requested_model_lane", "effective_model_lane",
+            "model", "use_local_model", "requested_executor",
             # `effective_executor`/`capability_delta` are deliberately NOT here: this
             # projection is only READ for `effective_model_lane` (grandchild
             # inheritance), the child learns its own reduction from the prompt and the
@@ -554,6 +574,7 @@ class OuroborosAgent:
             # passes the start-message identity to the next binding.
             "origin_message_ref",
             "origin_message_text",
+            "objective_author", "owner_corpus",
             # The complete work-order source reader needs the original typed
             # constraint mapping, not the normalized dataclass repr, to rebuild
             # the exact canonical serializer bytes during a source-range answer.
@@ -622,6 +643,7 @@ class OuroborosAgent:
             emit_progress_fn=self._bind_task_progress_for_task(task),
             event_queue=self._event_queue,
             task_id=str(task.get("id") or ""),
+            task_lifecycle_bound=True,
             task_depth=int(task.get("depth", 0)),
             is_direct_chat=bool(task.get("_is_direct_chat")),
             task_constraint=normalize_task_constraint(task.get("task_constraint")),
@@ -642,11 +664,21 @@ class OuroborosAgent:
         ctx.task_started_at = self._task_started_ts
         ctx.owner_wait_callback = getattr(self, "owner_wait_callback", None)
         ctx.owner_wait_resume = task.get("_owner_wait_resume")
+        ctx.budget_pause_resume = task.get("_budget_pause_resume")
         from ouroboros.owner_wait import load_owner_wait
         saved_wait = load_owner_wait(ctx)  # Runtime/ContextFit must disclose the original ceiling.
+        if not saved_wait and ctx.budget_pause_resume:
+            from ouroboros.budget_pause import load_budget_pause
+            saved_wait = load_budget_pause(ctx)  # same-ID budget continuation (#1196)
         if saved_wait and ctx.model_wait_context is not None:
+            # started_at stays the ORIGINAL start; the granted paused interval is
+            # the separate carrier the finite lifetime subtracts (#1196). A budget
+            # grant supplies the CURRENT cumulative value; an owner-wait restart
+            # of a previously paused task has none to supply, and the serializer's
+            # own saved carrier is used instead (``restore_continuation``, F5).
             ctx.model_wait_context.restore_continuation(
-                saved_wait.get("model_wait") or {}, started_at=ctx.task_started_at)
+                saved_wait.get("model_wait") or {}, started_at=ctx.task_started_at,
+                budget_paused_sec=(ctx.budget_pause_resume or {}).get("paused_duration_sec"))
 
         if self._event_queue is not None:
             # Optional runtime seam consumed by loop.py.  Unit/direct contexts
@@ -818,10 +850,22 @@ class OuroborosAgent:
             root_task_id = str(task.get("root_task_id") or metadata.get("root_task_id") or task_id)
             parent_task_id = str(task.get("parent_task_id") or metadata.get("parent_task_id") or "")
             budget_root = task.get("budget_drive_root") or metadata.get("budget_drive_root") or self.env.drive_root
+            root_limit_known = True
             try:
                 root_limit = float(runtime_setting("OUROBOROS_PER_TASK_COST_USD", "0") or 0)
             except (TypeError, ValueError):
                 root_limit = 0.0
+                root_limit_known = False
+            if task_id == root_task_id and not parent_task_id:
+                import math
+                task = dict(task)
+                task["_acceptance_original_root_cap"] = (
+                    {"state": "finite", "usd": root_limit, "source": "task_admission"}
+                    if root_limit_known and math.isfinite(root_limit) and root_limit > 0 else
+                    {"state": "unlimited", "source": "task_admission"}
+                    if root_limit_known and math.isfinite(root_limit) else
+                    {"state": "unknown", "source": "invalid_admission_setting"})
+            from ouroboros.usage_admission import task_billing_fields
             scope = UsageScope(
                 drive_root=budget_root,
                 task_id=task_id,
@@ -829,8 +873,9 @@ class OuroborosAgent:
                 parent_task_id=parent_task_id,
                 category=str(metadata.get("usage_category") or task.get("type") or "task"),
                 source="agent.task",
-                root_limit_usd=root_limit if root_limit > 0 else None,
                 root_cost_ceiling_usd=task.get("root_cost_ceiling_usd") or metadata.get("root_cost_ceiling_usd"),
+                # The whole-work group and its cap (a Continue's successor spends the ORIGINAL cap).
+                **task_billing_fields(task, root_task_id, root_limit if root_limit > 0 else None, budget_root, pin_initial=True),
             )
             with usage_scope(scope), task_model_wait_scope(
                 task=task, drive_root=self.env.drive_root, event_queue=self._event_queue,
@@ -840,7 +885,8 @@ class OuroborosAgent:
 
     def _handle_task_scoped(self, task: Dict[str, Any]) -> List[Dict[str, Any]]:
         self._busy = True
-        start_time = float((task.get("_owner_wait_resume") or {}).get("started_at") or time.time())
+        _continuation = task.get("_owner_wait_resume") or task.get("_budget_pause_resume") or {}
+        start_time = float(_continuation.get("started_at") or time.time())
         self._task_started_ts = start_time
         self._last_progress_ts = start_time
         self._pending_events = []
@@ -969,7 +1015,7 @@ class OuroborosAgent:
                         initial_effort=initial_effort,
                         drive_root=self.env.drive_root,
                     )
-                except BudgetExceeded:
+                except (BudgetExceeded, BudgetPauseRequested):
                     raise
                 except Exception as e:
                     from ouroboros.cancel_intents import STOP_POLICY_IMMEDIATE, active_intent, stop_policy
@@ -1003,6 +1049,10 @@ class OuroborosAgent:
             )
             if not isinstance(text, str) or (not text.strip() and not intentional_empty):
                 text = "⚠️ Model returned an empty response. Try rephrasing your request."
+                usage["terminal_origin"] = TERMINAL_ORIGIN_HOST_NOTICE
+                usage.pop("presence_completion_outcome", None)
+                if ctx is not None:
+                    ctx._presence_completion_accepted = False
 
             # A task that scoped ITSELF mid-run (ensure_project_scope) set the scope on
             # ctx, but persistence/finalization read the task dict — sync it back so the
@@ -1017,6 +1067,16 @@ class OuroborosAgent:
                 ctx=ctx,
                 event_queue=self._event_queue,
             )
+            return list(self._pending_events)
+
+        except BudgetPauseRequested as exc:
+            # The durable pause row already exists (the loop raised only after
+            # writing it). Supervisor owns the queue transition; no task_done,
+            # no result text, no Main final: the SAME task id stays pending
+            # under its exact continuation until an explicit owner Resume.
+            from ouroboros.budget_pause import pause_event
+
+            self._pending_events.append(pause_event(task, exc.pause))
             return list(self._pending_events)
 
         except BudgetExceeded as exc:
@@ -1070,6 +1130,7 @@ class OuroborosAgent:
             usage = {
                 "execution_status": "failed",
                 "reason_code": "budget_exhausted",
+                "terminal_origin": TERMINAL_ORIGIN_HOST_NOTICE,
                 "resource_limit": resource_limit,
             }
             llm_trace = {
@@ -1120,6 +1181,7 @@ class OuroborosAgent:
 
     def _emit_progress(self, text: str, *, incident: Optional[Dict[str, str]] = None,
                        executor_observation: Optional[Dict[str, Any]] = None,
+                       delegated_activity: Optional[Dict[str, Any]] = None,
                        narration: bool = False, card_row: str = "", card_row_id: str = "",
                        _task_id_override: Any = _PROGRESS_ID_UNSET,
                        _chat_id_override: Any = _PROGRESS_ID_UNSET,
@@ -1180,6 +1242,14 @@ class OuroborosAgent:
                 )
                 if observation:
                     progress_meta["executor_observation"] = observation
+            if delegated_activity is not None:
+                # The executor's typed words and technical events (``delegate_activity``):
+                # host progress about the delegated run, never this turn's own narration.
+                from ouroboros.subagent_messages import delegated_activity_meta
+
+                activity = delegated_activity_meta(delegated_activity, task_id=event["task_id"])
+                if activity:
+                    progress_meta["delegated_activity"] = activity
             # Stamped on EVERY frame, never inferred from the absence of other
             # metadata: a reader that sees no key is reading an older worker or a
             # row written before the fact existed, and keeps the legacy reading.

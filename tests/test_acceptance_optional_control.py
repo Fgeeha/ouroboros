@@ -1,7 +1,8 @@
-"""N2: complete acceptance prose and optional controls share the existing gates."""
+"""Explicit answer selection shares the existing review authority and wait policy."""
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 
 import pytest
@@ -9,11 +10,32 @@ import pytest
 from ouroboros import loop
 from ouroboros.acceptance_settlement import acceptance_wait_chosen
 from ouroboros.loop_acceptance_review import advance_explicit_acceptance, wait_for_acceptance_feedback
+from ouroboros.loop_delivery import completion_observation, consume_completion_request
+from ouroboros.tools.control_runtime import _finish_task
 from tests.test_acceptance_async_loop import ANSWER, call
 from tests.test_acceptance_async_loop import full_loop as _full_loop
 from tests.test_delivery_forced_finalization import _bind_host_pass, _forced_test_context
 
 full_loop = _full_loop  # noqa: F811 - shared real-loop fixture
+
+
+def _select(registry, ctx, trace, **arguments):
+    registry._ctx._completion_observation = completion_observation(registry._ctx, trace)
+    result = _finish_task(registry._ctx, "finish", **arguments)
+    assert json.loads(result)["status"] == "completion_requested"
+    return consume_completion_request(registry, ctx, trace)
+
+
+def _finish(answer=None, **arguments):
+    if answer is not None:
+        arguments["answer"] = answer
+    return {"content": None, "tool_calls": [call("finish_task", {"action": "finish", **arguments}, "select")]}
+
+
+def _keep(f):
+    return _finish(answer_sha256=f.ctx._delivery_candidate.content_sha256, acceptance_subject={
+        "owner_source_sha256": f.ctx._acceptance_observation["owner_source_sha256"],
+    })
 
 
 def _feedback(tmp_path, monkeypatch, entry="implicit"):
@@ -35,29 +57,32 @@ def _feedback(tmp_path, monkeypatch, entry="implicit"):
 @pytest.mark.parametrize("enforcement,mode", [
     ("advisory", "advanced"), ("blocking", "advanced"), ("blocking", "cyber_pro"),
 ])
-@pytest.mark.parametrize("answer", ["prose", "keep", "replace", "finish"])
+@pytest.mark.parametrize("answer", ["prose", "retained", "replace", "finish"])
 def test_acceptance_answer_choice_preserves_wait_policy(tmp_path, monkeypatch, entry, enforcement, mode, answer):
     monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", enforcement)
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", mode)
     registry, ctx, trace, candidate = _feedback(tmp_path, monkeypatch, entry)
     revised = ANSWER + " Budget: $12.\nThe complete timeline is two weeks."
-    registry._ctx._acceptance_pending_review_choice = "finish"
-    raw = revised if answer == "prose" else json.dumps({
-        "delivery_control": "replace" if answer == "replace" else "keep",
-        **({"full_answer": revised} if answer == "replace" else {}),
-        **({"pending_review": "finish"} if answer == "finish" else {}),
-    })
-    status, text = loop._resolve_delivery_control(raw, registry, ctx, trace)
-    assert status == ("fresh" if answer == "prose" else "resolved")
-    assert text == (revised if answer in {"prose", "replace"} else ANSWER)
-    assert registry._ctx._acceptance_pending_review_choice == ("finish" if answer == "finish" else "wait")
+    if answer == "prose":
+        assert loop._resolve_delivery_control(revised, registry, ctx, trace) == ("retry", ANSWER)
+        assert candidate.full_text == ANSWER
+        assert getattr(registry._ctx, "_completion_selected", None) is None
+    else:
+        selected = ({"answer": revised} if answer == "replace"
+                    else {"answer_sha256": candidate.content_sha256})
+        if answer == "finish":
+            selected["pending_review"] = "finish"
+        assert _select(registry, ctx, trace, **selected)
+        assert registry._ctx._delivery_candidate.full_text == (revised if answer == "replace" else ANSWER)
+    assert (getattr(registry._ctx, "_acceptance_pending_review_choice", "") or "wait") == (
+        "finish" if answer == "finish" else "wait")
     assert acceptance_wait_chosen(registry._ctx) is (
         mode != "cyber_pro" and (enforcement == "blocking" or answer != "finish")
     )
     assert registry._ctx._task_acceptance_pending == "paid-binding"
     assert candidate.control_episode_seen is True
-    assert "complete revised user-facing answer as ordinary prose" in str(ctx.messages)
-    assert ('"pending_review":"finish"' in str(ctx.messages)) is (
+    assert "Interim prose is activity, not a new completion selection" in str(ctx.messages)
+    assert ("Pending critics: choose pending_review=wait" in str(ctx.messages)) is (
         enforcement == "advisory" and mode != "cyber_pro"
     )
 
@@ -70,51 +95,71 @@ def test_acceptance_answer_choice_preserves_wait_policy(tmp_path, monkeypatch, e
     '{"delivery_control":"keep","delivery_control":"replace","full_answer":"bad"}',
     'A notice.\n{"delivery_control":"keep"}', '```json\n{"delivery_control":\n```',
 ])
-def test_malformed_acceptance_control_retains_complete_answer_after_one_repair(tmp_path, monkeypatch, raw):
+def test_unselected_or_historical_control_never_forces_completion(tmp_path, monkeypatch, raw):
     registry, ctx, trace, candidate = _feedback(tmp_path, monkeypatch)
-    assert loop._resolve_delivery_control(raw, registry, ctx, trace) == ("retry", "")
-    assert candidate.full_text == ANSWER and candidate.repair_attempted
-    wait_for_acceptance_feedback(registry, ctx, trace, [], set())
-    assert candidate.repair_attempted, "a repeated wake must not refund the repair"
-    status, text = loop._resolve_delivery_control(raw, registry, ctx, trace)
-    assert (status, text) == ("degraded", ANSWER)
-    assert candidate.degraded_reason == "invalid_delivery_control_after_repair"
+    for _ in range(3):
+        assert loop._resolve_delivery_control(raw, registry, ctx, trace) == ("retry", ANSWER)
+        assert candidate.full_text == ANSWER and not candidate.degraded
+        assert ctx.messages[-1]["role"] == "user"
+        wait_for_acceptance_feedback(registry, ctx, trace, [], set())
     assert registry._ctx._task_acceptance_pending == "paid-binding"
 
 
-def test_complete_prose_can_repair_a_malformed_optional_control(tmp_path, monkeypatch):
+def test_explicit_selection_after_a_malformed_old_control(tmp_path, monkeypatch):
     registry, ctx, trace, candidate = _feedback(tmp_path, monkeypatch)
-    assert loop._resolve_delivery_control("", registry, ctx, trace) == ("retry", "")
+    assert loop._resolve_delivery_control("", registry, ctx, trace) == ("retry", ANSWER)
     revised = ANSWER + " Budget: $12."
-    assert loop._resolve_delivery_control(revised, registry, ctx, trace) == ("fresh", revised)
-    assert candidate.repair_attempted and not candidate.degraded
+    assert _select(registry, ctx, trace, answer=revised)
+    assert registry._ctx._delivery_candidate.full_text == revised
+    assert not candidate.degraded
     assert registry._ctx._acceptance_pending_review_choice == "wait"
+
+
+@pytest.mark.parametrize("arguments", [
+    {"action": "unknown", "answer": ANSWER},
+    {"action": "finish", "answer": ""},
+    {"action": "finish", "answer_sha256": ""},
+    {"action": "finish", "answer": ANSWER, "answer_sha256": "both"},
+    {"action": "stop", "answer": ANSWER},
+    {"action": "finish", "answer": ANSWER, "pending_review": "unknown"},
+])
+def test_invalid_completion_retains_answer_then_allows_explicit_reselection(tmp_path, monkeypatch, arguments):
+    registry, ctx, trace, candidate = _feedback(tmp_path, monkeypatch)
+    result = _finish_task(registry._ctx, **arguments)
+    assert "ERROR: COMPLETION_ARGUMENT:" in result
+    assert getattr(registry._ctx, "_completion_request", None) is None
+    assert candidate.full_text == ANSWER
+    assert registry._ctx._task_acceptance_pending == "paid-binding"
+    assert _select(registry, ctx, trace, answer_sha256=candidate.content_sha256)
+    assert registry._ctx._delivery_candidate.full_text == ANSWER
 
 
 def test_changed_owner_source_still_requires_an_exact_current_acknowledgement(tmp_path, monkeypatch):
     registry, ctx, trace, old = _feedback(tmp_path, monkeypatch)
+    stale_source = registry._ctx._acceptance_observation["owner_source_sha256"]
     registry._ctx._owner_directives = [{"content": "Also give the delivery date."}]
     wait_for_acceptance_feedback(registry, ctx, trace, [], set())
     revised = ANSWER + " Delivery date: Friday."
-    assert loop._resolve_delivery_control(revised, registry, ctx, trace) == ("retry", "")
+    assert loop._resolve_delivery_control(revised, registry, ctx, trace) == ("retry", ANSWER)
+    assert old.full_text == ANSWER
+    assert not _select(registry, ctx, trace, answer=revised,
+                       acceptance_subject={"owner_source_sha256": stale_source})
     assert old.full_text == ANSWER
     observed = registry._ctx._acceptance_observation
-    assert loop._resolve_delivery_control(json.dumps({
-        "delivery_control": "replace", "full_answer": revised,
-        "acceptance_subject": {"owner_source_sha256": observed["owner_source_sha256"]},
-    }), registry, ctx, trace) == ("resolved", revised)
+    assert _select(registry, ctx, trace, answer=revised, acceptance_subject={
+        "owner_source_sha256": observed["owner_source_sha256"],
+    })
     assert registry._ctx._delivery_candidate.owner_source_sha256 == observed["owner_source_sha256"]
 
 
-def test_prose_replacement_after_material_change_cannot_inherit_an_old_pass(tmp_path, monkeypatch):
+def test_explicit_replacement_after_material_change_cannot_inherit_an_old_pass(tmp_path, monkeypatch):
     registry, ctx, trace, old = _feedback(tmp_path, monkeypatch)
     run = _bind_host_pass(loop, registry, trace, old)
     trace["tool_calls"].append({"tool": "write_file", "status": "ok", "is_error": False,
                                 "result": "new material evidence"})
     revised = ANSWER + " Budget: $12."
-    status, text = loop._resolve_delivery_control(revised, registry, ctx, trace)
-    assert (status, text) == ("fresh", revised)
-    fresh = loop._replace_delivery_candidate(registry, ctx, trace, text, control="candidate")
+    assert _select(registry, ctx, trace, answer=revised)
+    fresh = registry._ctx._delivery_candidate
     assert fresh.evidence_revision > old.evidence_revision
     assert fresh.evidence_fingerprint != old.evidence_fingerprint
     assert fresh.acceptance_binding["authoritative"] is False
@@ -122,8 +167,7 @@ def test_prose_replacement_after_material_change_cannot_inherit_an_old_pass(tmp_
 
 
 @pytest.mark.parametrize("control", [
-    "awaiting_control", "repair_requested", "owner_revision_required",
-    "effect_revision_required", "effect_revision_required_repair_requested",
+    "awaiting_control", "owner_revision_required", "effect_revision_required",
     "skill_revision_required", "skill_action_or_revision_required", "child_absorption_or_revision_required",
 ])
 @pytest.mark.parametrize("entry", ["implicit", "explicit"])
@@ -147,20 +191,20 @@ def test_acceptance_arm_does_not_replace_another_gates_control(tmp_path, monkeyp
         hold()
         wait_for_acceptance_feedback(registry, ctx, trace, [], set())
     assert candidate.finalization_control == control
-    assert registry._ctx._delivery_control_required is (control not in loop._DELIVERY_HOLD_CONTROLS)
-    if control not in loop._DELIVERY_HOLD_CONTROLS:
-        assert loop._resolve_delivery_control("Status notice.", registry, ctx, trace) == ("retry", "")
-        assert candidate.full_text == ANSWER
+    assert registry._ctx._delivery_control_required is True
+    assert loop._resolve_delivery_control("Status notice.", registry, ctx, trace) == ("retry", ANSWER)
+    assert candidate.full_text == ANSWER
 
 
 @pytest.mark.parametrize("raw,expected", [
-    ('{"delivery_control":"replace","full_answer":', (ANSWER, True, True, True, False)),
-    ('{"delivery_control":"keep"}', (ANSWER, True, False, True, False)),
-    ('{"delivery_control":"replace","full_answer":"Complete replacement."}',
+    ('{"action":"finish","answer":', (ANSWER, True, True, True, False)),
+    (json.dumps({"action": "finish", "answer_sha256": hashlib.sha256(ANSWER.encode()).hexdigest()}),
+     (ANSWER, True, False, True, False)),
+    ('{"action":"finish","answer":"Complete replacement."}',
      ("Complete replacement.", False, False, True, True)),
     ("Forced complete answer.", ("Forced complete answer.", False, False, True, False)),
 ])
-def test_acceptance_optional_control_keeps_forced_resolution(tmp_path, monkeypatch, raw, expected):
+def test_forced_transport_uses_explicit_completion_or_plain_final_prose(tmp_path, monkeypatch, raw, expected):
     from ouroboros.loop_delivery import _resolve_forced_delivery_control_body
 
     registry, _ctx, _trace, candidate = _feedback(tmp_path, monkeypatch)
@@ -171,7 +215,7 @@ def test_acceptance_optional_control_keeps_forced_resolution(tmp_path, monkeypat
 
 @pytest.mark.parametrize("entry", ["implicit", "explicit"])
 @pytest.mark.parametrize("enforcement", ["advisory", "blocking"])
-def test_whole_loop_delivers_complete_prose_after_settlement(full_loop, monkeypatch, entry, enforcement):
+def test_whole_loop_delivers_selected_complete_answer_after_settlement(full_loop, monkeypatch, entry, enforcement):
     f = full_loop
     monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", enforcement)
     revised = ANSWER + " Budget: $12.\nTimeline: two weeks."
@@ -184,7 +228,9 @@ def test_whole_loop_delivers_complete_prose_after_settlement(full_loop, monkeypa
                 return {"content": "", "tool_calls": [call("task_acceptance_review", {"claim": ANSWER}, "review")]}, 0.0
             return {"content": ANSWER}, 0.0
         assert f.model_step < 5, f.progress
-        return {"content": revised}, 0.0
+        return _finish(revised, acceptance_subject={
+            "owner_source_sha256": f.ctx._acceptance_observation["owner_source_sha256"],
+        }), 0.0
 
     monkeypatch.setattr(loop, "call_llm_with_retry", main)
     result, _usage, trace = f.run()
@@ -207,41 +253,49 @@ def test_cyber_explicit_nomination_keeps_its_existing_no_wait_power(full_loop, m
         if f.model_step == 1:
             return {"content": "", "tool_calls": [call("task_acceptance_review", {"claim": ANSWER}, "review")]}, 0.0
         assert f.model_step == 2 and f.entered.wait(5) and not f.release.is_set()
-        assert "Prose never requests pending_review:finish" in str(messages)
-        return {"content": revised}, 0.0
+        assert "Interim prose is activity, not a new completion selection" in str(messages)
+        return _finish(revised, acceptance_subject={
+            "owner_source_sha256": f.ctx._acceptance_observation["owner_source_sha256"],
+        }), 0.0
 
     monkeypatch.setattr(loop, "call_llm_with_retry", main)
-    result, _usage, trace = f.run()
+    result, usage, trace = f.run()
     assert result == revised and len(f.review_sends) == 1 and not f.waits
     assert trace["acceptance_decision"]["reason"] == "author_finish"
-    assert trace["acceptance_decision"]["author_disposition"]["source"] == "author_final_response"
+    author = trace["acceptance_decision"]["author_disposition"]
+    assert author["source"] == "author_final_response"
+    # The submitted final is Main's act: the host records "finish" and invents
+    # neither an "accepted" stance nor a "solved" tier (TZ-2 C4).
+    assert author["action"] == "finish" and author["disposition"] == ""
     assert trace["review_decision"]["review_pending"] is True
+    from ouroboros.outcomes import derive_loop_outcome
+
+    objective = derive_loop_outcome(result, usage, trace)["outcome_axes"]["objective"]
+    assert (objective["status"], objective["source"], objective["reason"]) == ("pass", "author_acceptance", "author_finish")
+    assert "outcome_tier" not in objective
 
 
 @pytest.mark.parametrize("early", ["settled", "queued_wake"])
-@pytest.mark.parametrize("reply", ["keep", "replace", "prose", "malformed"])
-def test_feedback_ready_before_parking_preserves_answer_protocol(tmp_path, monkeypatch, early, reply):
+@pytest.mark.parametrize("reply", ["retained", "replace", "prose", "historical"])
+def test_feedback_ready_before_parking_still_requires_explicit_selection(tmp_path, monkeypatch, early, reply):
     _loop, tools, ctx, trace = _forced_test_context(tmp_path)
     candidate = loop._replace_delivery_candidate(tools, ctx, trace, ANSWER, control="candidate")
     tools._ctx._task_acceptance_pending = "paid-binding"
     monkeypatch.setattr("ouroboros.acceptance_settlement.awaited_panel_has_settled", lambda *_: early == "settled")
-    # The stub takes the seam's keyword (owner_authority_only): the observation capture
-    # no longer swallows a stub's TypeError behind a blanket except.
     monkeypatch.setattr("ouroboros.loop_transport._owner_signal_pending", lambda *_a, **_k: early == "queued_wake")
     monkeypatch.setattr("ouroboros.owner_wait.wait_after_tools", lambda *_a, **_k: pytest.fail("settled feedback must not park"))
     wait_for_acceptance_feedback(tools, ctx, trace, [], set())
     assert candidate.control_episode_seen
-    assert "complete revised user-facing answer as ordinary prose" in str(ctx.messages)
+    assert "Interim prose is activity, not a new completion selection" in str(ctx.messages)
     revised = ANSWER + " The total budget is $12."
-    raw = {"keep": json.dumps({"delivery_control": "keep"}),
-           "replace": json.dumps({"delivery_control": "replace", "full_answer": revised}),
-           "prose": revised, "malformed": '{"delivery_control":"replace","full_answer":'}[reply]
-    status, text = loop._resolve_delivery_control(raw, tools, ctx, trace)
-    if reply == "malformed":
-        assert (status, text) == ("retry", "") and candidate.full_text == ANSWER
+    if reply in {"prose", "historical"}:
+        raw = revised if reply == "prose" else '{"delivery_control":"replace","full_answer":'
+        assert loop._resolve_delivery_control(raw, tools, ctx, trace) == ("retry", ANSWER)
+        assert candidate.full_text == ANSWER
     else:
-        assert status == ("fresh" if reply == "prose" else "resolved")
-        assert text == (ANSWER if reply == "keep" else revised)
+        arguments = {"answer": revised} if reply == "replace" else {"answer_sha256": candidate.content_sha256}
+        assert _select(tools, ctx, trace, **arguments)
+        assert tools._ctx._delivery_candidate.full_text == (revised if reply == "replace" else ANSWER)
         assert tools._ctx._acceptance_pending_review_choice == "wait"
     assert tools._ctx._task_acceptance_pending == "paid-binding"
 
@@ -252,7 +306,6 @@ def test_feedback_ready_before_parking_preserves_answer_protocol(tmp_path, monke
 ])
 def test_return_order_preserves_feedback_identity_and_new_subjects(full_loop, monkeypatch, order, next_action):
     from tests.test_loop_acceptance_gate import _order_acceptance_feedback
-    from tests.test_acceptance_async_loop import keep
 
     f = full_loop
     revised = ANSWER + " Budget: $12."
@@ -303,10 +356,9 @@ def test_return_order_preserves_feedback_identity_and_new_subjects(full_loop, mo
                 subject["effective_criteria"] = "Complete report including a verified budget of $12."
             if next_action in {"effect", "held_effect"} and f.model_step > 2:
                 subject["material_tool_indices"] = [1]
-            return {"content": json.dumps({"delivery_control": "replace", "full_answer": revised,
-                                           "acceptance_subject": subject})}, 0.0
+            return _finish(revised, acceptance_subject=subject), 0.0
         assert f.model_step < 7, f.progress
-        return keep(f), 0.0
+        return _keep(f), 0.0
 
     monkeypatch.setattr(loop, "call_llm_with_retry", main)
     result, _usage, trace = f.run()

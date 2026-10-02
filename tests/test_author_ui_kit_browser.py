@@ -196,7 +196,7 @@ def test_author_kit_authenticated_mount_and_lifetime(author_kit_server, tmp_path
             assert route.evaluate("window.kitCspViolations") == []
             assert module.evaluate("document.documentElement.dataset.theme") == "dark"
             page.evaluate("() => window.ouroTheme.set('light')")
-            module.wait_for_function("document.documentElement.dataset.theme === 'light'")
+            module.locator('html[data-theme="light"]').wait_for(state="attached")
             assert page.evaluate(
                 "node => document.querySelector('[data-widget-key=\\\"module-old\\\"] iframe') === node",
                 module_node,
@@ -205,7 +205,7 @@ def test_author_kit_authenticated_mount_and_lifetime(author_kit_server, tmp_path
                 "getComputedStyle(document.querySelector('.ui-control')).backgroundColor"
             ) == "rgb(245, 246, 248)"
             page.evaluate("() => window.ouroTheme.set('dark')")
-            module.wait_for_function("document.documentElement.dataset.theme === 'dark'")
+            module.locator('html[data-theme="dark"]').wait_for(state="attached")
             for frame in (module, route):
                 frame.get_by_role("button", name="Preview", exact=True).wait_for()
                 assert frame.get_by_label("Title", exact=True).input_value() == "My notes"
@@ -322,7 +322,7 @@ def test_author_kit_authenticated_mount_and_lifetime(author_kit_server, tmp_path
             }""")
             page.wait_for_function("window.handlers.size === 1")
             page.evaluate("() => handlers.forEach(handler => handler({type:'ext:export_widget:tick', data:{value:'delivered'}}))")
-            module.wait_for_function("document.getElementById('root').dataset.event === 'delivered'")
+            module.locator('#root[data-event="delivered"]').wait_for(state="attached")
             with page.expect_download() as download:
                 module.get_by_role("button", name="Export example", exact=True).click()
             assert Path(download.value.path()).read_text(encoding="utf-8") == "author kit export"
@@ -335,7 +335,7 @@ def test_author_kit_authenticated_mount_and_lifetime(author_kit_server, tmp_path
             evidence = Path(os.environ.get("OUROBOROS_UI_EVIDENCE_OUT", str(tmp_path / "evidence")))
             evidence.mkdir(parents=True, exist_ok=True)
             page.evaluate("() => window.ouroTheme.set('light')")
-            module.wait_for_function("document.documentElement.dataset.theme === 'light'")
+            module.locator('html[data-theme="light"]').wait_for(state="attached")
             module.locator('body').screenshot(
                 path=str(evidence / f"author-kit-{browser_name}-module-light.png")
             )

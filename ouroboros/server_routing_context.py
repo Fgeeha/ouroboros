@@ -64,6 +64,14 @@ def _addressable_root_tasks(ctx: Any, chat_id: Optional[int] = None) -> list:
             return
         if chat_id is not None and not _task_belongs_to_chat(ctx, tid, task_obj, int(chat_id or 0)):
             return
+        # RUNNING can mean only paid post-work remains. A terminal result
+        # cannot drain a new owner/peer message; don't suggest it as steerable.
+        from ouroboros.task_results import load_task_result
+        from ouroboros.task_status import SETTLED_STATUSES
+        from supervisor.queue import _task_drive_for_task
+
+        if (load_task_result(_task_drive_for_task(task_obj, tid), tid) or {}).get("status") in SETTLED_STATUSES:
+            return
         objective = str(
             task_obj.get("objective") or task_obj.get("description") or task_obj.get("text") or ""
         ).strip()
@@ -171,9 +179,10 @@ def _task_result_ground_truth(row: Dict[str, Any]) -> Dict[str, Any]:
 def _is_child_result(facts: Dict[str, Any]) -> bool:
     """A result that is NOT an owner root: it has a parent, or the subagent role.
 
-    ONE predicate for both readers of that fact - the manifest window that skips
-    children (owner decision batch 3, answer 6b=A) and the promote door, which
-    refuses them by the same rule. Reads a memoized fact row or a full result row.
+    ONE predicate for every reader of that fact - the manifest window that skips
+    children (owner decision batch 3, answer 6b=A), the pointer stamp that only a
+    root moves, and the promote receipt, which continues a named child with its
+    root disclosed. Reads a memoized fact row or a full result row.
     """
     return bool(str(facts.get("parent_task_id") or "").strip()) or str(
         facts.get("delegation_role") or "") == "subagent"
@@ -248,14 +257,14 @@ def _cancel_state_facts(ctx: Any, task_id: str) -> Dict[str, Any]:
 def _project_routing_manifest(ctx: Any, project_id: str) -> Dict[str, Any]:
     """The room's bounded HINT for a "continue this work" decision: the project's
     recent ROOT results and the roots still live in it, each with the small typed
-    facts that separate the two choices - a finished root is promote's predecessor,
+    facts that separate the two choices - a settled root is promote's predecessor,
     a live one is ``steer_task``.
 
-    A hint, never the door: promote's predicate admits an older root of the same
-    project too (ch. 10), so this window may be bounded without deciding what the
-    room can continue. Until it existed a room saw exactly ONE candidate, the
-    registry pointer, so a room whose pointer had moved could not name its own
-    interrupted root at all.
+    A hint, never the door: promote's predicate admits any settled result, listed
+    or not, of any project (ch. 10), so this window may be bounded without
+    deciding what the room can continue. Until it existed a room saw exactly ONE
+    candidate, the registry pointer, so a room whose pointer had moved could not
+    name its own interrupted root at all.
     """
     finals, omissions = _recent_root_results(ctx, project_id)
     active = [
@@ -280,7 +289,7 @@ def _not_a_root_result(row: Dict[str, Any]) -> bool:
 
 def _latest_project_task_result(ctx: Any, project_id: str) -> Optional[Dict[str, Any]]:
     """Newest ROOT task result bound to ``project_id`` (a child's is never the room's
-    continuation: the promote door refuses it, ``_is_child_result``) WITHOUT replaying the whole
+    last-result pointer: the hint offers roots only, ``_is_child_result``) WITHOUT replaying the whole
     store (DEVELOPMENT "Projection over replay"). The registry row's durable
     ``last_task_result_id`` pointer (stamped at project-task finalization) is
     read FIRST — one direct file fetch, immune to how many newer foreign
@@ -534,6 +543,14 @@ def _decision_turn_metadata(ctx: Any, chat_id: int, client_message_id: str, task
         # review wave, because the deciding turn was never told a receipt already
         # existed. The choice stays with the model - no host ban on a second root.
         routing_contract["message_routing_receipt"] = receipt
+        acts = _message_routing_acts(ctx, client_message_id)
+        if len(acts) > 1:
+            # The latest row hides earlier acts on the same message (a promote, then
+            # a steer): each act keeps its own receipt, read, never inferred.
+            routing_contract["message_routing_acts"] = acts
+            routing_contract["message_routing_acts_note"] = (
+                "Recorded routing acts already taken for THIS owner message, oldest first. "
+                "Facts, not a ban: another act stays your choice.")
     md["routing_contract"] = routing_contract
     return md
 
@@ -544,8 +561,8 @@ def main_lane_routing_metadata(ctx: Any, chat_id: int) -> Dict[str, Any]:
     Exactly what an owner turn in the same chat is handed — the Main routing manifest
     and this chat's addressable roots — minus what is bound to an owner message (there
     is none). One seam over the owner path, so a wake can never drift from what the
-    host says is addressable: without the manifest every predecessor the wake names is
-    refused as "not addressable" and it cannot continue prior work at all.
+    host shows an owner turn: the manifest is the hint both decide from, while the
+    door judges the named result itself, listed or not.
     """
     facts = _decision_turn_metadata(ctx, int(chat_id or 0), "", {})
     return dict(facts) if isinstance(facts, dict) else {}
@@ -568,8 +585,10 @@ def _message_routing_receipt(ctx: Any, client_message_id: str) -> Dict[str, Any]
     except Exception:
         log.debug("message routing receipt lookup failed", exc_info=True)
         return {}
-    if not row:
-        return {}
+    return _receipt_fields(row) if row else {}
+
+
+def _receipt_fields(row: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "action": str(row.get("action") or ""),
         "target": str(row.get("target") or ""),
@@ -578,6 +597,25 @@ def _message_routing_receipt(ctx: Any, client_message_id: str) -> Dict[str, Any]
         "ts": str(row.get("ts") or ""),
         "project_id": str(row.get("project_id") or ""),
     }
+
+
+def _message_routing_acts(ctx: Any, client_message_id: str) -> list:
+    """Every routing act recorded for THIS owner message (latest row per act), oldest first.
+
+    The routing rail already keeps one receipt per (message, routing token); this
+    only reads it. Acts keyed to a synthetic ``agent-steer:*`` id or to another
+    task's id carry no link to this message and stay unlisted (a producer gap).
+    """
+    try:
+        from ouroboros.project_dialogue import _ANNOTATIONS_NAME, _latest_annotations_by_token
+
+        rows = [row for (message_id, _token), row in _latest_annotations_by_token(
+            pathlib.Path(ctx.DRIVE_ROOT) / "logs" / _ANNOTATIONS_NAME).items()
+            if message_id == str(client_message_id)]
+    except Exception:
+        log.debug("message routing acts lookup failed", exc_info=True)
+        return []
+    return [_receipt_fields(row) for row in sorted(rows, key=lambda row: str(row.get("ts") or ""))]
 
 
 def _scoped_task_metadata(project_id: str, task_metadata: Any) -> Any:
@@ -632,17 +670,33 @@ def _project_id_for_registered_chat(ctx: Any, chat_id: int) -> str:
     return ""
 
 
-def _reserved_project_for_chat(ctx: Any, chat_id: int) -> Dict[str, Any]:
-    try:
-        from ouroboros.projects_registry import list_reserved_projects
+def _main_lane_chat(chat_id: int) -> bool:
+    """Host-attested absence of a Project room, answered without the registry.
 
-        cid = int(chat_id or 0)
-        for project in list_reserved_projects(ctx.DRIVE_ROOT):
-            try:
-                if int(project.get("chat_id") or 0) == cid:
-                    return dict(project)
-            except (TypeError, ValueError):
-                continue
+    Ids below the Project floor are Main, hidden or A2A. A transport id shares
+    the numeric range, so only the positively bound external owner slot (written
+    by that transport's own slash command) proves its chat is the owner's Main;
+    any other id at or above the floor still needs the strict registry read.
+    """
+    from ouroboros.contracts.chat_id_policy import is_project_chat_id
+
+    cid = int(chat_id or 0)
+    if not is_project_chat_id(cid):
+        return True
+    try:
+        from supervisor.state import control_value, load_state
+
+        known, bound = control_value(load_state(), "owner_external_chat_id")
     except Exception:
-        log.debug("Reserved Project chat lookup failed", exc_info=True)
-    return {}
+        return False  # an unreadable binding proves nothing
+    return known and type(bound) is int and bound == cid
+
+
+def _reserved_project_for_chat(ctx: Any, chat_id: int) -> Dict[str, Any]:
+    """Execution routing requires positive absence, not an unavailable display lens."""
+    from ouroboros.project_admission import reserved_project_for_chat
+
+    cid = int(chat_id or 0)
+    if _main_lane_chat(cid):
+        return {}  # Host-attested: this chat cannot belong to a Project room.
+    return reserved_project_for_chat(ctx.DRIVE_ROOT, cid)

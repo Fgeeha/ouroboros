@@ -71,10 +71,11 @@ def test_output_rebind_preserves_the_same_canonical_tool_catalog(transport, monk
         assert first == second and current_wire_candidate().custom_catalog_sha256 == catalog
 
 
-def test_local_serving_window_uses_live_arguments_not_training_or_fallback():
+def test_local_serving_window_uses_live_arguments_not_training_or_fallback(monkeypatch):
     from types import SimpleNamespace
     from ouroboros.local_model import LocalModelManager
 
+    monkeypatch.delenv("OUROBOROS_IN_WORKER", raising=False)
     manager = LocalModelManager.__new__(LocalModelManager)
     manager._proc = None
     manager._status = "offline"

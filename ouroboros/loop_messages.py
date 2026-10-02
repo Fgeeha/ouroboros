@@ -53,14 +53,17 @@ def _emit_checkpoint_event(
     drive_logs: Optional[pathlib.Path],
     data: Dict[str, Any],
 ) -> bool:
-    """Emit a task_checkpoint via event queue or direct events.jsonl append."""
+    """Emit a checkpoint; an explicit System row also projects to chat history."""
     payload = {"type": "task_checkpoint", "task_id": task_id, **data}
     if event_queue is not None:
         _emit_live_log(event_queue, payload)
     elif drive_logs:
         try:
             from ouroboros.utils import append_jsonl, utc_now_iso
-            append_jsonl(drive_logs / "events.jsonl", {"ts": utc_now_iso(), **payload})
+            payload = {"ts": utc_now_iso(), **payload}
+            append_jsonl(drive_logs / "events.jsonl", payload)
+            if payload.get("system_type") == "task_checkpoint":
+                append_jsonl(drive_logs / "progress.jsonl", payload)
         except Exception:
             pass
 
@@ -241,15 +244,44 @@ def _record_owner_directive(
 
 
 def _initialize_owner_directives(ctx: Any, messages: List[Dict[str, Any]]) -> None:
-    """Capture the canonical initial user turn before system notices are added."""
+    """Capture the run's first user turn before system notices are added.
+
+    A task-authored objective copies its retained owner corpus, not the draft.
+    Other runs record the first user row, labelled only by what the host knows:
+    ``initial_user`` when the owner door stamped this run (``run_origin``'s
+    ``owner_ingress``), ``initial_text`` otherwise — a Presence event, a wake, a
+    schedule, a follow-up, a child's work order or an unmarked context. The bytes of
+    an owner row do not change, so ``owner_source_sha256`` stays what it was; the
+    label is read by the models that judge the corpus (acceptance, safety, the
+    post-task synthesis), never branched on by the host.
+    """
     existing = getattr(ctx, "_owner_directives", None)
     if isinstance(existing, list) and existing:
         return
+    metadata = getattr(ctx, "task_metadata", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    author = metadata.get("objective_author")
+    # A task-drafted objective, or the host's Continue work order (its facts are
+    # the host's; the owner's exact words ride ``owner_corpus``).
+    if isinstance(author, dict) and author.get("kind") in {"task", "continuation"}:
+        for row in metadata.get("owner_corpus") or []:
+            if isinstance(row, dict) and row.get("source") in {
+                    "owner_mailbox", "owner_quiz_answer", "origin_message", "owner_corpus", "direct_incoming",
+                    "initial_user"}:  # the routing turn's own stamped owner row (a suppressed origin)
+                _loop()._record_owner_directive(
+                    ctx, source=str(row["source"]), content=row.get("content"),
+                    msg_id=str(row.get("msg_id") or ""),
+                    origin={key: row[key] for key in ("source_task_id", "relayed_from_task_id") if row.get(key)},
+                )
+        return  # The task-drafted objective is never an owner directive.
     for message in messages:
         if isinstance(message, dict) and str(message.get("role") or "") == "user":
+            from ouroboros.dialogue_provenance import run_origin
+
+            stamped = run_origin({"metadata": metadata})["owner_ingress"]
             _loop()._record_owner_directive(
                 ctx,
-                source="initial_user",
+                source="initial_user" if stamped else "initial_text",
                 content=message.get("content"),
             )
             return

@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 from ouroboros.acceptance_settlement import forced_rail_panel_verdict
 from ouroboros.review_cycles import REASON_REVIEW_CYCLES_EXHAUSTED
 from ouroboros.review_projection import publish_acceptance_checkpoint
-from ouroboros.outcomes import ACCEPTANCE_ACCEPTED, ACCEPTANCE_BYPASS_REASONS, ACCEPTANCE_BYPASS_REASON_BY_RAIL, ACCEPTANCE_DECISION_STATUSES, ACCEPTANCE_FINALIZED_UNACCEPTED, ACCEPTANCE_REVISION_REQUESTED, REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE, REASON_DELIVERY_CONTROL_DEGRADED, REASON_IDENTICAL_ACCEPTANCE_REFUSED, extract_final_answer, turn_has_reviewable_effects
+from ouroboros.outcomes import ACCEPTANCE_ACCEPTED, ACCEPTANCE_BYPASS_REASONS, ACCEPTANCE_BYPASS_REASON_BY_RAIL, ACCEPTANCE_DECISION_STATUSES, ACCEPTANCE_FINALIZED_UNACCEPTED, ACCEPTANCE_REVISION_REQUESTED, REASON_ACCEPTANCE_PREPARATION_FAILED, REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE, REASON_DELIVERY_CONTROL_DEGRADED, REASON_IDENTICAL_ACCEPTANCE_REFUSED, extract_final_answer, turn_has_reviewable_effects
 from ouroboros.tools.registry import ToolRegistry
 from ouroboros.utils import truncate_review_artifact
 
@@ -199,7 +199,7 @@ def _end_task_acceptance_fence(ctx: Any, *, outcome: str, admission_locked: bool
     if getattr(ctx, "_acceptance_review_only", False) and outcome != "revision":
         outcome = "revision"  # Early feedback never closes the root's future work.
     token = getattr(ctx, "_task_acceptance_fence_token", None)
-    if token is None and str(outcome) == "revision":
+    if token is None and str(outcome) in {"revision", "author_stop"}:
         token = getattr(ctx, "_task_acceptance_sealed_fence_token", None)
     callback = getattr(ctx, "end_acceptance_fence", None)
     admission_lock = getattr(ctx, "owner_message_admission_lock", None)
@@ -231,6 +231,8 @@ def _end_task_acceptance_fence(ctx: Any, *, outcome: str, admission_locked: bool
             ctx._task_acceptance_fence_generation_mismatch = generation_mismatch
             return FenceOutcome(op="end")
         expected_queue_generation = getattr(ctx, "_task_acceptance_fence_generation", None)
+        if expected_queue_generation is None and token == getattr(ctx, "_task_acceptance_sealed_fence_token", None):
+            expected_queue_generation = getattr(ctx, "_task_acceptance_sealed_fence_generation", None) or 0
         result, response = _fence_request(
             ctx, "end", callback, token=token, outcome=effective_outcome,
             **({} if expected_queue_generation is None else {"expected_generation": int(expected_queue_generation)}),
@@ -250,6 +252,7 @@ def _end_task_acceptance_fence(ctx: Any, *, outcome: str, admission_locked: bool
     if result:
         sealed = status == "sealed" or (not status and effective_outcome != "revision")
         ctx._task_acceptance_sealed_fence_token = token if sealed else None
+        ctx._task_acceptance_sealed_fence_generation = expected_queue_generation if sealed else None
     return result
 
 
@@ -265,9 +268,13 @@ def _supersede_delivery_acceptance_binding(
     The run remains in ``review_runs`` as audit evidence, but neither the
     candidate nor ``review_decision`` may keep pointing at it after answer text
     or answer-invalidating evidence changes.  Negative superseded verdicts stay
-    available to the outcome reducer's fail-closed path.
+    available to the outcome reducer's fail-closed path. An honoured author stop
+    binds no candidate or evidence, so it is never superseded here (TZ-2 C4).
     """
+    from ouroboros.review_records import recorded_author_stop
 
+    if recorded_author_stop(llm_trace.get("acceptance_decision")):
+        return False
     decision = (
         dict(llm_trace.get("review_decision") or {})
         if isinstance(llm_trace.get("review_decision"), dict)
@@ -351,6 +358,7 @@ def _supersede_task_acceptance_for_owner_followup(
     admission_locked: bool = False,
 ) -> bool:
     """Release finalization for Main to consume new input, retaining paid evidence."""
+    llm_trace.pop("task_completion", None)
     released = _loop()._end_task_acceptance_fence(
         ctx, outcome="revision", admission_locked=admission_locked,
     )
@@ -420,8 +428,14 @@ def _supersede_task_acceptance_for_evidence_change(
     messages: List[Dict[str, Any]],
     emit_progress: Callable[[str], None],
 ) -> None:
-    """Invalidate an acceptance boundary when frozen evidence changes before delivery."""
+    """Invalidate an acceptance boundary when frozen evidence changes before delivery.
 
+    An honoured author stop is no such boundary: only the author's next decision
+    or owner input reopens it (TZ-2 C4)."""
+    from ouroboros.review_records import recorded_author_stop
+
+    if recorded_author_stop(llm_trace.get("acceptance_decision")):
+        return
     if isinstance(run_record, dict):
         run_record["superseded_by_revision"] = True
         run_record["superseded_reason"] = reason
@@ -611,6 +625,9 @@ ACCEPTANCE_DECISION_REASONS = (
     "author_finish",
     "author_stop",
     "review_outcome_received",
+    # #1223: the host could not assemble the acceptance evidence locally, before
+    # any reviewer existed. Its own cause, never a reviewer verdict or rework.
+    REASON_ACCEPTANCE_PREPARATION_FAILED,
     "admission_close_unconfirmed",  # owner 2A: blocking, clean PASS, the supervisor never confirmed the close
     # An explicit author stop can retain the wallet's exhausted-cycle reason.
     REASON_REVIEW_CYCLES_EXHAUSTED,
@@ -618,8 +635,8 @@ ACCEPTANCE_DECISION_REASONS = (
     # obligation disposition, so the recorded verdict was replayed for free.
     REASON_IDENTICAL_ACCEPTANCE_REFUSED,
     REASON_DELIVERY_CONTROL_DEGRADED,
-    # Owner Q2A: the forced children_unabsorbed rail runs the panel but cannot
-    # grant a requested improvement pass; the dangling revision terminalizes.
+    # Real forced rails cannot buy an improvement pass; a dangling revision
+    # terminalizes. Historical child-reminder outcomes remain readable.
     "revision_unavailable_on_forced_rail",
     REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE,
     # Forced-rail acceptance bypass (closed set, outcomes.py SSOT): stamped by
@@ -637,7 +654,8 @@ def _set_acceptance_decision(llm_trace: Dict[str, Any], decision: Dict[str, Any]
     ``reason`` naming WHICH exit. A status outside the trio fails closed to
     ``finalized_unaccepted`` with its raw token surviving as ``reason`` — no
     fourth state, no lost token. The author's historical stance survives;
-    owner/evidence supersession consumes its controlling finish intent."""
+    owner/evidence supersession consumes its controlling finish intent and act,
+    so a later host exit never re-reads an earlier stop as its own (TZ-2 C4)."""
     previous = llm_trace.get("acceptance_decision") if isinstance(llm_trace.get("acceptance_decision"), dict) else {}
     merged = dict(decision)
     merged.setdefault("enforcement", _loop().get_review_enforcement())
@@ -647,14 +665,34 @@ def _set_acceptance_decision(llm_trace: Dict[str, Any], decision: Dict[str, Any]
         merged["status"] = ACCEPTANCE_FINALIZED_UNACCEPTED
         reason = reason or status or ACCEPTANCE_REASON_UNSPECIFIED
     merged["reason"] = reason
-    for key in ("agent_disposition", "agent_rationale", "author_disposition", "author_action"):
+    superseded = reason in {"owner_followup", "evidence_refresh"}
+    for key in ("agent_disposition", "agent_rationale", "author_disposition") + (() if superseded else ("author_action",)):
         if previous.get(key) and not merged.get(key):
             merged[key] = previous.get(key)
-    if reason not in {"owner_followup", "evidence_refresh", "author_finish", "author_stop"} and not (
+    if not superseded and reason not in {"author_finish", "author_stop"} and not (
         reason == "delivery_binding_superseded" and previous.get("reason") == "author_finish"
     ) and not merged.get("author_disposition") and previous.get("agent_finish_intent"):
         merged["agent_finish_intent"] = previous["agent_finish_intent"]
+    # #1224: while the host's own LOCAL acceptance preparation is unresolved, every
+    # decision carries that fact, so a rail's cause and the local failure are both
+    # stated instead of one replacing the other. A resolved incident stops riding
+    # along (its history stays on the trace), and an explicit one always wins.
+    if not merged.get("acceptance_incident"):
+        from ouroboros.acceptance_preparation import STATUS_FAILED, incident_projection
+
+        record = llm_trace.get("acceptance_preparation")
+        if isinstance(record, dict) and str(record.get("status") or "") == STATUS_FAILED:
+            merged["acceptance_incident"] = incident_projection(record)
+    incident = merged.get("acceptance_incident") or {}
+    if incident.get("status") == "failed" and incident.get("stage") == "preparation":
+        from ouroboros.acceptance_preparation import LOCAL_PREPARATION_ORIGIN
+
+        merged.setdefault("origin", LOCAL_PREPARATION_ORIGIN)
     llm_trace["acceptance_decision"] = merged
+    from ouroboros.acceptance_preparation import TASK_ONLY_ORIGINS
+
+    if merged.get("origin") in TASK_ONLY_ORIGINS:
+        return  # A host processing failure is no panel's applied reviewer decision.
     # A full applied-review source includes the host's actual decision, not
     # only the provider's earlier response. The decision above stays authority.
     for run in reversed(llm_trace.get("review_runs") or []):
@@ -668,6 +706,7 @@ def _set_acceptance_decision(llm_trace: Dict[str, Any], decision: Dict[str, Any]
 
 def merge_agent_acceptance_stance(trace: Dict[str, Any], decision: dict, ctx: Any) -> None:
     """Record one explicit stance after feedback, separately from the host verdict."""
+    observed = decision.get("observation")
     previous = trace.get("acceptance_decision")
     merged = dict(previous) if isinstance(previous, dict) else {}
     merged.setdefault("source", "agent_task_acceptance_review_tool")
@@ -682,16 +721,46 @@ def merge_agent_acceptance_stance(trace: Dict[str, Any], decision: dict, ctx: An
     outcome = trace.get("acceptance_review_outcome") or {}
     if not feedback and outcome.get("feedback_delivered"):
         feedback = outcome
-    if ctx is not None and (feedback or action == "stop") and decision.get("explicit_finish") is True and merged["agent_rationale"].strip():
-        from ouroboros.loop_delivery import delivery_evidence_fingerprint
+    if isinstance(observed, dict):
+        feedback = observed.get("feedback") or None
+    explicit = ctx is not None and decision.get("explicit_finish") is True and bool(merged["agent_rationale"].strip())
+    from ouroboros.acceptance_preparation import STATUS_FAILED, preparation_exposed
+
+    incident = observed.get("preparation") if isinstance(observed, dict) else trace.get("acceptance_preparation")
+    exposed_incident = (isinstance(incident, dict) and str(incident.get("status") or "") == STATUS_FAILED
+                        and preparation_exposed(incident))
+    if explicit and exposed_incident:
+        # An exposed LOCAL preparation failure binds the stance to the MATERIAL
+        # and the ATTEMPT it was informed about: there is no reviewer binding to
+        # bind to, and the author must not be routed back through the broken
+        # builder — or the same failing evidence fingerprint — in order to
+        # finish or stop. Its own branch, so no fallible computation sits here.
+        from ouroboros.loop_messages import owner_source_sha256
+
+        merged["agent_finish_intent"] = {
+            "author_action": action,
+            "preparation_identity": str(incident.get("source_identity") or ""),
+            "incident_id": str(incident.get("incident_id") or ""),
+            "incident_attempt": int(incident.get("attempts") or 0),
+            "candidate_sha256": str(getattr(getattr(ctx, "_delivery_candidate", None), "content_sha256", "")),
+            "owner_source_sha256": owner_source_sha256(ctx),
+        }
+    elif explicit and (feedback or action == "stop"):
+        from ouroboros.loop_delivery import observed_delivery_evidence
 
         merged["agent_finish_intent"] = {
             "review_binding_hash": str((feedback or {}).get("binding_hash") or ""),
             "author_action": action,
-            "tool_count": len(trace.get("tool_calls") or []),
-            "owner_directives": len(getattr(ctx, "_owner_directives", []) or []),
-            "evidence_fingerprint": delivery_evidence_fingerprint(ctx, trace),
+            "tool_count": observed.get("tool_count") if isinstance(observed, dict) else len(trace.get("tool_calls") or []),
+            "owner_directives": observed.get("owner_directives") if isinstance(observed, dict) else len(getattr(ctx, "_owner_directives", []) or []),
+            # UNKNOWN ("") binds to nothing: the host pass compares it against a
+            # fresh read, so an unverifiable stance is never honoured as ready.
+            "evidence_fingerprint": observed.get("evidence_fingerprint", "") if isinstance(observed, dict) else observed_delivery_evidence(ctx, trace),
         }
+    from ouroboros.review_records import recorded_author_stop
+
+    if merged.get("agent_finish_intent") and recorded_author_stop(previous):
+        ctx._task_acceptance_reviewed = False  # the author's next decision reopens an honoured stop
     trace["acceptance_decision"] = merged
 
 
@@ -872,8 +941,10 @@ def _format_obligations_clause(open_obligations: List[Dict[str, Any]]) -> str:
         return ""
     lines = [
         "",
-        "OPEN OBLIGATIONS (blocking review policy). Either FIX the work so the next review "
-        "panel finds it clean, or record your disagreement via the task_acceptance_review "
+        "OPEN OBLIGATIONS (blocking review policy). FIX the requirement by repair or by a "
+        "means you are authorized to change, with evidence it still holds; owner- and "
+        "parent-fixed methods stay binding. Or record disagreement about a finding or its "
+        "current applicability via the task_acceptance_review "
         "tool's obligation_dispositions (addressed / rejected / deferred + reason) — "
         "dispositions are the ONLY channel the reviewer adjudicates:",
     ]
@@ -914,11 +985,24 @@ def terminalize_dangling_revision(llm_trace: Dict[str, Any], *, rail: str) -> bo
     if str(decision.get("status") or "") != ACCEPTANCE_REVISION_REQUESTED:
         return False
     prior = str(decision.get("reason") or "") or ACCEPTANCE_REASON_UNSPECIFIED
+    # A revision that came from the HOST's own local preparation failure is not a
+    # reviewer's rework request, so it must not terminalize as one: the record
+    # would read "the requested rework never happened" with no reviewer in it
+    # (#1224). It keeps its own cause, and the rail is named beside it — the
+    # rationale here, and the owner-facing clause through `acceptance_incident`.
+    local_failure = prior == REASON_ACCEPTANCE_PREPARATION_FAILED
     _loop()._set_acceptance_decision(llm_trace, {
         "status": ACCEPTANCE_FINALIZED_UNACCEPTED,
-        "reason": "revision_unavailable_on_forced_rail",
+        "reason": REASON_ACCEPTANCE_PREPARATION_FAILED if local_failure
+                  else "revision_unavailable_on_forced_rail",
+        **({"origin": "local_acceptance_preparation"} if local_failure else {}),
+        **({"acceptance_incident": decision["acceptance_incident"]}
+           if local_failure and decision.get("acceptance_incident") else {}),
         "source": "forced_finalization",
         "rationale": (
+            f"Acceptance evidence could not be assembled locally; the forced {rail} rail "
+            "then ended the task. No reviewer rework was requested."
+            if local_failure else
             f"The acceptance decision was {prior}; the forced {rail} rail cannot "
             "take another model round."
         ),
@@ -954,6 +1038,7 @@ def _record_forced_acceptance_bypass(
     tools_ctx = getattr(getattr(ctx, "tools", None), "_ctx", None)
     if tools_ctx is None:
         return
+    from ouroboros.acceptance_history import seed_acceptance_history
     # A recorded host decision (canonical status, NOT the status-less agent
     # stance merged on a deferral) wins; the bypass record exists only for the
     # no-host-verdict shape; `_set_acceptance_decision` stamps.
@@ -963,6 +1048,8 @@ def _record_forced_acceptance_bypass(
         # take the pass it promised, so close it instead of leaving it dangling.
         terminalize_dangling_revision(llm_trace, rail=str(reason_code or ""))
         publish_acceptance_checkpoint(tools_ctx, llm_trace, task_id=ctx.task_id)
+        if decision.get("status") != "accepted":
+            seed_acceptance_history(tools_ctx, llm_trace, rail_reason)
         return
     if getattr(tools_ctx, "_task_acceptance_reviewed", False):
         return
@@ -998,3 +1085,4 @@ def _record_forced_acceptance_bypass(
         "source": "forced_finalization",
         **forced_rail_panel_verdict(tools_ctx, llm_trace, rail_reason),
     })
+    seed_acceptance_history(tools_ctx, llm_trace, rail_reason)

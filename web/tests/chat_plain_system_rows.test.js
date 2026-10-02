@@ -219,7 +219,7 @@ function makeInstance(mount) {
     };
     let generation = 0;
     const stateSnapshots = {
-        begin: () => ({ generation: ++generation, requestedAt: Date.now() }),
+        begin: () => ({ generation: ++generation, requestedAt: Date.now() }), gate() { return Promise.resolve(this.begin()); },
         isCurrent: () => true,
         apply() {},
     };
@@ -285,7 +285,7 @@ test('plain project row renders escaped text with the Project reference and no m
         const message = bubble.querySelector('.message');
         const actions = bubble.children.find((node) => node.classList.contains('system-message-actions'));
         assert.equal(message.contains(actions), false);
-        assert.equal(bubble.children.indexOf(actions), bubble.children.indexOf(message) + 1);
+        assert.equal(bubble.children.indexOf(actions), bubble.children.indexOf(message) + 2);
         assert.ok(actions, 'system-message-actions container present');
         // The row points at its Project with the one reference, never a button of its own.
         assert.deepEqual(referenceShape(actions.children[0]), LAUNCH_REFERENCE);
@@ -322,7 +322,7 @@ test('a completion row carrying the answer renders as an ordinary Ouroboros mess
         assert.doesNotMatch(bubble.innerHTML, /Open the Project for details|Completed/);
         const message = bubble.querySelector('.message');
         const actions = bubble.children.find((node) => node.classList.contains('system-message-actions'));
-        assert.equal(bubble.children.indexOf(actions), bubble.children.indexOf(message) + 1);
+        assert.equal(bubble.children.indexOf(actions), bubble.children.indexOf(message) + 2);
         // One control, and the SAME one the System row carries: the voice of a row never
         // chooses how the UI points at its Project.
         assert.equal(actions.children.length, 1);
@@ -402,7 +402,7 @@ test('the fold is CSS over the complete answer: clamp always, fade only when fol
     assert.match(rules, /\.chat-bubble\.project-answer\.is-folded > \.message \{[^}]*mask-image/);
     assert.doesNotMatch(rules, /user-select|font-size: \d|#[0-9a-fA-F]{3,6}\b/);
     // chat.js stays a caller: the decoration lives in its own module.
-    assert.match(chatSource, /decorateProjectRow\(bubble, \{ role, projectId, projectName \}\)/);
+    assert.match(chatSource, /decorateProjectRow\(bubble, \{ role, projectId, projectName,/);
 });
 
 test('plain system row renders identically live and after history reload', async () => {
@@ -662,11 +662,14 @@ test('render arm order and enhancement guard are pinned in source', () => {
     );
 });
 
-test('chat bubble heading clamp is scoped in style.css', () => {
-    // Inside chat bubbles every markdown heading is a subsection label at body
-    // size (DESIGN.md §2); the global md-h1 page-size rule stays for non-chat
-    // surfaces, and the live-card timeline carries its own inline clamp.
+test('chat bubble heading ladder is scoped in style.css', () => {
+    // Only a full rich answer (`.message.ui-rich-content`) follows the reading
+    // ladder (DESIGN.md §1, §5); compact Markdown in a bubble (a Skill Review
+    // report) keeps every heading a body-size semibold label; the global md-h1
+    // page-size rule stays for non-chat surfaces, and the live-card timeline
+    // carries its own inline clamp.
     assert.match(styleSource, /\.chat-bubble \.message \.md-h1,\n\.chat-bubble \.message \.md-h2,\n\.chat-bubble \.message \.md-h3 \{\n\s+font-size: var\(--type-body\);\n\s+font-weight: 600;\n\}/);
+    assert.match(styleSource, /\n\.chat-bubble \.message:where\(\.ui-rich-content\) :is\(\.md-h1, \.md-h2\) \{ font-size: var\(--md-heading-major\); \}\n\.chat-bubble \.message:where\(\.ui-rich-content\) \.md-h3 \{ font-size: var\(--md-heading-minor\); \}\n/);
     // The timeline label follows its row's size: collapsed rows are meta size,
     // an expanded row is body size (DESIGN.md §5, "summary outranks details").
     // Unambiguous block scan (indent, then a non-space start): the `(\s+[^\n]+\n)*`
@@ -678,7 +681,7 @@ test('chat bubble heading clamp is scoped in style.css', () => {
     assert.match(styleSource, decl('\\.chat-live-line-title', 'font-size: var\\(--type-meta\\);'));
     assert.match(styleSource, decl('\\.chat-live-line\\[data-expanded="1"\\] \\.chat-live-line-body', 'font-size: var\\(--type-body\\);'));
     assert.match(styleSource, decl('\\.chat-live-activity', 'font-size: var\\(--type-body\\);'));
-    // The rich bubble renderer demotes h4-h6 to the smallest label so the clamp reaches them.
+    // The rich bubble renderer gives h4-h6 the smallest label class, as the compact one demotes them.
     const richSource = readFileSync(new URL('../modules/chat_markdown.js', import.meta.url), 'utf8');
     assert.match(richSource, /querySelectorAll\('h1, h2, h3, h4, h5, h6'\)[\s\S]{0,160}Math\.min\(Number\(heading\.tagName\.slice\(1\)\), 3\)/);
 });

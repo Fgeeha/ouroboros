@@ -224,7 +224,7 @@ def test_architecture_mentions_shared_log_grouping_and_direct_provider_review_fa
     # silently re-expand to claim symmetric coverage it does not have yet.
     assert "Direct-provider review fallback" in arch
     assert "OpenAI-only review fallback" in arch  # legacy name still referenced for discoverability
-    assert "official OpenAI, Anthropic, MiniMax, DeepSeek, Cloud.ru, and GigaChat" in arch
+    assert "official OpenAI, Anthropic, MiniMax, DeepSeek, Z.ai, Cloud.ru, and GigaChat" in arch
     assert "_exclusive_direct_remote_provider_env" in arch
     # v4.34.0: direct-provider fallback now documents the
     # `main_model.startswith(provider_prefix)` guard in get_review_models —
@@ -308,9 +308,9 @@ def test_chat_id_addressing_docs_match_the_code_that_routes_it():
     # A degraded delivery names its own cause. The doc must keep saying which
     # code each rail actually produces — the forced rail keeps its own — rather
     # than renaming one after the other.
-    assert "which is this" in arch and "forced rail's own code" in arch
-    assert "the ordinary repair path records `invalid_delivery_control_after_repair`" in arch
-    assert "falls back to `delivery_control_degraded` only for a" in arch
+    assert 'finish_task(action="finish"|"stop", answer=...|answer_sha256=...)' in arch
+    assert "reminders no longer force completion" in arch
+    assert "host_salvage" in arch and "provider-death rail" in arch
     design = _read("docs/DESIGN.md")
     assert "Where a card does show a cause, it says it in the owner's" in design
     assert "the record keeps the machine code" in design
@@ -325,11 +325,12 @@ def test_consciousness_prompt_is_the_wake_message_of_an_ordinary_main_turn():
     is its USER message: no private capability catalog, no round or interval limits."""
     consciousness = _read("prompts/CONSCIOUSNESS.md")
 
-    assert consciousness.startswith("[Wake-up · {reason}]")
-    assert "Doing nothing is a fine outcome" in consciousness
-    assert "`set_next_wakeup`" in consciousness and "`escalate`" in consciousness
-    assert "recent_tasks" in consciousness
-    for retired in ("You can:", "up to 10 rounds", "Default wakeup", "background consciousness mode"):
+    assert consciousness.startswith("You are Ouroboros. No one has asked for a task; this turn is yours.")
+    assert "A pause is a legitimate decision" in consciousness
+    assert "Distinguish incremental cash cost from subscription quota" in consciousness
+    assert "ordinary turn, not an assigned deliverable" in consciousness
+    for retired in ("You can:", "up to 10 rounds", "Default wakeup", "background consciousness mode",
+                    "Doing nothing is a fine outcome", "`set_next_wakeup`", "`escalate`"):
         assert retired not in consciousness, retired
 
 

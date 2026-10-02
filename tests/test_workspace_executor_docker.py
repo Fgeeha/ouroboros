@@ -20,7 +20,7 @@ import pytest
 from ouroboros.tools.registry import ToolContext, ToolRegistry
 from ouroboros.workspace_executor import execute, normalize_executor_ref
 
-from tests._workspace_executor_shared import _init_repo
+from tests._workspace_executor_shared import _init_repo, fake_docker_cli
 
 
 def test_docker_executor_stop_failure_preserves_service_handle(tmp_path, monkeypatch):
@@ -60,7 +60,7 @@ def test_docker_executor_stop_failure_preserves_service_handle(tmp_path, monkeyp
             return subprocess.CompletedProcess(cmd, 0, stdout="running\n", stderr="")
         raise AssertionError(cmd)
 
-    monkeypatch.setattr(workspace_executor.subprocess, "run", fake_run)
+    fake_docker_cli(monkeypatch, fake_run)
     workspace_executor.start_service(
         ctx,
         name="svc",
@@ -377,7 +377,7 @@ def test_docker_executor_stop_success_without_terminal_kill_preserves_handle(tmp
             return subprocess.CompletedProcess(cmd, 0, stdout="running\n", stderr="")
         raise AssertionError(cmd)
 
-    monkeypatch.setattr(workspace_executor.subprocess, "run", fake_run)
+    fake_docker_cli(monkeypatch, fake_run)
     workspace_executor.start_service(
         ctx,
         name="svc",
@@ -431,7 +431,7 @@ def test_docker_executor_stop_unknown_probe_preserves_handle(tmp_path, monkeypat
             return subprocess.CompletedProcess(cmd, 7, stdout="", stderr="daemon unavailable")
         raise AssertionError(cmd)
 
-    monkeypatch.setattr(workspace_executor.subprocess, "run", fake_run)
+    fake_docker_cli(monkeypatch, fake_run)
     workspace_executor.start_service(
         ctx,
         name="svc",
@@ -484,7 +484,7 @@ def test_docker_executor_stop_state_exception_preserves_handle(tmp_path, monkeyp
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
         raise AssertionError(cmd)
 
-    monkeypatch.setattr(workspace_executor.subprocess, "run", fake_run)
+    fake_docker_cli(monkeypatch, fake_run)
     monkeypatch.setattr(workspace_executor, "_service_state", lambda _record: (_ for _ in ()).throw(RuntimeError("probe boom")))
     workspace_executor.start_service(
         ctx,
@@ -539,7 +539,7 @@ def test_docker_executor_global_cleanup_unknown_state_keeps_handle(tmp_path, mon
             return subprocess.CompletedProcess(cmd, 7, stdout="", stderr="daemon unavailable")
         raise AssertionError(cmd)
 
-    monkeypatch.setattr(workspace_executor.subprocess, "run", fake_run)
+    fake_docker_cli(monkeypatch, fake_run)
     workspace_executor.start_service(
         ctx,
         name="svc",
@@ -630,3 +630,101 @@ def test_docker_durable_cleanup_keeps_record_on_unknown_kill_zero(tmp_path, monk
     assert result[0]["state"] == "cleanup_pending"
     assert result[0]["cleanup_dispatched"] is False
     assert path.exists()
+
+
+def test_service_submission_spawns_a_real_process_inside_the_pause_gate_and_waits_after(monkeypatch):
+    """The genuine ``Popen`` path under the fake CLI: a real local process is
+    submitted while the owner Pause gate is held and reaped once it is released."""
+    import contextlib
+    import sys
+
+    import ouroboros.owner_pause as owner_pause
+    import ouroboros.workspace_executor as workspace_executor
+
+    held, events = [False], []
+    real_start = owner_pause.operation_start
+
+    @contextlib.contextmanager
+    def observed_start(*args, **kwargs):
+        with real_start(*args, **kwargs):
+            held[0] = True
+            try:
+                yield
+            finally:
+                held[0] = False
+
+    class ObservedPopen(subprocess.Popen):
+        def __init__(self, *args, **kwargs):
+            events.append(("spawn", held[0]))
+            super().__init__(*args, **kwargs)
+
+        def communicate(self, *args, **kwargs):
+            events.append(("wait", held[0]))
+            return super().communicate(*args, **kwargs)
+
+    monkeypatch.setattr(owner_pause, "operation_start", observed_start)
+    monkeypatch.setattr(workspace_executor.subprocess, "Popen", ObservedPopen)
+    completed = workspace_executor._submit_service_command(
+        [sys.executable, "-c", "import sys; print('12345'); sys.stderr.write('warn'); sys.exit(3)"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+
+    assert events == [("spawn", True), ("wait", False)]
+    assert (completed.returncode, completed.stdout, completed.stderr) == (3, "12345\n", "warn")
+
+
+def test_docker_service_start_refused_by_pause_during_preparation_sends_no_start(tmp_path, monkeypatch):
+    """A Pause accepted while the backend is being checked refuses the submission:
+    no ``docker exec`` start exists, no handle is kept and the call proves no effect."""
+    import ouroboros.workspace_executor as workspace_executor
+    from ouroboros import owner_pause
+    from ouroboros.task_results import write_task_result
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    data = tmp_path / "data"
+    data.mkdir()
+    write_task_result(data, "root", "running", root_task_id="root")
+    ctx = ToolContext(
+        repo_dir=tmp_path / "repo",
+        drive_root=data,
+        workspace_root=workspace,
+        workspace_mode="external",
+        task_id="root",
+        executor_ref={
+            "type": "docker_exec",
+            "id": "pb-container",
+            "container_name": "pb-container",
+            "network": "none",
+            "workspace_host_path": str(workspace),
+            "workspace_backend_path": "/workspace",
+        },
+    )
+    ctx.root_task_id = "root"
+    workspace_executor._SERVICES.clear()
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append([str(part) for part in cmd])
+        if cmd[:3] == ["docker", "inspect", "-f"]:
+            owner_pause.install_fence(data, "root", request_id="during-preparation")
+            return subprocess.CompletedProcess(cmd, 0, stdout="none\n", stderr="")
+        raise AssertionError(cmd)
+
+    fake_docker_cli(monkeypatch, fake_run)
+    with owner_pause.tool_handoff(ctx, "start_service") as outcome:
+        with pytest.raises(owner_pause.OwnerPauseRefused, match="owner_pause"):
+            workspace_executor.start_service(
+                ctx,
+                name="svc",
+                cmd=["sleep", "30"],
+                host_cwd=workspace,
+                cwd_root="active_workspace",
+                readiness={},
+                outputs=[],
+                before_outputs={},
+            )
+
+    assert [call[:2] for call in calls] == [["docker", "inspect"]]
+    assert outcome["not_started"] is True
+    assert workspace_executor.service_status(ctx, "svc") is None

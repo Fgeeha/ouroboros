@@ -6,6 +6,7 @@ import json
 import re
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
+from functools import wraps
 from types import MappingProxyType
 from typing import Any, Literal, Mapping
 
@@ -351,6 +352,21 @@ TOOL_CODE_SPECS: Mapping[str, ToolCodeSpec] = MappingProxyType(
             "warning",
             "follow the refusal text",
         ),
+        # The owner paused the tree before this call's launch handoff
+        # (ouroboros/owner_pause.py): nothing ran — distinct from a timeout or an
+        # interrupted call whose execution is unknown.
+        "OWNER_LAUNCH_AUTHORITY_UNAVAILABLE": _code_spec(
+            "unavailable", "unavailable", "warning", "retry when launch authority is available",
+        ),
+        "STOP_ACTION_CONFLICT": _code_spec(
+            "blocked", "blocked", "warning", "retry the original Stop action unchanged",
+        ),
+        "OWNER_PAUSE_NOT_STARTED": _code_spec(
+            "blocked",
+            "blocked",
+            "info",
+            "issue the call again after the owner resumes the task",
+        ),
         "CAPABILITY_UNAVAILABLE": _code_spec(
             "unavailable",
             "unavailable",
@@ -496,12 +512,25 @@ TOOL_CODE_SPECS: Mapping[str, ToolCodeSpec] = MappingProxyType(
 
 @dataclass(frozen=True)
 class ToolResult:
-    """Internal result; ``text`` remains the complete model-facing projection."""
+    """Internal result; ``text`` includes notes, ``producer_text`` never does.
+
+    Producer text is captured only when the host adds annotations, before any
+    composition. It is not bounded metadata and is never reconstructed from text.
+
+    Optional producer fact: ``meta.operation_outcome="completed_no_effect"``
+    describes a pre-effect refusal or completed read; ``completed`` describes
+    a foreground process exit, including nonzero. Neither metadata nor business
+    success grants custody settlement: the host observes handler unwind/join,
+    while independent process, receipt, model and delegated owners retain their
+    own unfinished work. Missing metadata does not keep a joined local call live.
+    """
 
     status: ToolStatus
     code: str
     text: str
     meta: Mapping[str, Any] = field(default_factory=dict)
+    producer_text: str | None = None
+    host_annotations: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.code, str) or not _CODE_RE.fullmatch(self.code):
@@ -513,6 +542,12 @@ class ToolResult:
             raise ValueError(f"status {self.status!r} does not match {self.code} ({spec.status!r})")
         if not isinstance(self.text, str):
             raise TypeError("tool result text must be a string")
+        if self.producer_text is not None and not isinstance(self.producer_text, str):
+            raise TypeError("tool producer text must be a string or None")
+        if not isinstance(self.host_annotations, tuple) or any(
+            not isinstance(note, str) for note in self.host_annotations
+        ):
+            raise TypeError("host annotations must be a tuple of strings")
         raw_meta = dict(self.meta or {})
         if any(not isinstance(key, str) for key in raw_meta):
             raise ValueError("tool result meta keys must be strings")
@@ -566,6 +601,8 @@ def _replace_tool_result(
         code=selected_code,
         text=result.text if text is None else text,
         meta=meta,
+        producer_text=result.producer_text,
+        host_annotations=result.host_annotations,
     )
 
 
@@ -607,6 +644,67 @@ def _restore_tool_result_sidecar(token: Token) -> None:
     _TOOL_RESULT_STATE.reset(token)
 
 
+def publish_no_effect(ctx: Any, result: str | ToolResult, *, tool_name: str = "") -> str:
+    """Publish a producer-proven refusal before this invocation's first effect.
+
+    Call only at the validation boundary, never on a generic error/timeout path.
+    Preserve typed classification/text; this outcome fact grants no custody settlement.
+    """
+    prior = _published_tool_result(ctx, None)
+    typed = result if isinstance(result, ToolResult) else (
+        prior if isinstance(prior, ToolResult) and prior.text == result
+        else LegacyTextResultAdapter.from_text(tool_name, result))
+    return _publish_tool_result(ctx, _replace_tool_result(
+        typed, meta_updates={"operation_outcome": "completed_no_effect"}))
+
+
+def completed_local_read(handler):
+    """Publish completion from a synchronous first-party reader's returned body.
+
+    Only producers with no external work/effects to settle may use this. A
+    warning, refusal or partial read is still a completed read, not permission
+    to retry unknown work. Escaping exceptions publish no completion fact.
+    Preserve the text ABI and any existing typed result/annotations exactly.
+    """
+    @wraps(handler)
+    def read(ctx, *args, **kwargs):
+        sentinel = object()
+        token = _install_tool_result_sidecar(ctx, sentinel)
+        try:
+            result = handler(ctx, *args, **kwargs)
+            published = _published_tool_result(ctx, sentinel)
+        finally:
+            _restore_tool_result_sidecar(token)
+        typed = result if isinstance(result, ToolResult) else (
+            published if isinstance(published, ToolResult) and published.text == result
+            else LegacyTextResultAdapter.from_text(handler.__name__, result))
+        typed = _replace_tool_result(typed, meta_updates={"operation_outcome": "completed_no_effect"})
+        return typed if isinstance(result, ToolResult) else _publish_tool_result(ctx, typed)
+    return read
+
+
+def launch_refusal_result(reason: str, *, completed_no_effect: bool = False) -> ToolResult:
+    """An unsent operation; only its producer can attest completed preparation."""
+    from ouroboros.owner_pause import NOT_STARTED_TEXT
+
+    unavailable = reason == "owner_launch_authority_unavailable"
+    code = "OWNER_LAUNCH_AUTHORITY_UNAVAILABLE" if unavailable else "OWNER_PAUSE_NOT_STARTED"
+    if unavailable:
+        text = ("⚠️ OWNER_LAUNCH_AUTHORITY_UNAVAILABLE: NOT STARTED — launch authority is temporarily "
+                "unavailable. Nothing was submitted; retry when authority is available.")
+    elif reason in {"owner_pause_authority_unreadable", "model_sleep_authority_unreadable"}:
+        text = ("⚠️ OWNER_PAUSE_NOT_STARTED: NOT STARTED — pause/sleep authority could not be read. "
+                "Nothing was submitted; repair the authority before retrying.")
+    elif reason == "operation_already_returned":
+        text = "⚠️ OWNER_PAUSE_NOT_STARTED: NOT STARTED — this operation has ended; it cannot submit more work."
+    else:
+        text = NOT_STARTED_TEXT
+    return ToolResult(status="unavailable" if unavailable else "blocked", code=code,
+                      text=f"{text} ({reason})", meta={"owner_pause_not_started": True,
+                      "control_reason": reason, **({"operation_outcome": "completed_no_effect"}
+                                                   if completed_no_effect else {})})
+
+
 def _publish_process_result(
     ctx: Any,
     code: str,
@@ -618,7 +716,7 @@ def _publish_process_result(
     shell_regex_auto_corrected: bool = False,
     meta: Mapping[str, Any] | None = None,
 ) -> str:
-    """Publish trusted process facts through the transient string-bound sidecar."""
+    """Publish process facts; only the executor producer can certify completion."""
 
     facts = dict(meta or {})
     if exit_code is not None:
@@ -686,6 +784,9 @@ _EXACT_IDENTIFIER_CODES = MappingProxyType(
         "ROOT_REQUIRED_USER_FILES": "ROOT_REQUIRED_USER_FILES",
         "ROOT_REQUIRED_ACTIVE_WORKSPACE": "ROOT_REQUIRED_ACTIVE_WORKSPACE",
         "USER_FILES_PATH_BLOCKED": "USER_FILES_PATH_BLOCKED",
+        "OWNER_PAUSE_NOT_STARTED": "OWNER_PAUSE_NOT_STARTED",
+        "OWNER_LAUNCH_AUTHORITY_UNAVAILABLE": "OWNER_LAUNCH_AUTHORITY_UNAVAILABLE",
+        "STOP_ACTION_CONFLICT": "STOP_ACTION_CONFLICT",
         "COGNITIVE_TOOL_REQUIRED": "COGNITIVE_TOOL_REQUIRED",
         "RESOURCE_CONSTRAINT_BLOCKED": "RESOURCE_CONSTRAINT_BLOCKED",
         "RESOURCE_POLICY_BLOCKED": "RESOURCE_POLICY_BLOCKED",
@@ -705,7 +806,10 @@ _EXACT_IDENTIFIER_CODES = MappingProxyType(
         "SAFETY_VIOLATION": "SAFETY_VIOLATION",
         "CAPABILITY_UNAVAILABLE": "CAPABILITY_UNAVAILABLE",
         "MCP_DISABLED": "MCP_UNAVAILABLE",
-        "MCP_TOOL_NOT_FOUND": "MCP_UNAVAILABLE",
+        # #1262: a name absent from the current MCP catalog is the caller's unknown
+        # tool, not a provider outage; a known disabled server or a catalog that
+        # could not be listed keeps MCP_UNAVAILABLE (MCP_DISABLED, MCP_CATALOG_*).
+        "MCP_TOOL_NOT_FOUND": "UNKNOWN_TOOL",
         "MCP_TOOL_DISALLOWED": "ACCESS_BLOCKED",
         "MCP_TOOL_TIMEOUT": "MCP_TIMEOUT",
         "MCP_TOOL_ERROR": "MCP_ERROR",
@@ -731,10 +835,11 @@ _EXACT_IDENTIFIER_CODES = MappingProxyType(
         "ROUTE_UNCONFIRMED": "TOOL_REPORTED_FAILURE",
         "ROUTING_UNCONFIRMED": "TOOL_REPORTED_FAILURE",
         "NEEDS_MANUAL_TARGET": "TOOL_REPORTED_FAILURE",
-        # ensure_project_scope joined the same rail: a refused or unconfirmed
-        # bind scoped nothing durably.
-        "SCOPE_REJECTED": "TOOL_REPORTED_FAILURE",
-        "SCOPE_UNCONFIRMED": "TOOL_REPORTED_FAILURE",
+        # ensure_project_scope joined the same rail (a refused/unconfirmed bind scoped
+        # nothing durably); cross-focus refusals split availability from policy.
+        "SCOPE_REJECTED": "TOOL_REPORTED_FAILURE", "SCOPE_UNCONFIRMED": "TOOL_REPORTED_FAILURE",
+        "FOCUS_PROJECTION_UNAVAILABLE": "LEGACY_UNAVAILABLE", "FOCUS_TASK_NOT_LIVE": "LEGACY_UNAVAILABLE",
+        "FOCUS_STALE": "LEGACY_BLOCKED", "TOOL_FORBIDDEN": "LEGACY_BLOCKED", "FOCUS_SOURCE_UNRESOLVED": "LEGACY_UNAVAILABLE", "FOCUS_SOURCE_UNRETAINED": "LEGACY_UNAVAILABLE",
         "TOOL_ERROR": "TOOL_ERROR",
         "TOOL_INTERNAL_ERROR": "TOOL_INTERNAL_ERROR",
         "EXECUTOR_UNAVAILABLE": "LEGACY_UNAVAILABLE",
@@ -966,6 +1071,14 @@ def _compose_execute_result_result(
         else LegacyTextResultAdapter.from_text(tool_name, base)
     )
     text = _compose_execute_result(base_result.text, route_note, safety_msg)
+    notes = tuple(note for note in (route_note, safety_msg) if note)
+    source = {
+        "producer_text": (
+            base_result.producer_text if base_result.producer_text is not None
+            else base_result.text if notes else None
+        ),
+        "host_annotations": base_result.host_annotations + notes,
+    }
     meta = dict(base_result.meta)
     if route_note:
         meta["route_note"] = True
@@ -982,6 +1095,7 @@ def _compose_execute_result_result(
             code=base_result.code,
             text=text,
             meta=meta,
+            **source,
         )
     if base_result.code == "OK":
         return ToolResult(
@@ -989,6 +1103,7 @@ def _compose_execute_result_result(
             code="SAFETY_WARNING",
             text=text,
             meta=meta,
+            **source,
         )
     meta["safety_warning"] = True
     return ToolResult(
@@ -996,4 +1111,5 @@ def _compose_execute_result_result(
         code=base_result.code,
         text=text,
         meta=meta,
+        **source,
     )

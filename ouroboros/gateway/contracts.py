@@ -1,16 +1,21 @@
-"""Descriptive HTTP + WebSocket Gateway Boundary contracts (v1).
+"""Gateway HTTP/WebSocket contracts (v1): descriptive, not runtime validation.
 
-TypedDicts document payloads, not runtime validation. Keep discriminating
-``type`` keys required; mark genuinely optional fields with ``NotRequired``.
-"""
+Keep discriminating ``type`` keys required; optional fields use ``NotRequired``."""
 
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
+from ouroboros.cost_projection import CostPresentation
 
 from ouroboros.gateway.history_contracts import ChatHistoryResponse  # noqa: F401 -- public re-export
 from ouroboros.gateway.widgets import ExtensionLiveSnapshot, WidgetTab, WidgetsResponse
 from ouroboros.gateway.decision_contracts import DecisionRequest, DecisionResponse  # noqa: F401 -- public re-exports
+from ouroboros.gateway.schedule_contracts import (  # noqa: F401 -- public re-exports
+    ScheduleActionResponse,
+    ScheduledTasksResponse,
+    ScheduleDeleteResponse,
+    ScheduleUpsertResponse,
+)
 
 try:  # Python 3.11+
     from typing import Literal, NotRequired, Required, TypedDict  # type: ignore[attr-defined]
@@ -106,18 +111,16 @@ class ChatOutbound(TypedDict):
     role: Literal["user", "assistant", "system"]
     content: str
     ts: str
+    ingress_accepted: NotRequired[bool]  # Canonical inbound row saved; not processing/start proof.
     markdown: NotRequired[bool]
     is_progress: NotRequired[bool]
     task_id: NotRequired[str]
     origin_message_ref: NotRequired[Dict[str, Any]]
     # X3: a repair receipt whose managed task id the router mints only at promotion (typed truth, no invented id).
     task_id_pending: NotRequired[bool]
-    # "finalizing" on a root's early final answer: the answer is delivered
-    # while post-task synthesis still runs, so the frame is NOT the task's
-    # terminal conclusion — task_done settles the card/turn.
+    # "finalizing": early answer during synthesis, NOT terminal; task_done settles the card/turn.
     task_phase: NotRequired[str]
-    # Direct/ephemeral finals and errors settle client activity without a snapshot:
-    # completed/failed/cancelled/rejected_duplicate, not an early answer.
+    # Direct/ephemeral completed/failed/cancelled/rejected_duplicate settles activity, not early answers.
     task_terminal_status: NotRequired[str]
     ephemeral_decision: NotRequired[bool]
     tool_calls: NotRequired[int]
@@ -141,13 +144,14 @@ class ChatOutbound(TypedDict):
     recommended_index: NotRequired[int]
     answered_index: NotRequired[int]
     comment: NotRequired[str]
+    host_facts: NotRequired[str]  # the mirrored card's host sentence (QuizOutbound.host_facts)
     task_incident: NotRequired[str]
     # A cancellation fault names the PHYSICAL task it could not settle when it differs from the logical task id.
     cancel_physical_task_id: NotRequired[str]
     toast_once: NotRequired[str]
-    # #628: the incident's valence for the one-shot toast (warn/ok/error),
-    # stamped by the producer that knows whether the boundary is a wait, a
-    # recovery or an exhaustion; absent = the browser keeps its alarm tone.
+    # #628: the one-shot toast's valence (warn/ok/error; the reaper's rail ``warning``
+    # is normalizeTone's existing ``warn`` alias, no new tone), stamped by the producer
+    # that knows wait/recovery/exhaustion; absent = the browser keeps its alarm tone.
     toast_tone: NotRequired[str]
     lifecycle: NotRequired[Dict[str, Any]]
     # C4 multi-chat dedupe: a duplicate lifecycle initiator's typed pointer to
@@ -169,23 +173,23 @@ class ChatOutbound(TypedDict):
     model_lane: NotRequired[str]
     requested_model_lane: NotRequired[str]
     effective_model_lane: NotRequired[str]
-    # Phase 6: the OPAQUE harness route RESOLVED AT DISPATCH for this bubble/subagent (`resolve_subagent_dispatch`,
-    # stamped once) — a delegated route only; absent/empty means the ordinary native path and the UI draws no chip.
-    # It is the route the run was sent to, not a receipt from the engine saying where it landed: a landing below the
-    # ask is disclosed on `capability_delta`, not by rewriting this field.
+    # Opaque delegated route stamped once by resolve_subagent_dispatch; absent/empty = native/no chip.
+    # Dispatch intent is not a landing receipt: a reduction belongs in capability_delta, never rewrites this route.
     executor_route: NotRequired[str]
-    # Latest observed progress actor, NOT terminal evidence or current liveness. Own
-    # task_id/task_attempt/run_id/attempt_id, harness_id, phase, revision; optional model has explicit model_source
-    # (requested or observed).
+    # Latest observed progress actor, NOT terminal evidence or current liveness. Own task_id/task_attempt/run_id/
+    # attempt_id, harness_id, phase, revision; optional model has explicit model_source (requested or observed).
     executor_observation: NotRequired[Dict[str, Any]]
-    # The completion-seam EVIDENCE the route decision is reconciled against (subagents.envelope_from_task):
-    # delegated runs started/settled/succeeded, terminal failure states, disclosed subscription spend (+estimated
-    # flag), engine-reported models, the additive `nanny_nudge_recorded` flag (a non-empty finalization nudge was
-    # durably stamped), and the additive `delegate_start_attempted` flag (any durable delegate_start attempt,
-    # refused or started). Terminal frames only; its absence means "no evidence yet", never "ran natively".
+    # Host observation: v/task_id/run_id/after_seq/through_seq, source (run_events|timeline_window,
+    # read_through/ref/provisional), typed parts/technical/gaps/omitted/latest_message. Part cuts count
+    # Unicode code points. (run_id, seq) is identity; cuts_truncated/seqs_truncated disclose its preview loss.
+    # source.ref = redacted JSONL via confined task-file ?source= (503 if unsupported). Never narration,
+    # terminal evidence or a complete-journal claim; full shape is mirrored in web/modules/api_types.js.
+    delegated_activity: NotRequired[Dict[str, Any]]
+    # Terminal evidence from subagents.envelope_from_task: run started/settled/succeeded counts, failure states,
+    # disclosed spend/estimated flag, engine models, nanny_nudge_recorded (durable nonempty finalization nudge),
+    # delegate_start_attempted (durable start or refusal). Absence = no evidence yet, never native execution.
     execution_evidence: NotRequired[Dict[str, Any]]
-    # The FACT beside the executor_route plan, from the same custody evidence:
-    # "harness_used" | "harness_attempted" | "native_only". Terminal frames only; absent =
+    # Custody fact beside executor_route: "harness_used" | "harness_attempted" | "native_only". Terminal only; absent =
     # no substrate claim.
     actual_substrate: NotRequired[str]
     model: NotRequired[str]
@@ -216,11 +220,11 @@ class ChatOutbound(TypedDict):
     # v6.87.48: count of OPEN ledger rows — the disclosed cause of
     # ``cost_final: false``, which can hold with every dollar bucket at zero.
     non_final_rows: NotRequired[Optional[int]]
-    # C12: the ledger's own INTEGRITY marker. The cost authority has always
-    # produced it (`reconstruct_task_cost`), but no carry list named it, so an
-    # amount computed over a degraded ledger reached every surface looking exactly
-    # like one computed over a sound ledger.
+    # C12: the ledger's own INTEGRITY marker from the cost authority (`reconstruct_task_cost`), carried so an
+    # amount computed over a degraded ledger never reaches a surface looking like one over a sound ledger.
     ledger_integrity_degraded: NotRequired[Optional[bool]]
+    # Closed shape owned by the cost producer; null means ledger unavailable.
+    cost_presentation: NotRequired[Optional[CostPresentation]]
     result: NotRequired[str]
     result_truncated: NotRequired[bool]  # P3: WS preview was capped; fetch full via task id
     trace_summary: NotRequired[str]
@@ -241,18 +245,19 @@ class ChatOutbound(TypedDict):
     transport: NotRequired[TransportMetadata]
     # Typed message kind; role alone selects authorship (DESIGN: Chat authorship and System rows).
     system_type: NotRequired[str]
-    # A host-stamped placement fact for a task-keyed System row: "timeline" = a timeline item of the task's card,
-    # "reviews" = the card's Reviews group carries the fact (the row is still attached to the card); absent = an
-    # ordinary row. ``card_row_id`` is the row's stable identity across live delivery, outbox replay and history.
+    # Host placement of a task's System row: timeline or Reviews; absent = ordinary. card_row_id is stable.
     card_row: NotRequired[Literal["timeline", "reviews"]]
     card_row_id: NotRequired[str]
+    card_row_revision: NotRequired[int]  # canonical source order, independent of delivery timestamp
+    late_evidence: NotRequired[Dict[str, Any]]  # late review identity/revision + exact applied source; no transcript
     # Event-time human presentation; raw task/project ids remain machine keys.
     target_label: NotRequired[str]
     project_id: NotRequired[str]
     project_name: NotRequired[str]
+    handoff_id: NotRequired[str]  # immutable origin/destination receipt identity
+    terminal_time: NotRequired[Dict[str, Any]]  # host-owned occurrence, separate from publication ts
     completion_answer: NotRequired[str]  # a Project root's model-authored final answer, mirrored into Main (DESIGN)
-    # Present on some transport re-broadcast paths.
-    chat_id: NotRequired[int]
+    chat_id: NotRequired[int]  # present on some transport re-broadcast paths
     # Server-stamped when chat_id is a reserved Project thread: Main never
     # adopts it, even before the browser has learned the project.
     project_thread: NotRequired[bool]
@@ -378,8 +383,7 @@ class QuizOutbound(TypedDict):
     Optional questions continue under ``assumption``; ``wait_for_answer`` marks
     required waiting without an implied answer. ``state`` carries lifecycle.
     Replay merges the stored ``answered_index`` and verbatim ``comment``; a
-    comment without an index is the owner's whole answer, not an option choice.
-    """
+    comment without an index is the owner's whole answer, not an option choice."""
 
     type: Literal["quiz"]
     role: Literal["assistant"]
@@ -393,6 +397,7 @@ class QuizOutbound(TypedDict):
     ts: str
     answered_index: NotRequired[int]
     comment: NotRequired[str]
+    host_facts: NotRequired[str]  # host-written, never the model's: asking task, run start, owner's last message
     chat_id: NotRequired[int]
     task_id: NotRequired[str]
     project_thread: NotRequired[bool]
@@ -674,7 +679,7 @@ class HealthResponse(TypedDict):
 class EvolutionStateSnapshot(TypedDict):
     """Nested ``evolution_state`` block inside ``StateResponse``."""
 
-    enabled: bool
+    enabled: Optional[bool]  # None: unknown control (state unavailable/recovering, #1307)
     status: str
     detail: str
     cycle: int
@@ -695,10 +700,9 @@ class EvolutionStateSnapshot(TypedDict):
 class ActiveDirectTurn(TypedDict):
     """An active in-process direct chat or ephemeral decision turn.
 
-    Snapshot rows in ``StateResponse.active_direct_turns``; the seven identity
-    and activity fields are always emitted by ``DirectActivityRegistry.snapshot()``
-    (empty-string for absent values), so the mirror marks them required.
-    A model_waits projection is optional and must be supplied by its live owner.
+    Rows of ``StateResponse.active_direct_turns``: ``DirectActivityRegistry.snapshot()``
+    always emits the seven identity/activity fields (empty string for absent values),
+    so the mirror marks them required; ``model_waits`` comes only from its live owner.
     """
 
     activity_id: str
@@ -713,19 +717,15 @@ class ActiveDirectTurn(TypedDict):
 
 
 class ActiveChatActivity(ActiveDirectTurn):
-    """One in-flight chat activity in ``StateResponse.active_chat_activities``.
-
-    The combined snapshot: direct/ephemeral registry turns (same rows as
-    ``active_direct_turns``) plus ROOT managed queue tasks projected as
-    ``kind="managed_task"`` with ``phase`` ``queued`` | ``budget_paused``
-    (zero-dispatch member awaiting an explicit resume — never plain
-    "queued") | ``working`` | ``finalizing`` (final answer stored, post-task
-    synthesis still open).
-    Field shape mirrors ``ActiveDirectTurn`` so one client reducer hydrates
-    both; managed rows carry an empty ``client_message_id``.
-    """
+    """One live activity: direct turns and managed ROOT queue tasks share this shape.
+    budget_pausing includes a saved root whose tree still settles; budget_paused
+    awaits explicit Resume. Direct paused turns keep their ID/kind. Unreadable
+    live waits or Pause authority report unknown (incomplete census); unresolved owner-question detail reports
+    required_question_unavailable. Managed rows have empty client_message_id."""
 
     required_question: NotRequired[Dict[str, Any]]
+    required_question_unavailable: NotRequired[bool]
+    project_admission_hold: NotRequired[Dict[str, Any]]
 
 
 class StateResponse(TypedDict):
@@ -741,8 +741,9 @@ class StateResponse(TypedDict):
     budget_pct: Optional[float]
     branch: str
     sha: str
-    evolution_enabled: bool
-    bg_consciousness_enabled: bool
+    evolution_enabled: Optional[bool]  # None: an unknown control (state unavailable/recovering), never "off"
+    bg_consciousness_enabled: Optional[bool]
+    state_quality: Dict[str, Any]  # state.json read quality: {quality, source, unconfirmed}
     evolution_cycle: int
     evolution_state: EvolutionStateSnapshot
     bg_consciousness_state: Dict[str, Any]
@@ -751,9 +752,7 @@ class StateResponse(TypedDict):
     supervisor_error: Optional[str]
     runtime_mode: str
     context_mode: str
-    # True when the EFFECTIVE `low` is a system auto-downgrade rather than an owner
-    # selection: the owner control needs it to offer "confirm Low" on a no-op click.
-    context_mode_auto_low: bool
+    context_mode_auto_low: bool  # frozen compatibility field, always False (persistent auto-Low is retired)
     safety_mode: str
     skills_repo_configured: bool
     github_token_configured: bool
@@ -907,13 +906,13 @@ class UiPreferencesResponse(TypedDict):
     sidebar_width: int  # px; 0 = CSS default (resizable side sections, v6.33.0)
     project_panel_width: int  # px; 0 = CSS default
     project_seen_revision: dict[str, int]  # monotonic paint ACK per active Project
+    welcome: dict[str, str]  # install-wide empty-Main UI copy: mode default|hidden|custom and plain text
 
 
 class GitLogResponse(TypedDict):
     commits: list[Dict[str, Any]]
-    # Tag rows: {tag, date, sha (peeled commit), message} — the mirror said
-    # ``list[str]`` while ``list_versions`` has always emitted dicts; corrected
-    # (behavioural documentation) in the 2026-08-31 updates redesign.
+    # Tag rows: {tag, date, sha (peeled commit), message} — the mirror said ``list[str]`` while ``list_versions``
+    # has always emitted dicts; corrected (behavioural documentation) in the 2026-08-31 updates redesign.
     tags: list[Dict[str, Any]]
     branch: str
     sha: str
@@ -924,20 +923,6 @@ class EvolutionDataResponse(TypedDict):
     checkpoints: NotRequired[list[Dict[str, Any]]]
     generated_at: str
     cached: bool
-
-
-class ScheduledTasksResponse(TypedDict):
-    schema_version: int
-    tasks: list[Dict[str, Any]]
-
-
-class ScheduleUpsertResponse(TypedDict):
-    ok: bool
-    schedule: Dict[str, Any]
-
-
-class ScheduleDeleteResponse(TypedDict):
-    ok: bool
 
 
 class UploadResponse(TypedDict):
@@ -1110,19 +1095,15 @@ class TaskListResponse(TypedDict, total=False):
 
 
 class TaskCostBreakdown(TypedDict):
-    """Read-time "where did the money go" projection on ``GET /api/tasks/{task_id}``
-    (ROOT tasks only). Computed from the physical-attempt ledger at read time and
-    never persisted; ``own + children + unattributed == subtree``. When the object
-    is present every key is present; the WHOLE object is absent — never a confident
-    $0 — when accounting is unavailable or holds no attributable row for the
-    subtree, and on non-root task details."""
+    """Root-only task-detail ledger projection, computed on read, never persisted.
+    All keys appear together; ``own + children + unattributed == subtree``. Omit
+    the object for non-roots, unavailable accounting or no attributable subtree rows; never invent $0."""
 
     own_usd: float
     children_usd: float
     unattributed_usd: float
     delegated_disclosed_usd: float
-    # C2: the explicit subtree total under its honest name —
-    # own + children + unattributed, an accounted UPPER BOUND, not a receipt.
+    # C2: own + children + unattributed is an accounted UPPER BOUND, not a receipt.
     accounted_upper_bound_usd: float
     subscription_sessions: int
     unknown_unmetered: int
@@ -1131,29 +1112,38 @@ class TaskCostBreakdown(TypedDict):
     authority: Literal["physical_attempt_ledger"]
 
 
-class TaskDetailResponse(TypedDict, total=False):
-    """``GET /api/tasks/{task_id}`` — the public task-result envelope (open shape;
-    stored task-result keys pass through) plus additive typed projections."""
+class HistoryRetentionProjection(TypedDict):
+    """Storage placement facts, independent of task outcome or review authority."""
 
+    status: Literal["pending", "problem", "complete"]
+    pending_count: int
+    problem_count: int
+    promoted_ref_count: int
+    promoted_source_handle_count: int
+    problem_reasons: NotRequired[List[Dict[str, Any]]]  # Optional grouped {reason: str, count: int} rows.
+
+
+class TaskDetailResponse(TypedDict, total=False):
+    """Open ``GET /api/tasks/{task_id}`` result: stored keys pass through beside typed projections."""
+
+    artifacts: List[Dict[str, Any]]  # Open result rows; a nested file carries additive ``relpath``.
+    # Per result directory: {name, files, size, excluded, available} for its ``?archive=`` ZIP.
+    artifact_archives: Dict[str, Dict[str, Any]]
     cost_breakdown: TaskCostBreakdown
+    history_retention: HistoryRetentionProjection
     model_waits: Dict[str, Any]
-    # Cancel projection (additive-optional): ``"pending"`` while a durable cancel intent is open and the
-    # supervisor teardown has not settled — the status itself honestly stays running/scheduled; absent on
-    # settled results and on tasks nobody asked to cancel. The UI's interim "Cancelling…" reads this, never a status.
+    # Open cancel intent/teardown: "pending" drives "Cancelling…", not lifecycle status.
+    # Absent for settled or unrequested cancellation; running/scheduled status stays truthful.
     cancel_state: str
-    # Rides beside ``cancel_state`` when the intent carries a reason (GR2-11):
-    # the WHY of the pending cancellation (owner text, "subtree cancellation of
-    # <root>", "evolution stopped", …). Absent when no reason was recorded.
+    # Pending intent's recorded reason (owner text or subtree cause); absent if none (GR2-11).
     cancel_reason: str
-    # S3 (Q1, additive-optional): rides beside a pending ``cancel_state`` when
-    # the open intent is the SOFT stop ("finalize_then_cancel") — the UI shows
-    # "Finalizing…" and offers the hard escalation. Absent on immediate intents.
+    # Soft finalize_then_cancel: "Finalizing…" plus hard escalation; absent on immediate intents (S3/Q1).
     stop_policy: str
-    # S3 (HQ1, additive-optional): the typed owner-hurry observability — the
-    # current block plus the archived history of prior same-id attempts.
-    # Absent on tasks nobody hurried. Task-detail data only, never chat.
+    # Current hurry plus prior same-id attempts; detail-only, absent if never hurried (S3/HQ1).
+    continuation_offer: ContinuationOffer
     owner_hurry: OwnerHurryProjection
     owner_hurry_history: list[OwnerHurryProjection]
+    project_admission_hold: Dict[str, Any]  # While the queue snapshot lists the row: its hold {reason, detail, label} or {}.
     error: str
 
 
@@ -1161,24 +1151,10 @@ ClaudexorReadState = Literal["ok", "not_read", "failed"]
 
 
 class ClaudexorStatusReads(TypedDict):
-    """PROVENANCE for each independent facet of ``GET /api/claudexor/status``.
-
-    An empty collection cannot say whether the daemon was ASKED: the owned
-    Claudexor daemon starts lazily, so an idle machine used to serve empty
-    lists that every consumer read as "no account connected" while real
-    accounts sat in the agent home. Each facet answers only for itself, since
-    one fanned-out read can fail while its siblings land:
-
-    - ``ok`` — read; the matching collection is AUTHORITATIVE (empty means empty)
-    - ``not_read`` — this facet was never asked: the daemon was not running, or
-      discovery/handshake died BEFORE the fan-out (which leaves every facet
-      untouched while the aggregate state reports ``unreachable``)
-    - ``failed`` — asked, and no usable answer came back: the read refused, or
-      the body arrived in a shape the facet does not promise
-
-    Facets map to ``harnesses`` (catalog), ``profiles`` (accounts) and ``quota``.
-    The manifest read behind the login-capability filter is deliberately NOT a
-    facet: its failure is absorbed (fail-open), never reported."""
+    """Independent status facets: harnesses/catalog, profiles/accounts and quota.
+    ok means authoritative (including empty); not_read means never asked, including
+    a discovery failure before fan-out; failed means no usable answer to a read.
+    The login-capability manifest filter fails open and is not a reported facet."""
 
     catalog: ClaudexorReadState
     accounts: ClaudexorReadState
@@ -1208,21 +1184,10 @@ class ClaudexorStatusResponse(TypedDict, total=False):
 
 
 class ClaudexorLoginJobResponse(TypedDict, total=False):
-    """The ONE login-job success envelope (frozen browser gateway ABI,
-    issues #124/#151): every ``/api/claudexor/login`` operation — create,
-    snapshot poll, cancel, input, reconcile — answers exactly one top-level
-    bare ``job`` (the daemon's ``ControlSetupJob``), never another envelope
-    nested under it (the double ``job.job`` was issue #124).
-
-    Operation metadata rides BESIDE the job: create adds ``job_id``,
-    ``disclosure_native``, ``setup_login_source`` and (external-terminal
-    flows whose exact packaged attach role was proven) the labelled
-    ``attach_command`` / ``attach_shell`` pair;
-    input keeps its ``ok`` bit; the snapshot poll is the daemon's own
-    ``{job, cursor, sequence, deviceCode?}`` envelope passed through
-    verbatim, so the transient sign-in disclosure lives at the ENVELOPE
-    level, not inside ``job``. ``job`` is required on every operation; all
-    other keys are operation-scoped."""
+    """Every login operation returns one required bare ControlSetupJob as job.
+    Create metadata, input ok and snapshot cursor/sequence/deviceCode stay beside
+    it. Snapshots pass through verbatim; attach_command/attach_shell require the
+    proven packaged role. Optional fields are operation-scoped; never job.job."""
 
     job: Required[Dict[str, Any]]
     # snapshot-only (daemon envelope verbatim)
@@ -1260,20 +1225,10 @@ class ClaudexorCredentialProfileDeleteResponse(TypedDict):
 
 
 class ClaudexorLoginJobProblem(TypedDict, total=False):
-    """The narrow login-job error envelope (frozen beside the success DTO —
-    the recovery UI consumes both sides of one operation contract): required
-    ``error`` prose, optional stable machine ``code``, optional bounded
-    ``required_actions`` naming the engine's continuation (e.g. reconcile's
-    409 ``setup_termination_unconfirmed`` carries
-    ``["retry_setup_reconciliation"]``). Daemon 404/410 job-absence verdicts,
-    the operation-scoped input/reconcile 409s, and setup-create 400/409 or the
-    frozen retryable 503 terminal-transport probe verdict ride this shape with
-    their original status, stable code, actions and the engine's own sentence.
-    Unmarked transport/discovery 503s and other daemon 5xx stay the proxy's
-    generic 503.
-    Not an action framework: the list mirrors the daemon's own top-level
-    ``ControlProblem.requiredActions`` (at most 16 strings of at most 512
-    chars) and nothing else."""
+    """Typed job errors preserve engine prose/status/code and bounded actions
+    (16 strings, 512 chars each). Covers absent jobs, input/reconcile conflicts,
+    setup 400/409 and marked retryable terminal-probe 503. Other daemon 5xx and
+    unmarked transport/discovery failures use the generic proxy 503."""
 
     error: Required[str]
     code: str
@@ -1308,42 +1263,90 @@ class TaskEvent(TypedDict, total=False):
     error: str
 
 
+class TaskPauseRequest(TypedDict):
+    """Text-free tree Pause; reuse request_id on retry."""
+    request_id: str
+
+
+class TaskPauseResponse(TypedDict, total=False):
+    ok: bool
+    task_id: str
+    root_task_id: str
+    fence_id: str
+    state: Literal["requested", "paused", "released"]
+    duplicate: bool
+    members: List[str]
+    snapshot_persisted: bool
+    latch_pending: bool
+    error: str
+    reason_code: str
+
+
+class TaskContinueRequest(TypedDict):
+    """Retry one action, including after an unconfirmed admission/reload."""
+    action_nonce: str
+
+
+class TaskContinueResponse(TypedDict, total=False):
+    ok: bool
+    task_id: str
+    predecessor_task_id: str
+    successor_task_id: str
+    replay: bool
+    recovered: bool
+    held: bool
+    status: str
+    blockers: List[Dict[str, Any]]
+    error: str
+    reason_code: str
+    cause: str
+    gaps: List[str]
+    unconfirmed: bool
+    state: Literal["bound", "admitted"]
+    action_nonce: str
+
+
+class ContinuationOffer(TypedDict, total=False):
+    """Bound is retryable using action_nonce; only admitted is a successor pointer."""
+    eligible: bool
+    refusal: str
+    cause: str
+    successor_task_id: str
+    state: Literal["bound", "admitted"]
+    action_nonce: str
+
+
+class TaskCancelRequest(TypedDict, total=False):
+    """Optional body; stop_action_id retries one action, distinct from custody ID.
+    Omission preserves legacy ingress without exact-replay assurance."""
+    cascade: bool
+    stop_policy: str
+    stop_action_id: str
+
+
 class TaskCancelResponse(TypedDict, total=False):
     ok: bool
     task_id: str
-    # v6.82 (P5): echoed when the optional request body {"cascade": true} asked
-    # for the subtree cancel, which is COMPLETE by the time this answer is sent;
-    # the plain envelope is unchanged.
+    # Cascade echoes subtree scope; immediate success follows teardown.
     cascade: bool
-    # Additive on the 202 acknowledgement of a ``{"stop_policy": "finalize_then_cancel"}`` request: the
-    # durable intent is open ("pending") while the bounded finalization attempt runs, and ``stop_policy``
-    # echoes the EFFECTIVE policy of the durable intent ("immediate" | "finalize_then_cancel") — a graceful
-    # request over an already-hard intent never softens it, and the answer says so. Absent on the legacy immediate path.
+    # Soft 202 keeps custody pending and echoes EFFECTIVE policy, never softening
+    # an immediate intent. Legacy immediate replies omit these additive fields.
     cancel_state: str
     stop_policy: str
     error: str
 
 
 class TaskHurryRequest(TypedDict):
-    """``POST /api/tasks/{task_id}/hurry`` — the text-free owner hurry control
-    (HQ1 owner decision, paraphrased: no visible chat message ever).
-
-    The body carries ONLY a client-generated stable ``request_id`` (reused on
-    retry so the acknowledgement is idempotent); any other field is refused.
-    There is deliberately no text and no chat side effect anywhere on this
-    path — the durable facts are the typed owner-mailbox control, the
-    ``owner_hurry`` task-result projection, and one non-chat event."""
-
+    """Text-free owner hurry (HQ1), POST /api/tasks/{task_id}/hurry.
+    Only stable request_id is accepted, reused on retry. No chat side effect;
+    durable facts are the mailbox control, owner_hurry projection and one event.
+    """
     request_id: str
 
 
 class OwnerHurryProjection(TypedDict, total=False):
-    """The ``owner_hurry`` block on the task result — task-detail
-    observability, never a chat message. ``state`` is the closed vocabulary
-    requested | applied | not_applied_before_terminal; ``effects`` maps each
-    host-rail effect to its recorded status. ``owner_hurry_history`` rows
-    carry the same shape plus ``archived_at``/``archived_reason`` (rolled over
-    on every same-id requeue by the shared retry-reset)."""
+    """Task-detail owner_hurry, never chat: requested|applied|not_applied_before_terminal.
+    Effects map host rails; same-ID requeues retain archived_at/archived_reason."""
 
     attempt_key: int
     request_id: str
@@ -1381,15 +1384,9 @@ class LogTailResponse(TypedDict, total=False):
 
 
 class OnboardingCompleteRequest(TypedDict, total=False):
-    """``POST /api/onboarding/complete`` — the wizard payload plus two
-    DECLARATIONS about the onboarding run itself.
-
-    The settings keys of the shared setup contract ride through unchanged (open
-    shape, same payload the wizard already builds); the two subscription flags
-    and canonical actor draft are typed here. None is authority:
-    ``subscriptionsConnected`` only tells the server to read the live
-    agent account state, and the server re-proves fresh-install status
-    on its own before applying anything."""
+    """Open setup-settings payload plus subscription declarations and actor draft.
+    These are not authority: subscriptionsConnected requests a live account read;
+    the server independently proves fresh-install status before applying."""
 
     subscriptionsConnected: bool
     skipSubscriptionPresets: bool
@@ -1421,12 +1418,8 @@ class OnboardingPresetProjection(TypedDict):
 
 
 class OnboardingCompleteResponse(TypedDict):
-    """The ONE success envelope. Settings, the next-boot runtime mode, the
-    fresh-install safety default and the durable completion fact land ATOMICALLY
-    — every success carries all four. The preset keys and their one-shot marker
-    ride the same write only when ``preset.applied`` is true; an ordinary success
-    with ``not_requested``, ``skipped_by_owner`` or ``not_install_time`` persists
-    no preset and no marker, which is the D-4 design, not a partial save."""
+    """Settings, next-boot mode, safety default and completion persist atomically.
+    Preset and one-shot marker join that write only when preset.applied is true."""
 
     ok: bool
     status: str
@@ -1436,14 +1429,8 @@ class OnboardingCompleteResponse(TypedDict):
 
 
 class SettingsPostCommitFailureResponse(TypedDict):
-    """500 from an owner settings write whose BYTES ALREADY LANDED.
-
-    The distinction the broad handlers used to erase: a failure BEFORE the write
-    is "nothing was saved", a failure AFTER it is "saved, and then this step
-    failed". ``post_commit_failed`` names the step (environment projection,
-    supervisor start, hot-reload…) so the owner knows what to retry — never that
-    the settings themselves need saving again. Shared by ``POST /api/settings``
-    and ``POST /api/onboarding/complete``."""
+    """500 after settings bytes landed; post_commit_failed names the later step.
+    Retry that step, never re-save. Shared by settings and onboarding writes."""
 
     error: str
     status: str
@@ -1488,6 +1475,7 @@ WS_MESSAGE_TYPES: tuple[str, ...] = (
 
 
 __all__ = [
+    "CostPresentation",
     "ChatInbound",
     "TaskConstraintInbound",
     "CommandInbound",
@@ -1557,6 +1545,7 @@ __all__ = [
     "ScheduledTasksResponse",
     "ScheduleUpsertResponse",
     "ScheduleDeleteResponse",
+    "ScheduleActionResponse",
     "UploadResponse",
     "ExtensionsIndexResponse",
     "ExtensionLiveSnapshot",
@@ -1591,6 +1580,9 @@ __all__ = [
     "TaskEventCursor",
     "TaskEventsRequest",
     "TaskCancelResponse",
+    "TaskCancelRequest",
+    "TaskPauseRequest", "TaskPauseResponse",
+    "TaskContinueRequest", "TaskContinueResponse", "ContinuationOffer",
     "TaskHurryRequest",
     "TaskHurryResponse",
     "OwnerHurryProjection",

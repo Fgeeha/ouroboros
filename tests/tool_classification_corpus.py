@@ -93,6 +93,7 @@ _CODE_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _INTERPOLATED_IDENTIFIERS = (
     "APPLY_PATCH_BLOCKED",   # tools/edit_ops.py::apply_patch error_tag
     "EDIT_BATCH_BLOCKED",    # tools/edit_ops.py::edit_batch error_tag
+    "PREFLIGHT_UNAVAILABLE", # commit_admission.py::format_release_metadata_preflight code
     "READ_FILE_BLOCKED",     # tools/core_file_tools.py::_local_readonly_resource_block action
     "SCRIPT_CWD_BLOCKED",    # tools/tool_resolution.py::_binding_error_text prefixes
     "SEARCH_BLOCKED",        # tools/core.py search_code, same action argument
@@ -301,6 +302,11 @@ _PRODUCER_SHAPES = (
     ("root_required_active_workspace", "write_file", "⚠️ ROOT_REQUIRED_ACTIVE_WORKSPACE: absolute path '/w/x.txt' is under the active workspace.", "ROOT_REQUIRED_ACTIVE_WORKSPACE", (("required_root", "active_workspace"),)),
     ("root_required_user_files", "write_file", "⚠️ ROOT_REQUIRED_USER_FILES: an absolute home path was given but root defaulted to 'active_workspace'.", "ROOT_REQUIRED_USER_FILES", ()),
     ("resource_constraint", "read_file", "⚠️ RESOURCE_CONSTRAINT_BLOCKED: task_contract.allowed_resources.network=false blocks it.", "RESOURCE_CONSTRAINT_BLOCKED", ()),
+    # tools/registry_core.py::ToolRegistry._execute_legacy_text (owner Batch4): the
+    # owner paused the tree before this call's launch handoff; nothing ran.
+    ("owner_pause_not_started", "knowledge_read", "⚠️ OWNER_PAUSE_NOT_STARTED: NOT STARTED — the owner paused this task tree before this operation was launched. Nothing ran; it may be issued again after Resume. (owner_pause)", "OWNER_PAUSE_NOT_STARTED", (("owner_pause_not_started", True),)),
+    ("owner_launch_authority_unavailable", "knowledge_read", "⚠️ OWNER_LAUNCH_AUTHORITY_UNAVAILABLE: NOT STARTED — launch authority is temporarily unavailable. Nothing was submitted; retry when authority is available.", "OWNER_LAUNCH_AUTHORITY_UNAVAILABLE", (("owner_pause_not_started", True),)),
+    ("stop_action_conflict", "cancel_task", "⚠️ STOP_ACTION_CONFLICT: stop_action_conflict; nothing was changed.", "STOP_ACTION_CONFLICT", ()),
     ("resource_policy", "read_file", "⚠️ RESOURCE_POLICY_BLOCKED: task_contract.resource_policy protects 'blackbox'.", "RESOURCE_POLICY_BLOCKED", ()),
     ("cognitive_redirect", "write_file", "⚠️ COGNITIVE_TOOL_REQUIRED: cognitive memory is not written via 'write_file'.", "COGNITIVE_TOOL_REQUIRED", ()),
     ("extension_reported_failure", "ext_1_demo_screenshot", '{"ok": false, "error": "HTTP 500"}', "TOOL_REPORTED_FAILURE", (("dynamic_provider", True),)),
@@ -324,12 +330,14 @@ _PRODUCER_SHAPES = (
     # tools/registry_core.py — an extension surface that exists but is not live
     # gets the host's unknown-tool sentence typed as unavailable, which is more
     # precise than "unknown" and is NOT the adapter's answer for the same text.
-    ("unknown_tool_extension_down", "ext_1_demo_screenshot", "⚠️ Unknown tool: ext_1_demo_screenshot. Available: read_file, run_command", "EXTENSION_UNAVAILABLE", (("dynamic_provider", True),)),
+    ("unknown_tool_extension_down", "ext_1_demo_screenshot", "⚠️ Unknown tool: 'ext_1_demo_screenshot': its extension is not live for this task right now. Nothing was executed.\nNo tool in ext_1_demo is currently callable in this task.", "EXTENSION_UNAVAILABLE", (("dynamic_provider", True),)),
     ("protected_write", "write_file", "⚠️ CORE_PROTECTION_BLOCKED: runtime_mode='advanced' refuses to write protected core path: ouroboros/safety.py. Switch to runtime_mode='pro' and let the normal triad + scope review cover the protected core/contract/release change before commit.", "CORE_PROTECTION_BLOCKED", ()),
-    # ouroboros/mcp_client.py — both unavailable terminals publish one code from
-    # two different first lines, which only a shape can express.
+    # ouroboros/mcp_client.py (MCPNameResolution.refusal) — the unavailable facts
+    # publish one code from different first lines, which only a shape can express;
+    # a catalog miss is the caller's unknown tool (#1262), the registry's own
+    # unknown-tool code published under the MCP marker.
     ("mcp_disabled", "mcp_svc__ping", "⚠️ MCP_DISABLED: enable MCP in Settings → Advanced to use this tool.", "MCP_UNAVAILABLE", ()),
-    ("mcp_tool_not_found", "mcp_svc__ping", "⚠️ MCP_TOOL_NOT_FOUND: 'mcp_svc__ping'. Refresh the server in Settings → Advanced or check the allowed_tools allowlist.", "MCP_UNAVAILABLE", ()),
+    ("mcp_tool_not_found", "mcp_svc__ping", "⚠️ MCP_TOOL_NOT_FOUND: 'mcp_svc__ping' is not in the current tool catalog of MCP server 'svc'. Nothing was executed.", "UNKNOWN_TOOL", ()),
     ("mcp_transport_timeout", "mcp_svc__ping", "⚠️ MCP_TOOL_TIMEOUT: server 'svc' did not respond in 60s", "MCP_TIMEOUT", ()),
     # tool_access.shell_cwd_block_message, published by both process guards.
     ("shell_cwd_block", "run_command", "⚠️ SHELL_CWD_BLOCKED: CWD_BLOCKED: cwd /etc is outside allowed roots for shell. Allowed cwd roots for this tool/profile: active_workspace=/w. Use one of those exact paths as cwd (or root=task_drive/artifact_store/user_files in file tools).", "SHELL_CWD_BLOCKED", ()),

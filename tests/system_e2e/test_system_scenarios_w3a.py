@@ -238,9 +238,9 @@ W3A_ACCEPT_PASS = json.dumps({
 })
 
 
-def _tool_rows(oracle: ArtifactOracle, tool_name: str) -> list:
-    return [row for row in oracle.tools_rows()
-            if str(row.get("tool") or row.get("name") or "") == tool_name]
+def _tool_rows(oracle: ArtifactOracle, tool_name: str) -> list:  # result rows only: not a call's start / wait end
+    return [row for row in oracle.tools_rows() if str(row.get("type") or "tool_call") == "tool_call"
+            and str(row.get("tool") or row.get("name") or "") == tool_name]
 
 
 def _git_log_subjects(clone) -> str:

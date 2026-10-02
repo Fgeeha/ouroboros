@@ -11,7 +11,7 @@ import pytest
 
 from ouroboros import cancel_intents, loop, model_wait, owner_mailbox, usage_accounting as ua
 from ouroboros.model_slots import MODEL_ACCOUNTS_KEY
-from ouroboros.task_results import load_task_result
+from ouroboros.task_results import STATUS_RUNNING, load_task_result, write_task_result
 from tests.test_llm_claudexor import MODEL, result, setup as gateway_fixture
 from tests.test_model_wait import live_wait as wait_fixture
 from tests.test_subscription_main_wait import main_call as main_fixture
@@ -144,11 +144,11 @@ def _loop_tools(ctx, owner):
     return tools
 
 
-def test_main_wait_does_not_call_configured_api_fallback_before_owner_switch(main_call, monkeypatch):
-    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+def test_main_quota_calls_configured_api_fallback_before_any_owner_wait(main_call, monkeypatch):
+    """Owner order: Auto rotation, then the configured fallback, and only then the owner question."""
     from ouroboros.llm_attempt import _attempt_request, _candidate_before_dispatch
 
-    ctx, gateway, owner, events, decide, _observations = main_call
+    ctx, gateway, owner, events, _decide, _observations = main_call
     tools = _loop_tools(ctx, owner)
     monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", "openai::alternate")
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
@@ -170,13 +170,7 @@ def test_main_wait_does_not_call_configured_api_fallback_before_owner_switch(mai
                                            before_dispatch=_candidate_before_dispatch(request_body, request))
 
     def catalog(*args, **kwargs):
-        assert api_calls == [] and len(gateway.accepted_operations) == 1
-        row = next(event for event in reversed(list(events.queue)) if event.get("type") == "task_model_wait")
-        response = decide({"request_id": "switch-api", "decision_id": f"model_wait:task-one:{row['wait_id']}",
-                           "revision": row["revision"], "action": "switch", "model": "openai::alternate",
-                           "credential_profile_id": "", "use_local": False, "persist_role": False})
-        assert response.status_code == 202
-        raise ClaudexorUnavailable("subscription_window_exhausted", "still waiting")
+        pytest.fail("the owner is asked only after every configured route of the round failed")
 
     monkeypatch.setattr(ctx.llm, "_chat_remote", send)
     monkeypatch.setattr(ctx.llm, "claudexor_model_catalog", catalog)
@@ -184,6 +178,7 @@ def test_main_wait_does_not_call_configured_api_fallback_before_owner_switch(mai
         ctx.messages, tools, ctx.llm, ctx.drive_logs, lambda *_args, **_kwargs: None, queue.Queue(),
         task_id="task-one", drive_root=ctx.drive_root, event_queue=events)
     assert text == "Finished" and api_calls == ["openai"]
+    assert not [event for event in list(events.queue) if event.get("type") == "task_model_wait"]
     assert usage["_model_route"] == {} and len(gateway.accepted_operations) == 1
     assert any(message.get("content") == "verified read A" for message in ctx.messages)
     assert any(message.get("content") == "completed review B" for message in ctx.messages)
@@ -365,12 +360,25 @@ def test_outage_wrap_keeps_older_wire_death_custody_without_summary(tmp_path, mo
                             lambda seconds, deadline, **kw: release_wait_after_control_check(seconds, kw["wake_check"]))
     else:
         monkeypatch.setattr(loop_transport, "interruptible_wait_sleep", release_wait_after_control_check)
-    kwargs = _loop_kwargs(tmp_path, ControlledLLM(), [])
-    kwargs["tools"]._ctx.is_direct_chat = interactive
-    with model_wait.task_model_wait_scope(task={"id": "t-death"}, drive_root=tmp_path,
-            event_queue=None, worker_slot_held=not interactive) as owner:
-        owner.tool_context = kwargs["tools"]._ctx
-        _text, usage, trace = loop.run_llm_loop(**kwargs)
+    def run():
+        kwargs = _loop_kwargs(tmp_path, ControlledLLM(), [])
+        kwargs["tools"]._ctx.is_direct_chat = interactive
+        if interactive:  # inline Presence retains the paid-repeat rail
+            kwargs["task_type"] = kwargs["tools"]._ctx.current_task_type = "presence"
+        with model_wait.task_model_wait_scope(task={"id": "t-death"}, drive_root=tmp_path,
+                event_queue=None, worker_slot_held=not interactive) as owner:
+            owner.tool_context = kwargs["tools"]._ctx
+            return loop.run_llm_loop(**kwargs)
+
+    # The managed task's Pause authority is its lifecycle row, which the agent
+    # publishes as RUNNING before the loop's first round (agent.py). Without it
+    # the authority is unknown: the loop refuses before any reservation or send.
+    with pytest.raises(model_wait.ModelWaitInterrupted, match="owner_pause_authority_unreadable"):
+        run()
+    assert not posted and llm.calls == 0 and not (tmp_path / ua.LEDGER_REL).exists()
+    write_task_result(tmp_path, "t-death", STATUS_RUNNING, root_task_id="t-death",
+                      _is_direct_chat=interactive)
+    _text, usage, trace = run()
     assert posted and llm.calls == 1
     assert [row["state"] for row in _ledger(tmp_path)] == ["reserved", "dispatched", "unresolved"]
     assert loop_llm_call.provider_no_call_source(usage, False)[0] == "provider_outcome_unknown_no_resend"
@@ -401,7 +409,8 @@ def test_real_main_control_preserves_candidate_without_new_summary(main_call, mo
     gateway.dispatch = ["response_received", "not_started"]
     held = []
 
-    def hold(content, limit, trace, actual_tools, *_args):
+    def hold(content, limit, trace, actual_tools, *_args, explicit_candidate=False):
+        assert explicit_candidate is False, "this fixture holds the first ordinary answer"
         held.append(loop._replace_delivery_candidate(actual_tools, limit, trace, content, control="hold_for_verification"))
         if stop == "wrap_unknown":
             gateway.pending = True

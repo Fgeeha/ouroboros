@@ -211,14 +211,14 @@ def request_finalization_grace(
         # would only decorate its summary.
         return control_msg_id
     try:
+        from ouroboros.project_dialogue import TASK_CAUSE_PHRASES
         from supervisor import workers as _workers_mod
+        cause = TASK_CAUSE_PHRASES.get(terminal_reason, terminal_reason)  # an unknown rail stays raw
         _workers_mod.get_event_q().put({
             "type": "send_message",
             "chat_id": chat_id,
-            "text": str(toast_text or "") or (
-                f"⏳ Task {task_id} reached {terminal_reason}. "
-                "Finalize artifacts/results now; supervisor will stop the task after the grace window."
-            ),
+            "text": str(toast_text or "") or (f"⏳ Task {task_id}: {cause}. Finalize artifacts/results now; "
+                                              "supervisor will stop the task after the grace window."),
             "role": "system", "system_type": "finalization_notice",
             "format": "markdown",
             "is_progress": True,
@@ -227,10 +227,9 @@ def request_finalization_grace(
             # events.HOST_NARRATION. Without it this toast stamped the task's
             # last_progress_at and the next tick withdrew the episode it announced.
             HOST_NARRATION: True,
-            "progress_meta": {
-                "task_incident": terminal_reason,
-                "toast_once": f"{task_id}:{terminal_reason}:{stamp}",
-            },
+            # toast_tone=warning: a rail is a limit the task hit, not an error the owner must fix (TZ-2 C1).
+            "progress_meta": {"task_incident": terminal_reason, "toast_tone": "warning",
+                              "toast_once": f"{task_id}:{terminal_reason}:{stamp}"},
             "ts": utc_now_iso(),
         })
     except Exception:
@@ -664,7 +663,7 @@ def _run_retry_admission_transaction(
                         else:
                             # Cancellation lost the boundary and the successor is
                             # durable: the retry inherits its predecessor's room.
-                            bind_retry_to_origin_project(q.DRIVE_ROOT, task, task_id, retry_task_id)
+                            bind_retry_to_origin_project(q.DRIVE_ROOT, admitted, task_id, retry_task_id)
     except Exception:
         admission_block = "cancel_intent_authority_unreadable"
         log.error(
@@ -678,14 +677,15 @@ def _run_retry_admission_transaction(
 
 
 def _discard_retry_inputs(q: Any, task: Dict[str, Any], task_id: str, retry_task_id: str) -> None:
-    """Drop the inputs copied onto a retry id that will never run."""
+    """Drop the inputs copied onto a retry id that will never run: by-value copies whose original id keeps
+    every row and input, never admitted data, so no custody settlement (``settle_child_drive``) is owed."""
     if not retry_task_id or retry_task_id == task_id:
         return
     from ouroboros.artifacts import task_artifact_dir_path
-    from ouroboros.owner_mailbox import cleanup_task_mailbox
+    from ouroboros.owner_mailbox import discard_mailbox_copy
 
     drive = q._task_drive_for_task(task, task_id)
-    cleanup_task_mailbox(drive, retry_task_id)
+    discard_mailbox_copy(drive, retry_task_id)
     shutil.rmtree(task_artifact_dir_path(drive, retry_task_id), ignore_errors=True)
 
 
@@ -1134,12 +1134,12 @@ def _deliver_reap_salvage(
         from ouroboros.observability import latest_llm_response_text, preserved_salvage_path
         from supervisor.terminal_delivery import deliver_unreviewed_salvage
 
-        salvage_text = latest_llm_response_text(
-            pathlib.Path(_q._task_drive_for_task(task, task_id)), task_id,
-        )
+        salvage_text = latest_llm_response_text(pathlib.Path(_q._task_drive_for_task(task, task_id)), task_id)
         deliver_unreviewed_salvage(
             pathlib.Path(_q.DRIVE_ROOT), task, task_id,
-            outcome=f"stopped by {terminal_reason}",
+            # TZ-2 C1: the typed rail travels; the builder speaks the owner sentence
+            # from the one cause table and keeps the code on the durable receipt.
+            outcome="", reason_code=terminal_reason,
             salvaged_text=salvage_text,
             preserved_path=preserved_salvage_path(pathlib.Path(_q.DRIVE_ROOT), task_id),
             unreconciled_runs=list(unreconciled_runs or []),
@@ -1314,12 +1314,10 @@ def _recover_replaced_timeout_files(job: dict, q: Any, workers: Any) -> None:
 
 
 def reap_timed_out_task(job: Dict[str, Any]) -> None:
-    """Kill the captured worker off-loop; confirm death before publication or retry.
+    """Kill off-loop and confirm death before publication/retry; saved terminal wins.
 
-    A saved terminal result wins over timeout. Unfinished file publication keeps
-    this exact job on the reaper's health-driven retry, without model replay.
-    A replacement pool/task can receive neither teardown nor retry/respawn from
-    this job; its old dead task's files remain independently recoverable.
+    Unfinished file publication retains this job for health retry without model
+    replay. A replacement pool/task gets no teardown/retry; old files remain recoverable.
     """
     from supervisor import queue as _q
     from supervisor import workers as workers_mod
@@ -1358,9 +1356,11 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
                             _incident_chat_id(task, owner_chat_id, _q))
         return
 
-    workers_mod._reconcile_confirmed_dead_review_owner(
-        int(getattr(proc, "pid", 0) or 0)
-    )
+    workers_mod._reconcile_confirmed_dead_review_owner(int(getattr(proc, "pid", 0) or 0))
+    with _q._queue_lock:
+        from supervisor.worker_health import _retire_dead_model_consumers
+        _retire_dead_model_consumers(job, captured_timeout=True)
+
 
     try:
         from ouroboros.tools.services import archive_task_service_logs
@@ -1553,19 +1553,20 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
         incident_chat_id = _incident_chat_id(task, owner_chat_id, _q)
         if incident_chat_id is not None:
             try:
+                from ouroboros.project_dialogue import TASK_CAUSE_PHRASES
+                cause = TASK_CAUSE_PHRASES.get(terminal_reason, terminal_reason)  # an unknown rail stays raw
+                headline = f"🛑 {cause}: task {task_id} killed after {int(runtime_sec)}s.\n"
                 if requeued:
                     send_with_budget(
                         incident_chat_id,
-                        f"🛑 {terminal_reason}: task {task_id} killed after {int(runtime_sec)}s.\n"
-                        f"Worker {worker_id} restarted. Task queued for retry attempt={new_attempt}.",
+                        headline + f"Worker {worker_id} restarted. Task queued for retry attempt={new_attempt}.",
                         is_progress=True, task_id=task_id,
                         progress_meta={"task_incident": "task_reaper_retry", "toast_once": incident_toast_once},
                         role="system", system_type="task_reaper_notice")
                 elif retry_suppression.get("kind") == "cancel_intent":
                     send_with_budget(
                         incident_chat_id,
-                        f"🛑 {terminal_reason}: task {task_id} killed after {int(runtime_sec)}s.\n"
-                        "Its retry was suppressed because cancellation won the "
+                        headline + "Its retry was suppressed because cancellation won the "
                         "admission race; cancellation custody is settling the task.",
                         is_progress=True,
                         task_id=task_id,
@@ -1578,8 +1579,7 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
                     stop_detail = _stop_detail(ceiling_reached, deadline_reached, orchestrator)
                     send_with_budget(
                         incident_chat_id,
-                        f"🛑 {terminal_reason}: task {task_id} killed after {int(runtime_sec)}s.\n"
-                        f"Worker {worker_id} restarted. {stop_detail}",
+                        headline + f"Worker {worker_id} restarted. {stop_detail}",
                         is_progress=True, task_id=task_id,
                         progress_meta={"task_incident": "task_reaper_stopped", "toast_once": incident_toast_once},
                         role="system", system_type="task_reaper_notice")

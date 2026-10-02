@@ -20,8 +20,8 @@ from ouroboros.tools.registry import ToolContext, ToolRegistry
 from ouroboros import subagent_worktrees as sw
 
 
-def _git(repo, *args, check=True):
-    return subprocess.run(["git", *args], cwd=str(repo), capture_output=True, text=True, check=check)
+def _git(repo, *args, check=True, text=True):
+    return subprocess.run(["git", *args], cwd=str(repo), capture_output=True, text=text, check=check)
 
 
 def _init_repo(path: pathlib.Path, files: dict) -> str:
@@ -422,7 +422,7 @@ def _make_child_patch(target_repo: pathlib.Path, drive: pathlib.Path, child_id: 
     (target_repo / rel).parent.mkdir(parents=True, exist_ok=True)
     original = (target_repo / rel).read_text(encoding="utf-8") if (target_repo / rel).exists() else ""
     (target_repo / rel).write_text(new_content, encoding="utf-8")
-    patch = _git(target_repo, "diff", "--binary", "HEAD", "--").stdout
+    patch = _git(target_repo, "diff", "--binary", "HEAD", "--", text=False).stdout
     # revert working tree so the patch can be applied fresh by the tool
     _git(target_repo, "checkout", "--", rel) if original else (target_repo / rel).unlink()
     art = task_artifact_dir_path(drive, child_id, create=True)
@@ -430,7 +430,7 @@ def _make_child_patch(target_repo: pathlib.Path, drive: pathlib.Path, child_id: 
     # hash. write_text() would translate "\n" -> "\r\n" on Windows, so the file's
     # sha256 (read back as bytes by the integrate tool) would diverge from the
     # manifest digest and trip INTEGRATE_PATCH_CORRUPT. Binary write keeps parity.
-    patch_bytes = patch.encode("utf-8")
+    patch_bytes = patch
     (art / "workspace.patch").write_bytes(patch_bytes)
     digest = sha256(patch_bytes).hexdigest()
     manifest = {
@@ -464,10 +464,10 @@ def _make_child_delete_patch(target_repo: pathlib.Path, drive: pathlib.Path, chi
     from hashlib import sha256
 
     (target_repo / rel).unlink()
-    patch = _git(target_repo, "diff", "--binary", "HEAD", "--").stdout
+    patch = _git(target_repo, "diff", "--binary", "HEAD", "--", text=False).stdout
     _git(target_repo, "checkout", "--", rel)
     art = task_artifact_dir_path(drive, child_id, create=True)
-    patch_bytes = patch.encode("utf-8")
+    patch_bytes = patch
     (art / "workspace.patch").write_bytes(patch_bytes)
     digest = sha256(patch_bytes).hexdigest()
     manifest = {
@@ -1163,14 +1163,14 @@ def test_acting_structured_write_stays_inside_its_selected_surface(tmp_path):
     assert not (wt.parent / "outside.txt").exists()
 
 
-def test_acting_read_schema_excludes_system_repo(tmp_path):
+def test_acting_read_schema_includes_parent_read_roots(tmp_path):
     reg, _ctx, _wt = _acting_registry(tmp_path)
     schemas = {s["function"]["name"]: s["function"] for s in reg.schemas()}
     rf = schemas.get("read_file")
     if rf:
         root_enum = rf["parameters"]["properties"].get("root", {}).get("enum")
         if isinstance(root_enum, list):
-            assert "system_repo" not in root_enum  # matches acting _POLICY (no system_repo)
+            assert {"system_repo", "user_files", "deliverables", "subagent_projects"} <= set(root_enum)
 
 
 def test_integrate_counts_as_reviewable_effect():
@@ -1287,8 +1287,8 @@ def test_no_workspace_acting_integrate_blocked(tmp_path):
     assert "ACTING_NO_WORKSPACE_BLOCKED" in reg.execute("integrate_subagent_patch", {"task_id": "x"})
 
 
-def test_acting_subagent_cannot_read_secrets(tmp_path):
-    # Acting children may write their surface but must NOT read owner secrets.
+def test_acting_subagent_reads_parent_visible_settings(tmp_path):
+    # Read reach follows the parent; the independent write surface is unchanged.
     from ouroboros.tools.core import _data_read
     repo = tmp_path / "repo"; repo.mkdir()
     drive = tmp_path / "data"; drive.mkdir()
@@ -1298,19 +1298,20 @@ def test_acting_subagent_cannot_read_secrets(tmp_path):
         task_constraint=TaskConstraint(mode="acting_subagent", surface="self_worktree", write_root=str(tmp_path / "wt")),
     )
     out = _data_read(ctx, "settings.json")
-    assert "DATA_READ_BLOCKED" in out and "sk-secret-xyz" not in out
+    assert "sk-secret-xyz" in out and "DATA_READ_BLOCKED" not in out
 
 
 def test_acting_subagent_keeps_workspace_access(tmp_path):
-    # The strict-readonly resource block must NOT restrict acting children's worktree.
-    from ouroboros.tools.core import _local_readonly_resource_block
+    from ouroboros.tools.core import _read_file
     repo = tmp_path / "repo"; repo.mkdir()
     drive = tmp_path / "data"; drive.mkdir()
+    work = tmp_path / "wt"; work.mkdir()
+    (work / "f.txt").write_text("child source", encoding="utf-8")
     ctx = ToolContext(
-        repo_dir=repo, drive_root=drive,
-        task_constraint=TaskConstraint(mode="acting_subagent", surface="self_worktree", write_root=str(tmp_path / "wt")),
+        repo_dir=repo, drive_root=drive, workspace_root=work, workspace_mode="external",
+        task_constraint=TaskConstraint(mode="acting_subagent", surface="self_worktree", write_root=str(work)),
     )
-    assert _local_readonly_resource_block(ctx, "active_workspace", tmp_path / "wt" / "f.txt", tmp_path / "wt", action="write") == ""
+    assert "child source" in _read_file(ctx, "f.txt")
 
 
 # 14. v6.21.0: genesis surface, compare helper, unified GC retention

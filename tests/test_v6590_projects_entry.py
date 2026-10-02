@@ -166,11 +166,14 @@ def test_update_project_provenance_fields_and_tombstone(tmp_path):
     folder = tmp_path / "keepme"
     folder.mkdir()
     update_project(data, "p1", working_dir=str(folder))
+    before_deletion = get_project(data, "p1")["routing_generation"]
     with pytest.raises(RuntimeError, match="cancellation/quiescence"):
         delete_project(data, "p1")
     deleting = begin_project_deletion(data, "p1")
     assert deleting["lifecycle"] == "deleting"
-    assert deleting["routing_generation"] == 1
+    # The preceding working-dir change also advances the routing generation;
+    # deletion must advance from THAT source instead of resetting the count.
+    assert deleting["routing_generation"] == before_deletion + 1
     complete_project_deletion(data, "p1")
     assert delete_project(data, "p1") is True  # idempotent compatibility completion
     assert get_project(data, "p1") is None

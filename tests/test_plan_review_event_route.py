@@ -101,9 +101,9 @@ def test_drain_deadline_releases_pending_dispatch_rows_and_the_last_settlement_w
         assert _mailbox_entries(tmp_path, request.task_id) == []
         release["s1"].set()
         deadline = time.time() + 10
-        while not any("[s1]: finished;" in line for line in progress) and time.time() < deadline:
+        while not any("m/a answered" in line for line in progress) and time.time() < deadline:
             time.sleep(0.01)
-        assert sum("[s1]: finished;" in line and "state=settled" in line for line in progress) == 1
+        assert sum("m/a answered" in line and "reviewer" in line for line in progress) == 1
         assert _mailbox_entries(tmp_path, request.task_id) == []  # one slot still running
         release["s2"].set()
         while len(_mailbox_entries(tmp_path, request.task_id)) < 1 and time.time() < deadline:
@@ -174,7 +174,7 @@ def test_requests_without_a_drain_deadline_and_other_surfaces_are_untouched(tmp_
     [actor] = custody.run_custodied_review_slots(**kwargs)  # waits for the worker as before
     assert actor.status == "ok" and actor.operation_state == "settled"
     assert not custody._RELEASED_WAVES
-    assert len(progress) == 2 and "[s1]: started;" in progress[0] and "[s1]: finished;" in progress[1]
+    assert len(progress) == 2 and "reviewer m/a started" in progress[0] and "m/a answered" in progress[1]
     assert _mailbox_entries(tmp_path, request.task_id) == []
     # A non-plan surface released at a drain deadline gets pending rows but no frame.
     triad, triad_kwargs = _custody_kwargs(
@@ -190,7 +190,9 @@ def test_requests_without_a_drain_deadline_and_other_surfaces_are_untouched(tmp_
     deadline = time.time() + 5
     while custody._RELEASED_WAVES and time.time() < deadline:
         time.sleep(0.01)
-    assert _mailbox_entries(tmp_path, request.task_id) == [] and all(line.startswith("Review ") for line in progress)
+    assert _mailbox_entries(tmp_path, request.task_id) == []
+    # Every row is a reviewer row of its own surface; no plan frame reached the non-plan surface.
+    assert all(line.startswith(("Plan reviewer m/a ", "Commit reviewer m/a ")) for line in progress)
 
 
 class _HeldExecutor:
@@ -239,6 +241,48 @@ def _wait_until(predicate, timeout=20.0):
     return predicate()
 
 
+def test_default_native_plan_reads_workspace_and_collects_exact_paid_wave(harness, monkeypatch):
+    """Real default slots, native executor, inspection registry and collector."""
+    from collections import Counter
+    from ouroboros.tools.plan_review_runtime import plan_review_slots
+    from ouroboros.usage_accounting import current_usage_scope
+    from tests.test_native_tool_round_executor import _tool_call
+
+    monkeypatch.setenv('OUROBOROS_REVIEWER_SLOTS', '')
+    harness.state['slots'] = plan_review_slots()
+    assert len(harness.state['slots']) == 3
+    assert all(slot.native_retrieval and not slot.subagent_id for slot in harness.state['slots'])
+    calls, release = [], threading.Event()
+
+    def transport(_self, **kwargs):
+        slot_id = current_usage_scope().review_slot_id
+        calls.append(slot_id)
+        assert kwargs['tools'] and release.wait(10)
+        observed = [m for m in kwargs['messages'] if m.get('role') == 'tool']
+        if observed:
+            assert 'deck notes' in observed[-1]['content']
+            answer = {'content': CLEAN}
+        else:
+            answer = {'tool_calls': [_tool_call('read_file', {'path': 'notes.md', 'root': 'active_workspace'})]}
+        return answer, {'prompt_tokens': 10, 'completion_tokens': 5, 'cost': 0,
+                        'physical_attempt_state': 'settled'}
+
+    monkeypatch.setattr('ouroboros.llm.LLMClient.chat', transport)
+    ctx = harness.make_ctx()
+    try:
+        assert not _control(_call(ctx))['closed']
+        assert _wait_until(lambda: len(calls) == 3)
+    finally:
+        release.set()
+    assert _wait_until(lambda: len(_mailbox_entries(harness.drive, ctx.task_id)) == 1)
+    answer = _call(ctx)
+    assert _control(answer) == {'outcome': 'GREEN', 'closed': True}, answer
+    assert set(Counter(calls).values()) == {2} and len(calls) == 6
+    assert _state(harness)['cycles_paid'] == 1
+    assert _control(_call(ctx)) == {'outcome': 'GREEN', 'closed': True}
+    assert len(calls) == 6
+
+
 def test_fresh_dispatch_returns_at_the_barrier_and_the_resubmitted_envelope_collects_once(harness, monkeypatch):
     executor = _install_real_substrate(monkeypatch)
     ctx = harness.make_ctx()
@@ -271,12 +315,12 @@ def test_fresh_dispatch_returns_at_the_barrier_and_the_resubmitted_envelope_coll
     # The identical envelope is the existing resume path: it collects the settled
     # slots (one cycle, no second send) and closes the wave.
     second = _call(ctx)
-    assert _control(second) == {"outcome": "GREEN", "closed": True}
+    assert _control(second) == {"outcome": "GREEN", "closed": True}, second
     state = _state(harness)
     assert state["cycles_paid"] == 1 and state["waves"][-1]["paid"] is True
     assert executor.execute_calls == 3
     # The final mailbox frame can precede another slot's progress callback.
-    assert _wait_until(lambda: any("[s1]: finished;" in line and "state=settled" in line for line in harness.progress))
+    assert _wait_until(lambda: any("m/a answered" in line and "reviewer" in line for line in harness.progress))
 
 
 def test_barrier_wave_replaces_a_stale_paid_predecessor_and_pays_only_at_collection(tmp_path):
@@ -319,7 +363,7 @@ def test_in_flight_panels_count_toward_the_cycle_cap_at_dispatch(harness, monkey
         state = _state(harness)
         assert state["cycles_paid"] == 0  # committed, not yet proven paid: nothing is written as spent
         assert state["current_attempt"]["fingerprint"] == first_fp  # the in-flight wave stays current
-        assert not any(line.startswith("📐 Plan review: PLAN_REVIEW_CYCLES_EXHAUSTED") for line in harness.progress)
+        assert not any(line.startswith("📐 Plan review: no review rounds left") for line in harness.progress)
     finally:
         executor.release.set()
     assert _wait_until(lambda: len(_mailbox_entries(harness.drive, "task-1")) == 1)
@@ -379,7 +423,7 @@ def test_a_slot_settling_during_the_barrier_release_never_splits_the_wave_into_t
             # s1 settles right after its own row is minted, before s2's row exists.
             assert entered["s1"].wait(10)
             release["s1"].set()
-            assert _wait_until(lambda: any("[s1]: finished;" in line for line in progress))
+            assert _wait_until(lambda: any("m/a wasn't sent" in line for line in progress))
         return actor
 
     monkeypatch.setattr(custody, "_late_or_timeout_actor", interleaved)
@@ -446,7 +490,7 @@ def test_a_collection_records_the_dispatched_packet_not_one_rebuilt_from_the_liv
     # The next paid cycle continues from that same recorded history, never from the rebuild.
     _slots, history, _threads, cause = continuation_inputs(
         harness.drive, "task-1", after, harness.state["slots"], user_content="Next paid review turn")
-    assert cause == "" and history
+    assert cause == {} and history
     assert late not in json.dumps(history["s1"][:-2]), "the late directive entered the prior history"
     assert history["s1"][:-2] == before_messages
 
@@ -461,21 +505,36 @@ def test_the_open_wave_text_names_the_route_that_waits_for_the_settlement_frame(
 
     executor = _install_real_substrate(monkeypatch)
     ctx = harness.make_ctx()
+    before = set(threading.enumerate())
+    workers = []
     try:
-        first = _call(ctx)
-        assert _wait_until(lambda: executor.execute_calls == 3)
+        try:
+            first = _call(ctx)
+            assert _wait_until(lambda: executor.execute_calls == 3)
+            workers = [t for t in threading.enumerate()
+                       if t not in before and t.name.startswith("ouroboros-review-plan_review-")]
+            assert sorted(t.name for t in workers) == [f"ouroboros-review-plan_review-s{i}" for i in (1, 2, 3)]
+        finally:
+            executor.release.set()
+        wave = _state(harness)["waves"][-1]
+        fp = wave["request_fingerprint"]
+        for text in (first, _next_step(wave, enforcement="blocking", cap=2, cycles_paid=0)):
+            # "paid" is not claimed: a slot released at the barrier is $0 until its row proves the send.
+            assert "one or more reviewer operations are still in flight" in text and "paid reviewer" not in text
+            assert ("The host writes ONE message into this task's mailbox when every released slot "
+                    "settles: wait_task on this task's own id (wait_tasks while children run) "
+                    "returns on it") in text
+            assert f"plan_task(review_disposition={{review_fingerprint: '{fp}', items: []}})" in text
+            assert "schedule_followup" not in text  # a new root task cannot collect this wave
+        assert _wait_until(lambda: len(_mailbox_entries(harness.drive, "task-1")) == 1)
     finally:
         executor.release.set()
-    wave = _state(harness)["waves"][-1]
-    fp = wave["request_fingerprint"]
-    for text in (first, _next_step(wave, enforcement="blocking", cap=2, cycles_paid=0)):
-        # "paid" is not claimed: a slot released at the barrier is $0 until its row proves the send.
-        assert "one or more reviewer operations are still in flight" in text and "paid reviewer" not in text
-        assert ("The host writes ONE message into this task's mailbox when every released slot "
-                "settles: wait_task on this task's own id (wait_tasks while children run) "
-                "returns on it") in text
-        assert f"plan_task(review_disposition={{review_fingerprint: '{fp}', items: []}})" in text
-        assert "schedule_followup" not in text  # a new root task cannot collect this wave
+        # Even a failed assertion must not leave this test's released reviewers alive.
+        # The positive path above still checks the exact settlement frame.
+        retired = _wait_until(lambda: not any(
+            t.is_alive() for t in threading.enumerate()
+            if t not in before and t.name.startswith("ouroboros-review-plan_review-")))
+    assert retired
 
 
 @pytest.mark.parametrize("effort", ["low", "high", "none", "default"])

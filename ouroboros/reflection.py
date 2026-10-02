@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import pathlib
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from ouroboros._outcome_tool_errors import _OK_TOOL_STATUSES
 from ouroboros.utils import utc_now_iso, append_jsonl, write_text_atomic
@@ -71,32 +72,23 @@ def _trace_call_reported_failure(tc: Dict[str, Any]) -> bool:
     return _trace_call_errored(tc) or str(tc.get("post_commit_tests") or "") == "failed"
 
 
-_REFLECTION_PROMPT_ERROR = """\
-You are performing a post-task experience review for Ouroboros, a self-modifying AI agent.
-The task had errors or blocking events. Write a concise 150-250 word reflection covering:
-
-1. What was the goal?
-2. What specific errors/blocks occurred?
-3. What was the root cause (if identifiable)?
-4. What should be done differently next time?
-
-Be concrete — cite specific file names, tool names, error messages. No platitudes.
-If structured review evidence exists, incorporate the critical/advisory findings and
-open obligations into the root-cause analysis. Mention them individually with their
-severity and item/tag identity rather than collapsing them into a generic "review failed".\
-"""
-
-_REFLECTION_PROMPT_NONTRIVIAL = """\
-You are performing a post-task experience review for Ouroboros, a self-modifying AI agent.
-The task was non-trivial (high round count or high cost) but completed without hard errors.
-Write a concise 150-250 word reflection covering:
-
-1. What was the goal?
-2. What took the most rounds/cost? Where was the friction?
-3. Were there weak assumptions, unnecessary detours, or suboptimal tool choices?
-4. What would make a similar task cheaper or faster next time?
-
-Be concrete — cite specific file names, tool names, decision points. No platitudes.\
+# One open review for every run that reflects. The host states facts (origin, trace,
+# errors, review evidence, cost, sealed outcome) and asks no leading questions: the
+# two former templates opened with "What was the goal?" and one asserted "non-trivial
+# (high round count or high cost)" for runs the workspace trigger admitted, which
+# taught the model to find a shortfall in a colleague's message it had rightly left
+# unanswered (BIBLE P1/P5/P13).
+_REFLECTION_PROMPT_HEAD = """\
+Review this finished run from its recorded inputs, execution and sealed outcome. Origin
+facts describe provenance; by themselves they establish neither owner authority, consent
+nor accepted requirements. Judge what work, if any, was requested and accepted, and whether the
+recorded outcome was appropriate: silence or an empty reply can be right when nothing needed
+saying and wrong when you were asked and could help. Distinguish your own choices from host or
+provider termination, and preparation from delivery. Explain the causes of errors or blocks
+as far as the evidence shows, and each review finding or open obligation with its severity and
+item/tag identity; read an owner question and its answer together. Note costly assumptions,
+detours or tool choices and useful changes for a similar run. Cite concrete evidence and name
+missing evidence instead of guessing. No lesson and no change are valid conclusions.\
 """
 
 # Shared tail with {format} fields.
@@ -108,14 +100,17 @@ worked together, an interpretation worth testing) — append a line:
 MEMORY_ACTIONS_JSON: [...]
 A JSON array of 0-3 objects. Each object must have:
 - type: one of "scratchpad_append", "knowledge_write", "identity_update_candidate"
-- content: concise, concrete text to persist
+- content: concise, concrete text to persist (a knowledge_write to an existing note uses edits instead)
 Optional field:
 - topic: REQUIRED only for knowledge_write (shelf-relative path, e.g. "review_process")
 - scope: optional global or project:<exact project id>; omission keeps this task's shelf
 Rules for memory actions:
 - scratchpad_append: a durable working-memory note useful for near-future tasks.
-- knowledge_write: complete revised Markdown understanding under `topic`. Use
-  knowledge_read to read the whole CURRENT note before replacing it. Preserve
+- knowledge_write: complete Markdown understanding for a new `topic`. For an existing
+  note, use knowledge_read to read the whole CURRENT note, then give "edits":
+  [{{"old_text": a passage occurring exactly once in its body, "new_text": its replacement,
+  empty to remove it, "basis": source and reason}}] and optionally "summary": "revised
+  summary" (no content beside them); unmentioned text and metadata stay. Preserve
   evidence, uncertainty and useful links; new topics need no prior read. A repeated
   interpretation is not new independent evidence. No blind append of fragments.
 - identity_update_candidate: a PROPOSED identity refinement; it is only recorded as a
@@ -147,7 +142,7 @@ Rules for candidates:
 - Tool arguments in logs may show `<TRUNCATED:key:Nch:sha=...>` placeholders.
   That is logging metadata, not the value passed to the tool.
 
-## Task goal
+{task_inputs}## Initial text of this run
 
 {goal}
 
@@ -155,7 +150,6 @@ Rules for candidates:
 
 {trace_summary}
 
-{task_inputs}
 ## Tool usage profile
 
 {tool_usage}
@@ -181,8 +175,7 @@ I am losing. A concrete forward-looking fix can be a kind=capability_idea backlo
 MEMORY_ACTIONS_JSON and BACKLOG_CANDIDATES_JSON lines.
 """
 
-_REFLECTION_PROMPT_ERROR_FULL = _REFLECTION_PROMPT_ERROR + _REFLECTION_PROMPT_TAIL
-_REFLECTION_PROMPT_NONTRIVIAL_FULL = _REFLECTION_PROMPT_NONTRIVIAL + _REFLECTION_PROMPT_TAIL
+_REFLECTION_PROMPT = _REFLECTION_PROMPT_HEAD + _REFLECTION_PROMPT_TAIL
 
 
 def should_generate_reflection(
@@ -218,13 +211,6 @@ def should_generate_reflection(
             return True
 
     return False
-
-
-def _synthesis_effort() -> str:
-    """Post-task synthesis thinks at the owner's Task / Chat level (settings SSOT), never a literal."""
-    from ouroboros.settings_scales import resolve_effort
-
-    return resolve_effort("task")
 
 
 def _collect_error_details(llm_trace: Dict[str, Any], cap: int = 3000) -> str:
@@ -368,11 +354,46 @@ def _extract_trailing_json(text: str, marker: str) -> tuple[str, Optional[list]]
     return remainder, value if isinstance(value, list) else None
 
 
-def _validate_memory_actions(raw: Any, task_id: str) -> List[Dict[str, Any]]:
-    """Keep only well-formed, allowed-type memory actions (max 3)."""
+def record_memory_action_skip(events: pathlib.Path, action: Dict[str, Any], reason: str, *,
+                              project_id: str = "", input_ref: Any = None) -> None:
+    """A lesson the host declines is a fact, not silence (I4).
+
+    One writer for every rejection seam — the validator on the model's raw output
+    and ``apply_memory_actions`` on a bound action — so the event names the reason
+    and, as ``input_ref``, what the seam that dropped the lesson had retained: the
+    validator's exact task-input prompt (the rejected reflection text itself is not
+    retained), a bound action's exact task-source copy of its reflection entry, or
+    the canonical log pointer. It can warn, never raise: an audit-write failure
+    must not discard the independent later lessons of the same batch."""
+    try:
+        recorded = append_jsonl(events, {"ts": utc_now_iso(), "type": "reflection_memory_action_skipped",
+                                         "task_id": str(action.get("task_id") or ""), "project_id": project_id,
+                                         "action_type": str(action.get("type") or "")[:80], "reason": reason,
+                                         "content_chars": len(str(action.get("content") or "")),
+                                         "input_ref": input_ref})
+        if not recorded:
+            log.warning("Reflection memory skip event was not recorded: task=%s reason=%s",
+                        action.get("task_id"), reason)
+    except Exception:
+        log.warning("Reflection memory skip event could not be written: task=%s reason=%s",
+                    action.get("task_id"), reason, exc_info=True)
+
+
+def _validate_memory_actions(raw: Any, task_id: str, *,
+                             on_skip: Optional[Callable[[Dict[str, Any], str], None]] = None) -> List[Dict[str, Any]]:
+    """Keep only well-formed, allowed-type memory actions (max 3).
+
+    ``on_skip(action, reason)`` hears every dropped dict item (``unsupported_type``,
+    ``empty_content``, ``missing_topic``): this is the seam the model's output
+    actually crosses, so the skip event fires here, before any action is bound."""
     out: List[Dict[str, Any]] = []
     if not isinstance(raw, list):
         return out
+
+    def skip(item: Dict[str, Any], action_type: str, reason: str) -> None:
+        if on_skip is not None:
+            on_skip({"type": action_type, "content": str(item.get("content") or ""), "task_id": task_id}, reason)
+
     for item in raw[:10]:
         if len(out) >= 3:
             break
@@ -380,15 +401,22 @@ def _validate_memory_actions(raw: Any, task_id: str) -> List[Dict[str, Any]]:
             continue
         action_type = str(item.get("type") or "").strip()
         if action_type not in _ALLOWED_MEMORY_ACTION_TYPES:
+            skip(item, action_type, "unsupported_type")
             continue
         content = (str(item.get("content") or "") if action_type == "knowledge_write"
                    else _truncate_with_notice(item.get("content", ""), 1200)).strip()
-        if not content:
+        # An existing note's knowledge_write carries anchored edits (+ summary) instead of content;
+        # present keys pass verbatim, however malformed, so the publisher's one contract refuses them.
+        change = ({key: item[key] for key in ("edits", "summary", "frontmatter") if key in item}
+                  if action_type == "knowledge_write" else {})
+        if not content and not change:
+            skip(item, action_type, "empty_content")
             continue
-        action: Dict[str, Any] = {"type": action_type, "content": content, "task_id": task_id}
+        action: Dict[str, Any] = {"type": action_type, "content": content, "task_id": task_id, **change}
         if action_type == "knowledge_write":
             topic = str(item.get("topic") or "").strip()
             if not topic:
+                skip(item, action_type, "missing_topic")
                 continue
             action["topic"] = topic
             if item.get("scope") is not None:
@@ -397,14 +425,26 @@ def _validate_memory_actions(raw: Any, task_id: str) -> List[Dict[str, Any]]:
     return out
 
 def task_inputs_prompt_section(review_evidence: Any) -> str:
-    """Render the same frozen task facts for summary and reflection, in full."""
+    """Render the same frozen task facts for summary and reflection, in full.
+
+    ``run_origin`` is the first key: the reader learns who started the run and
+    whether the owner door stamped it before it reads the first text, whose corpus
+    label (``initial_user`` / ``initial_text``) states only that stamp — never what
+    work was accepted, which the task contract and the recorded owner decisions say."""
     inputs = review_evidence.get("task_inputs") if isinstance(review_evidence, dict) else None
     if not isinstance(inputs, dict):
-        return "## Owner decisions and verification receipts\nTask-local input was not retained; absence is not evidence of missing approval or verification.\n\n"
+        return "## Run origin and recorded task inputs\nTask-local input was not retained; absence is not evidence of missing approval or verification.\n\n"
     return (
-        "## Owner decisions and verification receipts\n"
-        "These are recorded task inputs, separate from the critic's verdict. Preserve source attribution: "
-        "relayed peer proposals are not owner instructions. Interpret the owner's exact question and answer together. "
+        "## Run origin and recorded task inputs\n"
+        "`run_origin` is host-recorded provenance. `initial_user` marks a run the owner door stamped, by the "
+        "owner's own message or by the stamp a promoted root inherits (its text may then be a model-written "
+        "objective); `initial_text` marks a first text recorded without that stamp. Neither label decides "
+        "what work was accepted: the task contract and the recorded owner decisions do. Where `run_origin` is "
+        "absent, or shows no owner ingress beside an `initial_user` row (a run resumed across an upgrade), the "
+        "label is the recorder's older default and the origin is the host's record. These are recorded task "
+        "inputs, separate from "
+        "the critic's verdict. Preserve source attribution: relayed peer proposals are not owner instructions. "
+        "Interpret an owner question and its answer together. "
         "A recorded returncode of 0 is positive evidence, not a missing value. Use the shared verification "
         "summary for reconciliation; a later unrelated pass does not resolve another check's failure. "
         "An empty or unavailable section does not prove that no approval or check existed.\n"
@@ -521,10 +561,9 @@ def generate_reflection(
 
     if child_failure_classes and not (error_count or markers):
         error_details = "Child failure classes: " + ", ".join(child_failure_classes)
-    if error_count or markers or child_failure_classes:
-        prompt_template = _REFLECTION_PROMPT_ERROR_FULL
-    else:
-        prompt_template = _REFLECTION_PROMPT_NONTRIVIAL_FULL
+    # One frame for every run: an error-bearing and a clean run differ in the facts
+    # below (error details, markers, child classes), never in the question asked.
+    prompt_template = _REFLECTION_PROMPT
 
     if knowledge_context is None:
         from ouroboros.config import DATA_DIR
@@ -550,6 +589,7 @@ def generate_reflection(
 
     try:
         from ouroboros.consolidator import KnowledgeReadContext, KNOWLEDGE_MAINTENANCE_PROMPT, _call_consolidation_llm
+        from ouroboros.settings_scales import resolve_effort
 
         knowledge = KnowledgeReadContext(knowledge_context, "task_reflection")
         from ouroboros.consolidator import retain_memory_source
@@ -557,9 +597,11 @@ def generate_reflection(
         source_ref = retain_memory_source(knowledge_context, "task_input_reflection", complete_prompt.encode("utf-8"))
         raw_reflection_text, refl_usage = _call_consolidation_llm(
             llm_client, complete_prompt, "Task reflection", knowledge=knowledge, source_ref=source_ref,
-            reasoning_effort=_synthesis_effort())
+            reasoning_effort=resolve_effort("task"))  # the owner's Task / Chat level: one SSOT, no literal
         raw_reflection_text = raw_reflection_text.strip()
         memory_operation_errors = refl_usage.get("_consolidation_errors") or []
+        from ouroboros.knowledge import observed_route_stamp
+        reflection_route = observed_route_stamp(refl_usage)
         if not raw_reflection_text and memory_operation_errors:
             raw_reflection_text = "(reflection generation failed: " + str(memory_operation_errors[-1].get("message") or "unknown") + ")"
         task_id_str = str(task.get("id", "") or "")
@@ -602,7 +644,11 @@ def generate_reflection(
                     "priority": _truncate_with_notice(raw.get("priority", "med"), 10).strip().lower() or "med",
                     "kind": _truncate_with_notice(raw.get("kind", "improvement"), 40).strip() or "improvement",
                 })
-        memory_actions = _validate_memory_actions(raw_memory_actions, task_id_str)
+        # A rejected raw action is a typed event HERE, where production drops it
+        # (apply_memory_actions never sees it); the retained task input is its source.
+        memory_actions = _validate_memory_actions(raw_memory_actions, task_id_str, on_skip=functools.partial(
+            record_memory_action_skip, pathlib.Path(knowledge_context.drive_root) / "logs" / "events.jsonl",
+            project_id=str(getattr(knowledge_context, "project_id", "") or ""), input_ref=source_ref))
         memory_actions = [bound for action in memory_actions for bound in (
             knowledge.bind_entries([action]) if action["type"] == "knowledge_write" else [action])]
 
@@ -620,14 +666,24 @@ def generate_reflection(
         reflection_text = f"(reflection generation failed: {e})"
         backlog_candidates = []
         memory_actions = []
+        reflection_route = "unknown"
+        # The placeholder is a stage that lost its work, never a clean one: the
+        # post-task coordinator reads this typed row and degrades the checkpoint
+        # while later stages still run; an interruption row keeps precedence there.
+        from ouroboros.utils import sanitize_tool_result_for_log
+
+        memory_operation_errors = [*memory_operation_errors, {
+            "kind": "reflection_failed", "label": "Task reflection",
+            "message": sanitize_tool_result_for_log(str(e)) or type(e).__name__}]
 
     return {
         "ts": utc_now_iso(),
         "task_id": task.get("id", ""),
         "task_type": str(task.get("type", "")),
-        # Two goal fields with one owner each: ``goal`` is the bounded DISPLAY
-        # field every log/UI reader has always shown, ``goal_exact`` is the
-        # request as the owner wrote it. A destructive writer (the Pattern
+        # Two fields with one owner each: ``goal`` is the bounded DISPLAY field
+        # every log/UI reader has always shown, ``goal_exact`` is the run's exact
+        # initial text as recorded (whose it was is ``run_origin``'s fact, inside
+        # ``review_evidence.task_inputs``). A destructive writer (the Pattern
         # Register replaces its whole document) must decide from the exact text,
         # not from a 200-char display prefix that can end mid-sentence.
         "goal": goal,
@@ -649,6 +705,10 @@ def generate_reflection(
         "reflection": reflection_text,
         "backlog_candidates": backlog_candidates,
         "memory_actions": memory_actions,
+        # The route that ANSWERED the Light call (provider/resolved model, account
+        # when served by Claudexor), never the configured route: a model-wait
+        # override rebinds the call, and the history stamp must name what wrote.
+        "route": reflection_route,
         **({"source_ref": source_ref} if source_ref else {}),
         **({"memory_operation_errors": memory_operation_errors} if memory_operation_errors else {}),
     }
@@ -670,12 +730,30 @@ def apply_memory_actions(env: Any, actions: List[Dict[str, Any]], *, project_id:
     """
     pid = str(project_id or "").strip()
     applied = 0
+    events = pathlib.Path(env.drive_root) / "logs" / "events.jsonl"
+    # Project reflections live in a protected project store. Generic read_file
+    # cannot open it, while the canonical log contains only a bounded pointer.
+    # append_reflection_routed attaches an exact task-source copy to each action.
+    fallback_ref = ({"status": "source_unavailable", "project_id": pid} if pid else
+                    {"read": {"tool": "read_file", "arguments": {
+                        "root": "runtime_data", "path": f"logs/{REFLECTIONS_FILENAME}"}}})
+
+    def retained_input(action: Dict[str, Any]) -> Dict[str, Any]:
+        ref = action.get("_reflection_source_ref")
+        return ref if isinstance(ref, dict) and ref.get("kind") == "task_source" else fallback_ref
+
+    def skipped(action: Dict[str, Any], reason: str) -> None:
+        record_memory_action_skip(events, action, reason, project_id=pid, input_ref=retained_input(action))
+
     for action in (actions or [])[:3]:
         atype = str(action.get("type") or "")
         content = str(action.get("content") or "").strip()
-        if not content:
+        change = atype == "knowledge_write" and any(key in action for key in ("edits", "summary", "frontmatter"))
+        if not content and not change:
+            skipped(action, "empty_content")
             continue
         if pid and atype in ("scratchpad_append", "identity_update_candidate"):
+            skipped(action, "project_scoped_task")
             continue
         try:
             if atype == "scratchpad_append":
@@ -690,6 +768,7 @@ def apply_memory_actions(env: Any, actions: List[Dict[str, Any]], *, project_id:
             elif atype == "knowledge_write":
                 topic = str(action.get("topic") or "").strip()
                 if not topic:
+                    skipped(action, "missing_topic")
                     continue
                 from ouroboros.consolidator import _write_knowledge_entries
                 from ouroboros.tools.registry import ToolContext
@@ -699,7 +778,10 @@ def apply_memory_actions(env: Any, actions: List[Dict[str, Any]], *, project_id:
                 ctx = ToolContext(repo_dir=getattr(env, "repo_dir", env.drive_root), drive_root=root,
                                   budget_drive_root=canonical,
                                   project_id=pid, task_id=str(action.get("task_id") or ""))
-                outcomes = _write_knowledge_entries(root / "memory" / "knowledge", [action], context=ctx)
+                outcomes = _write_knowledge_entries(
+                    root / "memory" / "knowledge", [action], context=ctx,
+                    stamp={"writer": "reflection", "route": action.get("_reflection_route") or "unknown",
+                           "writer_input_ref": {**retained_input(action), "task_id": ctx.task_id}})
                 applied += sum(row["ok"] for row in outcomes)
                 if any(not row["ok"] for row in outcomes):
                     log.warning("Reflection knowledge update was not published: %s", outcomes)
@@ -740,8 +822,35 @@ def _admits_pattern_register(entry: Dict[str, Any]) -> bool:
     )
 
 
+def _update_pattern_register(drive_root: pathlib.Path, entry: Dict[str, Any]) -> None:
+    """The reflection stage's nested paid write, under the post-task stage protocol.
+
+    It runs after the reflection is persisted and buys nothing when the reflection's
+    own call was interrupted (a budget or unknown-outcome row). A control, the wallet
+    or an unresolved attempt on any provider's chain propagates, so no later paid
+    post-work runs (TZ-2 C3). An ordinary failure is one typed row on the entry's
+    ``memory_operation_errors``: learning that silently fails to land is invisible
+    erosion (P1), so the stage reads degraded while permitted later stages still run.
+    """
+    from ouroboros.post_task_synthesis import POST_TASK_INTERRUPT_KINDS, propagate_paid_interruption
+
+    errors = entry.get("memory_operation_errors") or []
+    if not _admits_pattern_register(entry) or any(
+            isinstance(row, dict) and row.get("kind") in POST_TASK_INTERRUPT_KINDS for row in errors):
+        return
+    try:
+        _update_patterns(drive_root, entry)
+    except Exception as exc:
+        propagate_paid_interruption(exc)
+        from ouroboros.utils import sanitize_tool_result_for_log
+
+        log.warning("Pattern register update failed for task %s: %s", entry.get("task_id", "?"), exc, exc_info=True)
+        entry["memory_operation_errors"] = [*errors, {"kind": "pattern_register_failed", "label": "Pattern Register",
+                                                      "message": sanitize_tool_result_for_log(str(exc)) or type(exc).__name__}]
+
+
 def append_reflection(drive_root: pathlib.Path, entry: Dict[str, Any]) -> None:
-    """Persist a reflection entry to the JSONL file."""
+    """Persist a reflection entry to the JSONL file, then its Pattern Register write."""
     reflections_path = drive_root / "logs" / REFLECTIONS_FILENAME
     try:
         append_jsonl(reflections_path, entry)
@@ -749,15 +858,7 @@ def append_reflection(drive_root: pathlib.Path, entry: Dict[str, Any]) -> None:
                  entry.get("task_id", "?"), entry.get("key_markers", []))
     except Exception:
         log.warning("Failed to save execution reflection", exc_info=True)
-
-    if _admits_pattern_register(entry):
-        try:
-            _update_patterns(drive_root, entry)
-        except Exception as exc:
-            # Learning that silently fails to land is invisible erosion: the
-            # register simply never hears about this class again (P1).
-            log.warning("Pattern register update failed for task %s: %s",
-                        entry.get("task_id", "?"), exc, exc_info=True)
+    _update_pattern_register(drive_root, entry)
 
 
 def append_reflection_routed(env: Any, task: Dict[str, Any], entry: Dict[str, Any]) -> None:
@@ -782,7 +883,10 @@ def append_reflection_routed(env: Any, task: Dict[str, Any], entry: Dict[str, An
     except Exception:
         pid = ""
     if not pid:
-        append_reflection(canonical, entry)
+        try:
+            append_reflection(canonical, entry)
+        finally:  # a paid interruption propagates only after the free source binding
+            _bind_reflection_action_source(canonical, entry)
         return
     from ouroboros.project_facts import project_reflections_path
 
@@ -796,12 +900,6 @@ def append_reflection_routed(env: Any, task: Dict[str, Any], entry: Dict[str, An
     except Exception:
         project_write_failed = True
         log.warning("Failed to save project execution reflection", exc_info=True)
-    if _admits_pattern_register(entry):
-        try:
-            _update_patterns(canonical, entry)
-        except Exception as exc:
-            log.warning("Pattern register update failed for task %s: %s",
-                        entry.get("task_id", "?"), exc, exc_info=True)
     try:
         append_jsonl(canonical / "logs" / REFLECTIONS_FILENAME, {
             "ts": str(entry.get("ts") or utc_now_iso()),
@@ -816,6 +914,32 @@ def append_reflection_routed(env: Any, task: Dict[str, Any], entry: Dict[str, An
         })
     except Exception:
         log.warning("Failed to write canonical reflection pointer", exc_info=True)
+    _bind_reflection_action_source(canonical, entry)
+    _update_pattern_register(canonical, entry)  # paid, last: its interruption loses no free write
+
+
+def _bind_reflection_action_source(canonical: pathlib.Path, entry: Dict[str, Any]) -> None:
+    """Give the later action writer an exact actor-readable source and the route that nominated it."""
+    actions = entry.get("memory_actions") or []
+    if not actions:
+        return
+    for action in actions:
+        if isinstance(action, dict):
+            action["_reflection_route"] = entry.get("route") or "unknown"
+    try:
+        from types import SimpleNamespace
+
+        from ouroboros.consolidator import retain_memory_source
+
+        ref = retain_memory_source(
+            SimpleNamespace(drive_root=canonical, task_id=str(entry.get("task_id") or "reflection")),
+            "reflection_memory_actions", json.dumps(entry, ensure_ascii=False).encode("utf-8"), "json")
+        for action in actions:
+            if isinstance(action, dict):
+                action["_reflection_source_ref"] = ref
+    except Exception:
+        log.warning("Reflection action source retention failed for task %s", entry.get("task_id"), exc_info=True)
+
 
 _PATTERNS_PROMPT = """\
 You maintain a Pattern Register for Ouroboros, a self-modifying AI agent.
@@ -834,7 +958,8 @@ Rules:
 
 ## New reflection
 
-Task: {goal}
+Run origin: {origin}
+Initial text: {goal}
 Markers: {markers}
 Reflection: {reflection}
 
@@ -869,6 +994,12 @@ def _update_patterns(drive_root: pathlib.Path, entry: Dict[str, Any]) -> None:
         # of the reflection once cut an exculpatory clause mid-word and the
         # register recorded the inverse of what the reflection concluded.
         current_patterns=current,
+        # The run's provenance rides beside its exact initial text: an error class is
+        # a failure, never "who spoke", and the writer must not read a colleague's
+        # or a template's words as the owner's task.
+        origin=json.dumps(
+            ((entry.get("review_evidence") or {}).get("task_inputs") or {}).get("run_origin") or "not recorded",
+            ensure_ascii=False, sort_keys=True),
         goal=str(entry.get("goal_exact") or entry.get("goal") or "?"),
         markers=", ".join(entry.get("key_markers", [])),
         reflection=str(entry.get("reflection") or ""),
@@ -877,6 +1008,7 @@ def _update_patterns(drive_root: pathlib.Path, entry: Dict[str, Any]) -> None:
     light_model = get_light_model()
     client = LLMClient()
     from ouroboros.llm_observability import chat_observed
+    from ouroboros.settings_scales import resolve_effort
 
     resp_msg, patterns_usage = chat_observed(
         client,
@@ -886,7 +1018,7 @@ def _update_patterns(drive_root: pathlib.Path, entry: Dict[str, Any]) -> None:
         model_role="light",
         messages=[{"role": "user", "content": prompt}],
         model=light_model,
-        reasoning_effort=_synthesis_effort(),
+        reasoning_effort=resolve_effort("task"),  # the owner's Task / Chat level: one SSOT, no literal
         max_tokens=16384,
     )
     # Pattern update also runs outside the tool-event loop.

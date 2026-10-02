@@ -686,32 +686,29 @@ def test_assisted_objective_is_truthful_for_any_conflict_free_reviewed_merge():
     assert "was rescued to" not in objective
 
 
-def test_boot_resume_does_not_enqueue_a_duplicate_assisted_resolver(monkeypatch):
+def test_boot_resume_does_not_enqueue_a_duplicate_assisted_resolver(tmp_path, monkeypatch):
+    """An older updater's queued resolver whose readable result allows the managed resume is
+    refreshed in place, never enqueued twice (a lost result holds it: test_project_authority_outages)."""
     import supervisor.queue as queue
     import supervisor.workers as workers
+    from ouroboros.task_results import write_task_result
 
+    monkeypatch.setattr(git_ops, "DRIVE_ROOT", tmp_path)
+    write_task_result(tmp_path, "resolver-task", "interrupted", admitted_dispatch="possible")
     monkeypatch.setattr(workers, "ensure_worker_pool_started", lambda **_kwargs: True)
     pending = [{"id": "resolver-task", "type": "task", "legacy_field": "preserved"}]
     monkeypatch.setattr(workers, "PENDING", pending)
     monkeypatch.setattr(workers, "RUNNING", {})
-    monkeypatch.setattr(
-        queue,
-        "enqueue_task",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("existing resolver must not be enqueued again")
-        ),
-    )
+    monkeypatch.setattr(queue, "enqueue_task", lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("existing resolver must not be enqueued again")))
 
-    tx = {
-        "task_id": "resolver-task",
-        "target_sha": "b" * 40,
-        "owner_chat_id": 0,
-    }
+    tx = {"task_id": "resolver-task", "target_sha": "b" * 40, "owner_chat_id": 0}
     task_id = update_merge.enqueue_assisted_resolution_task(tx)
 
     assert task_id == "resolver-task"
     assert pending[0]["legacy_field"] == "preserved"
     assert update_merge.assisted_task_metadata_authorizes(tx, pending[0]["metadata"])
+    assert not pending[0].get("_project_admission_restore_hold")
 
 
 def test_assisted_resolver_readiness_waits_for_clean_tree_boot(tmp_path, monkeypatch):
@@ -1545,8 +1542,11 @@ def test_boot_rematerialize_rescues_dirty_work_and_points_resolver_at_it(tmp_pat
     pointer on those two signals would lose the rescue nobody has read yet."""
     import supervisor.queue as queue
     import supervisor.workers as workers
+    from ouroboros.task_results import write_task_result
 
     repo, head, plan, _tx = _materialized_conflict_tx(tmp_path, monkeypatch)
+    # The interrupted resolver's readable result: the managed resume of the same id.
+    write_task_result(git_ops.DRIVE_ROOT, "resolver", "interrupted", admitted_dispatch="possible")
     (repo / "a.txt").write_text("half-finished resolution\n")
     # The residual class: MERGE_HEAD lost while dirty resolution work survives.
     (repo / ".git" / "MERGE_HEAD").unlink()
@@ -1555,7 +1555,8 @@ def test_boot_rematerialize_rescues_dirty_work_and_points_resolver_at_it(tmp_pat
     monkeypatch.setattr(workers, "PENDING", [])
     monkeypatch.setattr(workers, "RUNNING", {})
     captured = []
-    monkeypatch.setattr(queue, "enqueue_task", lambda task, front=False: captured.append(task))
+    monkeypatch.setattr(queue, "DRIVE_ROOT", git_ops.DRIVE_ROOT)
+    monkeypatch.setattr(queue, "enqueue_task", lambda task, front=False, **_k: captured.append(task) or task)
     persisted_before_materialize = []
     real_materialize = update_merge.materialize_assisted_merge_live
 

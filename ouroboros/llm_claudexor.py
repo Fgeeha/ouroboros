@@ -1,40 +1,6 @@
-"""Owned-engine model transport over one physical-attempt ledger entry.
-
-Claudexor owns translation, account selection and one generation per operation.
-This client owns its prepared request and returned result, using the existing
-private observability CAS before ACK. Re-reading a lost HTTP reply rejoins the
-same operation; it never buys another inference. A live typed operation is not
-an idle socket: only continuous loss of the control connection spends the
-transport timeout. Task deadlines and cancellation retain their outer owners.
-
-ACTIVE-TURN TRANSPORT SLOT. The engine's upstream keeps one logical turn per
-model client session and hands back an opaque continuation for it. That token
-is transport, not content: it belongs to the LIVE caller, not to the assistant
-history, so ``ModelTurnState`` is one mutable slot the caller owns and this
-module reads. ``_request`` deep-copies the slot's value into the frozen request
-as top-level ``nativeContinuation`` (``None`` on an opted-in empty slot), and a
-DISPATCHED durable result replaces the slot's value through ``adopt_turn_state``
-— ordinary not-dispatched or unknown outcomes and exchanges without the field
-leave it exactly as it was. A released ``invalid_continuation`` refusal alone
-authorizes one stateless repair before generation. A candidate priced ahead of
-its send — the wrap-up a forced finalization is admitted against — reads that
-SAME slot, so
-the admitted request and the dispatched one carry identical bytes. The engine
-alone compares route identity and starts fresh when it changes; the caller
-clears the slot through ``turn_state_for_route`` when its dispatch leaves this
-transport, and does not revive it on return. Opting in at all needs a serving
-engine whose strict request schema accepts the field
-(``CLAUDEXOR_MODEL_TURN_STATE_MIN_VERSION`` against ``owned_engine_version()``,
-the version proven by the last SUCCESSFUL handshake — a failed probe never
-un-proves it, so concurrent status polling cannot flip this shape between a
-priced candidate and its send); an older or not-yet-observed version sends the
-legacy shape, so a process's FIRST model call carries no slot, captures no
-token, and reads that legacy answer as silence about the turn rather than as a
-turn that ended. The value never leaves this transport: it is not usage, not
-an event, not a task card, and its ``repr`` says only whether a turn is active.
-That repair also resets assistant-level ``message.nativeContinuation`` using
-the existing account/source rules; ``native_continuation_reset`` records only
-routes and the affected surface, never either opaque payload.
+"""Caller-owned physical accounting; one engine operation rejoins lost control, private CAS precedes ACK.
+Only durable dispatched results update the caller's live turn slot; unknown/no-start/legacy outcomes preserve it.
+Pre-dispatch pricing reads that slot; route changes clear it. Deadlines/Stop stay unchanged (ARCHITECTURE §6).
 """
 
 from __future__ import annotations
@@ -50,28 +16,27 @@ import threading
 import time
 from typing import Any
 
-from ouroboros import config
-from ouroboros import context_fit
+from ouroboros import config, context_fit
 from ouroboros._usage_response import provider_cost_value
 from ouroboros.anthropic_native_custody import scrub_native_custody
 from ouroboros.claudexor_daemon import ensure_owned_gateway, owned_engine_version, read_owned_gateway
 from ouroboros.deadline_utils import llm_transport_timeout_sec
-from ouroboros.gateways.claudexor import (
-    ClaudexorUnavailable, engine_at_least, model_failure_evidence_supported, _READ_TIMEOUT_SEC,
-)
-from ouroboros.llm_attempt import _attempt_request, _candidate_before_dispatch
+from ouroboros.effort_evidence import model_effort_usage
+from ouroboros.gateways.claudexor import (ClaudexorUnavailable, engine_at_least, model_failure_evidence_supported,
+                                          operation_query_supported, _READ_TIMEOUT_SEC)
+from ouroboros.llm_attempt import _attempt_request, _candidate_before_dispatch, effort_request_facts
+from ouroboros.send_clock import stamp_clock_note
 from ouroboros.llm_substitution import (
-    SubstitutionBudget, substitution_fact, failed_account_preference,
-    remember_failed_profile, take_failed_account_preference)
+    AccountRotation, SubstitutionBudget, substitution_fact, failed_account_preference,
+    take_failed_account_preference)
 from ouroboros.model_slots import MODEL_ACCOUNTS_KEY, model_role_option
 from ouroboros.model_wait import ModelWaitInterrupted, current_model_wait, prepared_call_scope
 from ouroboros.observability import persist_call
+from ouroboros.owner_pause import launch_admission, OwnerPauseRefused, model_handed_off
 from ouroboros.transport_custody import ProviderNotDispatched
 from ouroboros.usage_accounting import (
     PhysicalAttemptPreparationFailed, current_physical_attempt_context, current_usage_scope,
-    execute_physical_attempt, execute_physical_attempt_async,
-    last_physical_attempt_capture,
-)
+    execute_physical_attempt, execute_physical_attempt_async, last_physical_attempt_capture)
 from ouroboros.utils import append_jsonl, sanitize_tool_result_for_log, utc_now_iso
 
 log = logging.getLogger(__name__)
@@ -113,8 +78,7 @@ def prepare_processing_target(target: dict) -> dict:
     """
     if not target.get("processing_preference") or "processing_preferences" in target:
         return target
-    prepared = dict(target)
-    prepared["processing_preferences"] = []
+    prepared = {**target, "processing_preferences": []}
     try:
         sources = model_sources(processing_view=True)
     except ClaudexorUnavailable:
@@ -131,7 +95,7 @@ class ClaudexorModelError(RuntimeError):
     """A model-operation fact with its exact role, route and recovery identity."""
 
     def __init__(self, problem: dict, *, model_role: str = "", operation_id: str = "",
-                 route: dict | None = None, unknown: bool = False):
+                 route: dict | None = None, unknown: bool = False, same_operation_recoverable: bool = False):
         self.problem = copy.deepcopy(problem)
         self.code = "model_outcome_unknown" if unknown else str(problem.get("code") or "model_operation_failed")
         super().__init__(f"{self.code}: {problem.get('message') or 'Model operation did not complete'}")
@@ -150,7 +114,7 @@ class ClaudexorModelError(RuntimeError):
             # rejection: no unknown outcome or same-request wire repair.
             self.stream_rejected = self.stream_incomplete = True
             self.retryable = False
-        self.model_role = model_role
+        self.model_role, self.same_operation_recoverable = model_role, same_operation_recoverable  # the latter: a READ failure; rejoin, never regenerate
         self.operation_id = operation_id
         self.route = copy.deepcopy(route or {})
 
@@ -166,12 +130,26 @@ class ClaudexorModelError(RuntimeError):
             for key, label in fields
             if isinstance(value := context.get(key), str) and value.strip()
         ]
-        # Details lead so the existing terminal preview can name the refusal.
+        # Details lead so a shortened Logs preview still names the refusal.
         return sanitize_tool_result_for_log("; ".join([", ".join(details), str(self)]) if details else str(self))
 
 
 class ClaudexorModelNotDispatched(ClaudexorModelError, ProviderNotDispatched):
     """Only a terminal engine receipt proving dispatch.state=not_started mints this."""
+
+
+def presence_refusal_unstarted(error: Exception, round_idx: int) -> bool:
+    """Positive no-generation receipt for ALL operations in one physical model call.
+
+    Never fall back to the process-local last capture: it may belong to an
+    earlier attempt. The caller separately accumulates this over fallback routes.
+    """
+    from ouroboros.usage_accounting import PhysicalAttemptCapture
+
+    capture = getattr(error, "physical_attempt_capture", None)
+    return (round_idx == 1 and isinstance(error, ClaudexorModelNotDispatched)
+            and getattr(error, "presence_all_operations_not_started", False) is True
+            and isinstance(capture, PhysicalAttemptCapture) and capture.state == "released")
 
 
 def propagate_model_error(error: Exception) -> None:
@@ -192,7 +170,7 @@ def propagate_model_error(error: Exception) -> None:
             raise error
 
 
-def _usage(result: dict) -> tuple[dict, float | None, bool]:
+def _usage(result: dict, effort: dict | None = None) -> tuple[dict, float | None, bool]:
     """Normalize explicit model usage; never run the generic body-error/free branch."""
     counters = result.get("usage") or {}
     cost_evidence = result.get("cost") or {}
@@ -201,13 +179,11 @@ def _usage(result: dict) -> tuple[dict, float | None, bool]:
     cost = cash if knowledge in {"exact", "estimated"} else None
     if knowledge == "estimated" and cost is None:
         cost = provider_cost_value(cost_evidence.get("estimatedUsd"))
-    usage = {
-        "prompt_tokens": counters.get("input_tokens"),
-        "completion_tokens": counters.get("output_tokens"),
-        "cached_tokens": counters.get("cached_input_tokens"),
-        "cache_write_tokens": counters.get("cache_write_tokens"),
-        "reasoning_tokens": counters.get("reasoning_tokens"),
-    }
+    usage = {key: counters.get(native) for key, native in (
+        ("prompt_tokens", "input_tokens"), ("completion_tokens", "output_tokens"),
+        ("cached_tokens", "cached_input_tokens"), ("cache_write_tokens", "cache_write_tokens"),
+        ("reasoning_tokens", "reasoning_tokens"))}
+    usage.update(model_effort_usage(result, effort))
     if isinstance(result.get("processing"), dict):
         usage["processing"] = copy.deepcopy(result["processing"])
     if cost_evidence:
@@ -249,9 +225,7 @@ def turn_state_for_route(slot: ModelTurnState | None, provider: str) -> ModelTur
     the caller, and returning later starts a fresh one rather than reviving a
     token the engine no longer owns.
     """
-    if slot is None:
-        return None
-    if str(provider or "") != "claudexor":
+    if slot is not None and str(provider or "") != "claudexor":
         slot.envelope = None
         return None
     return slot
@@ -293,7 +267,8 @@ def cache_key_for_model(model: str) -> str:
     shared session (measured 2026-09-17). One key per data root and model
     therefore lets a new task, child or consciousness cycle be served the
     governance prefix it shares with its predecessors on its very first round,
-    instead of paying it cold under a per-execution key. Empty for every other
+    instead of paying it cold under a per-execution key — once ``_request`` has
+    projected the declared prefix into its own input item. Empty for every other
     provider: API-compatible lanes keep their prefix-derived session identity.
     """
     from ouroboros.provider_models import provider_for_model
@@ -306,18 +281,20 @@ def cache_key_for_model(model: str) -> str:
 
 
 def _request(target: dict, messages: list, tools: list | None, parameters: dict) -> dict:
-    from ouroboros.llm_messages import _MessageShapingMixin
+    from ouroboros.llm_messages import _MessageShapingMixin, project_declared_system_prefix
 
+    target["requested_reasoning_effort"] = parameters.get("reasoning_effort")
     for name in ("response_format", "allow_server_web_search", "bypass_response_cache"):
         if parameters.get(name) or (name == "response_format" and parameters.get(name) is not None):
             raise ClaudexorModelError({"code": "unsupported_parameter", "message": f"Claudexor model transport does not support {name}.",
                                        "context": {"parameter": name}}, model_role=parameters.get("model_role", ""))
     # Only known host and foreign-provider metadata leave the send copy. Native
     # Claudexor payloads and tool schemas are opaque here and are never walked.
-    prepared = scrub_native_custody(_MessageShapingMixin._normalize_system_message_placement(messages))
+    # Every model source (today: Codex) shares a donor's cached prefix only up to an input-item boundary (33,024 vs 213,888).
+    prepared = project_declared_system_prefix(target, scrub_native_custody(_MessageShapingMixin._normalize_system_message_placement(messages)))
     for message in prepared:
         for name in ("_context_capsule", "acceptance_observation", "_acceptance_observation", "review_feedback",
-                     "reasoning", "reasoning_details", "reasoning_content", "response_id", "stop_reason"):
+                     "reasoning", "reasoning_details", "reasoning_content", "response_id", "stop_reason", "_stable_prefix_blocks"):
             message.pop(name, None)
         # A direct provider's refusal is assistant content, not routing metadata.
         # Preserve both text parts verbatim when a response carries both fields;
@@ -406,17 +383,27 @@ class _ModelInvocation:
         self.interrupt_reason = ""
         self.create_attempted = False
         self.capture_failure_evidence = False
+        self.capture_effort_evidence = False
         self.defer_close = False
         self.io_active = False
         self.io_lock = threading.Lock()
         self.outage_episode = None
 
-    def check_control(self):
+    def check_control(self, *, starting=False):
         """The caller supplies deadline/cancel policy; this seam transports it."""
         reason = self.interrupt_reason or (self.poll_control() if self.poll_control else None)
         if not reason:
             waiter = current_model_wait()
             reason = waiter.control_reason() if waiter is not None else None
+        if not reason and starting:
+            try:
+                if model_handed_off(self.invocation_id):
+                    self.create_attempted = True
+                else:
+                    with launch_admission(current_usage_scope()):
+                        self.create_attempted = True
+            except OwnerPauseRefused as exc:
+                reason = str(exc)  # prior create_attempted remains unknown, never unsent
         if not reason:
             return
         cancellation = "not_requested"
@@ -446,13 +433,17 @@ class _ModelInvocation:
             self.gateway = ensure_owned_gateway()
             # Freeze once before create. A lost create reply or replaced gateway
             # must reuse this same operation's diagnostic/idempotency contract.
-            self.capture_failure_evidence = model_failure_evidence_supported(self.gateway.operations())
+            operations = self.gateway.operations()
+            self.capture_failure_evidence = model_failure_evidence_supported(operations)
+            self.capture_effort_evidence = operation_query_supported(operations, method="POST",
+                path="/v2/model-operations", name="captureEffortEvidence", value="true")
             self.request_ref = self.gateway.upload_model_request(self.payload, idempotency_key=self.invocation_id)
             self.request_manifest_ref = persist_call(self.root, task_id=self.task_id, call_id=f"{self.invocation_id}_model_request",
                          call_type="llm_claudexor_request", payload=self.payload, keep_raw=True,
                          manifest={"invocation_id": self.invocation_id, "request_ref": self.request_ref,
                                    "model_role": self.role,
-                                   "capture_failure_evidence": self.capture_failure_evidence})["manifest_ref"]
+                                   "capture_failure_evidence": self.capture_failure_evidence,
+                                   "capture_effort_evidence": self.capture_effort_evidence})["manifest_ref"]
         except ClaudexorUnavailable as error:
             raise ClaudexorModelError({"code": error.code, "message": str(error)}, model_role=self.role) from None
 
@@ -467,7 +458,8 @@ class _ModelInvocation:
                     call_type="llm_claudexor_request", payload=self.payload, keep_raw=True,
                     manifest={"invocation_id": self.invocation_id, "request_ref": self.request_ref,
                               "model_role": self.role, "operation_id": self.operation_id,
-                              "capture_failure_evidence": self.capture_failure_evidence})["manifest_ref"]
+                              "capture_failure_evidence": self.capture_failure_evidence,
+                              "capture_effort_evidence": self.capture_effort_evidence})["manifest_ref"]
             except Exception as error:
                 self.request_manifest_ref = {}
                 log.warning("Model custody checkpoint unavailable: %s", type(error).__name__)
@@ -479,12 +471,11 @@ class _ModelInvocation:
             except Exception as error:
                 log.warning("Model custody observer unavailable: %s", type(error).__name__)
 
-    def error(self, problem: dict | None, detail: dict | None = None, *, unknown: bool = False):
-        detail = detail or {}
-        route = (detail.get("dispatch") or {}).get("route") or {}
+    def error(self, problem: dict | None, detail: dict | None = None, *, unknown: bool = False, rejoinable: bool = False):
+        route = ((detail or {}).get("dispatch") or {}).get("route") or {}
         cls = ClaudexorModelError if unknown else ClaudexorModelNotDispatched
-        return cls(problem or {"code": "model_operation_failed", "message": "The engine returned no model result."},
-                   model_role=self.role, operation_id=self.operation_id, route=route, unknown=unknown)
+        return cls(problem or {"code": "model_operation_failed", "message": "The engine returned no model result."}, model_role=self.role,
+                   operation_id=self.operation_id, route=route, unknown=unknown, same_operation_recoverable=rejoinable)
 
     def receive(self) -> dict:
         outage_started = None
@@ -493,10 +484,11 @@ class _ModelInvocation:
             self.check_control()
             try:
                 if not self.operation_id:
-                    self.create_attempted = True
                     self.observe_operation()
+                    self.check_control(starting=True)
                     detail = self.gateway.create_model_operation(self.request_ref, idempotency_key=self.invocation_id,
-                        **({"capture_failure_evidence": True} if self.capture_failure_evidence else {}))
+                        **({"capture_failure_evidence": True} if self.capture_failure_evidence else {}),
+                        **({"capture_effort_evidence": True} if self.capture_effort_evidence else {}))
                     self.operation_id = detail["id"]
                     self.observe_operation(accepted=True)
                 else:
@@ -505,7 +497,6 @@ class _ModelInvocation:
                 if self.outage_episode is not None:
                     self._control_outage(recovered=True)
                 if detail.get("state") not in {"queued", "running"}:
-                    self.detail = detail
                     response = detail.get("response") or {}
                     if response.get("state") != "ready":
                         raise self.error(detail.get("problem"), detail,
@@ -549,23 +540,22 @@ class _ModelInvocation:
                                       "context": {"httpStatus": error.status_code}}) from None
                 # A failed read after creation is never a provider connect failure.
                 # Drop its causal HTTP chain at this boundary: even ConnectError
-                # means only the local control read failed, not inference un-sent.
+                # means only the local control read failed, not inference un-sent (a refused read, 404 too).
                 if error.code != "daemon_unreachable" and not 500 <= error.status_code < 600:
-                    raise self.error({"code": error.code, "message": str(error)}, detail, unknown=True) from None
+                    if self._control_outage():  # rejoin by operation id OR the same create idempotency key
+                        continue
+                    raise self.error({"code": error.code, "message": str(error)}, detail, unknown=True, rejoinable=self.create_attempted) from None
                 if outage_started is None:
                     outage_started = time.monotonic()
                 if self._control_outage():
                     continue
                 if time.monotonic() - outage_started >= self.timeout:
-                    raise self.error({"code": "model_control_unreachable", "message": "Control connection lost; the same model operation may still finish."}, detail, unknown=True) from None
+                    raise self.error({"code": "model_control_unreachable", "message": "Control connection lost; the same model operation may still finish."}, detail, unknown=True, rejoinable=True) from None
             time.sleep(min(config.CLAUDEXOR_MODEL_POLL_INTERVAL_SEC, self.timeout))
 
     def _control_outage(self, *, recovered: bool = False) -> bool:
-        """Managed calls keep the same accepted operation through local HTTP loss."""
-        from ouroboros.loop_transport import (
-            TransportWaitEpisode, emit_network_wait_event,
-            managed_transport_continuation,
-        )
+        """Ordinary direct and queued calls keep the same operation through control loss."""
+        from ouroboros.loop_transport import TransportWaitEpisode, emit_network_wait_event, managed_transport_continuation
         waiter = current_model_wait()
         ctx = getattr(waiter, "tool_context", None)
         if not managed_transport_continuation(ctx):
@@ -594,13 +584,10 @@ class _ModelInvocation:
             previous, self.gateway = self.gateway, replacement
             if previous is not None:
                 previous.close()
-        def controlled():
-            self.check_control()
-            return False
         # Unlike an owner-mail peek, check_control's exception must propagate.
         deadline = time.monotonic() + backoff
         while time.monotonic() < deadline:
-            controlled()
+            self.check_control()
             time.sleep(min(config.CLAUDEXOR_MODEL_POLL_INTERVAL_SEC, max(0, deadline - time.monotonic())))
         return True
 
@@ -635,7 +622,7 @@ class _ModelInvocation:
         return custody
 
     def extract_usage(self, result: dict) -> tuple[dict, float | None, bool]:
-        usage, cost, final = _usage(result)
+        usage, cost, final = _usage(result, effort_request_facts(self.target, self.payload))
         # Settlement reads this row before the caller decides anything, and the
         # density witness must know whose tokenizer it measured: a generation
         # another model produced teaches nothing about the requested one. The
@@ -657,18 +644,17 @@ class _ModelInvocation:
     def finish(self, result: dict) -> tuple[dict, dict]:
         usage, cost, final = self.extract_usage(result)
         route = result.get("route") or {}
-        requested_options = copy.deepcopy(self.payload.get("options") or {})
-        applied_options = copy.deepcopy(result.get("appliedOptions"))
-        options_honored = "unknown" if applied_options is None else (
-            "mismatch" if any(applied_options[key] != value for key, value in requested_options.items() if key in applied_options) else "confirmed")
+        usage.pop("wire_layout", None)  # host-owned: the projection fact of THIS call's target
         usage.update(provider="claudexor", resolved_model=self.target["usage_model"], cost=cost, cost_final=final,
                      cost_estimated=cost is not None and not final,
+                     **({"wire_layout": dict(self.target["wire_layout"])} if isinstance(self.target.get("wire_layout"), dict) else {}),
                      claudexor={"operation_id": self.operation_id, "model_role": self.role,
                                 "requested_profile": str((self.payload.get("account") or {}).get("profileId") or ""),
                                 "route": copy.deepcopy(route), "cost_evidence": copy.deepcopy(result.get("cost")),
                                 "outcome": result.get("outcome"), "problem": copy.deepcopy(result.get("problem")),
-                                "requested_options": requested_options, "applied_options": applied_options,
-                                "options_honored": options_honored,
+                                "requested_options": copy.deepcopy(self.payload.get("options") or {}),
+                                "applied_options": copy.deepcopy(result.get("appliedOptions")),
+                                "applied_options_source": "provider_response",
                                 "output_reserve_tokens": self.output_reserve, "output_cap_applied": False,
                                 "result_custody": {"state": "pending", "operation_id": self.operation_id,
                                                    "response_ref": self.response_ref,
@@ -763,6 +749,8 @@ def _reset_native(payload: dict, error: ClaudexorModelNotDispatched, invocation:
 
 
 def _accounted_request(invocation: _ModelInvocation):
+    # Every invocation is a new host preparation: Main's clock line, kept by the idempotent upload/rejoin.
+    invocation.payload = stamp_clock_note(invocation.payload)
     request = replace(_attempt_request(invocation.target, invocation.payload),
                       force_unknown_reservation=True, max_completion_tokens=invocation.output_reserve)
     existing = _candidate_before_dispatch(invocation.payload, request)
@@ -775,8 +763,7 @@ def _accounted_request(invocation: _ModelInvocation):
     return request, before
 
 
-def _native_retry_preparation(target: dict, payload: dict, parameters: dict,
-                              error: ClaudexorModelNotDispatched):
+def _native_retry_preparation(target: dict, payload: dict, parameters: dict, error: ClaudexorModelNotDispatched):
     """Rebind the already-authorized un-sent repair before preparing its next attempt.
 
     The engine's new account receipt replaces provisional discovery. Pass the
@@ -816,13 +803,14 @@ def _processing_retry_payload(payload: dict, error: ClaudexorModelNotDispatched)
 
 
 def chat_claudexor(target: dict, messages: list, tools: list | None, **parameters: Any) -> tuple[dict, dict]:
-    """One generation, with one no-start repair per continuation/processing axis."""
+    """One generation, one no-start repair per continuation/processing axis, quota re-asks on Auto."""
     target = prepare_processing_target(target)
     payload = _request(target, messages, tools, parameters)
     retry_preparation = None
     native_repaired = processing_repaired = False
-    substitution = SubstitutionBudget(ClaudexorModelError)
-    for _preparation in range(3 + substitution.redos):
+    substitution, rotation = SubstitutionBudget(ClaudexorModelError), AccountRotation()
+    all_operations_not_started = True
+    for _preparation in range(3 + substitution.redos + rotation.CEILING):
         invocation = _ModelInvocation(target, payload, parameters)
         try:
             with prepared_call_scope(retry_preparation or {}) as prepared:
@@ -830,17 +818,19 @@ def chat_claudexor(target: dict, messages: list, tools: list | None, **parameter
                     invocation.payload = payload = _request(target, prepared["messages"], prepared.get("tools"), prepared)
                 request, before = _accounted_request(invocation)
                 result = execute_physical_attempt(request, invocation.receive, extractor=invocation.extract_usage, before_dispatch=before)
+                all_operations_not_started = False  # even a discarded substituted response ran
                 invocation.capture = last_physical_attempt_capture()
                 if substitution.admit(invocation, result):
-                    # The same round, asked again naming no account, on this
-                    # call's every later request: the engine alone picks.
+                    # Every later request in this round leaves account selection to the engine.
                     retry_preparation, parameters = None, {**parameters, "_no_account_preference": True}
                     payload = _request(target, payload["messages"], payload["tools"], {**(prepared or parameters), "_no_account_preference": True})
                     continue
                 adopt_turn_state((prepared or parameters).get("model_turn_state"),
                                  invocation.payload, result)
-                return substitution.disclose(invocation.finish(result))
+                return rotation.disclose(substitution.disclose(invocation.finish(result)))
         except ClaudexorModelNotDispatched as error:
+            all_operations_not_started &= getattr(getattr(error, "physical_attempt_capture", None), "state", None) == "released"
+            error.presence_all_operations_not_started = all_operations_not_started
             if invocation.response_ref:
                 invocation.acknowledge()
             updated = (_processing_retry_payload(payload, error)
@@ -852,17 +842,22 @@ def chat_claudexor(target: dict, messages: list, tools: list | None, **parameter
                 updated = _reset_native(payload, error, invocation)
                 native_repaired = updated is not None
             if updated is None:
-                remember_failed_profile(target, parameters, error)
+                rotation.refused_call(target, parameters, invocation, error)  # an engine verdict is never re-asked
                 raise
             payload = updated
             retry_preparation = _native_retry_preparation(target, payload, parameters, error)
         except ClaudexorModelError as error:
-            remember_failed_profile(target, parameters, error)
-            raise
+            all_operations_not_started = False
+            if not rotation.refused_call(target, parameters, invocation, error):
+                raise
+            retry_preparation, parameters, payload = rotation.reask(parameters, payload)
         except PhysicalAttemptPreparationFailed as error:
             cause = error.__cause__
             if isinstance(cause, ClaudexorModelError):
                 cause.physical_attempt_capture = error.physical_attempt_capture
+                all_operations_not_started &= (isinstance(cause, ClaudexorModelNotDispatched)
+                                               and error.physical_attempt_capture.state == "released")
+                cause.presence_all_operations_not_started = all_operations_not_started
                 raise cause from None
             raise
         finally:
@@ -924,7 +919,7 @@ def recover_model_attempt(drive_root, row: dict, *, gateway_factory=None):
         result = json.loads(raw)
         if not isinstance(result, dict) or result.get("outcome") not in {"completed", "incomplete", "failed"}:
             return "abandoned", {}, None, False
-        usage, cost, final = _usage(result)
+        usage, cost, final = _usage(result, row.get("effort"))
         return "settled", usage, cost, final
     finally:
         if gateway is not None and gateway_factory is None:
@@ -932,14 +927,15 @@ def recover_model_attempt(drive_root, row: dict, *, gateway_factory=None):
 
 
 async def chat_claudexor_async(target: dict, messages: list, tools: list | None, **parameters: Any) -> tuple[dict, dict]:
-    """Keep accounting/capture in the async caller; offload only synchronous I/O."""
+    """Offload synchronous I/O and joined accounting; adopt its capture in this caller."""
     target = (await asyncio.to_thread(prepare_processing_target, target)
               if target.get("processing_preference") and "processing_preferences" not in target else target)
     payload = _request(target, messages, tools, parameters)
     retry_preparation = None
     native_repaired = processing_repaired = False
-    substitution = SubstitutionBudget(ClaudexorModelError)
-    for _preparation in range(3 + substitution.redos):
+    substitution, rotation = SubstitutionBudget(ClaudexorModelError), AccountRotation()
+    all_operations_not_started = True
+    for _preparation in range(3 + substitution.redos + rotation.CEILING):
         invocation = _ModelInvocation(target, payload, parameters)
         try:
             with prepared_call_scope(retry_preparation or {}) as prepared:
@@ -955,17 +951,19 @@ async def chat_claudexor_async(target: dict, messages: list, tools: list | None,
 
                 result = await execute_physical_attempt_async(
                     request, receive, extractor=invocation.extract_usage, before_dispatch=prepare)
+                all_operations_not_started = False
                 invocation.capture = last_physical_attempt_capture()
                 if await invocation.offload(substitution.admit, invocation, result):
-                    # The same round, asked again naming no account, on this
-                    # call's every later request: the engine alone picks.
+                    # Every later request in this round leaves account selection to the engine.
                     retry_preparation, parameters = None, {**parameters, "_no_account_preference": True}
                     payload = _request(target, payload["messages"], payload["tools"], {**(prepared or parameters), "_no_account_preference": True})
                     continue
                 adopt_turn_state((prepared or parameters).get("model_turn_state"),
                                  invocation.payload, result)
-                return substitution.disclose(await invocation.offload(invocation.finish, result))
+                return rotation.disclose(substitution.disclose(await invocation.offload(invocation.finish, result)))
         except ClaudexorModelNotDispatched as error:
+            all_operations_not_started &= getattr(getattr(error, "physical_attempt_capture", None), "state", None) == "released"
+            error.presence_all_operations_not_started = all_operations_not_started
             if invocation.response_ref:
                 await invocation.offload(invocation.acknowledge)
             updated = (_processing_retry_payload(payload, error)
@@ -977,17 +975,23 @@ async def chat_claudexor_async(target: dict, messages: list, tools: list | None,
                 updated = _reset_native(payload, error, invocation)
                 native_repaired = updated is not None
             if updated is None:
-                remember_failed_profile(target, parameters, error)
+                rotation.refused_call(target, parameters, invocation, error)  # an engine verdict is never re-asked
                 raise
             payload = updated
             retry_preparation = _native_retry_preparation(target, payload, parameters, error)
         except ClaudexorModelError as error:
-            remember_failed_profile(target, parameters, error)
-            raise
+            all_operations_not_started = False
+            if not rotation.refused_call(target, parameters, invocation, error):
+                raise
+            retry_preparation, parameters, payload = rotation.reask(parameters, payload)
         except PhysicalAttemptPreparationFailed as error:
             cause = error.__cause__
             if isinstance(cause, (ClaudexorModelError, asyncio.CancelledError)):
                 cause.physical_attempt_capture = error.physical_attempt_capture
+                all_operations_not_started &= (isinstance(cause, ClaudexorModelNotDispatched)
+                                               and error.physical_attempt_capture.state == "released")
+                if isinstance(cause, ClaudexorModelError):
+                    cause.presence_all_operations_not_started = all_operations_not_started
                 raise cause from None
             raise
         finally:
