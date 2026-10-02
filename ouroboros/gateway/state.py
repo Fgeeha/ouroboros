@@ -317,7 +317,10 @@ def _task_activity_facts(drive_root: Any, task_id: str) -> dict:
     wait = data.get("owner_wait") if isinstance(data.get("owner_wait"), dict) else {}
     quizzes = data.get("owner_quiz") if isinstance(data.get("owner_quiz"), dict) else {}
     quiz = quizzes.get(str(wait.get("quiz_id") or ""), {})
-    facts = {"finalizing": post_task_synthesis_is_open(synthesis),
+    facts = {"finalizing": post_task_synthesis_is_open(synthesis), "late_phase": synthesis,
+             # An answered root's census row (D10) carries only its own routing identity.
+             "row": {key: data[key] for key in ("chat_id", "project_id", "_is_direct_chat", "queued_at")
+                     if key in data},
              "owner_wait": {key: wait[key] for key in ("quiz_id", "state", "resume_reason")
                             if key in wait},
              # The census pointer is the same complete row history and the live delivery carry
@@ -456,12 +459,34 @@ def _chat_activities_snapshot_safe(drive_root: Any, task_bindings: Any = None, *
                 else:
                     phase = "finalizing" if _managed_task_finalizing(drive_root, task_id) else "working"
                 activities.append(_activity(task_id, row, phase, started_at))
-        from ouroboros.post_task_checkpoint import post_task_model_waits
+        from ouroboros.post_task_checkpoint import post_task_model_waits, post_task_synthesis_in_flight
+        from ouroboros.review_operation import task_has_live_review_operation
         visible = {row["activity_id"]: row for row in activities}
+        for root_id, latch in fence_rows.items():
+            # D10: an answered root under the owner's Pause whose late phase is the
+            # tree's remaining work — its answer stays Done; the remainder pauses.
+            if latch.get("cause") != "owner_pause" or root_id in visible:
+                continue
+            facts = _task_activity_facts(drive_root, root_id)
+            if facts.get("late_phase") == "paused":
+                phase = "budget_paused"
+            elif (facts.get("finalizing") or post_task_synthesis_in_flight(drive_root, root_id)
+                  or task_has_live_review_operation(drive_root, root_id, sent_only=True)):
+                phase = "budget_pausing"
+            elif task_has_live_review_operation(drive_root, root_id):
+                phase = "budget_paused"  # an unsent late review deferred until Resume
+            else:
+                continue
+            row = dict(facts.get("row") or {})
+            visible[root_id] = _activity(root_id, row, phase, _epoch_or_zero(row.get("queued_at")))
+            activities.append(visible[root_id])
         for owner in post_task_model_waits(drive_root):
             waits = owner.snapshot()["model_waits"]
             if owner.task_id in visible:
-                visible[owner.task_id].update(phase="finalizing", model_waits=waits, task_attempt=owner.attempt)
+                # A Pause settling over the late phase stays "pausing", never back to finalizing.
+                pausing = visible[owner.task_id]["phase"] in {"budget_pausing", "budget_paused"}
+                visible[owner.task_id].update(model_waits=waits, task_attempt=owner.attempt,
+                                              **({} if pausing else {"phase": "finalizing"}))
             else:
                 row = {**owner.task, "model_waits": waits}
                 activities.append(_activity(owner.task_id, row, "finalizing", _epoch_or_zero(row.get("queued_at"))))

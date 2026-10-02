@@ -5,7 +5,9 @@
 
 1. Admission under the queue lock: a LIVE ROOT (pooled RUNNING or PENDING, or
    the in-process direct turn) with no pending Stop. A child is refused — the
-   Pause is the tree's, never one member's.
+   Pause is the tree's, never one member's. An answered root whose late work
+   is still open (D10: post-task synthesis or a retained review operation)
+   is the ``late`` lane: its delivered answer stays, the remainder pauses.
 2. The durable fence on the root's task result (atomic replace). Nothing is
    acknowledged before it lands; a failed write changes nothing else.
 3. Under the queue lock again, the root's existing admission latch
@@ -26,7 +28,9 @@ member still runs or any parked member's sent work is unsettled, ``paused``
 once none does (``refresh_owner_pause_tree``, called at every owner-reason
 park, after a member's terminal and from the assignment tick's observe-only
 re-check ``settle_requested_owner_pauses``). Only an explicit owner Resume of the root
-reopens it. Budget-pause policy is untouched: nothing here requests a stop.
+reopens it — except an answered root whose late work ended with nothing saved
+(D10): no member, no open phase, no live review; that Pause has nothing left
+and is released. Budget-pause policy is untouched: nothing here requests a stop.
 """
 
 from __future__ import annotations
@@ -55,6 +59,41 @@ def _locate_root_locked(q: Any, task_id: str) -> Tuple[Optional[Dict[str, Any]],
     return (dict(turn), "direct") if isinstance(turn, dict) else (None, "")
 
 
+def _late_work(q: Any, task_id: str) -> Tuple[Optional[Dict[str, Any]], bool]:
+    """``(result_row, live_review)`` of an answered root still owning late work, else ``(None, False)``."""
+    from ouroboros.post_task_checkpoint import post_task_synthesis_in_flight, post_task_synthesis_is_open
+    from ouroboros.review_operation import task_has_live_review_operation
+    from ouroboros.task_results import load_task_result
+
+    try:
+        row = load_task_result(q.DRIVE_ROOT, task_id, strict=True) or {}
+        live_review = bool(row) and task_has_live_review_operation(q.DRIVE_ROOT, task_id)
+    except Exception:
+        return None, False
+    checkpoint = row.get("root_phase_checkpoint") if isinstance(row.get("root_phase_checkpoint"), dict) else {}
+    if live_review or post_task_synthesis_in_flight(q.DRIVE_ROOT, task_id) or post_task_synthesis_is_open(
+            checkpoint.get("post_task_synthesis")):
+        return {**row, "id": task_id}, live_review
+    return None, False
+
+
+def _late_work_settled(root_drive: Any, root_task_id: str) -> bool:
+    """An answered root with no open late phase, synthesis in flight or live review; unknown is False."""
+    from ouroboros.post_task_checkpoint import post_task_synthesis_in_flight, post_task_synthesis_is_open
+    from ouroboros.review_operation import task_has_live_review_operation
+    from ouroboros.task_results import _TRULY_TERMINAL_STATUSES, load_task_result
+
+    try:
+        row = load_task_result(root_drive, root_task_id, strict=True) or {}
+        checkpoint = row.get("root_phase_checkpoint") if isinstance(row.get("root_phase_checkpoint"), dict) else {}
+        return bool(row.get("status") in _TRULY_TERMINAL_STATUSES
+                    and not post_task_synthesis_is_open(checkpoint.get("post_task_synthesis"))
+                    and not post_task_synthesis_in_flight(root_drive, root_task_id)
+                    and not task_has_live_review_operation(root_drive, root_task_id))
+    except Exception:
+        return False
+
+
 def _running_members_locked(q: Any, root_task_id: str) -> List[Tuple[str, Dict[str, Any]]]:
     members = []
     for task_id, meta in q.RUNNING.items():
@@ -73,8 +112,11 @@ def request_owner_pause(task_id: str, *, request_id: str) -> Dict[str, Any]:
 
     from supervisor import queue as q
     task_id = str(task_id or "").strip()
+    late_row, late_review = _late_work(q, task_id)  # durable reads stay outside the queue lock
     with q._queue_lock:
         task, lane = _locate_root_locked(q, task_id)
+        if task is None and late_row is not None:
+            task, lane = late_row, "late"
         if task is None:
             return {"ok": False, "error": "task_not_live"}
         lineage = resolve_task_lineage(
@@ -91,7 +133,7 @@ def request_owner_pause(task_id: str, *, request_id: str) -> Dict[str, Any]:
         except Exception:
             return {"ok": False, "error": "cancellation_authority_unavailable"}
         root_drive = pathlib.Path(task.get("budget_drive_root") or q.DRIVE_ROOT)
-        if lane != "direct":
+        if lane not in {"direct", "late"}:
             try:
                 q.ensure_control_task_result(task_id)
             except Exception:
@@ -100,7 +142,7 @@ def request_owner_pause(task_id: str, *, request_id: str) -> Dict[str, Any]:
     from supervisor.events_budget import _set_root_budget_pause_locked
 
     try:
-        fence, created = install_fence(root_drive, task_id, request_id=request_id)
+        fence, created = install_fence(root_drive, task_id, request_id=request_id, late_work=late_review)
     except OwnerPauseRefused as exc:
         return {"ok": False, "error": str(exc) or "pause_refused"}
     except Exception as exc:
@@ -179,7 +221,8 @@ def refresh_owner_pause_tree(root_task_id: str) -> str:
     """
     from ouroboros.budget_pause import budget_pause_row
     from ouroboros.owner_pause import (
-        FENCE_PAUSED, FENCE_REQUESTED, SETTLEMENT_EXTERNAL_RUNNING, read_fence, set_fence_state,
+        FENCE_PAUSED, FENCE_RELEASED, FENCE_REQUESTED, SETTLEMENT_EXTERNAL_RUNNING, fence_closed, read_fence,
+        set_fence_state,
     )
     from supervisor.workers import direct_chat_turn
 
@@ -191,17 +234,48 @@ def refresh_owner_pause_tree(root_task_id: str) -> str:
         root_task = (root_meta.get("task") if isinstance(root_meta, dict) else None) or root_row or {}
         root_drive = pathlib.Path((root_task or {}).get("budget_drive_root") or q.DRIVE_ROOT)
         running = _running_members_locked(q, root_task_id)
-        parked = [dict(item) for item in q.PENDING if isinstance(item, dict)
-                  and root_task_id in (str(item.get("root_task_id") or ""), str(item.get("id") or ""))
-                  and isinstance(item.get("_budget_pause"), dict)]
+        queued = [dict(item) for item in q.PENDING if isinstance(item, dict)
+                  and root_task_id in (str(item.get("root_task_id") or ""), str(item.get("id") or ""))]
+        parked = [item for item in queued if isinstance(item.get("_budget_pause"), dict)]
     try:
         fence = read_fence(root_drive, root_task_id)
     except Exception:
         log.debug("Owner pause fence unreadable for %s", root_task_id, exc_info=True)
         return ""
+    if (fence_closed(fence) and not running and not queued and direct_chat_turn(root_task_id) is None
+            and _late_work_settled(root_drive, root_task_id)):
+        try:
+            # CAS on the read state: a concurrent Resume or newer Pause wins.
+            set_fence_state(root_drive, root_task_id, fence_id=str(fence.get("fence_id") or ""),
+                            state=FENCE_RELEASED, expected_state=str(fence.get("state") or ""),
+                            release_reason="late_work_settled")
+        except Exception:
+            log.debug("Settled late-work Pause of %s was not released", root_task_id, exc_info=True)
+            return str(fence.get("state") or "")
+        with q._queue_lock:
+            latch = q.BUDGET_ROOT_FENCES.get(root_task_id) or {}
+            if latch.get("cause") == "owner_pause" and latch.get("fence_id") == fence.get("fence_id"):
+                q.BUDGET_ROOT_FENCES.pop(root_task_id, None)
+                q.persist_queue_snapshot(reason="owner_pause_late_work_settled")
+        append_jsonl(q.DRIVE_ROOT / "logs" / "events.jsonl",
+                     {"ts": utc_now_iso(), "type": "owner_pause_released", "task_id": root_task_id,
+                      "root_task_id": root_task_id, "fence_id": fence.get("fence_id"),
+                      "reason": "late_work_settled", "owner_visible": True})
+        return FENCE_RELEASED
     if not fence or str(fence.get("state") or "") != FENCE_REQUESTED:
         return str(fence.get("state") or "")
     if running or direct_chat_turn(root_task_id) is not None:
+        return FENCE_REQUESTED
+    from ouroboros.post_task_checkpoint import post_task_synthesis_in_flight
+    from ouroboros.review_operation import task_has_live_review_operation
+
+    try:
+        # The answered root's late work still sends (D10): its saved pause is not yet
+        # written, or a review it already sent is settling (an unsent one is deferred).
+        if post_task_synthesis_in_flight(root_drive, root_task_id) or task_has_live_review_operation(
+                root_drive, root_task_id, sent_only=True):
+            return FENCE_REQUESTED
+    except Exception:
         return FENCE_REQUESTED
     for item in parked:
         try:
@@ -238,6 +312,55 @@ def refresh_owner_pause_tree(root_task_id: str) -> str:
                   "parked_members": [str(item.get("id") or "") for item in parked],
                   "owner_visible": True, "toast_once": f"{root_task_id}:owner-paused:{fence.get('fence_id')}"})
     return FENCE_PAUSED
+
+
+def late_phase_settled(drive_root: Any, root_task_id: str) -> None:
+    """A late phase off the pooled lane just parked, ended or was stopped (D10).
+
+    Settle the root's Pause (``paused``, or released when nothing remains) and
+    re-check held Continues. Pooled workers reach the same checks through
+    their ``task_done``; outside this supervisor's queue it observes nothing.
+    """
+    from supervisor import queue as q
+
+    try:
+        if not getattr(q, "INITIALIZED", False) or (
+                pathlib.Path(q.DRIVE_ROOT).resolve() != pathlib.Path(drive_root).resolve()):
+            return
+        from supervisor.continuation_admission import release_settled_continuations
+        from supervisor.queue_transitions import clear_budget_root_fence_for_settled_tree
+
+        if clear_budget_root_fence_for_settled_tree({"id": root_task_id, "root_task_id": root_task_id}):
+            q.persist_queue_snapshot(reason="late_phase_settled")
+        refresh_owner_pause_tree(root_task_id)
+        release_settled_continuations(root_task_id)
+    except Exception:
+        log.warning("Late-phase settlement check failed for %s", root_task_id, exc_info=True)
+
+
+def retain_late_phase_latch(drive_root: Any, root_task_id: str) -> None:
+    """Startup: a saved late phase keeps its owner Pause latch (and so its census row
+    and Resume) even when the restored snapshot was too old to carry it. Never a grant."""
+    from ouroboros.owner_pause import fence_closed, read_fence
+    from supervisor import queue as q
+    from supervisor.events_budget import _set_root_budget_pause_locked
+
+    try:
+        if not getattr(q, "INITIALIZED", False) or (
+                pathlib.Path(q.DRIVE_ROOT).resolve() != pathlib.Path(drive_root).resolve()):
+            return
+        fence = read_fence(drive_root, root_task_id)
+        if not fence_closed(fence):
+            return
+        with q._queue_lock:
+            if root_task_id in q.BUDGET_ROOT_FENCES:
+                return
+            _set_root_budget_pause_locked(root_task_id, {
+                "fence_id": str(fence["fence_id"]), "cause": "owner_pause",
+                "paused_at": str(fence.get("requested_at") or utc_now_iso())})
+            q.persist_queue_snapshot(reason="late_phase_pause_retained")
+    except Exception:
+        log.warning("Saved late-phase Pause latch of %s was not retained", root_task_id, exc_info=True)
 
 
 _SETTLE_RECHECK_SEC = 5.0

@@ -253,9 +253,12 @@ class ReviewOperation:
             self._checked_at = now
             self.control_state = _operation_stop_state(self.result_root, self.task_id)
             if self.historical_purpose:
-                from ouroboros.acceptance_late import historical_operation_controls
+                from ouroboros.acceptance_late import historical_operation_controls, owner_paused_only
 
-                if historical_operation_controls(self.result_root, self.historical_purpose, unstarted=not self._dispatched):
+                blocked = historical_operation_controls(self.result_root, self.historical_purpose,
+                                                        unstarted=not self._dispatched)
+                # An owner Pause defers unsent work until Resume (D10); it is never a Stop.
+                if blocked and not owner_paused_only(self.result_root, self.historical_purpose, blocked):
                     self.control_state = "cancelled"
             if self.control_state in {"panic", "cancelled"}:
                 self._control = self.control_state
@@ -594,8 +597,13 @@ def _link_historical_controls(operation: ReviewOperation, entry: dict) -> None:
             raise ValueError("the operation control address did not land")
 
 
-def task_has_live_review_operation(root: Any, task_id: str, *, exclude_owner_id: str = '') -> bool:
-    """One task's exact operation/control addresses, for terminal Stop ingress."""
+def task_has_live_review_operation(root: Any, task_id: str, *, exclude_owner_id: str = '',
+                                   sent_only: bool = False) -> bool:
+    """One task's exact operation/control addresses, for terminal Stop ingress.
+
+    ``sent_only`` skips an operation still ``preparing``: it has sent nothing,
+    so an owner Pause can defer it without waiting for its settlement (D10).
+    """
     from ouroboros.task_results import load_task_result
 
     row = load_task_result(root, task_id, strict=True) or {}
@@ -611,7 +619,7 @@ def task_has_live_review_operation(root: Any, task_id: str, *, exclude_owner_id:
             if any(primary.get(key) != entry.get(key) for key in keys):
                 continue
             entry = primary
-        if entry.get("state") not in _OPEN_STATES:
+        if entry.get("state") not in _OPEN_STATES or sent_only and entry.get("state") == OPERATION_PREPARING:
             continue
         with _LOCK:
             live = _LIVE.get(owner)

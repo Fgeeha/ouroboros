@@ -113,7 +113,10 @@ def conflicting_writers(q: Any, predecessor: str, *, drive_root: Any = None,
     ``owner_pause_fence_id`` is the owner Pause's own census: a queued admitted
     dispatch that only that exact accepted Pause's latch holds is not running
     work (its earlier effects are still observed below). Continue never passes
-    it: that row would dispatch again once the Pause is resumed.
+    it: that row would dispatch again once the Pause is resumed. The answered
+    predecessor's own late phase (D10) is custody too: running or open, or
+    paused (Resume would write again) — the Pause's own census alone reads its
+    saved pause as settled.
     """
     from ouroboros.budget_pause import observe_task_runs
     from ouroboros.owner_pause import tree_member_results
@@ -135,6 +138,11 @@ def conflicting_writers(q: Any, predecessor: str, *, drive_root: Any = None,
         if str(task.get("root_task_id") or task_id) == predecessor:
             members.add(task_id)
             blockers.append({"kind": "running_member", "task_id": task_id})
+    from ouroboros.post_task_checkpoint import late_phase_state
+
+    late = late_phase_state(custody_root, predecessor)
+    if late and not (late == "paused" and owner_pause_fence_id):
+        blockers.append({"kind": f"late_phase_{late}", "task_id": predecessor})
     for task in pending:
         tid = str(task.get("id") or "")
         if str(task.get("root_task_id") or tid) == predecessor:

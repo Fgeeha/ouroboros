@@ -130,14 +130,19 @@ def _resume_outstanding(current: Dict[str, Any], fence: Dict[str, Any]) -> bool:
     (``reopen_for_resume``); that grant would release whatever shares its fence.
     """
     from ouroboros.budget_pause import STATE_RESUME_GRANTED, STATE_RESUMED
+    from ouroboros.post_task_checkpoint import late_phase_pause_record
 
     row = current.get("budget_pause") if isinstance(current.get("budget_pause"), dict) else {}
     grant = row.get("grant") if isinstance(row.get("grant"), dict) else {}
-    return bool(fence.get("fence_id") and grant.get("owner_pause_fence_id") == fence["fence_id"]
-                and not grant.get("revoked_at") and row.get("state") in {STATE_RESUME_GRANTED, STATE_RESUMED})
+    late = late_phase_pause_record(current).get("grant") or {}
+    return bool(fence.get("fence_id") and (
+        grant.get("owner_pause_fence_id") == fence["fence_id"]
+        and not grant.get("revoked_at") and row.get("state") in {STATE_RESUME_GRANTED, STATE_RESUMED}
+        or late.get("fence_id") == fence["fence_id"] and not late.get("revoked_at")))
 
 
-def install_fence(root_drive: Any, root_task_id: str, *, request_id: str) -> Tuple[Dict[str, Any], bool]:
+def install_fence(root_drive: Any, root_task_id: str, *, request_id: str,
+                  late_work: bool = False) -> Tuple[Dict[str, Any], bool]:
     """Close the root's fence durably; ``(fence, created)``.
 
     Idempotent by ``request_id`` across Resume and later Pause generations;
@@ -145,10 +150,14 @@ def install_fence(root_drive: Any, root_task_id: str, *, request_id: str) -> Tup
     second press while closed names that fence, never an additional Pause,
     unless outstanding Resume authority names it: then this fresh Pause gets
     its own fence identity, which that grant cannot release. A
-    terminal root refuses: a finished tree has nothing to pause. Raises
-    ``OwnerPauseRefused`` without any write on refusal; any write failure
-    propagates, so the caller never acknowledges an undurable Pause.
+    terminal root refuses: a finished tree has nothing to pause — unless its
+    answered task still owns late work (D10): an open post-task checkpoint
+    read under this lock, or a live review operation the caller attests
+    (``late_work``). Raises ``OwnerPauseRefused`` without any write on
+    refusal; any write failure propagates, so the caller never acknowledges
+    an undurable Pause.
     """
+    from ouroboros.post_task_checkpoint import post_task_synthesis_is_open
     from ouroboros.task_results import (
         _TRULY_TERMINAL_STATUSES, require_writable_task_result_schema,
         stamp_task_result_schema, task_result_path,
@@ -173,7 +182,9 @@ def install_fence(root_drive: Any, root_task_id: str, *, request_id: str) -> Tup
                 "state": FENCE_RELEASED}
             outcome.update(fence=replay, created=False)
             return None
-        if current.get("status") in _TRULY_TERMINAL_STATUSES:
+        checkpoint = current.get("root_phase_checkpoint")
+        late_open = isinstance(checkpoint, dict) and post_task_synthesis_is_open(checkpoint.get("post_task_synthesis"))
+        if current.get("status") in _TRULY_TERMINAL_STATUSES and not (late_work or late_open):
             raise OwnerPauseRefused("task_terminal")
         if fence_closed(old) and not _resume_outstanding(current, old):
             requests[request_id] = {"fence_id": old["fence_id"], "generation": old.get("generation")}

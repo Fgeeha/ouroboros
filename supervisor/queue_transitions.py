@@ -154,7 +154,9 @@ def clear_budget_root_fence_for_settled_tree(task: dict) -> bool:
     releases the latch as a class. A fence over a tree that still has PENDING
     or RUNNING members stays: only the last settling member clears it.
     Without this, cancelling a paused tree left the fence latched forever
-    (and the snapshot restore would resurrect it after a restart).
+    (and the snapshot restore would resurrect it after a restart). An owner
+    Pause latch also stays while the answered root's late phase is paused or
+    still running (D10): that remainder is the tree's last member.
     """
     q = _queue_module()
     if not isinstance(task, dict):
@@ -162,8 +164,14 @@ def clear_budget_root_fence_for_settled_tree(task: dict) -> bool:
     root_id = str(task.get("root_task_id") or task.get("id") or "").strip()
     if not root_id:
         return False
+    from ouroboros.post_task_checkpoint import late_phase_state
+
+    late = late_phase_state(q.DRIVE_ROOT, root_id) if (q.BUDGET_ROOT_FENCES.get(root_id) or {}).get(
+        "cause") == "owner_pause" else ""
     with q._queue_lock:
         if root_id not in q.BUDGET_ROOT_FENCES:
+            return False
+        if late and (q.BUDGET_ROOT_FENCES.get(root_id) or {}).get("cause") == "owner_pause":
             return False
 
         def _member(row) -> bool:
@@ -190,11 +198,16 @@ def sweep_orphaned_budget_fences(pending, fences, drive_root) -> list:
     cannot outlive its tree across restarts.
     """
     try:
+        from ouroboros.post_task_checkpoint import late_phase_state
+
         live_roots = {
             str(t.get("root_task_id") or t.get("id") or "")
             for t in pending if isinstance(t, dict)
         }
-        orphaned = [root for root in list(fences) if root not in live_roots]
+        # An open late phase (D10) is the owner-paused tree's member across Restart:
+        # saved, or still to be settled by recovery (the census then releases it).
+        orphaned = [root for root in list(fences) if root not in live_roots and not (
+            (fences.get(root) or {}).get("cause") == "owner_pause" and late_phase_state(drive_root, root))]
         for root in orphaned:
             fences.pop(root, None)
         if orphaned:
@@ -381,6 +394,15 @@ def resume_budget_paused_task(task_id: str, *, selected_by: str = "") -> Dict[st
     )
 
     external = observation = None
+    with q._queue_lock:
+        located = next((item for item in q.PENDING if str(item.get("id") or "") == task_id), None)
+    if located is None and not selected_by:
+        # An answered root's paused remainder (D10) resumes through its own grant.
+        from supervisor.budget_resume import resume_late_phase
+
+        late = resume_late_phase(task_id)
+        if late is not None:
+            return late
     with q._queue_lock:
         located = next((item for item in q.PENDING if str(item.get("id") or "") == task_id), None)
         if located is not None and not located.get("_budget_pause"):
@@ -1061,6 +1083,7 @@ def task_has_live_ownership(task_id: str, *, ignore_review_operation: str = '') 
     task_id = str(task_id or "").strip()
     if not task_id:
         return False
+    from ouroboros.post_task_checkpoint import late_phase_state
     from ouroboros.review_operation import task_has_live_review_operation
 
     try:
@@ -1068,6 +1091,8 @@ def task_has_live_ownership(task_id: str, *, ignore_review_operation: str = '') 
             return True
     except (OSError, ValueError, TypeError):
         return True  # unreadable ownership must not turn terminal Stop into a no-op
+    if late_phase_state(q.DRIVE_ROOT, task_id) == "paused":
+        return True  # a saved late phase (D10) is retained custody: Stop must reach its remainder
     with q._queue_lock:
         if task_id in q.RUNNING:
             return True

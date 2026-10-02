@@ -22,17 +22,19 @@ export function desiredLiveCardPhase(record = {}, terminalPhase = 'done') {
         // #1110: when the outcome is already observed, it OWNS the chip and the
         // hold states itself beside it. A card whose task had failed used to read
         // only "Finalizing…", so the failure had to be smuggled into the title.
+        // D10: the owner's Pause of that late work is the same second fact.
         const observed = String(record.observedOutcome || '');
+        const late = { budget_paused: 'Paused', budget_pausing: 'Pausing…' }[record.parkedPhase] || 'Finalizing…';
         if (observed) {
             const presentation = taskPresentation(observed);
             return {
                 phase: presentation.phase,
                 text: presentation.headline,
                 className: `chat-live-phase ${presentation.phase}`,
-                secondary: 'Finalizing…',
+                secondary: late,
             };
         }
-        return {
+        if (late === 'Finalizing…') return {
             phase: 'working',
             text: 'Finalizing…',
             className: 'chat-live-phase working finalizing',

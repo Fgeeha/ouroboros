@@ -171,7 +171,9 @@ export async function resumeTaskAction(taskId, { resume = resumeTask, toast = sh
         const ack = await resume(id);
         if (ack?.ok !== true) throw new Error('Resume acknowledgement is unknown; retry this action.');
         pauseRequestIds.delete(id);
-        toast('Resuming: the task returns to the queue.', 'info');
+        // An answered root's late work (D10) continues in place; its answer stays delivered.
+        toast(ack.late_phase ? 'Resuming: the work left after the delivered answer continues.'
+            : 'Resuming: the task returns to the queue.', 'info');
     } catch (exc) {
         // The server names the refusal (replay_unsafe / fence missing /
         // not budget-paused): show it verbatim instead of a generic failure.

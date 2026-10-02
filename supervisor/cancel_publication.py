@@ -710,6 +710,31 @@ def _finish_captured_chat_turn(
     return CANCEL_ALREADY_SETTLED if outcome == DIRECT_TURN_STOP_GONE else CANCEL_CANCELLED
 
 
+def stop_paused_late_phase_custody(q: Any, task_id: str, *, intent: Optional[Dict[str, Any]] = None) -> bool:
+    """The owner's Stop of an answered root's paused late phase (D10).
+
+    Only the saved remainder is cancelled: the phase settles ``degraded`` with
+    ``owner_stopped`` and its skipped stages, the delivered answer and the
+    terminal status stay, an unconsumed Resume grant is revoked. False when no
+    paused remainder is there (a consumed grant already owns it as live work).
+    """
+    from ouroboros.post_task_synthesis import stop_paused_late_phase
+    from supervisor.owner_pause_control import late_phase_settled
+    from supervisor.task_lifecycle import _settle_intent
+
+    try:
+        if not stop_paused_late_phase(q.DRIVE_ROOT, task_id):
+            return False
+    except Exception:
+        log.warning("Stop of the saved late phase of %s was not recorded", task_id, exc_info=True)
+        return False
+    _settle_intent(q, task_id, outcome="cancelled", detail="late_phase_owner_stopped", intent=intent)
+    late_phase_settled(q.DRIVE_ROOT, task_id)
+    q.append_jsonl(q.DRIVE_ROOT / "logs" / "events.jsonl",
+                   {"ts": utc_now_iso(), "type": "late_phase_stopped", "task_id": task_id, "owner_visible": True})
+    return True
+
+
 def _finalize_cancel_intent_on_miss(
     q: Any, task_id: str, *, intent: Optional[Dict[str, Any]] = None,
 ) -> str:

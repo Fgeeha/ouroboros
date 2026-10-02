@@ -61,8 +61,10 @@ def _files_ready(root: Any, tid: str, row: dict) -> bool:
 
 
 def _open(row: dict) -> bool:
+    from ouroboros.post_task_checkpoint import post_task_synthesis_is_open
+
     checkpoint = row.get("root_phase_checkpoint") or {}
-    return checkpoint.get("post_task_synthesis") in {"pending_once", "running"}
+    return post_task_synthesis_is_open(checkpoint.get("post_task_synthesis"))
 
 
 @contextmanager

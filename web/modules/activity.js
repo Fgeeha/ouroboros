@@ -32,6 +32,23 @@ function esc(value) {
 
 const getJson = (url) => fetchJson(url, { cache: 'no-store' });
 
+/** A census-only live root (a direct turn, or an answered root whose late work the owner
+ * paused, D10): its phase, and the shared control — Resume once the census says Paused. */
+export function liveActivityRowHtml(a, nowMs = Date.now()) {
+    const names = { direct_chat: 'Direct turn', managed_task: 'Managed task' };
+    const started = Number(a.started_at) || 0;
+    const elapsed = started > 0 ? ` · ${Math.max(0, Math.round(nowMs / 1000 - started))}s` : '';
+    return `<div class="activity-row">
+                <div class="activity-row-main">
+                    <span class="activity-name">${esc(names[a.kind] || 'Live turn')}</span>
+                    <span class="activity-sub">${esc(a.phase || '')}${elapsed}</span>
+                </div>
+                <div class="activity-row-actions">
+                    <button type="button" class="btn btn-xs btn-danger" data-act="task-control" data-id="${esc(a.activity_id || '')}" data-root="1"${a.phase === 'budget_paused' ? ' data-budget-paused="1"' : ''}>${esc(TASK_CONTROL_TRIGGER_LABEL)}</button>
+                </div>
+            </div>`;
+}
+
 /** A stored UTC schedule instant for the owner: this viewer's local time, the exact
  * UTC instant beside it (and in `datetime`/`title`). Records stay UTC; an unparseable
  * value is shown raw rather than guessed. `timeZone` exists for tests only. */
@@ -257,21 +274,8 @@ export function initActivity({ mount, ws } = {}) {
         const known = new Set([...running, ...pending].map((q) => String(q.id || q.task?.id || '')));
         const live = (Array.isArray(census?.active_chat_activities) ? census.active_chat_activities : [])
             .filter((a) => a && !known.has(String(a.activity_id || '')));
-        const names = { direct_chat: 'Direct turn', managed_task: 'Managed task' };
-        const liveRow = (a) => {
-            const started = Number(a.started_at) || 0;
-            const elapsed = started > 0 ? ` · ${Math.max(0, Math.round(Date.now() / 1000 - started))}s` : '';
-            return `<div class="activity-row">
-                <div class="activity-row-main">
-                    <span class="activity-name">${esc(names[a.kind] || 'Live turn')}</span>
-                    <span class="activity-sub">${esc(a.phase || '')}${elapsed}</span>
-                </div>
-                <div class="activity-row-actions">
-                    <button type="button" class="btn btn-xs btn-danger" data-act="task-control" data-id="${esc(a.activity_id || '')}" data-root="1">${esc(TASK_CONTROL_TRIGGER_LABEL)}</button>
-                </div>
-            </div>`;
-        };
-        const parts = [...running.map((q) => row(q, 'running')), ...pending.map((q) => row(q, 'pending')), ...live.map(liveRow)];
+        const parts = [...running.map((q) => row(q, 'running')), ...pending.map((q) => row(q, 'pending')),
+            ...live.map((a) => liveActivityRowHtml(a))];
         if (parts.length) return parts.join('');
         return census?.active_chat_activities_complete === true
             ? '<div class="activity-empty">Nothing running or queued.</div>'

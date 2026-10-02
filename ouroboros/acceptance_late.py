@@ -55,6 +55,18 @@ def historical_operation_controls(root: Any, purpose: dict, *, admission: bool =
         return ['historical_control_authority_unavailable']
 
 
+def owner_paused_only(root: Any, purpose: dict, blocked: list) -> bool:
+    """Only the accounting root's closed owner Pause blocks this work: unsent, it waits for Resume (D10)."""
+    from ouroboros.owner_pause import fence_closed, read_fence
+
+    if not blocked or any(item != 'root_budget_fence' and not str(item).startswith('pause:') for item in blocked):
+        return False
+    try:
+        return fence_closed(read_fence(root, purpose['accounting_root_task_id']))
+    except Exception:
+        return False
+
+
 def _receipt(root: Path, debt: dict) -> dict | None:
     from ouroboros.acceptance_history import historical_receipt_matches
     from ouroboros.artifacts import read_actor_source_bytes
@@ -283,20 +295,24 @@ def _run_historical_acceptance(ctx: Any, *, task_id: str, debt_id: str,
             return _collect_existing(usage_ctx, row, retry_key)
         purpose = operation.historical_purpose
         blocked = historical_operation_controls(root, purpose, admission=True)
-        if blocked:
+        if blocked and not (automatic and owner_paused_only(root, purpose, blocked)):
             return refused(blocked[0])
         if not _receipt(root, debt):
             return refused('exact_delivery_unconfirmed')
         receipt_verified = True
-        while _historical_writer_live(root, task_id, operation.owner_id):
+        while True:
+            # The existing operation holds this preparation drain until the original
+            # terminal writer releases custody — and, automatic and still unsent,
+            # through an owner Pause of that root until its Resume — without a scheduler.
+            live = _historical_writer_live(root, task_id, operation.owner_id)
+            blocked = [] if live else historical_operation_controls(root, purpose, admission=True)
+            if not live and not (automatic and owner_paused_only(root, purpose, blocked)):
+                break
             if not automatic:
                 return refused('historical_writer_still_live')
             if operation.control():
                 return refused('historical_preparation_cancelled')
-            # The existing operation holds this preparation drain until the
-            # original terminal writer releases custody, without a scheduler.
             time.sleep(0.1)
-        blocked = historical_operation_controls(root, purpose, admission=True)
         if blocked:
             return refused(blocked[0])
         lineage = resolve_task_lineage(task_id, metadata=row.get('metadata'), **{
