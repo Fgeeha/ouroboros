@@ -9,9 +9,9 @@ P7 makes context fit a maintenance constraint, not a line-count aesthetic.
   excluded) target roughly 1000 lines. The deterministic hard gates read
   exact-path debt from the manifest: 1600 lines per module
   (`ouroboros/size_ratchet_manifest.py::GIANT_PATHS`), 200,000 UTF-8 bytes per
-  module (`BYTE_DEBT`, shrink-only) and the exact-current 1001–1500 band
-  (`BAND_PATHS`; a new or re-entered path requires a nonblank rationale) — all
-  three apply to Python and JavaScript alike — and 300 lines per
+  module (`BYTE_DEBT`, shrink-only) and the 1001–1500 band (`BAND_PATHS`; an
+  entry may stay at 1501–1600 lines; a new entry needs a nonblank rationale) —
+  all three apply to Python and JavaScript alike — and 300 lines per
   non-grandfathered function (`FUNCTION_DEBT`, exact `(path, qualname)` keys),
   which sees the runtime-Python function inventory only (the iterator skips
   `tests/`, `devtools/`, JavaScript and `FUNCTION_COUNT_EXCLUDED_FILES`). A

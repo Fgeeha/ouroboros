@@ -345,6 +345,64 @@ def test_tree_validation_rejects_stale_and_new_exact_debt(tmp_path: Path) -> Non
     assert "GIANT_PATHS contains stale entry: 'stale.py'" in errors
 
 
+def _band_repo(tmp_path: Path, lines: dict[str, int], manifest: SizeRatchetManifest) -> Path:
+    """A repository whose committed manifest is ``manifest`` over modules of ``lines`` lines."""
+    files = {path: "x\n" * count for path, count in lines.items()}
+    files["ouroboros/size_ratchet_manifest.py"] = regenerate._render(manifest)
+    _bootstrap_repo(tmp_path / "repo", files=files)
+    return tmp_path / "repo"
+
+
+@pytest.mark.serial
+def test_band_entry_stays_only_while_its_module_sits_above_the_band(tmp_path: Path) -> None:
+    """A module drifting to 1501-1600 lines keeps its band entry (live and staged); below
+    the band, above the hard gate or deleted, the entry is stale, and a band module without
+    one is still missing."""
+    kept = _manifest(band_paths={"mod.py": "extraction seam"})
+    repo = _band_repo(tmp_path, {"mod.py": 1450}, kept)
+    stale = "BAND_PATHS contains stale entry: 'mod.py'"
+
+    _write_lines(repo / "mod.py", 1504)
+    _git(repo, "add", "mod.py")
+    assert validate_size_ratchet(repo) == []
+    _write_lines(repo / "mod.py", 1600)  # the top edge of the gap still keeps it
+    _git(repo, "add", "mod.py")
+    assert validate_size_ratchet(repo) == []
+    _write_lines(repo / "new.py", 1100)
+    assert validate_size_ratchet(repo) == ["BAND_PATHS missing live entry: 'new.py'"]
+    (repo / "new.py").unlink()
+
+    _write_lines(repo / "mod.py", 1000)  # the bottom edge of the band is already below it
+    assert validate_size_ratchet(repo) == [stale]
+    _write_lines(repo / "mod.py", 1700)
+    _write_manifest(repo, _manifest(giant_paths=frozenset({"mod.py"}), band_paths={"mod.py": "extraction seam"}))
+    assert validate_size_ratchet(repo) == [stale, "new module debt above 1600 lines: mod.py"]
+    _write_manifest(repo, kept)
+    (repo / "mod.py").unlink()
+    assert validate_size_ratchet(repo) == [stale]
+    # Only a band entry is kept: a giant entry for a module that shrank into the gap is still stale.
+    _write_lines(repo / "big.py", 1550)
+    _write_manifest(repo, _manifest(giant_paths=frozenset({"big.py"})))
+    assert "GIANT_PATHS contains stale entry: 'big.py'" in validate_size_ratchet(repo)
+
+
+@pytest.mark.serial
+def test_band_entry_kept_above_the_band_returns_with_its_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """1504 -> 1450 lines needs no new reason: the entry never left. The adjacent rule that a
+    surviving reason is immutable is unchanged."""
+    repo = _band_repo(tmp_path, {"mod.py": 1504}, _manifest(band_paths={"mod.py": "extraction seam"}))
+    assert collect_size_ratchet_inventory_at_ref(repo, "HEAD").above_band_paths == frozenset({"mod.py"})
+    _write_lines(repo / "mod.py", 1450)
+    monkeypatch.setattr(regenerate, "REPO_ROOT", repo)
+
+    assert validate_size_ratchet(repo) == []
+    assert regenerate._next_manifest({}).band_paths == {"mod.py": "extraction seam"}
+    _write_manifest(repo, _manifest(band_paths={"mod.py": "a new reason"}))
+    assert validate_size_ratchet(repo) == ["surviving band rationale is immutable: mod.py"]
+
+
 def test_tree_validation_reads_staged_bytes_not_unstaged_worktree_bytes(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     baseline = _bootstrap_repo(repo)
@@ -403,7 +461,7 @@ def test_function_totals_are_descriptive_in_staged_and_live_trees(tmp_path: Path
     assert f"**Functions:** {live_total}" in report
     assert count_line in report.splitlines()
     assert "No hard P7 limit violations detected" in report
-    assert "manifest is exact" in report
+    assert "manifest matches the live tree" in report
     assert "Complexity Status" not in report
     assert "Size-Ratchet Findings" not in report
     assert "total function count" not in report
@@ -1025,6 +1083,24 @@ def test_generator_candidate_allows_tracked_source_deletion(tmp_path: Path, monk
     assert generated.giant_paths == frozenset()
 
 
+@pytest.mark.serial
+def test_generator_keeps_a_band_entry_only_while_its_module_sits_above_the_band(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    committed = _manifest(band_paths={"down.py": "paid down", "up.py": "kept reason"})
+    repo = _band_repo(tmp_path, {"down.py": 1450, "up.py": 1450}, committed)
+    _write_lines(repo / "up.py", 1504)
+    _write_lines(repo / "down.py", 900)
+    monkeypatch.setattr(regenerate, "REPO_ROOT", repo)
+
+    generated = regenerate._next_manifest({})
+
+    assert generated.band_paths == {"up.py": "kept reason"}
+    assert regenerate.main(["--check"]) == 1  # the 900-line module's entry is stale
+    _write_manifest(repo, generated)
+    assert regenerate.main(["--check"]) == 0
+
+
 def test_manifest_render_is_deterministic() -> None:
     manifest_a = _manifest(
         giant_paths=frozenset({"z.py", "a.py"}),
@@ -1141,7 +1217,7 @@ def test_health_report_renders_size_ratchet_findings_section(
     monkeypatch.setattr(review_module, "validate_size_ratchet", lambda *_a, **_k: [])
     report = _codebase_health(SimpleNamespace(repo_dir=tmp_path))
     assert "Size-Ratchet Findings" not in report
-    assert "Size-ratchet manifest is exact and shrink-only against the committed authority" in report
+    assert "Size-ratchet manifest matches the live tree and is shrink-only against the committed authority" in report
 
 
 def test_staged_tree_is_read_without_taking_the_live_index_lock(tmp_path: Path) -> None:

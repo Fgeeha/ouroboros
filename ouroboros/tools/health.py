@@ -124,7 +124,7 @@ def _codebase_health(ctx: ToolContext) -> str:
                 f"all non-grandfathered modules <= {MAX_MODULE_LINES} lines)"
             )
 
-        # Size-ratchet validator findings (manifest exactness + shrink-only
+        # Size-ratchet validator findings (manifest matches the tree + shrink-only
         # transition). The official repository CI `size_ratchet` lane is the
         # enforcing surface; this report and check_worktree_readiness only warn.
         try:
@@ -139,7 +139,10 @@ def _codebase_health(ctx: ToolContext) -> str:
                 for finding in ratchet_findings:
                     lines.append(f"  - {finding}")
             else:
-                lines.append("\n✅ Size-ratchet manifest is exact and shrink-only against the committed authority")
+                lines.append(
+                    "\n✅ Size-ratchet manifest matches the live tree and is shrink-only "
+                    "against the committed authority"
+                )
 
         return "\n".join(lines)
 

@@ -45,7 +45,7 @@ def _local_findings(repo: Path, findings: list[str]) -> None:
         assert f"official CI will enforce: {finding}" in warnings
         assert f"  - {finding}" in report
     assert "validator unavailable" not in report
-    assert "exact and shrink-only against the committed authority" not in report
+    assert "matches the live tree and is shrink-only against the committed authority" not in report
     print(f"LOCAL_CONSUMERS {repo.name}: {findings!r}\nREADINESS {warnings!r}\nHEALTH\n{report}")
 
 
@@ -245,4 +245,6 @@ def test_readable_absence_and_valid_bases_still_pass(tmp_path: Path, monkeypatch
         ci_consumer.test_size_ratchet_manifest_matches_live_tree()
         ci_consumer.test_size_ratchet_transition_against_explicit_base()
         print(f"CI_ALLOWED base={ref}")
-    assert "exact and shrink-only against the committed authority" in _codebase_health(SimpleNamespace(repo_dir=repo))
+    assert "matches the live tree and is shrink-only against the committed authority" in _codebase_health(
+        SimpleNamespace(repo_dir=repo)
+    )

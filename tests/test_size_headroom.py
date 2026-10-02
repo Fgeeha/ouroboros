@@ -97,4 +97,4 @@ def test_real_readiness_keeps_information_out_of_warning_and_reuses_inventory(tm
     assert len(calls) == 1
     assert "Size Headroom (information; official CI enforces the limits)" in result
     assert "lines (1 remaining)" in result
-    assert "manifest is exact" in result
+    assert "manifest matches the live tree" in result

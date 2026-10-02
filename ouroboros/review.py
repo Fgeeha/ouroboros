@@ -101,6 +101,8 @@ class SizeRatchetInventory:
     function_debt: frozenset[tuple[str, str]]
     band_paths: frozenset[str]
     byte_debt: Mapping[str, int]
+    # Modules between the band and the hard gate (1501-1600 lines).
+    above_band_paths: frozenset[str] = frozenset()
 
 
 def _exact_repo_relative_path(raw: str | pathlib.Path) -> str:
@@ -318,6 +320,9 @@ def collect_size_ratchet_inventory(
             item.path for item in modules if TARGET_MODULE_LINES < item.line_count <= BAND_MODULE_MAX_LINES
         ),
         byte_debt={item.path: item.utf8_bytes for item in modules if item.utf8_bytes > MAX_MODULE_BYTES},
+        above_band_paths=frozenset(
+            item.path for item in modules if BAND_MODULE_MAX_LINES < item.line_count <= MAX_MODULE_LINES
+        ),
     )
 
 
@@ -628,14 +633,17 @@ def _manifest_inventory_errors(
 ) -> list[str]:
     errors: list[str] = []
 
-    for label, live, recorded in (
-        ("GIANT_PATHS", inventory.giant_paths, manifest.giant_paths),
-        ("FUNCTION_DEBT", inventory.function_debt, manifest.function_debt),
-        ("BAND_PATHS", inventory.band_paths, frozenset(manifest.band_paths)),
+    for label, live, recorded, kept in (
+        ("GIANT_PATHS", inventory.giant_paths, manifest.giant_paths, frozenset()),
+        ("FUNCTION_DEBT", inventory.function_debt, manifest.function_debt, frozenset()),
+        # A band entry stays while its module sits at 1501-1600 lines: such
+        # modules mostly drift across 1500 and back in changes that never touch
+        # them, and the entry keeps its recorded reason for the return.
+        ("BAND_PATHS", inventory.band_paths, frozenset(manifest.band_paths), inventory.above_band_paths),
     ):
         for item in sorted(live - recorded):
             errors.append(f"{label} missing live entry: {item!r}")
-        for item in sorted(recorded - live):
+        for item in sorted(recorded - live - kept):
             errors.append(f"{label} contains stale entry: {item!r}")
     if dict(inventory.byte_debt) != dict(manifest.byte_debt):
         errors.append(f"BYTE_DEBT differs from live exact counts: live={dict(inventory.byte_debt)!r}")
@@ -856,7 +864,8 @@ def validate_size_ratchet(
     """Validate live and staged candidates against the merge-aware committed authority.
 
     Enforcement contract: the OFFICIAL repository's CI ``size_ratchet`` lane
-    BLOCKS on these findings (tip exactness plus the pairwise base-vs-tip
+    BLOCKS on these findings (tip exactness, except that a band entry may stay
+    while its module sits at 1501-1600 lines, plus the pairwise base-vs-tip
     transition); every local surface (default pytest lanes exclude the marker;
     ``check_worktree_readiness`` and ``codebase_health`` report the findings)
     only WARNS. There is no committed-history replay: the previous manifest
@@ -1102,6 +1111,9 @@ def compute_complexity_metrics(sections: List[Tuple[str, str]]) -> Dict[str, Any
             item.path for item in modules if TARGET_MODULE_LINES < item.line_count <= BAND_MODULE_MAX_LINES
         ),
         byte_debt={item.path: item.utf8_bytes for item in modules if item.utf8_bytes > MAX_MODULE_BYTES},
+        above_band_paths=frozenset(
+            item.path for item in modules if BAND_MODULE_MAX_LINES < item.line_count <= MAX_MODULE_LINES
+        ),
     )
     return _metrics_from_inventory(inventory)
 

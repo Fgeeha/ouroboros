@@ -443,7 +443,7 @@ def test_no_oversized_modules():
 
 @pytest.mark.size_ratchet
 def test_size_ratchet_manifest_matches_live_tree():
-    """Exact module/function/band/byte debt matches the untruncated candidate tree."""
+    """Module/function/band/byte debt matches the untruncated candidate tree (a band entry may stay at 1501-1600 lines)."""
     from ouroboros.review import validate_size_ratchet
 
     errors = validate_size_ratchet(REPO)
@@ -457,8 +457,8 @@ def test_size_ratchet_transition_against_explicit_base():
     CI exports ``OURO_SIZE_RATCHET_BASE_REF`` (PR base SHA / push
     ``event.before``); without it the check degrades to the tip's parent
     manifest — the merge-aware local semantics. An all-zeros base (new-branch /
-    tag push) degrades the same way (never a skip), while manifest exactness
-    stays enforced by ``test_size_ratchet_manifest_matches_live_tree``.
+    tag push) degrades the same way (never a skip), while the manifest matching
+    the tree stays enforced by ``test_size_ratchet_manifest_matches_live_tree``.
     """
     from ouroboros.review import validate_size_ratchet_transition_against_base
 
