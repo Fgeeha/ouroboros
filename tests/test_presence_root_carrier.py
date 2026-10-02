@@ -76,10 +76,21 @@ def test_a_presence_childs_promote_and_follow_up_stay_its_bindings_work_under_th
     _evt, child = _admitted_child(tmp_path, monkeypatch, _parent(tmp_path, {"presence": _presence()}))
     ceiling = child["task_contract"]["capability_ceiling"]
     pending, emitted = [], []
+
+    def enqueue(task):
+        from ouroboros.usage_admission import task_billing_fields
+        # This queue double must carry the same initial binding as enqueue_task.
+        binding = task_billing_fields(task, task["id"], 0.75, tmp_path,
+                                      pin_initial=True, persist_initial=False)
+        task.setdefault("metadata", {})["billing_group"] = {
+            key: value for key, value in binding.items() if key.startswith("billing_group_")}
+        pending.append(dict(task))
+        return pending[-1]
+
     handler_ctx = types.SimpleNamespace(
         DRIVE_ROOT=tmp_path, WORKERS={0: types.SimpleNamespace()}, PENDING=pending, bridge=None,
         append_jsonl=lambda *_a, **_k: None, persist_queue_snapshot=lambda **_k: True,
-        enqueue_task=lambda task: pending.append(dict(task)) or pending[-1],
+        enqueue_task=enqueue,
         load_state=lambda: {"owner_chat_id": 1},
     )
     child_ctx = types.SimpleNamespace(
@@ -118,12 +129,17 @@ def test_a_presence_childs_promote_and_follow_up_stay_its_bindings_work_under_th
     assert "written to its mailbox" in steered and len(drain_owner_entries(tmp_path, root["id"])) == 1
 
     # A follow-up of that root keeps the same carrier and ceiling, never a Project.
+    # The root now acts as a worker, publishing the admitted queue metadata.
+    write_task_result(tmp_path, root["id"], "running", metadata=root["metadata"])
     root_ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path, task_id=root["id"], current_chat_id=4242,
                            task_contract=root["task_contract"], project_id="widened",
                            task_metadata={**root["metadata"], "root_task_id": root["id"], "delegation_role": "root"})
-    scheduled_text = _handle_schedule_followup(root_ctx, objective="Revisit the audit", run_at="2030-01-01T00:00:00Z")
+    scheduled_text = _handle_schedule_followup(root_ctx, objective="Revisit the audit", run_at="2030-01-01T00:00:00Z",
+                                               relation="related")
     assert scheduled_text.startswith("FOLLOWUP_SCHEDULED"), scheduled_text
     [record] = queue.list_scheduled_tasks(tmp_path)["tasks"]
+    assert record["followup_relation"]["billing_group"]["billing_group_limit_usd"] == 0.75
+    assert record["followup_relation"]["billing_group"] == root["metadata"]["billing_group"]
     followup = queue._task_from_schedule(record)
     assert followup["metadata"]["presence_binding_authority"] == authority and "presence" not in followup["metadata"]
     assert followup["task_contract"]["capability_ceiling"] == ceiling

@@ -23,6 +23,7 @@ from ouroboros.tools.control_events import (
 )
 from ouroboros.tool_access_paths import canonical_data_root
 from ouroboros.tools.registry import ToolContext
+from ouroboros.tools.tool_result import completed_local_read
 from ouroboros.utils import append_jsonl, utc_now_iso
 
 log = logging.getLogger(__name__)
@@ -604,6 +605,7 @@ def _second_project_note(ctx: ToolContext, already_bound: str, effective_pid: st
     )
 
 
+@completed_local_read
 def _list_projects(ctx: ToolContext, limit: int = 50) -> str:
     """Enumerate the owner's projects (id, name, recency) so the one mind can
     decide whether a main-chat message belongs to an existing project. The registry

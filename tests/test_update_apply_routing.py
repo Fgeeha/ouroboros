@@ -375,7 +375,7 @@ def test_assisted_update_refuses_when_one_review_wave_is_unaffordable(monkeypatc
     """Affordability floor: remaining budget above zero but below one estimated
     triad+scope wave refuses BEFORE any repo mutation (rescue included)."""
     import ouroboros.reviewer_slot_config as reviewer_slot_config
-    import ouroboros.usage_accounting as usage_accounting
+    import ouroboros.usage_admission as usage_admission
     import supervisor.git_ops as git_ops
     import supervisor.state as state
 
@@ -386,7 +386,7 @@ def test_assisted_update_refuses_when_one_review_wave_is_unaffordable(monkeypatc
     monkeypatch.setattr(reviewer_slot_config, "commit_triad_rows", lambda: [api_row])
     monkeypatch.setattr(reviewer_slot_config, "commit_scope_rows", lambda: [api_row])
     monkeypatch.setattr(
-        usage_accounting,
+        usage_admission,
         "review_wave_admission",
         lambda **kwargs: {
             "fits": False,

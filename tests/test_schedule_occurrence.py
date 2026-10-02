@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from ouroboros.task_results import load_task_result
+from ouroboros.task_results import load_task_result, write_task_result
 
 
 @pytest.fixture
@@ -43,7 +43,11 @@ def _row(q, schedule_id="s1", *, intent=None, cron=False, project_id="", chat_id
                                            **({"project_id": project_id} if project_id else {}), "metadata": meta},
               **({"next_run_at": "2000-01-01T00:00:00+00:00"} if cron else {})}
     q.queue.upsert_scheduled_task({**record, **{k: v for k, v in extra.items() if k != "continuation_of"}},
-                                  continuation_of=extra.get("continuation_of"))
+                                  continuation_of=extra.get("continuation_of"),
+                                  host_followup={"followup_relation": {"kind": "independent"},
+                                      "followup_origin": {"task_id": meta.get("origin_task_id", ""),
+                                                          "root_task_id": meta.get("origin_root_task_id")
+                                                          or meta.get("origin_task_id", "")}})
 
 
 def _rows(q):
@@ -309,6 +313,13 @@ def test_dispatch_barrier_restore_and_settlement(q, monkeypatch):
     q.queue.check_scheduled_tasks()
     [task] = q.pending
     assert occurrences.restore_allowed(task) is True  # accepted, never dispatched: may be revived
+    stored = load_task_result(q.root, task["id"])
+    receipt = stored["schedule_admission"]
+    for frozen in ({"id": "another-task"}, None):
+        write_task_result(q.root, task["id"], "scheduled", schedule_admission={**receipt, "task": frozen})
+        assert occurrences.restore_allowed(task) is False
+        assert occurrences.record_dispatch_possible(task) is False
+    write_task_result(q.root, task["id"], "scheduled", schedule_admission=receipt)
     assert occurrences.record_dispatch_possible(task) is True
     receipt = load_task_result(q.root, task["id"])
     assert receipt["status"] == "running" and receipt["schedule_admission"]["dispatch"] == "possible"

@@ -45,6 +45,16 @@ def held_lock(root, timeout=5):
         assert not thread.is_alive()
 
 
+@pytest.fixture(autouse=True)
+def lifecycle_authority(root):
+    from ouroboros.task_results import write_task_result
+    # Managed model consumers require the same canonical lifecycle authority
+    # as production. A missing result tests unreadable authority, not contention.
+    # Prepare before each test installs its negative lock fault.
+    for tid in ("dominant", "child"):
+        write_task_result(root, tid, "running", root_task_id="dominant")
+
+
 @contextlib.contextmanager
 def owner(root, **values):
     events = queue.Queue()
@@ -404,6 +414,10 @@ def test_real_loop_round_two_wait_keeps_tool_and_live_leaf(root, short_acquisiti
     from tests.test_loop_transport_wait import _loop_kwargs
 
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
+    from ouroboros.task_results import write_task_result
+
+    # The real owner Pause consumer requires admitted task/root authority.
+    write_task_result(root, "t-wait", "running", root_task_id="t-wait")
     registry = ToolRegistry(repo_dir=root, drive_root=root)
     registry._ctx.task_id = "t-wait"
     leaf = custody.RunCustody(run_id="accounting-live-leaf", task_id="t-wait", route_id="stub", model="stub")
@@ -433,7 +447,7 @@ def test_real_loop_round_two_wait_keeps_tool_and_live_leaf(root, short_acquisiti
                 return {"usage": {"cost": .001}}
             # The real loop owns the operation; the local provider stub uses the
             # same physical wrapper as API/review adapters.
-            ua.execute_physical_attempt(request(root, task_id="t-wait"), send)
+            ua.execute_physical_attempt(request(root, task_id="t-wait", root_task_id="t-wait"), send)
             if round_idx == 1:
                 return {"role": "assistant", "content": "", "tool_calls": [
                     {"id": "read-once", "type": "function", "function": {
@@ -547,8 +561,52 @@ def _churn_lock(root, start, stop, ready):
         time.sleep(.003)
 
 
+def _trace_lock_os_failures(monkeypatch, lock_path):
+    """Observe this fixture's exact lock calls; never classify or retry them."""
+    failures, probes = [], set()
+    opened, read, closed, unlinked = os.open, os.read, os.close, os.unlink
+    selected = lambda path: isinstance(path, (str, os.PathLike)) and os.fspath(path) == str(lock_path)
+
+    def observe(stage, call, *args, **kwargs):
+        try:
+            return call(*args, **kwargs)
+        except OSError as exc:
+            native = getattr(exc, "winerror", None)
+            failures.append({"stage": stage, "exception": type(exc).__name__, "repr": repr(exc),
+                             "errno": exc.errno, "native_error": native,
+                             "native_error_source": "exception.winerror" if native is not None else "unavailable"})
+            raise
+
+    def open_lock(path, flags, *args, **kwargs):
+        if not selected(path):
+            return opened(path, flags, *args, **kwargs)
+        stage = "create_exclusive" if flags & os.O_CREAT else "probe_open"
+        fd = observe(stage, opened, path, flags, *args, **kwargs)
+        if not flags & os.O_CREAT:
+            probes.add(fd)
+        return fd
+
+    def read_lock(fd, *args, **kwargs):
+        return observe("probe_read", read, fd, *args, **kwargs) if fd in probes else read(fd, *args, **kwargs)
+
+    def close_lock(fd, *args, **kwargs):
+        try:
+            return observe("probe_close", closed, fd, *args, **kwargs) if fd in probes else closed(fd, *args, **kwargs)
+        finally:
+            probes.discard(fd)
+
+    def unlink_lock(path, *args, **kwargs):
+        return observe("unlink", unlinked, path, *args, **kwargs) if selected(path) else unlinked(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", open_lock)
+    monkeypatch.setattr(os, "read", read_lock)
+    monkeypatch.setattr(os, "close", close_lock)
+    monkeypatch.setattr(os, "unlink", unlink_lock)
+    return failures
+
+
 @pytest.mark.parametrize("cancel", [False, True])
-def test_owned_process_churn_keeps_single_send_and_controls(root, cancel):
+def test_owned_process_churn_keeps_single_send_and_controls(root, cancel, monkeypatch):
     ctx = multiprocessing.get_context("spawn")
     start, stop, ready = ctx.Event(), ctx.Event(), ctx.Queue()
     children = [ctx.Process(target=_churn_lock, args=(root, start, stop, ready)) for _ in range(3)]
@@ -560,6 +618,7 @@ def test_owned_process_churn_keeps_single_send_and_controls(root, cancel):
         for child in children:
             child.start()
         assert len({ready.get(timeout=10) for _ in children}) == 3
+        lock_failures = _trace_lock_os_failures(monkeypatch, root / "state" / ledger.LOCK_REL.name)
         start.set()
         with owner(root, control=control), ua.physical_attempt_limit(1):
             if cancel:
@@ -569,7 +628,8 @@ def test_owned_process_churn_keeps_single_send_and_controls(root, cancel):
                     except ledger.UsageLockUnavailable as exc:
                         raise AssertionError(
                             "Accounting acquisition failed before cancellation: "
-                            f"reason={exc.reason!r}, error_number={exc.error_number!r}"
+                            f"reason={exc.reason!r}, error_number={exc.error_number!r}, "
+                            f"lock_os_failures={lock_failures!r}"
                         ) from exc
             else:
                 ua.execute_physical_attempt(request(root), lambda: sends.append(1) or {"usage": {}})

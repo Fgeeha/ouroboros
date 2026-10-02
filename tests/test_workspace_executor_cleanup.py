@@ -82,6 +82,15 @@ def test_executor_panic_cleanup_wait_false_uses_bounded_docker_stop(tmp_path, mo
 
     def fake_docker_wait(cmd, **kwargs):
         docker_run_calls.append([str(part) for part in cmd])
+        # The live-service observer uses its normal ten-second bound; stop,
+        # durable-record proof and marker retirement use five seconds.
+        live_probe = str(cmd[-1]) == "kill -0 67890 2>/dev/null && echo running || echo exited"
+        assert kwargs["timeout"] == (10 if live_probe else 5)
+        if str(cmd[-1]).startswith("rm -f -- "):
+            retained = json.loads((state_dir / "foreground-docker.json").read_text())
+            assert retained["backend_completed"] is True
+        if "printf completed" in str(cmd[-1]):
+            return subprocess.CompletedProcess(cmd, 0, stdout="completed", stderr="")
         if "kill -0" in str(cmd[-1]):
             return subprocess.CompletedProcess(cmd, 0, stdout="exited\n", stderr="")
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
@@ -96,9 +105,17 @@ def test_executor_panic_cleanup_wait_false_uses_bounded_docker_stop(tmp_path, mo
     killed_foreground = workspace_executor.kill_all_foreground(data, wait=False)
     killed_services = workspace_executor.kill_all_services(data, wait=False)
 
-    # Both in-memory and durable services perform an explicit kill-0
-    # confirmation after the stop shell, in addition to the dispatches.
-    assert len(docker_run_calls) == 5
+    # One stop/proof pair per service; foreground wait proof is persisted
+    # before the one bounded marker retirement. No workload is replayed.
+    scripts = [call[-1] for call in docker_run_calls]
+    assert scripts == [
+        workspace_executor._docker_exec_pidfile_stop_shell("/tmp/ouroboros-exec-test.pid"),
+        "rm -f -- /tmp/ouroboros-exec-test.pid",
+        workspace_executor._docker_service_stop_shell("67890"),
+        "kill -0 67890 2>/dev/null && echo running || echo exited",
+        workspace_executor._docker_service_stop_shell("12345"),
+        "kill -0 12345 2>/dev/null && echo running || echo exited",
+    ]
     assert all(call[:2] == ["docker", "exec"] for call in docker_run_calls)
     assert any(item.get("executor_type") == "docker_exec" for item in killed_foreground)
     assert any(item.get("state") == "stopped" for item in killed_services)

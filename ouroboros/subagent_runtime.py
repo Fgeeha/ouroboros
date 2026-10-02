@@ -790,7 +790,9 @@ def exact_start(ctx: Any, prompt: str, spec: Optional[dict[str, Any]] = None) ->
     except SubagentSelectionError as exc:
         from ouroboros.delegate_shared import _fail
 
-        return _fail("delegate_start", exc.code, exc.detail)
+        # Selector validation has not entered the physical-start producer yet.
+        return _replace_tool_result(_fail("delegate_start", exc.code, exc.detail),
+                                    meta_updates={"operation_outcome": "completed_no_effect"})
 
     token = _EXACT_START_SELECTION.set({
         "snapshot": selected_snapshot,

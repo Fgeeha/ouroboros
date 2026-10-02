@@ -1176,7 +1176,9 @@ body
         (skill_dir / "SKILL.md").write_text(manifest, encoding="utf-8")
         (skill_dir / "plugin.py").write_text("", encoding="utf-8")
     monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(user_skill.parent))
-    queue.upsert_scheduled_task({
+    # The row the skill producer persisted before the second payload appeared: skill provenance
+    # is host-authored, and the owner create door (upsert) stamps a new row as the owner's.
+    queue._write_scheduled_tasks({"tasks": [{
         "id": "skill-cron-demo-refresh",
         "name": "cron-demo/refresh",
         "enabled": True,
@@ -1185,7 +1187,7 @@ body
         "trigger": {"type": "cron", "expr": "* * * * *"},
         "next_run_at": "2000-01-01T00:00:00+00:00",
         "task": {"type": "task", "text": "run cron-demo"},
-    })
+    }]}, tmp_path)
 
     queue.resync_skill_schedules(tmp_path)
     before = queue.list_scheduled_tasks(tmp_path)["tasks"][0]

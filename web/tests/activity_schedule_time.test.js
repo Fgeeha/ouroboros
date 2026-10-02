@@ -21,3 +21,8 @@ test('an unparseable or absent value is shown raw, never guessed', () => {
     assert.equal(scheduleInstantHtml(''), '');
     assert.equal(scheduleInstantHtml(undefined), '');
 });
+
+test('a hard deadline includes its year in both viewer and UTC text', () => {
+    const html = scheduleInstantHtml('2099-01-01T00:00:00Z', { timeZone: 'Asia/Tokyo', includeYear: true });
+    assert.equal((html.match(/2099/g) || []).length, 4); // datetime, title and both visible instants
+});

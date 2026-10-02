@@ -1,6 +1,6 @@
 # Rules by change class
 
-This chapter gives one rule section per change class: tool registration, skill payloads, the live E2E stand, light mode and deliverables, retention, delegated subagents, cancellation, onboarding and settings, transport and late-result custody, LLM calls, timeout/wait control, and loop/acceptance state machines. Each section names its enforcing tests or gates, or marks rules as review-only; check a change against its applicable classes.
+Rules by change class: tool registration, skill payloads, the live E2E stand, light mode and deliverables, retention, delegated subagents, cancellation, onboarding and settings, transport and late-result custody, LLM calls, timeout/wait control, and loop/acceptance state machines. Each section names its enforcing tests or gates, or marks rules as review-only; check a change against its applicable classes.
 
 `docs/CHECKLISTS.md` remains the only reviewer scorer; its `development_compliance` item points at this handbook as a whole.
 
@@ -415,15 +415,15 @@ The imperatives:
   validates through the DURABLE result unconditionally (ARCHITECTURE §10 "Key
   Invariants" 15); only `interrupted` keeps its restore-path exemption, and
   the legacy `cancel_requested` status survives on a read path only.
-- `stop_policy` is an axis on the durable intent, and the owner hurry control
-  is a typed TASK-LOCAL owner-mailbox control — never a chat message, a global
-  settings mutation or a review-gate weakening. Every same-id requeue producer
+- `stop_policy` is an axis on the durable intent; the owner hurry control is a
+  typed TASK-LOCAL owner-mailbox control — never a chat message, global
+  settings mutation or review-gate weakening. Every same-id requeue producer
   calls the ONE shared `owner_hurry.retry_reset`; the durable hurry projection
-  writes only through `update_json_locked` on the `owner_hurry` keys, never
+  writes only via `update_json_locked` on `owner_hurry` keys, never
   `write_task_result`; UI surfaces share `web/modules/task_control_menu.js`;
-  queue-owned hurry admission initializes only an absent pooled result through
-  the task-result writer's atomic `create_only` branch, and direct turns stay
-  outside it.
+  queue-owned Pause/Hurry admission atomically `create_only`-writes an absent
+  pooled result from exact admitted lineage/budget/source facts; terminal rows
+  win; direct turns/billing stay outside.
 - Code owners stay narrow behind one public queue/lifecycle surface:
   retry-aware target/subtree-liveness in `supervisor/queue_transitions.py`,
   capture-miss terminalization/publication in

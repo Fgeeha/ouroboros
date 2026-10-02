@@ -717,19 +717,11 @@ class ActiveDirectTurn(TypedDict):
 
 
 class ActiveChatActivity(ActiveDirectTurn):
-    """One in-flight chat activity in ``StateResponse.active_chat_activities``.
-
-    Direct/ephemeral registry turns (the ``active_direct_turns`` rows) plus ROOT
-    managed queue tasks as ``kind="managed_task"`` with ``phase`` ``queued`` |
-    ``budget_paused`` (awaiting an explicit owner Resume; never plain "queued") |
-    ``budget_pausing`` (RUNNING, writing its exact pause record; #1196) | ``working`` |
-    ``finalizing`` (answer stored, post-task
-    synthesis open); a direct row whose live wait owner could not be read is
-    ``phase="unknown"``; a budget-paused direct turn (#1196) keeps its SAME id and
-    reports the managed phases as ``kind="direct_chat"``. Same shape as ``ActiveDirectTurn`` so one reducer hydrates
-    both (managed rows: empty ``client_message_id``). ``required_question_unavailable``:
-    a recorded owner-question wait whose detail could not be resolved — possibly blocked.
-    """
+    """One live activity: direct turns and managed ROOT queue tasks share this shape.
+    budget_pausing includes a saved root whose tree still settles; budget_paused
+    awaits explicit Resume. Direct paused turns keep their ID/kind. Unreadable
+    live waits or Pause authority report unknown (incomplete census); unresolved owner-question detail reports
+    required_question_unavailable. Managed rows have empty client_message_id."""
 
     required_question: NotRequired[Dict[str, Any]]
     required_question_unavailable: NotRequired[bool]
@@ -1148,6 +1140,7 @@ class TaskDetailResponse(TypedDict, total=False):
     # Soft finalize_then_cancel: "Finalizing…" plus hard escalation; absent on immediate intents (S3/Q1).
     stop_policy: str
     # Current hurry plus prior same-id attempts; detail-only, absent if never hurried (S3/HQ1).
+    continuation_offer: ContinuationOffer
     owner_hurry: OwnerHurryProjection
     owner_hurry_history: list[OwnerHurryProjection]
     project_admission_hold: Dict[str, Any]  # While the queue snapshot lists the row: its hold {reason, detail, label} or {}.
@@ -1158,24 +1151,10 @@ ClaudexorReadState = Literal["ok", "not_read", "failed"]
 
 
 class ClaudexorStatusReads(TypedDict):
-    """PROVENANCE for each independent facet of ``GET /api/claudexor/status``.
-
-    An empty collection cannot say whether the daemon was ASKED: the owned
-    Claudexor daemon starts lazily, so an idle machine used to serve empty
-    lists that every consumer read as "no account connected" while real
-    accounts sat in the agent home. Each facet answers only for itself, since
-    one fanned-out read can fail while its siblings land:
-
-    - ``ok`` — read; the matching collection is AUTHORITATIVE (empty means empty)
-    - ``not_read`` — this facet was never asked: the daemon was not running, or
-      discovery/handshake died BEFORE the fan-out (which leaves every facet
-      untouched while the aggregate state reports ``unreachable``)
-    - ``failed`` — asked, and no usable answer came back: the read refused, or
-      the body arrived in a shape the facet does not promise
-
-    Facets map to ``harnesses`` (catalog), ``profiles`` (accounts) and ``quota``.
-    The manifest read behind the login-capability filter is deliberately NOT a
-    facet: its failure is absorbed (fail-open), never reported."""
+    """Independent status facets: harnesses/catalog, profiles/accounts and quota.
+    ok means authoritative (including empty); not_read means never asked, including
+    a discovery failure before fan-out; failed means no usable answer to a read.
+    The login-capability manifest filter fails open and is not a reported facet."""
 
     catalog: ClaudexorReadState
     accounts: ClaudexorReadState
@@ -1205,21 +1184,10 @@ class ClaudexorStatusResponse(TypedDict, total=False):
 
 
 class ClaudexorLoginJobResponse(TypedDict, total=False):
-    """The ONE login-job success envelope (frozen browser gateway ABI,
-    issues #124/#151): every ``/api/claudexor/login`` operation — create,
-    snapshot poll, cancel, input, reconcile — answers exactly one top-level
-    bare ``job`` (the daemon's ``ControlSetupJob``), never another envelope
-    nested under it (the double ``job.job`` was issue #124).
-
-    Operation metadata rides BESIDE the job: create adds ``job_id``,
-    ``disclosure_native``, ``setup_login_source`` and (external-terminal
-    flows whose exact packaged attach role was proven) the labelled
-    ``attach_command`` / ``attach_shell`` pair;
-    input keeps its ``ok`` bit; the snapshot poll is the daemon's own
-    ``{job, cursor, sequence, deviceCode?}`` envelope passed through
-    verbatim, so the transient sign-in disclosure lives at the ENVELOPE
-    level, not inside ``job``. ``job`` is required on every operation; all
-    other keys are operation-scoped."""
+    """Every login operation returns one required bare ControlSetupJob as job.
+    Create metadata, input ok and snapshot cursor/sequence/deviceCode stay beside
+    it. Snapshots pass through verbatim; attach_command/attach_shell require the
+    proven packaged role. Optional fields are operation-scoped; never job.job."""
 
     job: Required[Dict[str, Any]]
     # snapshot-only (daemon envelope verbatim)
@@ -1257,20 +1225,10 @@ class ClaudexorCredentialProfileDeleteResponse(TypedDict):
 
 
 class ClaudexorLoginJobProblem(TypedDict, total=False):
-    """The narrow login-job error envelope (frozen beside the success DTO —
-    the recovery UI consumes both sides of one operation contract): required
-    ``error`` prose, optional stable machine ``code``, optional bounded
-    ``required_actions`` naming the engine's continuation (e.g. reconcile's
-    409 ``setup_termination_unconfirmed`` carries
-    ``["retry_setup_reconciliation"]``). Daemon 404/410 job-absence verdicts,
-    the operation-scoped input/reconcile 409s, and setup-create 400/409 or the
-    frozen retryable 503 terminal-transport probe verdict ride this shape with
-    their original status, stable code, actions and the engine's own sentence.
-    Unmarked transport/discovery 503s and other daemon 5xx stay the proxy's
-    generic 503.
-    Not an action framework: the list mirrors the daemon's own top-level
-    ``ControlProblem.requiredActions`` (at most 16 strings of at most 512
-    chars) and nothing else."""
+    """Typed job errors preserve engine prose/status/code and bounded actions
+    (16 strings, 512 chars each). Covers absent jobs, input/reconcile conflicts,
+    setup 400/409 and marked retryable terminal-probe 503. Other daemon 5xx and
+    unmarked transport/discovery failures use the generic proxy 503."""
 
     error: Required[str]
     code: str
@@ -1305,42 +1263,90 @@ class TaskEvent(TypedDict, total=False):
     error: str
 
 
+class TaskPauseRequest(TypedDict):
+    """Text-free tree Pause; reuse request_id on retry."""
+    request_id: str
+
+
+class TaskPauseResponse(TypedDict, total=False):
+    ok: bool
+    task_id: str
+    root_task_id: str
+    fence_id: str
+    state: Literal["requested", "paused", "released"]
+    duplicate: bool
+    members: List[str]
+    snapshot_persisted: bool
+    latch_pending: bool
+    error: str
+    reason_code: str
+
+
+class TaskContinueRequest(TypedDict):
+    """Retry one action, including after an unconfirmed admission/reload."""
+    action_nonce: str
+
+
+class TaskContinueResponse(TypedDict, total=False):
+    ok: bool
+    task_id: str
+    predecessor_task_id: str
+    successor_task_id: str
+    replay: bool
+    recovered: bool
+    held: bool
+    status: str
+    blockers: List[Dict[str, Any]]
+    error: str
+    reason_code: str
+    cause: str
+    gaps: List[str]
+    unconfirmed: bool
+    state: Literal["bound", "admitted"]
+    action_nonce: str
+
+
+class ContinuationOffer(TypedDict, total=False):
+    """Bound is retryable using action_nonce; only admitted is a successor pointer."""
+    eligible: bool
+    refusal: str
+    cause: str
+    successor_task_id: str
+    state: Literal["bound", "admitted"]
+    action_nonce: str
+
+
+class TaskCancelRequest(TypedDict, total=False):
+    """Optional body; stop_action_id retries one action, distinct from custody ID.
+    Omission preserves legacy ingress without exact-replay assurance."""
+    cascade: bool
+    stop_policy: str
+    stop_action_id: str
+
+
 class TaskCancelResponse(TypedDict, total=False):
     ok: bool
     task_id: str
-    # v6.82 (P5): echoed when the optional request body {"cascade": true} asked
-    # for the subtree cancel, which is COMPLETE by the time this answer is sent;
-    # the plain envelope is unchanged.
+    # Cascade echoes subtree scope; immediate success follows teardown.
     cascade: bool
-    # Additive on the 202 acknowledgement of a ``{"stop_policy": "finalize_then_cancel"}`` request: the
-    # durable intent is open ("pending") while the bounded finalization attempt runs, and ``stop_policy``
-    # echoes the EFFECTIVE policy of the durable intent ("immediate" | "finalize_then_cancel") — a graceful
-    # request over an already-hard intent never softens it, and the answer says so. Absent on the legacy immediate path.
+    # Soft 202 keeps custody pending and echoes EFFECTIVE policy, never softening
+    # an immediate intent. Legacy immediate replies omit these additive fields.
     cancel_state: str
     stop_policy: str
     error: str
 
 
 class TaskHurryRequest(TypedDict):
-    """``POST /api/tasks/{task_id}/hurry`` — the text-free owner hurry control
-    (HQ1 owner decision, paraphrased: no visible chat message ever).
-
-    The body carries ONLY a client-generated stable ``request_id`` (reused on
-    retry so the acknowledgement is idempotent); any other field is refused.
-    There is deliberately no text and no chat side effect anywhere on this
-    path — the durable facts are the typed owner-mailbox control, the
-    ``owner_hurry`` task-result projection, and one non-chat event."""
-
+    """Text-free owner hurry (HQ1), POST /api/tasks/{task_id}/hurry.
+    Only stable request_id is accepted, reused on retry. No chat side effect;
+    durable facts are the mailbox control, owner_hurry projection and one event.
+    """
     request_id: str
 
 
 class OwnerHurryProjection(TypedDict, total=False):
-    """The ``owner_hurry`` block on the task result — task-detail
-    observability, never a chat message. ``state`` is the closed vocabulary
-    requested | applied | not_applied_before_terminal; ``effects`` maps each
-    host-rail effect to its recorded status. ``owner_hurry_history`` rows
-    carry the same shape plus ``archived_at``/``archived_reason`` (rolled over
-    on every same-id requeue by the shared retry-reset)."""
+    """Task-detail owner_hurry, never chat: requested|applied|not_applied_before_terminal.
+    Effects map host rails; same-ID requeues retain archived_at/archived_reason."""
 
     attempt_key: int
     request_id: str
@@ -1378,15 +1384,9 @@ class LogTailResponse(TypedDict, total=False):
 
 
 class OnboardingCompleteRequest(TypedDict, total=False):
-    """``POST /api/onboarding/complete`` — the wizard payload plus two
-    DECLARATIONS about the onboarding run itself.
-
-    The settings keys of the shared setup contract ride through unchanged (open
-    shape, same payload the wizard already builds); the two subscription flags
-    and canonical actor draft are typed here. None is authority:
-    ``subscriptionsConnected`` only tells the server to read the live
-    agent account state, and the server re-proves fresh-install status
-    on its own before applying anything."""
+    """Open setup-settings payload plus subscription declarations and actor draft.
+    These are not authority: subscriptionsConnected requests a live account read;
+    the server independently proves fresh-install status before applying."""
 
     subscriptionsConnected: bool
     skipSubscriptionPresets: bool
@@ -1418,12 +1418,8 @@ class OnboardingPresetProjection(TypedDict):
 
 
 class OnboardingCompleteResponse(TypedDict):
-    """The ONE success envelope. Settings, the next-boot runtime mode, the
-    fresh-install safety default and the durable completion fact land ATOMICALLY
-    — every success carries all four. The preset keys and their one-shot marker
-    ride the same write only when ``preset.applied`` is true; an ordinary success
-    with ``not_requested``, ``skipped_by_owner`` or ``not_install_time`` persists
-    no preset and no marker, which is the D-4 design, not a partial save."""
+    """Settings, next-boot mode, safety default and completion persist atomically.
+    Preset and one-shot marker join that write only when preset.applied is true."""
 
     ok: bool
     status: str
@@ -1433,14 +1429,8 @@ class OnboardingCompleteResponse(TypedDict):
 
 
 class SettingsPostCommitFailureResponse(TypedDict):
-    """500 from an owner settings write whose BYTES ALREADY LANDED.
-
-    The distinction the broad handlers used to erase: a failure BEFORE the write
-    is "nothing was saved", a failure AFTER it is "saved, and then this step
-    failed". ``post_commit_failed`` names the step (environment projection,
-    supervisor start, hot-reload…) so the owner knows what to retry — never that
-    the settings themselves need saving again. Shared by ``POST /api/settings``
-    and ``POST /api/onboarding/complete``."""
+    """500 after settings bytes landed; post_commit_failed names the later step.
+    Retry that step, never re-save. Shared by settings and onboarding writes."""
 
     error: str
     status: str
@@ -1590,6 +1580,9 @@ __all__ = [
     "TaskEventCursor",
     "TaskEventsRequest",
     "TaskCancelResponse",
+    "TaskCancelRequest",
+    "TaskPauseRequest", "TaskPauseResponse",
+    "TaskContinueRequest", "TaskContinueResponse", "ContinuationOffer",
     "TaskHurryRequest",
     "TaskHurryResponse",
     "OwnerHurryProjection",

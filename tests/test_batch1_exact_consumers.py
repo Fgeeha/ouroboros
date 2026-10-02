@@ -334,6 +334,8 @@ def _pooled_test_entry(*args):
             workspace.mkdir(exist_ok=True)
             ctx = ToolContext(repo_dir=root / 'repo', drive_root=root / 'data',
                               workspace_root=workspace, workspace_mode='external', task_id='pooled')
+            from ouroboros.task_results import write_task_result
+            write_task_result(ctx.drive_root, 'pooled', 'running', root_task_id='pooled')
             registry = ToolRegistry(repo_dir=ctx.repo_dir, drive_root=ctx.drive_root)
             registry.set_context(ctx)
             shell_process._subprocess_lock.acquire()  # cleanup must not gate requests

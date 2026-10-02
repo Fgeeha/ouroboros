@@ -15,6 +15,7 @@ import copy
 import hashlib
 import json
 import logging
+import os
 import pathlib
 import threading
 import time
@@ -171,7 +172,9 @@ def refresh_root_accounting(
     if cached is not None and max_age_sec > 0 and cached["age_sec"] <= max_age_sec:
         return cached
     try:
-        projection = usage_projection(drive_root, root_task_id=root_task_id)
+        # A ``group:<id>`` key is the whole-work group's accounting (``usage_admission.accounting_key``).
+        group = root_task_id[len("group:"):] if root_task_id.startswith("group:") else ""
+        projection = usage_projection(drive_root, root_task_id="" if group else root_task_id, billing_group_id=group)
         _stash_root_accounting(
             root_task_id,
             _number(projection.get("accounted_usd")),
@@ -229,6 +232,8 @@ class UsageScope:
     parent_task_id: str = ""
     category: str = "task"
     source: str = "llm"
+    # Explicitly attributed system probes/one-shots have no task control owner.
+    non_task_operation: bool = False
     review_skill: str = ""
     review_wave_id: str = ""
     review_slot_id: str = ""
@@ -237,7 +242,15 @@ class UsageScope:
     root_cost_ceiling_usd: Optional[float] = None
     global_limit_source: str = ""
     global_limit_revision: Optional[str] = None
+    # Whole-work billing group (owner Batch4, ``usage_admission``): empty = this
+    # root is its own group under its own cap; a Continue's successor carries the
+    # ORIGINAL root's group and that root's original cap.
+    billing_group_id: str = ""
+    billing_group_limit_usd: Optional[float] = None
+    billing_group_limit_source: str = ""
+    billing_group_limit_revision: Optional[str] = None
     root_limit_source: str = ""  # Original None + provenance is unlimited, not a new default.
+    root_limit_revision: Optional[str] = None
 @dataclass(frozen=True)
 class PhysicalAttemptContext:
     profile: Literal["owner_max", "owner_low", "owner_nano", "task_local_low"]
@@ -421,28 +434,55 @@ def _claim_physical_dispatch(attempt_id: str = "") -> None:
 
 def _merge_scope(request: AttemptRequest) -> Tuple[AttemptRequest, UsageScope]:
     bound = _CURRENT_SCOPE.get() or UsageScope()
+    task_id = str(request.task_id or bound.task_id or "")
+    root_task_id = str(request.root_task_id or bound.root_task_id or task_id)
+    same_root = root_task_id == str(bound.root_task_id or bound.task_id or "")
     limit_owner = request if request.global_limit_usd is not None else bound
     limit_source = limit_owner.global_limit_source or (
         "attempt_request" if limit_owner is request else "usage_scope"
     )
     scope = UsageScope(
         drive_root=request.drive_root or bound.drive_root,
-        task_id=str(request.task_id or bound.task_id or ""),
-        root_task_id=str(request.root_task_id or bound.root_task_id or ""),
-        parent_task_id=str(request.parent_task_id or bound.parent_task_id or ""),
+        task_id=task_id,
+        root_task_id=root_task_id,
+        parent_task_id=str(request.parent_task_id or (bound.parent_task_id if same_root else "") or ""),
         category=str(request.category or bound.category or "task"),
         source=str(request.source or bound.source or "llm"),
+        non_task_operation=bound.non_task_operation and same_root,
         **{key: str(getattr(bound, key, "") or "") for key in REVIEW_ATTRIBUTION_KEYS},
         global_limit_usd=(
             request.global_limit_usd if request.global_limit_usd is not None else bound.global_limit_usd
         ),
-        root_limit_usd=(request.root_limit_usd if request.root_limit_usd is not None else bound.root_limit_usd),
-        root_cost_ceiling_usd=bound.root_cost_ceiling_usd,
+        root_limit_usd=(request.root_limit_usd if request.root_limit_usd is not None
+                        else bound.root_limit_usd if same_root else None),
+        root_limit_source=bound.root_limit_source if same_root else "",
+        root_limit_revision=bound.root_limit_revision if same_root else None,
+        root_cost_ceiling_usd=bound.root_cost_ceiling_usd if same_root else None,
         global_limit_source=limit_source if limit_owner.global_limit_usd is not None else "",
         global_limit_revision=limit_owner.global_limit_revision if limit_owner.global_limit_usd is not None else None,
+        billing_group_id=bound.billing_group_id if same_root else "",
+        billing_group_limit_usd=bound.billing_group_limit_usd if same_root else None,
+        billing_group_limit_source=bound.billing_group_limit_source if same_root else "",
+        billing_group_limit_revision=bound.billing_group_limit_revision if same_root else None,
     )
     if not scope.root_task_id and scope.task_id:
         scope = replace(scope, root_task_id=scope.task_id)
+    # Bare AttemptRequest is the ledger primitive; task consumers bind a UsageScope.
+    # Only task-bound execution resolves durable lineage here (a synthetic raw
+    # ledger request does not manufacture a task result).
+    if not scope.non_task_operation and not scope.billing_group_id and bound.task_id and scope.root_task_id and scope.drive_root:
+        from ouroboros.usage_admission import task_billing_fields
+
+        scope = replace(scope, **task_billing_fields({"id": scope.task_id}, scope.root_task_id,
+                                                    scope.root_limit_usd, scope.drive_root))
+    if scope.billing_group_id and scope.drive_root:
+        from ouroboros.usage_admission import effective_billing_fields
+        scope = replace(scope, **effective_billing_fields(scope.drive_root, scope.root_task_id, {
+            key: getattr(scope, key) for key in ("root_limit_usd", "root_limit_source", "root_limit_revision", "billing_group_id",
+                "billing_group_limit_usd", "billing_group_limit_source", "billing_group_limit_revision")},
+            non_task_operation=scope.non_task_operation))
+    if request.root_limit_usd is not None and (scope.root_limit_usd is None or request.root_limit_usd < scope.root_limit_usd):
+        scope = replace(scope, root_limit_usd=request.root_limit_usd, root_limit_source="attempt_request", root_limit_revision=None)
     if request.global_limit_usd is None and scope.global_limit_usd is not None:
         request = replace(request, global_limit_usd=scope.global_limit_usd,
                           global_limit_source=scope.global_limit_source,
@@ -460,32 +500,12 @@ from ouroboros._usage_rows_memo import (  # noqa: F401,E402  (re-exported seam)
 )
 
 
-def usage_projection(
-    drive_root: pathlib.Path | str | None = None,
-    *,
-    root_task_id: str = "",
-    global_limit_usd: Optional[float] = None,
-    include_roots: bool = True, allow_stale: bool = False,
-) -> Dict[str, Any]:
-    """Return a replayed global projection, or one root/subtree projection.
-    ``include_roots=False`` skips the per-root ``by_root`` map for hot-path readers
-    (``/api/state``); the slim result keeps the two fields ``budget_remaining`` reads.
-    ``allow_stale``: DISPLAY readers only, never money (``_memoized_final_rows``)."""
-    root = _drive_root(drive_root)
-    if root_task_id:
-        return _render_cached(
-            root, ("usage_projection", root_task_id, "", None, True),
-            lambda f, degraded: _projection_from_final(f, degraded, root_task_id=root_task_id), allow_stale=allow_stale)
-    if global_limit_usd is not None:
-        configured_limit = max(0.0, float(global_limit_usd))
-    else:
-        from ouroboros.settings_setup_contract import resolve_total_budget_usd
-        configured_limit = resolve_total_budget_usd() or 0.0
-    limit = configured_limit if (global_limit_usd is not None or configured_limit > 0) else None
-    return _render_cached(
-        root, ("usage_projection", "", "", limit, include_roots),
-        lambda final, degraded: _projection_from_final(final, degraded, limit,
-                                                       include_roots=include_roots), allow_stale=allow_stale)
+def usage_projection(drive_root=None, *, root_task_id="", global_limit_usd=None,
+                     include_roots=True, allow_stale=False, billing_group_id=""):
+    """Current read-side projection; immutable ledger rows retain historical caps."""
+    from ouroboros.usage_admission import current_usage_projection
+    return current_usage_projection(drive_root, root_task_id=root_task_id, global_limit_usd=global_limit_usd,
+        include_roots=include_roots, allow_stale=allow_stale, billing_group_id=billing_group_id)
 
 
 def usage_breakdown(
@@ -658,130 +678,6 @@ def _reservation_cost(request: AttemptRequest) -> Optional[float]:
     )
 
 
-def _per_slot(value: Any, count: int) -> list:
-    """Broadcast one scalar, or align one per-slot sequence, over ``count`` slots."""
-    if isinstance(value, (list, tuple)):
-        values = list(value)
-        return values[:count] + [values[-1] if values else 0] * max(0, count - len(values))
-    return [value] * count
-
-
-def review_wave_admission(
-    drive_root: pathlib.Path | str | None = None,
-    *,
-    root_task_id: str,
-    models: Sequence[str],
-    prompt_chars: int | Sequence[int],
-    max_completion_tokens: int | Sequence[int] = 65536,
-    remaining_usd_override: float | None = None,
-    task_id: str = "",
-    root_limit_usd: float | None = None,
-    root_limit_source: str = "",
-    global_limit_usd: float | None = None,
-    categories: str | Sequence[str] = "",
-    slot_ids: str | Sequence[str] = "",
-    processing_preferences: str | Sequence[str] = "",
-) -> Dict[str, Any]:
-    """Read-only whole-wave admission through each slot's reservation math.
-
-    Standalone callers may supply remaining_usd_override. Otherwise the tighter
-    global/root remainder binds, including every in-flight hold; unknown prices
-    stay unknown. A supplied root cap binds (None + root_limit_source means
-    original unlimited); otherwise use the ledger minimum. Global None resolves
-    settings; non-positive global limits are unbounded.
-
-    Inputs may be scalar or per-slot. Price each seat under its own sending scope,
-    never the caller's warm cache; bounds and remainders disclose admission.
-    """
-    result: Dict[str, Any] = {
-        "fits": True,
-        "estimated_wave_usd": None,
-        "remaining_usd": None,
-        "limit_usd": None,
-        "slots": len(list(models or [])),
-        "unpriced_slots": 0,
-        "accounted_usd": None,
-        "reserved_usd": None,
-        "slot_bounds": [],
-        **{key: None for key in ("global_limit_usd", "global_accounted_usd", "global_remaining_usd",
-                                 "global_reserved_usd", "binding_axis")},
-    }
-    root_task_id = str(root_task_id or "").strip()
-    if not root_task_id or not models:
-        return result
-    try:
-        from ouroboros.pricing import infer_provider_from_model
-
-        if remaining_usd_override is not None:
-            remaining = float(remaining_usd_override)
-        else:
-            # Every OPEN hold counts as reserved-by-others: a reserved row and a
-            # dispatched (in-flight) row both bind their upper bound on the fence.
-            holds = lambda p: round(float(_number(p.get("reserved_usd")) or 0.0)  # noqa: E731
-                                    + float(_number(p.get("unresolved_upper_bound_usd")) or 0.0), 6)
-            projection = usage_projection(drive_root, root_task_id=root_task_id)
-            limit = (
-                max(0.0, float(root_limit_usd)) if root_limit_usd is not None
-                else None if root_limit_source else _number(projection.get("limit_usd"))
-            )
-            accounted = _number(projection.get("accounted_usd"))
-            if limit is not None and accounted is not None:
-                remaining = round(max(0.0, limit - accounted), 6)
-                result.update(limit_usd=limit, accounted_usd=accounted, reserved_usd=holds(projection),
-                              binding_axis="root")
-            # The global axis reserve_attempt checks FIRST (all roots' rows, open holds included).
-            gp = usage_projection(drive_root, global_limit_usd=global_limit_usd, include_roots=False)
-            result.update(global_limit_usd=_number(gp.get("limit_usd")),
-                          global_accounted_usd=_number(gp.get("accounted_usd")),
-                          global_remaining_usd=_number(gp.get("remaining_known_usd")), global_reserved_usd=holds(gp))
-            global_remaining = result["global_remaining_usd"]
-            if global_remaining is not None and (result["binding_axis"] is None or global_remaining < remaining):
-                remaining, result["binding_axis"] = global_remaining, "global"
-            if result["binding_axis"] is None:
-                return result
-        result["remaining_usd"] = remaining
-        chars = _per_slot(prompt_chars, len(models))
-        outputs = _per_slot(max_completion_tokens, len(models))
-        seat_categories = _per_slot(categories, len(models))
-        seat_slot_ids = _per_slot(slot_ids, len(models))
-        seat_processing = _per_slot(processing_preferences, len(models))
-        base_scope = current_usage_scope() or UsageScope()
-        total = 0.0
-        for index, model in enumerate(models):
-            seat_scope = base_scope
-            if str(seat_categories[index] or ""):
-                seat_scope = replace(
-                    base_scope, category=str(seat_categories[index]),
-                    review_slot_id=str(seat_slot_ids[index] or ""),
-                )
-            with usage_scope(seat_scope):
-                bound = _reservation_cost(
-                    AttemptRequest(
-                        model=str(model or ""),
-                        provider=infer_provider_from_model(str(model or "")),
-                        prompt_tokens_estimate=max(0, int(chars[index] or 0)) // 4,
-                        max_completion_tokens=max(0, int(outputs[index] or 0)),
-                        task_id=str(task_id or ""),
-                        processing_preference=str(seat_processing[index] or ""),
-                        # The captured preference projected onto the provider-neutral reservation mode.
-                        submitted_processing_mode={"standard": "default", "fast": "priority", "economy": "flex"}.get(
-                            str(seat_processing[index] or "").strip().lower(), ""),
-                    )
-                )
-            result["slot_bounds"].append(None if bound is None else round(float(bound), 6))
-            if bound is None:
-                # Unknown contributes no invented price and remains explicitly counted.
-                result["unpriced_slots"] = int(result.get("unpriced_slots") or 0) + 1
-                continue
-            total += float(bound)
-        result["estimated_wave_usd"] = round(total, 6)
-        result["fits"] = total <= remaining + 1e-9
-        return result
-    except Exception:
-        log.debug("review_wave_admission failed open", exc_info=True)
-        return result
-
-
 def _global_limit(request: AttemptRequest) -> float:
     if request.global_limit_usd is not None:
         return max(0.0, float(request.global_limit_usd))
@@ -824,9 +720,9 @@ def _check_dispatch_fences(scope: UsageScope, root: pathlib.Path) -> None:
         for row in rows:
             if not isinstance(row, dict):
                 raise UsageAccountingError(f"invalid root budget fence row: {snapshot_path}")
-            if (str(row.get("root_task_id") or "") != root_task_id
+            if (str(row.get("root_task_id") or "") != root_task_id or row.get("cause") == "owner_pause"
                     or str(row.get("status") or "") not in {"active", "paused"}):
-                continue
+                continue  # an owner Pause gates launches itself (owner_pause.py): never a money stop
             # ONE member explicitly selected against THIS fence generation is
             # admitted (owner Q9, #1196): the queue recorded that selection on
             # the row itself, and the latch still refuses every unselected member.
@@ -891,6 +787,10 @@ def reserve_attempt(request: AttemptRequest) -> AttemptReservation:
                     limit_scope="root",
                     root_task_id=scope.root_task_id,
                 )
+        from ouroboros.usage_admission import raise_group_refusal, scope_group
+
+        raise_group_refusal(view, scope, bound)
+        group_id, group_limit = scope_group(scope)
         view.append(
             root,
             [
@@ -912,7 +812,11 @@ def reserve_attempt(request: AttemptRequest) -> AttemptReservation:
                     "task_id": scope.task_id,
                     "root_task_id": scope.root_task_id,
                     "parent_task_id": scope.parent_task_id,
+                    "billing_group_id": group_id, "billing_group_limit_usd": group_limit,
+                    "billing_group_limit_source": scope.billing_group_limit_source,
+                    "billing_group_limit_revision": scope.billing_group_limit_revision,
                     "category": scope.category,
+                    **({"non_task_operation": True} if scope.non_task_operation else {}),
                     "source": scope.source,
                     **{key: str(getattr(scope, key, "") or "") for key in REVIEW_ATTRIBUTION_KEYS},
                     # The value checked above, including a resolver fallback, is
@@ -922,6 +826,7 @@ def reserve_attempt(request: AttemptRequest) -> AttemptReservation:
                     "global_limit_source": scope.global_limit_source or "settings_budget_resolver",
                     "global_limit_revision": scope.global_limit_revision,
                     "root_limit_usd": scope.root_limit_usd,
+                    "root_limit_source": scope.root_limit_source, "root_limit_revision": scope.root_limit_revision,
                     "candidate_raw_sha256": request.candidate_raw_sha256,
                     "candidate_raw_size_bytes": request.candidate_raw_size_bytes,
                     "candidate_context_sha256": request.candidate_context_sha256,
@@ -937,6 +842,9 @@ def reserve_attempt(request: AttemptRequest) -> AttemptReservation:
                 }
             ],
         )
+        if group_id:
+            _stash_root_accounting(f"group:{group_id}",
+                                   view.summary(billing_group_id=group_id)["accounted_usd"], group_limit)
         if scope.root_task_id:
             _stash_root_accounting(
                 scope.root_task_id,
@@ -978,6 +886,11 @@ def record_unmetered_external_dispatch(
     ensure_legacy_imported(root)
     identity = hashlib.sha256(stable_id.encode("utf-8")).hexdigest()
     attempt_id = f"external-{identity[:24]}"
+    from ouroboros.usage_admission import settlement_billing_fields
+
+    real_task = str(task_id or bound.task_id or "")
+    real_root = str(root_task_id or (bound.root_task_id if not task_id else "") or real_task)
+    billing = settlement_billing_fields(root, real_task, real_root)
     row = {
         "kind": "external_unmetered",
         "attempt_id": attempt_id,
@@ -989,9 +902,10 @@ def record_unmetered_external_dispatch(
         "reservation_upper_bound_usd": None,
         "prompt_tokens": max(0, int(prompt_tokens or 0)),
         "completion_tokens": max(0, int(completion_tokens or 0)),
-        "task_id": str(task_id or bound.task_id or ""),
-        "root_task_id": str(root_task_id or bound.root_task_id or task_id or bound.task_id or ""),
+        "task_id": real_task,
+        "root_task_id": real_root,
         "parent_task_id": str(parent_task_id or bound.parent_task_id or ""),
+        **{key: value for key, value in billing.items() if key.startswith("billing_group_")},
         "category": str(category or bound.category or "external"),
         "source": str(source or bound.source or "external_skill"),
         "external_dispatch_id_sha256": identity,
@@ -1068,6 +982,12 @@ def record_subscription_session(
     ensure_legacy_imported(root)
     identity = hashlib.sha256(stable_id.encode("utf-8")).hexdigest()
     attempt_id = f"session-{identity[:24]}"
+    from ouroboros.usage_admission import settlement_billing_fields
+
+    # Explicit custody identities never inherit an unrelated caller's context.
+    real_task = str(task_id or bound.task_id or "")
+    real_root = str(root_task_id or (bound.root_task_id if not task_id else "") or real_task)
+    billing = settlement_billing_fields(root, real_task, real_root)
     input_counters = _normalized_input_token_usage(input_token_usage)
     attribution = {"review_skill": review_skill, "review_wave_id": review_wave_id, "review_slot_id": review_slot_id}
     row = {
@@ -1085,9 +1005,10 @@ def record_subscription_session(
         "completion_tokens": None if completion_tokens is None else max(0, int(completion_tokens)),
         # Cached tokens are a separate axis because harness semantics differ.
         "cached_tokens": None if cached_tokens is None else max(0, int(cached_tokens)),
-        "task_id": str(task_id or bound.task_id or ""),
-        "root_task_id": str(root_task_id or bound.root_task_id or task_id or bound.task_id or ""),
+        "task_id": real_task,
+        "root_task_id": real_root,
         "parent_task_id": str(parent_task_id or bound.parent_task_id or ""),
+        **{key: value for key, value in billing.items() if key.startswith("billing_group_")},
         "category": str(category or bound.category or "subagent"),
         "source": str(source or bound.source or "delegated_subagent"),
         **{key: str(attribution[key] or getattr(bound, key, "") or "") for key in REVIEW_ATTRIBUTION_KEYS},
@@ -1111,9 +1032,8 @@ def record_subscription_session(
         "category", "source", *REVIEW_ATTRIBUTION_KEYS, "subscription_route", "session_id_sha256",
     ))
 def _transition(reservation: AttemptReservation, state: str, **fields: Any) -> Dict[str, Any]:
-    from ouroboros.usage_ledger import is_abandoned_settlement
-
     from ouroboros._usage_wait import transition_acquisition
+    from ouroboros.usage_ledger import is_abandoned_settlement
 
     acquire = transition_acquisition(state, lambda: _check_dispatch_fences(
         reservation.scope or current_usage_scope() or UsageScope(), reservation.drive_root))
@@ -1151,19 +1071,38 @@ def _transition(reservation: AttemptReservation, state: str, **fields: Any) -> D
         if state == "released" and current.get("state") == "dispatched" and not allow_release:
             raise UsageAccountingError("dispatched attempts require a typed pre-dispatch release")
         if state == "dispatched":
-            scope = UsageScope(**{key: current.get(key, "") for key in
-                                 ("task_id", "root_task_id", "parent_task_id")})
+            scope = UsageScope(drive_root=reservation.drive_root,
+                non_task_operation=current.get("non_task_operation") is True, **{key: current.get(key) for key in
+                ("task_id", "root_task_id", "parent_task_id", "root_limit_usd", "root_limit_source", "root_limit_revision", "billing_group_id",
+                 "billing_group_limit_usd", "billing_group_limit_source", "billing_group_limit_revision")})
+            from ouroboros.owner_pause import member_fence
+            if fence := member_fence(scope):
+                from ouroboros.llm_attempt import _PhysicalSendNotStarted
+                raise _PhysicalSendNotStarted(str(fence.get("reason") or "owner_pause"))
+            from ouroboros.usage_admission import effective_billing_fields
+            effective = effective_billing_fields(reservation.drive_root, scope.root_task_id, {
+                key: getattr(scope, key) for key in ("root_limit_usd", "root_limit_source", "root_limit_revision",
+                    "billing_group_id", "billing_group_limit_usd", "billing_group_limit_source", "billing_group_limit_revision")},
+                non_task_operation=scope.non_task_operation)
+            if scope.root_limit_source == "attempt_request":
+                effective.update(root_limit_usd=scope.root_limit_usd, root_limit_source=scope.root_limit_source,
+                                 root_limit_revision=scope.root_limit_revision)
+            scope = replace(scope, **effective)
+            fields.update(effective)
             _check_dispatch_fences(scope, reservation.drive_root)
             limit_request = AttemptRequest(model=reservation.model, provider=reservation.provider,
                 global_limit_usd=(current.get("global_limit_usd") if current.get("global_limit_source")
                                   not in {"", "settings_budget_resolver"} else None))
             for axis, limit, identity in (
                 ("global", _global_limit(limit_request), None),
-                ("root", _number(current.get("root_limit_usd")), scope.root_task_id),
+                ("root", scope.root_limit_usd, scope.root_task_id),
             ):
                 if limit is not None and view.exceeds_limit(limit, root_task_id=identity, dispatch=True):
                     raise BudgetExceeded(f"{axis} model budget changed before dispatch", limit_scope=axis,
                                          root_task_id=scope.root_task_id)
+            from ouroboros.usage_admission import raise_group_refusal
+
+            raise_group_refusal(view, scope, dispatch=True)
         replaced = {"seq", "ts", "pre_compaction_seq", "settle_reason", "reason"}
         if state == "settled":
             replaced.update(("effort", "effort_resolution", "processing", "speed", "service_tier", "cost_basis", "cost_evidence"))
@@ -1171,7 +1110,26 @@ def _transition(reservation: AttemptReservation, state: str, **fields: Any) -> D
                 fields["effort"] = {**current["effort"], "reported": None, "report_source": None}
         row = {key: value for key, value in current.items() if key not in replaced}
         row.update(state=state, **fields)
-        appended = view.append(reservation.drive_root, [row])
+        if state == "dispatched":
+            from ouroboros.owner_pause import OwnerPauseRefused, launch_admission
+
+            try:
+                # Money acquisition/replay and preparation precede the final
+                # Pause gate. Only the durable local claim holds both locks.
+                with launch_admission(scope):
+                    appended = view.append(reservation.drive_root, [row])
+            except OwnerPauseRefused as exc:
+                from ouroboros.llm_attempt import _PhysicalSendNotStarted
+                raise _PhysicalSendNotStarted(str(exc) or "owner_pause") from exc
+        else:
+            appended = view.append(reservation.drive_root, [row])
+        from ouroboros._usage_money import billing_group_key
+
+        group_id = billing_group_key(current)
+        if group_id:
+            _stash_root_accounting(f"group:{group_id}",
+                view.summary(billing_group_id=group_id)["accounted_usd"],
+                _number(current.get("billing_group_limit_usd", current.get("root_limit_usd"))))
         root_task_id = str(current.get("root_task_id") or "")
         if root_task_id:
             _stash_root_accounting(root_task_id, view.summary(root_task_id)["accounted_usd"],
@@ -1182,6 +1140,7 @@ def _transition(reservation: AttemptReservation, state: str, **fields: Any) -> D
 def mark_dispatched(
     reservation: AttemptReservation, *,
     candidate_manifest_ref: Optional[Dict[str, Any]] = None,
+    local_answer_owner_pid: int = 0,
 ) -> None:
     invoke_bound_api_review_paid_stamp(fail_closed=True)
     try:
@@ -1195,7 +1154,14 @@ def mark_dispatched(
             log.exception("Failed bounded release after physical attempt limit")
         raise
     fields = {"candidate_manifest_ref": candidate_manifest_ref} if candidate_manifest_ref else {}
-    _transition(reservation, "dispatched", **fields)
+    if local_answer_owner_pid:
+        fields["local_answer_owner_pid"] = local_answer_owner_pid
+        from ouroboros.model_wait import current_model_wait
+        owner = current_model_wait()
+        if (owner is not None and local_answer_owner_pid == os.getpid()
+                and owner.task_id == (reservation.scope or UsageScope()).task_id):
+            fields.update(owner.bind_answer_consumer())
+    _transition(reservation, "dispatched", launch_state="claimed", transport_outcome="unknown", **fields)
     invoke_bound_api_review_paid_stamp(fail_closed=False)
 
 
@@ -1492,8 +1458,11 @@ def execute_physical_attempt(
         manifest_ref = before_dispatch(reservation) if before_dispatch is not None else None
         if manifest_ref is not None and not isinstance(manifest_ref, dict):
             raise TypeError("before_dispatch must return a manifest ref object or None")
-        mark_dispatched(reservation, candidate_manifest_ref=manifest_ref)
-        _record_attempt_capture(reservation, request, "dispatched", candidate_manifest_ref=manifest_ref)
+        # Capture/serialization is preparation. Dispatch gates after acquisition.
+        prepared_capture = _record_attempt_capture(reservation, request, "reserved", candidate_manifest_ref=manifest_ref)
+        dispatch_capture = replace(prepared_capture, state="dispatched")
+        mark_dispatched(reservation, candidate_manifest_ref=manifest_ref, local_answer_owner_pid=os.getpid())
+        _LAST_PHYSICAL_ATTEMPT.set(dispatch_capture)
     except BaseException as exc:
         failure = _pre_dispatch_failure(
             reservation, request, exc, candidate_manifest_ref=manifest_ref)
@@ -1501,7 +1470,8 @@ def execute_physical_attempt(
             raise
         raise failure from exc
     try:
-        response = send()
+        from ouroboros._usage_wait import model_send
+        response = model_send(reservation, send)
     except BaseException as exc:
         terminal_state = "dispatched"
         try:
@@ -1546,7 +1516,7 @@ async def execute_physical_attempt_async(
     before_dispatch: Optional[Callable[[AttemptReservation], Any]] = None,
 ) -> Any:
     _LAST_PHYSICAL_ATTEMPT.set(None)
-    from ouroboros._usage_wait import presend_off_loop, postresponse_off_loop
+    from ouroboros._usage_wait import postresponse_off_loop, presend_off_loop
     from ouroboros.llm_observability import retain_cancelled_response
 
     reservation = await presend_off_loop(reserve_attempt, request, on_cancel=lambda held: (
@@ -1558,32 +1528,52 @@ async def execute_physical_attempt_async(
             manifest_ref = await pending_manifest if hasattr(pending_manifest, "__await__") else pending_manifest
         if manifest_ref is not None and not isinstance(manifest_ref, dict):
             raise TypeError("before_dispatch must return a manifest ref object or None")
-        await presend_off_loop(mark_dispatched, reservation, candidate_manifest_ref=manifest_ref)
-        _record_attempt_capture(reservation, request, "dispatched", candidate_manifest_ref=manifest_ref)
+        prepared_capture = _record_attempt_capture(reservation, request, "reserved", candidate_manifest_ref=manifest_ref)
+        dispatch_capture = replace(prepared_capture, state="dispatched")
+        await presend_off_loop(mark_dispatched, reservation, candidate_manifest_ref=manifest_ref,
+                               local_answer_owner_pid=os.getpid())
+        _LAST_PHYSICAL_ATTEMPT.set(dispatch_capture)
     except BaseException as exc:
         failure = await presend_off_loop(_pre_dispatch_failure,
             reservation, request, exc, candidate_manifest_ref=manifest_ref)
         if failure is exc:
             raise
         raise failure from exc
-    try:
-        response = await send()
-    except BaseException as exc:
-        terminal_state = "dispatched"
+    async def complete():
         try:
-            terminal_state = await presend_off_loop(_terminalize_failed_attempt, reservation, exc)
-        except Exception:
-            log.exception("Failed to mark provider attempt unresolved: %s", reservation.attempt_id)
-        _record_attempt_capture(
-            reservation, request, terminal_state, candidate_manifest_ref=manifest_ref, exc=exc,
+            response = await send()
+        except BaseException as exc:
+            terminal_state = "dispatched"
+            try:
+                terminal_state = await presend_off_loop(_terminalize_failed_attempt, reservation, exc)
+            except Exception:
+                log.exception("Failed to mark provider attempt unresolved: %s", reservation.attempt_id)
+            _record_attempt_capture(
+                reservation, request, terminal_state, candidate_manifest_ref=manifest_ref, exc=exc,
+            )
+            raise
+        return await postresponse_off_loop(
+            _account_response, reservation, request, response, extractor, manifest_ref,
+            retain_on_cancel=lambda exact, capture: retain_cancelled_response(
+                replace(request, drive_root=reservation.drive_root,
+                                    task_id=(reservation.scope or UsageScope()).task_id or request.task_id), exact, capture),
         )
+
+
+    from ouroboros._usage_wait import model_send_async
+    try:
+        return await model_send_async(reservation, complete,
+            retain_on_cancel=lambda response, capture: retain_cancelled_response(
+                replace(request, drive_root=reservation.drive_root,
+                        task_id=(reservation.scope or UsageScope()).task_id or request.task_id), response, capture))
+    except BaseException as exc:
+        if getattr(exc, "model_sender_cancelled_before_entry", False):
+            await presend_off_loop(_pre_dispatch_failure, reservation, request, exc, candidate_manifest_ref=manifest_ref)
+        elif getattr(exc, "model_sender_not_started", False):
+            terminal_state = await presend_off_loop(_terminalize_failed_attempt, reservation, exc)
+            _record_attempt_capture(reservation, request, terminal_state,
+                                    candidate_manifest_ref=manifest_ref, exc=exc)
         raise
-    return await postresponse_off_loop(
-        _account_response, reservation, request, response, extractor, manifest_ref,
-        retain_on_cancel=lambda exact, capture: retain_cancelled_response(
-            replace(request, drive_root=reservation.drive_root,
-                                task_id=(reservation.scope or UsageScope()).task_id or request.task_id), exact, capture),
-    )
 
 
 # v7 L-C2 split: the one-time legacy usage-telemetry import (source snapshot and
@@ -1598,3 +1588,8 @@ from ouroboros.usage_legacy_import import (  # noqa: E402, F401 -- intentional p
     _legacy_snapshot,
     ensure_legacy_imported,
 )
+
+
+# Read-side admission projections over this ledger (the review wave's fit and the
+# whole-work group axis) live in their own leaf; the historical binding stays here.
+from ouroboros.usage_admission import review_wave_admission  # noqa: E402,F401 -- historical import surface

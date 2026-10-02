@@ -1,5 +1,4 @@
 /** Dependency-free JSDoc mirror of `ouroboros.gateway.contracts`. */
-
 /**
  * @typedef {Object} CostPresentation
  * @property {'own'|'root_tree'} scope
@@ -9,7 +8,6 @@
  * @property {boolean} accounting_open
  * @property {boolean} has_rows
  */
-
 /**
  * @typedef {Object} StateResponse
  * @property {number} uptime
@@ -45,7 +43,6 @@
  * @property {boolean=} active_chat_activities_complete
  * @property {ActiveChatActivity[]=} active_chat_activities  // combined snapshot: direct/ephemeral turns + root managed queue tasks
  */
-
 /**
  * Background Consciousness alarm-clock snapshot (server._describe_bg_consciousness_state over
  * consciousness.status_snapshot). A wake-up is an ordinary Main turn; its liveness is the direct-activity census, never a flag here.
@@ -69,7 +66,6 @@
  * @property {number} unknown_unmetered  // window rows without a price: spent_24h_usd is then a floor ("at least")
  * @property {boolean} integrity_degraded  // the ledger was quarantined/repaired; the numbers are best-effort
  */
-
 /**
  * @typedef {Object} ActiveDirectTurn
  * @property {Object.<string,Object>=} model_waits
@@ -82,7 +78,6 @@
  * @property {string} phase
  * @property {number} started_at
  */
-
 /**
  * @typedef {Object} ActiveChatActivity
  * @property {Object=} project_admission_hold  // accepted unstarted work waiting for original Project authority
@@ -95,10 +90,9 @@
  * @property {string} project_id
  * @property {string} client_message_id  // empty for managed queue rows
  * @property {string} kind  // direct_chat | managed_task — presentational label; membership in this census, not kind, decides liveness
- * @property {string} phase  // managed rows: queued | budget_pausing | budget_paused | working | finalizing; direct rows: thinking or unknown; budget-paused direct turns retain their ID/kind and use the managed phases after parking
+ * @property {string} phase  // managed: queued | budget_pausing | budget_paused | working | finalizing | unknown (unreadable Pause authority); direct: thinking or unknown; parked direct turns retain ID/kind and use managed phases
  * @property {number} started_at
  */
-
 /**
  * @typedef {Object} EvolutionDataResponse
  * @property {Object[]} points
@@ -106,7 +100,6 @@
  * @property {string} generated_at
  * @property {boolean} cached
  */
-
 /**
  * @typedef {Object} HealthResponse
  * @property {"ok"} status
@@ -114,32 +107,27 @@
  * @property {string} runtime_version
  * @property {string} app_version
  */
-
 /**
  * @typedef {Object} OpenAICompatibleModelsResponse
  * @property {string[]} models
  * @property {string=} error
  */
-
 /**
  * @typedef {Object} ProviderTestRequest
  * @property {string} provider_id
  * @property {Object<string, string>=} overrides
  */
-
 /**
  * @typedef {Object} ProviderTestResponse
  * @property {boolean} ok
  * @property {string=} error
  */
-
 /**
  * @typedef {Object} AvailableSubagentRoute
  * @property {'api_model'|'agent_session'} kind
  * @property {string} target_id
  * @property {string=} credential_profile_id
  */
-
 /**
  * @typedef {Object} AvailableSubagentItem
  * @property {string} subagent_id
@@ -214,10 +202,7 @@
  */
 
 /**
- * Settings, runtime mode, the fresh-install safety default and the durable
- * completion fact land atomically on every success. The one-shot preset marker
- * lands only for the automatic `reason=applied` install preset; an explicit
- * owner draft may be saved as `configured_by_owner` without reopening it.
+ * Settings, mode, safety and completion persist atomically; only applied presets persist a one-shot marker.
  * @typedef {Object} OnboardingCompleteResponse
  * @property {boolean} ok
  * @property {string} status
@@ -227,10 +212,7 @@
  */
 
 /**
- * 500 from an owner settings write whose BYTES ALREADY LANDED: `saved` is true
- * and `post_commit_failed` names the step that failed afterwards (environment
- * projection, supervisor start, hot-reload…). Never re-save on this — the
- * settings are on disk. Shared by POST /api/settings and the onboarding finish.
+ * 500 AFTER settings landed: retry the named later step, never re-save (settings/onboarding writes).
  * @typedef {Object} SettingsPostCommitFailureResponse
  * @property {string} error
  * @property {string} status  // saved_with_post_commit_error
@@ -239,12 +221,7 @@
  */
 
 /**
- * 503 from an owner settings write whose body did not answer within its bound
- * (twice OUROBOROS_SETTINGS_DOCUMENT_LOCK_TIMEOUT_SEC): the body keeps running
- * in its server thread, so whether the bytes landed is UNKNOWN — `saved` is
- * null, neither true nor false. Reload settings to see what landed instead of
- * re-saving blindly. Shared by POST /api/settings, the owner endpoints and
- * POST /api/onboarding/complete (the wizard offers "Check status" on it).
+ * 503 settings_save_timeout: the server writer still runs; saved=null is unknown. Reload to check status before retrying.
  * @typedef {Object} SettingsSaveTimeoutResponse
  * @property {string} error
  * @property {string} code  // settings_save_timeout
@@ -1198,9 +1175,9 @@
  * @property {string=} stop_policy
  * @property {OwnerHurryProjection=} owner_hurry
  * @property {OwnerHurryProjection[]=} owner_hurry_history
- * @property {{reason?:string, detail?:string, label?:string}=} project_admission_hold
- *   While the queue snapshot lists the row: its wait for original Project/scope evidence, or {}.
+ * @property {{reason?:string, detail?:string, label?:string}=} project_admission_hold  // while the queue snapshot lists the row: its wait for original Project/scope evidence, or {}
  * @property {string=} error
+ * @property {ContinuationOffer=} continuation_offer
  */
 
 /**
@@ -1217,6 +1194,7 @@
  */
 
 /**
+ * Independent facets: ok=authoritative, not_read=never asked, failed=no usable answer. Empty without ok proves nothing.
  * @typedef {Object} ClaudexorStatusReads
  * @property {ClaudexorReadState} catalog
  * @property {ClaudexorReadState} accounts
@@ -1265,9 +1243,7 @@
  */
 
 /**
- * One canonical login-job success envelope. Every operation carries one bare
- * daemon job at the top level; operation-specific metadata stays beside it.
- * Snapshot-only deviceCode is envelope-level, never nested inside job.
+ * One required bare daemon job per operation. Create/input/snapshot metadata and deviceCode stay beside it; attach commands need the proven packaged role.
  * @typedef {Object} ClaudexorLoginJobResponse
  * @property {Object} job
  * @property {string=} cursor
@@ -1283,10 +1259,7 @@
  */
 
 /**
- * Narrow typed problem envelope for login-job operations, including the
- * marked setup-create retryable terminal-probe 503. required_actions is the
- * daemon's bounded top-level continuation list, not a client-side action
- * framework; an unmarked discovery/transport 503 stays generic.
+ * Typed engine job error; marked retryable probe 503 and bounded engine actions pass through.
  * @typedef {Object} ClaudexorLoginJobProblem
  * @property {string} error
  * @property {string=} code
@@ -1338,46 +1311,89 @@
  */
 
 /**
- * Legacy name for the DELETE response: the subset every previous caller read of
- * what that endpoint now answers as a ScheduleActionResponse.
+ * Legacy DELETE response: the ScheduleActionResponse subset read by previous callers.
  * @typedef {Object} ScheduleDeleteResponse
  * @property {boolean} ok
  */
 
 /**
+ * @typedef {Object} TaskPauseRequest
+ * @property {string} request_id
+ */
+/**
+ * @typedef {Object} TaskPauseResponse
+ * @property {boolean=} ok
+ * @property {string=} task_id
+ * @property {string=} root_task_id
+ * @property {string=} fence_id
+ * @property {'requested'|'paused'|'released'=} state
+ * @property {boolean=} duplicate
+ * @property {Array<string>=} members
+ * @property {boolean=} snapshot_persisted
+ * @property {boolean=} latch_pending
+ * @property {string=} error
+ * @property {string=} reason_code
+ */
+/**
+ * @typedef {Object} TaskContinueRequest
+ * @property {string} action_nonce
+ */
+/**
+ * @typedef {Object} TaskContinueResponse
+ * @property {boolean=} ok
+ * @property {string=} task_id
+ * @property {string=} predecessor_task_id
+ * @property {string=} successor_task_id
+ * @property {boolean=} replay
+ * @property {boolean=} recovered
+ * @property {boolean=} held
+ * @property {string=} status
+ * @property {Array<Object>=} blockers
+ * @property {string=} error
+ * @property {string=} reason_code
+ * @property {string=} cause
+ * @property {Array<string>=} gaps
+ * @property {boolean=} unconfirmed
+ * @property {'bound'|'admitted'=} state
+ * @property {string=} action_nonce
+ */
+/**
+ * @typedef {Object} ContinuationOffer
+ * @property {boolean=} eligible
+ * @property {string=} refusal
+ * @property {string=} cause
+ * @property {string=} successor_task_id
+ * @property {'bound'|'admitted'=} state
+ * @property {string=} action_nonce
+ */
+/**
+ * Reuse stop_action_id (at most 200 characters) for this exact action; a later
+ * Stop needs a new ID, distinct from server request_id. No ID means no exact retry.
+ * @typedef {Object} TaskCancelRequest
+ * @property {boolean=} cascade
+ * @property {string=} stop_policy
+ * @property {string=} stop_action_id
+ */
+/**
  * @typedef {Object} TaskCancelResponse
  * @property {boolean} ok
  * @property {string} task_id
  * @property {boolean=} cascade
- *   v6.82 (P5): echoed only when the request body {"cascade": true} asked for the
- *   subtree cancel, which is complete by the time this answer is sent; the plain
- *   single-task envelope is unchanged.
+ *   Echoed only for {"cascade": true}, after subtree cancel completes; single-task envelope unchanged.
  * @property {string=} cancel_state
- *   S3 (Q1/Q2): "pending" on the 202 acknowledgement of a
- *   {"stop_policy": "finalize_then_cancel"} request — the durable intent is
- *   open while the bounded finalization attempt runs. Absent on the legacy
- *   immediate path.
+ *   "pending" on graceful 202 ACK: durable intent stays open during bounded finalization; absent for immediate.
  * @property {string=} stop_policy
- *   The EFFECTIVE policy of the durable intent ("immediate" |
- *   "finalize_then_cancel"): a graceful request over an already-hard intent
- *   never softens it, and the answer says so.
+ *   Effective durable "immediate" | "finalize_then_cancel"; a graceful request never softens a hard intent.
  * @property {string=} error
  */
-
 /**
- * POST /api/tasks/{task_id}/hurry — the text-free owner hurry control (HQ1:
- * no chat message, ever). The body carries ONLY a client-generated stable
- * request_id (reused on retry); any other field is refused.
+ * POST /api/tasks/{task_id}/hurry: no chat message. Only client request_id is
+ * accepted, stable across retries; every other body field is refused.
  * @typedef {Object} TaskHurryRequest
  * @property {string} request_id
  */
-
 /**
- * The owner_hurry block on the task result — task-detail observability,
- * never a chat message. state is the closed vocabulary
- * requested | applied | not_applied_before_terminal; effects maps each
- * host-rail effect to its recorded status. History rows carry the same shape
- * plus archived_at/archived_reason (rolled over on every same-id requeue).
+ * Task-detail owner_hurry; same-ID requeues archive this shape with archived_at/archived_reason.
  * @typedef {Object} OwnerHurryProjection
  * @property {number=} attempt_key
  * @property {string=} request_id
@@ -1393,10 +1409,7 @@
  */
 
 /**
- * Acknowledgement of the typed task-local acceleration control.
- * duplicate=true is the idempotent shape: the same request_id on the live
- * attempt (or a different id collapsing onto the one armed latch) returns
- * the existing acknowledgement without a second control.
+ * Same request/live-attempt or already armed latch returns one acknowledgement with duplicate=true.
  * @typedef {Object} TaskHurryResponse
  * @property {boolean} ok
  * @property {string} task_id
@@ -1550,9 +1563,8 @@
 
 export const MAX_LINK_ACTIONS = 12;
 export const MAX_QUIZ_OPTIONS = 6;
-// Mirror of ouroboros/gateway/task_decision.py::_COMMENT_MAX — the ingress
-// REFUSES a longer comment (it is delivered verbatim, never truncated), so
-// the card must not offer to send one.
+// Mirror task_decision._COMMENT_MAX: ingress refuses longer comments, never
+// truncates; cards must offer only comments the ingress can deliver verbatim.
 export const MAX_DECISION_COMMENT = 2000;
 export const GATEWAY_CONTRACT_VERSION = '7.5.1';
 

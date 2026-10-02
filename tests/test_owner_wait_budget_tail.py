@@ -17,6 +17,10 @@ from tests.test_loop_transport_wait import _loop_kwargs
 def test_cold_grant_checks_saved_budget_before_ordinary_dispatch(tmp_path, monkeypatch, queued_override, cold_restart):
     (tmp_path / "logs").mkdir()
     (tmp_path / "fixture.txt").write_text("A real extra tool read")
+    from ouroboros.task_results import write_task_result
+    write_task_result(tmp_path, 't-wait', 'running', billing_group={
+        'billing_group_id': 't-wait', 'billing_group_limit_usd': 50.0,
+        'billing_group_limit_source': 'initial_task_admission', 'billing_group_limit_revision': 'fixture'})
     scope = accounting.UsageScope(drive_root=tmp_path, task_id="t-wait", root_task_id="t-wait",
                                   global_limit_usd=200.0, root_limit_usd=50.0)
     calls, checkpoints, network = [], [], []

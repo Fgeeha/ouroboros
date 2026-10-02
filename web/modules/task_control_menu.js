@@ -12,11 +12,12 @@
 // product-wide parity), so eligibility gates differ per surface but the
 // actions, endpoint bindings, request-id retry, and refusals do not.
 
-import { cancelTask, hurryTask, resumeTask } from './api_client.js';
+import { cancelTask, hurryTask, pauseTask, resumeTask } from './api_client.js';
 import { showToast } from './toast.js';
 
 export const ACTION_FINALIZE = 'finalize';
 export const ACTION_HURRY = 'hurry';
+export const ACTION_PAUSE = 'pause';
 export const ACTION_RESUME = 'resume';
 export const ACTION_STOP_NOW = 'stop_now';
 
@@ -53,16 +54,36 @@ export function cancelRunEligibility({
 export const TASK_CONTROL_LABELS = Object.freeze({
     [ACTION_FINALIZE]: 'Wrap up',
     [ACTION_HURRY]: 'Hurry up',
+    [ACTION_PAUSE]: 'Pause',
     [ACTION_RESUME]: 'Resume',
     [ACTION_STOP_NOW]: 'Stop now',
 });
 
 /**
+ * Whether a queue row's task is the ROOT of its tree — the server's own rule
+ * (`task_results.resolve_task_lineage`), so a child never offers the whole-tree
+ * Pause the server would refuse (`not_a_root_task`) or aim at its parent.
+ * @param {object} task queue row task
+ * @param {string} id the row's task id
+ */
+export function isRootTaskRow(task = {}, id = '') {
+    const field = (key) => String(task?.[key] ?? task?.metadata?.[key] ?? '').trim();
+    const taskId = String(id || task?.id || '').trim();
+    const root = field('root_task_id') || taskId;
+    const role = field('delegation_role').toLowerCase();
+    const original = field('original_task_id');
+    if (!taskId || field('parent_task_id')) return false;
+    return root === taskId ? role !== 'subagent'
+        : role === 'root' && Boolean(original) && original === field('timeout_retry_from') && original !== taskId;
+}
+
+/**
  * The action set for the current card state (pure — node-testable).
- * @param {{cancelPending?: boolean}} [state]
+ * `wholeTree` is false for a child: its Pause would not name its own tree.
+ * @param {{cancelPending?: boolean, budgetPaused?: boolean, wholeTree?: boolean}} [state]
  * @returns {string[]} ordered action ids
  */
-export function taskControlActions({ cancelPending = false, budgetPaused = false } = {}) {
+export function taskControlActions({ cancelPending = false, budgetPaused = false, wholeTree = true } = {}) {
     // A pending cancel refuses hurry (HQ1) and a second soft stop is a no-op:
     // the single offered action is the hard escalation of the same intent.
     if (cancelPending) return [ACTION_STOP_NOW];
@@ -70,21 +91,94 @@ export function taskControlActions({ cancelPending = false, budgetPaused = false
     // The host-attested pause fact gates the offer; the server re-validates
     // (replay_unsafe and sibling checks answer 409 with the reason).
     if (budgetPaused) return [ACTION_RESUME, ACTION_STOP_NOW];
-    return [ACTION_FINALIZE, ACTION_HURRY, ACTION_STOP_NOW];
+    // Owner Batch4: Pause saves the WHOLE tree exactly (sent work finishes,
+    // new work is fenced) until an explicit Resume; Stop still ends it.
+    return wholeTree ? [ACTION_FINALIZE, ACTION_HURRY, ACTION_PAUSE, ACTION_STOP_NOW]
+        : [ACTION_FINALIZE, ACTION_HURRY, ACTION_STOP_NOW];
 }
 
-export async function resumeTaskAction(taskId) {
-    const id = String(taskId || '');
+// Retain an uncertain Pause's id for retries; acknowledgement or Resume
+// retires it, so a later intentional Pause is a new action.
+const pauseRequestIds = new Map();
+
+function pauseRequestId(taskId) {
+    const id = String(taskId || '').trim();
+    if (!pauseRequestIds.has(id)) {
+        const uuid = (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function')
+            ? globalThis.crypto.randomUUID()
+            : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+        pauseRequestIds.set(id, `pause-${uuid}`);
+    }
+    return pauseRequestIds.get(id);
+}
+
+// A durable Pause whose queue latch waited on a busy launch lock (202
+// `latch_pending`): the SAME id completes it. Bounded; never a new action.
+const PAUSE_LATCH_RETRY_MS = [250, 500, 1000, 2000];
+const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
+
+/**
+ * The shared "Pause" flow: one typed request, a local toast naming the
+ * truthful tree state, a typed refusal shown verbatim. Never a chat message.
+ * @param {string} taskId
+ * @param {{pause?: Function, toast?: Function, wait?: Function}} [deps]
+ * @returns {Promise<boolean>} whether the pause was accepted
+ */
+export async function pauseTaskAction(taskId, { pause = pauseTask, toast = showToast, wait = sleep } = {}) {
+    const id = String(taskId || '').trim();
+    if (!id || inFlight.has(id)) return false;
+    inFlight.add(id);
+    try {
+        const requestId = pauseRequestId(id);
+        let ack = await pause(id, requestId);
+        if (ack?.ok !== true) throw new Error('Pause acknowledgement is unknown; retry this action.');
+        // From here the fence is durable: a failed completion is never a refusal.
+        for (const delay of PAUSE_LATCH_RETRY_MS) {
+            if (!ack.latch_pending) break;
+            await wait(delay);
+            try {
+                const next = await pause(id, requestId);
+                if (next?.ok === true) ack = next;
+            } catch { /* keep the durable acknowledgement and its id */ }
+        }
+        if (ack.latch_pending) {
+            toast('Pausing: new work is stopped. The queue part of this Pause is not confirmed yet; '
+                + 'press Pause again to finish the same action.', 'info');
+            return true;
+        }
+        pauseRequestIds.delete(id);
+        if (ack.state === 'released') {
+            toast('This Pause was already resumed.', 'info');
+            return true;
+        }
+        toast(ack.state === 'paused'
+            ? 'Paused: the whole task tree is saved until you resume it.'
+            : 'Pausing: new work is stopped; work already sent finishes, then the tree is saved.', 'ok');
+        return true;
+    } catch (exc) {
+        toast(`Pause refused: ${exc?.message || exc}`, 'error');
+        return false;
+    } finally {
+        inFlight.delete(id);
+    }
+}
+
+export async function resumeTaskAction(taskId, { resume = resumeTask, toast = showToast } = {}) {
+    const id = String(taskId || '').trim();
     if (!id || inFlight.has(id)) return;
     inFlight.add(id);
     try {
-        await resumeTask(id);
-        showToast('Resuming: the task returns to the queue.', 'info');
+        const ack = await resume(id);
+        if (ack?.ok !== true) throw new Error('Resume acknowledgement is unknown; retry this action.');
+        pauseRequestIds.delete(id);
+        // An answered root's late work (D10) continues in place; its answer stays delivered.
+        toast(ack.late_phase ? 'Resuming: the work left after the delivered answer continues.'
+            : 'Resuming: the task returns to the queue.', 'info');
     } catch (exc) {
         // The server names the refusal (replay_unsafe / fence missing /
         // not budget-paused): show it verbatim instead of a generic failure.
         // Handled here, never rethrown: the menu callback is fire-and-forget.
-        showToast(`Resume refused: ${exc?.message || exc}`, 'error');
+        toast(`Resume refused: ${exc?.message || exc}`, 'error');
     } finally {
         inFlight.delete(id);
     }
@@ -170,11 +264,26 @@ export async function hurryTaskAction(taskId) {
  * @param {string} action
  * @returns {Promise<import('./api_types.js').TaskCancelResponse>}
  */
+const pendingStopActions = new Map();
+
 export async function requestStop(taskId, action) {
     const id = String(taskId || '').trim();
+    const key = JSON.stringify([id, action]);
+    // A lost response keeps this page-session action retryable. A confirmed
+    // response retires it; a later click is a genuinely new Stop. Hardening a
+    // soft Stop is a distinct action, even while the soft response is unknown.
+    if (!pendingStopActions.has(key)) {
+        const uuid = globalThis.crypto?.randomUUID?.()
+            || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+        pendingStopActions.set(key, `stop-${uuid}`);
+    }
     inFlight.add(id);
     try {
-        return await cancelTask(id, { cascade: true, stopPolicy: stopPolicyFor(action) });
+        const result = await cancelTask(id, { cascade: true, stopPolicy: stopPolicyFor(action),
+            stopActionId: pendingStopActions.get(key) });
+        if (result?.ok !== true) throw new Error('Stop acknowledgement is unknown; retry this action.');
+        pendingStopActions.delete(key);
+        return result;
     } finally {
         inFlight.delete(id);
     }
@@ -319,9 +428,12 @@ function onMenuKeydown(event) {
  * Dismissing (outside click / Escape) continues the run. Selecting an item
  * closes the menu and invokes `onAction(actionId)`.
  * @param {HTMLElement} anchor trigger element
- * @param {{cancelPending?: boolean, busy?: boolean, onAction: (action: string) => void}} opts
+ * @param {{cancelPending?: boolean, budgetPaused?: boolean, wholeTree?: boolean, busy?: boolean,
+ *     onAction: (action: string) => void}} opts
  */
-export function openTaskControlMenu(anchor, { cancelPending = false, budgetPaused = false, busy = false, onAction } = {}) {
+export function openTaskControlMenu(anchor, {
+    cancelPending = false, budgetPaused = false, wholeTree = true, busy = false, onAction,
+} = {}) {
     closeTaskControlMenu();
     if (!anchor?.isConnected || !document.body) return null;
     // A11y: the trigger owns a popup menu; expanded tracks the open state.
@@ -330,7 +442,7 @@ export function openTaskControlMenu(anchor, { cancelPending = false, budgetPause
     const menu = document.createElement('div');
     menu.className = 'task-control-menu';
     menu.setAttribute('role', 'menu');
-    for (const action of taskControlActions({ cancelPending, budgetPaused })) {
+    for (const action of taskControlActions({ cancelPending, budgetPaused, wholeTree })) {
         const item = document.createElement('button');
         item.type = 'button';
         item.className = `task-control-item${action === ACTION_STOP_NOW ? ' danger' : ''}`;
@@ -341,6 +453,12 @@ export function openTaskControlMenu(anchor, { cancelPending = false, budgetPause
         item.addEventListener('click', (event) => {
             event.stopPropagation();
             closeTaskControlMenu();
+            // Both surfaces' anchors name their task (Activity row `data-id`,
+            // chat card root `data-task-id`), so Pause needs no per-surface hook.
+            if (action === ACTION_PAUSE) {
+                pauseTaskAction(anchor.dataset?.id || anchor.closest?.('[data-task-id]')?.dataset?.taskId || '');
+                return;
+            }
             onAction?.(action);
         });
         menu.appendChild(item);

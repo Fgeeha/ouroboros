@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import json
 import math
 import time
 from pathlib import Path
@@ -46,13 +47,25 @@ def historical_operation_controls(root: Any, purpose: dict, *, admission: bool =
         frozen = read_acceptance_history(root, row['task_id'], debt)
         blocked = historical_review_controls(root, row, debt, caller_task_id=purpose.get('caller_task_id', ''),
             automatic=(admission or unstarted) and purpose['automatic'], historical_contract=frozen.get('task_contract') or {},
-            check_paid=admission, pending_panel=pending_panel)
+            check_paid=admission, check_pause=admission or unstarted, pending_panel=pending_panel)
         deadline = purpose.get('caller_deadline_at')
         if deadline and (parse_deadline_ts(deadline) is None or parse_deadline_ts(deadline) <= utc_now()):
             blocked.append('caller_deadline')
         return blocked
     except Exception:
         return ['historical_control_authority_unavailable']
+
+
+def owner_paused_only(root: Any, purpose: dict, blocked: list) -> bool:
+    """Only the accounting root's closed owner Pause blocks this work: unsent, it waits for Resume (D10)."""
+    from ouroboros.owner_pause import fence_closed, read_fence
+
+    if not blocked or any(item != 'root_budget_fence' and not str(item).startswith('pause:') for item in blocked):
+        return False
+    try:
+        return fence_closed(read_fence(root, purpose['accounting_root_task_id']))
+    except Exception:
+        return False
 
 
 def _receipt(root: Path, debt: dict) -> dict | None:
@@ -237,6 +250,59 @@ def _historical_writer_live(root: Path, task_id: str, operation_id: str) -> bool
         return True
 
 
+def resume_paused_acceptance_preparations(root: Any, task_id: str, fence: dict) -> int:
+    """Rebind only Pause-attested unsent intents; caller holds the exact root launch lock.
+
+    Live preparers already wait for this fence. Dead ones reuse their owner/debt
+    identity with a compare-and-set before handoff. Paid/unknown work stays with
+    its collector, and unreadable sources never authorize another preparation.
+    """
+    from ouroboros import review_operation as operations
+    from ouroboros.artifacts import read_actor_source_bytes
+    from ouroboros.task_results import load_task_acceptance_review_state
+
+    restart = []
+    for owner, subject, entry in operations.paused_acceptance_preparations(root, task_id, fence['fence_id']):
+        pause = entry['preparation_pause']
+        if (entry.get('state') != operations.OPERATION_PREPARING or entry.get('source_ref')
+                or pause.get('intent_ref') != entry.get('intent_ref')
+                or pause.get('controller') != entry.get('controller')
+                or pause.get('generation') != fence.get('generation')):
+            raise ValueError('late_preparation_authority_unknown')
+        with operations._LOCK:
+            live = operations._LIVE.get(owner)
+        controller = operations.controller_state(entry.get('controller'))
+        if (live is not None and not live.closed) or controller == 'alive':
+            continue
+        if controller != 'dead' and entry.get('controller') != operations.controller_identity():
+            raise ValueError('late_preparation_controller_unknown')
+        intent = json.loads(read_actor_source_bytes(root, subject, entry['intent_ref']))
+        purpose = intent.get('purpose') or {}
+        if (intent.get('kind') != 'historical_acceptance_preparation_intent' or intent.get('owner_id') != owner
+                or intent.get('controller') != entry.get('controller') or purpose.get('task_id') != subject
+                or purpose.get('task_attempt') != entry.get('task_attempt')
+                or purpose.get('accounting_root_task_id') != task_id
+                or entry.get('retry_key') != 'task_acceptance:' + hashlib.sha256(purpose['debt_id'].encode()).hexdigest()):
+            raise ValueError('late_preparation_source_mismatch')
+        claims = load_task_acceptance_review_state(root, task_id, require_root_result=True)['claims_by_binding']
+        if any(entry['retry_key'] == 'task_acceptance:' + str(claim.get('paid_identity') or '')
+               for claim in claims.values()):
+            raise ValueError('late_preparation_dispatch_unknown')
+        restart.append((owner, subject, entry, purpose))
+    from supervisor.workers import get_event_q
+    for owner, subject, entry, purpose in restart:
+        ctx = SimpleNamespace(task_id=purpose.get('caller_task_id') or subject, task_attempt=purpose['task_attempt'],
+            drive_root=root, budget_drive_root=root, task_metadata={'root_task_id': task_id},
+            event_queue=get_event_q(), pending_events=[])
+        prepared = {'status': 'prepared', 'owner_source_ref': purpose.get('owner_source_ref')}
+        operations.prepare_historical_operation(root=root, purpose=purpose, event_queue=ctx.event_queue,
+            background=True, resume_entry={'owner_id': owner, 'entry': entry},
+            work=lambda operation, ctx=ctx, subject=subject, purpose=purpose, prepared=prepared:
+                _run_historical_acceptance(ctx, task_id=subject, debt_id=purpose['debt_id'], prepared=prepared,
+                                          automatic=purpose['automatic'], operation=operation))
+    return len(restart)
+
+
 def _run_historical_acceptance(ctx: Any, *, task_id: str, debt_id: str,
                               prepared: dict | None, automatic: bool, operation: Any) -> dict:
     """Run one late panel or collect its existing identity, without author work."""
@@ -283,20 +349,25 @@ def _run_historical_acceptance(ctx: Any, *, task_id: str, debt_id: str,
             return _collect_existing(usage_ctx, row, retry_key)
         purpose = operation.historical_purpose
         blocked = historical_operation_controls(root, purpose, admission=True)
-        if blocked:
+        if blocked and not owner_paused_only(root, purpose, blocked):
             return refused(blocked[0])
         if not _receipt(root, debt):
             return refused('exact_delivery_unconfirmed')
         receipt_verified = True
-        while _historical_writer_live(root, task_id, operation.owner_id):
-            if not automatic:
+        while True:
+            # The existing operation holds this preparation drain until the original
+            # terminal writer releases custody — and, automatic and still unsent,
+            # through an owner Pause of that root until its Resume — without a scheduler.
+            live = _historical_writer_live(root, task_id, operation.owner_id)
+            blocked = [] if live else historical_operation_controls(root, purpose, admission=True)
+            if not live and not owner_paused_only(root, purpose, blocked):
+                break
+            if live and not automatic:
                 return refused('historical_writer_still_live')
             if operation.control():
                 return refused('historical_preparation_cancelled')
-            # The existing operation holds this preparation drain until the
-            # original terminal writer releases custody, without a scheduler.
-            time.sleep(0.1)
-        blocked = historical_operation_controls(root, purpose, admission=True)
+            from ouroboros.budget_pause import _HOLD_POLL_SEC
+            time.sleep(_HOLD_POLL_SEC)  # existing owner-hold observation cadence
         if blocked:
             return refused(blocked[0])
         lineage = resolve_task_lineage(task_id, metadata=row.get('metadata'), **{
@@ -334,9 +405,12 @@ def _run_historical_acceptance(ctx: Any, *, task_id: str, debt_id: str,
         for slot in slots:
             if slot.retrieves:
                 retain_review_source(request, slot.slot_id, root)
+        from ouroboros.usage_admission import task_billing_fields, effective_billing_fields
+        billing = task_billing_fields({'id': task_id}, accounting_id, cap.get('usd'), root)
+        billing = effective_billing_fields(root, accounting_id, billing)
         scope = UsageScope(drive_root=root, task_id=task_id, root_task_id=accounting_id,
-            source='historical_acceptance', root_limit_usd=cap.get('usd'),
-            root_limit_source=str(cap.get('source') or 'original_admission'))
+            source='historical_acceptance', **{**billing,
+                'root_limit_source': str(cap.get('source') or 'original_admission')})
         admission = SimpleNamespace(tools=SimpleNamespace(_ctx=usage_ctx), task_id=task_id, drive_root=root,
             review_binding=binding, historical_purpose=purpose, historical_operation=operation,
             purpose='' if automatic else 'owner_historical_acceptance')

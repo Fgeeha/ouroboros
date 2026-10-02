@@ -199,7 +199,7 @@ def _ctx(tmp_path, *, task_id="root-1", role="root"):
 def _followup(ctx, **kw):
     from ouroboros.tools.followup import _handle_schedule_followup
 
-    params = {"run_at": "2030-01-01T00:00:00+00:00",
+    params = {"relation": "independent", "run_at": "2030-01-01T00:00:00+00:00",
               "objective": "Re-run the plan panel once the reviewer window resets."}
     if "cron" in kw and "run_at" not in kw:
         params.pop("run_at")
@@ -266,7 +266,7 @@ def test_presence_followup_preserves_ceiling_and_return_context(tmp_path):
     record = queue.list_scheduled_tasks(tmp_path / "data")["tasks"][0]
     assert record["task"]["metadata"]["presence"] == {"binding_id": "b" * 32}
     assert record["task"]["task_contract"] == ctx.task_contract
-    assert record["task"]["metadata"]["origin_task_id"] == "root-1"
+    assert record["followup_origin"]["task_id"] == "root-1"
 
 
 def test_presence_recurring_followup_uses_existing_cron_and_preserves_authority(tmp_path):
@@ -524,7 +524,7 @@ def test_schedule_followup_root_id_falls_back_to_task_id_never_the_string_none(t
     from supervisor.queue import list_scheduled_tasks
 
     record = list_scheduled_tasks(pathlib.Path(tmp_path / "data").resolve())["tasks"][0]
-    assert record["task"]["metadata"]["origin_root_task_id"] == "root-3"
+    assert record["followup_origin"]["root_task_id"] == "root-3"
 
 
 def test_schedule_followup_preserves_source_project_and_chat(tmp_path):
@@ -704,10 +704,15 @@ def test_consumed_once_records_are_pruned_past_gc_retention(tmp_path):
     now = datetime.datetime.now(UTC)
     old = (now - datetime.timedelta(days=400)).isoformat()
     queue.upsert_scheduled_task({
-        "id": "consumed-old", "enabled": False, "completed_at": old,
+        "id": "consumed-old", "enabled": False, "completed_at": old, "last_task_id": "settled-old",
         "trigger": {"type": "once", "run_at": old},
         "task": {"type": "task", "text": "done long ago"},
     })
+    from ouroboros.task_results import write_task_result
+    write_task_result(tmp_path, "settled-old", "completed", result="settled")
+    queue.upsert_scheduled_task({
+        "id": "consumed-unidentified", "enabled": False, "completed_at": old,
+        "trigger": {"type": "once", "run_at": old}, "task": {"type": "task", "text": "unknown custody"}})
     queue.upsert_scheduled_task({
         "id": "consumed-fresh", "enabled": False, "completed_at": now.isoformat(),
         "trigger": {"type": "once", "run_at": now.isoformat()},
@@ -730,7 +735,8 @@ def test_consumed_once_records_are_pruned_past_gc_retention(tmp_path):
     })
     queue.check_scheduled_tasks()
     ids = {r["id"] for r in queue.list_scheduled_tasks(tmp_path)["tasks"]}
-    # Only the aged-out CONSUMED ONE-SHOT is pruned; a disabled cron row is a
+    # Only the aged-out CONSUMED ONE-SHOTS are pruned (an owner schedule's receipt
+    # ages out with or without a recorded task id); a disabled cron row is a
     # standing schedule the owner may re-enable, even when it carries completed_at.
     assert ids == {"consumed-fresh", "enabled-future", "disabled-cron", "disabled-cron-stamped"}
     assert pending == []
@@ -796,7 +802,7 @@ def test_schedule_followup_registration_surfaces():
     # tests/test_consciousness_observe_dispatch.py.
     assert [e.name for e in entries] == ["schedule_followup", "manage_schedules"]
     schema = entries[0].schema["parameters"]
-    assert set(schema["required"]) == {"objective"}
+    assert set(schema["required"]) == {"objective", "relation"}
     assert {"run_at", "cron"} <= set(schema["properties"])
     assert not ({"anyOf", "oneOf", "allOf"} & set(schema))
     from ouroboros.safety import POLICY_SKIP, TOOL_POLICY

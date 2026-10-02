@@ -8,17 +8,33 @@ import os
 import pathlib
 import re
 import subprocess
-from dataclasses import dataclass
+from contextvars import ContextVar
+from dataclasses import dataclass, replace
+from functools import wraps
 from typing import List, Optional
 
 from ouroboros.secret_masking import redact_known_values
 from ouroboros.tools.registry import ToolContext, ToolEntry
-from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
+from ouroboros.tools.tool_result import LegacyTextResultAdapter, ToolResult, _publish_tool_result, _replace_tool_result
 from ouroboros.utils import truncate_within_limit
 from ouroboros.utils import truncate_review_artifact as _truncate_with_notice
 
 log = logging.getLogger(__name__)
 _GENERIC_TRANSPORT = object()
+# One public tool invocation's "a gh subprocess was already launched" fact.
+_SUBMITTED: ContextVar[Optional[List[bool]]] = ContextVar("github_invocation_submitted", default=None)
+
+
+def _one_invocation(handler):
+    """Scope ``_gh_run``'s first-submission fact to one public tool invocation."""
+    @wraps(handler)
+    def invoke(ctx, *args, **kwargs):
+        token = _SUBMITTED.set([False])
+        try:
+            return handler(ctx, *args, **kwargs)
+        finally:
+            _SUBMITTED.reset(token)
+    return invoke
 
 
 # gh's own HTTP status shapes (see ``_gh_run``); the first match in stderr order wins.
@@ -39,14 +55,15 @@ class GhResult:
     failure: str
 
 
-def _refuse(ctx: ToolContext, text: str, code: str = "TOOL_ARG_ERROR") -> str:
+def _refuse(ctx: ToolContext, text: str, code: str = "TOOL_ARG_ERROR", *, no_effect: bool = False) -> str:
     """Publish a refusal this module AUTHORS as a typed result; text unchanged.
 
     The registry types a string result by its first-line typed marker (the
     warning sign plus an UPPER_SNAKE code), so prose such as ``⚠️ issue number must be positive`` was recorded ``status=ok``
     although the producer already knew it had refused. Both codes carry
     ``status="error"``."""
-    return _publish_tool_result(ctx, ToolResult(status="error", code=code, text=text))
+    return _publish_tool_result(ctx, ToolResult(status="error", code=code, text=text,
+        meta={"operation_outcome": "completed_no_effect"} if no_effect else {}))
 
 
 def github_token_from_env_or_settings() -> str:
@@ -101,11 +118,22 @@ def _gh_run(args: List[str], ctx: ToolContext, timeout: int = 30, input_data: Op
     # The target refusals below publish a typed argument error into the calling
     # tool's sidecar; the publication transport omits `repo`, so it can never
     # reach them and its own final result is never shadowed from here.
+    # A refusal before this invocation's FIRST gh launch also attests that the
+    # invocation had no effect; after any launch it attests nothing.
+    submitted = _SUBMITTED.get()
+    first = submitted is not None and not submitted[0]
+
+    def refused(text: str, failure: str, typed: Optional[ToolResult] = None) -> GhResult:
+        if first:
+            typed = _replace_tool_result(typed or LegacyTextResultAdapter.from_text("", text),
+                                         meta_updates={"operation_outcome": "completed_no_effect"})
+        return GhResult(False, _publish_tool_result(ctx, typed) if typed else text, None, None, failure)
+
     if repo is not _GENERIC_TRANSPORT and not isinstance(repo, str):
-        return GhResult(False, _publish_tool_result(ctx, ToolResult(
+        return refused("", "target", ToolResult(
             status="error", code="TOOL_ARG_ERROR",
             text="⚠️ GH_TARGET_INVALID: repo must be a string; omit it to use the selected Project.",
-        )), None, None, "target")
+        ))
     try:
         cwd, env = pathlib.Path(ctx.repo_dir), _gh_env(ctx)
         cmd = ["gh", *args]
@@ -121,24 +149,25 @@ def _gh_run(args: List[str], ctx: ToolContext, timeout: int = 30, input_data: Op
                 note = str(metadata.get("_project_room_note") or "")
                 selected = workspace or room_dir
                 if note or (selected and not pathlib.Path(selected).is_dir()):
-                    return GhResult(False,
+                    return refused(
                         f"⚠️ GH_TARGET_UNAVAILABLE: {note or 'The selected Project directory is unavailable.'}",
-                        None, None, "target")
+                        "target")
                 if project and not selected:
-                    return GhResult(False, _publish_tool_result(ctx, ToolResult(
+                    return refused("", "target", ToolResult(
                         status="error", code="TOOL_ARG_ERROR",
                         text="⚠️ GH_TARGET_REQUIRED: this Project has no repository directory; pass repo='[HOST/]OWNER/REPO'.",
-                    )), None, None, "target")
+                    ))
             binding = build_resolved_resource_binding(ctx, operation="shell", process_cwd="")
             cwd = binding.target_path
             if workspace and cwd != pathlib.Path(workspace).resolve(strict=False):
-                return GhResult(False,
-                    "⚠️ GH_TARGET_UNAVAILABLE: the task's Project binding could not be resolved.",
-                    None, None, "target")
+                return refused("⚠️ GH_TARGET_UNAVAILABLE: the task's Project binding could not be resolved.",
+                               "target")
             if workspace or room_dir or project:
                 env.pop("GH_REPO", None)  # Ambient defaults cannot replace the selected Project.
             if repo:
                 cmd.extend(["--repo", repo])
+        if submitted is not None:
+            submitted[0] = True
         res = subprocess.run(
             cmd,
             cwd=str(cwd),
@@ -175,9 +204,9 @@ def _gh_run(args: List[str], ctx: ToolContext, timeout: int = 30, input_data: Op
     except FileNotFoundError as e:
         missing = str(getattr(e, "filename", "") or "")
         if not missing or pathlib.Path(missing).name == "gh":
-            return GhResult(False,
+            return refused(
                 "⚠️ GH_ERROR: `gh` CLI not found. Install GitHub CLI and ensure it is on PATH (https://cli.github.com/)",
-                None, None, "cli_missing")
+                "cli_missing")
         detail = truncate_within_limit(redact_known_values(str(e), [github_token_from_env_or_settings()]), 600)
         return GhResult(False, f"⚠️ GH_ERROR: {detail}", None, None, "exception")
     except subprocess.TimeoutExpired:
@@ -232,7 +261,7 @@ def _list_issues(ctx: ToolContext, state: str = "open", labels: str = "", limit:
 
 def _get_issue(ctx: ToolContext, number: int, repo: str = "") -> str:
     if number <= 0:
-        return _refuse(ctx, "⚠️ TOOL_ARG_ERROR: issue number must be positive")
+        return _refuse(ctx, "⚠️ TOOL_ARG_ERROR: issue number must be positive", no_effect=True)
 
     args = [
         "issue", "view", str(number),
@@ -276,10 +305,10 @@ def _get_issue(ctx: ToolContext, number: int, repo: str = "") -> str:
 
 def _comment_on_issue(ctx: ToolContext, number: int, body: str, repo: str = "") -> str:
     if number <= 0:
-        return _refuse(ctx, "⚠️ TOOL_ARG_ERROR: issue number must be positive")
+        return _refuse(ctx, "⚠️ TOOL_ARG_ERROR: issue number must be positive", no_effect=True)
 
     if not body or not body.strip():
-        return _refuse(ctx, "⚠️ TOOL_ARG_ERROR: comment body cannot be empty.")
+        return _refuse(ctx, "⚠️ TOOL_ARG_ERROR: comment body cannot be empty.", no_effect=True)
 
     args = ["issue", "comment", str(number), "--body-file", "-"]
     raw = _gh_cmd(args, ctx, input_data=body, repo=repo)
@@ -290,7 +319,7 @@ def _comment_on_issue(ctx: ToolContext, number: int, body: str, repo: str = "") 
 
 def _close_issue(ctx: ToolContext, number: int, comment: str = "", repo: str = "") -> str:
     if number <= 0:
-        return _refuse(ctx, "⚠️ TOOL_ARG_ERROR: issue number must be positive")
+        return _refuse(ctx, "⚠️ TOOL_ARG_ERROR: issue number must be positive", no_effect=True)
 
     if comment and comment.strip():
         result = _comment_on_issue(ctx, number, comment, repo=repo)
@@ -341,7 +370,7 @@ def _list_prs(ctx: ToolContext, state: str = "open", limit: int = 20, repo: str 
 
 def _get_pr(ctx: ToolContext, number: int, repo: str = "") -> str:
     if number <= 0:
-        return _refuse(ctx, "⚠️ TOOL_ARG_ERROR: PR number must be positive.")
+        return _refuse(ctx, "⚠️ TOOL_ARG_ERROR: PR number must be positive.", no_effect=True)
 
     meta_args = [
         "pr", "view", str(number),
@@ -446,9 +475,9 @@ def _get_pr(ctx: ToolContext, number: int, repo: str = "") -> str:
 
 def _comment_on_pr(ctx: ToolContext, number: int, body: str, repo: str = "") -> str:
     if number <= 0:
-        return _refuse(ctx, "⚠️ TOOL_ARG_ERROR: PR number must be positive.")
+        return _refuse(ctx, "⚠️ TOOL_ARG_ERROR: PR number must be positive.", no_effect=True)
     if not (body or "").strip():
-        return _refuse(ctx, "⚠️ TOOL_ARG_ERROR: comment body cannot be empty.")
+        return _refuse(ctx, "⚠️ TOOL_ARG_ERROR: comment body cannot be empty.", no_effect=True)
 
     args = ["pr", "comment", str(number), "--body-file", "-"]
     raw = _gh_cmd(args, ctx, input_data=body, repo=repo)
@@ -466,7 +495,7 @@ def _pr_merge(ctx: ToolContext, number: int, expected_head_sha: str, method: str
     from ouroboros.tool_access import canonical_data_root
 
     if review_scope not in REVIEW_SCOPES or (review_verdict and not _VERDICT_RE.fullmatch(review_verdict)):
-        return _refuse(ctx, "⚠️ TOOL_ARG_ERROR: review_scope is full|delta; review_verdict is a short word such as PASS.")
+        return _refuse(ctx, "⚠️ TOOL_ARG_ERROR: review_scope is full|delta; review_verdict is a short word such as PASS.", no_effect=True)
     declared = ({"reviewed_head_sha": _sha(reviewed_head_sha), "reviewed_base_sha": _sha(reviewed_base_sha),
                  "scope": review_scope, "verdict": review_verdict}
                 if (reviewed_head_sha or review_verdict or review_task_ids) else None)
@@ -477,7 +506,7 @@ def _pr_merge(ctx: ToolContext, number: int, expected_head_sha: str, method: str
         review={"declared": declared, "task_ids": list(review_task_ids or [])})
     if receipt.get("refused"):
         code = "TOOL_ARG_ERROR" if receipt["refused"] == "arguments" else "TOOL_ERROR"
-        return _refuse(ctx, f"⚠️ PR_MERGE_REFUSED: {receipt['refused']} — {receipt.get('detail', '')}", code)
+        return _refuse(ctx, f"⚠️ PR_MERGE_REFUSED: {receipt['refused']} — {receipt.get('detail', '')}", code, no_effect=True)
     from ouroboros.merge_receipts import card_row_text
 
     status = (receipt.get("outcome") or {}).get("status", "unknown")
@@ -498,14 +527,19 @@ def _pr_merge(ctx: ToolContext, number: int, expected_head_sha: str, method: str
         lines.append("⚠️ The task-card receipt is not confirmed: " + str(card.get("reason") or "publication unknown")
                      + "; call pr_merge again for observation/publication only.")
     text = "\n".join(lines)
-    if status in ("merged", "queued"):
-        return text
-    return _refuse(ctx, f"⚠️ PR_MERGE_{status.upper()}: " + text, "TOOL_ERROR")
+    outcome = "completed" if status == "merged" else "unknown"
+    if status == "refused" and (receipt.get("effect") or {}).get("failure") in {"cli_missing", "target", "pre_effect"}:
+        outcome = "completed_no_effect"
+    return _publish_tool_result(ctx, ToolResult(
+        status="ok" if status in ("merged", "queued") else "error",
+        code="OK" if status in ("merged", "queued") else "TOOL_ERROR",
+        text=text if status in ("merged", "queued") else f"⚠️ PR_MERGE_{status.upper()}: " + text,
+        meta={"operation_outcome": outcome}))
 
 
 def _create_issue(ctx: ToolContext, title: str, body: str = "", labels: str = "", repo: str = "") -> str:
     if not title or not title.strip():
-        return _refuse(ctx, "⚠️ TOOL_ARG_ERROR: issue title cannot be empty.")
+        return _refuse(ctx, "⚠️ TOOL_ARG_ERROR: issue title cannot be empty.", no_effect=True)
 
     args = ["issue", "create", f"--title={title}"]
     if body:
@@ -641,6 +675,8 @@ def get_tools() -> List[ToolEntry]:
             }, "required": ["title"]},
         }, _create_issue),
     ]
+    # Wrapped here, not at definition: nested handler calls share one invocation.
+    tools = [replace(entry, handler=_one_invocation(entry.handler)) for entry in tools]
     for entry in tools:
         entry.schema["parameters"]["properties"]["repo"] = {
             "type": "string", "default": "",

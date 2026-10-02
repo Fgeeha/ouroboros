@@ -52,6 +52,12 @@ _TERMINAL_TOKENS = (
 # constant from the sticky set; "dynamic" is a variable or expression that can
 # carry one, which counts because the reducer, not the caller, decides.
 TERMINAL_WRITERS = {
+    # Create-only pooled control admission seeds running/scheduled authority;
+    # an existing row is returned unchanged, including any terminal status.
+    ('supervisor/queue.py::ensure_control_task_result', 'status'): 'dynamic',
+    # Continue replay restores the exact stored status, or seeds scheduled;
+    # its recovered admission cannot originate a new terminal transition.
+    ('supervisor/continuation_admission.py::_replay', 'stored.get("status") or "scheduled"'): 'dynamic',
     # A source-bound cap amendment preserves CURRENT lifecycle in its locked
     # projector; it changes money authority only and never revives the task.
     ('ouroboros/acceptance_history.py::prepare_owner_historical_review', 'accounting["status"]'): 'dynamic',
@@ -67,10 +73,6 @@ TERMINAL_WRITERS = {
     ('ouroboros/delegate_terminal.py::refresh_disposed_reconciliation', '"running"'): 'dynamic',
     ('ouroboros/gateway/tasks.py::_admission_rejection_response', 'STATUS_FAILED'): 'terminal',
     # API refusal now belongs to _admission_rejection_response and its receipt writer.
-    # The scanner treats a variable status as dynamic. This create-only site
-    # seeds scheduled/running from pooled membership and never ends a task;
-    # test_hurry_initial_lifecycle pins both choices and existing-row preservation.
-    ('ouroboros/gateway/task_hurry.py::_admit_hurry_locked', 'pooled_status'): 'dynamic',
     # Runtime707: CURRENT-ref retry publication moved out of observability's
     # locked sweep; terminal file-failure publication moved off event drain.
     # Both retain CURRENT lifecycle status rather than authoring completion.

@@ -604,6 +604,10 @@ class TestGlobalOnlyTreeAccounting:
 
 
     def test_an_uncapped_rooted_attempt_refreshes_the_real_tree_cache(self, tmp_path):
+        from ouroboros.task_results import write_task_result
+        write_task_result(tmp_path, 'root-u', 'running', billing_group={
+            'billing_group_id': 'root-u', 'billing_group_limit_usd': None,
+            'billing_group_limit_source': 'initial_task_admission', 'billing_group_limit_revision': 'fixture'})
         scope = usage_accounting.UsageScope(
             drive_root=tmp_path, task_id="child-u", root_task_id="root-u", global_limit_usd=100.0,
         )
@@ -1241,6 +1245,10 @@ class TestOneCeilingPerTree:
 
     def test_acceptance_rails_use_global_wallet_and_tree_spend(self, monkeypatch, tmp_path):
         monkeypatch.setenv("TOTAL_BUDGET", "50")
+        from ouroboros.task_results import write_task_result
+        write_task_result(tmp_path, 'root', 'running', billing_group={
+            'billing_group_id': 'root', 'billing_group_limit_usd': 100.0,
+            'billing_group_limit_source': 'initial_task_admission', 'billing_group_limit_revision': 'fixture'})
         for task_id, root_id, cost in (("child", "root", 42.0), ("other", "other", 7.0)):
             with usage_accounting.usage_scope(usage_accounting.UsageScope(
                 drive_root=tmp_path, task_id=task_id, root_task_id=root_id,

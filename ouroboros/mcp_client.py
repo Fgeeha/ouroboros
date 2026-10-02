@@ -71,6 +71,8 @@ _MAX_TOOL_SLUG = 32
 _HEADER_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
 _STDIO_DIAGNOSTIC_CONFIG = ContextVar("mcp_stdio_diagnostic_config", default=None)
+# The task whose discovery this listing is (``refresh_server``); None for Settings.
+_DISCOVERY_AUTHORITY = ContextVar("mcp_discovery_authority", default=None)
 
 # Block obvious metadata SSRF targets, but allow localhost/private LAN MCP servers.
 _DENIED_HOSTS = frozenset(
@@ -653,8 +655,10 @@ async def _list_tools_async(cfg: MCPServerConfig, *, timeout_sec: int) -> List[D
         raise RuntimeError(
             "MCP client SDK not installed. Add `mcp>=1.6` to the runtime."
         )
-    async def _do_with_session(session_factory) -> List[Dict[str, Any]]:
-        async with session_factory as transport_ctx:
+    from ouroboros.owner_pause import submit_async_preparation
+
+    async def _do_with_session() -> List[Dict[str, Any]]:
+        async with _transport_factory(cfg) as transport_ctx:
             # Both transports yield read/write streams.
             streams = transport_ctx
             if isinstance(streams, tuple):
@@ -697,8 +701,10 @@ async def _list_tools_async(cfg: MCPServerConfig, *, timeout_sec: int) -> List[D
                         )
                 return tools_raw
 
+    # A task's discovery passes that task's launch admission before each
+    # transport entry (a stdio server starts there); Settings probes name none.
     return await asyncio.wait_for(
-        _do_with_session(_transport_factory(cfg)), timeout=timeout_sec
+        submit_async_preparation(_do_with_session, source=_DISCOVERY_AUTHORITY.get()), timeout=timeout_sec
     )
 
 
@@ -710,6 +716,8 @@ async def _call_tool_async(
         raise RuntimeError(
             "MCP client SDK not installed. Add `mcp>=1.6` to the runtime."
         )
+    from ouroboros.owner_pause import submit_async_operation, submit_async_preparation
+
     async def _do() -> ToolResult:
         async with _transport_factory(cfg) as transport_ctx:
             streams = transport_ctx
@@ -719,10 +727,11 @@ async def _call_tool_async(
                 read, write = streams.read, streams.write  # pragma: no cover
             async with ClientSession(read, write) as session:
                 await session.initialize()
-                result = await session.call_tool(tool_name, arguments)
+                result = await submit_async_operation(None, session.call_tool, tool_name, arguments)
                 return _tool_result_from_call_result(result)
 
-    return await asyncio.wait_for(_do(), timeout=timeout_sec)
+    # Launch admission precedes transport entry: a stdio server starts there.
+    return await asyncio.wait_for(submit_async_preparation(_do), timeout=timeout_sec)
 
 
 def _stringify_call_result(result: Any) -> str:
@@ -811,7 +820,10 @@ def _run_async(coro_factory: Callable[[], Awaitable[Any]], *, join_timeout: Opti
         except BaseException as exc:
             holder["error"] = exc
 
-    thread = threading.Thread(target=_runner, name="mcp-sync-runner", daemon=True)
+    import contextvars
+
+    context = contextvars.copy_context()
+    thread = threading.Thread(target=lambda: context.run(_runner), name="mcp-sync-runner", daemon=True)
     thread.start()
     thread.join(timeout=join_timeout)
     if thread.is_alive():
@@ -1037,8 +1049,12 @@ class MCPManager:
                 "servers": servers,
             }
 
-    def refresh_server(self, server_id: str) -> Dict[str, Any]:
-        """Re-list tools for one server."""
+    def refresh_server(self, server_id: str, *, authority: Any = None) -> Dict[str, Any]:
+        """Re-list tools for one server; ``authority`` is the discovering task.
+
+        A listing that task's launch admission refuses (an accepted owner
+        Pause) opened nothing: the runtime keeps its tools and stays unlisted.
+        """
         with self._lock:
             if not self._enabled:
                 return {"ok": False, "error": "MCP client is disabled."}
@@ -1056,9 +1072,14 @@ class MCPManager:
                 return {"ok": False, "error": f"MCP server {server_id!r} is disabled."}
             timeout = self._tool_timeout_sec
 
+        from ouroboros.owner_pause import OwnerPauseRefused
+
         attempted_at = datetime.now(timezone.utc).isoformat()
+        token = _DISCOVERY_AUTHORITY.set(authority)
         try:
             tools_raw = _run_async(lambda: self._async_list_tools(cfg, timeout), join_timeout=timeout + 3)
+        except OwnerPauseRefused as exc:
+            return {"ok": False, "not_started": True, "error": f"MCP listing NOT STARTED: {exc}"}
         except BaseException as exc:  # noqa: BLE001 - surface any failure
             err_text = f"{type(exc).__name__}: {_redact_error_text(exc, cfg)}"
             with self._lock:
@@ -1069,6 +1090,8 @@ class MCPManager:
                     target.tools = []
                     target.tool_name_collisions = []
             return {"ok": False, "error": err_text}
+        finally:
+            _DISCOVERY_AUTHORITY.reset(token)
 
         pagination_truncated = any(
             isinstance(item, dict) and item.get("_pagination_truncated")
@@ -1157,15 +1180,16 @@ class MCPManager:
             ],
         }
 
-    def refresh_all(self) -> Dict[str, Any]:
-        """Refresh every enabled server."""
+    def refresh_all(self, *, authority: Any = None, unlisted_only: bool = False) -> Dict[str, Any]:
+        """Refresh every enabled server (or only those never attempted)."""
         outcomes: Dict[str, Any] = {}
         with self._lock:
             if not self._enabled:
                 return {"refreshed": {}, "error": "MCP client is disabled."}
-            ids = [cfg_id for cfg_id, rt in self._servers.items() if rt.config.enabled]
+            ids = [cfg_id for cfg_id, rt in self._servers.items()
+                   if rt.config.enabled and not (unlisted_only and rt.last_attempted)]
         for server_id in ids:
-            outcomes[server_id] = self.refresh_server(server_id)
+            outcomes[server_id] = self.refresh_server(server_id, authority=authority)
         return {"refreshed": outcomes}
 
     def refresh_all_background(self, *, reason: str = "settings") -> None:
@@ -1291,6 +1315,10 @@ class MCPManager:
                 text=text,
                 meta={"dynamic_provider": True},
             )
+        # Joined normal return (either SDK error bit): this invocation's call is over.
+        from ouroboros.owner_pause import record_mcp_call_returned
+
+        record_mcp_call_returned(prefixed_name)
         text = _model_facing_result(
             cfg,
             tool.raw_name,
@@ -1344,8 +1372,12 @@ def reconfigure_from_settings(settings: Dict[str, Any]) -> None:
     get_manager().reconfigure(settings)
 
 
-def ensure_configured_from_settings(*, refresh: bool = False) -> None:
-    """Configure this process's manager; workers have separate Python heaps."""
+def ensure_configured_from_settings(*, refresh: bool = False, authority: Any = None) -> None:
+    """Configure this process's manager; workers have separate Python heaps.
+
+    A refreshing read lists changed settings, and any server a refused
+    ``authority`` (see ``refresh_server``) left never attempted.
+    """
     from ouroboros.config import SETTINGS_PATH, load_settings
 
     manager = get_manager()
@@ -1355,11 +1387,11 @@ def ensure_configured_from_settings(*, refresh: bool = False) -> None:
         mtime_ns = None
     if manager.is_configured() and manager.settings_mtime_ns() is None:
         return
-    if manager.is_configured() and manager.settings_mtime_ns() == mtime_ns:
-        return
-    changed = manager.reconfigure(load_settings(), settings_mtime_ns=mtime_ns)
-    if refresh and changed:
-        manager.refresh_all()
+    changed = False
+    if not (manager.is_configured() and manager.settings_mtime_ns() == mtime_ns):
+        changed = manager.reconfigure(load_settings(), settings_mtime_ns=mtime_ns)
+    if refresh:
+        manager.refresh_all(authority=authority, unlisted_only=not changed)
 
 
 def refresh_all_background(*, reason: str = "settings") -> None:

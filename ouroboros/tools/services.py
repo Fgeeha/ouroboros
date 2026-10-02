@@ -12,6 +12,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
+from ouroboros.owner_pause import OwnerPauseRefused
+from ouroboros.tools.tool_result import launch_refusal_result
 from ouroboros.observability import redact_projection, write_blob
 from ouroboros.secret_masking import redact_known_values
 from ouroboros.platform_layer import (
@@ -43,7 +45,6 @@ from ouroboros.utils import append_jsonl, utc_now_iso
 from ouroboros.workspace_executor import executor_ref_from_ctx
 from ouroboros.workspace_executor import overlay_env, resolve_process_env, service_env, validate_process_env
 from ouroboros.workspace_executor import kill_all_services as executor_kill_all_services
-from ouroboros.workspace_executor import map_host_path as executor_map_host_path
 from ouroboros.workspace_executor import _read_local_service_marker
 from ouroboros.workspace_executor import service_logs as executor_service_logs
 from ouroboros.workspace_executor import service_status as executor_service_status
@@ -130,14 +131,10 @@ def _service_output_binding(
 
 
 def _executor_can_run_cwd(ctx: ToolContext, workdir: pathlib.Path) -> bool:
-    executor_ref = executor_ref_from_ctx(ctx)
-    if executor_ref is None:
-        return False
-    try:
-        executor_map_host_path(executor_ref, pathlib.Path(workdir).resolve(strict=False))
-        return True
-    except Exception:
-        return False
+    # Keep the service keyword spelling while sharing shell's reachability rule.
+    from ouroboros.tools.shell_process import _executor_can_run_cwd as reachable
+
+    return reachable(ctx, workdir)
 
 
 def _tail(path: pathlib.Path, chars: int) -> str:
@@ -358,6 +355,15 @@ def _readiness_marker_observed(record: ServiceRecord, marker: str) -> bool:
     return _read_local_service_marker(record, record.log_path, marker)
 
 
+def _refused_before_start(ctx: ToolContext, refusal: str) -> str:
+    """Producer fact: this start_service call refused during preparation, before
+    any process, service record or executor submission existed. Errors after
+    that point never carry it."""
+    from ouroboros.tools.shell import _pre_spawn_refusal
+
+    return _pre_spawn_refusal(ctx, refusal, tool="start_service")
+
+
 def _start_service(
     ctx: ToolContext,
     cmd: List[str],
@@ -371,7 +377,7 @@ def _start_service(
     _resolved_binding: ResolvedResourceBinding | None = None,
 ) -> str:
     if not isinstance(cmd, list) or not cmd or not all(str(x).strip() for x in cmd):
-        return "⚠️ TOOL_ARG_ERROR (start_service): cmd must be a non-empty array of strings."
+        return _refused_before_start(ctx, "⚠️ TOOL_ARG_ERROR (start_service): cmd must be a non-empty array of strings.")
     proposed_env = dict(env or {})
     try:
         refs = validate_process_env(env_from_settings)
@@ -382,23 +388,24 @@ def _start_service(
                 return _publish_tool_result(ctx, ToolResult(
                     status="blocked", code="ACCESS_BLOCKED",
                     text="⚠️ SERVICE_ENV_REFERENCE_BLOCKED: this task cannot select settings-backed service environment. A root task can start the service; existing literal environment and configured MCP access remain available.",
+                    meta={"operation_outcome": "completed_no_effect"},
                 ))
         env, secret_values = resolve_process_env(env, refs, settings=runtime_settings(settings_reader=load_settings) if refs else None)
     except ValueError as exc:
-        return f"⚠️ TOOL_ARG_ERROR (start_service): {exc}"
+        return _refused_before_start(ctx, f"⚠️ TOOL_ARG_ERROR (start_service): {exc}")
     service_name, name_error = _sanitize_service_name(name)
     if name_error:
-        return name_error
+        return _refused_before_start(ctx, name_error)
     readiness_timeout, readiness_error = _readiness_timeout(readiness)
     if readiness_error:
-        return readiness_error
+        return _refused_before_start(ctx, readiness_error)
     if _panic_requested:
-        return "⚠️ SERVICE_START_ERROR: Emergency Stop has retired service admission"
+        return _refused_before_start(ctx, "⚠️ SERVICE_START_ERROR: Emergency Stop has retired service admission")
     key = _service_key(ctx, service_name)
     with _LOCK:
         existing = _SERVICES.get(key)
         if existing and existing.proc.poll() is None:
-            return f"⚠️ SERVICE_ALREADY_RUNNING: {service_name} pid={existing.proc.pid}"
+            return _refused_before_start(ctx, f"⚠️ SERVICE_ALREADY_RUNNING: {service_name} pid={existing.proc.pid}")
     try:
         binding = _resolved_binding or build_resolved_resource_binding(
             ctx,
@@ -411,7 +418,7 @@ def _start_service(
         # One failure class, one message (v6.54.3 SSOT): the canonical cwd block
         # names every allowed root as label=path instead of a bare rootless
         # ValueError echo; the SHELL_CWD_BLOCKED status is a typed policy denial.
-        return shell_cwd_block_message(ctx, cwd, operation="service", error=exc)
+        return _refused_before_start(ctx, shell_cwd_block_message(ctx, cwd, operation="service", error=exc))
     if _resolved_binding is None:
         # Registry dispatch has already checked this exact prepared binding.
         # A direct handler caller uses the same Supervisor before the first
@@ -425,6 +432,7 @@ def _start_service(
         if not allowed:
             return _publish_tool_result(ctx, ToolResult(
                 status="blocked", code="SAFETY_VIOLATION", text=advice,
+                meta={"operation_outcome": "completed_no_effect"},
             ))
         if advice:
             ctx.emit_progress_fn(advice)
@@ -467,8 +475,14 @@ def _start_service(
                 secret_values=secret_values,
             )
             return json.dumps(payload, ensure_ascii=False, indent=2)
+        except OwnerPauseRefused as exc:
+            return _publish_tool_result(ctx, launch_refusal_result(str(exc), completed_no_effect=True))
         except Exception as exc:
-            return redact_known_values(f"⚠️ SERVICE_START_ERROR: executor backend failed: {type(exc).__name__}: {exc}", secret_values)
+            text = redact_known_values(f"⚠️ SERVICE_START_ERROR: executor backend failed: {type(exc).__name__}: {exc}", secret_values)
+            if getattr(exc, "process_not_started", False) is True:
+                return _publish_tool_result(ctx, ToolResult(status="error", code="LEGACY_TOOL_ERROR",
+                    text=text, meta={"operation_outcome": "completed_no_effect"}))
+            return text
     task_id = str(getattr(ctx, "task_id", "") or "manual")
     log_dir = pathlib.Path(ctx.drive_root) / "services" / task_id
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -526,6 +540,9 @@ def _start_service(
             env=overlay_env(apply_env_path_prepend(_service_env(), active_node_resolution(ctx)), env),
         )
         log_fh.close()
+    except OwnerPauseRefused as exc:
+        log_fh.close()
+        return _publish_tool_result(ctx, launch_refusal_result(str(exc), completed_no_effect=True))
     except Exception as exc:
         log_fh.close()
         return redact_known_values(f"⚠️ SERVICE_START_ERROR: {type(exc).__name__}: {exc}", secret_values)

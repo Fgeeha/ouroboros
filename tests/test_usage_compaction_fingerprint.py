@@ -63,8 +63,8 @@ def _rewrite_one_group_row(monkeypatch, mutate):
     """Let ``mutate`` edit the single group row of the built candidate."""
     real_build = uc._build_candidate
 
-    def build(records, decimal_records, raw, beat):
-        candidate, receipt = real_build(records, decimal_records, raw, beat)
+    def build(records, decimal_records, raw, beat, **kwargs):
+        candidate, receipt = real_build(records, decimal_records, raw, beat, **kwargs)
         lines = candidate.decode("utf-8").splitlines()
         rebuilt = []
         for line in lines:

@@ -249,6 +249,7 @@ def test_manual_ui_selection_is_fixed_partial_and_never_a_paid_or_full_check():
                            "test_browser_tools_smoke", "matrix", "download-artifact"):
         assert full_lane_only not in str(partial_job), full_lane_only
         assert full_lane_only in shared_text, full_lane_only
+    assert "-vv --tb=short" in _steps("ui-browser.yml", "ui-shard")["ui_tests"]["run"]
     assert '${{ inputs.diagnostic }}' not in partial["run"]
     assert partial["env"]["DIAGNOSTIC"] == "${{ inputs.diagnostic }}"
     assert "--scope \"$DIAGNOSTIC\"" in diagnostic["ui_summary"]["run"]

@@ -51,6 +51,8 @@ from ouroboros.gateway.contracts import (
     TaskEvent,
     TaskEventCursor,
     TaskEventsRequest,
+    TaskCancelRequest,
+    TaskPauseRequest, TaskPauseResponse, TaskContinueRequest, TaskContinueResponse, ContinuationOffer,
     TaskHurryRequest,
     TaskHurryResponse,
     TypingOutbound,
@@ -258,6 +260,8 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
                 UpdatePreflightRequest, UpdatePreflightResponse, UpdateApplyRequest,
                 UpdateApplySuccessResponse, UpdateApplyErrorResponse,
                 UpdateStatusReadyOutbound, TaskCostBreakdown, TaskDetailResponse,
+                TaskCancelRequest, TaskPauseRequest, TaskPauseResponse,
+                TaskContinueRequest, TaskContinueResponse, ContinuationOffer,
                 TaskHurryRequest, TaskHurryResponse, OwnerHurryProjection,
                 TaskEvent, TaskEventCursor, TaskEventsRequest,
                 OwnerSkillPresenceRuntimeRequest, OwnerSkillPresenceRuntimeResponse,
@@ -695,3 +699,9 @@ def test_cost_presentation_has_a_closed_nullable_wire_shape():
     assert set(get_args(hints['scope'])) == {'own', 'root_tree'}
     assert _contains_none(hints['tracked_amount'])
     assert _contains_none(get_type_hints(ChatOutbound, include_extras=True)['cost_presentation'])
+
+
+def test_owner_continuation_envelopes_are_exported():
+    from ouroboros.gateway import contracts
+    for cls in (TaskPauseRequest, TaskPauseResponse, TaskContinueRequest, TaskContinueResponse, ContinuationOffer):
+        assert cls.__name__ in contracts.__all__

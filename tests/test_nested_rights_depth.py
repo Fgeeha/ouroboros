@@ -1071,7 +1071,7 @@ def test_budget_pause_leaves_unresolved_invalid_depth_in_retry_custody(
             "budget_drive_root": str(tmp_path),
         },
         {
-            "id": "healthy-before-budget",
+            "id": "healthy-before-budget", "admitted_dispatch": "none",
             "type": "task",
             "chat_id": 1,
             "description": "pause this task",

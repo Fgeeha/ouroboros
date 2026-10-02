@@ -174,6 +174,36 @@ def _screenshot(page, tmp_path, name):
     page.screenshot(path=str(root / f"{name}.png"), full_page=False, animations="disabled")
 
 
+def _capture_selection_failure(page, title, output, engine, before_box, line_height):
+    """Save this synthetic drag's facts before its browser context closes."""
+    directory = Path(output) / "browser" / f"history-selection-{engine}-{page.viewport_size['width']}"
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        facts = title.evaluate("""(node, before) => {
+            const rect = node.getBoundingClientRect(), style = getComputedStyle(node);
+            const selection = getSelection();
+            const point = {x: before.box.x + 7, y: before.box.y + before.lineHeight / 2};
+            return {viewport: {width: innerWidth, height: innerHeight, dpr: devicePixelRatio},
+                selection: selection.toString(), rangeCount: selection.rangeCount,
+                before, after: {x: rect.x, y: rect.y, width: rect.width, height: rect.height},
+                connected: node.isConnected, userSelect: style.userSelect, lineHeight: style.lineHeight,
+                hit: document.elementFromPoint(point.x, point.y)?.outerHTML,
+                title: node.outerHTML, line: node.closest('.chat-live-line')?.outerHTML};
+        }""", {"box": before_box, "lineHeight": line_height})
+        (directory / "selection.json").write_text(json.dumps(facts, indent=2), encoding="utf-8")
+    except Exception as error:
+        print(f"HISTORY_SELECTION_DIAGNOSTIC facts unavailable: {type(error).__name__}", flush=True)
+    for name, capture in (
+        ("screenshot", lambda: page.screenshot(path=str(directory / "screenshot.png"), timeout=5_000)),
+        ("dom", lambda: (directory / "page.html").write_text(page.content(), encoding="utf-8")),
+    ):
+        try:
+            capture()
+        except Exception as error:
+            print(f"HISTORY_SELECTION_DIAGNOSTIC {name} unavailable: {type(error).__name__}", flush=True)
+    print(f"HISTORY_SELECTION_DIAGNOSTIC {directory}", flush=True)
+
+
 def _assert_main_beginning_visible(page):
     page.locator(MAIN).evaluate("node => { node.scrollTop = 0; node.dispatchEvent(new Event('scroll')); }")
     page.evaluate(_SETTLE_RESTORE_FRAMES)
@@ -377,7 +407,7 @@ def _feature_history(root):
 
 
 @pytest.mark.parametrize("browser_engine", ["chromium", "webkit"])
-def test_history_details_selection_replay_and_project_reopen(direct_server_with_data, browser_engine, tmp_path):
+def test_history_details_selection_replay_and_project_reopen(direct_server_with_data, browser_engine, tmp_path, request):
     from playwright.sync_api import sync_playwright
 
     root, url = direct_server_with_data["data_dir"], direct_server_with_data["url"]
@@ -405,7 +435,15 @@ def test_history_details_selection_replay_and_project_reopen(direct_server_with_
                     page.mouse.down()
                     page.mouse.move(box["x"] + min(box["width"] - 4, 100), box["y"] + line_height / 2, steps=10)
                     page.mouse.up()
-                    assert page.evaluate("() => getSelection().toString().length > 0")
+                    try:
+                        assert page.evaluate("() => getSelection().toString().length > 0")
+                    except AssertionError:
+                        from tests.ci_evidence import output_dir
+
+                        evidence = output_dir(request.config) or Path(
+                            os.environ.get("HISTORY_UI_EVIDENCE_DIR") or tmp_path / "history-ui-evidence")
+                        _capture_selection_failure(page, title, evidence, browser_engine, box, line_height)
+                        raise
                     assert line.get_attribute("data-expanded") == "0", "drag selection must not activate the title"
                     page.evaluate("() => getSelection().removeAllRanges()")
                     toggle.click()

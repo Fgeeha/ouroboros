@@ -88,6 +88,7 @@ _AUDIT_ROW_KEYS: tuple[str, ...] = (
     "id", "name", "enabled", "source", "skill", "trigger", "timezone",
     "created_at", "updated_at", "last_run_at", "last_task_id", "completed_at",
     "next_run_at", "manual_override",
+    "followup_relation", "followup_origin", "followup_hold", "followup_wait",
 )
 # ``manage_schedules`` is a model-facing tool.  Keep one page comfortably below
 # the tool result cap even when a schedule table contains many rows or hostile
@@ -276,9 +277,17 @@ def schedule_lifecycle_status(record: Dict[str, Any]) -> str:
 
     ``consumed`` and ``suppressed`` are RETAINED history: neither dispatches
     again, and neither is an ``active`` schedule wearing a disabled flag.
+    ``delete_pending`` outranks them: a deleted row that still owes accepted
+    work stays visible until that work no longer needs it, then disappears.
     """
+    if record.get("delete_requested_at"):
+        return "delete_pending"
     if _is_consumed_once(record):
         return "consumed"
+    if record.get("followup_hold"):
+        return "held"
+    if record.get("followup_wait"):
+        return "waiting"
     if _is_suppressed(record):
         return "suppressed"
     return "active" if record.get("enabled", True) else "disabled"
@@ -345,8 +354,20 @@ def _schedule_projection_row(raw: Dict[str, Any]) -> Dict[str, Any]:
     row["suppressed"] = status == "suppressed"
     # Retained rows are history the owner can still act on; only a suppressed
     # one can come back, and only after its skill is re-evaluated.
-    row["retained"] = status in {"consumed", "suppressed"}
-    row["restorable"] = status == "suppressed"
+    row["retained"] = status in {"consumed", "suppressed", "held"}
+    row["restorable"] = status == "suppressed" or bool(raw.get("followup_hold") and raw.get("hold_persisted", True))
+    row["delete_pending"] = status == "delete_pending"
+    if row["delete_pending"]:
+        row["delete_requested_at"] = _bounded_projection_text(raw.get("delete_requested_at"), 64)
+    from supervisor.followup_policy import relation_kind, origin_of
+    row["relation"] = relation_kind(raw)
+    row["followup_origin"] = origin_of(raw)
+    row["followup_hold"] = raw.get("followup_hold")
+    row["followup_wait"] = raw.get("followup_wait", "")
+    row["hold_persisted"] = raw.get("hold_persisted", bool(raw.get("followup_hold")))
+    relation = raw.get("followup_relation") or {}
+    row["billing_group"] = relation.get("billing_group")
+    row["deadline_at"] = relation.get("deadline_at", "")
     # A due occurrence that WAITS (#1315): the typed reason is the fact; what to say
     # about it, if anything, is the mind's call.
     hold = raw.get("hold") if isinstance(raw.get("hold"), dict) else None
@@ -432,8 +453,10 @@ def schedule_activity_projection(data: Dict[str, Any]) -> Dict[str, Any]:
         row["active"] = status == "active"
         row["consumed"] = status == "consumed"
         row["suppressed"] = status == "suppressed"
-        row["retained"] = status in {"consumed", "suppressed"}
-        row["restorable"] = status == "suppressed"
+        projected = _schedule_projection_row(row)
+        for key in ("retained", "restorable", "relation", "followup_origin", "followup_hold",
+                    "followup_wait", "hold_persisted", "billing_group", "deadline_at", "delete_pending"):
+            row[key] = projected[key]
         tasks.append(row)
     out["tasks"] = tasks
     return out
@@ -600,19 +623,19 @@ def resync_skill_schedules(drive_root: pathlib.Path | None = None) -> Dict[str, 
     )
 
 
-def _rows_hold_schedule(rows: Any, schedule_id: str) -> bool:
+def _rows_hold_schedule(rows: Any, schedule_id: str, task_id: str = "") -> bool:
     """Whether any queue row (a PENDING task or a RUNNING/snapshot wrapper) is its task."""
     for row in rows or []:
         if not isinstance(row, dict):
             continue
         task = row.get("task") if isinstance(row.get("task"), dict) else row
         meta = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
-        if str(meta.get("schedule_id") or "") == schedule_id:
+        if str(meta.get("schedule_id") or "") == schedule_id or (task_id and task.get("id") == task_id):
             return True
     return False
 
 
-def _schedule_running_or_queued(schedule_id: str, drive_root: pathlib.Path | None = None) -> bool | None:
+def _schedule_running_or_queued(schedule_id: str, drive_root: pathlib.Path | None = None, *, task_id: str = "") -> bool | None:
     """Whether a task this schedule already admitted is still pending or running.
 
     ``None`` means UNKNOWN, and it is load-bearing: PENDING/RUNNING are the
@@ -629,8 +652,8 @@ def _schedule_running_or_queued(schedule_id: str, drive_root: pathlib.Path | Non
     if not schedule_id:
         return False
     if not in_worker_process():
-        return (_rows_hold_schedule(_queue().PENDING, schedule_id)
-                or _rows_hold_schedule(_queue().RUNNING.values(), schedule_id))
+        return (_rows_hold_schedule(_queue().PENDING, schedule_id, task_id)
+                or _rows_hold_schedule(_queue().RUNNING.values(), schedule_id, task_id))
     snapshot = read_json_dict(pathlib.Path(drive_root or _queue().DRIVE_ROOT)
                               / "state" / "queue_snapshot.json")
     if not isinstance(snapshot, dict):
@@ -670,12 +693,13 @@ def _schedule_running_or_queued(schedule_id: str, drive_root: pathlib.Path | Non
             return None
     except (TypeError, ValueError, OverflowError):
         return None
-    return (_rows_hold_schedule(snapshot.get("pending"), schedule_id)
-            or _rows_hold_schedule(snapshot.get("running"), schedule_id))
+    return (_rows_hold_schedule(snapshot.get("pending"), schedule_id, task_id)
+            or _rows_hold_schedule(snapshot.get("running"), schedule_id, task_id))
 
 
 def _task_from_schedule(record: Dict[str, Any], *, task_id: str = "") -> Dict[str, Any]:
-    template = dict(record.get("task") or {})
+    from supervisor.followup_policy import normalize_template, bind_task
+    template = normalize_template(record)
     task_id = task_id or uuid.uuid4().hex[:8]
     # Membership, not truthiness: a template's explicit chat 0 is its hidden partition.
     has_chat = template.get("chat_id") not in (None, "")
@@ -711,7 +735,10 @@ def _task_from_schedule(record: Dict[str, Any], *, task_id: str = "") -> Dict[st
         task["allowed_resources"] = allowed_resources
     existing_contract = template.get("task_contract") if isinstance(template.get("task_contract"), dict) else {}
     if existing_contract:
-        task["task_contract"] = existing_contract
+        task["task_contract"] = dict(existing_contract)
+        if task.get("deadline_at"):
+            task["task_contract"]["deadline_at"] = task["deadline_at"]
+    bind_task(_queue().DRIVE_ROOT, task, record)
     task["task_contract"] = build_task_contract(apply_consciousness_authority(task))
     workspace = task["task_contract"]["workspace"]
     # Presence-bound work (a speaker's follow-up, or one acting for a descendant's binding)
@@ -765,6 +792,14 @@ def check_scheduled_tasks() -> None:
         for record in list(data.get("tasks") or []):
             if not isinstance(record, dict):
                 continue
+            from supervisor.followup_policy import control_guard, refresh_policy
+            try:
+                with control_guard(_queue().DRIVE_ROOT, record):
+                    occurrences.repair_followup_binding(record)
+                    view = refresh_policy(_queue().DRIVE_ROOT, data, record)
+            except Exception:
+                log.exception("Follow-up policy persistence unavailable")
+                continue
             if isinstance(record.get("occurrence"), dict):
                 # An occurrence in flight is decided from durable facts first — even on a
                 # disabled row: admission already happened, later changes are future-only.
@@ -778,7 +813,7 @@ def check_scheduled_tasks() -> None:
                         continue
                 elif verdict == "settled":
                     occurrences.settle(record)
-                    if record.get("delete_requested_at"):  # its deletion waited for this run
+                    if record.get("delete_requested_at") and occurrences.deletion_settled(record):
                         data["tasks"] = [row for row in data.get("tasks") or [] if row is not record]
                         continue
                 elif verdict in {"prepare", "republish"}:
@@ -786,6 +821,10 @@ def check_scheduled_tasks() -> None:
                     continue
                 else:
                     continue
+            if record.get("delete_requested_at") and occurrences.deletion_settled(record):
+                data["tasks"] = [row for row in data.get("tasks") or [] if row is not record]
+                changed = True
+                continue
             if not record.get("enabled", True) or occurrences.holding(record, now_utc):
                 continue
             schedule_id = str(record.get("id") or "").strip()
@@ -839,6 +878,8 @@ def check_scheduled_tasks() -> None:
                     collision_names = skill_identity_collision_names(_queue().DRIVE_ROOT)
                 if str(record.get("skill") or "") in collision_names:
                     continue
+            if view.get("hold") or view["wait"] or record.get("followup_hold"):
+                continue
             claims.append(occurrences.claim(record, due_at))
             changed = True
         # Consumed one-shot receipts age out past the unified GC retention (DEVELOPMENT
@@ -846,7 +887,7 @@ def check_scheduled_tasks() -> None:
         from ouroboros.retention import age_cutoff, get_gc_retention_days
 
         kept, pruned = _prune_consumed_once(list(data.get("tasks") or []),
-                                            age_cutoff(get_gc_retention_days()))
+                                            age_cutoff(get_gc_retention_days()), work_settled=occurrences.deletion_settled)
         if pruned:
             data["tasks"], changed = kept, True
         if changed:

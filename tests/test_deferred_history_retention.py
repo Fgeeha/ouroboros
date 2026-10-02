@@ -131,6 +131,7 @@ def test_public_exact_review_reader_works_while_history_is_deferred(tmp_path):
     registry = ToolRegistry(repo_dir=Path.cwd(), drive_root=parent)
     registry.set_context(ToolContext(repo_dir=Path.cwd(), drive_root=parent, task_id="next-owner",
                                     task_metadata={"budget_drive_root": str(parent)}))
+    write_task_result(parent, "next-owner", "running", root_task_id="next-owner")
     selector = review_source_reader(task_id, ref)
     result = registry.execute_result(selector["tool"], selector["arguments"])
     assert result.status == "ok"

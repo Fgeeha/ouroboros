@@ -18,6 +18,8 @@ def test_configured_readonly_session_receives_own_scope_and_real_lineage_inputs(
     from tests.test_delegated_skill_payload import _payload_ctx, _StartStub
 
     ctx = _payload_ctx(tmp_path, monkeypatch)
+    from ouroboros.task_results import write_task_result
+    write_task_result(ctx.drive_root, ctx.task_id, "running", root_task_id=ctx.task_id)
     ctx.task_metadata.update(resource_intent={"kind": "explicit_none"}, parent_task_id="parent")
     parent = tmp_path / "data/task_drives/parent"
     parent.mkdir(parents=True)

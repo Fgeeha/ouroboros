@@ -31,6 +31,8 @@ def _unclocked(messages):
 @pytest.fixture
 def acting(setup, monkeypatch):
     root, gateway, client = setup
+    from ouroboros.task_results import write_task_result
+    write_task_result(root, "task-one", "running", root_task_id="task-one", _attempt=1)
     gateway.results *= 4
     gateway.dispatch *= 4
     monkeypatch.setenv(MODEL_ACCOUNTS_KEY, json.dumps({"main": "main-only", "fallback": ["fallback-only"]}))

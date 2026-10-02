@@ -643,6 +643,7 @@ class OuroborosAgent:
             emit_progress_fn=self._bind_task_progress_for_task(task),
             event_queue=self._event_queue,
             task_id=str(task.get("id") or ""),
+            task_lifecycle_bound=True,
             task_depth=int(task.get("depth", 0)),
             is_direct_chat=bool(task.get("_is_direct_chat")),
             task_constraint=normalize_task_constraint(task.get("task_constraint")),
@@ -864,6 +865,7 @@ class OuroborosAgent:
                     {"state": "unlimited", "source": "task_admission"}
                     if root_limit_known and math.isfinite(root_limit) else
                     {"state": "unknown", "source": "invalid_admission_setting"})
+            from ouroboros.usage_admission import task_billing_fields
             scope = UsageScope(
                 drive_root=budget_root,
                 task_id=task_id,
@@ -871,8 +873,9 @@ class OuroborosAgent:
                 parent_task_id=parent_task_id,
                 category=str(metadata.get("usage_category") or task.get("type") or "task"),
                 source="agent.task",
-                root_limit_usd=root_limit if root_limit > 0 else None,
                 root_cost_ceiling_usd=task.get("root_cost_ceiling_usd") or metadata.get("root_cost_ceiling_usd"),
+                # The whole-work group and its cap (a Continue's successor spends the ORIGINAL cap).
+                **task_billing_fields(task, root_task_id, root_limit if root_limit > 0 else None, budget_root, pin_initial=True),
             )
             with usage_scope(scope), task_model_wait_scope(
                 task=task, drive_root=self.env.drive_root, event_queue=self._event_queue,

@@ -59,7 +59,7 @@ def test_original_calendar_window_uses_review_floor_without_author_reserve(
 
 
 def test_automatic_rechecks_window_after_original_writer_drains(late, tmp_path, monkeypatch):
-    from ouroboros import acceptance_late
+    from ouroboros import acceptance_late, review_source_closure
     from supervisor import queue as task_queue
     now = datetime.now(timezone.utc)
     clock = [now]
@@ -67,24 +67,38 @@ def test_automatic_rechecks_window_after_original_writer_drains(late, tmp_path, 
     f = delivered(tmp_path, monkeypatch, receipt='owed', deadline=(now + timedelta(seconds=201)).isoformat())
     monkeypatch.setattr(task_queue, 'RUNNING', {f.tid: {'task': f.task}})
     entered, release = threading.Event(), threading.Event()
-    sleep = acceptance_late.time.sleep
+    writer_live = acceptance_late._historical_writer_live
+    observations = []
+    preparations = []
+    retain_sources = review_source_closure.retain_review_request_sources
 
-    def drain(seconds):
-        if threading.current_thread() is not threading.main_thread() and seconds == 0.1:
+    def prepare_sources(*args, **kwargs):
+        preparations.append(True)
+        return retain_sources(*args, **kwargs)
+
+    def drain(*args, **kwargs):
+        live = writer_live(*args, **kwargs)
+        observations.append(live)
+        if live:
             entered.set()
             assert release.wait(5)
-        else:
-            sleep(seconds)
+            live = writer_live(*args, **kwargs)  # Observe the real writer after its drain.
+            observations.append(live)
+        return live
 
-    monkeypatch.setattr(acceptance_late.time, 'sleep', drain)
+    monkeypatch.setattr(acceptance_late, '_historical_writer_live', drain)
+    monkeypatch.setattr(review_source_closure, 'retain_review_request_sources', prepare_sources)
     try:
         chat._handle_send_message(f.event, _send_ctx(f.root, []))
         assert entered.wait(5) and not late.calls
         clock[0] += timedelta(seconds=2)
         task_queue.RUNNING.clear()
     finally:
+        task_queue.RUNNING.clear()
         release.set()
     row = _unpaid(f, late)
+    assert observations == [True, False]
+    assert not preparations, "expired post-drain window must refuse before preparing reviewer sources"
     pointer = next(iter(row['review_operations'].values()))
     assert pointer['preparation_outcome']['reason'] == 'review_skipped_deadline_reserve'
     assert not pointer.get('source_ref')  # no source preparation after the drain
