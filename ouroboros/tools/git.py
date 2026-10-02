@@ -904,7 +904,7 @@ def _review_binding_failure(
 
 
 def _check_ci_status_after_push(repo_dir: pathlib.Path) -> str:
-    """Return CI status for the just-pushed commit SHA, or empty on error."""
+    """Return each push workflow's state for the just-pushed SHA, or empty on error."""
     try:
         import urllib.request
         token = os.environ.get("GITHUB_TOKEN", "").strip()
@@ -933,14 +933,25 @@ def _check_ci_status_after_push(repo_dir: pathlib.Path) -> str:
         runs = [r for r in (data.get("workflow_runs") or []) if r.get("head_sha") == local_sha]
         if not runs:
             return "\n\n⏳ CI: Run not yet registered — check GitHub Actions in ~30s."
-        if runs[0].get("status") in ("in_progress", "queued"):
-            return "\n\n⏳ CI: Run in progress — check GitHub Actions for results."
-        completed = next((r for r in runs if r.get("status") == "completed"), None)
-        if completed is None:
-            return "\n\n⏳ CI: Run queued — check GitHub Actions for results."
-        conclusion = completed.get("conclusion", "")
-        if conclusion == "success":
-            return "\n\n✅ CI: Run passed for this commit."
+        # One push starts several workflows (code, browser lane, provider
+        # canaries), so each is reported under its own name and none stands for
+        # the others. The API lists newest first: a re-run supersedes its original.
+        latest: Dict[str, dict] = {}
+        for run in runs:
+            latest.setdefault(str(run.get("name") or run.get("path") or "workflow"), run)
+        states = {
+            name: str(run.get("conclusion") or "unknown") if run.get("status") == "completed"
+            else str(run.get("status") or "queued").replace("_", " ")
+            for name, run in latest.items()
+        }
+        summary = "; ".join(f"{name}: {state}" for name, state in states.items())
+        failed = next((name for name, run in latest.items()
+                       if run.get("status") == "completed" and states[name] != "success"), None)
+        if failed is None:
+            if all(state == "success" for state in states.values()):
+                return f"\n\n✅ CI: registered push runs passed for this commit — {summary}."
+            return f"\n\n⏳ CI: push runs in progress — {summary}. Check GitHub Actions for results."
+        completed, conclusion = latest[failed], states[failed]
         run_number = completed.get("run_number", "?")
         html_url = completed.get("html_url", "")
         jobs_url = completed.get("jobs_url", "")
@@ -961,13 +972,15 @@ def _check_ci_status_after_push(repo_dir: pathlib.Path) -> str:
                 pass  # Fall back to generic summary — run_number/html_url still surfaced below
         if conclusion == "failure":
             return (
-                f"\n\n⚠️ CI STATUS: Run FAILED for this commit (run #{run_number})\n"
+                f"\n\n⚠️ CI STATUS: {failed} FAILED for this commit (run #{run_number})\n"
+                f"  Workflows: {summary}\n"
                 f"  Failed: {failed_summary}\n"
-                f"  Fix: investigate failing tests, then push a fix commit.\n"
+                f"  Fix: investigate the failed jobs; push a fix commit when this commit caused them.\n"
                 f"  URL: {html_url}"
             )
         return (
-            f"\n\n⚠️ CI STATUS: Run {conclusion.upper()} for this commit (run #{run_number})\n"
+            f"\n\n⚠️ CI STATUS: {failed} {conclusion.upper()} for this commit (run #{run_number})\n"
+            f"  Workflows: {summary}\n"
             f"  URL: {html_url}"
         )
     except Exception:

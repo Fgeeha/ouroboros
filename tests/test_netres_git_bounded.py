@@ -380,3 +380,76 @@ def test_commit_path_auto_push_timeout_is_best_effort_warning(tmp_path, monkeypa
     assert "[push skipped: git push failed:" in result
     assert "exceeded" in result
     assert ctx.last_push_succeeded is False
+
+
+def _ci_note(monkeypatch, runs, jobs=None):
+    """The post-push CI note for one GitHub Actions answer; no network, no git."""
+    import io
+    import json
+    import urllib.request
+
+    from ouroboros.tools import git as git_module
+
+    sha = "a" * 40
+    monkeypatch.setenv("GITHUB_TOKEN", "test-token")
+    monkeypatch.setenv("GITHUB_REPO", "example/project")
+    monkeypatch.setattr(git_module, "run_cmd",
+                        lambda cmd, cwd=None, **_kw: "ouroboros\n" if "--abbrev-ref" in cmd else sha + "\n")
+
+    def fake_urlopen(request, timeout=None):
+        if isinstance(runs, Exception):
+            raise runs
+        if request.full_url.endswith("/jobs"):
+            return io.BytesIO(json.dumps({"jobs": jobs or []}).encode("utf-8"))
+        assert f"event=push&head_sha={sha}" in request.full_url
+        listed = [{"head_sha": sha, "run_number": index, "html_url": f"https://example.test/{index}",
+                   "jobs_url": f"https://example.test/{index}/jobs", **run}
+                  for index, run in enumerate(runs, start=1)]
+        return io.BytesIO(json.dumps({"workflow_runs": listed}).encode("utf-8"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    return git_module._check_ci_status_after_push(pathlib.Path("."))
+
+
+_DONE = {"status": "completed", "conclusion": "success"}
+
+
+def test_ci_note_names_every_push_workflow_and_none_stands_for_the_others(monkeypatch):
+    """One push starts the code workflow, the browser lane and the provider
+    canaries. A finished canary run listed first is not "CI passed"."""
+    note = _ci_note(monkeypatch, [
+        {"name": "Provider canaries", **_DONE},
+        {"name": "CI", "status": "in_progress", "conclusion": None},
+        {"name": "UI browser (ouroboros push)", "status": "queued", "conclusion": None},
+    ])
+    assert note.startswith("\n\n⏳ CI: push runs in progress — ") and "✅" not in note
+    assert "Provider canaries: success; CI: in progress; UI browser (ouroboros push): queued" in note
+
+    note = _ci_note(monkeypatch, [{"name": "Provider canaries", **_DONE}, {"name": "CI", **_DONE}])
+    assert note == ("\n\n✅ CI: registered push runs passed for this commit — "
+                    "Provider canaries: success; CI: success.")
+    assert _ci_note(monkeypatch, []) == "\n\n⏳ CI: Run not yet registered — check GitHub Actions in ~30s."
+
+
+def test_ci_note_attributes_a_failure_to_its_workflow(monkeypatch):
+    runs = [
+        {"name": "CI", **_DONE},
+        {"name": "Provider canaries", "status": "completed", "conclusion": "failure"},
+    ]
+    jobs = [{"name": "integration-test / integration-test", "conclusion": "failure",
+             "steps": [{"name": "Run integration tests", "conclusion": "failure"}]}]
+    note = _ci_note(monkeypatch, runs, jobs)
+    assert "⚠️ CI STATUS: Provider canaries FAILED for this commit (run #2)" in note
+    assert "  Workflows: CI: success; Provider canaries: failure\n" in note
+    assert "  Failed: integration-test / integration-test → Run integration tests\n" in note
+    assert note.endswith("  URL: https://example.test/2")
+
+    # A re-run supersedes its original: the API lists the newest run first.
+    rerun = _ci_note(monkeypatch, [{"name": "Provider canaries", **_DONE}, *runs])
+    assert rerun.startswith("\n\n✅") and "failure" not in rerun
+    cancelled = _ci_note(monkeypatch, [{"name": "CI", "status": "completed", "conclusion": "cancelled"}])
+    assert "⚠️ CI STATUS: CI CANCELLED for this commit (run #1)" in cancelled
+
+
+def test_ci_note_stays_empty_when_github_is_unreachable(monkeypatch):
+    assert _ci_note(monkeypatch, OSError("network down")) == ""
