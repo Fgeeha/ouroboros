@@ -451,6 +451,22 @@ def test_killed_xdist_session_names_every_test_in_flight(tmp_path):
         f"::error title=Test in flight when the session was killed::{node}" for node in blocked}
 
 
+@pytest.mark.parametrize("finished", [False, True], ids=["interrupted", "complete"])
+def test_exported_session_still_names_a_test_its_journal_left_in_flight(tmp_path, finished):
+    # An interrupt (a console CTRL_C at a step ceiling) lets pytest write its final export.
+    public, node = tmp_path / "public", "t.py::test_hangs"
+    _write_results(public, [{"nodeid": node, "phase": "setup", "outcome": "passed"}])
+    rows = [{"event": "start", "nodeid": node}] + ([{"event": "finish", "nodeid": node}] * finished)
+    (public / "events.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows),
+                                         encoding="utf-8")
+    summary, _ = _summary(tmp_path, public, producer="failure")
+    assert "Case outcomes: **unknown**" not in summary and "not_run=1" in summary
+    assert (f"| {node} |" in summary) is not finished
+    assert ("in flight" in summary) is not finished
+    assert _annotate(tmp_path, public) == (
+        [] if finished else [f"::error title=Test in flight when the session was killed::{node}"])
+
+
 def test_journal_holds_only_redacted_identity_enums_and_exception_types(tmp_path):
     result, public, _ = _producer(tmp_path, f"""
         import pytest

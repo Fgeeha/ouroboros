@@ -161,6 +161,7 @@ def test_model_fixture_serves_without_reverse_dns():
         proc.stderr.close()
 
 
+@pytest.mark.serial
 def test_child_observes_late_local_model_health_binding_and_stop(tmp_path, monkeypatch):
     from ouroboros.local_model import LocalModelManager
 

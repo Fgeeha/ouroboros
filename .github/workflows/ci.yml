@@ -162,8 +162,10 @@ jobs:
       # the serial split. --timeout guards against a hung test blocking the whole job.
       # Each producer step also carries a wall-clock ceiling well above its slowest
       # observed platform: the serial pass has no per-test timeout (the commit gate's
-      # serial pass has none either), so the ceiling is what bounds a hang there, and
-      # it fails the STEP, which leaves the evidence step below able to name the test.
+      # serial pass has none either), so the ceiling is what bounds a hang there. Its
+      # expiry fails that step, and with it the job, without cancelling the job: the
+      # evidence step below still names the test. On Linux and macOS the killed step's
+      # pytest can linger beside the later steps until the runner cleans up the job.
       - name: Run tests (parallel — excludes the costly marker lanes AND the serial real-process suites)
         id: tests_parallel
         timeout-minutes: 90

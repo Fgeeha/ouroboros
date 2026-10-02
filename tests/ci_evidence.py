@@ -113,6 +113,13 @@ def _journal(root: Path) -> tuple[list[str], list[dict]] | None:
     return list(running), failed
 
 
+def _flight_table(running: list[str]) -> list[str]:
+    if not running:
+        return []
+    return ["", "| Test in flight when the session ended |", "| --- |"] + [
+        f"| {_cell(node)} |" for node in running]
+
+
 def _failure_table(failed: list[dict]) -> list[str]:
     if not failed:
         return []
@@ -150,6 +157,8 @@ def render_summary(root: Path, *, producer_outcome: str, artifact_outcome: str,
             lines.append(f"**{collected - sum(counts.values())} collected test(s) produced no report**: "
                          "the session stopped before running them.")
         lines.extend(_failure_table([row for row in data["reports"] if row["outcome"] == "failed"]))
+        # An interrupted session still exports; only its journal names what it left running.
+        lines.extend(_flight_table((_journal(root) or ([], []))[0]))
         if data.get("collection_failures"):
             lines.append(f"Collection failures: {len(data['collection_failures'])}.")
     else:
@@ -159,9 +168,7 @@ def render_summary(root: Path, *, producer_outcome: str, artifact_outcome: str,
             running, failed = journal
             lines.extend(["", "The session ended before its final export. Its incremental journal "
                           f"recorded {len(running)} test(s) in flight and {len(failed)} failed report(s)."])
-            if running:
-                lines.extend(["", "| Test in flight when the session ended |", "| --- |"])
-                lines.extend(f"| {_cell(node)} |" for node in running)
+            lines.extend(_flight_table(running))
             lines.extend(_failure_table(failed))
     providers = []
     for path in sorted(root.glob("provider-*.json")):
@@ -226,6 +233,7 @@ def render_annotations(roots, *, limit: int = 10) -> list[str]:
             rows = data.get("collection_failures")
             collection += [row["nodeid"] for row in (rows if isinstance(rows, list) else [])
                            if isinstance(row, dict) and isinstance(row.get("nodeid"), str)]
+            running += (_journal(root) or ([], []))[0]
         elif (journal := _journal(root)) is not None:
             running += journal[0]
             failed += journal[1]

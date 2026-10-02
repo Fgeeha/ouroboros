@@ -133,6 +133,8 @@ def _run_shell(step, tmp_path, *, diagnostic="viewport", result=0):
     ("ui-browser.yml", "ui-smoke", "ui_tests"),
     ("ui-browser.yml", "ui-smoke", "ui_diagnostic"),
     ("ui-browser.yml", "ui-smoke", "browser_tools"),
+    *[("ci.yml", job, f"tests_{label}") for job in ("quick-test", "full-test")
+      for label in ("parallel", "serial", "size")],
 ])
 def test_actual_producer_shell_preserves_success_and_failure_exit(tmp_path, workflow, job, step, result):
     completed, args = _run_shell(_steps(workflow, job)[step], tmp_path, result=result)
