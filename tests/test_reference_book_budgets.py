@@ -446,7 +446,10 @@ Grants = dict[str, list[tuple[str, int]]]
 
 
 def _grant_files(root: pathlib.Path) -> list[pathlib.Path]:
-    return sorted(path for path in root.rglob("*") if path.is_file()) if root.is_dir() else []
+    # Dot-files are the desktop's own (a Finder ``.DS_Store``), never a grant and never tracked here.
+    if not root.is_dir():
+        return []
+    return sorted(path for path in root.rglob("*") if path.is_file() and not path.name.startswith("."))
 
 
 def _parse_grant(path: pathlib.Path) -> tuple[int, str]:
@@ -558,19 +561,17 @@ def _git(repo: pathlib.Path, *args: str, check: bool = True) -> subprocess.Compl
 def growth_base(repo: pathlib.Path, ref: str | None) -> str:
     """The commit this change is measured from; ``""`` when the growth rule does not apply.
 
-    The event base is the one the manifest transition uses (``test_size_ratchet_transition_against_explicit_base``),
-    and like it an all-zeros (new-branch/tag push) or unresolvable base degrades to HEAD's first
-    parent. Unlike it an unset or empty base skips: a local or dispatch run has no event base, and
-    HEAD's parent is not where a multi-commit change began.
+    The event base is the one the manifest transition uses (``test_size_ratchet_transition_against_explicit_base``).
+    Unlike it, a run without a resolvable event base skips: a local or manual run has none, a tag
+    push carries all zeros, and HEAD's parent is not where a multi-commit change began, so measuring
+    from it could redden a release for growth an earlier commit of the same change granted. The
+    chapter limit itself is checked on every run.
     """
     ref = (ref or "").strip()
     if not ref:
         return ""
-    for candidate in ((ref,) if ref.strip("0") else ()) + ("HEAD^",):
-        resolved = _git(repo, "rev-parse", "--verify", "--quiet", f"{candidate}^{{commit}}", check=False)
-        if resolved.returncode == 0:
-            return resolved.stdout.decode("ascii").strip()
-    return ""
+    resolved = _git(repo, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", check=False)
+    return resolved.stdout.decode("ascii").strip() if resolved.returncode == 0 else ""
 
 
 def _budget_numbers(source: str) -> dict[str, int]:

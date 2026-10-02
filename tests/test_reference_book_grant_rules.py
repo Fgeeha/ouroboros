@@ -80,6 +80,11 @@ def test_a_chapter_without_a_base_and_a_base_without_a_chapter_are_both_named():
 
 # --- the layout: nothing under the grant tree is silently ignored ----------------------------------
 
+PLACE = "sits at <book>/<chapter-stem>/<name>.grant"
+INTEGER = "a positive integer and nothing else"
+NO_REASON = "the reason, at least one non-blank line"
+GOOD = "500\n" + REASON
+
 
 def test_a_tree_of_well_formed_grants_or_no_tree_at_all_has_no_faults(tmp_path):
     assert grant_layout_faults(tmp_path / "absent", [CHAPTER]) == []
@@ -89,16 +94,20 @@ def test_a_tree_of_well_formed_grants_or_no_tree_at_all_has_no_faults(tmp_path):
     assert grant_layout_faults(tmp_path, [CHAPTER, OTHER]) == []
 
 
+def test_the_desktops_own_dot_files_are_not_grants_and_not_faults(tmp_path):
+    _write(tmp_path, GRANT, GOOD)
+    for stray in (".DS_Store", "development/.DS_Store", "development/02-example/.2026-10-02-example.grant"):
+        _write(tmp_path, stray, "999\n" + REASON)
+    assert grant_layout_faults(tmp_path, [CHAPTER]) == []
+    assert read_grants(tmp_path) == {CHAPTER: [(GRANT, 500)]}, "a dot-file grants nothing either"
+
+
 def test_a_crlf_checkout_reads_the_same_grant(tmp_path):
     _write(tmp_path, GRANT, "500\r\n" + REASON.replace("\n", "\r\n"))
     assert grant_layout_faults(tmp_path, [CHAPTER]) == []
     assert read_grants(tmp_path) == {CHAPTER: [(GRANT, 500)]}
 
 
-PLACE = "sits at <book>/<chapter-stem>/<name>.grant"
-INTEGER = "a positive integer and nothing else"
-NO_REASON = "the reason, at least one non-blank line"
-GOOD = "500\n" + REASON
 
 
 @pytest.mark.parametrize(
@@ -244,17 +253,14 @@ def test_base_facts_come_from_the_base_commit_in_bytes(tmp_path):
     assert base_facts(tmp_path, first) == ({CHAPTER: len(text.encode("utf-8"))}, set(), {})
 
 
-def test_growth_base_is_the_event_base_and_degrades_to_the_first_parent(tmp_path):
+def test_growth_base_is_the_event_base_and_nothing_else(tmp_path):
     _git(tmp_path, "init", "-q")
     first = _commit(tmp_path, {CHAPTER: "one\n"})
-    assert growth_base(tmp_path, first) == first
-    assert growth_base(tmp_path, "0" * 40) == "", "a root commit has no parent to degrade to"
-
-    second = _commit(tmp_path, {CHAPTER: "one\ntwo\n"})
+    _commit(tmp_path, {CHAPTER: "one\ntwo\n"})
     _commit(tmp_path, {CHAPTER: "one\ntwo\nthree\n"})
-    for unset in (None, "", "   "):
-        assert growth_base(tmp_path, unset) == "", "no event base: the rule does not apply, parent or not"
     assert growth_base(tmp_path, first) == first
     assert growth_base(tmp_path, f" {first[:12]} ") == first
-    assert growth_base(tmp_path, "0" * 40) == second, "all-zeros (new-branch/tag push) degrades to HEAD's parent"
-    assert growth_base(tmp_path, "f" * 40) == second, "an unresolvable base degrades to HEAD's parent"
+    # No event base (a local or manual run), all zeros (a tag or new-branch push) and a commit that
+    # is not in the repository all leave the rule unapplied; HEAD's parent is never substituted.
+    for absent in (None, "", "   ", "0" * 40, "f" * 40):
+        assert growth_base(tmp_path, absent) == "", absent
