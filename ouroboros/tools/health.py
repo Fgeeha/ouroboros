@@ -124,7 +124,7 @@ def _codebase_health(ctx: ToolContext) -> str:
                 f"all non-grandfathered modules <= {MAX_MODULE_LINES} lines)"
             )
 
-        # Size-ratchet validator findings (manifest exactness + shrink-only
+        # Size-ratchet validator findings (manifest matches the tree + shrink-only
         # transition). The official repository CI `size_ratchet` lane is the
         # enforcing surface; this report and check_worktree_readiness only warn.
         try:

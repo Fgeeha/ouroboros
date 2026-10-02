@@ -365,11 +365,14 @@ def test_band_entry_stays_only_while_its_module_sits_above_the_band(tmp_path: Pa
     _write_lines(repo / "mod.py", 1504)
     _git(repo, "add", "mod.py")
     assert validate_size_ratchet(repo) == []
+    _write_lines(repo / "mod.py", 1600)  # the top edge of the gap still keeps it
+    _git(repo, "add", "mod.py")
+    assert validate_size_ratchet(repo) == []
     _write_lines(repo / "new.py", 1100)
     assert validate_size_ratchet(repo) == ["BAND_PATHS missing live entry: 'new.py'"]
     (repo / "new.py").unlink()
 
-    _write_lines(repo / "mod.py", 900)
+    _write_lines(repo / "mod.py", 1000)  # the bottom edge of the band is already below it
     assert validate_size_ratchet(repo) == [stale]
     _write_lines(repo / "mod.py", 1700)
     _write_manifest(repo, _manifest(giant_paths=frozenset({"mod.py"}), band_paths={"mod.py": "extraction seam"}))
@@ -377,6 +380,10 @@ def test_band_entry_stays_only_while_its_module_sits_above_the_band(tmp_path: Pa
     _write_manifest(repo, kept)
     (repo / "mod.py").unlink()
     assert validate_size_ratchet(repo) == [stale]
+    # Only a band entry is kept: a giant entry for a module that shrank into the gap is still stale.
+    _write_lines(repo / "big.py", 1550)
+    _write_manifest(repo, _manifest(giant_paths=frozenset({"big.py"})))
+    assert "GIANT_PATHS contains stale entry: 'big.py'" in validate_size_ratchet(repo)
 
 
 @pytest.mark.serial
