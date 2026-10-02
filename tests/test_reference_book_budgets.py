@@ -274,7 +274,10 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # the production seam, resolution and doctor; no login or task), CI contracts the chapter had
     # no text for; the same 533 bytes the PR carried on its own base (measured 21317 there), now
     # on top of the #1300 Docker subsection. No text of either paragraph was touched in the merge.
-    "docs/architecture/08-git-branching-ci-and-build.md": 22500,
+    # 22500 -> 22800 (measured 22774): the run-cancellation rule (which CI runs a newer pull-request
+    # head cancels, and why re-runs keep their own group), a workflow contract the chapter had no
+    # text for; the pointer sentence beside it was reworded in place.
+    "docs/architecture/08-git-branching-ci-and-build.md": 22800,
     # 12405 -> 14400 (issue #1142): the ordinary-close paragraph gains the mechanism the chapter had
     # no text for — graceful stop signals the server PID only, the server half (stop event at the
     # signal, bounded uvicorn drain) is self-sufficient against an old group-SIGTERM launcher.
@@ -405,7 +408,10 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # cannot replace older text. 3283 -> 2969 bytes of section after that pass, plus
     # the `--temp-parent` refusal clause (a nested disposable root is not disposable).
     # Selected safe CI artifacts and the partial UI diagnostic add a new reader workflow.
-    "docs/development/14-build-and-ci.md": 20900,
+    # 20900 -> 21800 (measured 21627): how to read a red ordinary job — per-pass summaries and
+    # annotations, the `crash` phase, the incremental journal of a killed session and the step
+    # ceilings. The chapter described this only for the provider and UI lanes.
+    "docs/development/14-build-and-ci.md": 21800,
 }
 
 

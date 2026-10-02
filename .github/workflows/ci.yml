@@ -1,7 +1,7 @@
 # Ouroboros CI — Five-tier cross-platform testing and release pipeline
 #
-# Tier 1 (Quick):       Push to ouroboros or PR targeting ouroboros                   → Ubuntu-only tests (~1 min)
-# Tier 2 (Full):        Every PR → Windows/macOS; stable / manual / tag → full 3-OS matrix (~5 min)
+# Tier 1 (Quick):       Push to ouroboros or PR targeting ouroboros                   → Ubuntu-only tests
+# Tier 2 (Full):        Every PR → Windows/macOS; stable / manual / tag → full 3-OS matrix
 # Tier 2.5 (Integration): Push to main / ouroboros / ouroboros-stable / manual / tag  → Real-provider tests       (~2 min)
 # Tier 2.6 (Skill smoke): Push to ouroboros-stable / manual / tag                     → LIVE OuroborosHub official-skill install smoke (3-OS, ~5 min) + review→grant→enable-persistence flow on one cheap reviewer slot (ubuntu-only step, OPENROUTER_API_KEY, ~$1.2/run)
 # Tier 3 (Build+Release): Tag v*                                                       → PyInstaller + GitHub Release (~15 min)
