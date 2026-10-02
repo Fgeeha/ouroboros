@@ -282,7 +282,10 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 22800 -> 23200 (measured 23005): the CI table names where the provider canaries run for each
     # event (the shared body and its push wrapper) and that landed pushes get the desktop matrix;
     # the live-stand row shrank, the other two rows describe wiring the chapter did not have.
-    "docs/architecture/08-git-branching-ci-and-build.md": 23200,
+    # 23200 -> 23500 (measured 23386): the browser row describes the four-shard lane, its manifest
+    # witness and the reconciling verdict, and where a partial diagnostic runs; both sentences
+    # replace the single-job description in place.
+    "docs/architecture/08-git-branching-ci-and-build.md": 23500,
     # 12405 -> 14400 (issue #1142): the ordinary-close paragraph gains the mechanism the chapter had
     # no text for — graceful stop signals the server PID only, the server half (stop event at the
     # signal, bounded uvicorn drain) is self-sufficient against an old group-SIGTERM launcher.
@@ -418,7 +421,9 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 20900 -> 21800 (measured 21627): how to read a red ordinary job — per-pass summaries and
     # annotations, the `crash` phase, the incremental journal of a killed session and the step
     # ceilings. The chapter described this only for the provider and UI lanes.
-    "docs/development/14-build-and-ci.md": 21800,
+    # 21800 -> 22700 (measured 22540): how the sharded UI lane is proven (slice rule, session budget,
+    # manifest, reconciliation, re-run attempts) and the one place where evidence is authoritative.
+    "docs/development/14-build-and-ci.md": 22700,
 }
 
 

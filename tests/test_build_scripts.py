@@ -1151,7 +1151,7 @@ def test_ci_setup_aware_failure_collection_guards_each_independent_lane():
     for job_name in ("quick-test", "full-test", "marker-guards", "docker-ui-smoke", "system-e2e-mock", "android-test"):
         steps = jobs[job_name]["steps"]
         assert any("!cancelled()" in str(step.get("if", "")) for step in steps if "run" in step), job_name
-    ui = {step.get("name"): step for step in _ui_browser_jobs()["ui-smoke"]["steps"]}
+    ui = {step.get("name"): step for step in _ui_browser_jobs()["ui-shard"]["steps"]}
     host = ui["Run complete host UI lane with collection and availability guards"]
     assert "github.event_name" not in host["if"]
     assert "--require-ui-browser" in host["run"]
@@ -1194,10 +1194,10 @@ def test_ci_failure_collection_guards_every_independent_step_and_rerun_uploads()
         "system-e2e-mock": ["Run the keyless system E2E scenario lane (real isolated servers)", "Run the cancellation E-suite mock lane"],
         "android-test": ["Run Android source and release contract tests", "Compile and verify explicitly test-signed Android host"],
     }
-    expected["ui-smoke"] = ["Install UI smoke Chromium and WebKit",
+    expected["ui-shard"] = ["Install UI smoke Chromium and WebKit",
                            "Run complete host UI lane with collection and availability guards",
                            "Run browser tools Chromium/WebKit smoke"]
-    jobs = {**jobs, "ui-smoke": _ui_browser_jobs()["ui-smoke"]}
+    jobs = {**jobs, "ui-shard": _ui_browser_jobs()["ui-shard"]}
     for job, names in expected.items():
         steps = {step.get("name"): step for step in jobs[job]["steps"]}
         for name in names:
@@ -1247,7 +1247,7 @@ def test_only_the_browser_push_workflow_drops_the_path_filter():
 
     shared = yaml.safe_load((_REPO_PATH / ".github/workflows/ui-browser.yml").read_text(encoding="utf-8"))
     assert list(shared.get("on", shared.get(True))) == ["workflow_call"]
-    assert "secrets" not in str(shared["jobs"]["ui-smoke"])
+    assert "secrets" not in str(shared["jobs"])
 
 
 def test_ci_release_prerelease_flag_uses_preflight_output():
