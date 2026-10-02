@@ -342,15 +342,16 @@ def test_readme_and_homepage_state_upstream_status_plainly():
     for text in (readme, homepage):
         for line in text.splitlines():
             if "terminal-bench-2-1/pull/" in line:
-                assert "closed" in line.lower()
+                if text == readme:
+                    assert "Self-reported; community submissions closed" in line
                 assert "submission open" not in line.lower()
                 assert "open submission" not in line.lower()
     for root in (SITE, DOCS):
         benchmarks = (root / "benchmarks/index.html").read_text(encoding="utf-8")
-        assert "closed without merge on September 19, 2026" in benchmarks
+        assert "closed community submissions on September 19, 2026" in benchmarks
         for line in benchmarks.splitlines():
             if "terminal-bench-2-1/pull/" in line:
-                assert "closed submission (not merged)" in line
+                assert "community submissions closed" in line
 
 
 def test_russian_talk_is_secondary_and_explicitly_labelled():
