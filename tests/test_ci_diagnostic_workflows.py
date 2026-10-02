@@ -360,6 +360,44 @@ def test_actual_producer_shell_preserves_success_and_failure_exit(tmp_path, work
     assert args.count("pytest") == 1 and "summarize" not in args
 
 
+OFFICIAL, FORK, TAG = "razzant/ouroboros", "someone/private-copy", "refs/tags/v7.5.2"
+
+
+@pytest.mark.parametrize("event,ref,repository,flag", [
+    ("push", TAG, OFFICIAL, "--enforce"),
+    ("workflow_dispatch", TAG, OFFICIAL, "--enforce"),  # A manual run on a tag ref can publish too.
+    ("push", "refs/heads/ouroboros", OFFICIAL, ""),
+    ("workflow_dispatch", "refs/heads/candidate", OFFICIAL, ""),
+    ("schedule", "refs/heads/main", OFFICIAL, ""),
+    # A fork without the ten provider keys keeps releasing its own tags.
+    ("push", TAG, FORK, ""),
+    ("workflow_dispatch", TAG, FORK, ""),
+])
+def test_release_floor_is_the_last_canary_step_and_enforces_only_on_an_official_release_tag(
+        tmp_path, monkeypatch, event, ref, repository, flag):
+    from tests.test_platform_ci_events import _value
+
+    job = _workflow(CANARY)["jobs"]["integration-test"]
+    floor = job["steps"][-1]
+    assert floor["name"] == "Release floor for required provider canaries"
+    # Its exit IS the floor: a tolerated or conditional step would let a tag release past it.
+    assert set(floor) == {"name", "if", "env", "run"} and floor["if"] == "${{ !cancelled() }}"
+    assert "secrets." not in str(floor) and list(floor["env"]) == ["FLOOR_ENFORCE"]
+    # It reads the report the producer wrote, by the same path string.
+    produced = re.search(r'--junitxml=("[^"]+")', _steps(CANARY, "integration-test")["provider_tests"]["run"])
+    assert floor["run"] == ("python -m tests.provider_release_floor "
+                            f'--junit {produced.group(1)} --summary "$GITHUB_STEP_SUMMARY" $FLOOR_ENFORCE')
+    assert _value(floor["env"]["FLOOR_ENFORCE"], event=event, ref=ref, repository=repository) == flag
+    # The real shell passes the flag as its own argument, or no argument at all, and keeps the reader's exit.
+    monkeypatch.setenv("FLOOR_ENFORCE", flag)
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(tmp_path / "summary.md"))
+    completed, args = _run_shell(floor, tmp_path, result=1)
+    assert completed.returncode == 1, completed.stderr
+    assert args[:3] == ["-m", "tests.provider_release_floor", "--junit"] and args[4] == "--summary"
+    assert args[3].endswith("/ci-private/provider/results.xml") and args[5].endswith("summary.md")
+    assert args[6:] == ([flag] if flag else [])
+
+
 @pytest.mark.parametrize("selection,target", [
     ("viewport", "tests/test_ui_smoke_playwright.py::test_ui_smoke_live_card_mutations_preserve_viewport"),
     ("inflight", "tests/test_ui_smoke_inflight_indicator.py::test_ui_smoke_chat_inflight_indicator_lifecycle"),

@@ -360,8 +360,10 @@ jobs:
   # result. Branch pushes are deliberately NOT matched here:
   # `provider-canary-push.yml` owns that trigger and shares the job, so a
   # provider outage on a landed commit never reddens this workflow.
-  # Confirmed provider-contract failures block release-preflight; the test
-  # classifier keeps quota/rate-limit/5xx/timeout outcomes inconclusive.
+  # Confirmed provider-contract failures block release-preflight. A
+  # quota/rate-limit/5xx/timeout outcome is a typed inconclusive skip: a manual
+  # run reports it, and on a `v*` tag in the official repository the shared
+  # job's release floor fails unless every required canary passed.
   # ──────────────────────────────────────────────────────────────────
   integration-test:
     # A scheduled run is neither a manual run nor a tag. The leading guard keeps
@@ -395,8 +397,9 @@ jobs:
   # broken official skill); there is deliberately NO fallback-skip on
   # network failure, and gating the release on live external services
   # (GitHub raw, PyPI, DuckDuckGo, wttr.in, OpenRouter) is a deliberate
-  # owner decision. Provider integration is now a separate release-preflight
-  # dependency with typed inconclusive outcomes for transient outages. Runs
+  # owner decision. Provider integration is a separate release-preflight
+  # dependency: a tag in the official repository needs every required canary
+  # passed, so a transient provider outage blocks there as well. Runs
   # the `skill_smoke` pytest marker
   # (pyproject.toml) as serial pytest invocations: real network installs +
   # real pip installs into per-skill isolated envs are not xdist-safe —

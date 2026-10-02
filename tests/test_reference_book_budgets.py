@@ -419,7 +419,9 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # ceilings. The chapter described this only for the provider and UI lanes.
     # 21800 -> 22700 (measured 22540): how the sharded UI lane is proven (slice rule, session budget,
     # manifest, reconciliation, re-run attempts) and the one place where evidence is authoritative.
-    "docs/development/14-build-and-ci.md": 22700,
+    # 22700 -> 22848 (measured 22848): the release floor for required provider canaries on an official
+    # release tag, a CI contract the chapter had no text for; one clause on the provider sentence it qualifies.
+    "docs/development/14-build-and-ci.md": 22848,
 }
 
 
