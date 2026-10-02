@@ -449,24 +449,49 @@ def test_bounds_keep_the_header_and_every_run_id(checks):
                                                   "annotations: not read", "may hold more"))
 
 
-def test_a_run_completed_with_success_states_its_job_counts(checks):
-    """GitHub calls a run success while its jobs are skipped or one of them failed: the counts say so."""
-    jobs = [_job(54, "quick-test"), _job(55, "full-test (ubuntu-latest)", conclusion="skipped"),
-            _job(56, "build", conclusion="skipped"),
-            _job(57, "lint", conclusion="failure", steps=[(2, "Run", "completed", "failure")])]
-    fake = FakeChecks(polls=[[_run(11), _run(12, "Docs")]], jobs={11: jobs, 12: [_job(60, "build", run_id=12)]})
+_CONTINUED = [_job(54, "quick-test"), _job(55, "full-test (ubuntu-latest)", conclusion="skipped"),
+              _job(56, "build", conclusion="skipped"),
+              _job(57, "lint", conclusion="failure", steps=[(2, "Run", "completed", "failure")])]
+_LINT_ANNOTATION = {57: [{"annotation_level": "failure", "title": "", "message": "ruff: F821"}]}
+_LINT_DETAIL = [f"    - job lint [57]: failure {_RUNS}/11/job/57", "        step 2 Run: failure",
+                "        annotation failure: ruff: F821",
+                "        annotations: 1 at failure level, 1 shown; 1 of all levels read"]
+
+
+def test_a_run_completed_with_success_states_its_jobs_and_a_failed_one_in_full(checks):
+    """GitHub calls a run success while its jobs are skipped or one of them failed under `continue-on-error`:
+    the counts say so, and the failed job carries its steps and annotations like a job of a failed run."""
+    fake = FakeChecks(polls=[[_run(11), _run(12, "Docs")]], jobs={11: _CONTINUED, 12: [_job(60, "build", run_id=12)]},
+                      annotations=_LINT_ANNOTATION)
     assert checks(fake, sha=SHA).text.splitlines()[3:] == [
-        "Sources read: workflow runs; jobs (runs: 2); annotations (jobs: 0)",
+        "Sources read: workflow runs; jobs (runs: 2); annotations (jobs: 1)",
         "Sources unavailable: none",
         "Workflow runs: 2 — success 2",
         "", "Runs completed with success (2):",
         f"- CI (pull_request) run 11 attempt 1: success {_RUNS}/11",
         "    log of the failed steps: gh run view 11 --log-failed --repo github.example/owner/selected",
         "    jobs: 4 — success 1, failure 1, skipped 2",
+        *_LINT_DETAIL,
         f"- Docs (pull_request) run 12 attempt 1: success {_RUNS}/12",
         "    jobs: 1 — success 1",
         *_SHA_TAIL]
-    assert fake.sent("api") == []  # Only the counts line: no job list and no annotation read.
+    # Only the failed job's annotations are read; the run with successful jobs alone costs no annotation call.
+    assert [args[1].split("/")[4] for args in fake.sent("api")] == ["57"]
+
+
+def test_a_pull_request_reads_a_success_run_whose_rollup_job_failed(checks):
+    rollup = [{**_ACTIONS_ROLLUP[0], "name": "lint", "conclusion": "FAILURE", "detailsUrl": f"{_RUNS}/11/job/57"},
+              {**_ACTIONS_ROLLUP[0], "name": "build", "detailsUrl": f"{_RUNS}/12/job/60"}]
+    fake = FakeChecks(polls=[[_run(11), _run(12, "Docs")]], jobs={11: _CONTINUED, 12: [_job(60, "build", run_id=12)]},
+                      annotations=_LINT_ANNOTATION, rollup=rollup)
+    lines = checks(fake, number=7).text.splitlines()
+    at = lines.index(f"- CI (pull_request) run 11 attempt 1: success {_RUNS}/11")
+    assert lines[at + 1:at + 7] == [
+        "    log of the failed steps: gh run view 11 --log-failed --repo github.example/owner/selected",
+        "    jobs: 4 — success 1, failure 1, skipped 2", *_LINT_DETAIL]
+    # The run whose rollup jobs all succeeded is left to the rollup's counts: no jobs read for it.
+    assert [args[2] for args in fake.sent("run") if args[1] == "view"] == ["11"]
+    assert lines[lines.index(f"- Docs (pull_request) run 12 attempt 1: success {_RUNS}/12") + 1] == ""
 
     # Twenty runs have a line of their own across both groups; the others keep their ids beside their state.
     mixed = [_run(100 + index, conclusion="failure") for index in range(15)] + [_run(200 + index) for index in range(9)]
@@ -620,7 +645,7 @@ def test_earlier_attempts_of_a_run_are_named_as_not_read(checks):
         f"- CI (pull_request) run 11 attempt 2: success {_RUNS}/11",
         "    attempt 1 is not read: gh run view 11 --attempt 1 --repo github.example/owner/selected",
         f"- Docs (pull_request) run 12 attempt 4: success {_RUNS}/12",
-        "    attempts 1 to 3 are not read: gh run view 12 --attempt N --repo github.example/owner/selected",
+        "    attempts 1 to 3 are not read: gh run view 12 --attempt 1 --repo github.example/owner/selected",
         f"- Lint (pull_request) run 13 attempt 1: success {_RUNS}/13"]
 
 
@@ -668,6 +693,12 @@ def test_step_annotation_and_rollup_lists_state_what_they_leave_out(checks):
     assert lines[at + 1] == "- commit status security/scan: failure https://scan.example/7"
     assert lines[at + 2] == "- commit status deploy/0: success" and lines[-1] == "- 1 more of these: success 1"
     assert "more of these" not in checks(FakeChecks(polls=[[_run(11)]], rollup=quiet[:11] + [red]), number=7).text
+    # A commit status in `error` sorts with the failures, ahead of pending ones.
+    pending = [{**entry, "state": "PENDING"} for entry in quiet]
+    errored = {**red, "context": "ci/legacy", "state": "ERROR"}
+    lines = checks(FakeChecks(polls=[[_run(11)]], rollup=pending + [errored]), number=7).text.splitlines()
+    at = lines.index("Other checks, outside GitHub Actions (13) — pending 12, error 1:")
+    assert lines[at + 1] == "- commit status ci/legacy: error https://scan.example/7"
 
 
 @pytest.mark.parametrize("rollup", [[], None])

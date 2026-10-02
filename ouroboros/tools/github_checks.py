@@ -23,8 +23,8 @@ _CHECK_STATES = ("success", "failure", "cancelled", "timed_out", "startup_failur
 _CHECKS_QUIET = ("success", "skipped", "neutral")  # These carry no failed step.
 _CHECKS_FAILED = ("failure", "timed_out")  # These leave a step log to read.
 # Runs and rollup entries are listed in this order: failure-class states, unfinished ones, the rest, success last.
-_CHECKS_RANK = {state: rank for rank, state in enumerate(
-    ("failure", "timed_out", "startup_failure", "action_required", "cancelled", *_CHECKS_UNFINISHED))}
+_CHECKS_RANK = {state: rank for rank, state in enumerate(  # `error` is a commit status's failure word.
+    ("failure", "error", "timed_out", "startup_failure", "action_required", "cancelled", *_CHECKS_UNFINISHED))}
 # The wait cap plus the read budget stays under the ToolEntry default of 360 s.
 _CHECKS_WAIT_CAP_SEC, _CHECKS_READ_BUDGET_SEC, _CHECKS_POLL_SEC = 240, 90, 15
 _CHECKS_RUN_LIMIT, _CHECKS_RUN_LINES, _CHECKS_EXPANDED_RUNS = 100, 20, 8
@@ -94,13 +94,15 @@ def _job_failed(job: dict) -> bool:
                for item in (job, *(step for step in job.get("steps") or [] if isinstance(step, dict))))
 
 
-def _job_lines(jobs: List[dict], annotations: Callable[[dict], List[str]], counts_only: bool) -> List[str]:
-    """The lines of one run: job counts first, then its failed and unfinished jobs with their steps."""
+def _job_lines(jobs: List[dict], annotations: Callable[[dict], List[str]]) -> List[str]:
+    """The lines of one run: job counts first, then its failed and unfinished jobs with their steps.
+
+    Chosen by the jobs' own states: a `continue-on-error` job fails inside a run GitHub calls success."""
     if not jobs:
         return ["    jobs: 0 — GitHub lists no job for this run"]
     lines = [f"    jobs: {len(jobs)} — {_state_counts(jobs)}"]
     # A cancelled or skipped job that holds no failed step adds nothing to the counts line.
-    loud = [] if counts_only else sorted(
+    loud = sorted(
         (job for job in jobs if _job_failed(job) or _check_state(job) not in (*_CHECKS_QUIET, "cancelled")),
         key=lambda job: (not _job_failed(job), job.get("status") != "completed"))
     for job in loud[:_CHECKS_JOB_LINES]:
@@ -130,8 +132,8 @@ def _run_block(run: dict, slug: str, log_failed: bool, jobs_line: str) -> str:
         block.append(f"    log of the failed steps: gh run view {run_id} --log-failed{target}")
     attempt = _whole(run.get("attempt")) or 0
     if attempt > 1:  # The run list holds the latest attempt of a run only.
-        earlier, which = ("attempt 1 is", 1) if attempt == 2 else (f"attempts 1 to {attempt - 1} are", "N")
-        block.append(f"    {earlier} not read: gh run view {run_id} --attempt {which}{target}")
+        earlier = "attempt 1 is" if attempt == 2 else f"attempts 1 to {attempt - 1} are"
+        block.append(f"    {earlier} not read: gh run view {run_id} --attempt 1{target}")
     return "\n".join(block + ([jobs_line] if jobs_line else []))
 
 
@@ -356,8 +358,13 @@ def get_checks(ctx: ToolContext, number: object = 0, sha: object = "", wait_seco
     where = _GH_REPO_URL_RE.match(str((runs[0].get("url") if runs else "") or pr.get("url") or ""))
     repository = "/".join(where.groups()) if where else (repo or "resolved by the GitHub CLI from the Project directory")
     slug = ("/".join(where.groups()[1:]) if where.group(1) == "github.com" else repository) if where else repo
-    # Without the rollup's job counts a run GitHub calls success is read for its own job counts.
-    wanted = [run for run in runs if _check_state(run) != "success" or "statusCheckRollup" not in pr]
+    # Without the rollup's job counts a run GitHub calls success is read for its own job counts; with them, such a
+    # run is read when the rollup holds a failed job of it (a `continue-on-error` job fails inside a success run).
+    flagged = {"".join(_GH_RUN_ID_RE.findall(str(check.get("detailsUrl") or ""))[:1])
+               for check in pr.get("statusCheckRollup") or [] if isinstance(check, dict)
+               and check.get("__typename") == "CheckRun" and _check_state(check) in _CHECKS_FAILED}
+    wanted = [run for run in runs if _check_state(run) != "success" or "statusCheckRollup" not in pr
+              or str(run.get("databaseId")) in flagged]
     expanded = {id(run) for run in wanted[:_CHECKS_EXPANDED_RUNS]}
     unread = {id(run) for run in wanted[_CHECKS_EXPANDED_RUNS:]}
     blocks = []
@@ -366,7 +373,7 @@ def get_checks(ctx: ToolContext, number: object = 0, sha: object = "", wait_seco
         if id(run) in expanded:
             jobs, jobs_line = src.jobs(run)
             if jobs is not None:
-                jobs_line, *detail = _job_lines(jobs, src.annotations, _check_state(run) == "success")
+                jobs_line, *detail = _job_lines(jobs, src.annotations)
                 failed_job = any(_job_failed(job) for job in jobs)
         elif id(run) in unread:
             jobs_line = f"    jobs: not read (one call expands {_CHECKS_EXPANDED_RUNS} runs)"
