@@ -238,6 +238,7 @@ BUDGETS_SOURCE = (
 )
 
 
+@pytest.mark.serial
 def test_base_facts_come_from_the_base_commit_in_bytes(tmp_path):
     _git(tmp_path, "init", "-q")
     text = "# Example\n\ncaf\u00e9 na\u00efve\n"  # two-byte characters: a size in characters would be short
@@ -253,6 +254,7 @@ def test_base_facts_come_from_the_base_commit_in_bytes(tmp_path):
     assert base_facts(tmp_path, first) == ({CHAPTER: len(text.encode("utf-8"))}, set(), {})
 
 
+@pytest.mark.serial
 def test_growth_base_is_the_event_base_and_nothing_else(tmp_path):
     _git(tmp_path, "init", "-q")
     first = _commit(tmp_path, {CHAPTER: "one\n"})
