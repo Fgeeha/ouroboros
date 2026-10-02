@@ -783,6 +783,98 @@ def test_shard_reconciliation_uses_the_highest_attempt_and_says_which(tmp_path, 
     assert ambiguous.returncode == 1 and f"shard 2/3: 2 proofs from attempt {used}" in ambiguous.stdout
 
 
+def test_manifest_witness_is_the_highest_attempt_and_unique_in_it(tmp_path):
+    _lane_proofs(tmp_path)
+    _lane_projection(tmp_path / "manifest" / "ui-ci-full-manifest-2", attempt="2")
+    result, summary = _reconcile_shards(tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "- manifest: 7 nodes, from attempt 2" in summary and "GAP" not in summary
+    # Two unsharded witnesses of one attempt cannot both be the manifest.
+    _lane_projection(tmp_path / "manifest" / "ui-ci-full-manifest-2-copy", attempt="2")
+    ambiguous, summary = _reconcile_shards(tmp_path)
+    assert ambiguous.returncode == 1 and ambiguous.stdout.count("\nGAP ") == 1
+    assert "manifest: 2 projections from attempt 2" in ambiguous.stdout
+    assert "manifest: 2 projections from attempt 2" in summary
+
+
+ABSENT = object()
+
+
+def _exit_status(key, status):
+    def change(data):
+        if status is ABSENT:
+            del data["session_exit_code"]
+        else:
+            data["session_exit_code"] = status
+    return lambda paths: _rewrite(paths[key], change)
+
+
+@pytest.mark.parametrize("key, label", [(2, "shard 2/3"), ("manifest", "manifest")])
+@pytest.mark.parametrize("status, said", [(1, "1"), (2, "2"), (-9, "-9"), (ABSENT, "unknown"), (None, "unknown"),
+                                          (True, "unknown"), (False, "unknown"), ("0", "unknown"), (0.0, "unknown")],
+                         ids=["failed", "interrupted", "signal", "absent", "null", "true", "false", "text", "float"])
+def test_shard_reconciliation_refuses_the_proof_of_a_session_that_ended_red(tmp_path, key, label, status, said):
+    """Every node executed and every slice exact: the session's exit status alone decides."""
+    paths = _lane_proofs(tmp_path)
+    green, _ = _reconcile_shards(tmp_path)
+    assert green.returncode == 0, green.stdout + green.stderr
+    _exit_status(key, status)(paths)
+    red, summary = _reconcile_shards(tmp_path)
+    gap = f"{label}: its session ended with exit status {said}"
+    assert red.returncode == 1, red.stdout + red.stderr
+    assert red.stdout.count("\nGAP ") == 1 and f"GAP {gap}" in red.stdout and f"**GAP** {gap}" in summary
+    _exit_status(key, 0)(paths)
+    restored, _ = _reconcile_shards(tmp_path)
+    assert restored.returncode == 0, restored.stdout + restored.stderr
+
+
+def test_rerunning_one_red_shard_leaves_the_other_red_shard_a_gap(tmp_path):
+    """Shards 2 and 3 end red; only shard 2 is re-run and passes. Shard 3's proof stays red."""
+    paths = _lane_proofs(tmp_path)
+    for index in (2, 3):
+        _exit_status(index, 1)(paths)
+    rerun = _lane_projection(tmp_path / "shards" / "ui-ci-full-shard-2-2", shard=2, attempt="2")
+    result, summary = _reconcile_shards(tmp_path)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert result.stdout.count("\nGAP ") == 1
+    assert "GAP shard 3/3: its session ended with exit status 1" in result.stdout
+    # The superseded red attempt of shard 2 is no gap: its highest attempt is the proof.
+    assert "shard 2/3: its session" not in result.stdout
+    assert "shard 2/3: proof from attempt 2 (attempts present: 1, 2)" in summary
+    _rewrite(rerun, lambda data: data.update(session_exit_code=1))
+    both, _ = _reconcile_shards(tmp_path)
+    assert both.returncode == 1 and both.stdout.count("\nGAP ") == 2
+    assert "GAP shard 2/3: its session ended with exit status 1" in both.stdout
+
+
+def test_shard_reconciliation_slices_the_recorded_lane_by_position_like_the_plugin(tmp_path):
+    """The export redacts node ids after the plugin sliced them, so a recorded id can sort
+    elsewhere than the id that ran. Positions in the recorded list stay the plugin's."""
+    paths = _lane_proofs(tmp_path)
+    recorded = ["tests/test_lane_browser.py::test_zzz[***]"] + LANE_NODES[1:]
+    assert recorded != sorted(recorded) and len(set(recorded)) == len(recorded)
+
+    def record(key, nodes):
+        def change(data):
+            data["ui_browser"]["full"] = list(recorded)
+            if key != "manifest":
+                data["ui_browser"]["assigned"] = nodes
+                data["reports"] = _rows(nodes)
+        _rewrite(paths[key], change)
+
+    for key in ("manifest", 1, 2, 3):
+        record(key, recorded[key - 1::3] if key != "manifest" else None)
+    result, summary = _reconcile_shards(tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "GAP" not in summary
+    # A shard that took its slice of the re-sorted list ran other positions than the plugin assigns.
+    assert sorted(recorded)[0::3] != recorded[0::3]
+    record(1, sorted(recorded)[0::3])
+    resorted, _ = _reconcile_shards(tmp_path)
+    assert resorted.returncode == 1
+    assert "shard 1/3: its assignment is not slice 1 of 3 of the manifest lane" in resorted.stdout
+
+
 @pytest.mark.parametrize("phases, executed", [
     ((("setup", "passed"), ("call", "passed"), ("teardown", "passed")), True),
     ((("setup", "passed"), ("call", "failed"), ("teardown", "passed")), True),

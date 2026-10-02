@@ -302,8 +302,17 @@ def _lane_proofs(root: Path, *, sha: str, run_id: str, gaps: list) -> list[dict]
             # executed once it has a call phase or any non-passed report; a crash row is one.
             executed = {row["nodeid"] for row in data["reports"]
                         if row["phase"] in ("call", "crash") or row["outcome"] != "passed"}
-            proofs.append({"name": name, "attempt": int(attempt), "lane": lane, "executed": executed})
+            proofs.append({"name": name, "attempt": int(attempt), "lane": lane, "executed": executed,
+                           "exit": data.get("session_exit_code")})
     return proofs
+
+
+def _red_session(label: str, proof: dict) -> list[str]:
+    """The gap of a proof whose session did not end with exit status 0."""
+    status = proof["exit"]
+    if type(status) is int and status == 0:
+        return []
+    return [f"{label}: its session ended with exit status {status if type(status) is int else 'unknown'}"]
 
 
 def reconcile_shards(manifest_root: Path, shards_root: Path, *, count: int, sha: str,
@@ -312,8 +321,10 @@ def reconcile_shards(manifest_root: Path, shards_root: Path, *, count: int, sha:
 
     AUTHORITATIVE, unlike every other reader in this module: the manifest is the
     unsharded collection's witness of the lane, each shard must prove it saw that
-    same lane, took exactly its slice and executed all of it. Pass/fail of the
-    executed tests stays with each shard job's own exit code and is not judged here.
+    same lane, took exactly its slice and executed all of it. A proof whose session
+    ended with a non-zero exit status is a gap as well: what GitHub reports as the
+    result of a matrix job after one leg is re-run is undocumented, so a red session
+    is refused here and never left to the job results alone.
     """
     gaps, notes = [], []
     if not sha or not run_id or count < 1:
@@ -329,6 +340,10 @@ def reconcile_shards(manifest_root: Path, shards_root: Path, *, count: int, sha:
         manifest = max(witnesses, key=lambda proof: proof["attempt"])
         full = manifest["lane"]["full"]
         notes.append(f"manifest: {len(full)} nodes, from attempt {manifest['attempt']}")
+        same = sum(proof["attempt"] == manifest["attempt"] for proof in witnesses)
+        if same > 1:  # Two witnesses of one attempt cannot both be the manifest.
+            gaps.append(f"manifest: {same} projections from attempt {manifest['attempt']}")
+        gaps += _red_session("manifest", manifest)
         if not full or len(set(full)) != len(full):
             gaps.append("manifest: the lane is empty" if not full else "manifest: duplicate node ids: "
                         + _named(node for node, seen in Counter(full).items() if seen > 1))
@@ -352,6 +367,7 @@ def reconcile_shards(manifest_root: Path, shards_root: Path, *, count: int, sha:
         attempts = [candidate["attempt"] for candidate in proofs]
         if attempts.count(proof["attempt"]) > 1:
             gaps.append(f"{label}: {attempts.count(proof['attempt'])} proofs from attempt {proof['attempt']}")
+        gaps += _red_session(label, proof)
         assigned, executed = proof["lane"]["assigned"], proof["executed"]
         notes.append(f"{label}: proof from attempt {proof['attempt']}"
                      + (f" (attempts present: {', '.join(map(str, attempts))})" if len(proofs) > 1 else "")
@@ -362,7 +378,9 @@ def reconcile_shards(manifest_root: Path, shards_root: Path, *, count: int, sha:
                         + (f"; only in the shard: {_named(theirs - ours)}" if theirs - ours else "")
                         + (f"; only in the manifest: {_named(ours - theirs)}" if ours - theirs else "")
                         + ("; same nodes in another order" if theirs == ours else ""))
-        if full is not None and assigned != sorted(full)[index - 1::count]:
+        # By position in the recorded list, exactly as the plugin slices it. The list is not
+        # sorted here: an id the export redacts can sort elsewhere than the id that ran.
+        if full is not None and assigned != full[index - 1::count]:
             gaps.append(f"{label}: its assignment is not slice {index} of {count} of the manifest lane")
         if set(assigned) - executed:
             gaps.append(f"{label}: assigned but not executed ({len(set(assigned) - executed)}): "
@@ -394,7 +412,8 @@ def _reconcile(args) -> int:
         with args.summary.open("a", encoding="utf-8") as handle:
             handle.write("\n".join(
                 [f"## UI browser lane reconciliation — {_cell(verdict)}", "",
-                 f"Commit `{_cell(args.sha)}`, run {_cell(args.run_id)}. Test outcomes stay with each shard job.",
+                 f"Commit `{_cell(args.sha)}`, run {_cell(args.run_id)}. "
+                 "A session that ended red is a gap; its shard job names the failed tests.",
                  ""] + [f"- {_cell(note)}" for note in notes]
                 + [f"- **GAP** {_cell(gap)}" for gap in gaps]) + "\n")
     except OSError as error:  # The verdict stands without its rendering.
