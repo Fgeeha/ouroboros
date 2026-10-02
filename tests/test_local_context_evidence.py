@@ -286,11 +286,18 @@ def test_actual_local_connection_error_is_not_a_synthetic_overflow(manager, monk
 
 _STAND_IN_SERVER = '''
 """Loopback stand-in for ouroboros.local_model_server; it loads no model."""
-import json, os, sys
+import json, os, socket, sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from socketserver import TCPServer
 
 from ouroboros.local_model_server import input_fingerprint
+
+
+def no_reverse_dns(*args):
+    raise AssertionError("loopback fixture must not resolve hostnames")
+
+
+socket.getfqdn = no_reverse_dns
 
 PORT, N_CTX = (int(sys.argv[sys.argv.index(flag) + 1]) for flag in ("--port", "--n_ctx"))
 

@@ -286,13 +286,19 @@ def _loop_tree_accounting(
             refresh_root_accounting,
         )
 
+        from ouroboros.usage_admission import accounting_key
+
         scope = current_usage_scope()
         if scope is None or not scope.root_task_id:
             return None
+        key = accounting_key(scope)  # a Continue's successor paces on its whole-work GROUP
+        if scope.billing_group_id:
+            from ouroboros.usage_admission import task_money_snapshot
+            return task_money_snapshot(scope.drive_root, {"id": scope.task_id}, scope.root_task_id,
+                                       root_limit=scope.root_limit_usd)
         if refresh:
-            return refresh_root_accounting(scope.drive_root, scope.root_task_id,
-                                           max_age_sec=max_age_sec, strict=strict)
-        return last_root_accounting(scope.root_task_id)
+            return refresh_root_accounting(scope.drive_root, key, max_age_sec=max_age_sec, strict=strict)
+        return last_root_accounting(key)
     except Exception:
         log.debug("Tree accounting telemetry unavailable", exc_info=True)
         return None

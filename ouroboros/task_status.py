@@ -888,6 +888,13 @@ def effective_task_result(
                 merged_retry["retry_lineage"] = lineage
                 merged_retry.setdefault("original_task_id", task_id)
                 merged_retry.setdefault("supersedes_task_id", task_id)
+                # The retry answer does not erase the original's unknown effects.
+                # Invocation IDs and their original task/attempt attribution stay
+                # factual disclosure only, never authority to repeat an operation.
+                retired = result.get("retired_tool_invocations") or {}
+                if retired:
+                    merged_retry["retired_tool_invocations"] = {
+                        **retired, **(merged_retry.get("retired_tool_invocations") or {})}
                 # GR6-5b: the interrupted original's unreconciled delegated
                 # runs are a fact about runs that may STILL be live — the
                 # retry projection must not drop the disclosure the raw row

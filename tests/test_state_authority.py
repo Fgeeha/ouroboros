@@ -308,11 +308,17 @@ def test_boot_consumes_the_panic_flag_only_after_its_controls_are_durable(root, 
     from supervisor import worker_chat_lane
 
     monkeypatch.setattr(worker_chat_lane, "_pool", lambda: SimpleNamespace(DRIVE_ROOT=root, load_state=state.load_state))
+    state.save_state(_prior())
+    primary, backup = state.STATE_PATH.read_bytes(), state.STATE_LAST_GOOD_PATH.read_bytes()
+    state.STATE_PATH.unlink()
+    state.STATE_LAST_GOOD_PATH.unlink()
     flag = root / "state" / "panic_stop.flag"
     _write(flag, b"panic")
-    worker_chat_lane.auto_resume_after_restart()  # state uninitialized: controls not durable
+    worker_chat_lane.auto_resume_after_restart()  # initialized state unavailable: controls not durable
     assert flag.exists()
-    state.save_state(_prior())
+    # The retained queue is now prior history: repair known state, never mint defaults.
+    state.STATE_PATH.write_bytes(primary)
+    state.STATE_LAST_GOOD_PATH.write_bytes(backup)
     worker_chat_lane.auto_resume_after_restart()
     assert not flag.exists()
     live = state.load_state()

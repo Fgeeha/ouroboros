@@ -41,6 +41,7 @@ def _tracked_subprocess_run(cmd, **kwargs):
     shell_error."""
     global _spawning_subprocesses
     timeout = kwargs.pop("timeout", None)
+    record_path = None
     if kwargs.get("text") or kwargs.get("universal_newlines"):
         kwargs.setdefault("errors", "replace")
     kwargs.setdefault("stdin", subprocess.DEVNULL)
@@ -49,8 +50,22 @@ def _tracked_subprocess_run(cmd, **kwargs):
     try:
         if _panic_requested:
             raise RuntimeError("Emergency Stop has retired command admission")
-        proc = subprocess.Popen(cmd, **kwargs)
+        from ouroboros.owner_pause import operation_start
+
+        with operation_start():
+            try:
+                proc = subprocess.Popen(cmd, **kwargs)
+            except (OSError, ValueError) as exc:
+                exc.process_not_started = True
+                raise
         _active_subprocesses.add(proc)  # publish before the spawning owner can exit
+        from ouroboros.tool_custody import invocation_binding
+        from ouroboros.workspace_executor import _register_process
+        binding = invocation_binding()
+        if binding.get("drive_root") and binding.get("task_id"):
+            record_path = _register_process(pathlib.Path(binding["drive_root"]), {
+                "record_type": "foreground", "executor_type": "local", "executor_id": "host",
+                "host_pid": proc.pid})
     finally:
         _spawning_subprocesses -= 1
     try:
@@ -63,7 +78,10 @@ def _tracked_subprocess_run(cmd, **kwargs):
         proc.wait(timeout=5)
         raise
     finally:
-        _active_subprocesses.discard(proc)
+        if proc.poll() is not None:
+            from ouroboros.workspace_executor import _forget_process
+            _active_subprocesses.discard(proc)
+            _forget_process(record_path)
 
 
 def _kill_process_group(proc):

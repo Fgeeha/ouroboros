@@ -56,12 +56,18 @@ def test_two_native_accounting_waits_in_chat_logs_and_reload(subscription_ui, ro
             for index in range(2):
                 if index:
                     assert second.wait(20)
-                ua.execute_physical_attempt(request(root, task_id=task),
+                ua.execute_physical_attempt(request(root, task_id=task, root_task_id=task),
                                             lambda: sends.append(index) or {"usage": {"cost": .1}})
             finish.set()
 
     def pump(phase):
-        event = events.get(timeout=10)
+        try:
+            event = events.get(timeout=10)
+        except queue.Empty:
+            # Report a finished producer's failure, not only its missing event.
+            if future.done():
+                future.result()
+            raise
         assert event["data"]["phase"] == phase
         _handle_log_event(event, ctx)
         payload = published[-1]

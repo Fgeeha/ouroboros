@@ -22,28 +22,50 @@ export function desiredLiveCardPhase(record = {}, terminalPhase = 'done') {
         // #1110: when the outcome is already observed, it OWNS the chip and the
         // hold states itself beside it. A card whose task had failed used to read
         // only "Finalizing…", so the failure had to be smuggled into the title.
+        // D10: the owner's Pause of that late work is the same second fact.
         const observed = String(record.observedOutcome || '');
+        const late = { budget_paused: 'Paused', budget_pausing: 'Pausing…' }[record.parkedPhase] || 'Finalizing…';
         if (observed) {
             const presentation = taskPresentation(observed);
             return {
                 phase: presentation.phase,
                 text: presentation.headline,
                 className: `chat-live-phase ${presentation.phase}`,
-                secondary: 'Finalizing…',
+                secondary: late,
             };
         }
-        return {
+        if (late === 'Finalizing…') return {
             phase: 'working',
             text: 'Finalizing…',
             className: 'chat-live-phase working finalizing',
         };
     }
+    // Owner Batch4: a paused task (owner Pause, budget pause, Restart hold) is
+    // not working, and neither is one still settling its Pause.
+    if (record.parkedPhase === 'unknown') return { phase: 'unknown', text: 'Activity unconfirmed', className: 'chat-live-phase warn' };
+    if (record.parkedPhase === 'budget_paused') return { phase: 'paused', text: 'Paused', className: 'chat-live-phase warn' };
+    if (record.parkedPhase === 'budget_pausing') return {
+        phase: 'working', text: 'Pausing…', className: 'chat-live-phase working waiting',
+    };
     if (record.modelWaiting) return {
         phase: 'working', text: 'Waiting for access', className: 'chat-live-phase working waiting',
     };
     // A census Project/scope verification hold: an unfinished, static amber wait.
     if (record.projectHold) return { phase: 'working', text: record.projectHold, className: 'chat-live-phase warn' };
     return { phase: 'working', text: 'Working', className: 'chat-live-phase working' };
+}
+
+/**
+ * Keep an unfinished card's chip on its task's census phase (`/api/state`
+ * `active_chat_activities`): paused/pausing/unknown park it until a positive
+ * phase releases it. true when the chip changed.
+ */
+export function syncParkedPhase(record, phase = '') {
+    const parked = ['budget_paused', 'budget_pausing', 'unknown'].includes(String(phase || '')) ? String(phase) : '';
+    if (!record || record.finished || (record.parkedPhase || '') === parked) return false;
+    record.parkedPhase = parked;
+    const desired = desiredLiveCardPhase(record);
+    return setLiveCardPhase(record, desired.phase, desired.text, desired.className, desired.secondary);
 }
 
 // A replayed final may preserve only an already-terminal phase. Ordinary DOM
@@ -119,7 +141,8 @@ export function setLiveCardPhaseSecondary(record, text = '') {
 // remains unfinished without pretending the paused role is doing computation.
 export function setLiveCardTypingVisible(record, visible) {
     if (!record?.inlineTypingEl) return false;
-    const display = visible && !record.modelWaiting && !record.projectHold && !record.reviewAnchor && !record.historicalUnavailable && !record.historicalUnconfirmed ? '' : 'none';
+    const display = visible && !record.modelWaiting && !record.projectHold && !['budget_paused', 'unknown'].includes(record.parkedPhase)
+        && !record.reviewAnchor && !record.historicalUnavailable && !record.historicalUnconfirmed ? '' : 'none';
     if (record.inlineTypingEl.style.display === display) return false;
     record.inlineTypingEl.style.display = display;
     return Boolean(record.inlineTypingEl.isConnected);

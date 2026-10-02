@@ -90,6 +90,7 @@ class Worker:
     active_capacity: bool = True
     # Unlike temporary reaping, the readiness owner exhausted its bounded attempts.
     readiness_exhausted: bool = False
+    process_birth: str = ""  # captured while this exact Process is alive; never inferred after death
 
 
 _EVENT_Q = None
@@ -694,6 +695,7 @@ def _terminalization_retry_spec(task: Any) -> Optional[Dict[str, Any]]:
         "status": status if status in _TERMINALIZATION_RETRY_STATUSES else "failed",
         "trigger": str(raw.get("trigger") or "terminalization_retry").strip() or "terminalization_retry",
         "reconcile_delegate_custody": bool(raw.get("reconcile_delegate_custody", True)),
+        "stop_source": str(raw.get("stop_source") or ""),
     }
 
 
@@ -859,7 +861,7 @@ def _attach_retry_event_state(task: Dict[str, Any], event_published: Optional[bo
 def _make_terminalization_retry_task(
     task: Dict[str, Any], task_id: str, *, reason: str, status: str, trigger: str,
     reconcile_delegate_custody: bool = True, claim: Optional[Dict[str, Any]] = None,
-    event_published: Optional[bool] = None,
+    event_published: Optional[bool] = None, stop_source: str = "",
 ) -> Dict[str, Any]:
     """Copy a killed task into durable, non-dispatchable terminalization custody."""
     retry = dict(task) if isinstance(task, dict) else {}
@@ -883,6 +885,8 @@ def _make_terminalization_retry_task(
     }
     if event_published:
         retry_spec["event_published"] = True
+    if stop_source:
+        retry_spec["stop_source"] = str(stop_source)
     retry[_TERMINALIZATION_RETRY_FIELD] = retry_spec
     return _attach_retry_event_state(_attach_retry_claim(retry, claim), event_published)
 
@@ -890,7 +894,7 @@ def _make_terminalization_retry_task(
 def _retain_terminalization_retry_task(
     task: Dict[str, Any], task_id: str, *, reason: str, status: str, trigger: str,
     reconcile_delegate_custody: bool = True, claim: Optional[Dict[str, Any]] = None,
-    event_published: Optional[bool] = None,
+    event_published: Optional[bool] = None, stop_source: str = "",
 ) -> Dict[str, Any]:
     """Return retry custody without replacing an existing stronger marker."""
     if isinstance(task, dict) and isinstance(task.get(_TERMINALIZATION_RETRY_FIELD), dict):
@@ -904,6 +908,7 @@ def _retain_terminalization_retry_task(
         reconcile_delegate_custody=reconcile_delegate_custody,
         claim=claim,
         event_published=event_published,
+        stop_source=stop_source,
     )
 
 
@@ -947,7 +952,7 @@ def _terminalization_status_accepted(
 def _settle_terminalization_task(
     task: Dict[str, Any], *, reason: str, status: str, trigger: str,
     reconcile_delegate_custody: bool = True, allow_interrupted: bool = False,
-    event_already_published: bool = False,
+    event_already_published: bool = False, stop_source: str = "",
 ) -> bool:
     """Write and publish one shutdown outcome, retaining custody on any failure."""
     task_id = str(task.get("id") or "").strip()
@@ -958,8 +963,8 @@ def _settle_terminalization_task(
         _audit_delegate_terminal_custody(
             task_id, trigger, enabled=reconcile_delegate_custody,
         )
-        persisted = _write_failure_result(
-            task_id, reason=reason, status=requested_status,
+        persisted = _write_failure_result(  # the call shape without a stop door is unchanged
+            task_id, reason=reason, status=requested_status, **({"stop_source": stop_source} if stop_source else {}),
         )
     except Exception:
         log.warning(
@@ -1011,6 +1016,7 @@ def _settle_terminalization_retry_task(
         trigger=request["trigger"],
         reconcile_delegate_custody=request["reconcile_delegate_custody"],
         allow_interrupted=False,
+        stop_source=request["stop_source"],
         event_already_published=bool(
             isinstance(task.get(_TERMINALIZATION_RETRY_FIELD), dict)
             and task[_TERMINALIZATION_RETRY_FIELD].get("event_published")
@@ -1180,10 +1186,11 @@ def kill_workers(
     preserve_running_task_ids: Optional[set[str]] = None,
     reconcile_delegate_custody: bool = True,
     reconcile_review_custody: bool = True,
+    hold_never_started: bool = False,
+    stop_source: str = "",  # a stop door's typed cause (``_write_failure_result``)
 ) -> bool:
     global _WORKER_POOL_DISABLED_REASON
-    from supervisor import queue
-    from supervisor.queue_snapshot import _exact_pause_row
+    from supervisor import queue, restart_retention as retention  # every door retains saved pauses
     with _queue_lock:
         if disable_reason:
             _WORKER_POOL_DISABLED_REASON = str(disable_reason)
@@ -1215,6 +1222,8 @@ def kill_workers(
             try:
                 if w.proc.pid and not w.proc.is_alive():
                     dead_pids.add(int(w.proc.pid))
+                    from supervisor.worker_health import retire_confirmed_worker_consumers
+                    retire_confirmed_worker_consumers(w, RUNNING.get(w.busy_task_id))
             except Exception:
                 log.debug("Cannot confirm worker %s dead", w.wid, exc_info=True)
         from supervisor.worker_process import close_worker_stop_channel
@@ -1234,6 +1243,10 @@ def kill_workers(
         try:
             done_status = terminal_status or "failed"
             preserve_running = set(preserve_running_task_ids or ())
+            sleep_hold_reason = retention.saved_sleep_hold_reason(
+                DRIVE_ROOT, owner_restart=hold_never_started or stop_source == "owner_restart")
+            retention.park_saved_running_rows(RUNNING, PENDING, preserve_running, DRIVE_ROOT,
+                                             sleep_hold_reason=sleep_hold_reason)
             running_task_ids = set(RUNNING) - preserve_running
             interrupted_roots = {
                 str((meta.get("task") or {}).get("root_task_id") or task_id)
@@ -1251,6 +1264,7 @@ def kill_workers(
                     status=status,
                     trigger=trigger,
                     reconcile_delegate_custody=reconcile_delegate_custody,
+                    stop_source=stop_source,
                 )
 
             def _retain_killed_pending(
@@ -1265,6 +1279,7 @@ def kill_workers(
                     status=status,
                     trigger=trigger,
                     reconcile_delegate_custody=reconcile_delegate_custody,
+                    stop_source=stop_source,
                 )
                 terminalization_retry_ids.append(task_id or "<missing-task-id>")
                 return retry
@@ -1327,6 +1342,7 @@ def kill_workers(
                     trigger="worker_pool_kill",
                     reconcile_delegate_custody=reconcile_delegate_custody,
                     allow_interrupted=True,
+                    stop_source=stop_source,
                 ):
                     if archive_service_logs:
                         try:
@@ -1347,6 +1363,7 @@ def kill_workers(
                         status=done_status,
                         trigger="worker_pool_kill",
                         reconcile_delegate_custody=reconcile_delegate_custody,
+                        stop_source=stop_source,
                     )
                     RUNNING.pop(str(task_id), None)
                     replaced = False
@@ -1360,79 +1377,45 @@ def kill_workers(
                     if not replaced:
                         PENDING.append(retry_task)
                     terminalization_retry_ids.append(str(task_id))
-            if preserve_pending:
-                kept = []
-                for task in PENDING:
-                    retry_outcome = _settle_existing_retry(task)
-                    if retry_outcome is not None:
-                        if retry_outcome:
-                            drained_ids.append(str(task.get("id") or ""))
-                        else:
-                            kept.append(task)
-                        continue
-                    if str(task.get("id") or "") in preserve_running:
-                        kept.append(task)
-                        continue
-                    if _exact_pause_row(task):
-                        retained_paused_ids.append(str(task.get("id") or ""))
-                        kept.append(task)
-                        continue
-                    parent_id = str(task.get("parent_task_id") or "")
-                    root_id = str(task.get("root_task_id") or "")
-                    if parent_id and (parent_id in running_task_ids or root_id in interrupted_roots):
-                        tid = str(task.get("id") or "")
-                        if _settle_killed_pending(
-                            task,
-                            reason="Parent task was interrupted before this child started.",
-                            status="cancelled",
-                            trigger="pending_parent_interrupted",
-                        ):
-                            drained_ids.append(tid)
-                        else:
-                            kept.append(_retain_killed_pending(
-                                task,
-                                reason="Parent task was interrupted before this child started.",
-                                status="cancelled",
-                                trigger="pending_parent_interrupted",
-                            ))
-                        continue
-                    kept.append(task)
-                PENDING[:] = kept
-            else:
-                # Keep the previous snapshot authoritative until every drained
-                # row has either durable terminal custody or been requeued.
-                drained = queue.drain_all_pending(persist=False)
-                for task in drained:
-                    tid = str(task.get("id") or "").strip()
-                    retry_outcome = _settle_existing_retry(task)
-                    if retry_outcome is not None:
-                        if retry_outcome:
-                            drained_ids.append(tid)
-                        else:
-                            PENDING.append(task)
-                        continue
-                    if _exact_pause_row(task):
-                        retained_paused_ids.append(tid)
-                        PENDING.append(task)
-                        continue
-                    if _settle_killed_pending(
-                        task,
-                        reason=result_reason,
-                        status=done_status,
-                        trigger="pending_pool_kill",
-                    ):
+            # Every pending row follows the same custody/retention ordering.
+            # Only ordinary unretained rows differ between preserve and drain.
+            drained = queue.drain_all_pending(persist=False)
+            for task in drained:
+                tid = str(task.get("id") or "").strip()
+                retry_outcome = _settle_existing_retry(task)
+                if retry_outcome is not None:
+                    if retry_outcome:
                         drained_ids.append(tid)
                     else:
-                        # No id, failed durable write, or failed notification:
-                        # retain non-dispatchable custody so a later supervisor
-                        # pass can retry without starting the task.
-                        PENDING.append(_retain_killed_pending(
-                            task,
-                            reason=result_reason,
-                            status=done_status,
-                            trigger="pending_pool_kill",
-                        ))
-            if orphaned_ids or drained_ids or terminalization_retry_ids or retained_paused_ids:
+                        PENDING.append(task)
+                    continue
+                if preserve_pending and tid in preserve_running:
+                    PENDING.append(task)
+                    continue
+                if retention.retained_pending(task, sleep_hold_reason=sleep_hold_reason):
+                    retained_paused_ids.append(tid)
+                    PENDING.append(task)
+                    continue
+                if not preserve_pending and hold_never_started and retention.hold_never_started(
+                        task, running_task_ids, interrupted_roots):
+                    PENDING.append(task)
+                    continue
+                if preserve_pending:
+                    if not retention.child_of_interrupted(task, running_task_ids, interrupted_roots):
+                        PENDING.append(task)
+                        continue
+                    reason, status, trigger = (
+                        "Parent task was interrupted before this child started.",
+                        "cancelled", "pending_parent_interrupted")
+                else:
+                    reason, status, trigger = result_reason, done_status, "pending_pool_kill"
+                if _settle_killed_pending(task, reason=reason, status=status, trigger=trigger):
+                    drained_ids.append(tid)
+                else:
+                    # Failed durable settlement keeps non-dispatchable retry
+                    # custody, never a lost row or permission to run it again.
+                    PENDING.append(_retain_killed_pending(task, reason=reason, status=status, trigger=trigger))
+            if orphaned_ids or drained_ids or terminalization_retry_ids or retained_paused_ids or retention.held_ids(PENDING):
                 append_jsonl(
                     DRIVE_ROOT / "logs" / "supervisor.jsonl",
                     {
@@ -1442,6 +1425,7 @@ def kill_workers(
                         "drained_pending": drained_ids,
                         "terminalization_retry": terminalization_retry_ids,
                         **({"retained_budget_paused": retained_paused_ids} if retained_paused_ids else {}),
+                        **({"held_for_owner_restart": held} if (held := retention.held_ids(PENDING)) else {}),
                     },
                 )
         except Exception:

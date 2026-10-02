@@ -215,29 +215,28 @@ def _scheduled_tasks_digest(env: Any, *, limit: int = 8) -> Optional[Dict[str, A
     except Exception:
         log.debug("Failed to read scheduled tasks for context digest", exc_info=True)
         return None
-    tasks = [
-        t for t in (data.get("tasks") or [])
-        if isinstance(t, dict) and t.get("enabled", True)
-    ]
+    from supervisor.followup_policy import observed_store
+    from supervisor.queue_schedules import schedule_lifecycle_status
+    root = pathlib.Path(env.drive_path("state/scheduled_tasks.json")).parent.parent
+    data = observed_store(root, data)
+    # A deleted row still finishing accepted work stays in view until it goes.
+    tasks = [t for t in data.get("tasks", []) if isinstance(t, dict) and (t.get("enabled", True)
+             or t.get("followup_hold") or t.get("followup_wait") or t.get("delete_requested_at"))]
     if not tasks:
         return None
-    digest: List[Dict[str, Any]] = []
+    out: Dict[str, Any] = {"active": [], "held": [], "waiting": []}
     for record in tasks[:limit]:
-        trigger = record.get("trigger") if isinstance(record.get("trigger"), dict) else {}
-        entry = {
-            "id": str(record.get("id") or ""),
-            "name": str(record.get("name") or ""),
-            "timezone": str(record.get("timezone") or "") or "local",
-            "next_run_at": str(record.get("next_run_at") or ""),
-        }
-        if str(trigger.get("type") or "cron") == "once":
-            # One-shot records (schedule_followup) have no cron cadence: project
-            # the fire instant instead of an empty-string cron.
-            entry["run_at"] = str(trigger.get("run_at") or "")
-        else:
-            entry["cron"] = str(trigger.get("expr") or record.get("cron") or "")
-        digest.append(entry)
-    out: Dict[str, Any] = {"active": digest}
+        trigger = record.get("trigger") or {}
+        status = schedule_lifecycle_status(record)
+        entry = {"id": record.get("id"), "name": record.get("name"), "status": status,
+                 "relation": record.get("relation"), "followup_hold": record.get("followup_hold"),
+                 "followup_wait": record.get("followup_wait"), "hold_persisted": record.get("hold_persisted"),
+                 "timezone": record.get("timezone") or "local", "next_run_at": record.get("next_run_at") or ""}
+        entry["run_at" if trigger.get("type") == "once" else "cron"] = trigger.get("run_at" if trigger.get("type") == "once" else "expr", "")
+        if status == "delete_pending":
+            out.setdefault("delete_pending", []).append(entry)
+            continue
+        out["held" if record.get("followup_hold") else "waiting" if record.get("followup_wait") else "active"].append(entry)
     if len(tasks) > limit:
         out["omitted_count"] = len(tasks) - limit
     return out

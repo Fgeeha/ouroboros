@@ -37,6 +37,10 @@ def _detail_client(tmp_path: pathlib.Path) -> tuple[TestClient, pathlib.Path]:
     drive_root = tmp_path / "drive"
     drive_root.mkdir(exist_ok=True)
     app.state.drive_root = drive_root
+    from ouroboros.task_results import write_task_result
+    write_task_result(drive_root, 'root-alpha', 'running', billing_group={
+        'billing_group_id': 'root-alpha', 'billing_group_limit_usd': None,
+        'billing_group_limit_source': 'initial_task_admission', 'billing_group_limit_revision': 'fixture'})
     return TestClient(app), drive_root
 
 

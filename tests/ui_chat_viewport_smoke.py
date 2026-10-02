@@ -95,7 +95,6 @@ def run_chat_viewport_smoke(
     """Live card growth follows bottom or preserves the visible descendant."""
     pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
     from playwright.sync_api import Error as PlaywrightError
-    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
     from playwright.sync_api import sync_playwright
     from tests.ci_evidence import output_dir
 
@@ -152,29 +151,55 @@ def run_chat_viewport_smoke(
     def read_to_latest(page):
         # Follow is reading intent: the reader's own wheel reaches the live edge.
         # A scripted scroll (set_remaining) moves the view but decides nothing.
+        deadline = time.monotonic() + 30
         evidence.checkpoint("read_to_latest:prepare")
         box = page.locator("#chat-messages").bounding_box()
         evidence.point = {"x": box["x"] + box["width"] / 2, "y": box["y"] + box["height"] / 2}
         page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
-        # A wheel delta need not become the same number of scroll pixels.
-        # Keep reading physically until arrival, within the original 30s limit.
-        # Even at the bottom, one gesture must renew the reader's follow intent.
-        deadline = time.monotonic() + 30
+        # A native wheel impulse can finish short of the edge. Keep reading,
+        # but never accept a settled gesture that made no progress toward it.
         while True:
-            page.mouse.wheel(0, jump_state(page)["remaining"] + 200)
-            evidence.checkpoint("read_to_latest:wait_for_live_edge")
+            before = jump_state(page)
+            page.evaluate("""() => {
+                const feed = document.querySelector('#chat-messages');
+                const state = window.__viewportWheel = {seen: false, scrolls: 0, settled: false};
+                const wheel = () => { state.seen = true; };
+                const scroll = () => { state.scrolls++; state.settled = false; };
+                const end = () => {
+                    if (!state.seen || !state.scrolls) return;
+                    const count = state.scrolls;
+                    requestAnimationFrame(() => requestAnimationFrame(() => {
+                        if (count === state.scrolls) state.settled = true;
+                    }));
+                };
+                for (const [type, handler] of [['wheel', wheel], ['scroll', scroll], ['scrollend', end]])
+                    feed.addEventListener(type, handler, {passive: true});
+                state.dispose = () => {
+                    for (const [type, handler] of [['wheel', wheel], ['scroll', scroll], ['scrollend', end]])
+                        feed.removeEventListener(type, handler);
+                    delete window.__viewportWheel;
+                };
+            }""")
             try:
+                # Even an already-bottom reader needs an actual gesture to follow.
+                page.mouse.wheel(0, before["remaining"] + 200)
+                evidence.checkpoint("read_to_latest:wait_for_live_edge", before=before)
+                remaining_ms = (deadline - time.monotonic()) * 1000
+                assert remaining_ms > 0, "reading did not reach the live edge within 30 seconds"
                 page.wait_for_function(
-                    """() => {
-                        const messages = document.querySelector('#chat-messages');
-                        return messages.scrollHeight - messages.scrollTop - messages.clientHeight <= 1;
-                    }""",
-                    timeout=max(1, min(1_000, (deadline - time.monotonic()) * 1_000)),
+                    "atEdge => window.__viewportWheel.seen && (atEdge || window.__viewportWheel.settled)",
+                    arg=before["remaining"] <= 1, timeout=remaining_ms,
                 )
-                break
-            except PlaywrightTimeoutError:
-                if time.monotonic() >= deadline:
-                    raise
+                after = jump_state(page)
+                assert before["remaining"] <= 1 or after["remaining"] < before["remaining"], (before, after)
+                if after["remaining"] <= 1:
+                    break
+            finally:
+                if evidence.output_dir is not None:
+                    evidence._attempt("wheel_state", lambda: evidence.details.update(viewport_wheel=page.evaluate(
+                        "() => { const s = window.__viewportWheel; return s ? {seen: s.seen, scrolls: s.scrolls, "
+                        "settled: s.settled, time_ms: performance.now()} : {state: 'unavailable'}; }")))
+                page.evaluate("() => window.__viewportWheel.dispose()")
         page.evaluate(_SETTLE_TWO_FRAMES)
         evidence.checkpoint("read_to_latest:complete")
 
@@ -823,7 +848,7 @@ def run_chat_viewport_smoke(
                 page.route(
                     "**/api/tasks/vp-cancel-noop/cancel",
                     lambda route: route.fulfill(status=202, content_type="application/json", body=json.dumps({
-                        "task_id": "vp-cancel-noop", "cancel_state": "pending",
+                        "ok": True, "task_id": "vp-cancel-noop", "cancel_state": "pending",
                         "stop_policy": "finalize_then_cancel",
                     })),
                 )

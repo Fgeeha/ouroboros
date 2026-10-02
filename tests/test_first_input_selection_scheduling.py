@@ -179,7 +179,8 @@ def test_malformed_selection_has_typed_reason_without_creating_child(registry, s
     assert (result.status, result.code) == ("error", "TOOL_ARG_ERROR")
     assert result.meta["reason"] == "INPUT_SOURCE_SELECTION_INVALID"
     assert registry._ctx.pending_events == []
-    assert not (registry._ctx.drive_root / "task_results").exists()
+    # The launch fence may create its lock parent; a refusal creates no child result.
+    assert not list((registry._ctx.drive_root / "task_results").glob("*.json"))
 
 
 def test_declared_parent_cannot_request_shared_descendant(registry):
@@ -202,7 +203,8 @@ def test_session_route_refused_before_child_or_attachment_side_effects(registry,
     assert (result.status, result.code) == ("error", "TOOL_ARG_ERROR"), result.text
     assert result.meta["reason"] == "INPUT_SOURCE_SELECTION_UNSUPPORTED"
     assert registry._ctx.pending_events == []
-    assert not (registry._ctx.drive_root / "task_results").exists()
+    # The launch fence may create its lock parent; a refusal creates no child result.
+    assert not list((registry._ctx.drive_root / "task_results").glob("*.json"))
 
 
 def test_contract_selection_is_additive_strict_and_has_consistent_precedence():

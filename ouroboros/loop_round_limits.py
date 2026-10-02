@@ -135,7 +135,7 @@ def _drain_incoming_messages(
             break
 
     if drive_root is not None and task_id:
-        from ouroboros.owner_mailbox import CONTEXT_ONLY_TASK_PROVENANCES, KIND_FINALIZE_NOW, KIND_HURRY, KIND_OWNER_TEXT, KIND_QUIZ_ANSWER, KIND_TASK_MESSAGE, acknowledge_transcript_entry, deliver_quiz_answer, deliver_task_message, drain_owner_entries
+        from ouroboros.owner_mailbox import CONTEXT_ONLY_TASK_PROVENANCES, KIND_FINALIZE_NOW, KIND_HURRY, KIND_OWNER_PAUSE, KIND_OWNER_TEXT, KIND_QUIZ_ANSWER, KIND_TASK_MESSAGE, acknowledge_transcript_entry, deliver_quiz_answer, deliver_task_message, drain_owner_entries
 
         if owner_ctx:
             owner_ctx._loop_mailbox_seen_ids = _owner_msg_seen
@@ -144,6 +144,11 @@ def _drain_incoming_messages(
             kind = entry.get("kind") or KIND_OWNER_TEXT
             if kind == KIND_FINALIZE_NOW:
                 handle_finalize_now_entry(entry, owner_ctx, drive_root, task_id, controls)
+                continue
+            if kind == KIND_OWNER_PAUSE:
+                # ACK receipt of this wake signal, not settlement of the Pause.
+                # The launch boundary still reads the durable root fence.
+                acknowledge_transcript_entry(drive_root, task_id, entry, wake_id="owner_pause_wake")
                 continue
             if kind == KIND_HURRY:
                 # HQ1 no-chat contract (§19.7.2 item 6): a typed hurry
@@ -650,6 +655,47 @@ def _handle_model_wait_control(
     # catches a hold's interruption raised outside the model call, must not
     # hand the same error back here.
     error.control_rails_seen = True
+    if reason == "owner_launch_authority_unavailable":
+        # Only the positively unsent handoff waits; sent effects never retry.
+        # Reuse this task's live stack and control/deadline checks, no scheduler.
+        from ouroboros.owner_pause import OwnerPauseRefused, launch_admission
+        from ouroboros.usage_accounting import current_usage_scope
+        from ouroboros.llm_attempt import require_physical_dispatch_window
+        while True:
+            try:
+                require_physical_dispatch_window()
+                with launch_admission(current_usage_scope()):
+                    pass
+                return None
+            except OwnerPauseRefused as exc:
+                if str(exc) == reason:
+                    import time
+                    from ouroboros.budget_pause import _HOLD_POLL_SEC
+
+                    time.sleep(_HOLD_POLL_SEC)
+                    continue
+                error = ModelWaitInterrupted(str(exc), role=error.model_role, cause=error)
+            except Exception as exc:
+                from ouroboros.model_wait import propagate_model_control
+
+                # Physical pre-send controls carry no model_role. Rejoin the
+                # same typed contract as the model-call boundary, retaining the
+                # no-dispatch cause instead of leaking it or masking Stop.
+                try:
+                    propagate_model_control(exc, role=error.model_role)
+                except ModelWaitInterrupted as interrupted:
+                    error = interrupted
+                else:
+                    raise
+            reason = error.control_reason
+            break
+    if reason == "owner_pause":
+        # Raised only BEFORE request bytes (a pre-dispatch wait or the send's
+        # launch handoff): nothing is in flight, the loop pauses exactly here.
+        from ouroboros.budget_pause import enter_owner_pause
+
+        enter_owner_pause(ctx)
+        return None
     if reason not in {"cancelled", "finalize_requested", "deadline", "execution_deadline", "absolute_ceiling", "accounting_wait_expired"}:
         raise error
     owner = current_model_wait()
@@ -794,6 +840,12 @@ def _maybe_early_finalize(
     if reason in {"absolute_ceiling", "execution_deadline"}:
         return _handle_model_wait_control(limit_ctx, ModelWaitInterrupted(reason),
                                           transport_episode=transport_episode)
+    # The owner's Pause (a Stop above still wins): the root's durable fence, not
+    # the wake control, decides; entering the exact pause buys no model round.
+    from ouroboros.budget_pause import enter_cold_sleep, enter_owner_pause
+
+    enter_owner_pause(limit_ctx)
+    enter_cold_sleep(limit_ctx)  # the model's own cold sleep armed in the last tool batch
     # An active episode owns the deadline sliver: its last free redial +
     # no-resend terminal replace the paid deadline_local finalize call.
     if transport_episode is None:

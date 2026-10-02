@@ -103,17 +103,7 @@ def _admit_hurry_locked(task_id: str) -> Tuple[Optional[Dict[str, Any]], str, in
                 raise  # Preserve unreadable pooled authority before any hurry write.
             log.debug("hurry cancel-pending check failed for %s", task_id, exc_info=True)
         if pooled_status:
-            from ouroboros.task_results import load_task_result, write_task_result
-
-            # Queue identity owns this lifecycle seed; direct turns stay unchanged.
-            # The worker can publish between read and write, so create atomically.
-            if str(task.get("id") or "") != task_id:
-                raise ValueError("hurry queue task identity mismatch")
-            if load_task_result(q.DRIVE_ROOT, task_id, strict=True) is None:
-                write_task_result(
-                    q.DRIVE_ROOT, task_id, pooled_status,
-                    create_only=True, strict_existing_dict=True,
-                )
+            q.ensure_control_task_result(task_id)
         return task, "", attempt
 
 

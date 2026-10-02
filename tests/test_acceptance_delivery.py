@@ -454,7 +454,7 @@ def _seed_root_ledger(scope, *, cost=0.0):
 def _spy_admission(monkeypatch):
     """Record every real `review_wave_admission` call (models and result) and
     call through — the gate is observed, never replaced."""
-    from ouroboros import usage_accounting as ua
+    from ouroboros import usage_admission as ua
 
     calls = []
     original = ua.review_wave_admission

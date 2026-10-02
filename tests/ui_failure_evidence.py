@@ -20,16 +20,80 @@ from pathlib import Path
 
 _OBSERVE_EVENTS = """(() => {
     window.__ciUiEvents = [];
+    const instrumentation = window.__ciUiInstrumentation = {
+        wheel_after_dispatch: 'next task; completion requires event_phase === 0',
+        scroll_top: {state: 'unavailable', reason: 'not installed'},
+        unobserved_scroll_methods: ['scroll', 'scrollTo', 'scrollBy', 'scrollIntoView'],
+    };
     const identity = e => e instanceof Element
         ? {tag: e.tagName, id: e.id, class: String(e.className)} : null;
-    for (const type of ['wheel', 'scroll', 'scrollend']) {
+    const focus = () => ({document_focused: document.hasFocus(),
+        visibility_state: document.visibilityState, active_element: identity(document.activeElement)});
+    for (const type of ['focus', 'blur', 'focusin', 'focusout', 'visibilitychange']) {
         document.addEventListener(type, event => {
             window.__ciUiEvents.push({type, time_ms: performance.now(),
+                target: identity(event.target), ...focus()});
+        }, {capture: true, passive: true});
+    }
+    for (const type of ['wheel', 'scroll', 'scrollend']) {
+        document.addEventListener(type, event => {
+            const row = {type, time_ms: performance.now(),
                 target: identity(event.target), scroll_top: event.target?.scrollTop,
                 x: event.clientX, y: event.clientY, delta_x: event.deltaX,
                 delta_y: event.deltaY, delta_mode: event.deltaMode,
-                default_prevented_at_capture: event.defaultPrevented});
+                is_trusted: event.isTrusted, event_phase: event.eventPhase, ...focus(),
+                default_prevented_at_capture: event.defaultPrevented};
+            window.__ciUiEvents.push(row);
+            // A microtask can run between listeners. The next task sees whether
+            // dispatch actually finished, including a later preventDefault.
+            if (type === 'wheel') setTimeout(() => {
+                window.__ciUiEvents.push({type: 'wheel_after_dispatch',
+                    wheel_time_ms: row.time_ms, time_ms: performance.now(),
+                    event_phase: event.eventPhase, dispatch_complete: event.eventPhase === 0,
+                    default_prevented: event.defaultPrevented, is_trusted: event.isTrusted, ...focus()});
+            }, 0);
         }, {capture: true, passive: true});
+    }
+    // Chat's own position writers use scrollTop; native scrolling does not call
+    // this JS setter. Other methods are explicitly unobserved, never ruled out.
+    try {
+        const descriptor = Object.getOwnPropertyDescriptor(Element.prototype, 'scrollTop');
+        if (!descriptor?.get || !descriptor?.set || !descriptor.configurable) {
+            instrumentation.scroll_top = {state: 'unavailable', reason: 'native descriptor not wrappable'};
+            return;
+        }
+        Object.defineProperty(Element.prototype, 'scrollTop', {...descriptor, set(value) {
+            'use strict';
+            if (!(this instanceof Element) || this.id !== 'chat-messages')
+                return Reflect.apply(descriptor.set, this, [value]);
+            let row;
+            try {
+                row = {type: 'js_scroll_write', operation: 'scrollTop', time_ms: performance.now(),
+                    target: identity(this), before: Reflect.apply(descriptor.get, this, []),
+                    requested: ['number', 'string'].includes(typeof value) ? value : {type: typeof value},
+                    stack: new Error('feed scrollTop write').stack, returned: false};
+            } catch (error) {
+                instrumentation.scroll_top = {state: 'unavailable', reason: String(error)};
+            }
+            try {
+                const result = Reflect.apply(descriptor.set, this, [value]);
+                if (row) row.returned = true;
+                return result;
+            } finally {
+                try {
+                    if (row) {
+                        row.after = Reflect.apply(descriptor.get, this, []);
+                        window.__ciUiEvents.push(row);
+                    }
+                } catch (error) {
+                    instrumentation.scroll_top = {state: 'unavailable', reason: String(error)};
+                }
+            }
+        }});
+        instrumentation.scroll_top = {state: 'installed', target: '#chat-messages',
+            getter_preserved: true, configurable: descriptor.configurable, enumerable: descriptor.enumerable};
+    } catch (error) {
+        instrumentation.scroll_top = {state: 'unavailable', reason: String(error)};
     }
 })()"""
 
@@ -54,9 +118,12 @@ _FAILURE_GEOMETRY = """point => {
     const feed = document.querySelector('#chat-messages');
     return {time_ms: performance.now(), url: location.href,
         viewport: {width: innerWidth, height: innerHeight, device_scale: devicePixelRatio},
+        document_focused: document.hasFocus(), visibility_state: document.visibilityState,
+        active_element: describe(document.activeElement),
         status: document.querySelector('#chat-status')?.textContent,
         active_page: document.querySelector('.page.active')?.id,
         feed: describe(feed), hit_point: xy, hit_chain: chain,
+        instrumentation: window.__ciUiInstrumentation || {state: 'unavailable', reason: 'observer missing'},
         nested_scroll: feed ? [...feed.querySelectorAll('*')].filter(e =>
             e.scrollHeight > e.clientHeight + 1 &&
             ['auto', 'scroll', 'overlay'].includes(getComputedStyle(e).overflowY)

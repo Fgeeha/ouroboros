@@ -10,6 +10,7 @@ import { projectReference } from './project_reference.js';
 import { delegatedActivityBodyHtml, delegatedHeadline, delegatedLineView } from './delegated_activity.js';
 import { joinMarkdownHeadings, MARKDOWN_FENCED_CODE } from './utils.js';
 import { REUSABLE_TASK_IDS } from './task_control_menu.js';
+import { apiFetch } from './api_client.js';
 import {
     accountedUpperBound,
     accountedUpperBoundWithChildren,
@@ -388,6 +389,72 @@ export async function confirmAndSendPanic(deps) {
         return true;
     }
     return false;
+}
+
+// A root still settling its pause (the durable row says ``pausing``): its
+// checkpoint may not be saved yet, so a Restart can interrupt it.
+const PAUSING_PHASES = new Set(['budget_pausing', 'pausing']);
+
+/**
+ * The truthful body of the ONE Restart confirmation (owner quiz 285597): what
+ * the server's owner Restart actually does to running, paused, queued and
+ * still-pausing work (supervisor/restart_retention.py). ``activities`` is the
+ * live census; ``null`` means it could not be read, and the body says so
+ * instead of promising there is nothing still pausing.
+ * @param {Array<{phase?: string}>|null} activities
+ * @returns {string}
+ */
+export function restartConfirmBody(activities) {
+    const lines = [
+        'Running tasks stop. Tasks already paused stay paused.',
+        'Queued tasks that have not started are kept on hold under the same task, and wait for your Resume.',
+        'Saved settings apply after the restart.',
+    ];
+    if (!Array.isArray(activities) || activities.some((row) => row?.phase === 'unknown')) {
+        lines.push('Pause status could not be read: a task that is still pausing would be interrupted instead of staying paused.');
+        if (!Array.isArray(activities)) return lines.join('\n');
+    }
+    const pausing = activities.filter((row) => PAUSING_PHASES.has(String(row?.phase || ''))).length;
+    if (pausing) {
+        lines.push(`${pausing} task${pausing === 1 ? ' is' : 's are'} still pausing: a pause not saved when the restart `
+            + 'stops it is interrupted instead of staying paused.');
+    }
+    return lines.join('\n');
+}
+
+async function readLiveActivities() {
+    const resp = await apiFetch('/api/state', { cache: 'no-store' });
+    const data = resp?.ok ? await resp.json() : null;
+    if (!Array.isArray(data?.active_chat_activities) || data.active_chat_activities_complete !== true) {
+        throw new Error('census unavailable');
+    }
+    return data.active_chat_activities;
+}
+
+/**
+ * The ONE Restart confirm-and-send both UI Restart buttons use (the chat
+ * header and Settings "Restart now"; owner quiz 285597: one shared
+ * confirmation, deliberately added to the formerly immediate header button,
+ * never two dialogs). Telegram `/restart` and Panic are separate commands and
+ * keep their own contracts. `queue:false`: a disconnected page never queues a
+ * destructive command for a later reconnect.
+ */
+export async function confirmAndSendRestart({ openConfirmDialog, ws, readActivities = readLiveActivities }) {
+    let activities = null;
+    try {
+        activities = await readActivities();
+    } catch {
+        activities = null;
+    }
+    const confirmed = await openConfirmDialog({
+        title: 'Restart agent',
+        body: restartConfirmBody(activities),
+        confirmLabel: 'Restart',
+        danger: true,
+    });
+    if (!confirmed) return 'cancelled';
+    const result = ws?.send?.({ type: 'command', cmd: '/restart' }, { queue: false });
+    return result?.status === 'sent' ? 'sent' : 'not_connected';
 }
 
 export function getOrCreateChatSessionId(storage, cryptoImpl, now = Date.now, random = Math.random) {
@@ -993,9 +1060,10 @@ export function positiveTaskTerminalFact(row) {
  * Single status reducer for the chat header (owner decisions 2A/5A; managed
  * activities added by the project-continuity contract). Priority: disconnected
  * > background live card (Working...) > admitted managed work (Working...) >
- * server-confirmed direct/ephemeral turns (Thinking...) > local pending
- * submissions (Sending...) > queue-admitted but unstarted managed work
- * (Queued...) > idle. A queued task ranks below
+ * a root settling its Pause (Pausing…) > server-confirmed direct/ephemeral
+ * turns (Thinking...) > local pending submissions (Sending...) >
+ * queue-admitted but unstarted managed work (Queued...) > model access wait >
+ * paused work (Paused) > idle. A queued task ranks below
  * Sending... because an unacknowledged local submission is the more actionable
  * state. Idle is Starting… until the host proves `supervisor_ready` (В9),
  * then Online. Pure over its inputs for dependency-free node tests.
@@ -1006,7 +1074,9 @@ export function computeDerivedChatStatus({
     activeDirectCount = 0,
     activeManagedCount = 0,
     queuedManagedCount = 0,
+    pausingManagedCount = 0,
     pausedManagedCount = 0,
+    unknownActivityCount = 0,
     waitingModelCount = 0,
     projectWaitLabel = '',
     pendingSubmissionsCount = 0,
@@ -1021,6 +1091,8 @@ export function computeDerivedChatStatus({
     if (activeManagedCount > 0) {
         return { kind: 'thinking', text: 'Working...', showDots: true };
     }
+    // Sent work still finishing under the owner's Pause: settling, not working.
+    if (pausingManagedCount > 0) return { kind: 'thinking', text: 'Pausing…', showDots: true };
     if (activeDirectCount > 0) {
         return { kind: 'thinking', text: 'Thinking...', showDots: true };
     }
@@ -1032,10 +1104,12 @@ export function computeDerivedChatStatus({
         return { kind: 'thinking', text: 'Queued...', showDots: true };
     }
     if (waitingModelCount > 0) return { kind: 'online', text: 'Waiting for access', showDots: false };
+    if (unknownActivityCount > 0) return { kind: 'online', text: 'Activity unconfirmed', showDots: false };
     if (pausedManagedCount > 0) {
-        // Budget-paused work is NOT running and will not start by itself:
-        // never dress it up as Working or Queued.
-        return { kind: 'online', text: 'Paused (budget)', showDots: false };
+        // Paused work is NOT running and will not start by itself: never dress
+        // it up as Working or Queued. The census phase is shared by a budget
+        // pause, the owner's Pause and a Restart hold, so no cause is claimed.
+        return { kind: 'online', text: 'Paused', showDots: false };
     }
     if (projectWaitLabel) return { kind: 'online', text: projectWaitLabel, showDots: false };
     if (supervisorStarting) return { kind: 'starting', text: 'Starting…', showDots: false };
@@ -1043,20 +1117,24 @@ export function computeDerivedChatStatus({
 }
 
 // The reducer's counted inputs: census activities not waiting on a model, and mounted unfinished
-// cards, where a managed root drives Working… and a direct turn keeps the census verdict (Thinking…).
+// cards, where a managed root drives Working… and a direct turn keeps the census verdict (Thinking…);
+// a paused or pausing card (`task_phase_chip.syncParkedPhase`) is not working.
 export function chatStatusCounts(activities, records, isWaiting = () => false) {
-    const counts = { activeDirectCount: 0, activeManagedCount: 0, queuedManagedCount: 0, pausedManagedCount: 0,
-        hasActiveLiveCard: false, waitingModelCount: 0, projectWaitLabel: '' };
+    const counts = { activeDirectCount: 0, activeManagedCount: 0, queuedManagedCount: 0, pausingManagedCount: 0,
+        pausedManagedCount: 0, unknownActivityCount: 0, hasActiveLiveCard: false, waitingModelCount: 0,
+        projectWaitLabel: '' };
     for (const [id, entry] of activities) {
-        if (entry?.project_admission_hold?.label) {
-            counts.projectWaitLabel = entry.project_admission_hold.label;
-            if (/^budget_paus(ed|ing)$/.test(entry.phase ?? '')) counts.pausedManagedCount += 1;
-            continue;
-        }
-        if (isWaiting(id)) continue;
-        if (String(entry?.kind || '') !== 'managed_task') counts.activeDirectCount += 1;
+        // A Project verification hold is a static wait: never queued or working,
+        // while its pause/pausing/unknown census phase still counts as itself.
+        const projectHold = entry?.project_admission_hold?.label;
+        if (projectHold) counts.projectWaitLabel = projectHold;
+        else if (isWaiting(id)) continue;
+        if (entry?.phase === 'unknown') counts.unknownActivityCount += 1;
+        else if (entry?.phase === 'budget_pausing') counts.pausingManagedCount += 1;
+        else if (entry?.phase === 'budget_paused') counts.pausedManagedCount += 1;
+        else if (projectHold) continue;
+        else if (String(entry?.kind || '') !== 'managed_task') counts.activeDirectCount += 1;
         else if (String(entry?.phase || '') === 'queued') counts.queuedManagedCount += 1;
-        else if (/^budget_paus(ed|ing)$/.test(entry?.phase ?? '')) counts.pausedManagedCount += 1;
         else counts.activeManagedCount += 1;
     }
     for (const record of records) {
@@ -1067,7 +1145,7 @@ export function chatStatusCounts(activities, records, isWaiting = () => false) {
         }
         if (activities.get(record.groupId)?.project_admission_hold) continue;
         if (record.modelWaiting) counts.waitingModelCount += 1;
-        else if (!record.direct) counts.hasActiveLiveCard = true;
+        else if (!record.direct && !record.parkedPhase) counts.hasActiveLiveCard = true;
     }
     return counts;
 }

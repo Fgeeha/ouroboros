@@ -43,13 +43,17 @@ from ouroboros.subagent_messages import initiator_meta, subagent_message_meta
 from ouroboros.utils import utc_now_iso, append_jsonl, truncate_review_artifact as _truncate_with_notice
 from ouroboros.utils import in_worker_process
 from ouroboros.post_task_checkpoint import (
+    LatePhaseRun,
     POST_TASK_SYNTHESIS_INFLIGHT as _POST_TASK_SYNTHESIS_INFLIGHT,
     POST_TASK_SYNTHESIS_LOCK as _POST_TASK_SYNTHESIS_LOCK,
+    bind_late_phase_run,
     is_root_post_task as _is_root_post_task,
     post_task_synthesis_is_open as _post_task_synthesis_is_open,
     post_task_synthesis_is_terminal as _post_task_synthesis_is_terminal,
     root_checkpoint_roots as _root_checkpoint_roots,
     root_post_task_already_completed as _root_post_task_already_completed,
+    reset_late_phase_run,
+    root_post_task_paused as _root_post_task_paused,
     set_root_post_task_checkpoint as _set_root_post_task_checkpoint,
     settle_terminal_projection as _settle_terminal_projection,
 )
@@ -91,8 +95,9 @@ def _run_post_task_processing_async(
     on_reflection: Callable[[Dict[str, Any] | None, Any], None] | None = None,
     sealed_final: Dict[str, Any] | None = None,
     event_queue: Any = None,
+    resume: Dict[str, Any] | None = None,
 ) -> Dict[str, Any] | None:
-    """Run best-effort LLM-heavy post-task memory work off the reply path."""
+    """Run best-effort LLM-heavy post-task memory work off the reply path (``resume``: a saved late-phase Pause)."""
     task_snapshot = json.loads(json.dumps(task, ensure_ascii=False, default=str))
     trace_snapshot = json.loads(json.dumps(llm_trace, ensure_ascii=False, default=str))
     review_evidence_snapshot = json.loads(json.dumps(review_evidence, ensure_ascii=False, default=str))
@@ -125,6 +130,8 @@ def _run_post_task_processing_async(
         # The durable checkpoint owns paid idempotency; terminal roots never pay again.
         if _root_post_task_already_completed(env, task_snapshot):
             return None
+        if not resume and _root_post_task_paused(env, task_snapshot):
+            return None  # only the owner's Resume grant continues a saved late phase
         task_id = str(task_snapshot.get("id") or task_snapshot.get("task_id") or "")
         roots = _root_checkpoint_roots(env, task_snapshot)
         root_key = str(pathlib.Path(
@@ -142,7 +149,7 @@ def _run_post_task_processing_async(
     # boundary. No scoped worker or consolidation/model call may start first;
     # summary and reflection then receive this same object, while the existing
     # terminal checkpoint remains the only final accounting authority.
-    usage_snapshot = _pre_synthesis_usage_snapshot(env, task_snapshot, usage)
+    usage_snapshot = resume["usage_snapshot"] if resume else _pre_synthesis_usage_snapshot(env, task_snapshot, usage)
 
     # The owner's will while the synthesis is ALREADY billing (Stop-now after
     # the loop returned): one local predicate, consulted before EACH paid
@@ -169,12 +176,17 @@ def _run_post_task_processing_async(
     def _run_scoped() -> None:
         checkpoint_status = "degraded"
         skipped: list[str] = []
-        interrupted = ""
-        free_actions_applied = False
+        interrupted = current = ""
+        saved = resume or {}
+        free_actions_applied = bool(saved.get("free_actions_applied"))
+        completed: list[str] = list(saved.get("completed_stages") or ())
+        result.update(saved.get("result") or {})
+        late_token = bind_late_phase_run(late := LatePhaseRun(saved.get("marks"), saved.get("drafts")))
         try:
             # The free facts row precedes every paid stage, so neither Stop nor a
             # failed paid stage costs the card its facts; it is not a stage.
-            _record_task_facts(env, task_snapshot, usage_snapshot, trace_snapshot, drive_logs)
+            if not resume:
+                _record_task_facts(env, task_snapshot, usage_snapshot, trace_snapshot, drive_logs)
             from ouroboros.llm import LLMClient
             from ouroboros.memory import Memory
 
@@ -202,7 +214,7 @@ def _run_post_task_processing_async(
                 # Project facts stay scoped; generic process lessons remain global.
                 failure = ""
                 try:
-                    _update_improvement_backlog(env, reflection_entry)
+                    late_phase_step("promotion:backlog", lambda: _update_improvement_backlog(env, reflection_entry))
                 except Exception as error:
                     propagate_paid_interruption(error)
                     # A lost append or grooming pass is this stage's own typed
@@ -212,7 +224,7 @@ def _run_post_task_processing_async(
                 try:
                     from ouroboros.post_task_evolution import maybe_promote
 
-                    maybe_promote(env, task_snapshot, reflection_entry, llm_client)
+                    late_phase_step("promotion:promote", lambda: maybe_promote(env, task_snapshot, reflection_entry, llm_client))
                 except Exception as error:
                     propagate_paid_interruption(error)
                     # An ordinary chooser failure is this stage's own typed failure
@@ -220,7 +232,7 @@ def _run_post_task_processing_async(
                     failure = "promotion_failed"
                     log.warning("Post-task evolution promotion failed", exc_info=True)
                 if on_reflection is not None:
-                    on_reflection(reflection_entry, llm_client)
+                    late_phase_step("promotion:global", lambda: on_reflection(reflection_entry, llm_client))
                 return failure
 
             # All late model work belongs to this one scoped worker.  This keeps
@@ -231,7 +243,9 @@ def _run_post_task_processing_async(
                     env, task_memory, llm_client, task_snapshot, drive_logs)),
                 ("scratchpad_consolidation", lambda: _run_scratchpad_consolidation(
                     env, task_memory, llm_client)),
-                ("reflection", lambda: result.__setitem__("reflection_entry", _run_reflection(
+                ("reflection", (lambda: finish_published_reflection(env, task_snapshot, result["reflection_entry"]))
+                 if saved.get("stage") == "reflection" and result.get("reflection_entry") else
+                 lambda: result.__setitem__("reflection_entry", _run_reflection(
                     env, llm_client, task_snapshot, usage_snapshot, trace_snapshot,
                     review_evidence_snapshot, sealed_final=sealed_snapshot,
                     publish=lambda entry: result.__setitem__("reflection_entry", entry)))),
@@ -242,12 +256,15 @@ def _run_post_task_processing_async(
             )
             from ouroboros.usage_accounting import BudgetExceeded
 
-            stage_errors = False
+            stage_errors = bool(saved.get("stage_errors"))
             for index, (name, run_stage) in enumerate(stages):
+                if name in completed:
+                    continue
                 if _owner_stop_requested():
                     interrupted = "owner_stopped"
                     skipped = [stage for stage, _run in stages[index:]]
                     break
+                current = name
                 try:
                     stage_reason = run_stage()
                     if name == "reflection" and isinstance(result.get("reflection_entry"), dict):
@@ -280,21 +297,31 @@ def _run_post_task_processing_async(
                         break
                     stage_errors = True
                     log.warning("Post-task stage %s failed for %s", name, stage_task_id, exc_info=True)
+                completed.append(name)
             if not interrupted and not stage_errors:
                 checkpoint_status = "completed"
         except Exception:
             log.warning("Post-task setup failed for %s", stage_task_id, exc_info=True)
         finally:
+            if interrupted == "owner_pause" and _owner_stop_requested():  # Stop outranks Pause: nothing saved
+                interrupted, skipped = "owner_stopped", [current, *skipped]
             # Applying actions already produced by reflection is free and must
             # survive a later paid-stage refusal; never run the paid promotion here.
             if (result.get("reflection_entry") is not None
                     and interrupted not in {"owner_stopped", "cancelled", "finalize_requested"}
                     and not free_actions_applied):
                 _apply_free_reflection()
-            _set_root_post_task_checkpoint(
-                env, task_snapshot, checkpoint_status,
-                stop_reason=(f"{interrupted}:skipped={','.join(skipped)}" if interrupted else ""),
-            )
+            # The owner's Pause keeps the remainder (D10); a failed save stays an honest degraded.
+            if not (interrupted == "owner_pause" and park_late_phase(
+                    env, task_snapshot, current, [current, *skipped], completed, late=late, inputs=(
+                        usage, usage_snapshot, trace_snapshot, review_evidence_snapshot, sealed_snapshot, drive_logs,
+                        on_reflection), state=dict(result=dict(result), free_actions_applied=free_actions_applied,
+                                                   stage_errors=stage_errors))):
+                _set_root_post_task_checkpoint(
+                    env, task_snapshot, checkpoint_status,
+                    stop_reason=(f"{interrupted}:skipped={','.join(skipped)}" if interrupted else ""),
+                )
+            reset_late_phase_run(late_token)
             if post_task_key is not None:
                 with _POST_TASK_SYNTHESIS_LOCK:
                     _POST_TASK_SYNTHESIS_INFLIGHT.pop(post_task_key, None)
@@ -303,6 +330,8 @@ def _run_post_task_processing_async(
                 # Its terminal owner cleans up after the first save attempt.
                 from supervisor.terminal_delivery import cleanup_settled_owner_mailbox
                 cleanup_settled_owner_mailbox(intent_root, stage_task_id, task_snapshot)
+                from supervisor.owner_pause_control import late_phase_settled
+                late_phase_settled(intent_root, stage_task_id)
 
     from ouroboros.model_wait import current_model_wait, task_model_wait_scope
     parent_wait = current_model_wait()
@@ -356,7 +385,7 @@ def _run_post_task_processing_async(
 
 def recover_pending_root_post_task_synthesis(
     drive_root: Any, repo_dir: Any = None,
-    *, exclude_task_ids: frozenset[str] = frozenset(),
+    *, exclude_task_ids: frozenset[str] = frozenset(), resume_task_id: str = "",
 ) -> int:
     """Resume an undispatched root synthesis; degrade an indeterminate one.
 
@@ -365,11 +394,16 @@ def recover_pending_root_post_task_synthesis(
     duplicate while the recovered thread is alive.  After restart only
     ``pending_once`` is replay-safe: ``running`` may have crossed a paid provider
     boundary, so it becomes terminal ``degraded`` instead of repeating calls.
+    A ``paused`` late phase is kept and never auto-runs (an unconsumed Resume
+    grant is revoked); ``resume_task_id`` consumes that root's live grant.
     """
     from types import SimpleNamespace
+    from ouroboros.post_task_synthesis import resume_paused_late_phase, revoke_late_phase_grant
     from ouroboros.task_results import list_task_results
 
     root = pathlib.Path(drive_root).resolve(strict=False)
+    if resume_task_id:
+        return int(resume_paused_late_phase(root, repo_dir or root.parent, str(resume_task_id)))
     try:
         rows = list_task_results(root)
     except Exception:
@@ -391,6 +425,15 @@ def recover_pending_root_post_task_synthesis(
             # existing startup scan: no model call, no new timer, no new store. It is not
             # counted as a recovered synthesis, which is what this number means.
             _settle_terminal_projection(root, task_id, task={**stored, "id": task_id})
+            continue
+        if phase == "paused":
+            try:
+                revoke_late_phase_grant(root, task_id, reason="restart_no_resume")
+            except Exception:
+                log.warning("Late-phase Resume grant of %s was not revoked at restart", task_id, exc_info=True)
+            from supervisor.owner_pause_control import retain_late_phase_latch
+
+            retain_late_phase_latch(root, task_id)
             continue
         task = {**stored, "id": task_id, "root_task_id": str(stored.get("root_task_id") or task_id)}
         task.setdefault("budget_drive_root", str(root))
@@ -1422,4 +1465,7 @@ from ouroboros.post_task_synthesis import (  # noqa: E402, F401 -- intentional p
     _run_chat_consolidation,
     _run_scratchpad_consolidation,
     _run_reflection,
+    finish_published_reflection,
+    late_phase_step,
+    park_late_phase,
 )

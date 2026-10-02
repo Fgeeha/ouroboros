@@ -58,7 +58,9 @@ def test_failed_pre_handoff_proof_never_sends(host, tmp_path, monkeypatch, bound
             patch.setattr(task_admission, 'write_task_result' if boundary == 'result_raise'
                           else 'load_task_result', unavailable)
         workers.assign_tasks()
-    assert not sent and host.pending[0]['admitted_dispatch'] == 'possible'
+    # A refused claim snapshot sent nothing and keeps its never-sent fact (Batch4:
+    # reserved-but-unsent work is not sent); a failed later proof keeps 'possible'.
+    assert not sent and host.pending[0]['admitted_dispatch'] == ('none' if boundary.startswith('snapshot') else 'possible')
     assert 'held' not in queue.RUNNING
     # This process still owns the unhanded row; its normal assignment can retry
     # persistence. A restored row below has no such local custody proof.

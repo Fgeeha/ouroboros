@@ -433,6 +433,9 @@ def test_plan_task_argument_refusals_are_typed_at_the_registry_boundary(
 
     registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
     registry._ctx.task_id = "t46"  # answers beside an envelope are validated against the task's state
+    from ouroboros.task_results import write_task_result
+
+    write_task_result(tmp_path, "t46", "running", root_task_id="t46", task_attempt=1)
     monkeypatch.setattr(safety, "check_safety", lambda *_args, **_kwargs: (True, ""))
     monkeypatch.setattr(
         plan_review,

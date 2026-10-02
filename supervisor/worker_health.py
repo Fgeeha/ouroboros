@@ -256,6 +256,7 @@ def recover_confirmed_dead_worker(job: dict) -> None:
         with _queue_lock:
             if not _dead_job_is_current(job):
                 return
+            _retire_dead_model_consumers(job)
         if ready:
             _finish_self_finalized_task(
                 queue, _pool(), task, task_id, str(task.get("type") or ""),
@@ -277,6 +278,73 @@ def recover_confirmed_dead_worker(job: dict) -> None:
                          and str(_pool().DRIVE_ROOT) == job["drive_root"])
             if owned:
                 _respawn_after_reap(queue, _pool(), job["worker_id"], expected_worker=w)
+
+
+def retire_confirmed_worker_consumers(worker: Any, meta: dict | None) -> None:
+    """Reuse exact current pool ownership at every confirmed kill/join door.
+
+    Call under the queue lock before removing the captured RUNNING/worker row.
+    """
+    if not isinstance(meta, dict) or not isinstance(meta.get("task"), dict):
+        return
+    task = meta["task"]
+    _retire_dead_model_consumers({"worker": worker, "worker_id": worker.wid,
+        "task_id": str(task.get("id") or ""), "task": task, "meta": meta,
+        "attempt": int(meta.get("attempt") or task.get("_attempt") or 1),
+        "drive_root": str(_pool().DRIVE_ROOT)})
+
+
+def _retire_dead_model_consumers(job: dict, *, captured_timeout: bool = False) -> None:
+    """Queue-locked exact death proof, never PID absence or task terminality.
+
+    Timeout transfers ownership from RUNNING to its captured reaper job; the
+    other doors retain RUNNING until retirement. Each uses its existing current-
+    owner check, plus the same retained birth/Process/task/attempt proof below.
+    Unreadable/legacy evidence stays held; money and other custody are untouched.
+    """
+    worker = job["worker"]
+    birth = getattr(worker, "process_birth", "")
+    if captured_timeout:
+        from supervisor import queue
+        from supervisor.task_reaper import _timeout_job_is_current
+        current = _timeout_job_is_current(job, queue, _pool())
+    else:
+        current = _dead_job_is_current(job)
+    if (not isinstance(birth, str) or not birth or worker.proc.exitcode is None
+            or worker.proc.is_alive() or not current):
+        return
+    if (not isinstance(job.get("meta"), dict)
+            or job["meta"].get("task", {}).get("id") != job["task_id"]
+            or job["task"].get("id") != job["task_id"]):
+        return
+    try:
+        from ouroboros.tool_custody import retire_tool_invocations
+        retire_tool_invocations(
+            pathlib.Path(job["task"].get("budget_drive_root") or job["drive_root"]),
+            job["task_id"], str(job["task"].get("root_task_id") or job["task_id"]),
+            pid=worker.proc.pid, process_birth=birth, task_attempt=job["attempt"])
+    except Exception:
+        log.warning("Confirmed worker death could not retire tool invocations for %s", job["task_id"], exc_info=True)
+    try:
+        from ouroboros.usage_accounting import _memoized_final_rows
+        from ouroboros.model_wait import retire_model_consumers
+
+        root = pathlib.Path(job["task"].get("budget_drive_root") or job["drive_root"])
+        rows, integrity, _memo, _generation = _memoized_final_rows(root)
+        if not integrity:
+            raise ValueError("model consumer death custody unreadable")
+        consumers = {row["local_answer_consumer_id"]: job["attempt"] for row in rows
+                     if row.get("task_id") == job["task_id"]
+                     and row.get("root_task_id") == (job["task"].get("root_task_id") or job["task_id"])
+                     and row.get("local_answer_owner_pid") == worker.proc.pid
+                     and row.get("local_answer_owner_birth") == birth
+                     and type(row.get("local_answer_task_attempt")) is int
+                     and row["local_answer_task_attempt"] == job["attempt"]
+                     and isinstance(row.get("local_answer_consumer_id"), str) and row["local_answer_consumer_id"]}
+        if consumers:
+            retire_model_consumers(root, job["task_id"], consumers)
+    except Exception:
+        log.warning("Confirmed worker death could not retire model consumers for %s", job["task_id"], exc_info=True)
 
 
 def _complete_exact_budget_pause_after_death(job: dict, root: pathlib.Path, task: dict,

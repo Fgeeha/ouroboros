@@ -10,7 +10,7 @@ import { createChatDecision } from './chat_decision.js';
 import { bindProjectWorkPointer } from './project_work_pointer.js';
 import { createModelWaitController, isModelWaitReference } from './model_wait.js';
 import { clientSurfaceField } from './client_surface.js';
-import { syncResultFilesItem } from './result_files.js';
+import { syncSettledItems } from './settled_card.js';
 import { createChatReadingPosition } from './chat_reading_position.js';
 import { createChatHistoryPager, historyCoverage, historyIslandAtEdge } from './chat_history.js';
 import { createProjectReadReceipt, isAtNewestMessage } from './project_read_state.js';
@@ -58,6 +58,7 @@ import {
     setLiveCardTypingVisible,
     setHistoricalUnavailable,
     setHistoricalUnconfirmed,
+    syncParkedPhase,
 } from './task_phase_chip.js';
 import {
     loadSkillReviewDetail,
@@ -100,6 +101,7 @@ import {
     clearStickyCardState,
     clearTransientRoutingAnnotations,
     confirmAndSendPanic,
+    confirmAndSendRestart,
     computeDerivedChatStatus,
     computeHydratedDirectActivities,
     documentMessageKey,
@@ -173,7 +175,7 @@ export {
 };
 
 const PROJECT_ROW_TYPES = new Set(['project_started', 'project_handoff', 'project_completion_summary']);
-// HOST placement: custody warns; settled reviews read as results.
+// Host placement: custody warns; settled reviews show results.
 const CARD_ROW_PHASES = new Map([['timeline', 'warn'], ['reviews', 'result']]);
 const CHAT_STORAGE_KEY = 'ouro_chat';
 const CHAT_DRAFT_KEY = 'ouro_chat_draft';
@@ -1168,9 +1170,9 @@ export function createChatInstance({
         });
     }
 
-    // Detail reads refresh files/history, preserving lifecycle.
+    // Refresh files/history; retain lifecycle.
     function noteTaskDetails(record, detail) {
-        const files = syncResultFilesItem(record, detail);
+        const files = syncSettledItems(record, detail);
         const history = syncHistoryRetentionItem(record, detail);
         return Boolean((files || history) && (renderLiveCardMeta(record), updateLiveCardCount(record), renderLiveCardTimeline(record), true));
     }
@@ -1216,9 +1218,9 @@ export function createChatInstance({
         return lifecycle.classification === 'source_incomplete' ? false : undefined;
     }
 
-    // Host placement/task/card keys own content-only rows; phase/expansion stay.
-    // Reviews rehydrate; read failure keeps rows. Unkeyed rows stay bubbles.
-    // Pass 2 uses pass-1 cards, with no type allowlist.
+    // Host keys place content without changing phase/expansion.
+    // Reviews rehydrate; failures retain rows, unkeyed rows stay bubbles.
+    // Pass 2 uses pass-1 cards without a type allowlist.
     function isPlacedCardRow(msg) {
         return CARD_ROW_PHASES.has(taskKey(msg?.card_row)) && !!taskKey(msg?.task_id);
     }
@@ -1428,7 +1430,7 @@ export function createChatInstance({
         if (!tid || !nm) return false;
         const record = liveCardRecords.get(tid);
         if (!record) {
-            // task_named is broadcast to every instance, so bound the early-name buffer.
+            // task_named reaches every instance, so bound the early-name buffer.
             pendingSuggestedNames.set(tid, nm);
             if (pendingSuggestedNames.size > 100) {
                 pendingSuggestedNames.delete(pendingSuggestedNames.keys().next().value);
@@ -1611,8 +1613,7 @@ export function createChatInstance({
     window.addEventListener('ouro:page-shown', handlePageShown);
     document.addEventListener('visibilitychange', handlePageShown);
 
-    // Beyond the 4000-char WS preview: fetch/cache on expansion, bound scrolling,
-    // render only while expanded; failure keeps the preview.
+    // Beyond the 4000-char preview: fetch/cache on expansion, bounded scroll, render while expanded.
     async function fetchFullLineOutput(item, record) {
         item._fetchingFull = true;
         let changed = false;
@@ -1878,6 +1879,7 @@ export function createChatInstance({
         const record = getLiveCardRecord(taskId);
         changed = noteTaskDetails(record, msg) || changed;
         noteDirectTurn(record, msg?._is_direct_chat);
+        syncSettledItems(record, msg);
         changed = Boolean(record.reviewController?.updateMany(reviewGroupsFromTaskDetail(msg, taskId))) || changed;
         if (finalizing && !record.finished) record.finalizingHold = true;
         changed = applyLiveCardState(
@@ -2520,7 +2522,7 @@ export function createChatInstance({
                     const taskId = msg.task_id || '';
                     if (msg.system_type === 'project_question_pointer') { chatDecision.appendQuestionPointer(msg); continue; }
                     if (isReplayEvidenceRow(msg)) continue;
-                    // Owner-bound reviews attached in pass 1 are not terminal chat bubbles.
+                    // Owner-bound reviews attached in pass 1 are not terminal bubbles.
                     if (
                         admitCardMetadata(msg) !== undefined
                         || attachReviewFromRow(msg, msg.ts || '', true) !== undefined
@@ -2716,7 +2718,7 @@ export function createChatInstance({
             try {
                 // No welcome until this read lands.
                 emptyWelcome?.historyPending();
-                // An empty feed shows the read in flight (#1102); a painted one is left alone.
+                // An empty feed shows the read in flight (#1102); a painted one stays.
                 if (historyControls.beginRecent()) syncLoadOlderControl();
                 const data = await fetchHistory(null);
                 // Closed rooms do not consume late responses.
@@ -2801,7 +2803,7 @@ export function createChatInstance({
                 lastHistorySyncSucceeded = false;
                 emptyWelcome?.historyRead(false);
                 initialHydrationPromise = null;
-                // Never leave an empty feed blank: the failure and its Retry replace the loading state.
+                // Never leave an empty feed blank: failure and Retry replace the loading state.
                 historyControls.endRecent(err); syncLoadOlderControl();
                 const socketState = ws?.ws?.readyState;
                 const expectedDisconnect = socketState !== WebSocket.OPEN;
@@ -3213,7 +3215,7 @@ export function createChatInstance({
             return;
         }
         if (command === 'restart') {
-            ws.send({ type: 'command', cmd: '/restart' });
+            await confirmAndSendRestart({ openConfirmDialog, ws });
             return;
         }
         if (command === 'panic') {
@@ -3308,7 +3310,7 @@ export function createChatInstance({
             && [record.summaryButtonEl, record.reviewsHostEl].some(node => historyNodeIsProtected(node, messagesDiv)));
     }
 
-    // One retirement path for a message node: its media, decision views and markdown go with it.
+    // One retirement path per message node: media, decision views and markdown go with it.
     function releaseMessageNode(node) {
         chatMedia.release(node); chatDecision.releaseViews(node); destroyChatMarkdown(node); node.remove();
     }
@@ -3570,10 +3572,12 @@ export function createChatInstance({
         );
         activeDirectActivities.clear();
         for (const [k, v] of nextMap.entries()) {
+            const record = liveCardRecords.get(k);
             activeDirectActivities.set(k, v);
             restoreCardActivity(liveCardRecords.get(k), v.project_admission_hold);
-            markReviewAnchor(liveCardRecords.get(k));
-            noteDirectTurn(liveCardRecords.get(k), v.kind !== 'managed_task');
+            syncParkedPhase(record, v.phase);
+            markReviewAnchor(record);
+            noteDirectTurn(record, v.kind !== 'managed_task');
             if (v.kind === 'managed_task') missingManagedTaskIds.delete(k);
             if (v.clientMessageId) pendingSubmissions.delete(v.clientMessageId);
         }

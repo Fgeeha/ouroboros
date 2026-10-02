@@ -3,11 +3,12 @@
 The display memo/render cache permits explicitly stale presentation. The
 separate existing writer view is generation-bound and strict: complete records,
 last attempt rows, validation state/late-receipt rights and reversible exact cash
-by root advance together under the monetary lock. Ordinary cold/replaced views
+by root and billing group advance together under the monetary lock. Ordinary cold/replaced views
 prepare outside the lock and reconcile their suffix after identity/CAS proof.
 Only exceptional corruption repair uses the authoritative locked full replay.
-Strict readers share that preparation; display memos capture its row references.
-Public full-record/resume readers retain detached snapshots; writers borrow private state.
+Money/authority readers also prepare recoverable original bindings from the
+verified archive chain; display and raw-record readers never initiate that work.
+Display memos capture row references; public records detach, writers borrow.
 
 ``usage_accounting`` re-binds every name here, and the implementation resolves
 the substrate (``_locked``, ``_read_records_locked``, ...) through the
@@ -34,7 +35,8 @@ from ouroboros.runtime_limits import (
     USAGE_DISPLAY_REVALIDATE_AFTER_SEC,
 )
 from ouroboros.usage_ledger import QUARANTINE_REL, LedgerResumeState, UsageLockUnavailable, is_abandoned_settlement
-from ouroboros._usage_money import monetary_scope_key, ZERO_CASH, cash_contribution, change_cash, render_cash, exceeds_limit
+from ouroboros._usage_money import billing_group_key, monetary_scope_key, ZERO_CASH, cash_contribution, change_cash, render_cash, exceeds_limit
+from ouroboros._usage_rows import BindingIndex
 
 log = logging.getLogger(__name__)
 
@@ -99,7 +101,7 @@ def _memoized_final_rows(root: pathlib.Path, *, allow_stale: bool = False):
             return stale
     acquisition = (lambda path: ua._locked(path, timeout_sec=USAGE_DISPLAY_LOCK_TIMEOUT_SEC)) if allow_stale else None
     try:
-        with _writer_locked(root, acquisition=acquisition) as view:
+        with _writer_locked(root, acquisition=acquisition, recover_bindings=False) as view:
             resume = view.resume
             # Identity distinguishes rebuilt views even if their stat fingerprint
             # matches. Never retain resume.states/late_receipt_ids: they mutate.
@@ -135,7 +137,7 @@ def read_usage_records(root: pathlib.Path, *, final_only: bool = False) -> list:
     compatible locked reader below; do not recursively acquire the lock here.
     """
     root = _ua()._drive_root(root)
-    with _writer_locked(root) as view:
+    with _writer_locked(root, recover_bindings=False) as view:
         rows = list(view.finals.values()) if final_only else list(view.records)
     return copy.deepcopy(rows)
 
@@ -197,6 +199,9 @@ class _LedgerWriterView:
     finals: dict = field(default_factory=dict)
     cash: tuple = ZERO_CASH
     roots: dict = field(default_factory=dict)
+    groups: dict = field(default_factory=dict)
+    bindings: BindingIndex = field(default_factory=BindingIndex)
+    binding_archive: tuple | None = None
     fold_times: list = field(default_factory=list)
 
     def fold(self, rows: list) -> None:
@@ -211,8 +216,13 @@ class _LedgerWriterView:
             if previous:
                 root = monetary_scope_key(previous)
                 self.roots[root] = change_cash(self.roots[root], old)
+                group = billing_group_key(previous)
+                self.groups[group] = change_cash(self.groups[group], old)
             root = monetary_scope_key(row)
             self.roots[root] = change_cash(self.roots.get(root, ZERO_CASH), new=new)
+            group = billing_group_key(row)
+            self.groups[group] = change_cash(self.groups.get(group, ZERO_CASH), new=new)
+            self.bindings.fold(row)
             self.finals[identity] = row
             eligible = fold_eligible_at(row)
             if eligible is not None:
@@ -228,12 +238,18 @@ class _LedgerWriterView:
             heapq.heappop(self.fold_times)  # superseded late receipt, once per update
         return False
 
-    def summary(self, root_task_id: str | None = None) -> dict:
-        return render_cash(self.cash if root_task_id is None else self.roots.get(root_task_id, ZERO_CASH))
+    def totals(self, root_task_id=None, billing_group_id=None):
+        if root_task_id is not None and billing_group_id is not None:
+            raise ValueError("select one monetary axis")
+        if billing_group_id is not None:
+            return self.groups.get(billing_group_id, ZERO_CASH)
+        return self.cash if root_task_id is None else self.roots.get(root_task_id, ZERO_CASH)
 
-    def exceeds_limit(self, limit, bound=None, *, root_task_id=None, dispatch=False):
-        total = self.cash if root_task_id is None else self.roots.get(root_task_id, ZERO_CASH)
-        return exceeds_limit(total, limit, bound, dispatch=dispatch)
+    def summary(self, root_task_id: str | None = None, *, billing_group_id=None) -> dict:
+        return render_cash(self.totals(root_task_id, billing_group_id))
+
+    def exceeds_limit(self, limit, bound=None, *, root_task_id=None, billing_group_id=None, dispatch=False):
+        return exceeds_limit(self.totals(root_task_id, billing_group_id), limit, bound, dispatch=dispatch)
 
     def append(self, root: pathlib.Path, rows: list) -> list:
         ua = _ua()
@@ -341,6 +357,24 @@ def _writer_generation_matches(root: pathlib.Path, view: _LedgerWriterView) -> b
             and size >= resume.size and (size != resume.size or mtime == resume.st_mtime_ns))
 
 
+def _bindings_current(view: _LedgerWriterView) -> bool:
+    from ouroboros.usage_compaction import original_bindings_current
+    return not view.bindings.recovery or (view.binding_archive is not None
+                                         and original_bindings_current(view.binding_archive))
+
+
+def prepared_original_bindings(root: pathlib.Path) -> BindingIndex | None:
+    """Borrow already-proved authority for locked compaction, never read archives.
+
+    An unprepared explicit compaction preserves UNKNOWN; its archived source
+    still permits later off-lock recovery. Ordinary reservations prepare first.
+    """
+    with _LEDGER_READ_CACHE_LOCK:
+        view = _LEDGER_READ_CACHE.get(str(root.resolve(strict=False)))
+    return (view.bindings if view is not None and _writer_generation_matches(root, view)
+            and _bindings_current(view) else None)
+
+
 def _advance_writer(root: pathlib.Path, view: _LedgerWriterView) -> bool:
     ua = _ua()
     delta = ua._read_new_records_locked(root, view.resume, private=True)
@@ -354,7 +388,7 @@ def _advance_writer(root: pathlib.Path, view: _LedgerWriterView) -> bool:
 
 
 @contextlib.contextmanager
-def _writer_locked(root: pathlib.Path, *, before_read=None, acquisition=None):
+def _writer_locked(root: pathlib.Path, *, before_read=None, acquisition=None, recover_bindings=True):
     """Prepare outside, prove and reconcile inside, then lend one private view.
 
     Replacement (including a compaction in this acquisition) releases the lock
@@ -368,16 +402,22 @@ def _writer_locked(root: pathlib.Path, *, before_read=None, acquisition=None):
         with _LEDGER_READ_CACHE_LOCK:
             expected = _LEDGER_READ_CACHE.get(key)
         prepared = None
-        needs_preparation = expected is None or not _writer_generation_matches(root, expected)
+        needs_preparation = (expected is None or not _writer_generation_matches(root, expected)
+                             or (recover_bindings and not _bindings_current(expected)))
         if needs_preparation:
             prepared = _prepare_writer(root)
             if prepared is _PREPARATION_CHANGED:
                 continue
+            if prepared is not None and recover_bindings and prepared.bindings.recovery:
+                from ouroboros.usage_compaction import prepare_original_bindings
+                prior, prepared.binding_archive = prepare_original_bindings(root, prepared.records[0])
+                prepared.bindings.recover_from(prior)
         with (acquisition(root) if acquisition else ua._locked(root)) as heartbeat:
             with _LEDGER_READ_CACHE_LOCK:
                 view = _LEDGER_READ_CACHE.get(key)
             try:
-                if view is not None and _writer_generation_matches(root, view):
+                if (view is not None and _writer_generation_matches(root, view)
+                        and (not recover_bindings or _bindings_current(view))):
                     if not _advance_writer(root, view):
                         # Only an invalid suffix requires locked quarantine.
                         records = ua._read_records_locked(root)
@@ -393,6 +433,8 @@ def _writer_locked(root: pathlib.Path, *, before_read=None, acquisition=None):
                 else:
                     continue
                 _ledger_cache_put(key, view)
+                if recover_bindings and not _bindings_current(view):
+                    continue  # locked quarantine rebuilt it: prepare recovery outside
                 if before_read:
                     generation = _writer_generation(root)
                     before_read(heartbeat, view)

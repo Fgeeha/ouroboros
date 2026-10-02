@@ -114,6 +114,7 @@ def probe_oversized_context(
                 task_id="system:capability_probe",
                 root_task_id="system:capability_probe",
                 category="capability_probe",
+                non_task_operation=True,
                 source="capability_probe",
             )):
                 response = dispatch()
@@ -385,6 +386,7 @@ def probe_provider_readiness(
             task_id="system:provider_test",
             root_task_id="system:provider_test",
             category="provider_test",
+            non_task_operation=True,
             source="provider_test",
         )), physical_attempt_limit(1):
             response = _accounted_send(

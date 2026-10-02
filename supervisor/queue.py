@@ -286,6 +286,19 @@ def enqueue_task(
             if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
                 ADMISSION_RESERVATIONS.pop(task_id, None)
             return t
+        if not restoring_snapshot and task_id and str(t.get("root_task_id") or task_id) == task_id:
+            from ouroboros.config import runtime_setting
+            from ouroboros.usage_admission import task_billing_fields, UNAVAILABLE_GROUP_PREFIX
+
+            limit = float(runtime_setting("OUROBOROS_PER_TASK_COST_USD", "0") or 0)
+            binding = task_billing_fields(t, task_id, limit if limit > 0 else None,
+                                          t.get("budget_drive_root") or DRIVE_ROOT, pin_initial=True,
+                                          persist_initial=False)
+            if str(binding["billing_group_id"]).startswith(UNAVAILABLE_GROUP_PREFIX):
+                t["_admission_blocked"] = "billing_authority_unavailable"
+                return t
+            t.setdefault("metadata", {})["billing_group"] = {k: v for k, v in binding.items()
+                                                             if k.startswith("billing_group_")}
         QUEUE_SEQ_COUNTER_REF["value"] += 1
         seq = QUEUE_SEQ_COUNTER_REF["value"]
         t["priority"] = coerce_queue_order(t.get("priority"), _task_priority(str(t.get("type") or "")))
@@ -295,12 +308,15 @@ def enqueue_task(
         t["queued_at"] = utc_now_iso()
         if admission_token:
             t["_admission_owner_token"] = admission_token
+        from contextlib import nullcontext
+        from supervisor.followup_policy import scheduled_start
         from ouroboros.project_admission import host_unscoped
         from ouroboros.projects_registry import (
             ProjectAdmissionError, project_admission_guard, project_admission_view,
             task_project_membership, validate_project_admission,
         )
 
+        lookup = "project_routing_fence_lookup_failed"  # the authority whose read failed
         try:
             if has_project_admission:
                 validate_project_admission(project_admission)
@@ -322,20 +338,28 @@ def enqueue_task(
                         raise ProjectAdmissionError("project_routing_fence_changed", "The registered Project is missing.")
             if project_admission is not None and project_admission["project_id"] != project_id:
                 raise ProjectAdmissionError("project_routing_fence_changed", "The prepared Project scope changed.")
-            if project_id:
-                with project_admission_guard(DRIVE_ROOT, project_admission):
-                    # Recovery keeps the resource actually admitted, without a
-                    # transient derived-selection census or current-folder substitution.
-                    t["_project_admission"] = {key: value for key, value in project_admission.items()
-                                               if key != "workspace_claims"}
-                    t["_project_admission"]["frozen"] = True
+            # Preparation/allowance reads precede these short control locks.
+            # Restoring custody is not a new admission or permission to launch.
+            lookup = "followup_control_wait"
+            with (nullcontext(True) if restoring_snapshot else scheduled_start(DRIVE_ROOT, t)) as allowed:
+                lookup = "project_routing_fence_lookup_failed"
+                if not allowed:
+                    t["_admission_blocked"] = "followup_control_wait"
+                    return t
+                if project_id:
+                    with project_admission_guard(DRIVE_ROOT, project_admission):
+                        # Recovery keeps the resource actually admitted, without a
+                        # transient derived-selection census or current-folder substitution.
+                        t["_project_admission"] = {key: value for key, value in project_admission.items()
+                                                   if key != "workspace_claims"}
+                        t["_project_admission"]["frozen"] = True
+                        PENDING.append(t)
+                else:
+                    if not restoring_snapshot and not has_project_admission:
+                        t["_project_scope_none"] = True
                     PENDING.append(t)
-            else:
-                if not restoring_snapshot and not has_project_admission:
-                    t["_project_scope_none"] = True
-                PENDING.append(t)
         except (OSError, ValueError, TypeError, RuntimeError) as exc:
-            t.update(_admission_blocked=getattr(exc, "reason", "project_routing_fence_lookup_failed"),
+            t.update(_admission_blocked=getattr(exc, "reason", lookup),
                      _admission_detail=str(exc), _project_id=project_id,
                      _project_lifecycle=getattr(exc, "lifecycle", ""),
                      _admission_never_admitted=True)
@@ -355,6 +379,48 @@ def enqueue_task(
         if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
             ADMISSION_RESERVATIONS.pop(task_id, None)
     return t
+
+
+def ensure_control_task_result(task_id: str) -> Dict[str, Any]:
+    """Seed absent pooled lifecycle authority for a control, never from an ID alone.
+
+    Queue membership owns the facts for every admission producer (review,
+    evolution, assisted update and restore included). Keep the lock through
+    create-only publication; a concurrent worker/terminal writer wins unchanged.
+    Billing and direct-chat operations never create lifecycle rows here.
+    """
+    from ouroboros.task_results import load_task_result, resolve_task_lineage, write_task_result
+
+    with _queue_lock:
+        meta = RUNNING.get(task_id)
+        task = meta.get("task") if isinstance(meta, dict) else None
+        status = "running" if isinstance(task, dict) else "scheduled"
+        if not isinstance(task, dict):
+            task = next((row for row in PENDING if row.get("id") == task_id), None)
+        if not isinstance(task, dict) or task.get("id") != task_id or task.get("_admission_blocked"):
+            raise ValueError("control requires an admitted pooled task")
+        root = pathlib.Path(task.get("budget_drive_root") or DRIVE_ROOT)
+        existing = load_task_result(root, task_id, strict=True)
+        if existing is not None:
+            return existing
+        fields = {key: task[key] for key in (
+            "type", "chat_id", "metadata", "task_contract", "root_task_id", "parent_task_id",
+            "delegation_role", "project_id", "workspace_root", "workspace_mode", "memory_mode",
+            "budget_drive_root", "queued_at", "admitted_dispatch", "_admission_owner_token",
+            "origin_message_text", "origin_message_ref", "objective", "title", "suggested_name",
+            "original_task_id", "timeout_retry_from", "deadline_at", "root_cost_ceiling_usd",
+            "billing_group", "task_constraint", "objective_author", "owner_corpus", "task_group_id", "task_group",
+        ) if key in task}
+        fields["root_task_id"] = resolve_task_lineage(task_id, **{
+            key: task.get(key) for key in ("metadata", "root_task_id", "parent_task_id", "delegation_role",
+                                          "original_task_id", "timeout_retry_from")})["root_task_id"]
+        fields["description"] = task.get("description") or task.get("text") or ""
+        # The host attempt key the assignment mirror and the executor's start copy write:
+        # a split root's copyback authenticates its terminal time against it (terminal_time).
+        fields["task_attempt"] = int((meta.get("attempt") if status == "running" else 0) or task.get("_attempt") or 1)
+        if status == "running":
+            fields["started_at"] = meta.get("started_at")
+        return write_task_result(root, task_id, status, create_only=True, strict_existing_dict=True, **fields)
 
 
 def live_consciousness_root_count() -> int:

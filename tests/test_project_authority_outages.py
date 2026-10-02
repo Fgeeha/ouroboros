@@ -95,7 +95,9 @@ def test_first_restore_keeps_accepted_project_row_waiting_through_unreadable_res
         assert project_hold_fact(held)["label"] == "Waiting for Project verification"
         assert queue.persist_queue_snapshot()
     census = {row["activity_id"]: row for row in _chat_activities_snapshot_safe(host.root, availability={})}
-    assert census["held"]["phase"] == "queued"  # the same accepted id stays visible, waiting
+    # The same accepted id stays visible; its unreadable result is also unreadable
+    # Pause authority, so Batch4 reports `unknown` rather than a guessed queue phase.
+    assert census["held"]["phase"] == "unknown"
     assert census["held"]["project_admission_hold"]["label"] == "Waiting for Project verification"
     sent = worker(host, monkeypatch)
     workers.assign_tasks()

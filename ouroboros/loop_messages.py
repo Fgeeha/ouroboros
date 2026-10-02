@@ -261,7 +261,9 @@ def _initialize_owner_directives(ctx: Any, messages: List[Dict[str, Any]]) -> No
     metadata = getattr(ctx, "task_metadata", None)
     metadata = metadata if isinstance(metadata, dict) else {}
     author = metadata.get("objective_author")
-    if isinstance(author, dict) and author.get("kind") == "task":
+    # A task-drafted objective, or the host's Continue work order (its facts are
+    # the host's; the owner's exact words ride ``owner_corpus``).
+    if isinstance(author, dict) and author.get("kind") in {"task", "continuation"}:
         for row in metadata.get("owner_corpus") or []:
             if isinstance(row, dict) and row.get("source") in {
                     "owner_mailbox", "owner_quiz_answer", "origin_message", "owner_corpus", "direct_incoming",

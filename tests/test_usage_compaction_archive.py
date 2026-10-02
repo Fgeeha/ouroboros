@@ -149,7 +149,7 @@ def test_a_same_size_rewrite_is_caught_once_the_cache_entry_expires(data_root, c
     assert uc.archived_attempt_ids(data_root)
     _rewrite_segment_in_place(segment, b'"sett1ed"')
     entry = uc._SEGMENT_CACHE[str(segment)]
-    uc._SEGMENT_CACHE[str(segment)] = entry[:4] + (entry[4] - 3600,)
+    uc._SEGMENT_CACHE[str(segment)] = entry[:4] + (entry[4] - 3600,) + entry[5:]
 
     with pytest.raises(UsageLedgerCorrupt):
         uc.archived_attempt_ids(data_root)

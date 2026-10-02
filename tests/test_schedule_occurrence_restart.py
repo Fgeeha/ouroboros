@@ -95,7 +95,7 @@ def test_refusal_never_overrides_current_admission_or_unknown_source(q, monkeypa
         frozen = {"id": task_id, "type": "task", "text": "ACCEPTED ORIGINAL", "chat_id": 42,
                   "metadata": {"schedule_occurrence": {"schedule_id": "s1", "token": token}}}
         write_task_result(q.root, task_id, "scheduled", schedule_admission={
-            "token": token, "dispatch": "none", "task": frozen},
+            "schedule_id": "s1", "token": token, "dispatch": "none", "task": frozen},
             **({"_owner_hold": {"source": "owner", "revision": "latest"}} if case == "owner_hold" else {}))
     for _ in range(2):
         q.queue.check_scheduled_tasks()
@@ -192,7 +192,8 @@ if stage == "claim":
         context = ToolContext(repo_dir=repo, drive_root=root, task_id="origin", project_id="proj")
         context.is_direct_chat = True
         context.chat_id = 42
-        answer = _handle_schedule_followup(context, run_at="2000-01-01T00:00:00+00:00", objective="continue")
+        answer = _handle_schedule_followup(context, run_at="2000-01-01T00:00:00+00:00", objective="continue",
+                                           relation="independent")
         assert answer.startswith("FOLLOWUP_SCHEDULED"), answer
     else:
         _api(q, {"id": "s1", "name": "owner schedule", "trigger": {"type": "once", "run_at": "2000-01-01T00:00:00+00:00"},
@@ -377,7 +378,8 @@ def test_clock_enrichment_does_not_cross_frozen_occurrence_identity(q, monkeypat
     timing[mismatch] = "foreign"
     task = {"id": "task", "text": "frozen", "metadata": {"schedule_occurrence": timing}}
     result = {"status": "scheduled", "schedule_admission": {
-        "token": "our-token", "dispatch": "none", "task": task, "due_at": "2000-01-01T00:00:00+00:00"}}
+        "schedule_id": "schedule", "token": "our-token", "dispatch": "none", "task": task,
+        "due_at": "2000-01-01T00:00:00+00:00"}}
     monkeypatch.setattr(occurrence, "_read_back", lambda *_a, **_kw: copy.deepcopy(result))
     verdict, projected = occurrence.reconcile(row)
     assert verdict == "republish" and projected == task

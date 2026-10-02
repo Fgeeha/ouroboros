@@ -1,11 +1,27 @@
-"""Durable root post-task phase and final-cost checkpoint helpers."""
+"""Durable root post-task phase and final-cost checkpoint helpers.
+
+Owner D10 (late-phase Pause, soft same-task Resume): after the answer is
+delivered, the root's post-task synthesis is the same task's remaining work.
+An owner Pause reaching it at a paid boundary leaves the open, non-terminal
+``post_task_synthesis="paused"`` with one ``post_task_pause`` record: the
+interrupted stage, the completed stages and an actor-source payload with the
+task's frozen synthesis inputs, its original money scope and what the phase
+already holds (``LatePhaseRun``). Resume mints one single-use ``grant``; the
+existing late-phase executor consumes it, reopens the fence and re-enters the
+unfinished stage on CURRENT memory inputs, reassessing with those saved
+results — never replaying requests. Completed stages and applied effects do
+not repeat. Restart keeps the pause and revokes an unconsumed grant; Stop
+degrades the remainder ``owner_stopped``; ``running`` across a restart stays
+indeterminate exactly as before.
+"""
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import pathlib
 import threading
-from typing import Any, Dict
+from typing import Any, Callable, Dict
 
 from ouroboros.cost_projection import (
     COST_ALIAS_PAIRS,
@@ -31,7 +47,7 @@ log = logging.getLogger(__name__)
 POST_TASK_SYNTHESIS_LOCK = threading.Lock()
 # None reserves dispatch before the thread binds its live model-wait owner.
 POST_TASK_SYNTHESIS_INFLIGHT: dict[tuple[str, str], Any] = {}
-POST_TASK_SYNTHESIS_OPEN_STATUSES = frozenset({"pending_once", "running"})
+POST_TASK_SYNTHESIS_OPEN_STATUSES = frozenset({"pending_once", "running", "paused"})
 POST_TASK_SYNTHESIS_TERMINAL_STATUSES = frozenset({"completed", "degraded"})
 _TERMINAL_ACCOUNTING_FIELDS = (
     *TASK_COST_META_FIELDS,
@@ -58,6 +74,114 @@ def post_task_synthesis_is_open(value: Any) -> bool:
 def post_task_synthesis_is_terminal(value: Any) -> bool:
     """Return whether canonical post-task synthesis has settled."""
     return str(value or "") in POST_TASK_SYNTHESIS_TERMINAL_STATUSES
+
+
+def post_task_synthesis_is_paused(value: Any) -> bool:
+    """The owner's saved late phase: open work that nothing runs until Resume."""
+    return str(value or "") == "paused"
+
+
+def late_phase_pause_record(row: Any) -> Dict[str, Any]:
+    """The saved late-phase record of a paused root result, else ``{}``."""
+    checkpoint = row.get("root_phase_checkpoint") if isinstance(row, dict) else None
+    if not isinstance(checkpoint, dict) or not post_task_synthesis_is_paused(checkpoint.get("post_task_synthesis")):
+        return {}
+    record = checkpoint.get("post_task_pause")
+    return dict(record) if isinstance(record, dict) else {}
+
+
+def late_phase_state(drive_root: Any, task_id: str) -> str:
+    """``running`` / ``paused`` / ``""`` / ``unknown`` for one root's late phase.
+
+    ``running`` is this process's in-flight key or a durable open phase another
+    process may own (a pooled worker); ``unknown`` is unreadable authority.
+    """
+    if post_task_synthesis_in_flight(drive_root, task_id):
+        return "running"
+    try:
+        row = load_task_result(pathlib.Path(drive_root), str(task_id), strict=True) or {}
+    except Exception:
+        return "unknown"
+    checkpoint = row.get("root_phase_checkpoint") if isinstance(row.get("root_phase_checkpoint"), dict) else {}
+    phase = str(checkpoint.get("post_task_synthesis") or "")
+    if post_task_synthesis_is_paused(phase):
+        return "paused"
+    return "running" if post_task_synthesis_is_open(phase) else ""
+
+
+def update_late_phase_pause(drive_root: Any, task_id: str,
+                            mutate: Callable[[Dict[str, Any]], Dict[str, Any] | None]) -> Dict[str, Any] | None:
+    """Compare-and-set the paused record under the result lock; None when not applied.
+
+    ``mutate`` sees the current record of a still-``paused`` phase and returns
+    its replacement, or None to refuse. Grant, consumption, revocation and Stop
+    serialize here, so two Resumes or a Resume racing Stop apply at most once.
+    Like the owner fence, this is a field write on the result's own locked
+    read-modify-write: it never writes a lifecycle status.
+    """
+    from ouroboros.task_results import (
+        require_writable_task_result_schema,
+        stamp_task_result_schema,
+        task_result_path,
+    )
+    from ouroboros.utils import update_json_locked
+
+    applied: Dict[str, Any] = {}
+
+    def update(latest: Dict[str, Any]) -> Dict[str, Any] | None:
+        checkpoint = latest.get("root_phase_checkpoint") if latest else None
+        if not isinstance(checkpoint, dict) or not post_task_synthesis_is_paused(
+                checkpoint.get("post_task_synthesis")):
+            return None
+        require_writable_task_result_schema(latest)
+        record = mutate(dict(checkpoint.get("post_task_pause") or {}))
+        if record is None:
+            return None
+        applied["record"] = record
+        return stamp_task_result_schema({**latest, "root_phase_checkpoint": {**checkpoint, "post_task_pause": record}})
+
+    path = task_result_path(pathlib.Path(drive_root), str(task_id), create=False)
+    if not path.is_file():
+        return None
+    update_json_locked(path, update, strict_existing_dict=True)
+    return applied.get("record")
+
+
+class LatePhaseRun:
+    """What one root late phase already holds, carried across an owner Pause.
+
+    Two stage-owned facts, never request replay: ``marks`` name completed steps
+    whose effects must not repeat (a backlog append, a promotion step), and
+    ``drafts`` keep a confirmed consolidation draft whose correction the Pause
+    stopped, keyed by its room unit (``room_consolidation.summarize_source``).
+    A resumed correction checks that draft against the CURRENT source.
+    """
+
+    def __init__(self, marks: Any = (), drafts: Any = None) -> None:
+        self.marks = {str(mark) for mark in marks or ()}
+        self.drafts = {str(key): str(value) for key, value in (drafts or {}).items()} if isinstance(drafts, dict) else {}
+
+    def mark(self, name: str) -> None:
+        self.marks.add(str(name))
+
+    def marked(self, name: str) -> bool:
+        return str(name) in self.marks
+
+
+_LATE_PHASE_RUN: contextvars.ContextVar = contextvars.ContextVar("late_phase_run", default=None)
+
+
+def current_late_phase_run() -> LatePhaseRun | None:
+    return _LATE_PHASE_RUN.get()
+
+
+def bind_late_phase_run(run: LatePhaseRun | None):
+    """Bind the run to this execution context; returns the reset token."""
+    return _LATE_PHASE_RUN.set(run)
+
+
+def reset_late_phase_run(token: Any) -> None:
+    _LATE_PHASE_RUN.reset(token)
 
 
 def post_task_synthesis_in_flight(drive_root: Any, task_id: str) -> bool:
@@ -170,6 +294,12 @@ def project_replica_task_result_fields(
         overlay["root_phase_checkpoint"] = merged_checkpoint
         for field in _TERMINAL_ACCOUNTING_SCRUB_FIELDS:
             overlay.pop(field, None)
+    elif post_task_synthesis_is_paused(canonical_post_task) and isinstance(
+            overlay.get("root_phase_checkpoint"), dict):
+        # A saved late phase is canonical custody: no replica reopens or drops it.
+        overlay["root_phase_checkpoint"] = {**overlay["root_phase_checkpoint"], **{
+            key: canonical_checkpoint[key] for key in ("post_task_synthesis", "post_task_pause")
+            if key in canonical_checkpoint}}
 
     # Non-Project split synthesis writes this field in the canonical parent
     # root.  A later child replica must not replace it with stale child text.
@@ -290,6 +420,8 @@ def project_root_post_task_checkpoint_fields(
     else:
         if "post_task_stop_reason" in patch:
             current["post_task_stop_reason"] = patch["post_task_stop_reason"]
+        if "post_task_pause" in patch:
+            current["post_task_pause"] = patch["post_task_pause"]
         if patch_post_task:
             current["post_task_synthesis"] = patch_post_task
     if patch_post_task and (
@@ -363,6 +495,7 @@ def set_root_post_task_checkpoint(
     status: str,
     *,
     stop_reason: str = "",
+    pause: Dict[str, Any] | None = None,
 ) -> Dict[str, Any] | None:
     """Merge the phase marker and return the record actually stored, if any."""
     if not is_root_post_task(task):
@@ -436,6 +569,8 @@ def set_root_post_task_checkpoint(
             checkpoint_patch["accounting"] = accounting
         if stop_reason:
             checkpoint_patch["post_task_stop_reason"] = str(stop_reason)
+        if pause is not None:
+            checkpoint_patch["post_task_pause"] = dict(pause)
         stored: Dict[str, Any] | None = None
         try:
             stored = write_task_result(
@@ -527,14 +662,20 @@ from ouroboros.terminal_projection import (  # noqa: E402, F401
 )
 
 
-def root_post_task_already_completed(env: Any, task: Dict[str, Any]) -> bool:
+def _root_post_task_phase(env: Any, task: Dict[str, Any]) -> str:
     if not is_root_post_task(task):
-        return False
+        return ""
     task_id = str(task.get("id") or task.get("task_id") or "")
     roots = root_checkpoint_roots(env, task)
     existing = load_task_result(roots[0], task_id) if roots and task_id else None
     checkpoint = existing.get("root_phase_checkpoint") if isinstance(existing, dict) else None
-    return bool(
-        isinstance(checkpoint, dict)
-        and post_task_synthesis_is_terminal(checkpoint.get("post_task_synthesis"))
-    )
+    return str(checkpoint.get("post_task_synthesis") or "") if isinstance(checkpoint, dict) else ""
+
+
+def root_post_task_already_completed(env: Any, task: Dict[str, Any]) -> bool:
+    return post_task_synthesis_is_terminal(_root_post_task_phase(env, task))
+
+
+def root_post_task_paused(env: Any, task: Dict[str, Any]) -> bool:
+    """A saved late phase: only the owner's Resume grant continues it."""
+    return post_task_synthesis_is_paused(_root_post_task_phase(env, task))

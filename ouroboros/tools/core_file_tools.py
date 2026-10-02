@@ -28,7 +28,7 @@ from ouroboros.tool_access import (
     user_files_path_block_reason,
 )
 from ouroboros.tools.registry import ToolContext, active_repo_dir_for
-from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
+from ouroboros.tools.tool_result import ToolResult, _publish_tool_result, completed_local_read
 from ouroboros.utils import safe_relpath
 
 log = logging.getLogger(__name__)
@@ -584,6 +584,7 @@ def _stamp_read_view(ctx: ToolContext, target: Any, opened: str, opened_root: st
     return rendered
 
 
+@completed_local_read
 def _read_file(
     ctx: ToolContext,
     path: str,
@@ -700,6 +701,7 @@ def _read_file(
         ))
 
 
+@completed_local_read
 def _list_files(
     ctx: ToolContext,
     path: str = ".",

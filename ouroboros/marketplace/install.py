@@ -278,6 +278,7 @@ class _MarketplaceReviewCtx:
         self.drive_root: pathlib.Path = pathlib.Path(drive_root)
         self.repo_dir: pathlib.Path = pathlib.Path(repo_dir)
         self.task_id: Any = "marketplace_install"
+        self.task_lifecycle_bound = False
         self.current_chat_id: Any = 0
         self.pending_events: List[Any] = []
         self.emit_progress_fn = lambda _msg: None

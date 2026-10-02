@@ -285,7 +285,8 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
         "envelope_from_task", "write_task_result",
     })),
     "ouroboros/post_task_synthesis.py": ("ouroboros/agent_task_pipeline.py", "_atp", frozenset({
-        "_is_root_post_task", "load_task_result",
+        "_is_root_post_task", "load_task_result", "_run_global_backlog_promotion_only",
+        "_run_post_task_processing_async",
     })),
     "ouroboros/loop_acceptance.py": ("ouroboros/loop.py", "_loop", frozenset({
         "_append_or_merge_user_message", "_end_task_acceptance_fence",

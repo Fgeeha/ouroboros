@@ -725,7 +725,7 @@ def _start_assisted_merge_fenced(plan: dict, tx: dict) -> JSONResponse:
     try:
         from ouroboros.reviewer_slot_config import commit_scope_rows, commit_triad_rows
         from ouroboros.tools.review_helpers import REVIEW_PROMPT_TOKEN_BUDGET
-        from ouroboros.usage_accounting import review_wave_admission
+        from ouroboros.usage_admission import review_wave_admission
 
         # Native-retrieving actor rows (subagent_id + api route) are priced at
         # the SAME one-pack-call convention as packet rows: their true worst
