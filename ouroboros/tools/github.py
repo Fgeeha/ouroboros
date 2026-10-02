@@ -605,7 +605,7 @@ def get_tools() -> List[ToolEntry]:
             "name": "get_github_checks",
             "description": (
                 "Read what GitHub records about the checks of one commit: every workflow run (its latest attempt) with its state, the state "
-                "counts of its jobs (for a pull request, of the rollup's jobs), the failed and unfinished jobs and steps, "
+                "counts of its jobs (for a pull request, of the rollup's jobs), the failed, unfinished and cancelled jobs and their steps, "
                 "failure annotations (test names when the workflow publishes them) and, for a pull request, third-party "
                 "checks and commit statuses. Read-only: pushes and dispatches nothing. Reports facts and names each source "
                 "it could not read; it gives no verdict, and a workflow that did not start has no record to report."
