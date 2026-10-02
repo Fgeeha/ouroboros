@@ -444,9 +444,20 @@ def test_ci_note_attributes_a_failure_to_its_workflow(monkeypatch):
     assert "  Failed: integration-test / integration-test → Run integration tests\n" in note
     assert note.endswith("  URL: https://example.test/2")
 
-    # A re-run supersedes its original: the API lists the newest run first.
+    # The same commit pushed again: the API lists the newest run of a workflow first.
     rerun = _ci_note(monkeypatch, [{"name": "Provider canaries", **_DONE}, *runs])
     assert rerun.startswith("\n\n✅") and "failure" not in rerun
+    # A finished failure is reported while another workflow still runs, and every red workflow is named.
+    racing = _ci_note(monkeypatch, [
+        {"name": "CI", "status": "in_progress", "conclusion": None},
+        {"name": "Provider canaries", "status": "completed", "conclusion": "failure"},
+        {"name": "UI browser (ouroboros push)", "status": "completed", "conclusion": "failure"},
+    ])
+    assert "⚠️ CI STATUS: Provider canaries, UI browser (ouroboros push) FAILED" in racing and "⏳" not in racing
+    assert "CI: in progress" in racing
+    skipped = _ci_note(monkeypatch, [{"name": "CI", **_DONE},
+                                     {"name": "Sync mirror", "status": "completed", "conclusion": "skipped"}])
+    assert skipped.startswith("\n\n✅") and "Sync mirror: skipped" in skipped
     cancelled = _ci_note(monkeypatch, [{"name": "CI", "status": "completed", "conclusion": "cancelled"}])
     assert "⚠️ CI STATUS: CI CANCELLED for this commit (run #1)" in cancelled
 

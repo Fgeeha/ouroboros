@@ -92,6 +92,12 @@ def _canary_wiring_faults(ci, shared, push):
             faults.append(f"{label} does not pass exactly the eight provider secrets by name")
         if caller.get("permissions") != {"contents": "read"}:
             faults.append(f"{label} widens the called job's permissions")
+    # Exact key sets: a condition or a group on any of the three jobs changes how often the paid job runs.
+    for label, job, keys in (("ci.yml", ci["jobs"]["integration-test"], {"if", "uses", "secrets", "permissions"}),
+                             (CANARY_PUSH, push["jobs"]["integration-test"], {"uses", "secrets", "permissions"}),
+                             (CANARY, shared["jobs"]["integration-test"], {"runs-on", "steps"})):
+        if set(job) != keys:
+            faults.append(f"{label} canary job carries keys other than {sorted(keys)}")
     declared = {name: {"required": False} for name in PROVIDER_SECRETS}
     if _triggers(shared) != {"workflow_call": {"secrets": declared}}:
         faults.append("the shared job is not call-only with eight optional secrets")
@@ -136,6 +142,11 @@ CANARY_DRIFTS = {
     "caller leaves the shared job": lambda w: w.ci["jobs"]["integration-test"].update(uses="./other.yml"),
     "shared job loses its read-only default": lambda w: w.shared.pop("permissions"),
     "caller widens permissions": lambda w: w.push["jobs"]["integration-test"].update(permissions="write-all"),
+    "wrapper job condition": lambda w: w.push["jobs"]["integration-test"].update(
+        {"if": "github.ref == 'refs/heads/ouroboros-stable'"}),
+    "shared job condition": lambda w: w.shared["jobs"]["integration-test"].update(
+        {"if": "github.event_name == 'workflow_dispatch'"}),
+    "code-workflow caller concurrency": lambda w: w.ci["jobs"]["integration-test"].update(concurrency="canary"),
 }
 
 

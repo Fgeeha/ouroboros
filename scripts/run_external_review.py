@@ -108,6 +108,7 @@ _REVIEW_SUBSTRATE_PATHS = frozenset({
 })
 _RELEASE_MACHINERY_PATHS = frozenset({
     ".github/workflows/ci.yml",
+    ".github/workflows/provider-canary.yml", ".github/workflows/provider-canary-push.yml",  # ci.yml's canary job
     "build.sh",
     "build_linux.sh",
     "build_windows.ps1",

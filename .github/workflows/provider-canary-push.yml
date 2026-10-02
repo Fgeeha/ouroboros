@@ -3,7 +3,7 @@
 # The canaries call third-party models, so a red run here can mean a provider
 # misbehaved while the repository's code is fine. They live in their own
 # workflow so that outcome carries its own badge and never reddens `ci.yml`,
-# which reports the code. The run frequency per push is unchanged: this trigger
+# which reports the code. Each matching push starts one paid run: this trigger
 # carries the same branches and the same path filter as the `ci.yml` push
 # trigger, and `ci.yml` calls the same reusable job only for manual runs and
 # `v*` tags, where the release chain requires it.

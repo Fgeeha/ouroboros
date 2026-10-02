@@ -83,7 +83,7 @@ Admit an attempt only while settled spend plus in-flight reservations plus its o
 
 #### Reports, focused verification and CI
 
-Run roots are append-only outside `repo/` and live `data/`; the focused contracts are the `tests/test_e2e_live_*` modules plus `tests/test_server_runner_absorb_wait.py`, and the `e2e-live` CI job runs only on its nightly cron or an explicit `e2e_live=true` dispatch — see devtools/e2e_live/README.md#reports-focused-verification-and-ci.
+Run roots are append-only outside `repo/` and live `data/`; the focused contracts are the `tests/test_e2e_live_*` modules plus `tests/test_server_runner_absorb_wait.py`, and the `e2e-live` CI job runs only on an explicit `e2e_live=true` dispatch — see devtools/e2e_live/README.md#reports-focused-verification-and-ci.
 
 ### Light mode and external deliverables
 

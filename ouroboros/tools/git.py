@@ -935,7 +935,8 @@ def _check_ci_status_after_push(repo_dir: pathlib.Path) -> str:
             return "\n\n⏳ CI: Run not yet registered — check GitHub Actions in ~30s."
         # One push starts several workflows (code, browser lane, provider
         # canaries), so each is reported under its own name and none stands for
-        # the others. The API lists newest first: a re-run supersedes its original.
+        # the others. The API lists newest first: the first row per workflow is
+        # the one for the latest push of this commit.
         latest: Dict[str, dict] = {}
         for run in runs:
             latest.setdefault(str(run.get("name") or run.get("path") or "workflow"), run)
@@ -945,10 +946,12 @@ def _check_ci_status_after_push(repo_dir: pathlib.Path) -> str:
             for name, run in latest.items()
         }
         summary = "; ".join(f"{name}: {state}" for name, state in states.items())
-        failed = next((name for name, run in latest.items()
-                       if run.get("status") == "completed" and states[name] != "success"), None)
+        settled = ("success", "skipped", "neutral")  # A workflow whose jobs all skip is not a failure.
+        red = [name for name, run in latest.items()
+               if run.get("status") == "completed" and states[name] not in settled]
+        failed = red[0] if red else None
         if failed is None:
-            if all(state == "success" for state in states.values()):
+            if all(state in settled for state in states.values()):
                 return f"\n\n✅ CI: registered push runs passed for this commit — {summary}."
             return f"\n\n⏳ CI: push runs in progress — {summary}. Check GitHub Actions for results."
         completed, conclusion = latest[failed], states[failed]
@@ -972,7 +975,7 @@ def _check_ci_status_after_push(repo_dir: pathlib.Path) -> str:
                 pass  # Fall back to generic summary — run_number/html_url still surfaced below
         if conclusion == "failure":
             return (
-                f"\n\n⚠️ CI STATUS: {failed} FAILED for this commit (run #{run_number})\n"
+                f"\n\n⚠️ CI STATUS: {', '.join(red)} FAILED for this commit (run #{run_number})\n"
                 f"  Workflows: {summary}\n"
                 f"  Failed: {failed_summary}\n"
                 f"  Fix: investigate the failed jobs; push a fix commit when this commit caused them.\n"

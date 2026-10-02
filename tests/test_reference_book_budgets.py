@@ -277,7 +277,10 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 22500 -> 22800 (measured 22774): the run-cancellation rule (which CI runs a newer pull-request
     # head cancels, and why re-runs keep their own group), a workflow contract the chapter had no
     # text for; the pointer sentence beside it was reworded in place.
-    "docs/architecture/08-git-branching-ci-and-build.md": 22800,
+    # 22800 -> 23200 (measured 23005): the CI table names where the provider canaries run for each
+    # event (the shared body and its push wrapper) and that landed pushes get the desktop matrix;
+    # the live-stand row shrank, the other two rows describe wiring the chapter did not have.
+    "docs/architecture/08-git-branching-ci-and-build.md": 23200,
     # 12405 -> 14400 (issue #1142): the ordinary-close paragraph gains the mechanism the chapter had
     # no text for — graceful stop signals the server PID only, the server half (stop event at the
     # signal, bounded uvicorn drain) is self-sufficient against an old group-SIGTERM launcher.
