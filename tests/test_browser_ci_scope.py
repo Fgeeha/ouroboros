@@ -1,4 +1,10 @@
+import json
+import os
 from pathlib import Path
+import re
+import subprocess
+import sys
+import textwrap
 from types import SimpleNamespace
 
 import pytest
@@ -6,7 +12,8 @@ import pytest
 from scripts.browser_ci_scope import documentation_only
 from tests import browser_lane
 
-WORKFLOWS = Path(__file__).resolve().parents[1] / ".github/workflows"
+REPO = Path(__file__).resolve().parents[1]
+WORKFLOWS = REPO / ".github/workflows"
 
 
 @pytest.mark.parametrize("paths,expected", [
@@ -41,13 +48,16 @@ def _workflow(name):
 def test_one_browser_lane_serves_pull_requests_manual_tags_and_ouroboros_pushes():
     shared, triggers = _workflow("ui-browser.yml")
     assert list(triggers) == ["workflow_call"], "the shared lane runs only when called"
-    job = shared["jobs"]["ui-smoke"]
-    assert "secrets." not in str(job)
+    assert "secrets." not in str(shared["jobs"])
+    job = shared["jobs"]["ui-shard"]
     full = next(step for step in job["steps"] if "--require-ui-browser" in step.get("run", ""))
     assert "pytest tests/ -m ui_browser" in full["run"]
     assert "safe_test.py" in full["run"]
-    setup = next(step for step in job["steps"] if step.get("id") == "setup_python")
-    assert setup["with"]["install-project"] == "false"
+    push, push_triggers = _workflow("ui-browser-push.yml")
+    for producer in (job, shared["jobs"]["ui-manifest"], push["jobs"]["ui-diagnostic"]):
+        setup = next(step for step in producer["steps"]  # Exact candidate, never an editable install.
+                     if step.get("uses") == "./.github/actions/setup-python-env")
+        assert setup["with"]["install-project"] == "false"
 
     ci, ci_triggers = _workflow("ci.yml")
     caller = ci["jobs"]["ui-smoke"]
@@ -60,12 +70,14 @@ def test_one_browser_lane_serves_pull_requests_manual_tags_and_ouroboros_pushes(
     assert "push" not in caller["if"] and "schedule" not in caller["if"]
     assert ci_triggers["schedule"] == [{"cron": "37 4 * * *"}]
 
-    push, push_triggers = _workflow("ui-browser-push.yml")
     assert list(push_triggers) == ["push", "workflow_dispatch"]
     assert push_triggers["workflow_dispatch"]["inputs"]["diagnostic"]["options"] == [
         "full", "viewport", "inflight"]
     assert push_triggers["push"] == {"branches": ["ouroboros"]}
     assert push["jobs"]["ui-smoke"]["uses"] == caller["uses"]
+    # Both callers hand the lane nothing: it has no input to select a part of it with.
+    assert "with" not in caller and "with" not in push["jobs"]["ui-smoke"]
+    assert triggers["workflow_call"] is None
 
 
 def test_a_later_docs_only_push_cannot_supersede_an_untested_code_push():
@@ -87,8 +99,10 @@ def _item(name, marked=True):
 
 
 class _Config(SimpleNamespace):
-    def getoption(self, _name):
-        return True
+    required, shard = True, None
+
+    def getoption(self, name):
+        return self.shard if name == "--ui-browser-shard" else self.required
 
     def getini(self, name):
         return {"python_files": ["test_*.py"], "norecursedirs": [".*", "venv"]}[name]
@@ -101,6 +115,8 @@ def _config(**kwargs):
         register=lambda plugin, name: plugins.__setitem__(name, plugin),
     )
     kwargs.setdefault("option", SimpleNamespace(collectonly=False))
+    deselected = kwargs.setdefault("deselected", [])
+    kwargs.setdefault("hook", SimpleNamespace(pytest_deselected=lambda items: deselected.extend(items)))
     # No tests/ beneath this root: only the explicitly reported modules exist.
     kwargs.setdefault("rootpath", Path(__file__).parent / "no-such-lane-root")
     return _Config(args=["tests/"], pluginmanager=manager, **kwargs)
@@ -196,6 +212,60 @@ def test_collection_guard_accepts_full_lane_and_refuses_deselection(partial):
             next(hook)
         assert config._required_ui_nodes == {"first", "second"}
         assert browser_lane._reconciliation(config).required == {"first", "second"}
+        assert config._ui_browser_lane == {"full": ["first", "second"]}, "an unsharded lane records no shard"
+        assert config.deselected == []
+
+
+@pytest.mark.parametrize("index,slice_", [(1, ["a", "d"]), (2, ["b", "e"]), (3, ["c"])])
+def test_shard_keeps_every_nth_node_of_the_sorted_lane_in_collection_order(index, slice_):
+    config = _config(shard=f"{index}/3")
+    browser_lane.pytest_configure(config)
+    items = [_item(name) for name in "dacbe"]  # Collection order is not the sorted order.
+    with pytest.raises(StopIteration):
+        next(_guard(config, items))
+    assert [item.nodeid for item in items] == [name for name in "dacbe" if name in slice_]
+    assert sorted(item.nodeid for item in config.deselected) == sorted(set("abcde") - set(slice_))
+    assert config._ui_browser_lane == {"full": list("abcde"), "shard": [index, 3], "assigned": slice_}
+    # Reconciliation covers this shard's slice only: another shard's node is never "not executed" here.
+    assert config._required_ui_nodes == set(slice_)
+    assert browser_lane._reconciliation(config).required == set(slice_)
+
+
+@pytest.mark.parametrize("option", [{"keyword": "publish"}, {"deselect": ["tests/test_x.py::one"]}, {}])
+def test_shard_option_never_relaxes_the_full_lane_guard(option):
+    config = _config(shard="1/2", option=SimpleNamespace(collectonly=False, **option))
+    browser_lane.pytest_configure(config)
+    items = [_item("first"), _item("second"), _item("third")]
+    hook = _guard(config, items)
+    if not option:
+        items.pop()  # Deselected by something other than the shard itself.
+    with pytest.raises(pytest.UsageError, match="UI_BROWSER_INCOMPLETE"):
+        next(hook)
+    assert not hasattr(config, "_ui_browser_lane"), "a refused lane leaves no lane facts to export"
+
+
+@pytest.mark.parametrize("value,required,accepted", [
+    ("1/1", True, True), ("3/3", True, True), ("2/4", True, True),
+    ("2/4", False, False),  # A shard without the full-lane guard proves nothing.
+    ("0/3", True, False), ("4/3", True, False), ("1/0", True, False), ("-1/3", True, False),
+    ("1", True, False), ("1/3/5", True, False), ("a/b", True, False), ("1 /3", True, False),
+    ("", True, False),
+])
+def test_shard_option_is_refused_when_malformed_or_without_the_lane_guard(value, required, accepted):
+    config = _config(shard=value, required=required)
+    if accepted:
+        browser_lane.pytest_configure(config)
+        assert browser_lane._shard(config) == tuple(int(part) for part in value.split("/"))
+    else:
+        with pytest.raises(pytest.UsageError, match="UI_BROWSER_SHARD"):
+            browser_lane.pytest_configure(config)
+
+
+def test_shard_beyond_the_lane_is_refused_instead_of_running_nothing():
+    config = _config(shard="3/3")
+    browser_lane.pytest_configure(config)
+    with pytest.raises(pytest.UsageError, match=r"UI_BROWSER_INCOMPLETE: shard 3/3 of 2 nodes is empty"):
+        next(_guard(config, [_item("first"), _item("second")]))
 
 
 def test_collection_guard_refuses_an_empty_lane():
@@ -288,3 +358,162 @@ def test_required_engine_is_launched_and_missing_engine_fails(monkeypatch):
     engine.launch = lambda **kwargs: (_ for _ in ()).throw(RuntimeError("missing executable"))
     with pytest.raises(pytest.UsageError, match="UI_BROWSER_UNAVAILABLE"):
         browser_lane.pytest_collection_finish(session)
+
+
+RUN_FACTS = {"GITHUB_SHA": "5" * 40, "GITHUB_RUN_ID": "7007", "GITHUB_RUN_ATTEMPT": "1"}
+LANE = {
+    "test_lane_alpha.py": """
+        import pytest
+        @pytest.mark.ui_browser
+        @pytest.mark.parametrize("engine", ["chromium", "webkit"])
+        def test_page(engine):
+            pass
+        @pytest.mark.ui_browser
+        def test_plain():
+            pass
+        def test_outside_the_lane():
+            raise AssertionError("-m ui_browser deselects this")
+    """,
+    "test_lane_beta.py": """
+        import pytest
+        pytestmark = pytest.mark.ui_browser
+        @pytest.mark.parametrize("case", range(4))
+        def test_case(case):
+            pass
+    """,
+}
+
+
+def _lane_process(tmp_path, name, *options, guarded=True):
+    """One real pytest process over a synthetic `tests/` lane.
+
+    The real plugins collect, guard, slice, reconcile and export; only the engine
+    launch is replaced, so the proof needs no installed browser.
+    """
+    project = tmp_path / "project"
+    if not project.exists():
+        (project / "tests").mkdir(parents=True)
+        (project / "pytest.ini").write_text("[pytest]\nmarkers = ui_browser: synthetic lane\n",
+                                            encoding="utf-8")
+        for module, source in LANE.items():
+            (project / "tests" / module).write_text(textwrap.dedent(source), encoding="utf-8")
+    work = tmp_path / name
+    work.mkdir(parents=True)
+    argv = ["-p", "tests.conftest", "-o", "addopts=", "--rootdir", str(project),
+            "--confcutdir", str(project), "-m", "ui_browser", "--ci-evidence-dir", str(work / "host"),
+            *(["--require-ui-browser"] if guarded else []), *options, "tests/"]
+    entry = work / "run_lane.py"
+    entry.write_text(
+        "import contextlib, os, sys, types\n"
+        f"sys.path.insert(0, {str(REPO)!r})\n"
+        f"os.chdir({str(project)!r})\n"
+        f"os.environ.update({RUN_FACTS!r})\n"
+        "import playwright.sync_api\n"
+        "engine = types.SimpleNamespace(launch=lambda **_: types.SimpleNamespace(close=lambda: None))\n"
+        "playwright.sync_api.sync_playwright = lambda: contextlib.nullcontext(\n"
+        "    types.SimpleNamespace(chromium=engine, webkit=engine))\n"
+        "import pytest\n"
+        f"raise SystemExit(pytest.main({argv!r}))\n", encoding="utf-8")
+    env = {**os.environ, "OUROBOROS_RUN_UI_SMOKE": "1",
+           "OUROBOROS_EXPECT_BROWSER_ENGINES": "chromium,webkit"}
+    result = subprocess.run(
+        [sys.executable, "-I", "-S", str(REPO / "scripts/safe_test.py"), "--temp-parent", str(tmp_path),
+         "--", sys.executable, str(entry)],
+        cwd=REPO, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180)
+    return result, work  # A console code page may not be UTF-8: assertions read ASCII only.
+
+
+def _lane_results(work):
+    return json.loads((work / "host" / "results.json").read_text(encoding="utf-8"))
+
+
+def _called(results):
+    return [row["nodeid"] for row in results["reports"] if row["phase"] == "call"]
+
+
+def _reconcile(tmp_path, manifest, shards, count):
+    summary = tmp_path / "reconcile.md"
+    summary.unlink(missing_ok=True)
+    result = subprocess.run(
+        [sys.executable, "-I", "-S", str(REPO / "tests/ci_evidence.py"), "reconcile-shards",
+         "--manifest", str(manifest), "--shards", str(shards), "--count", str(count),
+         "--sha", RUN_FACTS["GITHUB_SHA"], "--run-id", RUN_FACTS["GITHUB_RUN_ID"],
+         "--summary", str(summary)],
+        cwd=tmp_path, capture_output=True, text=True, encoding="utf-8", timeout=60)
+    return result, summary.read_text(encoding="utf-8")
+
+
+@pytest.mark.serial
+def test_real_shards_partition_the_lane_and_reconcile_against_the_unsharded_manifest(tmp_path):
+    collected, manifest = _lane_process(tmp_path, "manifest", "--collect-only", "-q")
+    assert collected.returncode == 0, collected.stdout + collected.stderr
+    lane = _lane_results(manifest)["ui_browser"]
+    full = lane["full"]
+    assert lane == {"full": full} and len(full) == 7 and full == sorted(set(full))
+    assert not any("test_outside_the_lane" in node for node in full)
+    assert _lane_results(manifest)["reports"] == [] and "UI_BROWSER_SHARD" not in collected.stdout
+
+    slices = []
+    for index in (1, 2, 3):
+        run, work = _lane_process(tmp_path, f"shards/ui-shard-{index}", f"--ui-browser-shard={index}/3")
+        assert run.returncode == 0, run.stdout + run.stderr
+        results = _lane_results(work)
+        assigned = results["ui_browser"]["assigned"]
+        assert results["ui_browser"] == {"full": full, "shard": [index, 3], "assigned": assigned}
+        assert f"UI_BROWSER_SHARD {index}/3: assigned {len(assigned)} of 7" in run.stdout
+        assert sorted(_called(results)) == assigned and results["tests_collected"] == len(assigned)
+        assert results["session_exit_code"] == 0 and "UI_BROWSER_NOT_EXECUTED" not in run.stdout
+        slices.append(assigned)
+    # Pairwise disjoint and complete at once: the sorted concatenation is the lane itself.
+    assert sorted(node for assigned in slices for node in assigned) == full
+    assert [len(assigned) for assigned in slices] == [3, 2, 2]
+
+    proven, summary = _reconcile(tmp_path, manifest, tmp_path / "shards", 3)
+    assert proven.returncode == 0, proven.stdout + proven.stderr
+    assert "UI_BROWSER_RECONCILE complete" in proven.stdout and "GAP" not in summary
+
+    (tmp_path / "shards" / "ui-shard-2" / "host" / "results.json").unlink()
+    silent, summary = _reconcile(tmp_path, manifest, tmp_path / "shards", 3)
+    assert silent.returncode == 1 and "shard 2/3: no proof" in silent.stdout
+    for node in slices[1]:  # The nodes no shard proved are named, the proven ones are not.
+        assert node in silent.stdout and node in summary
+    assert not any(node in silent.stdout for node in slices[0] + slices[2])
+
+
+@pytest.mark.serial
+def test_real_shard_still_refuses_a_narrowed_lane_and_an_unguarded_shard(tmp_path):
+    narrowed, work = _lane_process(tmp_path, "narrowed", "--ui-browser-shard=1/3", "-k", "test_case")
+    assert narrowed.returncode == 4, narrowed.stdout + narrowed.stderr
+    assert re.search(r"ERROR: UI_BROWSER_INCOMPLETE: collection narrowed \S+ -k$", narrowed.stderr, re.M)
+    refused = _lane_results(work)
+    assert refused["reports"] == [] and "ui_browser" not in refused, "a refused lane exports no lane facts"
+
+    unguarded, work = _lane_process(tmp_path, "unguarded", "--ui-browser-shard=1/3", guarded=False)
+    assert unguarded.returncode == 4, unguarded.stdout + unguarded.stderr
+    assert "UI_BROWSER_SHARD" in unguarded.stderr and not (work / "host" / "results.json").exists()
+
+
+@pytest.mark.serial
+def test_real_shard_out_of_session_budget_names_only_its_own_unexecuted_nodes(tmp_path):
+    # pytest-timeout's cooperative session budget: checked after each test, it ends the
+    # session through its normal finish. An already spent budget runs exactly one test.
+    run, work = _lane_process(tmp_path, "shards/ui-shard-1", "--ui-browser-shard=1/2",
+                              "--session-timeout=0.001")
+    assert run.returncode == 1, run.stdout + run.stderr
+    results = _lane_results(work)
+    lane = results["ui_browser"]
+    assert lane["shard"] == [1, 2] and len(lane["assigned"]) == 4 and len(lane["full"]) == 7
+    executed = _called(results)
+    assert len(executed) == 1 and executed[0] in lane["assigned"]
+    unexecuted = sorted(set(lane["assigned"]) - set(executed))
+    assert f"UI_BROWSER_NOT_EXECUTED (3): {', '.join(unexecuted)}" in run.stdout
+    assert "session-timeout" in run.stdout and results["session_exit_code"] == 1
+    other_shard = set(lane["full"]) - set(lane["assigned"])
+    named = run.stdout.split("UI_BROWSER_NOT_EXECUTED", 1)[1].splitlines()[0]
+    assert not any(node in named for node in other_shard)
+
+    _, manifest = _lane_process(tmp_path, "manifest", "--collect-only", "-q")
+    red, summary = _reconcile(tmp_path, manifest, tmp_path / "shards", 2)
+    assert red.returncode == 1
+    assert f"shard 1/2: assigned but not executed (3): {', '.join(unexecuted)}" in red.stdout
+    assert "shard 2/2: no proof" in red.stdout and "INCOMPLETE" in summary
