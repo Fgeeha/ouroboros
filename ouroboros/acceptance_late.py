@@ -366,7 +366,8 @@ def _run_historical_acceptance(ctx: Any, *, task_id: str, debt_id: str,
                 return refused('historical_writer_still_live')
             if operation.control():
                 return refused('historical_preparation_cancelled')
-            time.sleep(0.1)
+            from ouroboros.budget_pause import _HOLD_POLL_SEC
+            time.sleep(_HOLD_POLL_SEC)  # existing owner-hold observation cadence
         if blocked:
             return refused(blocked[0])
         lineage = resolve_task_lineage(task_id, metadata=row.get('metadata'), **{

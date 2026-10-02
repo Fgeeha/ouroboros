@@ -517,13 +517,12 @@ class ToolResult:
     Producer text is captured only when the host adds annotations, before any
     composition. It is not bounded metadata and is never reconstructed from text.
 
-    Additive producer fact: ``meta.operation_outcome="completed_no_effect"``
-    proves this invocation completed without effects, even if the requested
-    read failed; ``completed`` attests a foreground process exit, including
-    nonzero. Neither settles independent child/process custody. The registry consumes it only from a returned first-party
-    body, never from dynamic/remote receipts or an escaping exception. It
-    settles only that tool handoff; process, money and delegated custody remain
-    separate. Missing/unknown values keep the existing conservative semantics.
+    Optional producer fact: ``meta.operation_outcome="completed_no_effect"``
+    describes a pre-effect refusal or completed read; ``completed`` describes
+    a foreground process exit, including nonzero. Neither metadata nor business
+    success grants custody settlement: the host observes handler unwind/join,
+    while independent process, receipt, model and delegated owners retain their
+    own unfinished work. Missing metadata does not keep a joined local call live.
     """
 
     status: ToolStatus
@@ -649,7 +648,7 @@ def publish_no_effect(ctx: Any, result: str | ToolResult, *, tool_name: str = ""
     """Publish a producer-proven refusal before this invocation's first effect.
 
     Call only at the validation boundary, never on a generic error/timeout path.
-    Preserve existing typed classification and text; this settles no other custody.
+    Preserve typed classification/text; this outcome fact grants no custody settlement.
     """
     prior = _published_tool_result(ctx, None)
     typed = result if isinstance(result, ToolResult) else (

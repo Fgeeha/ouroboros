@@ -93,6 +93,7 @@ def test_real_local_process_completion_permits_saved_resume(tmp_path, monkeypatc
 
 
 def test_unmarked_missing_file_after_executor_handoff_is_not_no_effect(tmp_path, monkeypatch):
+    """An unwound local body keeps its error, without claiming an executor is still alive."""
     from tests.test_batch4_producer_custody import _registry
     from ouroboros.task_results import load_task_result
 
@@ -103,9 +104,9 @@ def test_unmarked_missing_file_after_executor_handoff_is_not_no_effect(tmp_path,
     result = registry.execute_result("run_command", {"cmd": ["opaque"]})
     assert result.text.startswith("⚠️ SHELL_ERROR")
     assert result.meta.get("operation_outcome") != "completed_no_effect"
-    assert load_task_result(tmp_path, "root")["launch_handoffs"]
+    assert not load_task_result(tmp_path, "root")["launch_handoffs"]
     _park(tmp_path, monkeypatch, queue, workers)
-    assert queue.resume_budget_paused_task("root")["error"] == "owner_pause_effects_unsettled"
+    assert queue.resume_budget_paused_task("root")["ok"]
 
 
 @pytest.mark.parametrize("task_id", ["system:provider_test", "system:capability_probe"])

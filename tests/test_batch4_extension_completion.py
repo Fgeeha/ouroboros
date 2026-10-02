@@ -216,7 +216,7 @@ def test_local_return_cannot_retire_independent_custody(tmp_path, monkeypatch, k
         assert after.get("merge_receipts") == before.get("merge_receipts")
         assert after.get("retired_model_consumers") == before.get("retired_model_consumers")
         assert ua.read_usage_records(tmp_path) == money and dc.pending_invocations(tmp_path) == pending
-        expected = {"model": "model_handoff", "merge": "tool_handoff", "delegate": "delegated_run"}[kind]
+        expected = {"model": "model_handoff", "merge": "merge_operation", "delegate": "delegated_run"}[kind]
         assert any(row["kind"] == expected for row in conflicting_writers(queue, "root"))
         if kind != "model":  # The ledger's answer-consumer census belongs to Pause/Continue.
             assert cold_blockers(registry._ctx)

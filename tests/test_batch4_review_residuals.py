@@ -74,8 +74,8 @@ def test_refusal_before_the_first_launch_settles_its_claim(tmp_path, monkeypatch
 
 
 @pytest.mark.parametrize("second", ["unavailable", "folderless"])
-def test_a_refusal_after_an_earlier_launch_keeps_custody(tmp_path, monkeypatch, second):
-    """The comment was already handed to gh: the close's target refusal proves nothing."""
+def test_later_refusal_keeps_prior_effect_unknown_but_closes_local_invocation(tmp_path, monkeypatch, second):
+    """The close's refusal cannot claim no effect for the already-returned comment."""
     from ouroboros.task_results import load_task_result
 
     registry, queue, workers, launched = _github_task(tmp_path, monkeypatch, "workspace")
@@ -98,13 +98,13 @@ def test_a_refusal_after_an_earlier_launch_keeps_custody(tmp_path, monkeypatch, 
     assert launched == [["issue", "comment"]]
     assert "GH_TARGET_" in result.text and result.status != "ok", result
     assert result.meta.get("operation_outcome") != "completed_no_effect"
-    assert load_task_result(tmp_path, "root")["launch_handoffs"]
+    assert not load_task_result(tmp_path, "root")["launch_handoffs"]
     _park(tmp_path, monkeypatch, queue, workers)
-    assert queue.resume_budget_paused_task("root")["error"] == "owner_pause_effects_unsettled"
+    assert queue.resume_budget_paused_task("root")["ok"]
 
 
 @pytest.mark.parametrize("failure", ["exit", "timeout"])
-def test_an_unknown_first_gh_outcome_keeps_custody(tmp_path, monkeypatch, failure):
+def test_returned_unknown_gh_outcome_preserves_error_without_ghost_invocation(tmp_path, monkeypatch, failure):
     from ouroboros.task_results import load_task_result
 
     registry, queue, workers, launched = _github_task(tmp_path, monkeypatch, "workspace")
@@ -123,9 +123,9 @@ def test_an_unknown_first_gh_outcome_keeps_custody(tmp_path, monkeypatch, failur
 
     assert launched == [["issue", "comment"]] and result.status != "ok", result
     assert result.meta.get("operation_outcome") != "completed_no_effect"
-    assert load_task_result(tmp_path, "root")["launch_handoffs"]
+    assert not load_task_result(tmp_path, "root")["launch_handoffs"]
     _park(tmp_path, monkeypatch, queue, workers)
-    assert queue.resume_budget_paused_task("root")["error"] == "owner_pause_effects_unsettled"
+    assert queue.resume_budget_paused_task("root")["ok"]
 
 
 def test_direct_handler_calls_attest_nothing(tmp_path, monkeypatch):

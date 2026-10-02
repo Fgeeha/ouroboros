@@ -98,6 +98,7 @@ def test_real_pr_merge_registry_preserves_known_and_unknown_custody(tmp_path, mo
     from ouroboros.tools.registry import ToolRegistry
     from ouroboros.tools import github
     from tests.test_pr_merge_receipts import FakeGh, HEAD
+    from ouroboros.tool_custody import retained_tool_custody
     write_task_result(tmp_path, "merge-task", "running", root_task_id="merge-task")
     registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
     registry._ctx.task_id = registry._ctx.root_task_id = "merge-task"
@@ -106,14 +107,17 @@ def test_real_pr_merge_registry_preserves_known_and_unknown_custody(tmp_path, mo
     monkeypatch.setattr(github, "github_cli_configured", lambda: True)
     result = registry.execute_result("pr_merge", {"number": 7, "expected_head_sha": HEAD,
         "method": "merge", "review_scope": "invalid" if case == "arguments" else "full"})
-    claims = load_task_result(tmp_path, "merge-task").get("launch_handoffs", {})
-    assert bool(claims) is held, result
+    row = load_task_result(tmp_path, "merge-task")
+    assert not row.get("launch_handoffs"), "the local merge invocation returned"
+    custody = retained_tool_custody(tmp_path, "merge-task", row)
+    assert any(item["kind"] == "merge_operation" for item in custody) is held, result
     if held:
         assert result.meta["operation_outcome"] == "unknown"
         before = len([c for c in fake.calls if c[:2] == ["pr", "merge"]])
         registry.execute_result("pr_merge", {"number": 7, "expected_head_sha": HEAD, "method": "merge"})
         assert len([c for c in fake.calls if c[:2] == ["pr", "merge"]]) == before
-        assert set(claims) <= set(load_task_result(tmp_path, "merge-task")["launch_handoffs"])
+        after = retained_tool_custody(tmp_path, "merge-task", load_task_result(tmp_path, "merge-task"))
+        assert {item['receipt_id'] for item in custody} <= {item['receipt_id'] for item in after}
 
 
 @pytest.mark.parametrize("initial", ["timeout_open", "queued"])
@@ -121,6 +125,7 @@ def test_merge_readback_retires_only_exact_prior_claims(tmp_path, monkeypatch, i
     from ouroboros.tools import github
     from tests.test_pr_merge_receipts import FakeGh, HEAD, MERGE
     from tests.test_batch4_producer_custody import _registry, _consumers
+    from ouroboros.tool_custody import retained_tool_custody
     registry, queue, workers = _registry(tmp_path, monkeypatch)
     fake = FakeGh(tmp_path, merge=initial)
     monkeypatch.setattr(github, "github_cli_configured", lambda: True)
@@ -128,16 +133,19 @@ def test_merge_readback_retires_only_exact_prior_claims(tmp_path, monkeypatch, i
     args = {"number": 7, "expected_head_sha": HEAD, "method": "merge"}
     result = registry.execute_result("pr_merge", args)
     assert result.meta["operation_outcome"] == "unknown"
-    claims = load_task_result(tmp_path, "root")["launch_handoffs"]
-    assert claims
+    row = load_task_result(tmp_path, "root")
+    assert not row["launch_handoffs"]
+    assert any(item['kind'] == 'merge_operation' for item in retained_tool_custody(tmp_path, 'root', row))
     from ouroboros.model_sleep import cold_blockers
     from supervisor.continuation_admission import conflicting_writers
     assert cold_blockers(registry._ctx) and conflicting_writers(queue, "root")
-    write_task_result(tmp_path, "root", "running", launch_handoffs={**claims,
+    write_task_result(tmp_path, "root", "running", launch_handoffs={
         "independent": {"tool": "pr_merge", "task_id": "root", "state": "claimed"}})
     fake.pr.update(state="MERGED", mergeCommit={"oid": MERGE})
     assert registry.execute_result("pr_merge", args).meta["operation_outcome"] == "completed"
     assert set(load_task_result(tmp_path, "root")["launch_handoffs"]) == {"independent"}
+    assert [item['kind'] for item in retained_tool_custody(
+        tmp_path, 'root', load_task_result(tmp_path, 'root'))] == ['tool_handoff']
     assert sum(c[:2] == ["pr", "merge"] for c in fake.calls) == 1
     assert cold_blockers(registry._ctx) and conflicting_writers(queue, "root")
     # Remove only the synthetic independent fixture claim to inspect all readers.

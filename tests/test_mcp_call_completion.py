@@ -10,6 +10,7 @@ lost response, a spoofed result or another invocation's unknown claim does not.
 from __future__ import annotations
 
 import functools
+import threading
 from contextlib import asynccontextmanager
 
 import pytest
@@ -140,16 +141,29 @@ def test_a_returned_mcp_call_settles_its_claim_for_every_consumer(tmp_path, monk
 
 def test_the_returned_call_retires_only_its_own_claim(tmp_path, monkeypatch):
     registry, queue, workers = _registry(tmp_path, monkeypatch)
-    # An unrelated invocation whose outcome stays unknown (its reader raised).
-    failed = registry.execute_result("query_code", {"op": "symbols", "limit": "invalid"})
-    assert failed.status == "error"
-    unknown = dict(load_task_result(tmp_path, "root")["launch_handoffs"])
-    assert len(unknown) == 1
-    calls = _wire(monkeypatch)
-    assert registry.execute_result("mcp_demo__effect", {}).status == "ok"
-    assert calls == ["effect"]
-    assert load_task_result(tmp_path, "root")["launch_handoffs"] == unknown
-    _consumers(tmp_path, registry, queue, workers, held=True)
+    # A genuinely in-flight independent invocation, not a reader that already unwound.
+    entered, release = threading.Event(), threading.Event()
+    def pending(*_args, **_kwargs):
+        entered.set()
+        assert release.wait(10)
+        return 'joined'
+    registry.override_handler('knowledge_read', pending)
+    thread = threading.Thread(target=registry.execute_result, args=('knowledge_read', {'topic': 'x'}))
+    thread.start()
+    try:
+        assert entered.wait(5)
+        unknown = dict(load_task_result(tmp_path, "root")["launch_handoffs"])
+        assert len(unknown) == 1
+        calls = _wire(monkeypatch)
+        assert registry.execute_result("mcp_demo__effect", {}).status == "ok"
+        assert calls == ["effect"]
+        assert load_task_result(tmp_path, "root")["launch_handoffs"] == unknown
+        _consumers(tmp_path, registry, queue, workers, held=True)
+    finally:
+        release.set()
+        thread.join(5)
+        assert not thread.is_alive()
+    assert not load_task_result(tmp_path, 'root')['launch_handoffs']
 
 
 @pytest.mark.parametrize("failure", ["timeout", "lost_response"])

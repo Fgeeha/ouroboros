@@ -291,8 +291,16 @@ def historical_review_controls(root: Any, row: dict, debt: dict, *, caller_task_
             fences = snapshot.get("budget_root_fences", [])
             if not isinstance(fences, list) or any(not isinstance(f, dict) for f in fences):
                 raise ValueError("invalid_budget_fences")
-            if check_pause and any(f.get("root_task_id") == debt["accounting_root_task_id"]
-                   and f.get("status") in {"active", "paused"} for f in fences):
+            for fence in fences if check_pause else ():
+                if fence.get("root_task_id") != debt["accounting_root_task_id"] or fence.get("status") not in {"active", "paused"}:
+                    continue
+                if fence.get("cause") == "owner_pause":
+                    from ouroboros.owner_pause import read_fence
+                    current = read_fence(root, debt["accounting_root_task_id"])
+                    # Resume opens durable authority before its queue projection is
+                    # persisted. That stale latch cannot cancel newly resumed work.
+                    if current.get("state") == "released" and current.get("fence_id") == fence.get("fence_id"):
+                        continue
                 blocked.append("root_budget_fence")
         from ouroboros.task_pacing import BudgetSnapshot, review_launch_allowed
         for suffix, raw in deadlines:

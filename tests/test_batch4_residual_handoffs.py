@@ -166,7 +166,8 @@ def test_patch_phase2_failure_is_not_validation_no_effect(tmp_path, monkeypatch)
     assert (workspace / "a.txt").read_text() == "first\n"
     assert result.status != "ok"
     assert result.meta.get("operation_outcome") != "completed_no_effect"
-    assert load_task_result(tmp_path, "root").get("launch_handoffs")
+    assert not (workspace / 'b.txt').exists()
+    assert not load_task_result(tmp_path, "root").get("launch_handoffs"), "the failed write body returned"
 
 
 def test_patch_validation_cannot_retire_an_independent_unknown_handoff(tmp_path, monkeypatch):

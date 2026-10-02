@@ -199,7 +199,7 @@ def test_definite_pre_effect_refusal_releases_its_launch_claim(tmp_path, monkeyp
     assert queue.resume_budget_paused_task("root")["ok"] is True
 
 
-def test_an_error_after_the_github_call_keeps_conservative_custody(tmp_path, monkeypatch):
+def test_returned_github_parse_error_does_not_keep_local_execution_alive(tmp_path, monkeypatch):
     from ouroboros.task_results import load_task_result
     from ouroboros.tools import github
     from supervisor import state
@@ -211,9 +211,9 @@ def test_an_error_after_the_github_call_keeps_conservative_custody(tmp_path, mon
     result = registry.execute_result("get_github_issue", {"number": 5})
     assert "failed to parse issue JSON" in result.text
     assert result.meta.get("operation_outcome") != "completed_no_effect"
-    assert load_task_result(tmp_path, "root")["launch_handoffs"]
+    assert not load_task_result(tmp_path, "root")["launch_handoffs"]
     _park(tmp_path, monkeypatch, queue, workers)
-    assert queue.resume_budget_paused_task("root")["error"] == "owner_pause_effects_unsettled"
+    assert queue.resume_budget_paused_task("root")["ok"]
 
 
 def test_pause_during_mcp_safety_preparation_starts_no_transport(tmp_path, monkeypatch):

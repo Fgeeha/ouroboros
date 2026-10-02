@@ -55,7 +55,7 @@ def test_pre_effect_refusal_leaves_sleep_pause_continue_usable(tmp_path, monkeyp
 
 
 @pytest.mark.parametrize('failure', ['unknown', 'timeout', 'post_spawn_missing'])
-def test_ambiguous_command_error_retains_custody(tmp_path, monkeypatch, failure):
+def test_unwound_command_error_keeps_error_without_ghost_custody(tmp_path, monkeypatch, failure):
     import subprocess
     from ouroboros.tools.registry import ToolRegistry
     from ouroboros.tools import shell
@@ -71,8 +71,9 @@ def test_ambiguous_command_error_retains_custody(tmp_path, monkeypatch, failure)
     monkeypatch.setattr(shell, '_tracked_subprocess_run', ambiguous)
     result = registry.execute_result('run_command', {'cmd': ['ambiguous']})
     assert result.status != 'ok'
-    assert load_task_result(tmp_path, 'root')['launch_handoffs']
-    assert any(b['kind'] == 'tool_handoff' for b in conflicting_writers(q, 'root'))
+    assert result.meta.get('operation_outcome') != 'completed_no_effect'
+    assert not load_task_result(tmp_path, 'root')['launch_handoffs']
+    assert not any(b['kind'] == 'tool_handoff' for b in conflicting_writers(q, 'root'))
 
 
 @pytest.mark.parametrize('origin', ['review', 'evolution', 'assisted', 'restore', 'plain'])
@@ -163,7 +164,7 @@ def test_command_refusal_and_unknown_outcomes_reach_real_continue(tmp_path, monk
     workers.RUNNING.clear()
     ack = admit_continuation('root', action_nonce=NONCE)
     assert ack['ok'], ack
-    assert ack['held'] == (outcome != 'refused')
+    assert not ack['held'], "none of these returned bodies owns an independent physical operation"
     assert len(q.PENDING) == 1
 
 

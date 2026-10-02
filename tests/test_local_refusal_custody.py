@@ -122,7 +122,7 @@ def test_a_write_then_error_is_not_mislabelled_a_pre_effect_refusal(tmp_path, mo
     assert result.status == "error"
     assert result.meta.get("operation_outcome") != "completed_no_effect"
     assert (repo / "notes.txt").read_text(encoding="utf-8") == "alpha\ngamma\nalpha\n"
-    assert load_task_result(tmp_path, "root")["launch_handoffs"]
+    assert not load_task_result(tmp_path, "root")["launch_handoffs"], "the write completed before its exception"
 
 
 def _completion_refusal(registry, case):

@@ -75,7 +75,7 @@ def test_mcp_initialization_pause_fences_call_across_async_runner(tmp_path, monk
     assert not load_task_result(tmp_path, "root").get("launch_handoffs")
 
 
-def test_positive_no_effect_fact_is_not_a_tool_name_exception(tmp_path, monkeypatch):
+def test_business_metadata_does_not_outlive_a_joined_builtin(tmp_path, monkeypatch):
     from ouroboros.tools.registry import ToolRegistry
     from ouroboros.tools.tool_result import ToolResult
     from ouroboros.task_results import load_task_result
@@ -87,8 +87,10 @@ def test_positive_no_effect_fact_is_not_a_tool_name_exception(tmp_path, monkeypa
         registry.override_handler("list_available_tools", lambda *_a, **_kw: ToolResult(
             status="ok", code="LEGACY_WARNING", text="empty read",
             meta={"operation_outcome": "completed_no_effect", "dynamic_provider": dynamic}))
-        registry.execute_result("list_available_tools", {})
-        assert bool(load_task_result(tmp_path, "root").get("launch_handoffs")) == dynamic
+        result = registry.execute_result("list_available_tools", {})
+        assert result.meta['dynamic_provider'] is dynamic
+        assert result.meta['operation_outcome'] == 'completed_no_effect'
+        assert not load_task_result(tmp_path, "root").get("launch_handoffs")
 
 
 @pytest.mark.parametrize("veto", ["unknown_dispatch", "stop", "foreign_hold", "snapshot", "fence_write"])
