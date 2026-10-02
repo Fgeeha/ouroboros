@@ -104,8 +104,9 @@ def effective_billing_fields(budget_root: Any, root_id: str, fields: Dict[str, A
 def ledger_billing_binding(budget_root: Any, root_task_id: str) -> Dict[str, Any]:
     """Recover attribution from existing ledger authority, never current settings.
 
-    Missing, invalid or unstamped original carriage in an aggregate is unknown and
-    raises ``LedgerBindingUnknown``: callers refuse it as unavailable authority.
+    Writer preparation may recover old missing carriage from its verified archive.
+    Otherwise unknown original authority raises ``LedgerBindingUnknown``; callers
+    refuse it rather than borrow a current allowance.
     """
     from ouroboros import usage_accounting as ua
     from ouroboros._usage_rows import UNKNOWN_BINDING, LedgerBindingUnknown

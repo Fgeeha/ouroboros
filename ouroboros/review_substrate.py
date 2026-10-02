@@ -308,7 +308,8 @@ class ReviewCoordinator:
             category=review_usage_category(request.surface),
             source="review_substrate",
             non_task_operation=not bool((base_scope.task_id and not base_scope.non_task_operation)
-                                        or getattr(self.usage_ctx, "task_id", "")),
+                                        or (getattr(self.usage_ctx, "task_id", "")
+                                            and getattr(self.usage_ctx, "task_lifecycle_bound", None) is not False)),
             review_skill=str(review_meta.get("review_skill") or base_scope.review_skill or ""),
             review_wave_id=str(review_meta.get("review_wave_id") or base_scope.review_wave_id or ""),
             global_limit_usd=global_limit,

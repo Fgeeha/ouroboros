@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import copy
 import hashlib
 import json
 import logging
@@ -86,7 +87,7 @@ _COMPACT_ATTEMPTS_LOCK = threading.Lock()
 
 # Immutable-segment cache for the history readers: abs path -> (expected
 # sha256, frozen attempt-id set, embedded prior header, file fingerprint, the
-# moment it was verified). The fingerprint is part of the hit condition, so a
+# verification time, original binding index). The fingerprint binds a hit, so a
 # segment deleted or rewritten after a warm read re-verifies (and fails)
 # instead of answering from memory — but a fingerprint is not proof of
 # identity: an in-place rewrite of the same size, inside the filesystem's
@@ -97,7 +98,7 @@ _COMPACT_ATTEMPTS_LOCK = threading.Lock()
 _SEGMENT_MTIME_SETTLE_SEC = 2.0
 _SEGMENT_CACHE_TTL_SEC = 60.0
 _SEGMENT_CACHE: Dict[
-    str, Tuple[str, frozenset, Optional[Dict[str, Any]], Tuple[int, int, int, int], float]
+    str, Tuple[str, frozenset, Optional[Dict[str, Any]], Tuple[int, int, int, int], float, BindingIndex]
 ] = {}
 
 # The union over one WHOLE chain, keyed by the chain's identity ((archive_rel,
@@ -107,7 +108,7 @@ _SEGMENT_CACHE: Dict[
 # compaction and only the newest chain can ever be asked again, so a
 # long-lived process must not keep one archived-id set per epoch it ever saw.
 _CHAIN_UNION_CACHE_MAX = 4
-_CHAIN_UNION_CACHE: Dict[Tuple[Tuple[str, str], ...], frozenset] = {}
+_CHAIN_UNION_CACHE: Dict[Tuple[Tuple[str, str], ...], tuple] = {}
 
 
 # Shared exact arithmetic; the literal-exact compaction self-check stays independent.
@@ -615,6 +616,7 @@ def _foldable_attempt_ids(records: list, *, now_ts: Optional[float] = None) -> s
 
 def _build_candidate(
     records: list, decimal_records: list, raw: bytes, beat: Callable[[], None],
+    *, bindings: Optional[BindingIndex] = None,
 ) -> Tuple[bytes, Dict[str, Any]]:
     """Fold ``records`` into the candidate bytes + commit receipt.
 
@@ -647,11 +649,12 @@ def _build_candidate(
         raise _Abort("nothing foldable")
     # An aggregate's cap is a minimum and its position a sort order, so the
     # block carries every source binding verbatim (usage_admission readers).
-    bindings = BindingIndex()
-    for index, row in enumerate(records):
-        if index % 4096 == 0:
-            beat()
-        bindings.fold(row)
+    if bindings is None:
+        bindings = BindingIndex()
+        for index, row in enumerate(records):
+            if index % 4096 == 0:
+                beat()
+            bindings.fold(row)
     carried_keys: tuple = (set(), set())
 
     baseline_id = f"baseline-{uuid.uuid4().hex[:12]}"
@@ -843,7 +846,16 @@ def compact_usage_ledger_locked(
             float_rows, decimal_rows = _parse_ledger_lines(raw)
             if len(float_rows) != len(records):
                 raise _Abort("post-read line drift")
-            candidate, receipt = _build_candidate(float_rows, decimal_rows, raw, beat)
+            from ouroboros._usage_rows_memo import prepared_original_bindings
+            prepared = prepared_original_bindings(root)
+            bindings = BindingIndex()
+            for index, row in enumerate(float_rows):
+                if index % 4096 == 0:
+                    beat()
+                bindings.fold(row)
+            if prepared is not None:
+                bindings.recover_from(prepared)
+            candidate, receipt = _build_candidate(float_rows, decimal_rows, raw, beat, bindings=bindings)
             if len(candidate) >= len(raw):
                 raise _Abort("no byte gain")
             beat()
@@ -854,6 +866,13 @@ def compact_usage_ledger_locked(
             source_bindings, candidate_bindings = BindingIndex(), BindingIndex()
             for row in decimal_rows:
                 source_bindings.fold(row)
+            if prepared is not None:
+                # Match the literal comparison's Decimal representation without
+                # rewriting original source/revision attribution.
+                exact = BindingIndex(recovered=set(prepared.recovered))
+                exact.roots, exact.groups = [json.loads(json.dumps(index), parse_float=Decimal)
+                                            for index in (prepared.roots, prepared.groups)]
+                source_bindings.recover_from(exact)
             for row in candidate_decimals:
                 candidate_bindings.fold(row)
             if source_bindings != candidate_bindings:
@@ -1147,7 +1166,7 @@ def _open_archive_entry(path: pathlib.Path, dir_fd: Optional[int]) -> int:
 
 def _load_segment(
     root: pathlib.Path, header: Dict[str, Any], dir_fd: Optional[int]
-) -> Tuple[frozenset, Optional[Dict[str, Any]]]:
+) -> tuple:
     """Read one archived segment named (and fully described) by ``header``.
 
     Segments are immutable, so a verified read is cached — but the cache is
@@ -1177,7 +1196,7 @@ def _load_segment(
             and (now - info.st_mtime) > _SEGMENT_MTIME_SETTLE_SEC
             and (now - cached[4]) <= _SEGMENT_CACHE_TTL_SEC
         ):
-            return cached[1], cached[2]
+            return cached[1], cached[2], cached[5]
         chunks: list = []
         while True:
             chunk = os.read(fd, 1 << 20)
@@ -1207,8 +1226,11 @@ def _load_segment(
     ids.discard("")
     prior_header = rows[0] if rows and str(rows[0].get("kind") or "") == "usage_baseline" else None
     frozen = frozenset(ids)
-    _SEGMENT_CACHE[key] = (expected_sha256, frozen, prior_header, fingerprint, now)
-    return frozen, prior_header
+    bindings = BindingIndex()
+    for row in rows:
+        bindings.fold(row)
+    _SEGMENT_CACHE[key] = (expected_sha256, frozen, prior_header, fingerprint, now, bindings)
+    return frozen, prior_header, bindings
 
 
 def _no_newer_archived_epoch(
@@ -1296,8 +1318,8 @@ def _union_segment_ids(segment_ids: list) -> frozenset:
     return frozenset(ids)
 
 
-def archived_attempt_ids(root: pathlib.Path | str | None = None) -> frozenset:
-    """Every ``attempt_id`` recorded in the archived ledger segments.
+def _archive_chain(root: pathlib.Path, live_header: Optional[dict]) -> tuple:
+    """Attempt identities and original bindings from one verified archive chain.
 
     Walks the tamper-evident chain: the live header names (and hash-pins) the
     newest segment; each segment's own leading header names the one before it.
@@ -1317,8 +1339,6 @@ def archived_attempt_ids(root: pathlib.Path | str | None = None) -> frozenset:
     mis-stepped, cyclic or out-anchored chain raises ``UsageLedgerCorrupt`` —
     the model-send reverse sweep must treat that as its existing UNKNOWN /
     skip-pass state, never as evidence of an orphan."""
-    root = pathlib.Path(_drive_root(root))
-    live_header = _live_baseline_header(root)
     if live_header is None:  # no stamp: only the kernel's exact "no archive directory" ends
         for level in ((root / ARCHIVE_SEGMENT_DIR_REL).parent, root / ARCHIVE_SEGMENT_DIR_REL):
             try:  # a link at either level — dangling included — is the stamped reader's refusal, not ENOENT
@@ -1331,7 +1351,7 @@ def archived_attempt_ids(root: pathlib.Path | str | None = None) -> frozenset:
         try:  # the question early; anything else is UNKNOWN (typed), never a silent empty answer
             mode = os.stat(root / ARCHIVE_SEGMENT_DIR_REL).st_mode
         except FileNotFoundError:
-            return frozenset()  # never compacted and no archive: nothing to anchor against
+            return frozenset(), BindingIndex(), ()  # never compacted: no archive authority
         except OSError as exc:
             raise UsageLedgerCorrupt(
                 f"usage archive directory cannot be inspected: {root / ARCHIVE_SEGMENT_DIR_REL}"
@@ -1348,6 +1368,7 @@ def archived_attempt_ids(root: pathlib.Path | str | None = None) -> frozenset:
     header = live_header
     chain: list = []
     segments: list = []
+    binding_segments: list = []
     seen: set = set()
     expected_epoch: Optional[int] = None
     try:
@@ -1366,9 +1387,10 @@ def archived_attempt_ids(root: pathlib.Path | str | None = None) -> frozenset:
             if archive_rel in seen:
                 raise UsageLedgerCorrupt(f"usage archive segment cycle at {archive_rel}")
             seen.add(archive_rel)
-            segment_ids, header = _load_segment(root, header, dir_fd)
+            segment_ids, header, bindings = _load_segment(root, header, dir_fd)
             chain.append((archive_rel, expected))
             segments.append(segment_ids)
+            binding_segments.append(bindings)
             expected_epoch = epoch - 1
             if header is None and expected_epoch != 0:
                 raise UsageLedgerCorrupt(
@@ -1382,12 +1404,64 @@ def archived_attempt_ids(root: pathlib.Path | str | None = None) -> frozenset:
     key = tuple(chain)
     cached = _CHAIN_UNION_CACHE.get(key)
     if cached is not None:
-        return cached
+        return *cached, key
     union = _union_segment_ids(segments)
+    bindings = BindingIndex()
+    for segment in reversed(binding_segments):
+        current = copy.deepcopy(segment)
+        current.recover_from(bindings)
+        bindings = current
     if len(_CHAIN_UNION_CACHE) >= _CHAIN_UNION_CACHE_MAX:
         _CHAIN_UNION_CACHE.clear()
-    _CHAIN_UNION_CACHE[key] = union
-    return union
+    _CHAIN_UNION_CACHE[key] = (union, bindings)
+    return union, bindings, key
+
+
+def archived_attempt_ids(root: pathlib.Path | str | None = None) -> frozenset:
+    """Validated live-header archive chain's attempt identities (never replay)."""
+    root = pathlib.Path(_drive_root(root))
+    return _archive_chain(root, _live_baseline_header(root))[0]
+
+
+def prepare_original_bindings(root: pathlib.Path, header: dict) -> tuple:
+    """Off-lock recovery from the same verified chain as history membership.
+
+    The writer later proves its captured live generation. The certificate uses
+    the existing segment-cache lifetime and file identities; warm reservations
+    only stat these sources, never parse the archive again. An unavailable
+    source leaves UNKNOWN, with the same bounded cache lifetime for retry.
+    """
+    paths = []
+    verified_at = time.time()
+    bindings = BindingIndex()
+    try:
+        _ids, bindings, chain = _archive_chain(root, header)
+        paths = [(str(root / rel), _SEGMENT_CACHE[str(root / rel)][3]) for rel, _sha in chain]
+        verified_at = min([verified_at, *(_SEGMENT_CACHE[path][4] for path, _ in paths)])
+        directory = root / ARCHIVE_SEGMENT_DIR_REL
+        info = directory.stat()
+        paths.append((str(directory), (info.st_ino, info.st_dev, info.st_size, info.st_mtime_ns)))
+    except (UsageLedgerCorrupt, OSError, ValueError):
+        bindings, paths = BindingIndex(), []
+        log.warning("Original usage binding archive unavailable for %s", root, exc_info=True)
+    return bindings, (verified_at, tuple(paths))
+
+
+def original_bindings_current(certificate: Optional[tuple]) -> bool:
+    """Cheap freshness of off-lock recovery; no ledger/archive replay or mutation."""
+    if certificate is None:
+        return True
+    verified_at, paths = certificate
+    if time.time() - verified_at > _SEGMENT_CACHE_TTL_SEC:
+        return False
+    try:
+        for path, expected in paths:
+            info = pathlib.Path(path).lstat()
+            if (info.st_ino, info.st_dev, info.st_size, info.st_mtime_ns) != expected:
+                return False
+        return True
+    except OSError:
+        return False
 
 
 def usage_attempt_recorded(

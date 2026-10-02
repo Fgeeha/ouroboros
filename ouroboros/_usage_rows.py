@@ -57,18 +57,23 @@ class BindingIndex:
     the first group row of each root/group; an explicit ``NO_ORIGINAL_BINDING``
     there leaves that member unbound for a later original row. Missing,
     invalid or unstamped carriage fixes that member's binding as UNKNOWN,
-    never a later row's cap. Equality compares the two indexes only.
+    never a later row's cap. A verified archived generation may recover only
+    old missing carriage through recover_from. Equality compares the indexes.
     """
 
     roots: Dict[str, Any] = field(default_factory=dict)
     groups: Dict[str, Any] = field(default_factory=dict)
     carried: bool = field(default=False, compare=False)
+    recovery: dict = field(default_factory=dict, compare=False)
+    recovered: set = field(default_factory=set, compare=False)
+    legacy: bool = field(default=False, compare=False)
     unbound: set = field(default_factory=set, compare=False)  # (carrier, key) the block left open
 
     def fold(self, row: Dict[str, Any]) -> None:
         kind = str(row.get("kind") or "")
         if kind == "usage_baseline":
             self.carried = row.get(BINDING_AUTHORITY_FIELD) == BINDING_CARRIED
+            self.legacy = BINDING_AUTHORITY_FIELD not in row
             return
         root, group = monetary_scope_key(row), billing_group_key(row)
         if kind == "usage_baseline_group":
@@ -78,10 +83,14 @@ class BindingIndex:
                     continue  # only the first block row of each member decides it
                 if not self.carried:
                     index[key] = UNKNOWN_BINDING
+                    if self.legacy and not any(field in row for field in (CARRIED_ROOT_BINDING, CARRIED_GROUP_BINDING)):
+                        self.recovery[(name, key)] = True
                 elif row.get(name) == NO_ORIGINAL_BINDING:
                     self.unbound.add((name, key))
                 else:
                     index[key] = _carried(row.get(name), key, owner)
+                    if row.get(name) == UNKNOWN_BINDING:
+                        self.recovery[(name, key)] = False
             return
         if ((root and root not in self.roots) or (group and group not in self.groups)) and any(
                 cap in row for cap in _BINDING_CAPS):
@@ -89,6 +98,22 @@ class BindingIndex:
             for index, key in ((self.roots, root), (self.groups, group)):
                 if key:
                     index.setdefault(key, binding)
+
+    def recover_from(self, prior: "BindingIndex") -> None:
+        """Recover old missing carriage, never repair contradictory modern facts.
+
+        A stamped UNKNOWN may only inherit a recovery proved for its exact
+        archived source generation. An unstamped old block can recover the
+        preceding original rows. Missing/invalid modern payloads remain gaps.
+        Original source/revision and explicit unlimited None stay verbatim.
+        """
+        for name, index, previous in ((CARRIED_ROOT_BINDING, self.roots, prior.roots),
+                                       (CARRIED_GROUP_BINDING, self.groups, prior.groups)):
+            for (carrier, key), legacy in self.recovery.items():
+                value = previous.get(key)
+                if carrier == name and isinstance(value, dict) and (legacy or (name, key) in prior.recovered):
+                    index[key] = dict(value)
+                    self.recovered.add((name, key))
 
 
 def row_ts_epoch(row: Any) -> Optional[float]:

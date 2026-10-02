@@ -249,19 +249,30 @@ The group key (§4) makes each group homogeneous in every branch predicate
 exactly the per-row branch taken `weight` times with the sums pre-added.
 
 Original cap authority is separate from aggregate minima. `BindingIndex`
-folds every original row, preserving the first root/group binding and explicit
-unlimited `None`. Compaction stamps `binding_authority=carried` on the header
-and puts `original_root_binding` / `original_group_binding` on the first
-aggregate for each respective identity. An identity no source row had bound
-yet carries the exact string `unbound` there: under the stamp it leaves that
-axis open, so the first later original row binds it exactly as it would have
-uncompacted. That first occurrence fixes each axis independently: missing,
-malformed, foreign or unstamped payload means UNKNOWN, never authority from a
-later aggregate or original row. Repeated compaction
-carries UNKNOWN forward; publication compares source/candidate bindings as
-well as money. Warm and cold readers share this index. Continue refuses an
-unknown original binding; valid durable bindings and owner amendments remain
-separate authorities. Readers never reconstruct authority from archives.
+keeps the earliest original root/group fields verbatim, including explicit
+unlimited `None`. Compaction stamps `binding_authority=carried` and puts
+`original_root_binding` / `original_group_binding` on the first aggregate for
+each identity. Exact `unbound` leaves that axis open to the first later original
+row. Missing, malformed or foreign modern carriage fixes UNKNOWN; a later cap
+or aggregate sort order cannot replace it.
+
+Older unstamped blocks may recover exact original fields through
+`usage_compaction.prepare_original_bindings`: the existing hash/size/transition
+and complete epoch/anchor validation, oldest source first. A newer UNKNOWN
+can inherit only a recovery proved for its own archived source. Unrecorded,
+pre-archive/imported or corrupt authority stays a gap, never current settings.
+Source/revision fields remain unchanged; the header's segment chain retains
+the original attempt evidence. Durable bindings and owner amendments remain
+separate authorities.
+
+Strict writer preparation recovers outside the money lock; generation/CAS and
+appended-suffix validation precede use. Its archive certificate shares the
+existing segment-cache lifetime and checks source fingerprints. Warm admission
+uses that view without parsing archives; source loss invalidates it. Display
+and raw-record reads do not initiate archive recovery. Compaction borrows only
+prepared authority, compares exact source/candidate bindings and money, and
+carries recovered values for cold reads. An unprepared explicit pass preserves
+UNKNOWN with its archive chain, allowing later off-lock recovery.
 
 ## 8. Concurrency, crash-safety, caches
 

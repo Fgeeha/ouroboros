@@ -183,8 +183,7 @@ def _strip_carriage(root):
     _cold(root)
 
 
-def test_older_block_is_unknown_never_an_invented_allowance(data_root, monkeypatch):
-    from ouroboros._usage_rows import LedgerBindingUnknown
+def test_older_block_recovers_exact_original_authority_and_recompacts(data_root, monkeypatch):
     from ouroboros.task_results import write_task_result
 
     root = ua._drive_root(data_root)
@@ -203,16 +202,15 @@ def test_older_block_is_unknown_never_an_invented_allowance(data_root, monkeypat
     sums = _sums(root, "P", "Q", "R")
     _strip_carriage(root)
     assert _sums(root, "P", "Q", "R") == sums
-    for epoch in range(2):  # a newer pass carries the unknown forward instead of healing it
-        assert original_group_limit(root, "P") == {"limit_usd": None, "source": "ledger_binding_unknown"}
-        with pytest.raises(LedgerBindingUnknown):
-            ledger_billing_binding(root, "P")
-        assert task_billing_fields({"id": "P"}, "P", 30.0, root)["billing_group_id"] == "unavailable:P"
-        with pytest.raises(ValueError):
-            _billing_group(SimpleNamespace(DRIVE_ROOT=root), "P", {"task_id": "P"})
-        assert task_money_snapshot(root, {"id": "P"}, "P") is None
-        # A durable group binding stays usable; only the root's unknown ORIGINAL cap is refused.
-        assert task_money_snapshot(root, {"id": "R"}, "R") is None
+    for epoch in range(2):  # a newer pass carries the verified original, never today's cap
+        assert original_group_limit(root, "P") == {"limit_usd": 20.0, "source": "ledger_first_row"}
+        assert ledger_billing_binding(root, "P")["billing_group_limit_usd"] == 20.0
+        assert task_billing_fields({"id": "P"}, "P", 30.0, root)["billing_group_limit_usd"] == 20.0
+        assert _billing_group(SimpleNamespace(DRIVE_ROOT=root), "P", {"task_id": "P"})["billing_group_limit_usd"] == 20.0
+        assert task_money_snapshot(root, {"id": "P"}, "P")["root_axis"]["limit_usd"] == 20.0
+        # Explicit original unlimited remains distinct from the later durable group cap.
+        assert original_group_limit(root, "R")["limit_usd"] is None
+        assert task_money_snapshot(root, {"id": "R"}, "R")["group_axis"]["limit_usd"] == 8.0
         explicit = task_money_snapshot(root, {"id": "R"}, "R", root_limit=8.0)
         assert explicit["root_axis"]["limit_usd"] == 8.0 and explicit["group_axis"]["limit_usd"] == 8.0
         # A root outside the aggregate (its only chain is still open) keeps its exact binding.
