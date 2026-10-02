@@ -66,7 +66,7 @@ def test_one_browser_lane_serves_pull_requests_manual_tags_and_ouroboros_pushes(
     assert "github.event_name == 'workflow_dispatch'" in caller["if"]
     assert "startsWith(github.ref, 'refs/tags/v')" in caller["if"]
     # A push reaches the lane through its own workflow, never through ci.yml's
-    # path-filtered push trigger.
+    # push trigger.
     assert "push" not in caller["if"] and "schedule" not in caller["if"]
     assert ci_triggers["schedule"] == [{"cron": "37 4 * * *"}]
 

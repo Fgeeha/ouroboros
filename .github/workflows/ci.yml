@@ -15,43 +15,17 @@
 
 name: CI
 
-# Two separate push triggers: branches have path filters, tags do not.
-# This ensures tag pushes always fire (even if only VERSION/README changed).
-# The browser lane is the ONE exception that must see every `ouroboros` push,
-# including a Makefile/spec/requirements-only one: it lives in its own
-# `ui-browser-push.yml`, which calls the SAME reusable `ui-browser.yml` lane
-# this workflow calls for pull requests, manual runs and tags.
+# The code workflow runs on every push to the three shared branches and on
+# every `v*` tag, with no path filter: tests and builds read prompts, skills,
+# the Makefile, the spec and the requirements too, and a path list silently
+# leaves a new top-level path untested. The paid provider canaries keep their
+# own path list in `provider-canary-push.yml`, and the browser lane's push
+# entry stays `ui-browser-push.yml`, which calls the SAME reusable
+# `ui-browser.yml` lane this workflow calls for pull requests, manual runs and
+# tags.
 on:
   push:
     branches: [main, ouroboros, ouroboros-stable]
-    paths:
-      - 'ouroboros/**'
-      - 'supervisor/**'
-      - 'server.py'
-      - 'tests/**'
-      - 'web/**'
-      - 'site/**'
-      - 'docs/**'
-      - 'assets/**'
-      - 'requirements-runtime.lock'
-      - 'uv.lock'
-      - 'pyproject.toml'
-      - '.github/workflows/**'
-      - '.github/actions/**'
-      - 'build.sh'
-      - 'build_linux.sh'
-      - 'build_windows.ps1'
-      - 'Dockerfile'
-      - 'scripts/**'
-      - 'devtools/**'
-      - 'packaging/**'
-      - 'android/**'
-      - 'VERSION'
-      - 'README.md'
-      - 'CONTRIBUTING.md'
-      - 'LICENSE'
-      - '.github/PULL_REQUEST_TEMPLATE.md'
-      - 'launcher.py'
     tags:
       - 'v*'
   # Fork-safe PR validation: no provider secrets and no pull_request_target.
@@ -77,9 +51,6 @@ on:
   # bind a scheduled job to its own cron string.
   schedule:
     - cron: '37 4 * * *'
-
-# Note: GitHub Actions evaluates `branches` + `paths` together but `tags`
-# separately — a tag push matching `v*` will trigger regardless of paths.
 
 # Read-only is sufficient for tests and fork PRs. The release job overrides
 # this narrowly with contents: write when publishing a tag.
@@ -555,9 +526,9 @@ jobs:
           grep -q "tests/test_smoke.py" /tmp/size-ratchet-collect.txt
           grep -q "tests/test_repo_health_smoke.py" /tmp/size-ratchet-collect.txt
 
-  # Pushes are deliberately NOT matched here: this workflow keeps the base path
-  # filter, so a Makefile/spec-only push would silently skip the browser lane.
-  # `.github/workflows/ui-browser-push.yml` owns that trigger and shares this job.
+  # Pushes are deliberately NOT matched here: `.github/workflows/ui-browser-push.yml`
+  # owns that trigger and shares this job, so a landed push gets one browser
+  # lane under its own result.
   ui-smoke:
     if: |
       github.event_name == 'pull_request'

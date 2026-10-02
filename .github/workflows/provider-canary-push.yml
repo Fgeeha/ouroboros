@@ -4,9 +4,10 @@
 # misbehaved while the repository's code is fine. They live in their own
 # workflow so that outcome carries its own badge and never reddens `ci.yml`,
 # which reports the code. Each matching push starts one paid run: this trigger
-# carries the same branches and the same path filter as the `ci.yml` push
-# trigger, and `ci.yml` calls the same reusable job only for manual runs and
-# `v*` tags, where the release chain requires it.
+# carries the same three branches as the `ci.yml` push trigger and, on purpose,
+# its own path list, so a prompts- or skills-only push starts the code workflow
+# and no paid run. `ci.yml` calls the same reusable job only for manual runs
+# and `v*` tags, where the release chain requires it.
 name: Provider canaries
 
 on:

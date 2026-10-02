@@ -20,6 +20,16 @@ PROVIDER_SECRETS = (
     "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "MINIMAX_API_KEY", "DEEPSEEK_API_KEY",
     "CLOUDRU_FOUNDATION_MODELS_API_KEY", "CLOUDRU_FOUNDATION_MODELS_BASE_URL", "GIGACHAT_CREDENTIALS",
 )
+SHARED_BRANCHES = ["main", "ouroboros", "ouroboros-stable"]
+# What starts a PAID canary run on a branch push. The code workflow has no path list, so this
+# one is spelled out here: a prompts- or skills-only push runs the code workflow and no canary.
+CANARY_PUSH_PATHS = [
+    "ouroboros/**", "supervisor/**", "server.py", "tests/**", "web/**", "site/**", "docs/**", "assets/**",
+    "requirements-runtime.lock", "uv.lock", "pyproject.toml", ".github/workflows/**", ".github/actions/**",
+    "build.sh", "build_linux.sh", "build_windows.ps1", "Dockerfile", "scripts/**", "devtools/**",
+    "packaging/**", "android/**", "VERSION", "README.md", "CONTRIBUTING.md", "LICENSE",
+    ".github/PULL_REQUEST_TEMPLATE.md", "launcher.py",
+]
 DOWNLOAD_ACTION = "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
 UI_JOBS = ["scope", "ui-shard", "ui-manifest", "ui-smoke"]
 # The complete lane takes no selection: its jobs run whenever browsers are needed.
@@ -115,12 +125,12 @@ def _canary_wiring_faults(ci, shared, push):
     declared = {name: {"required": False} for name in PROVIDER_SECRETS}
     if _triggers(shared) != {"workflow_call": {"secrets": declared}}:
         faults.append("the shared job is not call-only with eight optional secrets")
-    # Same branches and path filter as the code workflow's push trigger: one paid run per push.
-    code_push = _triggers(ci)["push"]
-    if _triggers(push) != {"push": {"branches": code_push["branches"], "paths": code_push["paths"]}}:
-        faults.append("the push wrapper's trigger differs from ci.yml's branch pushes")
-    if code_push["branches"] != ["main", "ouroboros", "ouroboros-stable"]:
-        faults.append("ci.yml's branch pushes are not the three shared branches")
+    # One paid run per push that touches the canary path list, on the three shared branches only.
+    if _triggers(push) != {"push": {"branches": SHARED_BRANCHES, "paths": CANARY_PUSH_PATHS}}:
+        faults.append("the push wrapper's trigger is not the three shared branches with the canary path list")
+    # The code workflow sees EVERY push to those branches: a path list here leaves a landed commit untested.
+    if _triggers(ci)["push"] != {"branches": SHARED_BRANCHES, "tags": ["v*"]}:
+        faults.append("ci.yml's push trigger is not the three shared branches plus v* tags with no path filter")
     for label, workflow in ((CANARY, shared), (CANARY_PUSH, push)):
         if list(workflow["jobs"]) != ["integration-test"]:
             faults.append(f"{label} holds more than the canary job")
@@ -167,7 +177,10 @@ CANARY_DRIFTS = {
     "wrapper gains a second trigger": lambda w: _triggers(w.push).update(workflow_dispatch=None),
     "wrapper drops a branch": lambda w: _triggers(w.push)["push"]["branches"].remove("main"),
     "wrapper drops a path": lambda w: _triggers(w.push)["push"]["paths"].pop(),
-    "ci.yml gains a path": lambda w: _triggers(w.ci)["push"]["paths"].append("Makefile"),
+    "wrapper gains a path": lambda w: _triggers(w.push)["push"]["paths"].append("prompts/**"),
+    "ci.yml regains a path filter": lambda w: _triggers(w.ci)["push"].update(paths=["ouroboros/**"]),
+    "ci.yml ignores a path": lambda w: _triggers(w.ci)["push"].update({"paths-ignore": ["prompts/**"]}),
+    "ci.yml drops a branch": lambda w: _triggers(w.ci)["push"]["branches"].remove("main"),
     "wrapper concurrency": lambda w: w.push.update(concurrency="canary"),
     "shared job concurrency": lambda w: w.shared["jobs"]["integration-test"].update(concurrency="canary"),
     "inherited secrets": lambda w: w.ci["jobs"]["integration-test"].update(secrets="inherit"),

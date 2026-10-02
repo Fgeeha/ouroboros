@@ -1221,28 +1221,23 @@ def test_ci_step_outcome_references_resolve_to_prior_step_ids():
 
 
 
-def test_ci_branch_filters_include_packaging_assets():
-    workflow = _ci_workflow()
-
-    assert "- 'packaging/**'" in workflow
-    assert "- 'devtools/**'" in workflow
-
-
-def test_only_the_browser_push_workflow_drops_the_path_filter():
+def test_neither_the_code_workflow_nor_the_browser_push_workflow_filters_pushes_by_path():
     import yaml
 
-    # The shared workflow keeps ci.yml's filter for every other job; the browser
-    # lane alone must also see a Makefile-, spec- or requirements-only push.
-    ci_push = yaml.safe_load(_ci_workflow()).get("on", None)
-    ci_push = (ci_push or yaml.safe_load(_ci_workflow())[True])["push"]
-    assert ci_push["paths"] and "Makefile" not in str(ci_push["paths"])
+    # A path list decides whether a LANDED commit is tested at all: packaging/, devtools/,
+    # prompts/, skills/, the Makefile, the spec and the requirements are read by tests and
+    # builds, so both push entries must see a push that touches only those.
+    ci = yaml.safe_load(_ci_workflow())
+    ci_push = ci.get("on", ci.get(True))["push"]
+    assert ci_push == {"branches": ["main", "ouroboros", "ouroboros-stable"], "tags": ["v*"]}
 
     push = yaml.safe_load((_REPO_PATH / ".github/workflows/ui-browser-push.yml").read_text(encoding="utf-8"))
     trigger = push.get("on", push.get(True))
     assert list(trigger) == ["push", "workflow_dispatch"], "the UI-only entry adds no schedule or paid lane"
     assert trigger["workflow_dispatch"]["inputs"]["diagnostic"]["options"] == ["full", "viewport", "inflight"]
     assert trigger["push"]["branches"] == ["ouroboros"]
-    assert "paths" not in trigger["push"] and "paths-ignore" not in trigger["push"]
+    for label, entry in (("ci.yml", ci_push), ("ui-browser-push.yml", trigger["push"])):
+        assert "paths" not in entry and "paths-ignore" not in entry, label
     assert push["jobs"]["ui-smoke"]["uses"] == "./.github/workflows/ui-browser.yml"
 
     shared = yaml.safe_load((_REPO_PATH / ".github/workflows/ui-browser.yml").read_text(encoding="utf-8"))
