@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
 
 
-def _value(expression, *, event, ref, base="", schedule="", cancelled=False, attempt=1):
+def _value(expression, *, event, ref, base="", schedule="", cancelled=False, attempt=1, e2e_live="false"):
     """Evaluate the workflow's small expression vocabulary against real event shapes."""
     expression = expression.strip()
     if expression.startswith("$" + "{{"):
@@ -25,7 +25,7 @@ def _value(expression, *, event, ref, base="", schedule="", cancelled=False, att
     github = SimpleNamespace(
         event_name=event, ref=ref, base_ref=base, run_id=77, run_attempt=attempt,
         event=SimpleNamespace(
-            schedule=schedule, inputs=SimpleNamespace(e2e_live="false"), before="previous-tip",
+            schedule=schedule, inputs=SimpleNamespace(e2e_live=e2e_live), before="previous-tip",
             pull_request=SimpleNamespace(number=42, base=SimpleNamespace(sha="pr-base")),
         ),
     )
@@ -76,12 +76,32 @@ def test_desktop_pr_matrix_keeps_merge_checkout_and_pr_base_evidence_secret_free
     assert _value(base, event="push", ref="refs/heads/ouroboros-stable") == "previous-tip"
 
 
-@pytest.mark.parametrize("cron", ["37 4 * * *", "17 3 * * *"])
+# "17 3 * * *" is a cron string this workflow does not carry: an event bearing
+# a stale cron still admits no ordinary job.
+@pytest.mark.parametrize("cron", ["37 4 * * *", pytest.param("17 3 * * *", id="foreign-cron")])
 def test_scheduled_main_runs_do_not_enter_the_ordinary_matrix(cron):
     for name in ("quick-test", "full-test"):
         assert not _value(
             WORKFLOW["jobs"][name]["if"], event="schedule", ref="refs/heads/main", schedule=cron,
         )
+
+
+@pytest.mark.parametrize("event,ref,schedule,e2e_live,admitted", [
+    ("workflow_dispatch", "refs/heads/ouroboros", "", "true", True),
+    ("workflow_dispatch", "refs/heads/candidate", "", "true", True),
+    ("workflow_dispatch", "refs/heads/ouroboros", "", "false", False),
+    ("schedule", "refs/heads/main", "37 4 * * *", "false", False),
+    ("schedule", "refs/heads/main", "17 3 * * *", "false", False),
+    ("push", "refs/heads/ouroboros", "", "false", False),
+    ("push", "refs/heads/main", "", "false", False),
+    ("push", "refs/tags/v7.0.0", "", "false", False),
+    ("pull_request", "refs/pull/42/merge", "", "false", False),
+])
+def test_the_paid_live_stand_runs_only_on_a_dispatch_that_opts_in(event, ref, schedule, e2e_live, admitted):
+    """The paid `e2e-live` job takes no schedule: only a dispatch with `e2e_live=true` admits it."""
+    job = WORKFLOW["jobs"]["e2e-live"]
+    facts = {"event": event, "ref": ref, "schedule": schedule, "e2e_live": e2e_live}
+    assert bool(_value(job["if"], base="ouroboros" if event == "pull_request" else "", **facts)) is admitted
 
 
 @pytest.mark.parametrize("name", [

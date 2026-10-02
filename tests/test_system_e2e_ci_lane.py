@@ -93,14 +93,15 @@ def _job_text(job: str) -> str:
 MOCK_CRON = "37 4 * * *"
 
 
-def test_the_workflow_carries_daily_off_peak_schedules_each_owned_by_one_job():
+def test_the_workflow_carries_one_daily_off_peak_schedule_owned_by_one_job():
     workflow = _workflow()
     schedule = _triggers(workflow).get("schedule") or []
     crons = [str(entry["cron"]) for entry in schedule]
-    # Two crons: this keyless lane and the paid `e2e-live` stand
-    # (tests/test_e2e_live_ci_lane.py). A cron nobody binds to is a second
-    # nightly wake-up of every job gated on the bare event name.
-    assert crons == [MOCK_CRON, "17 3 * * *"], schedule
+    # One cron: this keyless lane. The paid `e2e-live` stand runs only on its
+    # opt-in dispatch input (tests/test_e2e_live_ci_lane.py). A cron nobody
+    # binds to is a second nightly wake-up of every job gated on the bare
+    # event name.
+    assert crons == [MOCK_CRON], schedule
     for entry in schedule:
         minute, hour, day, month, weekday = str(entry["cron"]).split()
         assert (day, month, weekday) == ("*", "*", "*"), entry
@@ -108,12 +109,12 @@ def test_the_workflow_carries_daily_off_peak_schedules_each_owned_by_one_job():
         # On the hour is when everyone else's cron fires and GitHub's queue is
         # deepest; an off-peak minute is the documented way to avoid the backlog.
         assert int(minute) != 0, entry
-    # Every job that fires on `schedule` names ITS cron string, so neither cron
-    # wakes the other lane: a bare `github.event_name == 'schedule'` would.
+    # Every job that fires on `schedule` names ITS cron string, so a cron added
+    # for another lane never wakes it: a bare `github.event_name == 'schedule'` would.
     for name, job in workflow["jobs"].items():
         condition = " ".join(str(job.get("if", "")).split())
         if "github.event_name == 'schedule'" not in condition:
-            continue  # `!= 'schedule'` guards (integration-test) keep a lane OFF both crons
+            continue  # `!= 'schedule'` guards (integration-test) keep a lane OFF every cron
         assert "github.event.schedule ==" in condition, (name, condition)
         assert "github.event_name == 'schedule' ||" not in condition, (name, condition)
 
