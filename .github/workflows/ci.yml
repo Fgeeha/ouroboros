@@ -19,7 +19,7 @@ name: CI
 # This ensures tag pushes always fire (even if only VERSION/README changed).
 # The browser lane is the ONE exception that must see every `ouroboros` push,
 # including a Makefile/spec/requirements-only one: it lives in its own
-# `ui-browser-push.yml`, which calls the SAME reusable `ui-browser.yml` job
+# `ui-browser-push.yml`, which calls the SAME reusable `ui-browser.yml` lane
 # this workflow calls for pull requests, manual runs and tags.
 on:
   push:
@@ -713,7 +713,7 @@ jobs:
   # server with OUROBOROS_PREFLIGHT_TEST_WORKERS = 16 // lanes = 16 workers
   # on a 4-vCPU runner (slower than the operator host, not wrong), the node
   # lane of that gate needs node 22, and the UI probe / the agent's browser
-  # tool need Playwright Chromium — the same provisioning as ui-smoke, minus
+  # tool need Playwright Chromium — the same provisioning as a ui-shard job, minus
   # webkit. The run root is under runner.temp (the stand refuses a root inside
   # the repo), the lane settings file (0600, carries the key) is NEVER
   # uploaded: the artifact globs name the manifest, the result index, each

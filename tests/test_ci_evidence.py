@@ -698,13 +698,25 @@ def test_red_browser_tools_session_beside_a_shard_proof_is_refused(tmp_path):
     result, summary = _reconcile_shards(tmp_path)
     gap = "ui-ci-full-shard-1-1/tools/results.json: its session ended with exit status 1"
     assert result.returncode == 1 and gap in result.stdout and gap in summary
-    # A re-run of that job supersedes it: only the newest attempt's tools session is judged.
-    rerun = tmp_path / "shards" / "ui-ci-full-shard-1-2" / "tools"
-    rerun.parent.mkdir()
-    _write_results(rerun, _rows(["tests/test_browser_tools_smoke.py::test_tools"]))
-    _rewrite(rerun / "results.json", lambda data: data.update(github={**identity, "run_attempt": "2"}))
-    result, _ = _reconcile_shards(tmp_path)
+    # A re-run of that job supersedes it: the red tools session belongs to the superseded attempt's
+    # artifact, and so does a session the guard refused before it recorded a lane.
+    rerun = tmp_path / "shards" / "ui-ci-full-shard-1-2"
+    _lane_projection(rerun, shard=1, attempt="2")
+    _write_results(rerun / "tools", _rows(["tests/test_browser_tools_smoke.py::test_tools"]))
+    refused = tmp_path / "shards" / "ui-ci-full-shard-2-0" / "host"
+    refused.mkdir(parents=True)
+    _write_results(refused)
+    _rewrite(refused / "results.json", lambda data: data.update(session_exit_code=4))
+    result, summary = _reconcile_shards(tmp_path)
     assert result.returncode == 0, result.stdout
+    assert "shard 1/3: proof from attempt 2 (attempts present: 1, 2)" in summary
+
+
+def test_an_unreadable_proof_tree_is_a_failed_reconciliation(tmp_path):
+    paths = _lane_proofs(tmp_path)
+    paths[2].write_text("[" * 100_000, encoding="utf-8")  # The parser gives up on it.
+    result, summary = _reconcile_shards(tmp_path)
+    assert result.returncode == 1 and "GAP " in result.stdout and "INCOMPLETE" in summary
 
 
 def _drop(paths, key):

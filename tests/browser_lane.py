@@ -16,7 +16,9 @@ collects and checks the complete lane exactly as above, then keeps every N-th no
 of the sorted node ids starting at the K-th and reconciles that slice. The lane
 facts (complete sorted lane, shard, assigned slice) are left on the config for the
 evidence export; `tests/ci_evidence.py reconcile-shards` proves the slices of one
-run add up to the lane an unsharded collection sees.
+run add up to the lane an unsharded collection sees. Shards are separate processes
+that agree on node IDS: a parametrization must give each case a stable id and order
+(no iteration over a set, no unsorted glob), or one id names different cases per shard.
 """
 import fnmatch
 import os

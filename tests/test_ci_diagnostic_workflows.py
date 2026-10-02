@@ -256,6 +256,29 @@ def test_manual_ui_selection_is_fixed_partial_and_never_a_paid_or_full_check():
     assert "--scope full " in shard["ui_summary"]["run"] and "DIAGNOSTIC" not in shard["ui_summary"]["env"]
 
 
+@pytest.mark.parametrize("exported", [True, False], ids=["proof-present", "export-failed"])
+def test_a_shard_attempt_without_a_published_proof_is_red_itself(tmp_path, exported):
+    """An attempt whose export or upload failed must not leave `ui-smoke` an earlier attempt's proof to accept."""
+    job = _workflow("ui-browser.yml")["jobs"]["ui-shard"]
+    steps = _steps("ui-browser.yml", "ui-shard")
+    proof, upload = steps["ui_proof"], steps["ui_evidence"]
+    assert "continue-on-error" not in proof and "continue-on-error" not in upload
+    assert proof["if"] == "${{ !cancelled() && steps.ui_tests.outcome != 'skipped' }}"
+    assert upload["with"]["if-no-files-found"] == "error" and "!cancelled()" in upload["if"]
+    order = [step.get("id") for step in job["steps"]]
+    assert order.index("ui_tests") < order.index("ui_proof") < order.index("ui_evidence")
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("workflow shell unavailable on this host")
+    if exported:
+        target = tmp_path / "ci-evidence" / "ui" / "host" / "results.json"
+        target.parent.mkdir(parents=True)
+        target.write_text("{}", encoding="utf-8")
+    command = proof["run"].replace("${{ runner.temp }}", str(tmp_path))
+    done = subprocess.run([bash, "-e", "-o", "pipefail", "-c", command], capture_output=True, timeout=10)
+    assert (done.returncode == 0) is exported
+
+
 def test_ui_producers_have_distinct_reports_and_only_the_public_parent_is_uploaded():
     shard, diagnostic = _steps("ui-browser.yml", "ui-shard"), _steps(*PARTIAL)
     run = "${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}"
@@ -356,16 +379,17 @@ def test_full_lane_runs_as_four_guarded_shards_under_step_ceilings(tmp_path):
     assert job["needs"] == "scope" and job["if"] == FULL_LANE
     assert job["strategy"] == {"fail-fast": False, "matrix": {"shard": [1, 2, 3, 4]}}
     install, lane, tools = steps["install_browsers"], steps["ui_tests"], steps["browser_tools"]
-    # A step ceiling fails the step and the evidence steps still run; the job ceiling,
-    # which cancels them, lies above every step ceiling together.
-    assert (install["timeout-minutes"], lane["timeout-minutes"], job["timeout-minutes"]) == (45, 75, 150)
+    # Every producer step has its own ceiling, and their sum stays under the job's: a step
+    # ceiling fails the step and leaves the evidence steps running, the job ceiling cancels them.
+    ceilings = (install["timeout-minutes"], lane["timeout-minutes"], tools["timeout-minutes"])
+    assert ceilings == (45, 90, 20) and sum(ceilings) < job["timeout-minutes"] == 170
     assert "chromium webkit" in install["run"]
     for producer in (lane, tools):
         assert producer["env"]["OUROBOROS_EXPECT_BROWSER_ENGINES"] == "chromium,webkit"
     completed, args = _run_shell(lane, tmp_path)
     assert completed.returncode == 0, completed.stderr
     assert args[args.index("pytest") + 1:][:4] == ["tests/", "-m", "ui_browser", "--require-ui-browser"]
-    assert "--ui-browser-shard=2/4" in args and "--session-timeout=3600" in args
+    assert "--ui-browser-shard=2/4" in args and "--session-timeout=4500" in args
     # The session budget is cooperative; nothing kills a test mid-flight or narrows the lane.
     assert not any(arg.startswith(("--timeout", "-k", "--deselect", "--ignore", "--lf", "-x", "-n"))
                    for arg in args)
@@ -479,6 +503,8 @@ SKIPPED_LANE = {"SHARD_RESULT": "skipped", "MANIFEST_RESULT": "skipped"}
      ["coverage decision is unknown (scope job: failure, run_browser: none)"]),
     ({"SCOPE_RESULT": "cancelled", "RUN_BROWSER": "false", **SKIPPED_LANE}, "unknown", False,
      ["coverage decision is unknown (scope job: cancelled, run_browser: false)"]),
+    ({"SCOPE_RESULT": "failure", "RUN_BROWSER": "false", **SKIPPED_LANE}, "unknown", False,
+     ["coverage decision is unknown (scope job: failure, run_browser: false)"]),
     ({"RUN_BROWSER": "", **SKIPPED_LANE}, "unknown", False, ["run_browser: none"]),
     ({"RUN_BROWSER": "maybe", **SKIPPED_LANE}, "unknown", False, ["run_browser: maybe"]),
     # A selection reaches this shell from nowhere: one in its environment changes nothing.
@@ -486,7 +512,7 @@ SKIPPED_LANE = {"SHARD_RESULT": "skipped", "MANIFEST_RESULT": "skipped"}
      ["ui-manifest: skipped", "ui-shard: skipped"]),
 ], ids=["full-green", "shard-failed", "shard-cancelled", "shard-skipped", "manifest-failed", "both-failed",
         "manifest-skipped", "lane-silent", "documentation-only", "scope-failed", "scope-cancelled",
-        "scope-silent", "scope-garbage", "no-diagnostic-path"])
+        "scope-failed-after-deciding", "scope-silent", "scope-garbage", "no-diagnostic-path"])
 def test_aggregator_verdict_shell_has_two_explicit_paths(tmp_path, results, path, green, said):
     code, stdout, summary = _verdict(tmp_path, **results)
     assert code == int(not green), stdout

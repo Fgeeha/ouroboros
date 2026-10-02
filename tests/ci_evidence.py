@@ -272,8 +272,9 @@ def _lane_proofs(root: Path, *, sha: str, run_id: str, gaps: list, others: list 
     """UI lane projections beneath root that belong to this commit and run.
 
     Each results.json is judged where it lies, never by its directory name. One
-    without a `ui_browser` block is another producer's (browser tools): it proves no
-    lane node and is collected in `others` for its session status only. An unreadable
+    without a `ui_browser` block is another producer's (browser tools) or a session the
+    guard refused before it recorded a lane: it proves no lane node and is collected in
+    `others` for its session status only. An unreadable
     one, or a lane projection of another commit or run, is a gap.
     """
     proofs = []
@@ -290,8 +291,7 @@ def _lane_proofs(root: Path, *, sha: str, run_id: str, gaps: list, others: list 
         attempt = identity.get("run_attempt")
         if "ui_browser" not in data:
             if others is not None:
-                others.append({"name": name, "exit": data.get("session_exit_code"),
-                               "attempt": int(attempt) if isinstance(attempt, str) and attempt.isdecimal() else 0})
+                others.append({"name": name, "exit": data.get("session_exit_code")})
             continue
         lane = data["ui_browser"]
         if not _lane_shape(lane):
@@ -360,7 +360,7 @@ def reconcile_shards(manifest_root: Path, shards_root: Path, *, count: int, sha:
                                                 if total else "carries no shard block"))
         else:
             by_shard.setdefault(index, []).append(proof)
-    proven = set()
+    proven, winners = set(), set()
     for index in range(1, count + 1):
         label = f"shard {index}/{count}"
         proofs = sorted(by_shard.get(index, []), key=lambda proof: proof["attempt"])
@@ -368,6 +368,7 @@ def reconcile_shards(manifest_root: Path, shards_root: Path, *, count: int, sha:
             gaps.append(f"{label}: no proof")
             continue
         proof = proofs[-1]
+        winners.add(proof["name"].split("/", 1)[0])
         attempts = [candidate["attempt"] for candidate in proofs]
         if attempts.count(proof["attempt"]) > 1:
             gaps.append(f"{label}: {attempts.count(proof['attempt'])} proofs from attempt {proof['attempt']}")
@@ -393,11 +394,11 @@ def reconcile_shards(manifest_root: Path, shards_root: Path, *, count: int, sha:
             gaps.append(f"{label}: executed outside its assignment ({len(executed - set(assigned))}): "
                         + _named(executed - set(assigned)))
         proven |= executed & set(assigned)
-    # A producer that shares a shard's artifact (browser tools) proves no lane node; its red
-    # session of the newest attempt is refused for the same reason a red shard is.
-    newest = max((other["attempt"] for other in others), default=0)
+    # A producer that shares a winning proof's artifact (browser tools) proves no lane node; its
+    # red session is refused for the same reason a red shard is. One in the artifact of a
+    # superseded attempt belongs to that attempt and is superseded with it.
     for other in others:
-        if other["attempt"] == newest:
+        if other["name"].split("/", 1)[0] in winners:
             gaps += _red_session(other["name"], other)
     if full is not None and set(full) - proven:
         gaps.append(f"lane: {len(set(full) - proven)} of {len(full)} manifest nodes are executed by no shard: "
