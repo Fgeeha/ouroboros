@@ -302,13 +302,6 @@ jobs:
         if: ${{ !cancelled() && steps.setup_node.outcome == 'success' && (runner.os != 'Windows' || (steps.posix_tools.outcome == 'success' && steps.select_posix_tools.outcome == 'success')) }}
         shell: bash
         run: cd web && npm ci --no-audit --no-fund && npm run lint:undef
-      # `-n auto` counts PHYSICAL cores where psutil is installed, which is Windows only
-      # (two of the runner's four logical ones); the commit gate and the other runners
-      # size the pool by logical cores.
-      - name: Size the Windows worker pool by logical cores
-        if: ${{ !cancelled() && runner.os == 'Windows' }}
-        shell: pwsh
-        run: '"PYTEST_XDIST_AUTO_NUM_WORKERS=$env:NUMBER_OF_PROCESSORS" >> $env:GITHUB_ENV'
       # A command-line `-m` REPLACES the pyproject addopts markexpr, so repeat the default
       # marker-lane exclusions and AND them with the serial split. --timeout guards hangs.
       - name: Run tests (parallel — excludes the costly marker lanes AND the serial real-process suites)
