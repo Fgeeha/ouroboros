@@ -1062,9 +1062,8 @@ def _live_retry_target_locked(q: Any, task_id: str) -> Tuple[str, str]:
 
 
 def task_has_live_ownership(task_id: str, *, ignore_review_operation: str = '') -> bool:
-    """Whether live PHYSICAL ownership remains for this task: a RUNNING row, a
-    busy worker slot, the in-process direct-chat turn or its still-billing
-    post-task synthesis (GR6-1, the one predicate behind the class rule).
+    """Whether executable or paused custody remains for this task: a RUNNING row,
+    busy worker, direct turn, still-billing synthesis or saved late remainder.
 
     The pipeline persists the durable terminal result BEFORE post-task
     cognition ends, so "the status is settled" and "the worker is dead" are
@@ -1084,11 +1083,15 @@ def task_has_live_ownership(task_id: str, *, ignore_review_operation: str = '') 
     if not task_id:
         return False
     from ouroboros.post_task_checkpoint import late_phase_state
-    from ouroboros.review_operation import task_has_live_review_operation
+    from ouroboros.review_operation import task_has_live_review_operation, paused_acceptance_preparations
 
     try:
         if task_has_live_review_operation(q.DRIVE_ROOT, task_id, exclude_owner_id=ignore_review_operation):
             return True
+        from ouroboros.owner_pause import fence_closed, read_fence
+        fence = read_fence(q.DRIVE_ROOT, task_id)
+        if fence_closed(fence) and paused_acceptance_preparations(q.DRIVE_ROOT, task_id, fence['fence_id']):
+            return True  # Addressable owed work, not a claim that its controller is alive.
     except (OSError, ValueError, TypeError):
         return True  # unreadable ownership must not turn terminal Stop into a no-op
     if late_phase_state(q.DRIVE_ROOT, task_id) == "paused":

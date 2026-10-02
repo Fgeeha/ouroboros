@@ -50,7 +50,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
   │   ├── task_admission.py    ← Token-owned reservations fence duplicate ingress ids before Project/workspace/attachment effects; host receipts and restore-hold revalidation; queue.py owns state (§5)
   │   ├── task_lifecycle.py    ← Cancellation custody — the ONE settle owner of durable cancel intents — plus the `sweep_cancel_intents` watchdog and the queue-owned root-budget admission fence (flow: §5; rules: §10 invariant 14)
   │   ├── cancel_publication.py ← Cancellation settlement publication for `task_lifecycle.py`: typed CANCEL_* outcomes, artifact-honest cancelled result fields, ledger cost reconstruction, salvage, owed-before-settle registration, capture-miss terminalization (§5)
-  │   ├── budget_resume.py     ← Exact pause grants, revocation and hold release; queue_transitions re-exports (§6 Exact budget pause and Resume)
+  │   ├── budget_resume.py     ← Task/late-phase Resume grants, revocation and hold release; queue_transitions re-exports (§6)
   │   ├── owner_pause_control.py ← Owner Pause fence/latch, member wake and tree settlement (§6 Owner Pause)
   │   ├── continuation_admission.py ← Owner Continue admission: replay-first, predecessor claim, held unknown writer (§6 Owner Continue)
   │   ├── sleep_wake.py        ← Cold model-sleep wake: readiness recorded once, typed `sleep_wake` grant, vetoed by holds (§6)
@@ -101,7 +101,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── task_finalization.py ← Early final-answer delivery (one `delivery_id` for the live and buffered copy) + the sealed final package for summary/reflection — a prompt input, never a validator (§6 Post-task reflection); owns the `swarm_efficiency` rollup (`lanes_requested`: pre-dispatch events cannot know effective lanes; `planned` stays null; Swarm intent is the typed `force_plan_source == "swarm"`; `no_fanout_observed`) and the root `depth` block (`requested_depth`/`permitted_depth`/`attempted_depth`/`achieved_depth`, status `host_visible_only`) (§6 Budget tracking)
       ├── mutation_attribution.py ← Root-task baseline capture; clean-at-baseline candidates plus exact explicit predecessor adoption without erasing original dirt; terminal content fingerprints and committed interval delta (§6 Git and commit review)
       ├── process_interpreters.py ← Interpreter resolvers for the process launch surfaces: the pre-guard unversioned-Python resolver and the post-gates Node ladder — its probe EXECUTES a candidate, so it runs only after the dispatch gates (§2; CLI / Headless Boundary below)
-      ├── post_task_checkpoint.py ← Durable root post-task phase/final-cost checkpoint shared by task finalization and Project naming recovery
+      ├── post_task_checkpoint.py ← Root phase/cost and saved late-work Pause, shared by finalization and Project naming recovery (§6)
       ├── terminal_projection.py, terminal_time.py ← Cognition-free settled-result projection; durable Main delivery via outbox/maintenance scan; per-attempt end time (§3 Main rows; §6 Post-task reflection)
       ├── presence_profile.py  ← Strict reviewed `presence:` behavior-profile parser (instructions, context topics, runtime defaults, portable capability requests)
       ├── presence_runtime.py  ← Symbolic `main`/`light` defaults; owner-local overrides clamped to the global round limit

@@ -192,11 +192,11 @@ class _OperationWait(TaskModelWait):
 class ReviewOperation:
     """One panel's live controller: its wait owner, its controls and worker lifetime."""
 
-    def __init__(self, *, parent: Any, request: Any, task_id: str, result_root: pathlib.Path):
+    def __init__(self, *, parent: Any, request: Any, task_id: str, result_root: pathlib.Path, owner_id: str = ''):
         from ouroboros.model_wait import mutate_wait
         from ouroboros.task_results import load_task_result
 
-        self.owner_id = f"review-operation-{uuid.uuid4().hex}"
+        self.owner_id = owner_id or f"review-operation-{uuid.uuid4().hex}"
         self.surface = str(getattr(request, "surface", "") or "")
         self.retry_key = str(getattr(request, "retry_key", "") or "")
         self.historical_purpose = copy.deepcopy((getattr(request, "policy", None) or {}).get("historical_acceptance"))
@@ -320,7 +320,7 @@ def current_review_operation() -> Optional[ReviewOperation]:
 
 
 def prepare_historical_operation(*, root: Any, purpose: dict, event_queue: Any,
-                                 work: Callable, background: bool) -> dict:
+                                 work: Callable, background: bool, resume_entry: Optional[dict] = None) -> dict:
     """Own historical preparation BEFORE starting it; never a ready/paid checkpoint.
 
     The same operation upgrades its intent to a complete canonical request at
@@ -338,15 +338,20 @@ def prepare_historical_operation(*, root: Any, purpose: dict, event_queue: Any,
     parent = TaskModelWait(task=task, drive_root=root, event_queue=event_queue, worker_slot_held=False)
     request = SimpleNamespace(surface='task_acceptance', retry_key=retry_key,
                               policy={'historical_acceptance': purpose})
-    operation = ReviewOperation(parent=parent, request=request, task_id=task['id'], result_root=pathlib.Path(root))
+    operation = ReviewOperation(parent=parent, request=request, task_id=task['id'], result_root=pathlib.Path(root),
+                                owner_id=str((resume_entry or {}).get('owner_id') or ''))
     parent.close()
     operation.preparing = True
     operation.enter()
     with _LOCK:
+        if operation.owner_id in _LIVE:
+            raise ValueError('historical preparation already has a live owner')
         _LIVE[operation.owner_id] = operation
     try:
         intent = {'schema_version': 1, 'kind': 'historical_acceptance_preparation_intent',
                   'owner_id': operation.owner_id, 'controller': operation.identity, 'purpose': purpose}
+        if resume_entry:
+            intent['resumed_from_intent'] = resume_entry['entry']['intent_ref']
         ref = store_actor_source_bytes(root, task['id'], category='context_checkpoints',
             source_id='historical-acceptance-intent', extension='json',
             data=json.dumps(intent, sort_keys=True, ensure_ascii=False).encode())
@@ -354,7 +359,15 @@ def prepare_historical_operation(*, root: Any, purpose: dict, event_queue: Any,
         entry = {'surface': 'task_acceptance', 'retry_key': retry_key, 'task_attempt': purpose['task_attempt'],
                  'controller': operation.identity, 'state': OPERATION_PREPARING, 'intent_ref': ref,
                  'recorded_at': utc_now_iso()}
+        from ouroboros.owner_pause import fence_closed, read_fence
+        pause = read_fence(root, purpose['accounting_root_task_id'])
+        if fence_closed(pause):
+            entry['preparation_pause'] = _preparation_pause(purpose['accounting_root_task_id'], pause, entry)
         def admit(rows: dict) -> dict:
+            if resume_entry:
+                if rows.get(operation.owner_id) != resume_entry['entry']:
+                    raise ValueError('historical preparation resume identity changed')
+                return {**rows, operation.owner_id: entry}
             if any(row.get('retry_key') == retry_key and (purpose['automatic']
                    or row.get('state') != 'preparation_refused') for row in rows.values()):
                 raise ValueError('historical acceptance operation already retained')
@@ -597,21 +610,15 @@ def _link_historical_controls(operation: ReviewOperation, entry: dict) -> None:
             raise ValueError("the operation control address did not land")
 
 
-def task_has_live_review_operation(root: Any, task_id: str, *, exclude_owner_id: str = '',
-                                   sent_only: bool = False) -> bool:
-    """One task's exact operation/control addresses, for terminal Stop ingress.
-
-    ``sent_only`` skips an operation still ``preparing``: it has sent nothing,
-    so an owner Pause can defer it without waiting for its settlement (D10).
-    """
+def _task_operation_entries(root: Any, task_id: str) -> Iterator[tuple]:
+    """Resolve the task's existing primary/control addresses without inventing liveness."""
     from ouroboros.task_results import load_task_result
-
     row = load_task_result(root, task_id, strict=True) or {}
     for owner, entry in (row.get(OPERATIONS_FIELD) or {}).items():
-        if owner == exclude_owner_id:
-            continue
+        subject = task_id
         if entry.get("control_only"):
-            target = load_task_result(root, entry.get("subject_task_id"), strict=True) or {}
+            subject = entry.get("subject_task_id")
+            target = load_task_result(root, subject, strict=True) or {}
             primary = (target.get(OPERATIONS_FIELD) or {}).get(owner) or {}
             # The immutable intent survives the upgrade; Stop must remain
             # addressable between primary-pointer and control-link writes.
@@ -619,6 +626,15 @@ def task_has_live_review_operation(root: Any, task_id: str, *, exclude_owner_id:
             if any(primary.get(key) != entry.get(key) for key in keys):
                 continue
             entry = primary
+        yield owner, subject, entry
+
+
+def task_has_live_review_operation(root: Any, task_id: str, *, exclude_owner_id: str = '',
+                                   sent_only: bool = False) -> bool:
+    """Physical review ownership; unsent preparation is excluded by ``sent_only``."""
+    for owner, _subject, entry in _task_operation_entries(root, task_id):
+        if owner == exclude_owner_id:
+            continue
         if entry.get("state") not in _OPEN_STATES or sent_only and entry.get("state") == OPERATION_PREPARING:
             continue
         with _LOCK:
@@ -628,6 +644,56 @@ def task_has_live_review_operation(root: Any, task_id: str, *, exclude_owner_id:
         if controller_state(entry.get("controller")) in {"alive", "unknown"}:
             return True
     return False
+
+
+def _preparation_pause(task_id: str, fence: dict, entry: dict) -> dict:
+    return {'root_task_id': task_id, 'fence_id': fence['fence_id'], 'generation': fence.get('generation'),
+            'intent_ref': entry['intent_ref'], 'controller': entry['controller']}
+
+
+def retain_preparing_owner_pause(root: Any, task_id: str, fence: dict) -> None:
+    """Bind already-retained unsent preparation to the accepted owner Pause."""
+    for owner, subject, entry in _task_operation_entries(root, task_id):
+        if entry.get('state') != OPERATION_PREPARING or entry.get('source_ref') or not entry.get('intent_ref'):
+            continue
+        def retain(rows, owner=owner, entry=entry):
+            if rows.get(owner) != entry:
+                return None  # It upgraded to a request; its ordinary paid custody wins.
+            return {**rows, owner: {**entry, 'preparation_pause': _preparation_pause(task_id, fence, entry)}}
+        _update_operations(root, subject, retain)
+
+
+def paused_acceptance_preparations(root: Any, task_id: str, fence_id: str) -> list:
+    """Durable owed work, separate from whether its controller is physically alive."""
+    return [(owner, subject, entry) for owner, subject, entry in _task_operation_entries(root, task_id)
+            if (entry.get('preparation_pause') or {}).get('root_task_id') == task_id
+            and (entry.get('preparation_pause') or {}).get('fence_id') == fence_id
+            and entry.get('state') != 'preparation_refused']
+
+
+def stop_paused_acceptance_preparations(root: Any, task_id: str) -> bool:
+    """Discard only a dead controller's unsent saved remainder; keep its evidence."""
+    from ouroboros.owner_pause import fence_closed, launch_lock, read_fence
+
+    stopped = []
+    with launch_lock(root, task_id):
+        fence = read_fence(root, task_id)
+        if not fence_closed(fence):
+            return False
+        for owner, subject, entry in paused_acceptance_preparations(root, task_id, fence['fence_id']):
+            with _LOCK:
+                live = _LIVE.get(owner)
+            if ((live is not None and not live.closed) or controller_state(entry.get('controller')) in {'alive', 'unknown'}
+                    or entry.get('source_ref') or entry.get('state') not in {OPERATION_PREPARING, 'preparation_unknown'}):
+                continue  # Live/paid operations still settle through their existing owners.
+            def stop(rows, owner=owner, entry=entry):
+                if rows.get(owner) != entry:
+                    return None
+                stopped.append(owner)
+                return {**rows, owner: {**entry, 'state': 'preparation_refused', 'finished_at': utc_now_iso(),
+                    'preparation_outcome': {'status': 'owed', 'reason': 'owner_stopped', 'dispatched': False}}}
+            _update_operations(root, subject, stop)
+    return bool(stopped)
 
 
 def _update_operations(root: Any, task_id: str, transform: Callable[[Dict[str, Any]], Any], *,
@@ -1275,6 +1341,15 @@ def recover_orphaned_acceptance_operations(drive_root: Any, *, stop: Optional[Ca
                                                "reason": "controller_unverifiable"})
                 continue
             if state == OPERATION_PREPARING:
+                from ouroboros.owner_pause import fence_closed, read_fence
+                pause = entry.get('preparation_pause') or {}
+                fence = read_fence(root, pause.get('root_task_id', '')) if pause else {}
+                if fence_closed(fence) and fence.get('fence_id') == pause.get('fence_id'):
+                    from supervisor.owner_pause_control import retain_late_phase_latch
+                    retain_late_phase_latch(root, pause['root_task_id'])
+                    report['deferred'].append({'task_id': path.stem, 'owner_id': owner_id,
+                                               'reason': 'owner_paused_preparation'})
+                    continue  # Unsent remainder, not a live controller or boot dispatch authority.
                 _mark_operation(root, path.stem, owner_id, 'preparation_unknown', from_states={OPERATION_PREPARING})
                 report['pending'].append({'task_id': path.stem, 'owner_id': owner_id,
                                           'reason': 'preparation_controller_ended_before_request'})

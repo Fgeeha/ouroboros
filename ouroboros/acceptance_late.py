@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import json
 import math
 import time
 from pathlib import Path
@@ -249,6 +250,59 @@ def _historical_writer_live(root: Path, task_id: str, operation_id: str) -> bool
         return True
 
 
+def resume_paused_acceptance_preparations(root: Any, task_id: str, fence: dict) -> int:
+    """Rebind only Pause-attested unsent intents; caller holds the exact root launch lock.
+
+    Live preparers already wait for this fence. Dead ones reuse their owner/debt
+    identity with a compare-and-set before handoff. Paid/unknown work stays with
+    its collector, and unreadable sources never authorize another preparation.
+    """
+    from ouroboros import review_operation as operations
+    from ouroboros.artifacts import read_actor_source_bytes
+    from ouroboros.task_results import load_task_acceptance_review_state
+
+    restart = []
+    for owner, subject, entry in operations.paused_acceptance_preparations(root, task_id, fence['fence_id']):
+        pause = entry['preparation_pause']
+        if (entry.get('state') != operations.OPERATION_PREPARING or entry.get('source_ref')
+                or pause.get('intent_ref') != entry.get('intent_ref')
+                or pause.get('controller') != entry.get('controller')
+                or pause.get('generation') != fence.get('generation')):
+            raise ValueError('late_preparation_authority_unknown')
+        with operations._LOCK:
+            live = operations._LIVE.get(owner)
+        controller = operations.controller_state(entry.get('controller'))
+        if (live is not None and not live.closed) or controller == 'alive':
+            continue
+        if controller != 'dead' and entry.get('controller') != operations.controller_identity():
+            raise ValueError('late_preparation_controller_unknown')
+        intent = json.loads(read_actor_source_bytes(root, subject, entry['intent_ref']))
+        purpose = intent.get('purpose') or {}
+        if (intent.get('kind') != 'historical_acceptance_preparation_intent' or intent.get('owner_id') != owner
+                or intent.get('controller') != entry.get('controller') or purpose.get('task_id') != subject
+                or purpose.get('task_attempt') != entry.get('task_attempt')
+                or purpose.get('accounting_root_task_id') != task_id
+                or entry.get('retry_key') != 'task_acceptance:' + hashlib.sha256(purpose['debt_id'].encode()).hexdigest()):
+            raise ValueError('late_preparation_source_mismatch')
+        claims = load_task_acceptance_review_state(root, task_id, require_root_result=True)['claims_by_binding']
+        if any(entry['retry_key'] == 'task_acceptance:' + str(claim.get('paid_identity') or '')
+               for claim in claims.values()):
+            raise ValueError('late_preparation_dispatch_unknown')
+        restart.append((owner, subject, entry, purpose))
+    from supervisor.workers import get_event_q
+    for owner, subject, entry, purpose in restart:
+        ctx = SimpleNamespace(task_id=purpose.get('caller_task_id') or subject, task_attempt=purpose['task_attempt'],
+            drive_root=root, budget_drive_root=root, task_metadata={'root_task_id': task_id},
+            event_queue=get_event_q(), pending_events=[])
+        prepared = {'status': 'prepared', 'owner_source_ref': purpose.get('owner_source_ref')}
+        operations.prepare_historical_operation(root=root, purpose=purpose, event_queue=ctx.event_queue,
+            background=True, resume_entry={'owner_id': owner, 'entry': entry},
+            work=lambda operation, ctx=ctx, subject=subject, purpose=purpose, prepared=prepared:
+                _run_historical_acceptance(ctx, task_id=subject, debt_id=purpose['debt_id'], prepared=prepared,
+                                          automatic=purpose['automatic'], operation=operation))
+    return len(restart)
+
+
 def _run_historical_acceptance(ctx: Any, *, task_id: str, debt_id: str,
                               prepared: dict | None, automatic: bool, operation: Any) -> dict:
     """Run one late panel or collect its existing identity, without author work."""
@@ -295,7 +349,7 @@ def _run_historical_acceptance(ctx: Any, *, task_id: str, debt_id: str,
             return _collect_existing(usage_ctx, row, retry_key)
         purpose = operation.historical_purpose
         blocked = historical_operation_controls(root, purpose, admission=True)
-        if blocked and not (automatic and owner_paused_only(root, purpose, blocked)):
+        if blocked and not owner_paused_only(root, purpose, blocked):
             return refused(blocked[0])
         if not _receipt(root, debt):
             return refused('exact_delivery_unconfirmed')
@@ -306,9 +360,9 @@ def _run_historical_acceptance(ctx: Any, *, task_id: str, debt_id: str,
             # through an owner Pause of that root until its Resume — without a scheduler.
             live = _historical_writer_live(root, task_id, operation.owner_id)
             blocked = [] if live else historical_operation_controls(root, purpose, admission=True)
-            if not live and not (automatic and owner_paused_only(root, purpose, blocked)):
+            if not live and not owner_paused_only(root, purpose, blocked):
                 break
-            if not automatic:
+            if live and not automatic:
                 return refused('historical_writer_still_live')
             if operation.control():
                 return refused('historical_preparation_cancelled')

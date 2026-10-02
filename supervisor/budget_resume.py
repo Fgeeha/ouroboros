@@ -640,14 +640,15 @@ def _late_phase_refusal(q: Any, root: pathlib.Path, task_id: str, row: Dict[str,
         root, {**row, "id": task_id}, str(row.get("root_task_id") or task_id))
     if refusal:
         return refusal
-    try:
-        read_actor_source_bytes(root, task_id, record["payload_ref"])
-    except Exception:
-        return {"ok": False, "error": "pause_source_unreadable", "action": "cancel_or_new_run"}
+    if record:
+        try:
+            read_actor_source_bytes(root, task_id, record["payload_ref"])
+        except Exception:
+            return {"ok": False, "error": "pause_source_unreadable", "action": "cancel_or_new_run"}
     return None
 
 
-def _release_late_fence(q: Any, root: pathlib.Path, task_id: str, fence: Dict[str, Any]) -> Dict[str, Any]:
+def _release_late_fence(q: Any, root: pathlib.Path, task_id: str, row: dict, fence: Dict[str, Any]) -> Dict[str, Any]:
     """Resume of an answered root's Pause with no saved post-task remainder (D10).
 
     Nothing left at all: the tree census already releases it. Only deferred,
@@ -660,7 +661,11 @@ def _release_late_fence(q: Any, root: pathlib.Path, task_id: str, fence: Dict[st
     from supervisor.continuation_admission import conflicting_writers, release_settled_continuations
     from supervisor.owner_pause_control import refresh_owner_pause_tree
 
-    if refresh_owner_pause_tree(task_id) != FENCE_RELEASED:
+    remainder = refresh_owner_pause_tree(task_id) != FENCE_RELEASED
+    if remainder:
+        refusal = _late_phase_refusal(q, root, task_id, row, {}, fence)
+        if refusal:
+            return refusal
         try:
             blocked = (post_task_synthesis_in_flight(root, task_id)
                        or task_has_live_review_operation(root, task_id, sent_only=True)
@@ -672,6 +677,11 @@ def _release_late_fence(q: Any, root: pathlib.Path, task_id: str, fence: Dict[st
             return {"ok": False, "error": "owner_pause_effects_unsettled", "action": "wait_for_effect_settlement"}
         try:
             with launch_lock(root, task_id):
+                from ouroboros.owner_pause import read_fence
+                from ouroboros.acceptance_late import resume_paused_acceptance_preparations
+                if read_fence(root, task_id) != fence:
+                    return {"ok": False, "error": "selection_authority_changed"}
+                resume_paused_acceptance_preparations(root, task_id, fence)
                 set_fence_state(root, task_id, fence_id=str(fence.get("fence_id") or ""), state=FENCE_RELEASED,
                                 expected_state=str(fence.get("state") or ""), release_reason="owner_resume_late")
         except Exception as exc:
@@ -681,7 +691,7 @@ def _release_late_fence(q: Any, root: pathlib.Path, task_id: str, fence: Dict[st
                 q.BUDGET_ROOT_FENCES.pop(task_id, None)
             q.persist_queue_snapshot(reason="owner_pause_late_released")
     release_settled_continuations(task_id)
-    return {"ok": True, "task_id": task_id, "root_task_id": task_id, "late_phase": "settled",
+    return {"ok": True, "task_id": task_id, "root_task_id": task_id, "late_phase": "resumed" if remainder else "settled",
             "owner_pause_released": True}
 
 
@@ -713,7 +723,7 @@ def resume_late_phase(task_id: str) -> Optional[Dict[str, Any]]:
         return None
     record = late_phase_pause_record(row)
     if not record:
-        return _release_late_fence(q, root, task_id, fence) if fence_closed(fence) else None
+        return _release_late_fence(q, root, task_id, row, fence) if fence_closed(fence) else None
     with _LATE_RESUMING_LOCK:
         if task_id in _LATE_RESUMING:
             return {"ok": False, "error": "resume_already_granted"}

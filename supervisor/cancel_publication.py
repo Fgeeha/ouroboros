@@ -713,17 +713,19 @@ def _finish_captured_chat_turn(
 def stop_paused_late_phase_custody(q: Any, task_id: str, *, intent: Optional[Dict[str, Any]] = None) -> bool:
     """The owner's Stop of an answered root's paused late phase (D10).
 
-    Only the saved remainder is cancelled: the phase settles ``degraded`` with
-    ``owner_stopped`` and its skipped stages, the delivered answer and the
-    terminal status stay, an unconsumed Resume grant is revoked. False when no
-    paused remainder is there (a consumed grant already owns it as live work).
+    Saved post-task work degrades with ``owner_stopped`` and its skipped stages;
+    an unsent review records ``preparation_refused/owner_stopped``. The delivered
+    answer/status stay, and unused grants revoke. Live work keeps its own owner.
     """
     from ouroboros.post_task_synthesis import stop_paused_late_phase
+    from ouroboros.review_operation import stop_paused_acceptance_preparations
     from supervisor.owner_pause_control import late_phase_settled
     from supervisor.task_lifecycle import _settle_intent
 
     try:
-        if not stop_paused_late_phase(q.DRIVE_ROOT, task_id):
+        stopped_post = stop_paused_late_phase(q.DRIVE_ROOT, task_id)
+        stopped_review = stop_paused_acceptance_preparations(q.DRIVE_ROOT, task_id)
+        if not stopped_post and not stopped_review:
             return False
     except Exception:
         log.warning("Stop of the saved late phase of %s was not recorded", task_id, exc_info=True)
