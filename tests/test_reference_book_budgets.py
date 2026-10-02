@@ -245,7 +245,8 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 328400 -> 328500 (measured 328427): the addressed clause names the cases decided before it that carry no note.
     # Batch5 #1336 restores the official limit by compressing touched acceptance
     # prose while documenting frozen source/money/operation custody in place.
-    "docs/architecture/06-agent-core.md": 328500,
+    # 328500 -> 328545 (measured 328520): the stale-debt sentence names the band entry kept at 1501-1600 lines.
+    "docs/architecture/06-agent-core.md": 328545,
     # 36991 -> 37300: the facade paragraph names the three loop constants runtime_limits.py
     # gained (events batch bound, budget-projection retry interval); no older text to displace.
     # 37300 -> 38400 (PR #1207): the Z.ai (`zai::`) direct provider gets its own route
