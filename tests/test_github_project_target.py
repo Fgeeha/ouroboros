@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from ouroboros.tools import github
+from ouroboros.tools import github, github_checks
 from ouroboros.tools.registry import ToolContext
 
 
@@ -336,8 +336,8 @@ def checks(tmp_path, monkeypatch):
 
     clock = SimpleNamespace(now=0.0, slept=[], request_cost=0.0)
     monkeypatch.setattr(github, "github_token_from_env_or_settings", lambda: "fixture-token")
-    monkeypatch.setattr(github, "utc_now_iso", lambda: "2026-10-02T12:00:00+00:00")
-    monkeypatch.setattr(github, "time", SimpleNamespace(
+    monkeypatch.setattr(github_checks, "utc_now_iso", lambda: "2026-10-02T12:00:00+00:00")
+    monkeypatch.setattr(github_checks, "time", SimpleNamespace(
         monotonic=lambda: clock.now,
         sleep=lambda seconds: (clock.slept.append(seconds), setattr(clock, "now", clock.now + seconds))))
     ctx, _ = _context(tmp_path, "queued")
@@ -349,7 +349,7 @@ def checks(tmp_path, monkeypatch):
             clock.now += clock.request_cost
             return fake(*a, **kw)
 
-        monkeypatch.setattr(github, "_gh_run", transport)
+        monkeypatch.setattr(github_checks, "_gh_run", transport)
         result = registry.execute_result("get_github_checks", args)
         assert not any(word in result.text.lower() for word in ("passed", "failing")), result.text
         return result
@@ -805,9 +805,14 @@ def test_checks_reader_is_registered_read_only():
     assert TOOL_POLICY["get_github_checks"] == POLICY_SKIP and "get_github_checks" in _GITHUB_TOKEN_TOOLS
     assert entry.schema["parameters"]["required"] == [] and not entry.mutates_worktree
     assert set(entry.schema["parameters"]["properties"]) == {"number", "sha", "wait_seconds", "repo"}
-    assert github._CHECKS_WAIT_CAP_SEC + github._CHECKS_READ_BUDGET_SEC < entry.timeout_sec
+    assert github_checks._CHECKS_WAIT_CAP_SEC + github_checks._CHECKS_READ_BUDGET_SEC < entry.timeout_sec
     assert "ends the call with that error" in entry.schema["parameters"]["properties"]["wait_seconds"]["description"]
     for listing in (OBSERVE_DISABLED, tool_capabilities.OBSERVE_WORLD_MUTATION_TOOLS, tool_capabilities.READ_ONLY_PARALLEL_TOOLS,
                     tool_capabilities.LOCAL_READONLY_SUBAGENT_TOOL_NAMES, tool_capabilities.ACTING_SUBAGENT_TOOL_NAMES):
         assert "get_github_checks" not in listing
     assert "comment_on_pr" in OBSERVE_DISABLED  # The same lists do carry the family's write verbs.
+    # The reader's module is a helper of the family: the family module registers the tool, in frozen builds too.
+    from ouroboros.tools.registry import ToolRegistry
+
+    assert not hasattr(github_checks, "get_tools") and hasattr(github, "get_tools")
+    assert "github" in ToolRegistry._FROZEN_TOOL_MODULES and "github_checks" not in ToolRegistry._FROZEN_TOOL_MODULES

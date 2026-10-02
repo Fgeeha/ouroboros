@@ -47,7 +47,9 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 166450 -> 167000 (merge of the moved target into the plan-review branch, measured 166885): both
     # sides' replaced paragraphs land together; no text was appended by the merge itself.
     # 167000 -> 167300 (merge of the moved target into the plan-review branch, measured 167032): both sides' paragraphs land together.
-    "docs/architecture/01-high-level-architecture.md": 167300,
+    # 167300 -> 167600 (measured 167528): the module-map row of the new `tools/github_checks.py`, the
+    # reader split out of `tools/github.py` at the 1000-line band; no older row describes it.
+    "docs/architecture/01-high-level-architecture.md": 167600,
     # 15517 -> 16200 (#1195): the session-custodied startup historical audit is a
     # new node of the startup flow (readiness no longer waits for the historical
     # seal diagnostic); the chapter had no older description of that pass to replace.
