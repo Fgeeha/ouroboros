@@ -18,6 +18,7 @@ from tests.test_reference_book_budgets import (
     budget_faults,
     grant_layout_faults,
     growth_base,
+    measures_one_change,
     growth_faults,
     read_grants,
 )
@@ -78,7 +79,7 @@ def test_a_chapter_without_a_base_and_a_base_without_a_chapter_are_both_named():
     ]
 
 
-# --- the layout: nothing under the grant tree is silently ignored ----------------------------------
+# --- the layout: nothing under the grant tree but a dot-file is silently ignored -------------------
 
 PLACE = "sits at <book>/<chapter-stem>/<name>.grant"
 INTEGER = "a positive integer and nothing else"
@@ -106,8 +107,6 @@ def test_a_crlf_checkout_reads_the_same_grant(tmp_path):
     _write(tmp_path, GRANT, "500\r\n" + REASON.replace("\n", "\r\n"))
     assert grant_layout_faults(tmp_path, [CHAPTER]) == []
     assert read_grants(tmp_path) == {CHAPTER: [(GRANT, 500)]}
-
-
 
 
 @pytest.mark.parametrize(
@@ -265,3 +264,14 @@ def test_growth_base_is_the_event_base_and_nothing_else(tmp_path):
     # is not in the repository all leave the rule unapplied; HEAD's parent is never substituted.
     for absent in (None, "", "   ", "0" * 40, "f" * 40):
         assert growth_base(tmp_path, absent) == "", absent
+
+
+@pytest.mark.parametrize(("environ", "applies"), [
+    ({}, True),  # a local run with an explicit base
+    ({"GITHUB_EVENT_NAME": "pull_request", "GITHUB_REF": "refs/pull/7/merge"}, True),
+    ({"GITHUB_EVENT_NAME": "push", "GITHUB_REF": "refs/heads/ouroboros"}, True),
+    ({"GITHUB_EVENT_NAME": "push", "GITHUB_REF": "refs/heads/ouroboros-stable"}, False),
+    ({"GITHUB_EVENT_NAME": "push", "GITHUB_REF": "refs/heads/main"}, False),
+])
+def test_the_growth_rule_measures_one_change_not_a_release_range(environ, applies):
+    assert measures_one_change(environ) is applies

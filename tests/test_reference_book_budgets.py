@@ -13,7 +13,7 @@ files. A change that needs more room adds its own file and edits no shared line:
 rule counts the files a change adds, plus any raise of the base number (what a compression pass
 makes, and what a change written before grant files existed still does). A compression pass folds the grants back: it sets the
 chapter's base number to the measured size plus a margin and deletes that chapter's grant files in
-the same change. The layout check is unmarked, so a file the size lane would ignore fails every
+the same change. The layout check is unmarked, so a file the size lane would ignore (dot-files aside) fails every
 default lane instead of landing silently.
 """
 from __future__ import annotations
@@ -559,6 +559,12 @@ def _git(repo: pathlib.Path, *args: str, check: bool = True) -> subprocess.Compl
     return subprocess.run(["git", *args], cwd=repo, check=check, capture_output=True)
 
 
+def measures_one_change(environ) -> bool:
+    """A pull request or a push to ``ouroboros`` is one change; a push to ``main`` or ``ouroboros-stable``
+    spans a whole release, whose earlier folds and pre-grant growth the rule cannot attribute."""
+    return environ.get("GITHUB_EVENT_NAME") != "push" or environ.get("GITHUB_REF") == "refs/heads/ouroboros"
+
+
 def growth_base(repo: pathlib.Path, ref: str | None) -> str:
     """The commit this change is measured from; ``""`` when the growth rule does not apply.
 
@@ -626,9 +632,11 @@ def test_a_change_grows_a_chapter_only_by_what_it_grants():
     A grant sized only to the shortfall would let two changes that share the same leftover room land
     over the limit with no merge conflict, so each change covers every byte it adds.
     """
+    if not measures_one_change(os.environ):
+        pytest.skip("a push to a release branch spans many changes; the growth rule measures one")
     base = growth_base(REPO, os.environ.get(BASE_REF_ENV))
     if not base:
-        pytest.skip(f"{BASE_REF_ENV} names no base commit, so this change's growth cannot be measured")
+        pytest.skip(f"{BASE_REF_ENV} names no base commit this clone holds, so this change's growth cannot be measured")
     base_sizes, base_grants, base_numbers = base_facts(REPO, base)
     faults = growth_faults(
         base_sizes, _chapter_sizes(), base_grants, read_grants(REPO / GRANTS_TREE), base_numbers, CHAPTER_BYTE_BUDGETS
