@@ -347,6 +347,7 @@ def disabled_tools_dispatch_only(ctx: Any) -> bool:
 _GITHUB_TOKEN_TOOLS = frozenset({
     "list_github_prs",
     "get_github_pr",
+    "get_github_checks",
     "comment_on_pr",
     "pr_merge",
     "list_github_issues",

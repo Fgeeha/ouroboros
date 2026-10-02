@@ -65,6 +65,7 @@ TOOL_POLICY: Dict[str, str] = {
     "browser_action": POLICY_SKIP,
     "list_github_prs": POLICY_SKIP,
     "get_github_pr": POLICY_SKIP,
+    "get_github_checks": POLICY_SKIP,
     "list_github_issues": POLICY_SKIP,
     "get_github_issue": POLICY_SKIP,
     "plan_task": POLICY_SKIP,

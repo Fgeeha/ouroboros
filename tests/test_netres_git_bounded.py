@@ -423,6 +423,7 @@ def test_ci_note_names_every_push_workflow_and_none_stands_for_the_others(monkey
         {"name": "UI browser (ouroboros push)", "status": "queued", "conclusion": None},
     ])
     assert note.startswith("\n\n⏳ CI: push runs in progress — ") and "✅" not in note
+    assert note.endswith(f". Read the results later: get_github_checks(sha='{'a' * 40}').")
     assert "Provider canaries: success; CI: in progress; UI browser (ouroboros push): queued" in note
 
     note = _ci_note(monkeypatch, [{"name": "Provider canaries", **_DONE}, {"name": "CI", **_DONE}])
