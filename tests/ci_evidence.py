@@ -4,6 +4,10 @@ Registered after tests/conftest.py establishes isolation. The summary entrypoint
 uses only stdlib and trusts the supplied Actions producer outcome, not case totals.
 events.jsonl is the controller's incremental journal: it names the tests in flight
 when a session is killed before its final results.json export.
+
+Everything here is diagnostic except `reconcile-shards`: the sharded UI browser lane
+is proven complete only by its shards' projections, so there a missing or invalid
+projection is a failure, never an unknown.
 """
 from __future__ import annotations
 
@@ -248,6 +252,156 @@ def render_annotations(roots, *, limit: int = 10) -> list[str]:
     return shown
 
 
+def _named(nodes, *, shown: int = 20) -> str:
+    nodes = sorted(nodes)
+    return ", ".join(nodes[:shown]) + (f" … and {len(nodes) - shown} more" if len(nodes) > shown else "")
+
+
+def _lane_shape(lane) -> bool:
+    def strings(value):
+        return isinstance(value, list) and all(isinstance(node, str) for node in value)
+    if not isinstance(lane, dict) or not strings(lane.get("full")):
+        return False
+    shard = lane.get("shard")
+    return "shard" not in lane or (
+        isinstance(shard, list) and len(shard) == 2 and all(type(part) is int for part in shard)
+        and strings(lane.get("assigned")))
+
+
+def _lane_proofs(root: Path, *, sha: str, run_id: str, gaps: list) -> list[dict]:
+    """UI lane projections beneath root that belong to this commit and run.
+
+    Each results.json is judged where it lies, never by its directory name. One
+    without a `ui_browser` block is another producer's (browser tools) and is not
+    a proof; an unreadable one, or a lane projection of another commit or run, is a gap.
+    """
+    proofs = []
+    for directory, dirs, files in os.walk(root):
+        dirs.sort()
+        if "results.json" not in files:
+            continue
+        name = (Path(directory) / "results.json").relative_to(root).as_posix()
+        data, error = _final(Path(directory))
+        if error:
+            gaps.append(f"{name}: {error}")
+            continue
+        if "ui_browser" not in data:
+            continue
+        lane, identity = data["ui_browser"], data.get("github")
+        identity = identity if isinstance(identity, dict) else {}
+        attempt = identity.get("run_attempt")
+        if not _lane_shape(lane):
+            gaps.append(f"{name}: invalid ui_browser block")
+        elif identity.get("sha") != sha or identity.get("run_id") != run_id:
+            gaps.append(f"{name}: belongs to commit {identity.get('sha')} run "
+                        f"{identity.get('run_id')}, expected commit {sha} run {run_id}")
+        elif not (isinstance(attempt, str) and attempt.isdecimal()):
+            gaps.append(f"{name}: run attempt is unknown")
+        else:
+            # The lane guard's own rule (tests/browser_lane.py LaneReconciliation): a node is
+            # executed once it has a call phase or any non-passed report; a crash row is one.
+            executed = {row["nodeid"] for row in data["reports"]
+                        if row["phase"] in ("call", "crash") or row["outcome"] != "passed"}
+            proofs.append({"name": name, "attempt": int(attempt), "lane": lane, "executed": executed})
+    return proofs
+
+
+def reconcile_shards(manifest_root: Path, shards_root: Path, *, count: int, sha: str,
+                     run_id: str) -> tuple[list[str], list[str]]:
+    """(gaps, notes) of one run's sharded UI lane; any gap makes the lane RED.
+
+    AUTHORITATIVE, unlike every other reader in this module: the manifest is the
+    unsharded collection's witness of the lane, each shard must prove it saw that
+    same lane, took exactly its slice and executed all of it. Pass/fail of the
+    executed tests stays with each shard job's own exit code and is not judged here.
+    """
+    gaps, notes = [], []
+    if not sha or not run_id or count < 1:
+        return ["the expected commit, run id and a positive shard count are required"], notes
+    full = None
+    witnesses = _lane_proofs(manifest_root, sha=sha, run_id=run_id, gaps=gaps)
+    gaps += [f"{proof['name']}: the manifest carries a shard block"
+             for proof in witnesses if "shard" in proof["lane"]]
+    witnesses = [proof for proof in witnesses if "shard" not in proof["lane"]]
+    if not witnesses:
+        gaps.append("manifest: no valid projection of the unsharded lane")
+    else:
+        manifest = max(witnesses, key=lambda proof: proof["attempt"])
+        full = manifest["lane"]["full"]
+        notes.append(f"manifest: {len(full)} nodes, from attempt {manifest['attempt']}")
+        if not full or len(set(full)) != len(full):
+            gaps.append("manifest: the lane is empty" if not full else "manifest: duplicate node ids: "
+                        + _named(node for node, seen in Counter(full).items() if seen > 1))
+            full = None
+    by_shard = {}
+    for proof in _lane_proofs(shards_root, sha=sha, run_id=run_id, gaps=gaps):
+        index, total = proof["lane"].get("shard", (0, 0))
+        if total != count or not 1 <= index <= count:
+            gaps.append(f"{proof['name']}: " + (f"declares shard {index}/{total}, expected one of {count}"
+                                                if total else "carries no shard block"))
+        else:
+            by_shard.setdefault(index, []).append(proof)
+    proven = set()
+    for index in range(1, count + 1):
+        label = f"shard {index}/{count}"
+        proofs = sorted(by_shard.get(index, []), key=lambda proof: proof["attempt"])
+        if not proofs:
+            gaps.append(f"{label}: no proof")
+            continue
+        proof = proofs[-1]
+        attempts = [candidate["attempt"] for candidate in proofs]
+        if attempts.count(proof["attempt"]) > 1:
+            gaps.append(f"{label}: {attempts.count(proof['attempt'])} proofs from attempt {proof['attempt']}")
+        assigned, executed = proof["lane"]["assigned"], proof["executed"]
+        notes.append(f"{label}: proof from attempt {proof['attempt']}"
+                     + (f" (attempts present: {', '.join(map(str, attempts))})" if len(proofs) > 1 else "")
+                     + f"; assigned {len(assigned)}, executed {len(executed & set(assigned))}")
+        if full is not None and proof["lane"]["full"] != full:
+            theirs, ours = set(proof["lane"]["full"]), set(full)
+            gaps.append(f"{label}: its lane differs from the manifest"
+                        + (f"; only in the shard: {_named(theirs - ours)}" if theirs - ours else "")
+                        + (f"; only in the manifest: {_named(ours - theirs)}" if ours - theirs else "")
+                        + ("; same nodes in another order" if theirs == ours else ""))
+        if full is not None and assigned != sorted(full)[index - 1::count]:
+            gaps.append(f"{label}: its assignment is not slice {index} of {count} of the manifest lane")
+        if set(assigned) - executed:
+            gaps.append(f"{label}: assigned but not executed ({len(set(assigned) - executed)}): "
+                        + _named(set(assigned) - executed))
+        if executed - set(assigned):
+            gaps.append(f"{label}: executed outside its assignment ({len(executed - set(assigned))}): "
+                        + _named(executed - set(assigned)))
+        proven |= executed & set(assigned)
+    if full is not None and set(full) - proven:
+        gaps.append(f"lane: {len(set(full) - proven)} of {len(full)} manifest nodes are executed by no shard: "
+                    + _named(set(full) - proven))
+    return gaps, notes
+
+
+def _reconcile(args) -> int:
+    try:
+        gaps, notes = reconcile_shards(args.manifest, args.shards, count=args.count,
+                                       sha=args.sha, run_id=args.run_id)
+    except Exception as error:  # An unreadable proof tree is a failed proof, not a skipped one.
+        gaps, notes = [f"reconciliation failed ({type(error).__name__})"], []
+    verdict = (f"INCOMPLETE — {len(gaps)} gap(s)" if gaps
+               else f"complete — every node of the lane is executed by one of {args.count} shards")
+    lines = [f"UI_BROWSER_RECONCILE {verdict}"] + notes + [f"GAP {gap}" for gap in gaps]
+    # GitHub shows at most ten error annotations per step; the log and summary list every gap.
+    lines += [_annotation("UI browser lane incomplete", gap) for gap in gaps[:10]]
+    sys.stdout.buffer.write("".join(line + "\n" for line in lines).encode("utf-8", "replace"))
+    sys.stdout.flush()
+    try:
+        with args.summary.open("a", encoding="utf-8") as handle:
+            handle.write("\n".join(
+                [f"## UI browser lane reconciliation — {_cell(verdict)}", "",
+                 f"Commit `{_cell(args.sha)}`, run {_cell(args.run_id)}. Test outcomes stay with each shard job.",
+                 ""] + [f"- {_cell(note)}" for note in notes]
+                + [f"- **GAP** {_cell(gap)}" for gap in gaps]) + "\n")
+    except OSError as error:  # The verdict stands without its rendering.
+        print(f"::warning::UI lane reconciliation summary is unavailable ({type(error).__name__}).")
+    return 1 if gaps else 0
+
+
 def _main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -262,6 +416,10 @@ def _main(argv=None) -> int:
     annotate = commands.add_parser("annotate")
     annotate.add_argument("--evidence-dir", type=Path, action="append", required=True)
     annotate.add_argument("--limit", type=int, default=10)
+    reconcile = commands.add_parser("reconcile-shards")
+    for flag, kind in (("--manifest", Path), ("--shards", Path), ("--count", int),
+                       ("--sha", str), ("--run-id", str), ("--summary", Path)):
+        reconcile.add_argument(flag, type=kind, required=True)
     argv = sys.argv[1:] if argv is None else list(argv)
     try:
         args = parser.parse_args(argv)
@@ -271,6 +429,8 @@ def _main(argv=None) -> int:
         # Annotations are advisory: neither usage nor unreadable evidence fails a step.
         print("::warning::CI annotations are unavailable (usage error).")
         return 0
+    if args.command == "reconcile-shards":
+        return _reconcile(args)
     if args.command == "annotate":
         try:
             lines = render_annotations(args.evidence_dir, limit=args.limit)
@@ -412,6 +572,10 @@ class _Results:
                 "github": {name: os.environ.get("GITHUB_" + name.upper(), "")
                            for name in ("sha", "run_id", "run_attempt")},
             }
+            # tests/browser_lane.py: the complete lane, and this session's shard and slice.
+            lane = getattr(self.config, "_ui_browser_lane", None)
+            if lane:
+                facts["ui_browser"] = lane
             write_json(output_dir(self.config) / "results.json", _redact(facts, self.secrets))
         except Exception as error:
             # Diagnostics alone never alter session.exitstatus or expose a body.

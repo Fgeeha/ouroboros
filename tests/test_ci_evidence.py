@@ -613,3 +613,212 @@ def test_label_extends_only_the_heading(tmp_path):
     assert labelled != plain
     partial, _ = _summary(tmp_path, public, scope="viewport", label="serial | pass")
     assert partial.startswith("## CI test evidence — serial &#124; pass — PARTIAL DIAGNOSTIC\n")
+
+
+LANE_NODES = sorted([f"tests/test_lane_browser.py::test_case[{index}]" for index in range(6)]
+                    + ["tests/test_lane_browser.py::test_имя[webkit]"])
+LANE_SHA, LANE_RUN = "a" * 40, "4242"
+
+
+def _slice(index, count=3):
+    return LANE_NODES[index - 1::count]
+
+
+def _rows(nodes, phases=(("setup", "passed"), ("call", "passed"), ("teardown", "passed"))):
+    return [{"nodeid": node, "phase": phase, "outcome": outcome} for node in nodes
+            for phase, outcome in phases]
+
+
+def _lane_projection(directory, *, shard=None, attempt="1", reports=None):
+    """One job's evidence as the reconciler finds it: <artifact>/host/results.json."""
+    lane = {"full": list(LANE_NODES)}
+    if shard is not None:
+        lane.update(shard=[shard, 3], assigned=_slice(shard))
+    path = directory / "host" / "results.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({
+        "format": 1, "session_exit_code": 0, "collection_failures": [], "ui_browser": lane,
+        "reports": _rows(lane.get("assigned", [])) if reports is None else reports,
+        "github": {"sha": LANE_SHA, "run_id": LANE_RUN, "run_attempt": attempt}}), encoding="utf-8")
+    return path
+
+
+def _lane_proofs(tmp_path):
+    """A complete, consistent run: the manifest and three shards, named like their artifacts."""
+    paths = {"manifest": _lane_projection(tmp_path / "manifest" / "ui-ci-full-manifest-1")}
+    for index in (1, 2, 3):
+        paths[index] = _lane_projection(tmp_path / "shards" / f"ui-ci-full-shard-{index}-1", shard=index)
+    # The browser-tools producer shares shard 1's artifact; it is no lane proof.
+    _write_results(tmp_path / "shards" / "ui-ci-full-shard-1-1" / "tools",
+                   _rows(["tests/test_browser_tools_smoke.py::test_tools"]))
+    return paths
+
+
+def _rewrite(path, change):
+    data = json.loads(path.read_text(encoding="utf-8"))
+    change(data)
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _reconcile_shards(tmp_path, *, count="3", sha=LANE_SHA, run_id=LANE_RUN, summary=None):
+    summary = summary or tmp_path / "reconcile.md"
+    result = subprocess.run(
+        [sys.executable, "-I", "-S", str(REPO / "tests/ci_evidence.py"), "reconcile-shards",
+         "--manifest", str(tmp_path / "manifest"), "--shards", str(tmp_path / "shards"),
+         "--count", count, "--sha", sha, "--run-id", run_id, "--summary", str(summary)],
+        cwd=tmp_path, capture_output=True, text=True, encoding="utf-8", timeout=30)
+    return result, summary.read_text(encoding="utf-8") if summary.is_file() else ""
+
+
+def test_shard_reconciliation_passes_only_a_complete_consistent_run(tmp_path):
+    _lane_proofs(tmp_path)
+    result, summary = _reconcile_shards(tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "UI_BROWSER_RECONCILE complete" in result.stdout
+    assert "GAP" not in result.stdout and "::error" not in result.stdout
+    assert "## UI browser lane reconciliation — complete" in summary and "GAP" not in summary
+    assert f"Commit `{LANE_SHA}`, run {LANE_RUN}." in summary and "- manifest: 7 nodes, from attempt 1" in summary
+    for index, size in ((1, 3), (2, 2), (3, 2)):
+        assert f"- shard {index}/3: proof from attempt 1; assigned {size}, executed {size}" in summary
+    # The expected commit and run are mandatory facts, never wildcards.
+    for unknown in ({"sha": ""}, {"run_id": ""}, {"count": "0"}):
+        refused, _ = _reconcile_shards(tmp_path, **unknown)
+        assert refused.returncode == 1 and "are required" in refused.stdout
+    usage = subprocess.run([sys.executable, "-I", "-S", str(REPO / "tests/ci_evidence.py"),
+                            "reconcile-shards"], capture_output=True, timeout=30)
+    assert usage.returncode == 2
+
+
+def _drop(paths, key):
+    paths[key].unlink()
+
+
+def _garbage(paths, key):
+    paths[key].write_text("not-json", encoding="utf-8")
+
+
+def _lane(key, **facts):
+    return lambda paths: _rewrite(paths[key], lambda data: data["ui_browser"].update(facts))
+
+
+def _identity(key, **facts):
+    return lambda paths: _rewrite(paths[key], lambda data: data["github"].update(facts))
+
+
+def _reports(key, rows):
+    return lambda paths: _rewrite(paths[key], lambda data: data.update(reports=rows))
+
+
+@pytest.mark.parametrize("fault, named", [
+    (lambda paths: _drop(paths, 2), ["shard 2/3: no proof",
+                                     "lane: 2 of 7 manifest nodes are executed by no shard: " + ", ".join(_slice(2))]),
+    (lambda paths: _garbage(paths, 2), ["ui-ci-full-shard-2-1/host/results.json: result projection unavailable",
+                                        "shard 2/3: no proof"]),
+    (_identity(2, sha="b" * 40), [f"belongs to commit {'b' * 40} run {LANE_RUN}", "shard 2/3: no proof"]),
+    (_identity(3, run_id="9"), [f"belongs to commit {LANE_SHA} run 9, expected commit {LANE_SHA} run {LANE_RUN}",
+                                "shard 3/3: no proof"]),
+    (_identity(1, run_attempt=""), ["ui-ci-full-shard-1-1/host/results.json: run attempt is unknown"]),
+    (_lane(3, full=LANE_NODES + ["tests/test_new.py::test_added"]),
+     ["shard 3/3: its lane differs from the manifest; only in the shard: tests/test_new.py::test_added"]),
+    (_lane(2, full=LANE_NODES[1:]),
+     [f"shard 2/3: its lane differs from the manifest; only in the manifest: {LANE_NODES[0]}"]),
+    (_lane(1, full=LANE_NODES[::-1]), ["shard 1/3: its lane differs from the manifest; same nodes in another order"]),
+    (lambda paths: (_lane(1, assigned=_slice(2))(paths), _reports(1, _rows(_slice(2)))(paths)),
+     ["shard 1/3: its assignment is not slice 1 of 3 of the manifest lane",
+      "lane: 3 of 7 manifest nodes are executed by no shard: " + ", ".join(_slice(1))]),
+    (_reports(1, _rows(_slice(1)[1:]) + _rows(_slice(1)[:1], (("setup", "passed"), ("teardown", "passed")))),
+     [f"shard 1/3: assigned but not executed (1): {_slice(1)[0]}",
+      f"lane: 1 of 7 manifest nodes are executed by no shard: {_slice(1)[0]}"]),
+    (_reports(1, _rows(_slice(1) + _slice(2)[:1])),
+     [f"shard 1/3: executed outside its assignment (1): {_slice(2)[0]}"]),
+    (_lane(2, shard=[2, 4]), ["declares shard 2/4, expected one of 3", "shard 2/3: no proof"]),
+    (_lane(2, shard=[2, "3"]), ["ui-ci-full-shard-2-1/host/results.json: invalid ui_browser block"]),
+    (lambda paths: _rewrite(paths[2], lambda data: [data["ui_browser"].pop(key) for key in ("shard", "assigned")]),
+     ["ui-ci-full-shard-2-1/host/results.json: carries no shard block", "shard 2/3: no proof"]),
+    (_lane("manifest", shard=[1, 3], assigned=_slice(1)),
+     ["ui-ci-full-manifest-1/host/results.json: the manifest carries a shard block",
+      "manifest: no valid projection of the unsharded lane"]),
+    (_lane("manifest", full=[]), ["manifest: the lane is empty"]),
+    (_lane("manifest", full=LANE_NODES + LANE_NODES[:1]), [f"manifest: duplicate node ids: {LANE_NODES[0]}"]),
+    (lambda paths: _drop(paths, "manifest"), ["manifest: no valid projection of the unsharded lane"]),
+    (lambda paths: _garbage(paths, "manifest"),
+     ["ui-ci-full-manifest-1/host/results.json: result projection unavailable",
+      "manifest: no valid projection of the unsharded lane"]),
+], ids=["missing-shard", "garbage-shard", "other-commit", "other-run", "unknown-attempt", "lane-grew",
+        "lane-shrank", "lane-reordered", "wrong-slice", "not-executed", "foreign-node", "other-count",
+        "invalid-block", "unsharded-shard", "sharded-manifest", "empty-manifest", "duplicate-manifest",
+        "missing-manifest", "garbage-manifest"])
+def test_shard_reconciliation_is_red_and_names_every_gap(tmp_path, fault, named):
+    fault(_lane_proofs(tmp_path))
+    result, summary = _reconcile_shards(tmp_path)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "UI_BROWSER_RECONCILE INCOMPLETE" in result.stdout and "reconciliation — INCOMPLETE" in summary
+    for gap in named:
+        assert gap in result.stdout, result.stdout
+        assert gap in summary, summary
+    assert sum(line.startswith("::error title=UI browser lane incomplete::")
+               for line in result.stdout.splitlines()) == result.stdout.count("\nGAP ")
+
+
+@pytest.mark.parametrize("attempts, complete", [
+    ({"1": False, "2": True}, True), ({"1": True, "2": False}, False),
+    ({"9": False, "10": True}, True),  # Attempts order as numbers, not as text.
+], ids=["red-then-green", "green-then-red", "numeric-order"])
+def test_shard_reconciliation_uses_the_highest_attempt_and_says_which(tmp_path, attempts, complete):
+    paths = _lane_proofs(tmp_path)
+    paths[2].unlink()
+    unexecuted = _slice(2)[0]
+    for attempt, executed in attempts.items():
+        _lane_projection(tmp_path / "shards" / f"ui-ci-full-shard-2-rerun-{attempt}", shard=2,
+                         attempt=attempt, reports=_rows(_slice(2) if executed else _slice(2)[1:]))
+    result, summary = _reconcile_shards(tmp_path)
+    used = max(attempts, key=int)
+    assert result.returncode == int(not complete), result.stdout + result.stderr
+    assert (f"shard 2/3: proof from attempt {used} (attempts present: "
+            f"{', '.join(sorted(attempts, key=int))})") in summary
+    assert (f"shard 2/3: assigned but not executed (1): {unexecuted}" in summary) is not complete
+    # Two proofs of one shard from the same attempt cannot both be the proof.
+    _lane_projection(tmp_path / "shards" / "ui-ci-full-shard-2-copy", shard=2, attempt=used)
+    ambiguous, _ = _reconcile_shards(tmp_path)
+    assert ambiguous.returncode == 1 and f"shard 2/3: 2 proofs from attempt {used}" in ambiguous.stdout
+
+
+@pytest.mark.parametrize("phases, executed", [
+    ((("setup", "passed"), ("call", "passed"), ("teardown", "passed")), True),
+    ((("setup", "passed"), ("call", "failed"), ("teardown", "passed")), True),
+    ((("setup", "failed"),), True), ((("setup", "skipped"),), True), ((("crash", "failed"),), True),
+    ((("setup", "passed"),), False), ((("setup", "passed"), ("teardown", "passed")), False), ((), False),
+], ids=["passed", "failed", "setup-error", "skipped", "crash", "setup-only", "no-call", "silent"])
+def test_shard_reconciliation_counts_execution_exactly_as_the_lane_guard_does(tmp_path, phases, executed):
+    from types import SimpleNamespace
+
+    from tests.browser_lane import LaneReconciliation
+
+    node = _slice(1)[0]
+    guard = LaneReconciliation({node})
+    for phase, outcome in phases:
+        # xdist reports a dead worker's test with when="???"; the export calls that phase "crash".
+        guard.pytest_runtest_logreport(SimpleNamespace(
+            nodeid=node, when="???" if phase == "crash" else phase, outcome=outcome))
+    assert (guard.missing == []) is executed
+    paths = _lane_proofs(tmp_path)
+    _reports(1, _rows(_slice(1)[1:]) + _rows([node], phases))(paths)
+    result, _ = _reconcile_shards(tmp_path)
+    assert (result.returncode == 0) is executed, result.stdout
+    assert (f"assigned but not executed (1): {node}" in result.stdout) is not executed
+
+
+def test_shard_reconciliation_verdict_survives_an_unwritable_summary_and_caps_long_lists(tmp_path):
+    _lane_proofs(tmp_path)
+    blocked = tmp_path / "summary-is-a-directory"
+    blocked.mkdir()
+    result, _ = _reconcile_shards(tmp_path, summary=blocked)
+    assert result.returncode == 0 and "::warning::" in result.stdout
+    for index in (1, 2, 3):
+        (tmp_path / "shards" / f"ui-ci-full-shard-{index}-1" / "host" / "results.json").unlink()
+    red, _ = _reconcile_shards(tmp_path, summary=blocked)
+    assert red.returncode == 1 and "::warning::" in red.stdout
+
+    from tests.ci_evidence import _named
+    assert _named(f"n{index:02}" for index in range(23)).endswith("n19 … and 3 more")
+    assert _named(["b", "a"]) == "a, b"
