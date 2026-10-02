@@ -689,6 +689,24 @@ def test_shard_reconciliation_passes_only_a_complete_consistent_run(tmp_path):
     assert usage.returncode == 2
 
 
+def test_red_browser_tools_session_beside_a_shard_proof_is_refused(tmp_path):
+    """The tools smoke shares shard 1's artifact; its failure must not hide behind a green lane proof."""
+    _lane_proofs(tmp_path)
+    identity = {"sha": LANE_SHA, "run_id": LANE_RUN}
+    tools = tmp_path / "shards" / "ui-ci-full-shard-1-1" / "tools" / "results.json"
+    _rewrite(tools, lambda data: data.update(session_exit_code=1, github={**identity, "run_attempt": "1"}))
+    result, summary = _reconcile_shards(tmp_path)
+    gap = "ui-ci-full-shard-1-1/tools/results.json: its session ended with exit status 1"
+    assert result.returncode == 1 and gap in result.stdout and gap in summary
+    # A re-run of that job supersedes it: only the newest attempt's tools session is judged.
+    rerun = tmp_path / "shards" / "ui-ci-full-shard-1-2" / "tools"
+    rerun.parent.mkdir()
+    _write_results(rerun, _rows(["tests/test_browser_tools_smoke.py::test_tools"]))
+    _rewrite(rerun / "results.json", lambda data: data.update(github={**identity, "run_attempt": "2"}))
+    result, _ = _reconcile_shards(tmp_path)
+    assert result.returncode == 0, result.stdout
+
+
 def _drop(paths, key):
     paths[key].unlink()
 
