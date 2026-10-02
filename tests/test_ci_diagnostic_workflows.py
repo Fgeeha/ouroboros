@@ -1,11 +1,13 @@
 """Public CI exports preserve producer exits, secret boundaries and full UI proof."""
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 
 import pytest
 import yaml
@@ -166,3 +168,103 @@ def test_every_added_outcome_reference_names_an_already_declared_step():
             assert set(references) <= known, (workflow, step.get("name"), references, known)
             if step.get("id"):
                 known.add(step["id"])
+
+
+EVIDENCE_ACTION = "./.github/actions/test-evidence"
+PASSES = ("parallel", "serial", "size")
+
+
+def _evidence_action():
+    return yaml.safe_load((ROOT / EVIDENCE_ACTION / "action.yml").read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize("jobname,artifact", [
+    ("quick-test", "quick-test"), ("full-test", "full-test-${{ matrix.os }}"),
+])
+def test_ordinary_jobs_name_their_failures_without_owning_the_result(jobname, artifact):
+    job = _workflow("ci.yml")["jobs"][jobname]
+    steps = _steps("ci.yml", jobname)
+    for label in PASSES:
+        producer = steps[f"tests_{label}"]
+        assert "continue-on-error" not in producer
+        assert f'--ci-evidence-dir="${{{{ runner.temp }}}}/ci-evidence/{label}"' in producer["run"]
+        # A hang fails the step, so the evidence step still runs; a job limit would cancel it.
+        assert isinstance(producer["timeout-minutes"], int)
+    assert "continue-on-error" not in job and "timeout-minutes" not in job
+    evidence = next(step for step in job["steps"] if step.get("uses") == EVIDENCE_ACTION)
+    assert evidence["continue-on-error"] is True and "!cancelled()" in evidence["if"]
+    assert evidence["with"] == {"name": artifact, "passes": " ".join(
+        f"{label}=${{{{ steps.tests_{label}.outcome }}}}" for label in PASSES)}
+    assert job["steps"].index(evidence) > max(job["steps"].index(steps[f"tests_{label}"])
+                                              for label in PASSES)
+
+
+def test_evidence_action_steps_are_independent_diagnostics():
+    upload, report = _evidence_action()["runs"]["steps"]
+    for step in (upload, report):  # Neither waits for the other's success nor fails the caller.
+        assert step["if"] == "${{ !cancelled() }}" and step["continue-on-error"] is True
+    assert upload["uses"] == UPLOAD_ACTION
+    assert upload["with"]["path"] == "${{ runner.temp }}/ci-evidence/"
+    for fact in ("inputs.name", "github.run_id", "github.run_attempt"):
+        assert fact in upload["with"]["name"]
+    assert report["shell"] == "bash"  # One shell on all three runner systems.
+    assert report["env"]["ARTIFACT_OUTCOME"] == "${{ steps.upload.outcome }}"
+    assert report["env"]["ARTIFACT_URL"] == "${{ steps.upload.outputs.artifact-url }}"
+    assert "python -I -S tests/ci_evidence.py summarize" in report["run"]
+    assert "python -I -S tests/ci_evidence.py annotate" in report["run"]
+    assert "pytest" not in report["run"] and "${{" not in report["run"]
+
+
+def _publish(tmp_path, passes):
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("workflow shell unavailable on this host")
+    summary = tmp_path / "summary.md"
+    env = {**os.environ, "PASSES": passes, "ARTIFACT_OUTCOME": "success",
+           "ARTIFACT_URL": "https://github.com/example/project/actions/runs/1/artifacts/2",
+           "EVIDENCE_ROOT": str(tmp_path / "ci-evidence"), "GITHUB_STEP_SUMMARY": str(summary),
+           "REAL_PYTHON": sys.executable}
+    script = 'python() { "$REAL_PYTHON" "$@"; }\n' + _evidence_action()["runs"]["steps"][1]["run"]
+    completed = subprocess.run([bash, "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", script],
+                               cwd=ROOT, env=env, capture_output=True, text=True,
+                               encoding="utf-8", timeout=60)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    errors = [line for line in completed.stdout.splitlines() if line.startswith("::error")]
+    return errors, summary.read_text(encoding="utf-8") if summary.exists() else ""
+
+
+def _final_projection(directory, outcome, error_type=""):
+    directory.mkdir(parents=True)
+    (directory / "results.json").write_text(json.dumps({
+        "format": 1, "session_exit_code": int(outcome == "failed"), "tests_collected": 1,
+        "collection_failures": [], "github": {},
+        "reports": [{"nodeid": "t.py::test_a", "phase": "call", "outcome": outcome,
+                     "error_type": error_type}]}), encoding="utf-8")
+
+
+def test_published_evidence_names_failed_killed_and_silent_passes(tmp_path):
+    root = tmp_path / "ci-evidence"
+    _final_projection(root / "parallel", "failed", "KeyError")
+    (root / "serial").mkdir()
+    (root / "serial" / "events.jsonl").write_text(
+        json.dumps({"event": "start", "nodeid": "t.py::test_b"}) + "\n", encoding="utf-8")
+    errors, summary = _publish(tmp_path, "parallel=failure serial=failure size=failure idle=skipped")
+    assert errors == [
+        "::error title=No test evidence::The size pass failed before any test reported; "
+        "read that step's log.",
+        "::error title=Failed test::t.py::test_a (call, KeyError)",
+        "::error title=Test in flight when the session was killed::t.py::test_b",
+    ]
+    for label in PASSES:
+        assert f"## CI test evidence — {label} pass" in summary
+    assert "idle pass" not in summary  # A skipped producer ran nothing and reports nothing.
+    assert "| t.py::test_a | call | KeyError |" in summary
+    assert "| t.py::test_b |" in summary
+
+
+def test_published_evidence_is_quiet_for_green_passes(tmp_path):
+    _final_projection(tmp_path / "ci-evidence" / "parallel", "passed")
+    errors, summary = _publish(tmp_path, "parallel=success serial=skipped size=skipped")
+    assert errors == []
+    assert "## CI test evidence — parallel pass" in summary and "passed=1, failed=0" in summary
+    assert "serial pass" not in summary and "diagnostics_incomplete" not in summary

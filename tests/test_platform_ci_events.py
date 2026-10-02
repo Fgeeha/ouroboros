@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
 
 
-def _value(expression, *, event, ref, base="", schedule="", cancelled=False):
+def _value(expression, *, event, ref, base="", schedule="", cancelled=False, attempt=1):
     """Evaluate the workflow's small expression vocabulary against real event shapes."""
     expression = expression.strip()
     if expression.startswith("$" + "{{"):
@@ -23,16 +23,17 @@ def _value(expression, *, event, ref, base="", schedule="", cancelled=False):
     expression = " ".join(expression.split()).replace("&&", " and ").replace("||", " or ")
     expression = re.sub(r"!(?!=)", "not ", expression)
     github = SimpleNamespace(
-        event_name=event, ref=ref, base_ref=base,
+        event_name=event, ref=ref, base_ref=base, run_id=77, run_attempt=attempt,
         event=SimpleNamespace(
             schedule=schedule, inputs=SimpleNamespace(e2e_live="false"), before="previous-tip",
-            pull_request=SimpleNamespace(base=SimpleNamespace(sha="pr-base")),
+            pull_request=SimpleNamespace(number=42, base=SimpleNamespace(sha="pr-base")),
         ),
     )
     return eval(expression, {"__builtins__": {}}, {
         "github": github, "fromJSON": json.loads,
         "startsWith": lambda value, prefix: value.startswith(prefix),
         "always": lambda: True, "cancelled": lambda: cancelled,
+        "format": lambda template, *values: template.format(*values),
     })
 
 
@@ -101,3 +102,18 @@ def test_status_checks_and_inequality_keep_independent_meanings(event, cancelled
         "${{ always() && !cancelled() && github.event_name != 'schedule' }}",
         event=event, ref="refs/heads/candidate", cancelled=cancelled,
     ) is expected
+
+
+@pytest.mark.parametrize("event,attempt,group,cancels", [
+    ("pull_request", 1, "ci-pr-42", True),
+    # GitHub keeps one pending run per group: a re-run of an old head must not share the new head's.
+    ("pull_request", 2, "ci-run-77-2", False),
+    ("push", 1, "ci-run-77-1", False),
+    ("schedule", 1, "ci-run-77-1", False),
+    ("workflow_dispatch", 1, "ci-run-77-1", False),
+])
+def test_only_a_new_pull_request_head_cancels_a_run(event, attempt, group, cancels):
+    concurrency = WORKFLOW["concurrency"]
+    facts = {"event": event, "ref": "refs/heads/candidate", "attempt": attempt}
+    assert _value(concurrency["group"], **facts) == group
+    assert bool(_value(concurrency["cancel-in-progress"], **facts)) is cancels
