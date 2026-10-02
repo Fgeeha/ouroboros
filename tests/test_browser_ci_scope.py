@@ -48,13 +48,15 @@ def _workflow(name):
 def test_one_browser_lane_serves_pull_requests_manual_tags_and_ouroboros_pushes():
     shared, triggers = _workflow("ui-browser.yml")
     assert list(triggers) == ["workflow_call"], "the shared lane runs only when called"
-    job = shared["jobs"]["ui-smoke"]
-    assert "secrets." not in str(job)
+    assert "secrets." not in str(shared["jobs"])
+    job = shared["jobs"]["ui-shard"]
     full = next(step for step in job["steps"] if "--require-ui-browser" in step.get("run", ""))
     assert "pytest tests/ -m ui_browser" in full["run"]
     assert "safe_test.py" in full["run"]
-    setup = next(step for step in job["steps"] if step.get("id") == "setup_python")
-    assert setup["with"]["install-project"] == "false"
+    for name in ("ui-shard", "ui-manifest", "ui-diagnostic"):  # Exact candidate, never an editable install.
+        setup = next(step for step in shared["jobs"][name]["steps"]
+                     if step.get("uses") == "./.github/actions/setup-python-env")
+        assert setup["with"]["install-project"] == "false"
 
     ci, ci_triggers = _workflow("ci.yml")
     caller = ci["jobs"]["ui-smoke"]
