@@ -40,14 +40,15 @@ def _value(expression, *, event, ref, base="", schedule="", cancelled=False, att
 @pytest.mark.parametrize("event,ref,base,quick,platforms", [
     ("pull_request", "refs/pull/42/merge", "ouroboros", True, ["windows-latest", "macos-latest"]),
     ("pull_request", "refs/pull/42/merge", "main", False, []),
-    ("push", "refs/heads/ouroboros", "", True, []),
+    # A landed commit gets the same two desktop systems a pull request gets; Ubuntu is quick-test.
+    ("push", "refs/heads/ouroboros", "", True, ["windows-latest", "macos-latest"]),
     ("push", "refs/heads/main", "", False, []),
     ("push", "refs/heads/ouroboros-stable", "", False, ["ubuntu-latest", "windows-latest", "macos-latest"]),
     ("push", "refs/tags/v7.0.0", "", False, ["ubuntu-latest", "windows-latest", "macos-latest"]),
     ("workflow_dispatch", "refs/heads/candidate", "", True, ["ubuntu-latest", "windows-latest", "macos-latest"]),
     ("schedule", "refs/heads/main", "", False, []),
 ])
-def test_ordinary_matrix_expands_for_prs_without_changing_existing_events(event, ref, base, quick, platforms):
+def test_ordinary_matrix_covers_prs_and_landed_pushes_and_keeps_other_events(event, ref, base, quick, platforms):
     facts = {"event": event, "ref": ref, "base": base}
     assert bool(_value(WORKFLOW["jobs"]["quick-test"]["if"], **facts)) is quick
     job = WORKFLOW["jobs"]["full-test"]
