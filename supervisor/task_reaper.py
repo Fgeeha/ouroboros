@@ -1358,8 +1358,8 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
 
     workers_mod._reconcile_confirmed_dead_review_owner(int(getattr(proc, "pid", 0) or 0))
     with _q._queue_lock:
-        from supervisor.worker_health import retire_confirmed_worker_consumers
-        retire_confirmed_worker_consumers(job["worker"], _q.RUNNING.get(task_id))
+        from supervisor.worker_health import _retire_dead_model_consumers
+        _retire_dead_model_consumers(job, captured_timeout=True)
 
 
     try:

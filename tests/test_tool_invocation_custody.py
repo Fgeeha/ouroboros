@@ -357,3 +357,26 @@ def test_executor_census_reports_unreadable_directory(tmp_path, monkeypatch):
                    'workspace_executor_custody_unreadable' in row['detail']
                    for row in blockers), (blockers, seen, str(folder))
     assert not cold_blockers(registry._ctx)  # Readable empty store still works.
+
+
+@pytest.mark.parametrize("known", [False, True])
+def test_effective_retry_read_keeps_predecessor_unknown_effect_history(tmp_path, known):
+    from ouroboros.task_results import write_task_result, load_task_result
+    from ouroboros.tool_custody import retire_tool_invocations
+    from ouroboros.tools.control_task_results import _get_task_result
+    from ouroboros.tools.registry import ToolContext
+    from ouroboros.tools.join_ledger import _child_result_sha256
+
+    claim = {"tool": "local-effect", "task_id": "old", "root_task_id": "old", "state": "claimed",
+             "local_owner": {"pid": 880001, "process_birth": "owned", "task_attempt": 1}}
+    write_task_result(tmp_path, "old", "running", root_task_id="old", launch_handoffs={"original-op": claim})
+    retire_tool_invocations(tmp_path, "old", "old", pid=880001, process_birth="owned", task_attempt=1)
+    write_task_result(tmp_path, "new", "completed", result="Retry result", original_task_id="old",
+                      timeout_retry_from="old", root_task_id="old")
+    write_task_result(tmp_path, "old", "failed", reason_code="idle_timeout", superseded_by="new",
+                      retry_task_id="new")
+    assert "original-op" in load_task_result(tmp_path, "old")["retired_tool_invocations"]
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+    data = load_task_result(tmp_path, "new")
+    result = _get_task_result(ctx, "old", **({"known_result_sha256": _child_result_sha256(data)} if known else {}))
+    assert "original-op" in result and "external effects remain unknown" in result, result

@@ -294,17 +294,24 @@ def retire_confirmed_worker_consumers(worker: Any, meta: dict | None) -> None:
         "drive_root": str(_pool().DRIVE_ROOT)})
 
 
-def _retire_dead_model_consumers(job: dict) -> None:
+def _retire_dead_model_consumers(job: dict, *, captured_timeout: bool = False) -> None:
     """Queue-locked exact death proof, never PID absence or task terminality.
 
-    Both OS families use the spawn owner's retained birth token and the dead
-    Process handle. Unreadable/legacy evidence retains the local writer claim;
-    dispatched money and all other custody are untouched.
+    Timeout transfers ownership from RUNNING to its captured reaper job; the
+    other doors retain RUNNING until retirement. Each uses its existing current-
+    owner check, plus the same retained birth/Process/task/attempt proof below.
+    Unreadable/legacy evidence stays held; money and other custody are untouched.
     """
     worker = job["worker"]
     birth = getattr(worker, "process_birth", "")
+    if captured_timeout:
+        from supervisor import queue
+        from supervisor.task_reaper import _timeout_job_is_current
+        current = _timeout_job_is_current(job, queue, _pool())
+    else:
+        current = _dead_job_is_current(job)
     if (not isinstance(birth, str) or not birth or worker.proc.exitcode is None
-            or not _dead_job_is_current(job)):
+            or worker.proc.is_alive() or not current):
         return
     if (not isinstance(job.get("meta"), dict)
             or job["meta"].get("task", {}).get("id") != job["task_id"]
