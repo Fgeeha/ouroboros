@@ -1222,6 +1222,8 @@ def kill_workers(
             try:
                 if w.proc.pid and not w.proc.is_alive():
                     dead_pids.add(int(w.proc.pid))
+                    from supervisor.worker_health import retire_confirmed_worker_consumers
+                    retire_confirmed_worker_consumers(w, RUNNING.get(w.busy_task_id))
             except Exception:
                 log.debug("Cannot confirm worker %s dead", w.wid, exc_info=True)
         from supervisor.worker_process import close_worker_stop_channel

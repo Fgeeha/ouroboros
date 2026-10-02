@@ -9,7 +9,7 @@ pytestmark = pytest.mark.serial
 
 
 @pytest.mark.parametrize("outcome", ["error", "timeout", "exception", "remote_start", "exit_error", "git_error", "legacy_warning"])
-def test_unknown_registry_outcomes_keep_custody_after_terminal(tmp_path, monkeypatch, outcome):
+def test_business_outcomes_do_not_outlive_the_joined_registry_handler(tmp_path, monkeypatch, outcome):
     from ouroboros.loop_tool_execution import _execute_single_tool
     from ouroboros.task_results import load_task_result, write_task_result
     from ouroboros.tools.registry import ToolRegistry
@@ -39,11 +39,11 @@ def test_unknown_registry_outcomes_keep_custody_after_terminal(tmp_path, monkeyp
     call = {"id": "call-1", "function": {"name": "knowledge_read", "arguments": '{"topic":"x"}'}}
     _execute_single_tool(registry, call, tmp_path / "logs", "root")
     before = load_task_result(tmp_path, "root")["launch_handoffs"]
-    assert len(before) == 1 and calls == ["effect may have started"]
+    assert before == {} and calls == ["effect may have started"]
     write_task_result(tmp_path, "root", "failed", reason_code="task_exception")
     assert load_task_result(tmp_path, "root")["launch_handoffs"] == before
     blockers = conflicting_writers(queue, "root")
-    assert any(row["kind"] == "tool_handoff" for row in blockers), blockers
+    assert not any(row["kind"] == "tool_handoff" for row in blockers), blockers
     assert calls == ["effect may have started"], "classification never resends"
 
 

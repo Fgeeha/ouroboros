@@ -483,10 +483,11 @@ def tree_member_results(root_drive: Any, root_task_id: str) -> Dict[str, Dict[st
 
 @contextmanager
 def tool_handoff(source: Any, name: str):
-    """Retain custody until the registry supplies positive operation settlement.
+    """Track the local invocation separately from its owned physical operations.
 
-    A returned error, opaque remote receipt or escaping exception is not that
-    evidence. Unknown claims survive terminality and never authorize replay.
+    Actual handler unwind closes this invocation regardless of business outcome.
+    Pending host receipts and independently owned executors remain custody;
+    neither a result code nor metadata can certify their completion.
     """
     from ouroboros.task_results import stamp_task_result_schema
     from ouroboros.utils import update_json_locked, utc_now_iso
@@ -499,14 +500,21 @@ def tool_handoff(source: Any, name: str):
     path = _result_path(root_drive, task_id)
     op_id = uuid.uuid4().hex
     outcome["operation_id"] = op_id
+    outcome["claim_path"] = path
     token = _TOOL_OPERATION.set((source, name, outcome))
     def claim(current):
         if not current.get("status") or current.get("task_id") != path.stem:
             raise OwnerPauseRefused("owner_pause_authority_unreadable")
         outstanding = dict(current.get("launch_handoffs") or {})
         outstanding[op_id] = {"tool": name, "task_id": task_id, "root_task_id": root_id,
-                              "state": "claimed", "claimed_at": utc_now_iso()}
+                              "state": "claimed", "claimed_at": utc_now_iso(),
+                              **({"local_owner": local_owner} if local_owner else {})}
         return stamp_task_result_schema({**current, "launch_handoffs": outstanding})
+    from ouroboros.model_wait import current_model_wait
+    owner = current_model_wait()
+    local_owner = ({"pid": os.getpid(), "process_birth": owner.answer_owner_birth,
+                    "task_attempt": owner.attempt}
+                   if owner is not None and owner.task_id == task_id else {})
     claimed = False
     try:
         # Stateful tools were submitted to their sticky executor by the loop.
@@ -526,6 +534,7 @@ def tool_handoff(source: Any, name: str):
             # refuse. A not-yet-published member uses its existing root owner.
             if not path.exists():
                 path = _result_path(root_drive, root_id)
+                outcome["claim_path"] = path
             if path.exists():
                 update_json_locked(path, claim, strict_existing_dict=True)
                 claimed = True
@@ -538,7 +547,14 @@ def tool_handoff(source: Any, name: str):
             if not current.get("status") or current.get("task_id") != path.stem:
                 raise OwnerPauseRefused("owner_pause_authority_unreadable")
             outstanding = dict(current.get("launch_handoffs") or {})
-            outstanding.pop(op_id, None)
+            claim = outstanding.get(op_id)
+            if claim is not None:
+                claim = {**claim, "state": "returned", "returned_at": utc_now_iso()}
+                from ouroboros.tool_custody import claim_still_owns_effect
+                if claim_still_owns_effect(root_drive, claim):
+                    outstanding[op_id] = claim
+                else:
+                    outstanding.pop(op_id, None)
             return stamp_task_result_schema({**current, "launch_handoffs": outstanding})
         # Close local admission even if durable cleanup cannot acquire its lock.
         # Failure retains custody; it must not replace an executed result with
@@ -610,15 +626,24 @@ def run_operation(source: Any, function: Any, *args: Any, **kwargs: Any):
 
 
 def run_tool_handler(source: Any, function: Any, *args: Any, **kwargs: Any):
+    """The host joins the actual body, including its exception unwind.
+
+    A caller's outer timeout cannot reach this finally while the body still runs.
+    This closes local launch capability, not processes, receipts or remote effects.
+    """
     active = _TOOL_OPERATION.get()
-    if active and active[0] is source and active[2].get("handed"):
-        if active[2].get("closed"):
-            raise OwnerPauseRefused("operation_already_returned")
-        active[2]["not_started"] = False
-        return function(*args, **kwargs)  # Keep browser/greenlet thread affinity.
-    from ouroboros.tools.process_facts import process_facts_handoff
-    with process_facts_handoff(function) as invoke:
-        return run_operation(source, invoke, *args, **kwargs)
+    try:
+        if active and active[0] is source and active[2].get("handed"):
+            if active[2].get("closed"):
+                raise OwnerPauseRefused("operation_already_returned")
+            active[2]["not_started"] = False
+            return function(*args, **kwargs)  # Keep browser/greenlet thread affinity.
+        from ouroboros.tools.process_facts import process_facts_handoff
+        with process_facts_handoff(function) as invoke:
+            return run_operation(source, invoke, *args, **kwargs)
+    finally:
+        if active and active[0] is source:
+            active[2]["settled"] = True
 
 
 def submit_async_operation(source: Any, function: Any, *args: Any, **kwargs: Any):

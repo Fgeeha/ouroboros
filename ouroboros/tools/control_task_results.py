@@ -400,6 +400,9 @@ def _get_task_result(
         )
     if isinstance(data.get("cancel_origin"), dict):
         output += f"\n\n[CANCELLED_BY] {json.dumps(data['cancel_origin'], ensure_ascii=False)}"
+    if data.get("retired_tool_invocations"):
+        output += ("\n\n[INTERRUPTED_TOOL_CALLS] Local execution ended; external effects remain unknown.\n"
+                   + json.dumps(data["retired_tool_invocations"], ensure_ascii=False))
     from ouroboros.task_custody import unread_mail_notice
 
     if unread := unread_mail_notice(data.get("unread_mailbox")):

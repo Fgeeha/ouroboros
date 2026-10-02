@@ -50,7 +50,7 @@ def test_completed_local_read_warning_releases_tree_custody(tmp_path, monkeypatc
 
 
 @pytest.mark.parametrize("outcome", ["warning", "exception", "timeout", "dynamic"])
-def test_read_name_cannot_certify_replaced_or_opaque_body(tmp_path, monkeypatch, outcome):
+def test_result_metadata_cannot_override_actual_handler_unwind(tmp_path, monkeypatch, outcome):
     from ouroboros.task_results import load_task_result
     from ouroboros.tools.registry import ToolRegistry
     from ouroboros.tools.tool_result import ToolResult
@@ -75,10 +75,10 @@ def test_read_name_cannot_certify_replaced_or_opaque_body(tmp_path, monkeypatch,
     registry.override_handler("read_file", opaque)
     registry.execute_result("read_file", {"path": "absent", "root": "active_workspace"})
     assert entered == [True]
-    assert load_task_result(tmp_path, "root").get("launch_handoffs")
+    assert not load_task_result(tmp_path, "root").get("launch_handoffs")
 
 
-def test_real_reader_escaping_exception_does_not_publish_completion(tmp_path, monkeypatch):
+def test_real_reader_exception_keeps_business_error_without_ghost_invocation(tmp_path, monkeypatch):
     from ouroboros.task_results import load_task_result
     from ouroboros.tools.registry import ToolRegistry
 
@@ -89,7 +89,7 @@ def test_real_reader_escaping_exception_does_not_publish_completion(tmp_path, mo
     # The actual query reader raises while parsing its numeric options.
     result = registry.execute_result("query_code", {"op": "symbols", "limit": "invalid"})
     assert result.status == "error" and not result.meta.get("operation_outcome")
-    assert load_task_result(tmp_path, "root").get("launch_handoffs")
+    assert not load_task_result(tmp_path, "root").get("launch_handoffs")
 
 
 def test_mcp_start_between_timeout_result_and_handoff_close_keeps_custody(tmp_path, monkeypatch):

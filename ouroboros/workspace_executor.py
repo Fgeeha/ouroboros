@@ -1,16 +1,10 @@
-"""Host-owned workspace execution backends for external task workspaces.
+"""Host-owned external workspace execution behind semantic task executor_ref.
 
-The task contract stays semantic. This module consumes an operator/runtime
-``executor_ref`` from task metadata and routes process execution into the
-declared backend when present.
-
-Completion belongs to the backend, not its host CLI. The Docker foreground
-wrapper retains its wait fact as ``completed`` in the existing unique pidfile;
-a bounded readback consumes it. Missing/malformed files or failed probes keep
-both the durable executor record and the tool's launch claim. Stop cleanup
-also requires its explicit backend receipt. These are foreground facts, not
-proof against escaped descendants. Popen failures settle only with the
-producer's positive no-start marker; a later exception is unknown.
+Completion belongs to the backend, not its host CLI. Its unique pidfile keeps
+wrapper wait evidence; failed readback retains task-attributed executor custody.
+Stop also requires a backend receipt. Live children survive exception unwind
+in these records independently of the closed tool invocation. Root join proves
+nothing about escaped descendants; pre-spawn failure starts nothing.
 """
 
 from __future__ import annotations
@@ -33,7 +27,7 @@ from ouroboros.platform_layer import (
     IS_WINDOWS,
     bootstrap_process_path,
     kill_pid_tree, kill_process_group_id, kill_process_tree,
-    pid_is_signalable,
+    pid_is_signalable, pid_provably_gone,
     process_command, process_group_id,
     request_process_tree_kill,
     scrub_repo_from_pythonpath, subprocess_new_group_kwargs,
@@ -242,13 +236,9 @@ def execute(
     env_overlay: "dict[str, str] | None" = None,
     target_env: "dict[str, str] | None" = None,
 ) -> ExecutorResult:
-    """Run one foreground command in the configured backend.
-
-    ``env_overlay`` (e.g. the interpreter resolver's attested emergency PATH
-    prepend) applies only to the LOCAL backend, which runs on this host; the
-    docker backend deliberately ignores it — host paths and host PATH must not
-    leak into a container environment. Explicit target_env is separate and
-    reaches either backend; Docker carries its values only through inert aliases.
+    """Run in the configured backend. Host/interpreter ``env_overlay`` applies
+    only locally: host paths/PATH must not leak into Docker. Explicit target_env
+    is separate and reaches either backend, through inert aliases in Docker.
     """
     executor = executor_ref_from_ctx(ctx)
     if executor is None:
@@ -282,13 +272,9 @@ def _system_repo_dir() -> str | None:
 
 
 def overlay_env(base: "dict[str, str]", env_overlay: "dict[str, str] | None") -> dict[str, str]:
-    """Case-aware overlay merge for executor-local and companion child envs.
-
-    Windows env keys are case-insensitive, so an overlaid key replaces any
-    case-variant already present (``Path`` vs ``PATH``) instead of producing a
-    duplicate; POSIX keys stay case-sensitive and are replaced exactly.
-    (The plain-host PATH prepend keeps its own equivalent dedupe in
-    ``process_interpreters.apply_env_path_prepend``.)
+    """Overlay executor/companion environments: Windows keys ignore case, POSIX do not.
+    Replace existing casing instead of duplicating Path/PATH. Plain-host PATH
+    dedupe remains in ``process_interpreters.apply_env_path_prepend``.
     """
     env = dict(base)
     for key, value in (env_overlay or {}).items():
@@ -369,7 +355,8 @@ def _execute_local(
         raise
     finally:
         _FOREGROUND.pop(proc, None)
-        _forget_process(record_path)
+        if proc.poll() is not None:
+            _forget_process(record_path)  # Exceptions cannot discard a live child.
 
 
 def _execute_docker(
@@ -498,6 +485,8 @@ def _retire_docker_completion(record_path: pathlib.Path | None) -> bool:
         if record.get("backend_completed") is not True:
             record["backend_completed"] = True
             atomic_write_json(record_path, record, trailing_newline=True)
+        if not pid_provably_gone(int(record.get("host_pid") or 0)):
+            return False  # Backend completion does not join a still-live CLI.
         proc = subprocess.run(["docker", "exec", record["container_name"], "sh", "-lc",
             "rm -f -- " + shlex.quote(record["backend_pidfile"])],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
@@ -602,8 +591,14 @@ def _services_snapshot() -> list[_ExecutorService]:
 
 
 def _register_process(drive_root: pathlib.Path | None, payload: dict[str, Any]) -> pathlib.Path | None:
-    state_dir = _state_dir(drive_root)
+    from ouroboros.tool_custody import invocation_binding, retain_unconfirmed_host_operation
+
+    binding = invocation_binding()
+    payload = {**{key: value for key, value in binding.items() if key != "drive_root"}, **payload}
+    state_dir = _state_dir(pathlib.Path(binding["drive_root"]) if binding.get("drive_root") else drive_root)
     if state_dir is None:
+        if binding.get("task_id"):
+            retain_unconfirmed_host_operation("executor_custody_unavailable")
         return None
     record_id = _safe_record_id(str(payload.get("record_type") or "process"))
     host_command_sha256 = ""
@@ -627,6 +622,7 @@ def _register_process(drive_root: pathlib.Path | None, payload: dict[str, Any]) 
         atomic_write_json(path, record, trailing_newline=True)
         return path
     except Exception:
+        retain_unconfirmed_host_operation("executor_custody_write_failed")
         return None
 
 
@@ -692,23 +688,15 @@ def _host_pid_matches_record(record: dict[str, Any]) -> bool:
         return False
     expected = str(record.get("host_command_sha256") or "").strip()
     if not expected:
-        # No command line could be captured at register time. On Windows that is
-        # ALWAYS the case (platform_layer.process_command() is POSIX-only), and
-        # without a fallback the record would be permanently unvalidatable, so
-        # kill_all_foreground/_services would never dispatch taskkill for it (the
-        # worktree/service cleanup leak): there, fall back to liveness — owner/
-        # schema/id are already verified by the caller (_valid_process_record).
-        # On POSIX the capture can also fail for a genuine child (macOS `ps` right
-        # after the spawn), so liveness must still count — but pid_is_alive answers
-        # the wrong question for a KILL decision: since C6 round 5.4 it reads EPERM
-        # as alive, and an owner-shaped forged record naming a foreign pid would be
-        # signalled. Ours to kill means signalable by us (platform_layer.pid_is_signalable;
-        # under root every live pid is signalable — the forged-record rule is a non-root property).
+        # Windows has no POSIX command capture; macOS ps can also miss a spawn.
+        # Owner/schema/id were validated. Fallback requires signalability:
+        # pid_is_alive includes EPERM, which grants no right to kill. This
+        # protects foreign processes only for non-root (root can signal all).
         return pid_is_signalable(host_pid)
     return _process_command_sha256(host_pid) == expected
 
 
-def _valid_process_record(path: pathlib.Path, record: dict[str, Any]) -> bool:
+def _valid_process_record(path: pathlib.Path, record: dict[str, Any], *, check_identity: bool = True) -> bool:
     if record.get("owner") != _PROCESS_RECORD_OWNER:
         return False
     try:
@@ -735,7 +723,7 @@ def _valid_process_record(path: pathlib.Path, record: dict[str, Any]) -> bool:
         elif not backend_pid.isdigit():
             return False
     else:
-        if not _host_pid_matches_record(record):
+        if check_identity and not _host_pid_matches_record(record):
             return False
     return True
 
@@ -1036,10 +1024,17 @@ def start_service(
             text=True,
         )
         if proc.returncode != 0:
+            from ouroboros.tool_custody import retain_unconfirmed_host_operation
+            retain_unconfirmed_host_operation("backend_service_start_unconfirmed")
             raise RuntimeError(_service_diagnostic(
                 proc.stderr.strip() or proc.stdout.strip() or "docker service start failed", secret_values,
             ))
-        record.backend_pid = (proc.stdout or "").strip().splitlines()[-1].strip()
+        lines = (proc.stdout or "").strip().splitlines()
+        record.backend_pid = lines[-1].strip() if lines else ""
+        if not record.backend_pid.isdigit():
+            from ouroboros.tool_custody import retain_unconfirmed_host_operation
+            retain_unconfirmed_host_operation("backend_service_identity_unconfirmed")
+            raise RuntimeError("backend service identity was not confirmed")
         record.backend_log_path = log_path
         with _STATE_LOCK:
             _SERVICES[key] = record
@@ -1060,10 +1055,13 @@ def _submit_service_command(cmd: list[str], **kwargs) -> subprocess.CompletedPro
             raise
     try:
         stdout, stderr = proc.communicate(timeout=20)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.communicate()
-        # Backend effects are unknown; the registry must keep its handoff.
+    except Exception as exc:
+        from ouroboros.tool_custody import retain_unconfirmed_host_operation
+        retain_unconfirmed_host_operation("backend_service_start_unconfirmed")
+        if isinstance(exc, subprocess.TimeoutExpired):
+            proc.kill()
+            proc.communicate()
+        # The host CLI ended; no backend service receipt was obtained.
         raise
     return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
 

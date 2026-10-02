@@ -1314,12 +1314,10 @@ def _recover_replaced_timeout_files(job: dict, q: Any, workers: Any) -> None:
 
 
 def reap_timed_out_task(job: Dict[str, Any]) -> None:
-    """Kill the captured worker off-loop; confirm death before publication or retry.
+    """Kill off-loop and confirm death before publication/retry; saved terminal wins.
 
-    A saved terminal result wins over timeout. Unfinished file publication keeps
-    this exact job on the reaper's health-driven retry, without model replay.
-    A replacement pool/task can receive neither teardown nor retry/respawn from
-    this job; its old dead task's files remain independently recoverable.
+    Unfinished file publication retains this job for health retry without model
+    replay. A replacement pool/task gets no teardown/retry; old files remain recoverable.
     """
     from supervisor import queue as _q
     from supervisor import workers as workers_mod
@@ -1358,9 +1356,11 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
                             _incident_chat_id(task, owner_chat_id, _q))
         return
 
-    workers_mod._reconcile_confirmed_dead_review_owner(
-        int(getattr(proc, "pid", 0) or 0)
-    )
+    workers_mod._reconcile_confirmed_dead_review_owner(int(getattr(proc, "pid", 0) or 0))
+    with _q._queue_lock:
+        from supervisor.worker_health import retire_confirmed_worker_consumers
+        retire_confirmed_worker_consumers(job["worker"], _q.RUNNING.get(task_id))
+
 
     try:
         from ouroboros.tools.services import archive_task_service_logs

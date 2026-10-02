@@ -206,12 +206,15 @@ def cold_blockers(ctx: Any, *, chosen: Dict[str, Any] | None = None) -> List[Dic
                 # including a child whose terminal/mail was selected as our wake.
                 blockers.append({"kind": "queued_member", "detail": task_id})
             own_sleep = current_tool_operation(ctx, "await_messages") if own else ""
-            if any(op != own_sleep for op in (row.get("launch_handoffs") or {})):
+            from ouroboros.tool_custody import retained_tool_custody
+            if retained_tool_custody(root, task_id, row, excluding=own_sleep):
                 blockers.append({"kind": "member_custody", "detail": task_id})
         for member in members - {str(ctx.task_id)}:
             observed = observe_task_runs(root, member, request_stop=False)
             if observed.get("custody_read") != "ok" or observed.get("runs"):
                 blockers.append({"kind": "member_custody", "detail": member})
+        from ouroboros.tool_custody import task_process_blockers
+        blockers.extend(task_process_blockers(root, members))
         complete, processes = pc._read_ledger_strict(root)
         if not complete:
             raise OSError("process_custody_unreadable")

@@ -609,6 +609,7 @@ def cancel_task_custody(task_id: str, *, deliver: bool = True) -> str:
     captured_pending = None
     captured_worker = None
     captured_meta = None
+    captured_running = None
     with q._queue_lock:
         settled = _settled_status(q.DRIVE_ROOT, task_id)
         if settled:
@@ -666,7 +667,8 @@ def cancel_task_custody(task_id: str, *, deliver: bool = True) -> str:
                     # Popping the row here would blind task_subtree_is_live for
                     # the whole off-lock kill window, letting a concurrent
                     # cascade report a settled tree over a still-live process.
-                    captured_meta = dict(q.RUNNING.get(task_id) or {})
+                    captured_running = q.RUNNING.get(task_id)
+                    captured_meta = dict(captured_running or {})
                     captured_worker.reaping = True
                     break
 
@@ -747,6 +749,7 @@ def cancel_task_custody(task_id: str, *, deliver: bool = True) -> str:
             return _finish_captured_running(
                 task_id, captured_worker, captured_meta or {},
                 intent=intent, deliver=deliver, settled_status=settled,
+                captured_running=captured_running,
             )
         return _finalize_cancel_intent_on_miss(task_id, intent=intent)
     except Exception:
@@ -1107,7 +1110,7 @@ def _finish_captured_pending(
 def _finish_captured_running(
     task_id: str, worker: Any, meta: Dict[str, Any], *,
     intent: Optional[Dict[str, Any]] = None, deliver: bool = True,
-    settled_status: str = "",
+    settled_status: str = "", captured_running: Optional[Dict[str, Any]] = None,
 ) -> str:
     """A running task: CONFIRM the process is dead, persist, then publish.
 
@@ -1155,6 +1158,10 @@ def _finish_captured_running(
         return CANCEL_FAILED
 
     _reconcile_dead_review_owner(q.DRIVE_ROOT, int(getattr(worker.proc, "pid", 0) or 0))
+    with q._queue_lock:
+        from supervisor.worker_health import retire_confirmed_worker_consumers
+        retire_confirmed_worker_consumers(worker, captured_running)
+
 
     # A terminal checkpoint can precede split-drive adoption and artifact capture.
     # Keep fully published CURRENT byte-identical; complete only work still owed.

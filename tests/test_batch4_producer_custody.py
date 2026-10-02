@@ -44,11 +44,11 @@ def _consumers(tmp_path, registry, queue, workers, held):
     from tests.test_owner_continue import _interrupted, NONCE
 
     claims = load_task_result(tmp_path, "root").get("launch_handoffs", {})
-    assert bool(claims) is held
+    # Local invocation and independent executor custody are separate facts.
     assert bool(cold_blockers(registry._ctx)) is held
     selection = {"senders": [], "tasks": [], "runs": [], "wake_at": ""}
     if held:
-        with pytest.raises(ValueError, match="member_custody"):
+        with pytest.raises(ValueError, match="tool_handoff|workspace_executor|member_custody"):
             request_sleep(registry._ctx, selection, "cold")
     else:
         request_sleep(registry._ctx, selection, "cold")
@@ -170,7 +170,7 @@ def test_vcs_argument_refusal_and_corrected_retry_settle_only_their_claims(tmp_p
     _consumers(tmp_path, registry, queue, workers, False)
 
 
-def test_ambiguous_git_error_survives_corrected_retry(tmp_path, monkeypatch):
+def test_joined_git_error_does_not_survive_corrected_retry(tmp_path, monkeypatch):
     from ouroboros.tools import git
     from ouroboros.task_results import load_task_result
 
@@ -181,12 +181,12 @@ def test_ambiguous_git_error_survives_corrected_retry(tmp_path, monkeypatch):
     result = registry.execute_result("vcs_diff", {"root": "active_workspace"})
     assert result.code == "GIT_ERROR" and not result.meta.get("operation_outcome")
     claim = load_task_result(tmp_path, "root")["launch_handoffs"]
-    assert len(claim) == 1
+    assert claim == {}
     monkeypatch.setattr(git, "run_cmd", lambda *_a, **_kw: "")
     registry.execute_result("vcs_diff", {"root": "active_workspace", "head": "HEAD"})
     registry.execute_result("vcs_diff", {"root": "active_workspace"})
     assert load_task_result(tmp_path, "root")["launch_handoffs"] == claim
-    _consumers(tmp_path, registry, queue, workers, True)
+    _consumers(tmp_path, registry, queue, workers, False)
 
 
 @pytest.mark.parametrize("name,args", [
@@ -268,7 +268,7 @@ def test_backend_completion_probe_requires_exact_owned_wait_fact(tmp_path, monke
         assert pidfile.read_text() == content
 
 
-def test_exit_code_without_producer_completion_is_not_settlement(tmp_path, monkeypatch):
+def test_business_exit_code_does_not_override_host_return(tmp_path, monkeypatch):
     from ouroboros.tools.tool_result import _publish_process_result
 
     registry, queue, workers = _registry(tmp_path, monkeypatch)
@@ -276,7 +276,7 @@ def test_exit_code_without_producer_completion_is_not_settlement(tmp_path, monke
         _publish_process_result(ctx, "SHELL_EXIT_ERROR", "client ended", exit_code=7))
     result = registry.execute_result("knowledge_read", {"topic": "x"})
     assert result.meta["exit_code"] == 7 and "operation_outcome" not in result.meta
-    _consumers(tmp_path, registry, queue, workers, True)
+    _consumers(tmp_path, registry, queue, workers, False)
 
 
 @pytest.mark.parametrize("receipt", ["", "completed"])
@@ -311,7 +311,7 @@ def test_lost_completion_probe_reply_preserves_retry_receipt(tmp_path, monkeypat
     assert probe("simulated", str(pidfile))
 
 
-def test_timeout_cleanup_receipt_does_not_blanket_settle_generic_operation(tmp_path, monkeypatch):
+def test_host_join_and_backend_cleanup_settle_timed_out_invocation(tmp_path, monkeypatch):
     from ouroboros import workspace_executor as executor
     registry, queue, workers = _registry(tmp_path, monkeypatch, "docker_exec")
     _docker(monkeypatch, timeout=True, backend="completed")
@@ -319,7 +319,7 @@ def test_timeout_cleanup_receipt_does_not_blanket_settle_generic_operation(tmp_p
     result = registry.execute_result("run_command", {"cmd": ["backend-writer"]})
     assert result.status == "timeout" and not result.meta.get("operation_outcome")
     assert not executor._iter_process_records(tmp_path)
-    _consumers(tmp_path, registry, queue, workers, True)
+    _consumers(tmp_path, registry, queue, workers, False)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="Runs the backend receipt cleanup in POSIX sh")

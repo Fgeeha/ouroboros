@@ -148,8 +148,8 @@ def conflicting_writers(q: Any, predecessor: str, *, drive_root: Any = None,
         member_results = tree_member_results(custody_root, predecessor)
         for task_id, row in member_results.items():
             members.add(task_id)
-            for op in (row.get("launch_handoffs") or {}).values():
-                blockers.append({"kind": "tool_handoff", "task_id": task_id, "operation": op})
+            from ouroboros.tool_custody import retained_tool_custody
+            blockers.extend(retained_tool_custody(custody_root, task_id, row))
         # A member whose result has been collected can still own a remote start.
         from ouroboros.delegate_custody_memo import custody_rows_with_integrity
         rows, malformed = custody_rows_with_integrity(custody_root, predecessor)
@@ -172,6 +172,8 @@ def conflicting_writers(q: Any, predecessor: str, *, drive_root: Any = None,
     try:
         from ouroboros import process_custody as pc
         from ouroboros.platform_layer import pid_is_alive
+        from ouroboros.tool_custody import task_process_blockers
+        blockers.extend(task_process_blockers(custody_root, members))
         complete, records = pc._read_ledger_strict(custody_root)
         if not complete:
             raise OSError("process_custody_unreadable")

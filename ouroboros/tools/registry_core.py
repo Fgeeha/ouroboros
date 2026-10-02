@@ -1063,8 +1063,6 @@ class ToolRegistry:
                             return refusal, None
                         observed_skill = (state_root, constraint)
                     result = run_tool_handler(self._ctx, entry.handler, self._ctx, **handler_args)
-                    if handoff is not None:
-                        handoff["builtin_returned"] = True
                     published = _published_tool_result(
                         self._ctx,
                         tool_result_sentinel,
@@ -1112,24 +1110,11 @@ class ToolRegistry:
             with tool_handoff(self._ctx, str(name or "")) as handoff:
                 result = self._execute_admitted_text(name, args, handoff)
                 typed = result if isinstance(result, ToolResult) else LegacyTextResultAdapter.from_text(name, result)
-                # Only handoff closure may decide not_started, under the launch
-                # lock: a timed-out MCP runner may still start before closure.
-                # A successful first-party body
-                # settles its local call; owned processes/runs keep their own
-                # custody. Errors/timeouts and opaque remote acknowledgements
-                # prove neither settlement nor the absence of remote effects.
-                # Host-owned sidechannels record a local extension's joined
-                # return and an MCP call joined to its final response (that
-                # call ended, not any remote job it began); body/metadata never
-                # attest custody.
-                # Explicit unknown completion also overrides an OK client exit.
-                handoff["settled"] = (
-                    handoff.get("local_extension_returned") is True
-                    or handoff.get("mcp_call_returned") is True or (
-                    handoff.get("builtin_returned") is True and not typed.meta.get("dynamic_provider")
-                    and (typed.meta.get("operation_outcome") in {"completed", "completed_no_effect"} or (
-                        "operation_outcome" not in typed.meta and typed.status == "ok"
-                        and typed.code not in {"LEGACY_UNTYPED", "LEGACY_WARNING", "GIT_ERROR"}))))
+                # Host unwind/transport owners settle local execution. Business
+                # status and tool-authored metadata cannot create or negate a join.
+                handoff["settled"] = (handoff.get("settled") is True
+                    or handoff.get("local_extension_returned") is True
+                    or handoff.get("mcp_call_returned") is True)
                 return typed
         except OwnerPauseRefused as exc:
             from ouroboros.tools.tool_result import launch_refusal_result

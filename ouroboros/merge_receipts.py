@@ -112,9 +112,7 @@ def write_receipt(drive_root: Any, task_id: str, receipt: Dict[str, Any], *, cla
         rows = [r for r in rows if _must_observe(r) or r["receipt_id"] in keep]
         selected.update(updated)
         claims = dict(current.get("launch_handoffs") or {})
-        status = (updated.get("outcome") or {}).get("status")
-        definite = status == "merged" or (status == "refused" and
-            (updated.get("effect") or {}).get("failure") in {"cli_missing", "target", "pre_effect"})
+        definite = effect_is_definite(updated)
         if definite:
             for operation_id in updated.get("launch_operation_ids") or []:
                 claim_row = claims.get(operation_id) or {}
@@ -157,6 +155,13 @@ def _merge_facts(prior: Dict[str, Any], incoming: Dict[str, Any]) -> Dict[str, A
             outcome.pop("merge_tree_unavailable", None)
         merged["outcome"] = outcome
     return merged
+
+
+def effect_is_definite(receipt: Dict[str, Any]) -> bool:
+    """Positive merge/no-effect fact, independently of publication still owed."""
+    status = (receipt.get("outcome") or {}).get("status")
+    return status == "merged" or (status == "refused" and
+        (receipt.get("effect") or {}).get("failure") in {"cli_missing", "target", "pre_effect"})
 
 
 def _must_observe(receipt: Dict[str, Any]) -> bool:

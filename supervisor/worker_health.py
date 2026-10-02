@@ -280,6 +280,20 @@ def recover_confirmed_dead_worker(job: dict) -> None:
                 _respawn_after_reap(queue, _pool(), job["worker_id"], expected_worker=w)
 
 
+def retire_confirmed_worker_consumers(worker: Any, meta: dict | None) -> None:
+    """Reuse exact current pool ownership at every confirmed kill/join door.
+
+    Call under the queue lock before removing the captured RUNNING/worker row.
+    """
+    if not isinstance(meta, dict) or not isinstance(meta.get("task"), dict):
+        return
+    task = meta["task"]
+    _retire_dead_model_consumers({"worker": worker, "worker_id": worker.wid,
+        "task_id": str(task.get("id") or ""), "task": task, "meta": meta,
+        "attempt": int(meta.get("attempt") or task.get("_attempt") or 1),
+        "drive_root": str(_pool().DRIVE_ROOT)})
+
+
 def _retire_dead_model_consumers(job: dict) -> None:
     """Queue-locked exact death proof, never PID absence or task terminality.
 
@@ -296,6 +310,14 @@ def _retire_dead_model_consumers(job: dict) -> None:
             or job["meta"].get("task", {}).get("id") != job["task_id"]
             or job["task"].get("id") != job["task_id"]):
         return
+    try:
+        from ouroboros.tool_custody import retire_tool_invocations
+        retire_tool_invocations(
+            pathlib.Path(job["task"].get("budget_drive_root") or job["drive_root"]),
+            job["task_id"], str(job["task"].get("root_task_id") or job["task_id"]),
+            pid=worker.proc.pid, process_birth=birth, task_attempt=job["attempt"])
+    except Exception:
+        log.warning("Confirmed worker death could not retire tool invocations for %s", job["task_id"], exc_info=True)
     try:
         from ouroboros.usage_accounting import _memoized_final_rows
         from ouroboros.model_wait import retire_model_consumers

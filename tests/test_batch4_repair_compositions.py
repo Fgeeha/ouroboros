@@ -125,8 +125,16 @@ def test_unknown_root_claim_blocks_real_cold_request(tmp_path, monkeypatch):
     _running(tmp_path, workers)
     registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
     registry._ctx.task_id = registry._ctx.root_task_id = "root"
-    registry.override_handler("knowledge_read", lambda *_a, **_kw: ToolResult(
-        status="ok", code="LEGACY_UNTYPED", text="remote accepted", meta={"dynamic_provider": True}))
+    def body(ctx, **_kw):
+        from ouroboros.tools.control_events import _emit_and_wait_for_routing
+        ctx.event_queue = None
+        _, receipt = _emit_and_wait_for_routing(ctx, {
+            "type": "promote_chat_to_task", "task_id": "pending-root", "routing_token": "pending-token",
+            "client_message_id": "pending-message", "objective": "work"})
+        assert receipt["status"] == "unconfirmed"
+        return ToolResult(status="ok", code="LEGACY_UNTYPED", text="remote accepted",
+                          meta={"dynamic_provider": True, "operation_outcome": "completed"})
+    registry.override_handler("knowledge_read", body)
     registry.execute_result("knowledge_read", {"topic": "x"})
     registry._ctx.task_attempt = 1
     with pytest.raises(ValueError, match="member_custody"):
