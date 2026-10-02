@@ -570,11 +570,15 @@ def _create_issue(ctx: ToolContext, title: str, body: str = "", labels: str = ""
 _CHECK_STATES = ("success", "failure", "cancelled", "timed_out", "startup_failure", "action_required", "stale",
                  "skipped", "neutral", "queued", "in_progress", "waiting", "requested", "pending")
 _CHECKS_QUIET = ("success", "skipped", "neutral")
+# Runs are listed and expanded in this order: failure-class states, unfinished ones, the rest, success last.
+_CHECKS_RANK = {state: rank for rank, state in enumerate(
+    ("failure", "timed_out", "startup_failure", "action_required", "cancelled", *_CHECK_STATES[9:]))}
 # The wait cap plus the read budget stays under the ToolEntry default of 360 s.
 _CHECKS_WAIT_CAP_SEC, _CHECKS_READ_BUDGET_SEC, _CHECKS_POLL_SEC = 240, 90, 15
 _CHECKS_RUN_LIMIT, _CHECKS_RUN_LINES, _CHECKS_EXPANDED_RUNS = 100, 20, 8
 _CHECKS_JOB_LINES, _CHECKS_ANNOTATED_JOBS, _CHECKS_OTHER_LINES = 10, 10, 12
 _GH_REPO_URL_RE = re.compile(r"^https://([^/]+)/([^/]+)/([^/]+)/")
+_GH_RUN_ID_RE = re.compile(r"/actions/runs/(\d+)")
 _FULL_SHA_RE = re.compile(r"[0-9a-f]{40}")
 
 
@@ -612,13 +616,14 @@ def _gh_failure(res: GhResult) -> str:
     return f"{kind}: {_one_line(res.text.partition(': ')[2], 160)}" if res.failure == "exit" else kind
 
 
-def _checks_job_lines(jobs: List[dict], annotations) -> List[str]:
+def _checks_job_lines(jobs: List[dict], annotations, counts_only: bool) -> List[str]:
     """Detail lines of one run: job counts, then its failed, unfinished and cancelled jobs."""
     if not jobs:
         return ["    jobs: 0 — GitHub lists no job for this run"]
     lines = [f"    jobs: {len(jobs)} — {_state_counts(jobs)}"]
-    loud = sorted((job for job in jobs if _check_state(job) not in _CHECKS_QUIET),
-                  key=lambda job: (_check_state(job) == "cancelled", job.get("status") != "completed"))
+    loud = [] if counts_only else sorted(
+        (job for job in jobs if _check_state(job) not in _CHECKS_QUIET),
+        key=lambda job: (_check_state(job) == "cancelled", job.get("status") != "completed"))
     for job in loud[:_CHECKS_JOB_LINES]:
         state = _check_state(job)
         lines.append(f"    - job {_one_line(job.get('name'))} [{job.get('databaseId')}]: {state} {job.get('url') or ''}".rstrip())
@@ -634,27 +639,40 @@ def _checks_job_lines(jobs: List[dict], annotations) -> List[str]:
     return lines
 
 
-def _other_check_lines(others: Optional[List[dict]], number: int, rollup_size: int) -> List[str]:
-    """Checks GitHub Actions does not own: third-party check runs and commit statuses of a pull request."""
-    if others is None:
-        return ["Other checks: not read — " + (
-            "the pull request check rollup is unavailable." if number else
-            "a commit SHA target reads GitHub Actions workflow runs only; "
-            "third-party checks and commit statuses are read for a pull request number.")]
-    if not others:
-        return [f"Other checks: none — every entry of the pull request rollup ({rollup_size}) is a job of a GitHub Actions workflow."]
-    lines = [f"Other checks, outside GitHub Actions ({len(others)}) — {_state_counts(others)}:"]
-    for check in others[:_CHECKS_OTHER_LINES]:
-        kind = "commit status" if check.get("__typename") == "StatusContext" else "check run"
-        lines.append(f"- {kind} {_one_line(check.get('context') or check.get('name'), 80)}: {_check_state(check)} "
+def _rollup_lines(title: str, checks: List[dict]) -> List[str]:
+    """A bounded list of pull request rollup entries under their state counts; nothing for an empty list."""
+    lines = [f"{title} ({len(checks)}) — {_state_counts(checks)}:"] if checks else []
+    for check in checks[:_CHECKS_OTHER_LINES]:
+        kind = "commit status" if check.get("__typename") == "StatusContext" else "job" if check.get("workflowName") else "check run"
+        name = check.get("context") or " / ".join(filter(None, (check.get("workflowName"), check.get("name"))))
+        lines.append(f"- {kind} {_one_line(name, 80)}: {_check_state(check)} "
                      f"{_one_line(check.get('targetUrl') or check.get('detailsUrl'), 200)}".rstrip())
-    if len(others) > _CHECKS_OTHER_LINES:
-        lines.append(f"- {len(others) - _CHECKS_OTHER_LINES} more other checks: {_state_counts(others[_CHECKS_OTHER_LINES:])}")
+    if len(checks) > _CHECKS_OTHER_LINES:
+        lines.append(f"- {len(checks) - _CHECKS_OTHER_LINES} more of these: {_state_counts(checks[_CHECKS_OTHER_LINES:])}")
     return lines
 
 
-def _render_checks(lines: List[str], runs: List[dict], details: dict, slug: str, tail: List[str]) -> str:
-    """Header, then one spine line per run with its id, then other checks; these always appear.
+def _rollup_report(checks: object, runs: List[dict]) -> tuple:
+    """Header facts and closing lists of a pull request's check rollup: its Actions jobs and the other checks."""
+    rollup = [check for check in checks or [] if isinstance(check, dict)]
+    actions = [check for check in rollup if check.get("__typename") == "CheckRun" and check.get("workflowName")]
+    others = [check for check in rollup if not (check.get("__typename") == "CheckRun" and check.get("workflowName"))]
+    listed = {str(run.get("databaseId")) for run in runs if _check_state(run) != "success"}
+    # A job in a failure or unfinished state that no run listed as not success holds is shown by itself.
+    stray = [job for job in actions if _check_state(job) not in _CHECKS_QUIET
+             and "".join(_GH_RUN_ID_RE.findall(str(job.get("detailsUrl") or ""))[:1]) not in listed]
+    where = "in a run absent from the run list or listed as success"
+    facts = [f"Pull request rollup, GitHub Actions jobs: {len(actions)} — {_state_counts(actions) or 'no entry'}"
+             + (f"; {len(stray)} of them {where}" if stray else "")]
+    if others:
+        facts.append(f"Other checks, outside GitHub Actions: {len(others)} — {_state_counts(others)}")
+    return facts, _rollup_lines(f"GitHub Actions jobs of the rollup {where}", stray) + (
+        _rollup_lines("Other checks, outside GitHub Actions", others) or
+        [f"Other checks: none — every entry of the pull request rollup ({len(rollup)}) is a job of a GitHub Actions workflow."])
+
+
+def _render_checks(lines: List[str], runs: List[dict], details: dict, log_hint: dict, tail: List[str]) -> str:
+    """Header, then one spine line per run with its id, then the rollup lists; these always appear.
 
     The detail lines of expanded runs are admitted while the result bound has room."""
     blocks: List[tuple] = []
@@ -665,16 +683,15 @@ def _render_checks(lines: List[str], runs: List[dict], details: dict, slug: str,
             continue
         blocks.append((f"\n{title} ({len(group)}):", []))
         for run in group[:spare]:
+            detail = details.get(run.get("databaseId"), [])
             spine = (f"- {_one_line(run.get('workflowName'), 80)} ({run.get('event')}) run {run.get('databaseId')} "
                      f"attempt {run.get('attempt')}: {_check_state(run)} {run.get('url') or ''}").rstrip()
-            if run.get("status") == "completed" and _check_state(run) not in (*_CHECKS_QUIET, "cancelled"):
-                spine += (f"\n    log of the failed steps: gh run view {run.get('databaseId')} --log-failed"
-                          + (f" --repo {slug}" if slug else ""))
-            if group is not done and run.get("databaseId") not in details:
+            spine += log_hint.get(run.get("databaseId"), "")
+            if detail is None:
                 spine += f"\n    jobs: not read (one call expands {_CHECKS_EXPANDED_RUNS} runs)"
-            blocks.append((spine, details.get(run.get("databaseId"), [])))
+            blocks.append((spine, detail or []))
         if len(group) > spare:
-            blocks.append((f"- {len(group) - spare} more runs, ids: "
+            blocks.append((f"- {len(group) - spare} more runs — {_state_counts(group[spare:])}; ids: "
                            + ", ".join(str(run.get("databaseId")) for run in group[spare:]), []))
         spare = max(0, spare - len(group))
     cut = "    {} more detail lines of this run are not shown: the result bound is reached"
@@ -695,17 +712,15 @@ def _get_checks(ctx: ToolContext, number: int = 0, sha: str = "", wait_seconds: 
     """Report what GitHub records about one commit's checks: facts and unavailable sources, never a verdict."""
     number, sha = int(number or 0), str(sha or "").strip().lower()
     if number < 0 or (number > 0) == bool(sha):
-        return _refuse(ctx, "⚠️ TOOL_ARG_ERROR: pass exactly one target: number (a pull request) or sha (a full 40-hex commit SHA).")
+        return _refuse(ctx, "⚠️ TOOL_ARG_ERROR: pass exactly one target: number (a pull request) or sha "
+                            "(a full 40-hex commit SHA).", no_effect=True)
     if sha and not _FULL_SHA_RE.fullmatch(sha):
         return _refuse(ctx, "⚠️ TOOL_ARG_ERROR: sha must be a full 40-hex commit SHA; pass a pull request number, "
-                            "or resolve a branch or tag with `git rev-parse <ref>` first.")
+                            "or resolve a branch or tag with `git rev-parse <ref>` first.", no_effect=True)
     started = time.monotonic()
     wait = max(0, min(int(wait_seconds or 0), _CHECKS_WAIT_CAP_SEC))
     deadline = started + wait + _CHECKS_READ_BUDGET_SEC  # The one bound of every request and every sleep.
-    unavailable: List[str] = []
-    job_failures: List[str] = []
-    annotation_failures: List[str] = []
-    annotation_reads: List[str] = []
+    unavailable, job_failures, annotation_failures, annotation_reads = [], [], [], []  # Lists of str.
 
     def call(args: List[str], bound: bool = True) -> GhResult:
         left = int(deadline - time.monotonic())
@@ -752,19 +767,19 @@ def _get_checks(ctx: ToolContext, number: int = 0, sha: str = "", wait_seconds: 
             return _refuse(ctx, f"⚠️ TOOL_ERROR: GitHub returned no head commit for pull request #{number}.", "TOOL_ERROR")
     while True:  # Completion is judged on the runs of the fixed SHA, not on the jobs listed so far.
         res = call(["run", "list", "--commit", sha, "--limit", str(_CHECKS_RUN_LIMIT), "--json",
-                    "databaseId,workflowName,event,status,conclusion,attempt,url,headSha,createdAt"])
+                    "databaseId,workflowName,event,status,conclusion,attempt,url,headSha"])
         if not res.ok:
             return res.text
-        runs = _gh_json(res, list)
-        if runs is None:
+        rows = _gh_json(res, list)
+        if rows is None:
             return _refuse(ctx, f"⚠️ TOOL_ERROR: failed to parse workflow runs JSON: {res.text[:500]}", "TOOL_ERROR")
-        runs = sorted((run for run in runs if isinstance(run, dict) and str(run.get("headSha") or sha).lower() == sha),
-                      key=lambda run: (_check_state(run) == "success", _check_state(run) in _CHECKS_QUIET))
+        runs = sorted((run for run in rows if isinstance(run, dict) and str(run.get("headSha") or sha).lower() == sha),
+                      key=lambda run: _CHECKS_RANK.get(_check_state(run), len(_CHECKS_RANK) + (_check_state(run) == "success")))
         left = started + wait - time.monotonic()
         if left <= 0 or (runs and all(run.get("status") == "completed" for run in runs)):
             break
         time.sleep(min(_CHECKS_POLL_SEC, left))
-    waited = int(time.monotonic() - started)
+    waited = min(int(time.monotonic() - started), wait)  # The time of the last request is not waiting.
     head_note = "head as read by this call"
     if number and wait:
         res = read_pr(rollup=True)
@@ -781,42 +796,56 @@ def _get_checks(ctx: ToolContext, number: int = 0, sha: str = "", wait_seconds: 
             if "statusCheckRollup" in latest:
                 unavailable.append("pull request check rollup (GitHub's rollup describes the moved head)")
 
-    open_runs = [run for run in runs if _check_state(run) != "success"]
-    details: dict = {}
-    for run in open_runs[:_CHECKS_EXPANDED_RUNS]:
+    where = _GH_REPO_URL_RE.match(str((runs[0].get("url") if runs else "") or pr.get("url") or ""))
+    repository = "/".join(where.groups()) if where else (repo or "resolved by the GitHub CLI from the Project directory")
+    slug = ("/".join(where.groups()[1:]) if where.group(1) == "github.com" else repository) if where else repo
+    # Without the rollup's job counts a run GitHub calls success is read for its own job counts.
+    wanted = [run for run in runs if _check_state(run) != "success" or "statusCheckRollup" not in pr]
+    details: dict = {run.get("databaseId"): None for run in wanted[_CHECKS_EXPANDED_RUNS:]}  # None: jobs not read.
+    log_failed = {run.get("databaseId") for run in runs
+                  if run.get("status") == "completed" and _check_state(run) not in (*_CHECKS_QUIET, "cancelled")}
+    for run in wanted[:_CHECKS_EXPANDED_RUNS]:
         res = call(["run", "view", str(run.get("databaseId")), "--json", "jobs"])
         data = _gh_json(res, dict)
         if data is None:
             job_failures.append(_gh_failure(res))
             details[run.get("databaseId")] = [f"    jobs: unavailable ({job_failures[-1]})"]
-        else:
-            details[run.get("databaseId")] = _checks_job_lines(
-                [job for job in data.get("jobs") or [] if isinstance(job, dict)], annotations)
+            continue
+        jobs = [job for job in data.get("jobs") or [] if isinstance(job, dict)]
+        details[run.get("databaseId")] = _checks_job_lines(jobs, annotations, _check_state(run) == "success")
+        if run.get("status") == "completed" and any(_check_state(job) in ("failure", "timed_out") for job in jobs):
+            log_failed.add(run.get("databaseId"))  # A cancelled run can hold a failed job and its log.
     if job_failures:
         unavailable.append(f"jobs (runs: {len(job_failures)}; {job_failures[0]})")
     if annotation_failures:
         unavailable.append(f"annotations (jobs: {len(annotation_failures)}; {annotation_failures[0]})")
-    read = ["workflow runs", f"jobs (runs: {min(len(open_runs), _CHECKS_EXPANDED_RUNS) - len(job_failures)})",
+    over = len(wanted) - _CHECKS_EXPANDED_RUNS
+    read = ["workflow runs", f"jobs (runs: {min(len(wanted), _CHECKS_EXPANDED_RUNS) - len(job_failures)}" + (
+                f"; jobs not read for {over} runs: one call reads the jobs of {_CHECKS_EXPANDED_RUNS} runs" if over > 0 else "") + ")",
             f"annotations (jobs: {len(annotation_reads) - len(annotation_failures)})"]
-    others = None
-    if "statusCheckRollup" in pr:
-        read.append("pull request check rollup")
-        rollup = [check for check in pr["statusCheckRollup"] or [] if isinstance(check, dict)]
-        others = [check for check in rollup if not (check.get("__typename") == "CheckRun" and check.get("workflowName"))]
-
-    where = _GH_REPO_URL_RE.match(str((runs[0].get("url") if runs else "") or pr.get("url") or ""))
-    repository = "/".join(where.groups()) if where else (repo or "resolved by the GitHub CLI from the Project directory")
-    slug = ("/".join(where.groups()[1:]) if where.group(1) == "github.com" else repository) if where else repo
     lines = [f"GitHub checks for commit {sha}", f"Repository: {repository}"]
     if number:
         lines.append(f"Pull request: #{number} {pr.get('url') or ''}{' (head in a fork)' if pr.get('isCrossRepository') else ''}; {head_note}")
+    facts = [f"Workflow runs: {len(runs)} — {_state_counts(runs)}" if runs else
+             "Workflow runs: 0 — no workflow run is registered for this commit — this is not a test result"]
+    if not runs and not number:
+        facts.append("A commit SHA the repository does not hold and a commit with no run yet read the same" + (
+            "." if repo else "; the repository is the one the GitHub CLI resolves from the Project directory "
+                             "(pass repo='[HOST/]OWNER/REPO' to name it)."))
+    if len(rows) >= _CHECKS_RUN_LIMIT:
+        facts.append(f"The run list is read up to {_CHECKS_RUN_LIMIT} runs; GitHub may hold more for this commit.")
+    tail = ["Other checks: not read — " + (
+        "the pull request check rollup is unavailable." if number else
+        "a commit SHA target reads GitHub Actions workflow runs only; "
+        "third-party checks and commit statuses are read for a pull request number.")]
+    if "statusCheckRollup" in pr:
+        read.append("pull request check rollup")
+        rollup_facts, tail = _rollup_report(pr["statusCheckRollup"], runs)
+        facts += rollup_facts
     lines += [f"Observed: {utc_now_iso()}" + (f"; waited {waited}s of {wait}s for the runs to complete" if wait else ""),
-              "Sources read: " + "; ".join(read), "Sources unavailable: " + ("; ".join(unavailable) or "none"),
-              f"Workflow runs: {len(runs)} — {_state_counts(runs)}" if runs else
-              "Workflow runs: 0 — no workflow run is registered for this commit — this is not a test result"]
-    if len(runs) >= _CHECKS_RUN_LIMIT:
-        lines.append(f"The run list is read up to {_CHECKS_RUN_LIMIT} runs; GitHub may hold more for this commit.")
-    return _render_checks(lines, runs, details, slug, _other_check_lines(others, number, len(pr.get("statusCheckRollup") or [])))
+              "Sources read: " + "; ".join(read), "Sources unavailable: " + ("; ".join(unavailable) or "none"), *facts]
+    hint = "\n    log of the failed steps: gh run view {} --log-failed" + (f" --repo {slug}" if slug else "")
+    return _render_checks(lines, runs, details, {run_id: hint.format(run_id) for run_id in log_failed}, tail)
 
 def get_tools() -> List[ToolEntry]:
     tools = [
@@ -852,11 +881,11 @@ def get_tools() -> List[ToolEntry]:
         ToolEntry("get_github_checks", {
             "name": "get_github_checks",
             "description": (
-                "Read what GitHub records about the checks of one commit: every workflow run with its state, "
-                "the failed and unfinished jobs and steps, failure annotations (test names when the workflow "
-                "publishes them) and, for a pull request, third-party checks and commit statuses. Read-only: "
-                "pushes and dispatches nothing. Reports facts and names each source it could not read; it gives "
-                "no verdict, and a workflow that did not start has no record to report."
+                "Read what GitHub records about the checks of one commit: every workflow run with its state, the state "
+                "counts of its jobs (for a pull request, of the rollup's jobs), the failed and unfinished jobs and steps, "
+                "failure annotations (test names when the workflow publishes them) and, for a pull request, third-party "
+                "checks and commit statuses. Read-only: pushes and dispatches nothing. Reports facts and names each source "
+                "it could not read; it gives no verdict, and a workflow that did not start has no record to report."
             ),
             "parameters": {"type": "object", "properties": {
                 "number": {"type": "integer", "default": 0,
@@ -865,7 +894,8 @@ def get_tools() -> List[ToolEntry]:
                         "description": "Full 40-hex commit SHA (resolve a branch or tag with `git rev-parse <ref>`)."},
                 "wait_seconds": {"type": "integer", "default": 0,
                                  "description": "Poll until a workflow run is registered and every registered run is completed, "
-                                                "or this many seconds pass (max 240); the report states what is unfinished."},
+                                                "or this many seconds pass (max 240); the report states what is unfinished. "
+                                                "A run-list read that fails, also during the wait, ends the call with that error."},
             }, "required": []},
         }, _get_checks),
 
