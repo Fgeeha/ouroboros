@@ -7,6 +7,7 @@ import test from 'node:test';
 import { readFileSync } from 'node:fs';
 
 import { continueNonce, continueOfferView, continueTaskAction, syncContinueAction } from '../modules/task_continue.js';
+import { taskReasonDetail, taskReasonPhrase } from '../modules/log_events.js';
 import { ElementStub, installDom, restoreDom } from './chat_dom_fixture.js';
 
 function memoryStorage() {
@@ -110,11 +111,78 @@ function settledRootCard(taskId, { isSubagent = false } = {}) {
         }
         return null;
     };
-    root.querySelector = (selector) => (selector === '[data-continue-task]' ? deep(root, 'continueTask') : null);
+    root.querySelector = (selector) => {
+        const key = { '[data-continue-task]': 'continueTask', '[data-continue-refusal]': 'continueRefusal' }[selector];
+        return key ? deep(root, key) : null;
+    };
     return { root, groupId: taskId, isSubagent };
 }
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+test('a canonical hard-bound refusal remains one readable fact beside the existing actions', async () => {
+    const { prior } = installDom();
+    try {
+        const card = settledRootCard('expired-root');
+        const detail = { status: 'failed', reason_code: 'provider_unavailable',
+            continuation_offer: { eligible: false, refusal: 'hard_limit_reached', cause: 'deadline' } };
+        const terminalReason = taskReasonDetail(detail);
+        assert.match(terminalReason, /provider/);
+        assert.deepEqual(continueOfferView(detail), { kind: 'refusal', cause: 'deadline' });
+        syncContinueAction(card, detail);
+        const note = card.root.querySelector('[data-continue-refusal]');
+        assert.ok(note, 'an API-only reason and a hidden button are insufficient');
+        assert.equal(note.textContent, `Continue unavailable. ${taskReasonPhrase('deadline')}`);
+        assert.equal(note.className, 'ui-status');
+        assert.equal(note.dataset.tone, 'muted', 'the shared primitive normalizes neutral to its muted alias');
+        assert.equal(note.tagName, 'SPAN');
+        assert.equal(note.getAttribute('aria-live'), '');
+        assert.equal(note.onclick, undefined);
+        assert.equal(card.root.querySelector('[data-continue-task]'), null);
+        syncContinueAction(card, detail);
+        syncContinueAction(card, { type: 'task_metrics_event' });
+        assert.equal(card.root.querySelector('[data-continue-refusal]'), note);
+        assert.equal(note.parentElement.children.length, 1);
+        assert.equal(taskReasonDetail(detail), terminalReason, 'action availability does not rewrite task outcome');
+
+        syncContinueAction(card, { continuation_offer: { eligible: false,
+            refusal: 'hard_limit_reached', cause: 'budget_exhausted' } });
+        assert.equal(card.root.querySelector('[data-continue-refusal]'), note);
+        assert.equal(note.textContent, `Continue unavailable. ${taskReasonPhrase('budget_exhausted')}`);
+        const reloaded = settledRootCard('expired-root');
+        syncContinueAction(reloaded, detail);
+        assert.equal(reloaded.root.querySelector('[data-continue-refusal]').textContent,
+            `Continue unavailable. ${taskReasonPhrase('deadline')}`);
+
+        for (const offer of [{ eligible: true, cause: 'provider_unavailable' },
+            { eligible: false, state: 'bound', action_nonce: 'bound-nonce-123', successor_task_id: 'next' },
+            { eligible: false, successor_task_id: 'next' }]) {
+            syncContinueAction(card, detail);
+            syncContinueAction(card, { continuation_offer: offer });
+            assert.equal(card.root.querySelector('[data-continue-refusal]'), null);
+            assert.ok(card.root.querySelector('[data-continue-task]'));
+        }
+        assert.equal(card.root.querySelector('[data-continue-task]').textContent, 'Continued');
+    } finally { restoreDom(prior); }
+});
+
+test('missing offers, other refusals and converted Main pointers gain no hard-bound claim', () => {
+    const { prior } = installDom();
+    try {
+        for (const offer of [undefined, null, {}, { eligible: false, refusal: 'stopped_by_owner' },
+            { eligible: false, refusal: 'author_finished' }, { eligible: false, refusal: 'predecessor_live' }]) {
+            const card = settledRootCard('without-hard-bound');
+            syncContinueAction(card, offer === undefined ? {} : { continuation_offer: offer });
+            assert.equal(card.root.querySelector('[data-continue-refusal]'), null);
+            assert.equal(card.root.querySelector('[data-continue-task]'), null);
+        }
+        const converted = settledRootCard('converted-root');
+        converted.root.dataset.projectCreated = '1';
+        syncContinueAction(converted, { continuation_offer: {
+            eligible: false, refusal: 'hard_limit_reached', cause: 'deadline' } });
+        assert.equal(converted.root.children.length, 0, 'Main keeps its Project pointer, without a second action row');
+    } finally { restoreDom(prior); }
+});
 
 test('an event row never erases the offer; a root that ended without an answer reads its detail once', async () => {
     const { prior } = installDom();

@@ -5,6 +5,8 @@ then reloads the browser. It does not emulate Continue acknowledgements.
 """
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+import json
+import os
 from pathlib import Path
 from threading import Thread
 
@@ -148,3 +150,165 @@ def test_failed_admission_reload_retry_and_tree_pause_consumers(tmp_path, monkey
         server.server_close()
         thread.join(5)
     print('BATCH4_REPAIR_UI_EVIDENCE', evidence)
+
+
+CONTINUE_HTML = '''<!doctype html><html class="ouro-ui"><head><meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/ui.css"><link rel="stylesheet" href="/style.css">
+<script src="/purify.min.js"></script><script src="/marked.min.js"></script>
+</head><body><main id="chat-mount" style="height:100vh;width:100%"></main><script type="module">
+import {createChatInstance} from '/modules/chat.js';
+const room=Number(new URLSearchParams(location.search).get('room')||1);
+const handlers=new Map();
+const ws={on(type,fn){const list=handlers.get(type)||[];list.push(fn);handlers.set(type,list);return ()=>{};},
+    isConnected:()=>true,send(){throw Error('No model request belongs to this display test');}};
+const emit=(type,value)=>(handlers.get(type)||[]).forEach(fn=>fn(value));
+const state={activePage:'chat',projectChatIds:new Set([7]),unreadCount:0};
+window.chat=createChatInstance({ws,state,updateUnreadBadge(){},chatId:room,projectId:room===7?'report-project':'',
+    idPrefix:'fixture-chat',asPanel:true,mountEl:document.getElementById('chat-mount'),
+    stateSnapshots:{begin:()=>({generation:1,requestedAt:Date.now()}),gate(){return Promise.resolve(this.begin());},
+        isCurrent:()=>true,apply(){}}});
+window.replay=async()=>{
+    for(const kind of ['budget','expired','ready']){
+        const id=kind+'-'+room;
+        const detail=await (await fetch('/api/tasks/'+id)).json();
+        emit('chat',{task_id:id,chat_id:room,role:'assistant',is_progress:true,
+            text:'Preparing the report',ts:'2026-09-26T11:59:59Z'});
+        emit('chat',{...detail,task_id:id,chat_id:room,role:'system',system_type:'task_summary',
+            task_terminal_status:detail.status,text:'Report preparation ended.',ts:'2026-09-26T12:00:00Z'});
+    }
+};
+await window.replay();window.fixtureReady=true;
+</script></body></html>'''
+
+
+@pytest.mark.parametrize('engine', ['chromium', 'webkit'])
+@pytest.mark.parametrize('width', [1200, 390])
+def test_hard_bound_continue_reason_on_real_collapsed_chat_cards(tmp_path, monkeypatch, engine, width):
+    """Real host offers + Chat's settled-card consumer, with no model or server runtime."""
+    from playwright.sync_api import sync_playwright, expect
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+    from starlette.testclient import TestClient
+    from ouroboros.gateway.tasks import api_task_get
+    from ouroboros.gateway.task_continue import api_task_continue
+    from ouroboros.gateway.history import make_chat_history_endpoint
+    from ouroboros.task_results import load_task_result, write_task_result
+    from ouroboros.utils import append_jsonl
+
+    q, _, workers = _install_queue(tmp_path, monkeypatch)
+    monkeypatch.setattr('ouroboros.llm.LLMClient.chat', lambda *_a, **_k: pytest.fail('paid explanation'))
+    for room in (1, 7):
+        for kind, reason in [('budget', 'budget_exhausted'), ('expired', 'provider_unavailable'),
+                             ('ready', 'provider_unavailable')]:
+            tid = f'{kind}-{room}'
+            _interrupted(tmp_path, tid, reason_code=reason)
+            write_task_result(tmp_path, tid, 'failed', chat_id=room,
+                              deadline_at='2000-01-01T00:00:00Z' if kind == 'expired' else '2099-01-01T00:00:00Z')
+            append_jsonl(tmp_path / 'logs' / 'chat.jsonl', {
+                'task_id': tid, 'chat_id': room, 'direction': 'out', 'role': 'system',
+                'system_type': 'task_summary', 'task_terminal_status': 'failed', 'is_progress': True,
+                'text': 'Report preparation ended.', 'ts': '2026-09-26T12:00:00Z'})
+    app = Starlette(routes=[Route('/api/tasks/{task_id}', api_task_get),
+                           Route('/api/chat/history', make_chat_history_endpoint(tmp_path)),
+                           Route('/api/tasks/{task_id}/continue', api_task_continue, methods=['POST'])])
+    app.state.drive_root, app.state.repo_dir = tmp_path, WEB.parent
+    client = TestClient(app)
+    requests = []
+
+    def respond(route):
+        request = route.request
+        path = request.url.split('/api/', 1)[1]
+        if path.startswith(('tasks/', 'chat/history')):
+            if request.method == 'POST':
+                requests.append((path, request.post_data_json))
+                response = client.post('/api/' + path, json=request.post_data_json)
+            else:
+                response = client.get('/api/' + path)
+            route.fulfill(status=response.status_code, content_type='application/json', body=response.content)
+        else:
+            route.fulfill(content_type='application/json', body=json.dumps({
+                'messages': [], 'entries': [], 'active_chat_activities': [],
+                'active_chat_activities_complete': True, 'supervisor_ready': True}))
+
+    class Handler(SimpleHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+
+        def do_GET(self):
+            if self.path.startswith('/fixture'):
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(CONTINUE_HTML.encode('utf-8'))
+            else:
+                super().do_GET()
+
+    server = ThreadingHTTPServer(('127.0.0.1', 0), partial(Handler, directory=str(WEB)))
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    evidence = Path(os.environ.get('OUROBOROS_UI_EVIDENCE_DIR', str(tmp_path / 'screenshots')))
+    evidence.mkdir(parents=True, exist_ok=True)
+    try:
+        with sync_playwright() as pw:
+            browser = getattr(pw, engine).launch(headless=True)
+            try:
+                page = browser.new_page(viewport={'width': width, 'height': 900}, has_touch=width < 980)
+                errors = []
+                page.on('pageerror', lambda error: errors.append(str(error)))
+                page.route('**/api/**', respond)
+                for room in (1, 7):
+                    page.goto(f'http://127.0.0.1:{server.server_port}/fixture?room={room}')
+                    page.wait_for_function('window.fixtureReady === true')
+                    cards = {kind: page.locator(f'.chat-live-card[data-task-id="{kind}-{room}"]')
+                             for kind in ('budget', 'expired', 'ready')}
+                    for card in cards.values():
+                        expect(card).to_have_count(1)
+                        if card.get_attribute('data-expanded') == '1':
+                            card.locator('[data-live-summary-button]').click()
+                    page.screenshot(path=str(evidence / f'continue-{engine}-{width}-room{room}.png'))
+                    for kind in ('budget', 'expired'):
+                        cards[kind].screenshot(path=str(evidence / f'continue-{engine}-{width}-room{room}-{kind}.png'))
+                    before_posts = len(requests)
+                    for kind, phrase in [('budget', 'budget'), ('expired', 'deadline')]:
+                        card = cards[kind]
+                        reason = card.locator(':scope > .chat-live-actions > [data-continue-refusal]')
+                        expect(reason).to_be_visible()
+                        expect(reason).to_contain_text('Continue unavailable.')
+                        expect(reason).to_contain_text(phrase)
+                        expect(reason).to_have_attribute('data-tone', 'muted')  # shared neutral alias
+                        assert reason.get_attribute('aria-live') is None
+                        assert reason.evaluate('el => el.tagName') == 'SPAN'
+                        expect(card.locator('[data-continue-task]')).to_have_count(0)
+                        expect(card.locator('[data-live-phase]')).to_have_text('Failed')
+                        assert card.evaluate('el => el.scrollWidth <= el.clientWidth + 1')
+                    expect(cards['expired'].locator('[data-live-activity]')).to_contain_text('provider')
+                    page.evaluate('window.savedRefusal=document.querySelector("[data-continue-refusal]")')
+                    page.evaluate('window.replay()')
+                    assert page.evaluate('window.savedRefusal===document.querySelector("[data-continue-refusal]")')
+                    expect(cards['budget'].locator('[data-continue-refusal]')).to_have_count(1)
+                    assert len(requests) == before_posts
+                    page.reload()
+                    page.wait_for_function('window.fixtureReady === true')
+                    expect(cards['budget'].locator('[data-continue-refusal]')).to_be_visible()
+                    expect(cards['expired'].locator('[data-continue-refusal]')).to_contain_text('deadline')
+                    assert len(requests) == before_posts
+                    # A stale explicit press still refuses under the same hard rail.
+                    denied = client.post(f'/api/tasks/budget-{room}/continue', json={'action_nonce': 'stale-press-123'})
+                    assert denied.status_code == 409 and denied.json()['reason_code'] == 'hard_limit_reached'
+                    assert not load_task_result(tmp_path, f'budget-{room}').get('continued_by')
+                    cards['ready'].get_by_role('button', name='Continue', exact=True).click()
+                    expect(cards['ready'].locator('[data-continue-task]')).to_have_text('Continued')
+                    assert len(requests) == before_posts + 1
+                    successor = load_task_result(tmp_path, f'ready-{room}')['continued_by']['successor_task_id']
+                    assert sum(task['id'] == successor for task in workers.PENDING) == 1
+                    page.screenshot(path=str(evidence / f'continue-{engine}-{width}-room{room}-continued.png'))
+                assert not errors
+            finally:
+                browser.close()
+    finally:
+        client.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(5)
+        assert not thread.is_alive()
+    print('BATCH4_CONTINUE_DISCLOSURE_UI_EVIDENCE', evidence)

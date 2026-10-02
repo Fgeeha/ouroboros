@@ -9,9 +9,10 @@
 // a second Continue — new work goes through the conversation).
 
 import { continueTask, fetchTaskDetail } from './api_client.js';
-import { ensureLiveActionsEl } from './chat_activity.js';
-import { taskDoneIsTerminal } from './log_events.js';
+import { ensureLiveActionsEl, ownLiveActionsEl } from './chat_activity.js';
+import { taskDoneIsTerminal, taskReasonPhrase } from './log_events.js';
 import { showToast } from './toast.js';
+import { setInlineStatus } from './ui_primitives.js';
 
 const NONCE_KEY = 'ouro_continue_nonce:';
 const inFlight = new Set();
@@ -34,13 +35,16 @@ export function continueNonce(taskId, storage, retainedNonce = '') {
     return nonce;
 }
 
-/** @returns {{kind: 'offer'|'retry'|'successor'|'none', successorId?: string, cause?: string, actionNonce?: string}} */
+/** @returns {{kind: 'offer'|'retry'|'successor'|'refusal'|'none', successorId?: string, cause?: string, actionNonce?: string}} */
 export function continueOfferView(detail) {
     const offer = detail?.continuation_offer;
     if (!offer || typeof offer !== 'object') return { kind: 'none' };
     if (offer.state === 'bound') return offer.action_nonce
         ? { kind: 'retry', actionNonce: String(offer.action_nonce) } : { kind: 'none' };
     if (offer.successor_task_id) return { kind: 'successor', successorId: String(offer.successor_task_id) };
+    if (offer.eligible === false && offer.refusal === 'hard_limit_reached') {
+        return { kind: 'refusal', cause: String(offer.cause || offer.refusal) };
+    }
     return offer.eligible ? { kind: 'offer', cause: String(offer.cause || '') } : { kind: 'none' };
 }
 
@@ -118,12 +122,26 @@ export function syncContinueAction(record, detail, { read = fetchTaskDetail } = 
         return false;
     }
     const view = continueOfferView(detail);
-    const actions = view.kind === 'none' ? null : ensureLiveActionsEl(record);
-    const existing = record?.root?.querySelector?.('[data-continue-task]');
-    if (!actions) {
+    const actions = view.kind === 'none' ? ownLiveActionsEl(record) : ensureLiveActionsEl(record);
+    const existing = actions?.querySelector('[data-continue-task]');
+    const refusal = actions?.querySelector('[data-continue-refusal]');
+    if (!actions || view.kind === 'none') {
         existing?.remove();
+        refusal?.remove();
         return false;
     }
+    if (view.kind === 'refusal') {
+        existing?.remove();
+        const note = refusal || document.createElement('span');
+        if (!refusal) {
+            note.className = 'ui-status';
+            note.dataset.continueRefusal = String(record.groupId || '');
+            actions.appendChild(note);
+        }
+        setInlineStatus(note, `Continue unavailable. ${taskReasonPhrase(view.cause)}`, 'neutral');
+        return !refusal;
+    }
+    refusal?.remove();
     const button = existing || document.createElement('button');
     if (!existing) {
         button.type = 'button';
