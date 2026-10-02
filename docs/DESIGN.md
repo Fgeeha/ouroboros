@@ -274,14 +274,18 @@ Status, owner action, and urgent notification are separate product concepts:
   task as a proxy.
 
 Activity schedule rows use the same factual status rule: `active`, `disabled`,
-`suppressed`, and `consumed once · history` describe lifecycle state, while the
-adjacent Disable/Enable, Restore, and Delete controls state the owner action. A
-consumed one-shot is history even when its task succeeded or failed; the status
-never implies a result. Retained rows — consumed and suppressed — collapse into
-one disclosure rather than padding the standing list or disappearing: history
-the owner can still open, read and act on. A suppressed skill row keeps Restore
-so the owner can ask for it back; a consumed one keeps only Delete, because
-offering Enable on a schedule that cannot fire again would be a lie.
+`suppressed`, `consumed once · history` and `deletion pending` describe lifecycle
+state, while the adjacent Disable/Enable, Restore, and Delete controls state the
+owner action. A consumed one-shot is history even when its task succeeded or
+failed; the status never implies a result. Retained rows — consumed and
+suppressed — collapse into one disclosure rather than padding the standing list
+or disappearing: history the owner can still open, read and act on. A suppressed
+skill row keeps Restore so the owner can ask for it back; a consumed one keeps
+only Delete, because offering Enable on a schedule that cannot fire again would
+be a lie. A deleted row still finishing work it already accepted stays in the
+standing list and says what it waits for. Where generic Restore can cancel the
+pending deletion, the button says Cancel deletion, not Enable. An exact hold
+release stays separate and preserves the deletion intent.
 
 A record of what the owner did earlier is history, not status. A skill's
 OuroborosHub submission (the version it sent and its PR link) lives in the

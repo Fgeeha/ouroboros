@@ -53,7 +53,8 @@ log = logging.getLogger(__name__)
 
 # Host-owned row fields: never authored by a payload, never copied into a task.
 OCCURRENCE_FIELDS = ("occurrence", "hold", "continuation_of", "delete_requested_at")
-_FINGERPRINT_FIELDS = ("task", "trigger", "timezone", "cron", "name", "description", "enabled", "manual_override")
+_FINGERPRINT_FIELDS = ("task", "trigger", "timezone", "cron", "name", "description", "enabled", "manual_override",
+                       "followup_origin", "followup_relation")
 _SETTLED = "settled"
 
 
@@ -140,7 +141,9 @@ def reconcile(record: Dict[str, Any]) -> tuple[str, Optional[Dict[str, Any]]]:
         set_hold(record, "occurrence_result_unreadable", f"{type(exc).__name__}: {exc}")
         return "hold", None
     admission = result.get("schedule_admission") if isinstance(result.get("schedule_admission"), dict) else {}
-    ours = bool(admission) and str(admission.get("token") or "") == token
+    ours = (bool(admission) and str(admission.get("token") or "") == token
+            and admission.get("schedule_id") == record.get("id")
+            and (admission.get("task") or {}).get("id") == task_id)
     if result and not ours:
         set_hold(record, "occurrence_task_conflict", f"task {task_id} result belongs to another admission")
         return "hold", None
@@ -158,8 +161,9 @@ def reconcile(record: Dict[str, Any]) -> tuple[str, Optional[Dict[str, Any]]]:
                                ("claimed_at", occ.get("claimed_at"))):
                 if not timing.get(key) and value:
                     timing[key] = value
-        if "_owner_hold" in result:
-            task["_owner_hold"] = copy.deepcopy(result["_owner_hold"])
+        for key in ("_owner_hold", "_consciousness_continuation"):
+            if key in result:
+                task[key] = copy.deepcopy(result[key])
         return "republish", task
     if _unstarted_claim(occ, result):
         if (not record.get("enabled", True) or
@@ -204,11 +208,107 @@ def owed(record: Dict[str, Any], *, drive_root: Optional[pathlib.Path] = None) -
                     and isinstance(admission.get("task"), dict)) else None
 
 
+def work_settled(record: Dict[str, Any], *, drive_root: Optional[pathlib.Path] = None) -> bool:
+    """Occurrence settlement is not task settlement: keep its control row until both.
+
+    A receipt-less claim positively never started, and a row that never admitted
+    anything owes nothing: neither needs the queue, so a worker without a fresh
+    snapshot deletes it at once. Otherwise the admitted task must be absent from
+    the queue and settled; a collected result of a task no occurrence still
+    names is settled history. Unreadable or unknown evidence keeps the row.
+    """
+    from supervisor.queue_schedules import _schedule_running_or_queued
+    from ouroboros.task_status import SETTLED_STATUSES
+
+    root = drive_root if drive_root is not None else _queue().DRIVE_ROOT
+    occ = record.get("occurrence") if isinstance(record.get("occurrence"), dict) else {}
+    tid = str(occ.get("task_id") or record.get("last_task_id") or "")
+    try:
+        if occ and _unstarted_claim(occ, _read_back(str(occ.get("task_id") or ""), drive_root=root)):
+            # Only an earlier occurrence's task can be unsettled.
+            occ, tid = {}, str(record.get("last_task_id") or "")
+            if not tid:
+                return True
+        elif not occ and not tid and not record.get("completed_at"):
+            return True
+        if _schedule_running_or_queued(str(record.get("id") or ""), root, task_id=tid) is not False:
+            return False
+        if not tid:
+            return not occ
+        result = _read_back(tid, drive_root=root)
+        return (not occ) if not result else result.get("status") in SETTLED_STATUSES
+    except Exception:
+        return False
+
+
+def deletion_settled(record: Dict[str, Any], *, drive_root: Optional[pathlib.Path] = None) -> bool:
+    """Whether a deferred delete/GC may drop the row: nothing retained still needs it.
+
+    An independent schedule's row has no role once its accepted run starts. A
+    continuation (related, or an unrecorded published relationship) is the
+    task's Stop/Restart release and ``scheduled_start`` binding until it settles.
+    """
+    from supervisor.followup_policy import relation_kind
+
+    return relation_kind(record) == "independent" or work_settled(record, drive_root=drive_root)
+
+
+def repair_followup_binding(record: Dict[str, Any]) -> bool:
+    """Supervisor-only convergence of a resolved, already fired, unrun occurrence.
+
+    The canonical frozen receipt is written/read back before the live row and
+    snapshot. A partial publication stays non-dispatchable at bound_task; another
+    tick completes the SAME identity. No missing/possible receipt buys a rebind.
+    The caller holds queue/table and origin control locks.
+    """
+    from supervisor.followup_policy import bind_task, relation_kind
+
+    q = _queue()
+    tid = str((record.get("occurrence") or {}).get("task_id") or record.get("last_task_id") or "")
+    if not tid or relation_kind(record) == "unknown":
+        return False
+    try:
+        stored = _read_back(tid)
+        receipt = stored.get("schedule_admission") or {}
+        frozen = receipt.get("task") or {}
+        token = receipt.get("token")
+        occ = record.get("occurrence") or {}
+        live = next((t for t in q.PENDING if str(t.get("id") or "") == tid), None)
+        if (not token or receipt.get("schedule_id") != record.get("id")
+                or frozen.get("id") != tid or stored.get("status") != "scheduled"
+                or receipt.get("dispatch") != "none" or occ.get("dispatch") == "possible"
+                or (occ and (occ.get("task_id") != tid or occ.get("token") != token))
+                or tid in q.RUNNING):
+            return False
+        if live is not None and (live.get("admitted_dispatch") != "none" or
+                (live.get("metadata") or {}).get("schedule_occurrence") !=
+                (frozen.get("metadata") or {}).get("schedule_occurrence")):
+            return False
+        rebound = copy.deepcopy(frozen)
+        bind_task(q.DRIVE_ROOT, rebound, record)
+        if rebound != frozen or any((stored.get(key) or {}) != (rebound.get(key) or {}) for key in ("metadata", "deadline_at", "task_contract")):
+            item = {"task": rebound, "occurrence": {"token": token, "task_id": tid,
+                    "due_at": receipt.get("due_at")}, "schedule_id": record["id"]}
+            if not _write_receipt(item, record):
+                return False
+        if live is not None:
+            before = copy.deepcopy(live)
+            bind_task(q.DRIVE_ROOT, live, record)
+            if live != before and q.persist_queue_snapshot(reason="followup_binding_repaired") is not True:
+                live.clear()
+                live.update(before)
+                return False
+        return True
+    except Exception:
+        log.warning("Fired follow-up %s retains its binding hold", tid, exc_info=True)
+        return False
+
+
 def discard_claim(record: Dict[str, Any], data: Dict[str, Any]) -> bool:
     """Drop unaccepted work and finish any earlier deferred delete atomically."""
     record.pop("occurrence", None)
     record.pop("hold", None)
-    if record.get("delete_requested_at"):
+    if record.get("delete_requested_at") and deletion_settled(record):
         data["tasks"] = [row for row in data.get("tasks") or [] if row is not record]
         return True
     return False
@@ -262,7 +362,10 @@ def prepare(claimed: Dict[str, Any]) -> Dict[str, Any]:
     from supervisor.queue_schedules import _task_from_schedule
 
     record, occ = claimed["record"], claimed["occurrence"]
-    task = _task_from_schedule(record, task_id=str(occ["task_id"]))
+    try:
+        task = _task_from_schedule(record, task_id=str(occ["task_id"]))
+    except (ValueError, TypeError) as exc:
+        return {**claimed, "task": {}, "hold": ("followup_binding_unavailable", str(exc))}
     if task.get("chat_id") is None:
         return {**claimed, "task": task, "hold": ("owner_chat_unknown", "the owner destination is not currently known")}
     task["metadata"]["schedule_occurrence"] = {
@@ -295,7 +398,8 @@ def _origin_intent(template: Dict[str, Any], record: Dict[str, Any]) -> Optional
     A Main chat address alone says nothing about its selected resource."""
     from ouroboros.task_results import load_task_result
 
-    origin = str((template.get("metadata") or {}).get("origin_task_id") or record.get("origin_task_id") or "")
+    origin = str((record.get("followup_origin") or {}).get("task_id") or
+                 (template.get("metadata") or {}).get("origin_task_id") or record.get("origin_task_id") or "")
     if not origin:
         return None
     try:
@@ -438,25 +542,30 @@ def admit(prepared: List[Dict[str, Any]]) -> None:
             if item.get("hold"):
                 set_hold(record, *item["hold"])
                 continue
-            current.pop("admission", None)  # retire the legacy refusal witness
-            outcome = q.enqueue_task(item["task"], consciousness_window=windows.get(item["schedule_id"]),
-                                     project_admission=item.get("project_admission"),
-                                     continuation=bool(record.get("continuation_of") or
-                                                       (item.get("stored_task") or {}).get("_consciousness_continuation")))
-            block = str(outcome.get("_admission_blocked") or "") if isinstance(outcome, dict) else ""
-            if block:
-                _refused(record, block, outcome, data)
-                continue
-            item["task"] = outcome  # preserve host-stamped continuation and admission facts
-            if not _write_receipt(item, record):
-                _unqueue([str(occ["task_id"])])
-                set_hold(record, "receipt_failed", "the admission receipt could not be written and verified")
-                continue
-            if current.get("phase") == "claimed":
-                _advance(record, current)
-            current["phase"] = "admitted"
-            record["occurrence"] = current
-            admitted.append(str(occ["task_id"]))
+            from supervisor.followup_policy import control_guard, refresh_policy
+            with control_guard(q.DRIVE_ROOT, record):
+                policy = refresh_policy(q.DRIVE_ROOT, data, record)
+                if policy.get("hold") or policy["wait"] or record.get("followup_hold"):
+                    continue
+                current.pop("admission", None)  # retire the legacy refusal witness
+                outcome = q.enqueue_task(item["task"], consciousness_window=windows.get(item["schedule_id"]),
+                                         project_admission=item.get("project_admission"),
+                                         continuation=bool(record.get("continuation_of") or
+                                                           (item.get("stored_task") or {}).get("_consciousness_continuation")))
+                block = str(outcome.get("_admission_blocked") or "") if isinstance(outcome, dict) else ""
+                if block:
+                    _refused(record, block, outcome, data)
+                    continue
+                item["task"] = outcome  # preserve host-stamped continuation and admission facts
+                if not _write_receipt(item, record):
+                    _unqueue([str(occ["task_id"])])
+                    set_hold(record, "receipt_failed", "the admission receipt could not be written and verified")
+                    continue
+                if current.get("phase") == "claimed":
+                    _advance(record, current)
+                current["phase"] = "admitted"
+                record["occurrence"] = current
+                admitted.append(str(occ["task_id"]))
         if not changed:
             return
         try:
@@ -489,7 +598,7 @@ def _refused(record: Dict[str, Any], block: str, outcome: Dict[str, Any], data: 
 
 def _write_receipt(item: Dict[str, Any], record: Dict[str, Any]) -> bool:
     """The accepted occurrence's durable receipt, carrying its frozen task and the
-    task's own room address (never the hidden chat 0).
+    task's own room address (including an explicitly selected hidden chat 0).
 
     Monotonic: it lands only over absence or over this token's own still-undispatched
     ``scheduled`` receipt — never over a row that says ``dispatch=possible``, a later
@@ -510,9 +619,9 @@ def _write_receipt(item: Dict[str, Any], record: Dict[str, Any]) -> bool:
         if (str(current.get("status") or "") != STATUS_SCHEDULED or prior.get("token") != occ["token"]
                 or prior.get("dispatch") != "none"):
             return None
-        if "_owner_hold" in current:
-            task["_owner_hold"] = copy.deepcopy(current["_owner_hold"])
-            incoming["schedule_admission"]["task"]["_owner_hold"] = copy.deepcopy(current["_owner_hold"])
+        for key in ("_owner_hold", "_consciousness_continuation"):
+            if key in current:
+                task[key] = copy.deepcopy(current[key])
         return incoming
 
     try:
@@ -528,7 +637,10 @@ def _write_receipt(item: Dict[str, Any], record: Dict[str, Any]) -> bool:
             task_contract=task.get("task_contract") if isinstance(task.get("task_contract"), dict) else {},
             result="Scheduled task queued.", metadata=dict(task.get("metadata") or {}),
             schedule_id=item["schedule_id"], schedule_name=str(record.get("name") or ""),
-            schedule_admission=receipt)
+            schedule_admission=receipt,
+            **({"billing_group": task["metadata"]["billing_group"]}
+               if (task.get("metadata") or {}).get("billing_group") else {}),
+            **{key: task[key] for key in ("_owner_hold", "_consciousness_continuation") if key in task})
         if written is False:
             return False
         stored = _read_back(str(task["id"]))
@@ -537,7 +649,7 @@ def _write_receipt(item: Dict[str, Any], record: Dict[str, Any]) -> bool:
         return False
     got = stored.get("schedule_admission") if isinstance(stored.get("schedule_admission"), dict) else {}
     return (str(stored.get("status") or "") == STATUS_SCHEDULED
-            and got.get("token") == occ["token"] and got.get("dispatch") == "none")
+            and got == receipt)
 
 
 def _read_back(task_id: str, *, drive_root: Optional[pathlib.Path] = None) -> Dict[str, Any]:
@@ -583,6 +695,8 @@ def record_dispatch_possible(task: Dict[str, Any]) -> bool:
             task["_owner_hold"] = copy.deepcopy(current["_owner_hold"])
             return None
         if (str(admission.get("token") or "") != token
+                or not isinstance(admission.get("task"), dict)
+                or admission["task"].get("id") != task.get("id")
                 or str(admission.get("schedule_id") or "") != schedule_id
                 or str(current.get("status") or "") not in {STATUS_SCHEDULED, STATUS_RUNNING, STATUS_INTERRUPTED}):
             return None
@@ -605,11 +719,6 @@ def record_dispatch_possible(task: Dict[str, Any]) -> bool:
     if not (got.get("token") == token and got.get("dispatch_mark") == mark
             and str(stored.get("status") or "") == STATUS_RUNNING):
         return False
-    if redispatch:
-        # Existing custody admitted this same task again. Its previous possible
-        # dispatch is independent of row retirement or a successor's token.
-        occ["dispatch"] = "possible"
-        return True
     from supervisor.queue_schedules import _write_scheduled_tasks, load_schedule_store, schedule_transaction
 
     try:
@@ -619,7 +728,11 @@ def record_dispatch_possible(task: Dict[str, Any]) -> bool:
             if row is not None:
                 current = row.get("occurrence") or {}
                 if current.get("token") != token:
-                    return False
+                    # Custody may resume an old task after its occurrence retired,
+                    # without editing a successor. A first handoff needs its row.
+                    if redispatch:
+                        occ["dispatch"] = "possible"
+                    return redispatch
                 current["dispatch"] = "possible"
                 if _write_scheduled_tasks(data) is False:
                     return False
@@ -643,14 +756,24 @@ def restore_allowed(task: Dict[str, Any]) -> bool:
     owns a started run, and the scheduler's reconcile holds an unprovable one."""
     occ = (task.get("metadata") or {}).get("schedule_occurrence") if isinstance(task.get("metadata"), dict) else None
     if not isinstance(occ, dict):
-        return True
-    if occ.get("dispatch") == "possible":
-        return False
+        return not (task.get("metadata") or {}).get("schedule_id")
     from ouroboros.task_results import load_task_result
 
     try:
         existing = load_task_result(_queue().DRIVE_ROOT, str(task.get("id") or ""), strict=True) or {}
     except Exception:
+        return False
+    admission = existing.get("schedule_admission") if isinstance(existing.get("schedule_admission"), dict) else {}
+    if (not occ.get("token") or admission.get("token") != occ.get("token")
+            or admission.get("schedule_id") != occ.get("schedule_id")):
+        return False
+    frozen = admission.get("task")
+    if not isinstance(frozen, dict) or frozen.get("id") != task.get("id"):
+        return False
+    for key in ("_owner_hold", "_consciousness_continuation"):
+        if key in existing or key in frozen:
+            task[key] = copy.deepcopy(existing.get(key, frozen.get(key)))
+    if occ.get("dispatch") == "possible":
         return False
     try:
         from supervisor.queue_schedules import load_schedule_store
@@ -661,10 +784,5 @@ def restore_allowed(task: Dict[str, Any]) -> bool:
             return False
     except Exception:
         return False
-    admission = existing.get("schedule_admission") if isinstance(existing.get("schedule_admission"), dict) else {}
-    frozen = admission.get("task") or {}
-    for key in ("_owner_hold", "_consciousness_continuation"):
-        if key in existing or key in frozen:
-            task[key] = copy.deepcopy(existing.get(key, frozen.get(key)))
     return (str(existing.get("status") or "") == "scheduled" and admission.get("dispatch") == "none"
             and str(admission.get("token") or "") == str(occ.get("token") or ""))

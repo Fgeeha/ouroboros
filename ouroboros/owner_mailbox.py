@@ -55,6 +55,11 @@ KIND_HURRY = "hurry"
 # chosen option label (plus an optional owner comment) — delivered inside a
 # structural frame, never as forged free-form owner dialogue.
 KIND_QUIZ_ANSWER = "quiz_answer"
+# The owner's Pause of a whole tree (``owner_pause.py``): a WAKE signal, never
+# dialogue and never the authority — the root's durable fence decides. It wakes
+# a warm owner wait so the member reaches its safe boundary without buying a
+# model round; a member whose fence is already open again ignores it.
+KIND_OWNER_PAUSE = "owner_pause"
 # A model-call waiter consumes this control itself, not the conversation loop.
 # The default drain withholds it so it cannot become forged owner dialogue.
 KIND_MODEL_WAIT = "model_wait"

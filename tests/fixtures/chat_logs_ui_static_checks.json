@@ -1083,7 +1083,7 @@
     "id": "test_cancel_run_confirm_and_cascade",
     "path": "web/modules/task_control_menu.js",
     "kind": "contains",
-    "value": "cancelTask(id, { cascade: true, stopPolicy: stopPolicyFor(action) })"
+    "value": "cancelTask(id, { cascade: true, stopPolicy: stopPolicyFor(action),\n            stopActionId: pendingStopActions.get(key) })"
   },
   {
     "id": "test_inflight_keyed_final_scoped_conclusion",

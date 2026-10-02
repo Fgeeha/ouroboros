@@ -1,10 +1,6 @@
-"""Caller-owned Claudexor model transport over physical-attempt accounting.
-One engine operation rejoins after lost control; bytes enter private CAS before ACK. The live ``ModelTurnState`` belongs to
-the caller, never stored assistant history: only a dispatched, durable result
-updates it, while unknown/no-start/legacy silence preserves it. Requests priced
-ahead of dispatch read the SAME slot; leaving this route clears it. The schema
-floor and native-continuation repair: ARCHITECTURE §6 "The live turn slot".
-No provider wait changes the task's deadline or Stop.
+"""Caller-owned physical accounting; one engine operation rejoins lost control, private CAS precedes ACK.
+Only durable dispatched results update the caller's live turn slot; unknown/no-start/legacy outcomes preserve it.
+Pre-dispatch pricing reads that slot; route changes clear it. Deadlines/Stop stay unchanged (ARCHITECTURE §6).
 """
 
 from __future__ import annotations
@@ -25,10 +21,10 @@ from ouroboros._usage_response import provider_cost_value
 from ouroboros.anthropic_native_custody import scrub_native_custody
 from ouroboros.claudexor_daemon import ensure_owned_gateway, owned_engine_version, read_owned_gateway
 from ouroboros.deadline_utils import llm_transport_timeout_sec
-from ouroboros.gateways.claudexor import (
-    ClaudexorUnavailable, engine_at_least, model_failure_evidence_supported,
-    operation_query_supported, _READ_TIMEOUT_SEC)
-from ouroboros.llm_attempt import _attempt_request, _candidate_before_dispatch
+from ouroboros.effort_evidence import model_effort_usage
+from ouroboros.gateways.claudexor import (ClaudexorUnavailable, engine_at_least, model_failure_evidence_supported,
+                                          operation_query_supported, _READ_TIMEOUT_SEC)
+from ouroboros.llm_attempt import _attempt_request, _candidate_before_dispatch, effort_request_facts
 from ouroboros.send_clock import stamp_clock_note
 from ouroboros.llm_substitution import (
     AccountRotation, SubstitutionBudget, substitution_fact, failed_account_preference,
@@ -36,6 +32,7 @@ from ouroboros.llm_substitution import (
 from ouroboros.model_slots import MODEL_ACCOUNTS_KEY, model_role_option
 from ouroboros.model_wait import ModelWaitInterrupted, current_model_wait, prepared_call_scope
 from ouroboros.observability import persist_call
+from ouroboros.owner_pause import launch_admission, OwnerPauseRefused, model_handed_off
 from ouroboros.transport_custody import ProviderNotDispatched
 from ouroboros.usage_accounting import (
     PhysicalAttemptPreparationFailed, current_physical_attempt_context, current_usage_scope,
@@ -175,8 +172,6 @@ def propagate_model_error(error: Exception) -> None:
 
 def _usage(result: dict, effort: dict | None = None) -> tuple[dict, float | None, bool]:
     """Normalize explicit model usage; never run the generic body-error/free branch."""
-    from ouroboros.effort_evidence import model_effort_usage
-
     counters = result.get("usage") or {}
     cost_evidence = result.get("cost") or {}
     cash = provider_cost_value(cost_evidence.get("cashUsd"))
@@ -394,12 +389,21 @@ class _ModelInvocation:
         self.io_lock = threading.Lock()
         self.outage_episode = None
 
-    def check_control(self):
+    def check_control(self, *, starting=False):
         """The caller supplies deadline/cancel policy; this seam transports it."""
         reason = self.interrupt_reason or (self.poll_control() if self.poll_control else None)
         if not reason:
             waiter = current_model_wait()
             reason = waiter.control_reason() if waiter is not None else None
+        if not reason and starting:
+            try:
+                if model_handed_off(self.invocation_id):
+                    self.create_attempted = True
+                else:
+                    with launch_admission(current_usage_scope()):
+                        self.create_attempted = True
+            except OwnerPauseRefused as exc:
+                reason = str(exc)  # prior create_attempted remains unknown, never unsent
         if not reason:
             return
         cancellation = "not_requested"
@@ -480,8 +484,8 @@ class _ModelInvocation:
             self.check_control()
             try:
                 if not self.operation_id:
-                    self.create_attempted = True
                     self.observe_operation()
+                    self.check_control(starting=True)
                     detail = self.gateway.create_model_operation(self.request_ref, idempotency_key=self.invocation_id,
                         **({"capture_failure_evidence": True} if self.capture_failure_evidence else {}),
                         **({"capture_effort_evidence": True} if self.capture_effort_evidence else {}))
@@ -618,8 +622,6 @@ class _ModelInvocation:
         return custody
 
     def extract_usage(self, result: dict) -> tuple[dict, float | None, bool]:
-        from ouroboros.llm_attempt import effort_request_facts
-
         usage, cost, final = _usage(result, effort_request_facts(self.target, self.payload))
         # Settlement reads this row before the caller decides anything, and the
         # density witness must know whose tokenizer it measured: a generation
@@ -819,8 +821,7 @@ def chat_claudexor(target: dict, messages: list, tools: list | None, **parameter
                 all_operations_not_started = False  # even a discarded substituted response ran
                 invocation.capture = last_physical_attempt_capture()
                 if substitution.admit(invocation, result):
-                    # The same round, asked again naming no account, on this
-                    # call's every later request: the engine alone picks.
+                    # Every later request in this round leaves account selection to the engine.
                     retry_preparation, parameters = None, {**parameters, "_no_account_preference": True}
                     payload = _request(target, payload["messages"], payload["tools"], {**(prepared or parameters), "_no_account_preference": True})
                     continue
@@ -953,8 +954,7 @@ async def chat_claudexor_async(target: dict, messages: list, tools: list | None,
                 all_operations_not_started = False
                 invocation.capture = last_physical_attempt_capture()
                 if await invocation.offload(substitution.admit, invocation, result):
-                    # The same round, asked again naming no account, on this
-                    # call's every later request: the engine alone picks.
+                    # Every later request in this round leaves account selection to the engine.
                     retry_preparation, parameters = None, {**parameters, "_no_account_preference": True}
                     payload = _request(target, payload["messages"], payload["tools"], {**(prepared or parameters), "_no_account_preference": True})
                     continue

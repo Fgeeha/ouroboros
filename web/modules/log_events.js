@@ -695,7 +695,7 @@ const TERMINAL_TASK_DETAIL_STATUSES = new Set([
 ]);
 // Statuses that make the OUTCOME known, whether or not the card may close yet.
 const OBSERVED_OUTCOME_STATUSES = new Set([...TERMINAL_TASK_DETAIL_STATUSES, 'done', 'cancel_requested']);
-const OPEN_POST_TASK_SYNTHESIS_STATUSES = new Set(['pending_once', 'running']);
+const OPEN_POST_TASK_SYNTHESIS_STATUSES = new Set(['pending_once', 'running', 'paused']);
 
 export function isTerminalTaskDetail(record) {
     const status = String(record?.status || '').toLowerCase();

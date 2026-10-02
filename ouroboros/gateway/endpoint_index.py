@@ -32,6 +32,8 @@ HTTP_ENDPOINTS: tuple[str, ...] = (
     "POST /api/tasks/{task_id}/events",
     "POST /api/tasks/{task_id}/cancel",
     "POST /api/tasks/{task_id}/hurry",
+    "POST /api/tasks/{task_id}/pause",
+    "POST /api/tasks/{task_id}/continue",
     "POST /api/tasks/{task_id}/resume",
     "POST /api/decisions",
     "GET /api/schedules",

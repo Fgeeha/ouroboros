@@ -741,6 +741,7 @@ def test_timed_out_stateful_tool_retires_the_generation_and_closes_on_the_worker
     already-settled race), retires the executor WITHOUT cancelling that queued
     cleanup, and closes handles the worker created even AFTER the detach."""
     from types import SimpleNamespace
+    from contextvars import Context, ContextVar
 
     import ouroboros.loop_tool_execution as lte
     from ouroboros.tools.registry import BrowserState
@@ -804,10 +805,15 @@ def test_timed_out_stateful_tool_retires_the_generation_and_closes_on_the_worker
     monkeypatch.setattr(lte, "load_settings", lambda: {})
     monkeypatch.delenv("OUROBOROS_TOOL_TIMEOUT_SEC", raising=False)
 
-    result = lte._execute_with_timeout(
-        tools, tc, tmp_path, 1, task_id="task",  # the durable start row lands here (#1316)
-        stateful_executor=executor,
-    )
+    marker = ContextVar("stateful-test")
+    token = marker.set("owning-execution")
+    try:
+        result = lte._execute_with_timeout(
+            tools, tc, tmp_path, 1, task_id="task",
+            stateful_executor=executor,
+        )
+    finally:
+        marker.reset(token)
     assert result["is_error"] is True
     # The shared slot holds a FRESH generation; the retired one keeps the
     # handles for its owner thread.
@@ -819,7 +825,10 @@ def test_timed_out_stateful_tool_retires_the_generation_and_closes_on_the_worker
     assert kind == "cleanup" and executor.retired and not executor.reset_called
     # The TOOL submit goes through the generation-bound wrapper (a revert to
     # plain _execute_single_tool would reopen the pre-capture window).
-    assert executor.queued[0][1] is lte._execute_browser_tool_bound
+    _, submitted, submitted_args = executor.queued[0]
+    assert isinstance(submitted.__self__, Context) and submitted.__name__ == "run"
+    assert submitted.__self__.get(marker) == "owning-execution"
+    assert submitted_args[0] is lte._execute_browser_tool_bound
     assert closed == []
     # The hung worker creates one more handle AFTER the detach — it lands in
     # the retired generation and is reaped too.

@@ -79,10 +79,15 @@ ZERO_CASH = (Decimal(0),) * len(CASH_KEYS)
 def monetary_scope_key(row: dict) -> str:
     """Canonical root monetary scope, shared by replay and incremental indexes.
 
-    Absent/None/empty roots keep the existing unattributed key. Additive scope
-    metadata has no monetary authority until its owning contract lands here.
+    Absent/None/empty roots keep the existing unattributed key. Billing groups
+    are a separate derived axis; they never replace the real root identity.
     """
     return str(row.get("root_task_id") or "")
+
+
+def billing_group_key(row: dict) -> str:
+    """Whole-work scope, including pre-group rows of the original root."""
+    return str(row.get("billing_group_id") or monetary_scope_key(row))
 
 
 def cash_contribution(row: dict) -> tuple[Decimal, ...]:

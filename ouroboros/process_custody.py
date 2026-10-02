@@ -180,7 +180,10 @@ def spawn_supervised(
         merged = dict(subprocess_new_group_kwargs())
         merged.update(popen_kwargs)
         popen_kwargs = merged
-    proc = subprocess.Popen(cmd, **popen_kwargs)  # noqa: S603 — callers pass vetted argv lists
+    from ouroboros.owner_pause import operation_start
+
+    with operation_start():
+        proc = subprocess.Popen(cmd, **popen_kwargs)  # noqa: S603 — callers pass vetted argv lists
     try:
         if on_spawn is not None:
             on_spawn(proc)

@@ -833,6 +833,7 @@ class LocalModelManager:
                 task_id="system:capability_probe",
                 root_task_id="system:capability_probe",
                 category="capability_probe",
+                non_task_operation=True,
                 source="capability_probe.local_model",
             )):
                 return _send()

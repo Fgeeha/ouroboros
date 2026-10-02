@@ -101,6 +101,9 @@ class ToolContext:
     # Budget tracking for usage events.
     event_queue: Optional[Any] = None
     task_id: Optional[str] = None
+    # The agent binds lifecycle authority; standalone tool invocations only
+    # carry attribution. Missing managed authority must never become standalone.
+    task_lifecycle_bound: bool = False
 
     # Conversation messages for safety checks.
     messages: Optional[List[Dict[str, Any]]] = None

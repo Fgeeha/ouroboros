@@ -355,6 +355,11 @@ CURRENT_PRODUCER_CONTRACTS = {
     # Saved-setting selection uses the existing process access authority; its new
     # foreground refusal remains blocked through both text and native ACCESS_BLOCKED.
     "PROCESS_ENV_REFERENCE_BLOCKED": (True, "blocked"),
+    # Owner Batch4: a call the owner's Pause fenced before its launch handoff never
+    # ran; it is the substrate's answer, homed with the other runtime refusals.
+    "OWNER_PAUSE_NOT_STARTED": (True, "blocked"),
+    "OWNER_LAUNCH_AUTHORITY_UNAVAILABLE": (True, "unavailable"),
+    "STOP_ACTION_CONFLICT": (True, "blocked"),
     "SAFETY_ADVICE": (False, "ok"),
     "LIGHT_MODE_REPO_CHANGED": (False, "ok"),
     "BROWSER_ACTION_OUTCOME_UNKNOWN": (True, "error"),
@@ -397,6 +402,10 @@ CURRENT_PRODUCER_CONTRACTS = {
     "SCOPE_UNCONFIRMED": (True, "tool_reported_failure"),
     "TOOL_ERROR": (True, "error"),
     "native:TOOL_REPORTED_FAILURE:TOOL_ERROR": (True, "tool_reported_failure"),
+    # extension_dispatch's async runner that ended without a result is the first
+    # EXTENSION_ERROR producer with a literal first line, so the harvest now sees
+    # the pair. Its code answers as the shape:extension_handler_error row does (A.17).
+    "native:EXTENSION_ERROR:TOOL_ERROR": (True, "extension_error"),
     # Release admission split its one PREFLIGHT_BLOCKED text in two: a source it
     # could not read is unavailable evidence, not a candidate defect. The new
     # identifier reaches its text through the `code` variable, so it is declared

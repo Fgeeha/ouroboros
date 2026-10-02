@@ -13,7 +13,7 @@ from ouroboros.config import (
 )
 from ouroboros.deadline_utils import owner_deadline_exhausted, transport_timeout_with_deadline
 from ouroboros.tools.registry import ToolContext, ToolEntry
-from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
+from ouroboros.tools.tool_result import ToolResult, _publish_tool_result, completed_local_read
 from ouroboros.model_wait import current_model_wait, model_waitable
 from ouroboros.utils import emit_cognitive_operation_event
 from ouroboros.observability import new_call_id
@@ -685,6 +685,7 @@ def attach_local_image_to_context(ctx: ToolContext, path: str) -> Tuple[bool, st
     )
 
 
+@completed_local_read
 def _view_image(ctx: ToolContext, path: str = "") -> str:
     """Bring a LOCAL image file into the active model's context NATIVELY.
 

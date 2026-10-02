@@ -608,6 +608,11 @@ def test_stall_end_carries_samples_top_frames_and_the_last_stack(monkeypatch, jo
     runtime_only = [f"{sys.prefix}/lib/python3/threading.py:1 in wait".replace("\\", "/")]
     assert server_liveness._innermost_repo_frame(runtime_only) == ""  # a stall entirely inside the runtime names nothing
     assert server_liveness._innermost_repo_frame(["/srv/app/x.py:3 in f", *runtime_only]) == "/srv/app/x.py:f"
+    from types import SimpleNamespace
+    # A relocatable interpreter reports its prefix through ``bin/..`` yet loads the normalized path.
+    monkeypatch.setattr(server_liveness, "sys", SimpleNamespace(prefix="/opt/py/bin/..", base_prefix="/opt/py/bin/.."))
+    for row in ("/opt/py/lib/python3.10/threading.py:324 in wait", "/opt/py/bin/../lib/python3.10/threading.py:1 in f"):
+        assert server_liveness._innermost_repo_frame([row]) == "", row
 
 
 def test_stack_rows_parse_windows_drives_and_colons_inside_paths():

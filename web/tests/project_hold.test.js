@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { computeHydratedDirectActivities, chatStatusCounts, computeDerivedChatStatus } from '../modules/chat_activity.js';
 import { summarizeProjectActivities } from '../modules/project_activity.js';
 import { handoffPhase } from '../modules/project_handoff.js';
-import { desiredLiveCardPhase, setHistoricalUnavailable, setLiveCardPhase, setLiveCardTypingVisible } from '../modules/task_phase_chip.js';
+import { desiredLiveCardPhase, setHistoricalUnavailable, setLiveCardPhase, setLiveCardTypingVisible, syncParkedPhase } from '../modules/task_phase_chip.js';
 import { readFileSync } from 'node:fs';
 
 const hold = { label: 'Waiting for Project verification', reason: 'project_routing_fence_lookup_failed', detail: 'Authority is unreadable.' };
@@ -29,6 +29,27 @@ test('held task is stationary across hydrated Chat, Project and Main receipt', (
     assert.equal(handoffPhase(held, null, false).text, 'Activity unconfirmed');
 });
 
+for (const [phase, text, kind, showDots] of [
+    ['budget_pausing', 'Pausing…', 'thinking', true],
+    ['budget_paused', 'Paused', 'online', false],
+    ['unknown', 'Activity unconfirmed', 'online', false],
+    ['queued', hold.label, 'online', false],
+]) {
+    test(`Project hold preserves the ${phase} Chat header`, () => {
+        const row = { ...held, phase };
+        const activities = computeHydratedDirectActivities(new Map(), [row], 7);
+        const card = { root: { isConnected: true }, groupId: 'same-id', finished: false,
+            parkedPhase: phase === 'queued' ? '' : phase, projectHold: hold.label };
+        assert.deepEqual(computeDerivedChatStatus(chatStatusCounts(activities, [card])),
+            { kind, text, showDots });
+        const resumed = computeHydratedDirectActivities(activities,
+            [{ ...row, phase: 'working', project_admission_hold: undefined }], 7);
+        card.parkedPhase = '';
+        card.projectHold = '';
+        assert.equal(computeDerivedChatStatus(chatStatusCounts(resumed, [card])).text, 'Working...');
+    });
+}
+
 test('same-ID recovery clears the hold; independent work and budget remain truthful', () => {
     const activities = computeHydratedDirectActivities(new Map(), [held], 7);
     const recovered = computeHydratedDirectActivities(activities, [{ ...held, phase: 'working', project_admission_hold: undefined }], 7);
@@ -38,7 +59,8 @@ test('same-ID recovery clears the hold; independent work and budget remain truth
     assert.equal(summarizeProjectActivities([held, sibling]).motion, true);
     assert.match(summarizeProjectActivities([held, sibling]).label, /Waiting for Project/);
     const paused = computeHydratedDirectActivities(new Map(), [{ ...held, phase: 'budget_paused' }], 7);
-    assert.equal(computeDerivedChatStatus(chatStatusCounts(paused, [])).text, 'Paused (budget)');
+    // Batch4: one census phase covers budget pause, owner Pause and Restart hold, so no cause is claimed.
+    assert.equal(computeDerivedChatStatus(chatStatusCounts(paused, [])).text, 'Paused');
 });
 
 test('Main handoff keeps a budget pause beside the Project wait, as the sidebar does', () => {
@@ -76,6 +98,58 @@ test('a held card with retained progress waits statically; Stop, terminal and sa
     assert.match(chat, /function restoreCardActivity\(record, held = \{\}\) \{\r?\n\s+if \(!setHistoricalUnavailable\(record, false, held\)\)/);
 });
 
+
+for (const [parkedPhase, phase, label] of [
+    ['budget_paused', 'paused', 'Paused'], ['unknown', 'unknown', 'Activity unconfirmed'],
+]) {
+    for (const releaseFirst of ['Project', 'parked']) {
+        test(`Project hold and ${parkedPhase} recover independently (${releaseFirst} first)`, () => {
+            const attrs = new Map();
+            const card = { finished: false, root: { dataset: {} },
+                phaseEl: { hidden: false, dataset: {}, textContent: '', className: '',
+                    getAttribute: key => attrs.get(key), setAttribute: (key, value) => attrs.set(key, value) },
+                inlineTypingEl: { style: { display: '' }, isConnected: true } };
+            setLiveCardPhase(card, 'working', 'Working', 'chat-live-phase working');
+            assert.equal(card.inlineTypingEl.style.display, '');
+            syncParkedPhase(card, parkedPhase);
+            setHistoricalUnavailable(card, false, hold);
+            assert.equal(card.parkedPhase, parkedPhase);
+            assert.equal(card.projectHold, hold.label);
+            assert.equal(card.projectHoldDetail, hold.detail);
+            assert.equal(card.phaseEl.dataset.phase, phase);
+            assert.ok(card.phaseEl.textContent.includes(label), 'the parked fact remains visible');
+            setLiveCardTypingVisible(card, true);
+            assert.equal(card.inlineTypingEl.style.display, 'none');
+
+            if (releaseFirst === 'Project') {
+                setHistoricalUnavailable(card, false, {});
+                assert.equal(card.projectHold, '');
+                assert.equal(card.projectHoldDetail, '');
+                assert.equal(card.parkedPhase, parkedPhase, 'Project recovery cannot release another hold');
+                assert.equal(card.phaseEl.dataset.phase, phase);
+                assert.equal(card.phaseEl.textContent, label);
+                setLiveCardTypingVisible(card, true);
+                assert.equal(card.inlineTypingEl.style.display, 'none', 'the remaining parked phase stays still');
+                syncParkedPhase(card, 'working');
+            } else {
+                syncParkedPhase(card, 'working');
+                assert.equal(card.parkedPhase, '');
+                assert.equal(card.projectHold, hold.label, 'a positive task phase cannot clear the Project hold');
+                assert.equal(card.phaseEl.textContent, hold.label);
+                assert.equal(card.phaseEl.className, 'chat-live-phase warn');
+                setLiveCardTypingVisible(card, true);
+                assert.equal(card.inlineTypingEl.style.display, 'none', 'the remaining Project hold stays still');
+                setHistoricalUnavailable(card, false, {});
+            }
+            assert.equal(card.parkedPhase, '');
+            assert.equal(card.projectHold, '');
+            assert.equal(card.phaseEl.dataset.phase, 'working');
+            assert.equal(card.phaseEl.textContent, 'Working');
+            assert.equal(card.phaseEl.className, 'chat-live-phase working');
+            assert.equal(card.inlineTypingEl.style.display, '', 'clearing both causes restores real activity');
+        });
+    }
+}
 
 test('nested wait keeps the host cause as text and clears it only on a recovery fact', () => {
     const card = { isSubagent: true };

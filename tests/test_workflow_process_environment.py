@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 import sys
 
 import pytest
@@ -262,27 +263,38 @@ def test_unknown_wrapper_provenance_never_invents_a_python_path(process_context)
     assert '"selected_path": null' in result.text
 
 
-def test_docker_target_env_uses_only_inert_host_aliases(monkeypatch, tmp_path):
+@pytest.mark.parametrize("receipt", ["completed", ""])
+def test_docker_target_env_uses_only_inert_host_aliases(monkeypatch, tmp_path, receipt):
     from types import SimpleNamespace
     from ouroboros import workspace_executor as executor
 
     seen = {}
+    probes = []
     class Process:
         pid, returncode = 123, 0
         def __init__(self, command, **kwargs):
             seen.update(command=command, kwargs=kwargs)
         def communicate(self, **kwargs):
             return "done", ""
+    def probe(command, **kwargs):
+        assert command[:3] == ["docker", "exec", "isolated-fixture"]
+        assert command[-1].endswith('= completed ] && printf completed')
+        assert kwargs["timeout"] == 5 and "env" not in kwargs
+        probes.append(command)
+        return subprocess.CompletedProcess(command, 0, receipt, "")
     monkeypatch.setattr(executor.subprocess, "Popen", Process)
+    monkeypatch.setattr(executor.subprocess, "run", probe)
     monkeypatch.setattr(executor, "_register_process", lambda *a: None)
     monkeypatch.setattr(executor, "_forget_process", lambda *a: None)
     ref = SimpleNamespace(network="default", container_name="isolated-fixture", kind="docker_exec", executor_id="fixture")
     target = {"DOCKER_HOST": "target-only", "PATH": "/target/bin", "TOKEN": "fake-$('literal')\nsecret"}
     result = executor._execute_docker(ref, ["python3", "-c", "print('done')"], "/workspace", 5, drive_root=tmp_path, target_env=target)
     assert result.returncode == 0
+    assert result.operation_outcome == ("completed" if receipt == "completed" else "unknown")
+    assert len(probes) == 1
     host_env = seen["kwargs"]["env"]
     assert host_env.get("DOCKER_HOST") == os.environ.get("DOCKER_HOST")
     assert host_env["PATH"] == os.environ["PATH"]
-    assert all(value not in " ".join(seen["command"]) for value in target.values())
+    assert all(value not in " ".join(command) for command in [seen["command"], *probes] for value in target.values())
     aliases = [seen["command"][i + 1] for i, value in enumerate(seen["command"]) if value == "--env"]
     assert len(aliases) == 3 and {host_env[key] for key in aliases} == set(target.values())

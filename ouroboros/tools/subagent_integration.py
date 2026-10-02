@@ -26,6 +26,7 @@ import zipfile
 from typing import Any, Dict, List, Tuple, Union
 
 from ouroboros.tools.registry import ToolContext, ToolEntry
+from ouroboros.tools.tool_result import completed_local_read
 from ouroboros.artifacts import task_artifact_dir_path
 from ouroboros.task_results import load_task_result
 from ouroboros.workspace_file_outputs import file_output_changes, prepare_file_outputs, verify_file_outputs
@@ -984,6 +985,7 @@ def _integrate_subagent_patch(
 _COMPARE_PATCH_PREVIEW_CHARS = 12000
 
 
+@completed_local_read
 def _compare_subagent_patches(ctx: ToolContext, task_ids: Any = None) -> str:
     """Read-only best-of-N helper: show several children's returned patches side by
     side so the parent can synthesize LLM-first. Applies/commits nothing."""

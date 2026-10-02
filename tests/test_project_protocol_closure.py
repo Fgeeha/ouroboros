@@ -180,7 +180,9 @@ def test_schedule_followup_keeps_known_membership_after_room_loss(room, tmp_path
     folder = tmp_path / "frozen"
     folder.mkdir()
     intent = {"kind": intent_kind, "project_id": "target", "root": str(folder)}
-    _row(room, intent=intent, metadata={evidence: "origin"})
+    # Followup origins are host-recorded task+root pairs; root evidence names an unbound child.
+    _row(room, intent=intent, metadata={evidence: "origin"} if evidence == "origin_task_id"
+         else {"origin_task_id": "origin-child", "origin_root_task_id": "origin"})
     drop(room.root, "target")
     room.queue.check_scheduled_tasks()
     assert not room.pending

@@ -51,12 +51,13 @@ class ModelWaitInterrupted(RuntimeError):
                     setattr(self, name, getattr(cause, name))
 
 
-def propagate_model_control(error: Exception) -> None:
+def propagate_model_control(error: Exception, *, role: str = "") -> None:
     """One typed host interruption, whether raised by the live wait or transport."""
     if isinstance(error, ModelWaitInterrupted):
         raise error
     if getattr(error, "code", "") == "model_operation_interrupted" and getattr(error, "control_reason", ""):
-        raise ModelWaitInterrupted(error.control_reason, role=getattr(error, "model_role", ""), cause=error) from error
+        raise ModelWaitInterrupted(error.control_reason, role=getattr(error, "model_role", "") or role,
+                                   cause=error) from error
 
 
 def model_wait_reason(error: Exception) -> str:
@@ -163,7 +164,9 @@ def execution_elapsed_seconds(meta: dict, now: float) -> float:
         return 0.0
     if started <= 0 or not math.isfinite(started):
         return 0.0
-    return max(0.0, now - started - quota_waited_seconds(meta, now) - budget_paused_seconds(meta))
+    sleeping = meta.get("sleep_parked_at")  # a pooled model sleep in progress (worker_owner_wait)
+    return max(0.0, now - started - quota_waited_seconds(meta, now) - budget_paused_seconds(meta)
+               - (max(0.0, now - float(sleeping)) if isinstance(sleeping, (int, float)) else 0.0))
 
 
 _CURRENT: contextvars.ContextVar[TaskModelWait | None] = contextvars.ContextVar(
@@ -269,6 +272,8 @@ def mutate_wait(root: Any, task_id: str, wait_id: str, transform: Callable) -> d
 
     def update(current):
         require_writable_task_result_schema(current)
+        if not current.get("status") or current.get("task_id") != task_id:
+            raise ValueError("model wait requires its lifecycle owner's task result")
         waits = current.get("model_waits", {})
         if not isinstance(waits, dict):
             raise ValueError("model_waits projection is malformed")
@@ -303,6 +308,9 @@ class TaskModelWait:
     def __init__(self, *, task: dict, drive_root: Any, event_queue: Any,
                  worker_slot_held: bool, row_mutator: Callable | None = None,
                  rows_reader: Callable | None = None, owner_control: Callable | None = None):
+        from ouroboros.platform_layer import process_start_time
+        import os
+
         self.task = task
         self.drive_root = drive_root
         metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
@@ -316,6 +324,9 @@ class TaskModelWait:
         self.tool_context = None
         self.lock = threading.RLock()
         self.closed = False
+        self.answer_consumer_id = uuid.uuid4().hex
+        self.answer_consumer_bound = False
+        self.answer_owner_birth = process_start_time(os.getpid())  # outside the dispatch/launch locks
         self.overrides: dict[str, dict] = {}
         self.waits: dict[str, dict] = {}
         self.clocks: dict[str, _QuotaClock] = {"": _QuotaClock()}
@@ -329,6 +340,10 @@ class TaskModelWait:
         self.auto_continue: dict[str, bool] = {}
         self.seen_controls: set[str] = set()
         self.mailbox_stamp = None
+        resume = task.get("_budget_pause_resume") or {}
+        sleep_since = resume.get("sleep_exclusion_since")
+        self.sleep_started_monotonic: float | None = (
+            time.monotonic() - max(0.0, time.time() - float(sleep_since)) if sleep_since else None)
         # Public facts every new row of this owner carries (a review operation
         # names its exact controller); the waiting slot is stamped per row.
         self.row_facts: dict[str, dict] = {}
@@ -359,10 +374,13 @@ class TaskModelWait:
                 for key, row in self.waits.items()}}
 
     def executed_seconds(self, *, now: float | None = None) -> float:
-        """Live execution time: elapsed minus the quota union minus budget pause."""
+        """Live execution time: elapsed minus the quota union minus budget pause,
+        minus a model sleep in progress (``model_sleep`` folds it into the paused
+        carrier when the task runs again, so it is never subtracted twice)."""
         stamp = time.monotonic() if now is None else now
-        return max(0.0, stamp - self.started_monotonic
-                   - self.paused_seconds(now=stamp) - self.budget_paused_sec)
+        sleeping = self.sleep_started_monotonic
+        return max(0.0, stamp - self.started_monotonic - self.paused_seconds(now=stamp) - self.budget_paused_sec
+                   - (max(0.0, stamp - sleeping) if sleeping is not None else 0.0))
 
     def execution_window_remaining(self) -> float | None:
         """A custom live owner supplies its own clock and a task without an absolute
@@ -519,6 +537,23 @@ class TaskModelWait:
                 return "finalize_requested"
         return None
 
+    def pre_dispatch_pause(self) -> str | None:
+        """The owner's Pause over this task's tree, for a PRE-dispatch wait only.
+
+        Never part of ``control_reason``: that reader also polls while a sent
+        model operation's result is awaited, and an owner Pause lets sent work
+        finish instead of cancelling it (``owner_pause``).
+        """
+        from types import SimpleNamespace
+
+        from ouroboros.owner_pause import RAIL_OWNER_PAUSE, member_fence
+
+        source = self.tool_context or SimpleNamespace(
+            task_id=self.task_id, root_task_id=str(self.task.get("root_task_id") or self.task_id),
+            budget_drive_root=self.canonical_root)
+        fence = member_fence(source)
+        return str(fence.get("reason") or RAIL_OWNER_PAUSE) if fence else None
+
     def _publish(self, row: dict, *, applied_request_id: str = "") -> None:
         with self.lock:
             self.revision += 1
@@ -655,7 +690,8 @@ class TaskModelWait:
         try:
             self._publish(row)
             while True:
-                control = "caller_cancelled" if caller_cancel is not None and caller_cancel.is_set() else self.control_reason()
+                control = ("caller_cancelled" if caller_cancel is not None and caller_cancel.is_set()
+                           else self.control_reason() or self.pre_dispatch_pause())
                 callback = kwargs.get("model_poll_control")
                 if not control and callback is not None:
                     control = callback()
@@ -714,9 +750,48 @@ class TaskModelWait:
             row.update(state="resolved", resolution=resolution)
             self._publish(row, applied_request_id=request_id)
 
+    def bind_answer_consumer(self) -> dict:
+        """Bind this local receiver before dispatch; birth absence grants no death recovery."""
+        with self.lock:
+            if self.closed:
+                from ouroboros.llm_attempt import _PhysicalSendNotStarted
+                raise _PhysicalSendNotStarted("cancelled")
+            self.answer_consumer_bound = True
+            return {"local_answer_consumer_id": self.answer_consumer_id,
+                    "local_answer_task_attempt": self.attempt,
+                    "local_answer_owner_birth": self.answer_owner_birth}
+
     def close(self) -> None:
         with self.lock:
             self.closed = True
+            if not self.answer_consumer_bound:
+                return
+        # Positive retirement of THIS consumer, not terminal task status, PID
+        # absence or the pool's current assignment. Cash and remote custody stay.
+        try:
+            retire_model_consumers(self.canonical_root, self.task_id, {self.answer_consumer_id: self.attempt})
+        except Exception:
+            import logging
+            logging.getLogger(__name__).warning("Model consumer retirement could not persist for %s", self.task_id,
+                                                exc_info=True)
+
+
+def retire_model_consumers(root: Any, task_id: str, consumers: dict[str, int]) -> None:
+    """Positive receiver retirement, from scope exit or exact confirmed-worker death.
+
+    This existing result projection releases only local answer-writing custody.
+    It changes no usage row, external process or delegated-run obligation.
+    """
+    from ouroboros.task_results import require_writable_task_result_schema, stamp_task_result_schema, task_result_path
+    def retire(current):
+        require_writable_task_result_schema(current)
+        if not current.get("status") or current.get("task_id") != task_id:
+            raise ValueError("model consumer retirement requires its task result")
+        retired = dict(current.get("retired_model_consumers") or {})
+        for consumer, attempt in consumers.items():
+            retired[consumer] = {"task_attempt": attempt, "retired_at": utc_now_iso()}
+        return stamp_task_result_schema({**current, "retired_model_consumers": retired})
+    update_json_locked(task_result_path(pathlib.Path(root), task_id), retire, strict_existing_dict=True)
 
 
 @contextlib.contextmanager

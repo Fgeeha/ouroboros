@@ -417,7 +417,7 @@ def _validate_records(
         _validate_candidate_facts(row, sequence)
         for numeric_field in (
             "cost_usd", "reservation_upper_bound_usd", "reservation_usd",
-            "max_budget_usd", "global_limit_usd", "root_limit_usd",
+            "max_budget_usd", "global_limit_usd", "root_limit_usd", "billing_group_limit_usd",
         ):
             # Nonfinite money is not a torn row. Its distinct error bypasses
             # tail quarantine, including incremental fallback and compaction.

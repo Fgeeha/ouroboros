@@ -11,6 +11,18 @@
       "acceptance_clause": "Accounting access did not recover within this turn’s wait window."
     },
     {
+      "name": "owner Restart has a readable cause without changing its typed identity",
+      "record": {"status": "cancelled", "reason_code": "owner_restart", "cancel_origin": {"source": "owner_restart", "reason": "Owner restart"}},
+      "phase": "cancelled", "headline": "Cancelled",
+      "acceptance_clause": "Stopped by the Restart command."
+    },
+    {
+      "name": "shutdown has its own cause, never invented owner intent",
+      "record": {"status": "cancelled", "reason_code": "server_shutdown", "cancel_origin": {"source": "server_shutdown", "reason": "Server shutdown"}},
+      "phase": "cancelled", "headline": "Cancelled",
+      "acceptance_clause": "Server shutdown."
+    },
+    {
       "name": "unrecovered model handover shows a readable warning",
       "record": {
         "status": "completed", "reason_code": "authoring_handover_incomplete",

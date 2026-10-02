@@ -13,9 +13,7 @@ from starlette.responses import Response
 
 from ouroboros.contracts.chat_id_policy import is_a2a_chat_id
 from ouroboros.gateway._helpers import (
-    _TAIL_WINDOW_START_BYTES,
-    coerce_int,
-    read_rotated_jsonl_entries,
+    _TAIL_WINDOW_START_BYTES, coerce_int, read_rotated_jsonl_entries,
 )
 from ouroboros.gateway.cost_breakdown import make_cost_breakdown_endpoint  # noqa: F401 — historical import path (router)
 from ouroboros.gateway.history_paging import (
@@ -116,12 +114,6 @@ _SKILL_REVIEW_STRING_FIELDS = (
 )
 _SKILL_REVIEW_INT_FIELDS = ("review_round", "snapshot_attempt")
 _SKILL_REVIEW_BOOL_FIELDS = ("snapshot_revised",)
-
-
-def _review_executions(value: Any) -> list[Dict[str, str]]:
-    from ouroboros.review_execution_projection import normalize_review_executions
-
-    return normalize_review_executions(value)
 
 
 def _stored_chat_id(value: Any, default: int = 1) -> int:
@@ -497,6 +489,9 @@ def _annotate_terminal_task_truth(
                     terminal_truth["history_retention"] = retention
                 if result.get("reason_code"):
                     terminal_truth["reason_code"] = str(result.get("reason_code") or "")
+                from ouroboros.owner_continue import continuation_offer
+
+                terminal_truth["continuation_offer"] = continuation_offer(result, task_id)
                 # Persisted cost truth overrides the row fallback via message.update().
                 # ABI-3 conversion resolves legacy pairs deprecated-wins and emits
                 # only honest names.
@@ -863,7 +858,9 @@ def _collect_chat_rows(
                     rec[key] = coerce_int(entry.get(key), 0)
                 for key in _SKILL_REVIEW_BOOL_FIELDS:
                     rec[key] = bool(entry.get(key))
-                rec["executions"] = _review_executions(entry.get("executions"))
+                from ouroboros.review_execution_projection import normalize_review_executions
+
+                rec["executions"] = normalize_review_executions(entry.get("executions"))
             # Delivered document rows carry lightweight media metadata (no
             # base64); surface a msg_type + download_url so the frontend
             # rebuilds the file bubble on reload instead of a bare text line.
@@ -1030,6 +1027,8 @@ def _fold_task_bound_skill_reviews(combined: list[Dict[str, Any]]) -> list[Dict[
     replays Skill history and never claims an authoritative total beyond the
     references present in this Chat window.
     """
+    from ouroboros.review_execution_projection import normalize_review_executions
+
     groups: Dict[tuple[str, str, str], list[tuple[int, Dict[str, Any]]]] = {}
     for index, row in enumerate(combined):
         if row.get("is_progress") or str(row.get("system_type") or "") != "skill_review":
@@ -1074,7 +1073,7 @@ def _fold_task_bound_skill_reviews(combined: list[Dict[str, Any]]) -> list[Dict[
                 # terminal text is therefore the only useful attempt body.
                 "text": str(row.get("text") or ""),
                 "superseded": position < len(surviving_rows) - 1,
-                "executions": _review_executions(row.get("executions")),
+                "executions": normalize_review_executions(row.get("executions")),
                 **_history_identity(row),
             }
             for key in _SKILL_REVIEW_STRING_FIELDS:

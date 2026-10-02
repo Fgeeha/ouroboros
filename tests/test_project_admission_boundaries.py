@@ -111,8 +111,9 @@ def test_failed_head_proof_keeps_custody_without_starving_other_work(host, tmp_p
     head = accepted(host, tmp_path)
     if boundary == "schedule":
         head["metadata"]["schedule_occurrence"] = {"schedule_id": "schedule", "token": "occurrence"}
-        write_task_result(host.root, "held", "scheduled", schedule_admission={
-            "schedule_id": "schedule", "token": "occurrence", "dispatch": "none", "status": "accepted"})
+        write_task_result(host.root, "held", "scheduled", schedule_admission={  # receipts freeze their task
+            "schedule_id": "schedule", "token": "occurrence", "dispatch": "none", "status": "accepted",
+            "task": {"id": "held"}})
     original = copy.deepcopy(head)
     for i in range(worker_count):
         queue.enqueue_task({"id": f"main-{i}", "type": "task", "chat_id": 1, "text": "Independent work"})
@@ -161,7 +162,8 @@ def test_failed_head_proof_keeps_custody_without_starving_other_work(host, tmp_p
         workers.assign_tasks()
     assert [row["id"] for row in sent] == [f"main-{i}" for i in range(worker_count)]
     assert attempts == ["held"]
-    assert host.pending == [head] and head["admitted_dispatch"] == "possible"
+    # A refused claim snapshot sent nothing and keeps the never-sent fact (Batch4).
+    assert host.pending == [head] and head["admitted_dispatch"] == ("none" if boundary == "snapshot" else "possible")
     assert "held" not in queue.RUNNING and not host.attempts
     workers.WORKERS[0].busy_task_id = None
     workers.assign_tasks()

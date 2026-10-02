@@ -162,7 +162,7 @@ def test_cancel_task_writes_durable_intent_and_emits_live(tmp_path):
     assert any(e.get("type") == "cancel_task" and e.get("task_id") == "child42" for e in event_queue.events)
     # Idempotent: a second request reuses the intent instead of re-minting.
     again = _cancel_task(ctx, "child42")
-    assert "idempotent" in again
+    assert "existing cancellation custody retained" in again
     assert active_intent(tmp_path, "child42")["request_id"] == intent["request_id"]
 
 

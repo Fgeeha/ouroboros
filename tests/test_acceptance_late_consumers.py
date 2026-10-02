@@ -400,7 +400,13 @@ def test_explicit_receipt_requires_id_routed_chat_and_exact_bytes(late, tmp_path
 
 @pytest.mark.parametrize('cap', ['unlimited', 'unknown', 'prior_hold', 'prior_spend', 'live_global'])
 def test_original_cap_and_live_money_fences_use_original_wallet(late, tmp_path, monkeypatch, cap):
+    import time
+    from ouroboros import pricing
     from ouroboros.usage_accounting import AttemptRequest, reserve_attempt
+    # The wave fence needs a priced reviewer seat: an unpriced one adds nothing and fits. Pin the
+    # catalog row; a live fetch that times out, or a test's leftover 30 s retry_after, leaves none.
+    monkeypatch.setitem(pricing._cached_pricing, 'openrouter', {'openai/gpt-4.1-nano': (0.1, 0.025, None, 0.4)})
+    monkeypatch.setitem(pricing._pricing_fetched_at, 'openrouter', time.time())
     f = delivered(tmp_path, monkeypatch, retry=True, cap='unlimited' if cap in {'unlimited', 'live_global'} else 'unknown' if cap == 'unknown' else 'finite')
     monkeypatch.setenv('OUROBOROS_PER_TASK_COST_USD', '0.00001')
     if cap == 'prior_hold':

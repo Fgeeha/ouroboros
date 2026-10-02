@@ -133,7 +133,9 @@ def test_run_shell_missing_binary_publishes_duration_only(tmp_path, monkeypatch)
     monkeypatch.setattr("ouroboros.tools.shell.load_settings", lambda: {})
 
     def raise_missing(cmd, **kwargs):
-        raise FileNotFoundError(2, "No such file or directory", cmd[0])
+        error = FileNotFoundError(2, "No such file or directory", cmd[0])
+        error.process_not_started = True  # the Popen producer's exact no-start proof
+        raise error
 
     monkeypatch.setattr("ouroboros.tools.shell._tracked_subprocess_run", raise_missing)
     result = _run_shell(_ctx(tmp_path), ["definitely-not-a-binary"])
