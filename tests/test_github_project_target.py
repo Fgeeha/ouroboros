@@ -241,7 +241,7 @@ def test_cli_store_metadata_enables_only_cli_tools_without_probing(tmp_path, mon
     ctx, _ = _context(tmp_path, "queued")
     for name, _, _ in _CALLS:
         assert _builtin_tool_availability(name, ctx)[0] is True
-    for name in ("run_ci_tests", "submit_skill_to_hub", "generate_evolution_stats"):
+    for name in ("submit_skill_to_hub", "generate_evolution_stats"):
         assert _builtin_tool_availability(name, ctx) == (False, "missing_credential", "GITHUB_TOKEN")
 
 

@@ -268,34 +268,6 @@ def test_ff_pull_fetch_is_bounded_with_repo_cwd_and_keeps_error_shape(tmp_path, 
     assert result.startswith("⚠️ PULL_ERROR: git fetch failed:")
 
 
-def test_ci_push_branch_is_bounded_with_repo_cwd_and_keeps_shape(tmp_path, monkeypatch):
-    from ouroboros.tools import ci
-
-    repo = _seed_repo(tmp_path / "repo")
-    captured = {}
-
-    def fake_bounded(args, *, cwd=None, timeout=None):
-        captured["args"] = list(args)
-        captured["cwd"] = cwd
-        return 0, "pushed", ""
-
-    monkeypatch.setattr(update_source, "_git_network_bounded", fake_bounded)
-    ok, message = ci._push_branch(str(repo), "feature")
-    assert ok is True
-    assert message == "pushed"
-    assert captured["args"] == ["push", "-u", "origin", "feature"]
-    assert captured["cwd"] == repo
-
-    monkeypatch.setattr(
-        update_source,
-        "_git_network_bounded",
-        lambda args, **_kw: (update_source.FETCH_TIMEOUT_RC, "", "git push exceeded 300s and was terminated"),
-    )
-    ok, message = ci._push_branch(str(repo), "feature")
-    assert ok is False
-    assert "exceeded" in message
-
-
 def test_run_git_network_cmd_failure_reports_stdout_when_stderr_is_empty(tmp_path, monkeypatch):
     """Some git failures report only on stdout; the run_cmd-shaped error must
     carry that text instead of an empty STDERR-only message."""

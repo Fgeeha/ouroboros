@@ -54,7 +54,6 @@ TOOL_MODULES = [
     "ouroboros.tools.git_rollback",
     "ouroboros.tools.git_pr",
     "ouroboros.tools.github",
-    "ouroboros.tools.ci",
     "ouroboros.tools.verify",
 ]
 
@@ -99,7 +98,6 @@ def test_tool_set_matches(registry):
 
 EXPECTED_TOOLS = [
     "browse_page", "browser_action",
-    "run_ci_tests",
     "preflight_review", "review_status",
     "compact_context", "set_tool_timeout", "request_restart",
     "promote_to_stable", "schedule_subagent", "schedule_followup", "manage_schedules",
@@ -229,7 +227,6 @@ def test_frozen_registry_includes_packaged_tool_modules(monkeypatch):
         "review_status",
         "plan_task",
         "vcs_rollback",
-        "run_ci_tests",
         # github.py is in _FROZEN_TOOL_MODULES — PR inspection tools must work in frozen builds
         "list_github_prs",
         "get_github_pr",

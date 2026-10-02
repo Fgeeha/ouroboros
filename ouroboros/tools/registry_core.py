@@ -310,7 +310,7 @@ class ToolRegistry:
         self._handler_overrides: Dict[str, Callable] = {}
 
     _FROZEN_TOOL_MODULES = [
-        "browser", "ci", "claude_advisory_review", "compact_context", "control",
+        "browser", "claude_advisory_review", "compact_context", "control",
         "core", "delegate", "edit_ops", "evolution_stats", "followup", "git", "git_pr", "git_rollback", "github",
         "health", "join_ledger", "knowledge", "media", "memory_tools", "plan_review", "project_journal", "presence",
         "recent_tasks",

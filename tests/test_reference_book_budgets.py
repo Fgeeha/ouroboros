@@ -388,7 +388,9 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 98600 -> 99300 (merge of the moved target into the plan-review branch, measured 99030): both sides' paragraphs land together.
     # 99300 -> 99800 (measured 99712): one bullet — plan-review answers merge by finding_id, the addressed re-ask
     # and its $0 replay rows, the quiz-answer rule; the base sat 270 bytes under.
-    "docs/development/06-rules-by-change-class.md": 99800,
+    # 99800 -> 100000 (measured 99967): one bullet names the retired `run_ci_tests`, its successor for
+    # reading and the archive that holds the dropped outcomes; a retirement record replaces no older text.
+    "docs/development/06-rules-by-change-class.md": 100000,
     "docs/development/07-managed-update-rule.md": 4166,
     "docs/development/08-mutation-attribution-rule.md": 2899,
     "docs/development/09-process-custody-rule.md": 10028,
