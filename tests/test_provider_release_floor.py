@@ -13,7 +13,7 @@ REQUIRED = [canary.canary_id for canary in provider_canary_matrix() if canary.cr
 OPTIONAL = [canary.canary_id for canary in provider_canary_matrix() if not canary.credential_required]
 VICTIM = REQUIRED[len(REQUIRED) // 2]
 SECRET = "SECRET-sk-live-0123456789"
-ERROR = "::error title=Required provider canary not evaluated::"
+ERROR = "::error title=Required provider canary did not pass::"
 
 
 def _junit(tmp_path, cases, foreign=()):
@@ -47,7 +47,7 @@ def _run(tmp_path, capsys, junit, *, enforce):
     code = main(["--junit", str(junit), "--summary", str(summary), *(["--enforce"] if enforce else [])])
     out = capsys.readouterr().out
     written = summary.read_text(encoding="utf-8")
-    # Another step's summary survives, and no skip message or body leaves the private report.
+    # What the summary file held survives, and no skip message or body leaves the private report.
     assert written.startswith("earlier step\n") and "Release floor for required provider canaries" in written
     assert SECRET not in out and SECRET not in written
     return code, out, written

@@ -362,7 +362,7 @@ jobs:
   # provider outage on a landed commit never reddens this workflow.
   # Confirmed provider-contract failures block release-preflight. A
   # quota/rate-limit/5xx/timeout outcome is a typed inconclusive skip: a manual
-  # run reports it, and on a `v*` tag in the official repository the shared
+  # run on a branch reports it, and on a `v*` tag in the official repository the shared
   # job's release floor fails unless every required canary passed.
   # ──────────────────────────────────────────────────────────────────
   integration-test:

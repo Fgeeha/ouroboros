@@ -21,7 +21,7 @@ from tests.provider_contract_ci import provider_canary_matrix
 
 _CLASSNAME = "tests.test_provider_integration"
 _TEST = "test_full_registry_provider_contract"
-_ERROR = "::error title=Required provider canary not evaluated::"
+_ERROR = "::error title=Required provider canary did not pass::"
 
 
 def required_canary_ids() -> list[str]:
@@ -75,7 +75,7 @@ def main(argv: list[str] | None = None) -> int:
     lines = ["", "### Release floor for required provider canaries", "", sentence]
     if table:
         lines += ["", "| Required canary | State |", "|---|---|", *table]
-    with args.summary.open("a", encoding="utf-8") as handle:  # The step summary is shared: append only.
+    with args.summary.open("a", encoding="utf-8") as handle:  # Append: never truncate what the file holds.
         handle.write("\n".join(lines) + "\n")
     print(sentence)
     if not (args.enforce and offenders):

@@ -6,7 +6,7 @@
 # which reports the code. Each matching push starts one paid run: this trigger
 # carries the same three branches as the `ci.yml` push trigger and, on purpose,
 # its own path list, so a prompts- or skills-only push starts the code workflow
-# and no paid run. `ci.yml` calls the same reusable job only for manual runs
+# and no paid canary run. `ci.yml` calls the same reusable job only for manual runs
 # and `v*` tags, where the release chain requires it.
 name: Provider canaries
 
