@@ -650,6 +650,22 @@ def test_dot_github_workflow_is_release_invariant():
     assert protected_path_category("./.github/workflows/ci.yml") == "release-invariant"
 
 
+def test_provider_canary_workflows_are_protected_exactly_like_ci_yml():
+    """`release-preflight` requires the provider-canary job, whose body and
+    branch-push trigger live in two workflow files beside ci.yml; an inventory
+    naming only the parent would leave the release canary editable."""
+    from ouroboros.runtime_mode_policy import RELEASE_INVARIANT_PATHS
+
+    parent = protected_path_category(".github/workflows/ci.yml")
+    for name in ("provider-canary.yml", "provider-canary-push.yml"):
+        path = f".github/workflows/{name}"
+        assert (REPO / path).is_file(), path
+        assert path in RELEASE_INVARIANT_PATHS, path
+        assert protected_path_category(path) == protected_path_category(f"./{path}") == parent, path
+    # The category follows the listed files, not the directory.
+    assert protected_path_category(".github/workflows/unlisted.yml") == ""
+
+
 def test_advanced_mode_allows_non_critical_write_calls_through(tmp_path, monkeypatch):
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
     reg = _registry(tmp_path)
