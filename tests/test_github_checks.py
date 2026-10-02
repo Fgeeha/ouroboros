@@ -681,7 +681,7 @@ def test_an_empty_rollup_is_called_empty(checks, rollup):
         "Other checks: none — every entry of the pull request rollup (1) is a job of a GitHub Actions workflow.")
 
 
-def test_the_report_stays_inside_the_result_limit(checks):
+def test_the_report_stays_inside_the_result_limit(checks, monkeypatch):
     """Long names and long GitHub Enterprise URLs: the header facts, the counts and every run id are reserved
     first, and the rollup entries, the run lines and the detail lines share what is left."""
     from ouroboros.tool_capabilities import tool_result_limit
@@ -722,6 +722,18 @@ def test_the_report_stays_inside_the_result_limit(checks):
     # Both rollup lists keep their title and counts, and what they leave out is counted.
     assert "Other checks, outside GitHub Actions (40) — failure 40:" in lines and lines[-1] == "- 28 more of these: failure 28"
     assert any(line.endswith("more detail lines of this run are not shown: the result bound is reached") for line in lines)
+
+    # The order of admission holds under any limit: with a third of the room the header facts, the counts and
+    # every run id stay, the rollup entries are cut by the room that is left, and no run has a line of its own.
+    monkeypatch.setattr(github_checks, "tool_result_limit", lambda _name: 5000)
+    tight = checks(FakeChecks(polls=[runs], jobs=jobs, rollup=rollup), number=7).text.splitlines()
+    assert len("\n".join(tight)) <= 5000 and tight[:3] == lines[:3] and tight[5:10] == lines[5:10]
+    packed = {state: [int(run_id) for run_id in line.partition("ids: ")[2].split(", ")]
+              for line in tight for state in ("failure", "cancelled") if f" more runs — {state}; ids: " in line}
+    assert sorted(packed["failure"] + packed["cancelled"]) == ids and not any(line.startswith("- Integration") for line in tight)
+    shown = [sum(line.startswith(kind) for line in tight) for kind in ("- job ", "- commit status ")]
+    assert 0 < shown[0] < 12 and shown[1] < 12
+    assert [int(line.split()[1]) for line in tight if " more of these: failure " in line] == [40 - shown[0], 40 - shown[1]]
 
 
 def test_checks_reader_is_registered_read_only():
