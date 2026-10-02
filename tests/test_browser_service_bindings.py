@@ -114,21 +114,59 @@ def test_concurrent_bindings_merge_and_recycled_identity_is_not_live(tmp_path):
     assert not server_process.service_binding_is_live(stale)
 
 
-def test_child_observes_late_local_model_health_binding_and_stop(tmp_path, monkeypatch):
-    from ouroboros.local_model import LocalModelManager
-
-    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
-    model_script = tmp_path / "model_fixture.py"
-    model_script.write_text('''from http.server import BaseHTTPRequestHandler, HTTPServer
+_MODEL_SERVER = '''from http.server import BaseHTTPRequestHandler, HTTPServer
+import socketserver
+class LoopbackHTTPServer(HTTPServer):
+ def server_bind(self):
+  # Numeric loopback fixture: no hostname semantics, skip HTTPServer's reverse DNS.
+  socketserver.TCPServer.server_bind(self)
+  self.server_name, self.server_port = self.server_address[:2]
 class Handler(BaseHTTPRequestHandler):
  def do_GET(self):
   body=b'{"data":[{"id":"fixture","context_window":4096}]}'
   self.send_response(200); self.send_header('Content-Length',str(len(body))); self.end_headers(); self.wfile.write(body)
  def log_message(self,*args): pass
-server=HTTPServer(('127.0.0.1',0),Handler)
+server=LoopbackHTTPServer(('127.0.0.1',0),Handler)
 print(server.server_address[1],flush=True)
 server.serve_forever()
-''', encoding="utf-8")
+'''
+
+
+@pytest.mark.serial
+def test_model_fixture_serves_without_reverse_dns():
+    """The model fixture binds a numeric loopback address, so it must start and answer
+    while ``socket.getfqdn`` raises: that lookup costs about 35 s per bind on macOS CI."""
+    import http.client
+
+    refuse = ("import socket\n"
+              "def _refuse(*_a): raise RuntimeError('fixture performed reverse DNS')\n"
+              "socket.getfqdn = _refuse\n")
+    proc = subprocess.Popen([sys.executable, "-c", refuse + _MODEL_SERVER],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        line = proc.stdout.readline()
+        assert line.strip().isdigit(), proc.communicate(timeout=5)
+        client = http.client.HTTPConnection("127.0.0.1", int(line), timeout=5)
+        try:
+            client.request("GET", "/v1/models")
+            response = client.getresponse()
+            assert response.status == 200
+            assert json.loads(response.read())["data"][0]["id"] == "fixture"
+        finally:
+            client.close()
+    finally:
+        proc.kill()
+        proc.wait(timeout=5)
+        proc.stdout.close()
+        proc.stderr.close()
+
+
+def test_child_observes_late_local_model_health_binding_and_stop(tmp_path, monkeypatch):
+    from ouroboros.local_model import LocalModelManager
+
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    model_script = tmp_path / "model_fixture.py"
+    model_script.write_text(_MODEL_SERVER, encoding="utf-8")
     model = subprocess.Popen([sys.executable, str(model_script)], stdout=subprocess.PIPE,
                              text=True, **subprocess_new_group_kwargs())
     reader_code = """import json,sys

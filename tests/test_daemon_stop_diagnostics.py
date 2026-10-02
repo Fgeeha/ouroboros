@@ -350,8 +350,13 @@ def test_real_legacy_daemon_attach_then_stop_uses_token_and_ledger(tmp_path, mon
 
 
 _STOP_ENDPOINT = """
-import http.server, json, socket, sys, threading
+import http.server, json, socket, socketserver, sys, threading
 mode = sys.argv[1]
+class LoopbackHTTPServer(http.server.ThreadingHTTPServer):
+    def server_bind(self):
+        # Numeric loopback fixture: no hostname semantics, skip HTTPServer's reverse DNS.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *_args): pass
     def do_POST(self):
@@ -382,10 +387,39 @@ if mode == 'refused':
     print(sock.getsockname()[1], flush=True)
     threading.Event().wait()
 else:
-    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    server = LoopbackHTTPServer(('127.0.0.1', 0), Handler)
     print(server.server_port, flush=True)
     server.serve_forever()
 """
+
+
+@pytest.mark.serial
+def test_stop_endpoint_fixture_serves_without_reverse_dns():
+    """The stop endpoint binds a numeric loopback address, so it must start and answer
+    while ``socket.getfqdn`` raises: that lookup costs about 35 s per bind on macOS CI."""
+    import http.client
+
+    refuse = ("import socket\n"
+              "def _refuse(*_a): raise RuntimeError('fixture performed reverse DNS')\n"
+              "socket.getfqdn = _refuse\n")
+    proc = subprocess.Popen([sys.executable, "-u", "-c", refuse + _STOP_ENDPOINT, "normal"],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        line = proc.stdout.readline()
+        assert line.strip().isdigit(), proc.communicate(timeout=5)
+        client = http.client.HTTPConnection("127.0.0.1", int(line), timeout=5)
+        try:
+            client.request("POST", "/v2/handshake", body=b"{}")
+            response = client.getresponse()
+            assert response.status == 200
+            assert json.loads(response.read())["compatible"] is True
+        finally:
+            client.close()
+    finally:
+        proc.kill()
+        proc.wait(timeout=5)
+        proc.stdout.close()
+        proc.stderr.close()
 
 
 @pytest.fixture
