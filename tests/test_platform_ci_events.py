@@ -117,3 +117,14 @@ def test_only_a_new_pull_request_head_cancels_a_run(event, attempt, group, cance
     facts = {"event": event, "ref": "refs/heads/candidate", "attempt": attempt}
     assert _value(concurrency["group"], **facts) == group
     assert bool(_value(concurrency["cancel-in-progress"], **facts)) is cancels
+
+
+def test_windows_parallel_pass_sizes_its_pool_by_logical_cores():
+    steps = WORKFLOW["jobs"]["full-test"]["steps"]
+    sizing = next(step for step in steps if "PYTEST_XDIST_AUTO_NUM_WORKERS" in step.get("run", ""))
+    assert "runner.os == 'Windows'" in sizing["if"] and sizing["shell"] == "pwsh"
+    assert "$env:NUMBER_OF_PROCESSORS" in sizing["run"] and "$env:GITHUB_ENV" in sizing["run"]
+    parallel = next(step for step in steps if step.get("id") == "tests_parallel")
+    assert steps.index(sizing) < steps.index(parallel) and "-n auto" in parallel["run"]
+    # The quick job has no psutil: its `auto` is already the logical count.
+    assert "PYTEST_XDIST_AUTO_NUM_WORKERS" not in str(WORKFLOW["jobs"]["quick-test"])
