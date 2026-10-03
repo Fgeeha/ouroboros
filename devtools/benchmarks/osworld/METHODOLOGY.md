@@ -113,7 +113,7 @@ finished "chat-style" left the Ouroboros `loop_outcome.final_answer` empty
 to `not_evaluated`, and several tasks lost reward because the agent answered
 in chat instead of leaving the VM in the evaluator-expected state (e.g.
 `is_expected_active_tab` checks the active URL, `compare_table` checks a saved
-`.xlsx`). Two structural fixes live in `run_step_agent.py`:
+`.xlsx`). Two structural fixes live in `step_agent_policy.py`:
 
 1. **Terminal-message capture.** The per-step JSON schema has a
    `final_answer` field; when the agent emits `done`/`fail` the runner

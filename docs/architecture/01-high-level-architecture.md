@@ -539,6 +539,8 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
 
 `devtools/benchmarks/cowork_bench/` runs a clean seed in pinned containers with a persistent MCP proxy. Its launcher owns spending, limits and ledgers; `official_receipt.py` reads exact evaluator bytes, `eval_attempt.py` claims each official evaluation once and runs the opt-in audit-only diagnostic; the audit keeps scoring authority (see `METHODOLOGY.md`).
 
+`devtools/benchmarks/osworld/` keeps admission, actor attestation, finalization and CLI entry points in `run_step_agent.py` and `run_cu_bridge_agent.py`. Their `step_agent_*` and `cu_bridge_*` leaves own environment, claims, actions, policy, prompts and accounting; the runners re-export the shared surface. The module map is `devtools/benchmarks/osworld/README.md`.
+
 ### Gateway Boundary v1
 
 `ouroboros/gateway/` is the single inbound browser/CLI boundary (`ouroboros/gateways/` holds the thin outbound adapters): `contracts.py` owns the envelopes, with the endpoint index in `endpoint_index.py`, `router.py` collects the routes, and `files.py`/`host_service.py` stay separate trust boundaries. The contract is EXECUTABLE — `gateway/schema.py` validates ingress against JSON Schema derived from those TypedDicts. Domain handlers translate transport into calls on existing runtime owners and must not acquire a second copy of queue, review, settings, or lifecycle policy. The facade exists for dependency direction: the UI evolves without importing the agent body, and the runtime evolves without ad-hoc browser contracts.

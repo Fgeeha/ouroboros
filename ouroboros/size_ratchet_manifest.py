@@ -3,8 +3,6 @@
 BASELINE_SOURCE_SHA = "77d6827b7a72a632899bb6cc64a7e759aabcfaa6"
 
 GIANT_PATHS = (
-    "devtools/benchmarks/osworld/run_cu_bridge_agent.py",
-    "devtools/benchmarks/osworld/run_step_agent.py",
     "ouroboros/tools/git.py",
     "server.py",
     "skills/unix_computer_use/plugin.py",
@@ -103,6 +101,7 @@ BAND_PATHS = {
     "devtools/benchmarks/cybergym/cybergym_lifecycle.py": "Run/settle lifecycle layer of the executor split: one accounting seam.",
     "devtools/benchmarks/cybergym/cybergym_protocol.py": "Stateless protocol layer of the adapter split: constants, validators, provenance.",
     "devtools/benchmarks/cybergym/cybergym_reconcile.py": "CyberGym recovery joins existing checkpoint, result, claim and cleanup authority without repeating an agent; one recovery owner retains that crash-window contract.",
+    "devtools/benchmarks/osworld/run_cu_bridge_agent.py": "OSWorld launcher retains admission and finalization seams; gate, budget, prompts and tool-policy helpers live in bounded owner leaves.",
     "devtools/benchmarks/swe_bench_pro/e1v2/run_pro.py": None,
     "devtools/benchmarks/terminal_bench/harbor_installed_agent.py": None,
     "devtools/benchmarks/terminal_bench/run_tb.py": None,
@@ -258,5 +257,5 @@ BYTE_BASELINE_DEBT = {
 }
 
 BYTE_DEBT = {
-    "tests/test_devtools_benchmarks.py": 326550,
+    "tests/test_devtools_benchmarks.py": 326542,
 }
