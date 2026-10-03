@@ -434,7 +434,7 @@ def test_linux_packages_ship_the_systemd_user_unit():
     # A user unit, not a system one: state lives in $HOME.
     assert "WantedBy=default.target" in unit
     # The native launcher remains the only bootstrap/restart/panic owner.
-    assert "ExecStart=/opt/ouroboros/Ouroboros" in unit
+    assert "ExecStart=/opt/ouroboros/Ouroboros --launch-intent automatic" in unit.splitlines()
     assert not any(line.startswith("Restart=") for line in unit.splitlines())
     # Stopping must reach the worker pool, not just the launcher.
     assert "KillMode=control-group" in unit
@@ -442,7 +442,7 @@ def test_linux_packages_ship_the_systemd_user_unit():
     # The digest-bound package smoke verifies the unit from the installed
     # .deb/.rpm, not only the source staging tree.
     assert "test -s /usr/lib/systemd/user/ouroboros.service" in smoke
-    assert "grep -Fqx 'ExecStart=/opt/ouroboros/Ouroboros'" in smoke
+    assert "grep -Fqx 'ExecStart=/opt/ouroboros/Ouroboros --launch-intent automatic'" in smoke
     assert "grep -Fqx 'KillMode=control-group'" in smoke
     assert "! grep -q '^Restart='" in smoke
 
