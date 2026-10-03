@@ -248,6 +248,15 @@ def commit_review_contract_fingerprint() -> str:
         if any(triad_actor_ids):
             for row, actor in zip(triad_rows, triad_actor_ids):
                 row.append(actor)
+        # A direct api row saved as native delivery (#1334) is the same kind of
+        # contract change with no actor id to carry it; the column appears only
+        # when such a row exists, so every other panel keeps its exact bytes.
+        native_direct = [bool(flag) and not actor and str(getattr(route, "value", route) or "") == "api_chat"
+                         for flag, actor, route in zip(row_plan.get("retrieves") or [], triad_actor_ids
+                                                       or [""] * len(triad_rows), row_plan["routes"])]
+        if any(native_direct):
+            for row, native in zip(triad_rows, native_direct):
+                row.append("native_retrieval" if native else "")
         scope_slots = list(scope_reviewer_slots())
         scope_rows = [
             [
@@ -825,6 +834,7 @@ def _invalidate_advisory(
             mutation_root=mutation_root or pathlib.Path(ctx.repo_dir),
             changed_paths=changed_paths,
             source_tool=source_tool or _current_review_tool_name(ctx),
+            mutating_task_id=str(getattr(ctx, "task_id", "") or ""),
         )
     except Exception:
         pass
@@ -1111,8 +1121,11 @@ def _check_advisory_freshness(ctx: ToolContext, commit_message: str,
         )
 
     if latest and latest.status == "stale" and state.last_stale_from_edit_ts:
+        # Attribution only for a marker scoped to this checkout (or unscoped).
+        writer = (f" by {state.stale_marker_attribution_note(str(getattr(ctx, 'task_id', '') or ''))}"
+                  if state.last_stale_repo_key in ("", repo_key) else "")
         stale_reason = (f"Advisory invalidated by worktree edit at "
-                        f"{state.last_stale_from_edit_ts}. Re-run advisory after all edits.")
+                        f"{state.last_stale_from_edit_ts}{writer}. Re-run advisory after all edits.")
     elif latest:
         stale_reason = (f"Latest run: status={latest.status}, hash={latest.snapshot_hash[:12]}, "
                         f"ts={latest.ts}. Snapshot changed (files edited after advisory ran).")

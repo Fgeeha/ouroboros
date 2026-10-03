@@ -4,6 +4,7 @@ import { renderAgentAccountsSection, renderAgentsServiceBanner } from './harness
 import { renderReviewerSlotsSection } from './reviewer_slots.js';
 import { renderSubagentsSection } from './subagents_settings.js';
 import { modelRolesHost } from './model_roles.js';
+import { bindSecretReveal } from './settings_secrets.js';
 
 // Reads as a sequence: keys → secrets → which API models → who among the agents
 // does what → behavior → technical. "Agents", not "Coding agents" (D-10): the
@@ -410,7 +411,7 @@ export function renderSettingsPage() {
                 <section class="settings-panel" data-settings-panel="behavior">
                     <div class="form-section">
                         <h3>Reasoning Effort</h3>
-                        <div class="settings-section-copy">Controls how deeply the model thinks per task type. Higher effort = slower but more thorough.</div>
+                        <div class="settings-section-copy">Preferred reasoning effort per task type. Unsupported levels adapt to the route; native mappings, required minimums or provider defaults may apply. Requested, sent and reported effort are recorded in Logs.</div>
                         <div class="settings-effort-grid">
                             ${EFFORT_FIELDS.map(([id, label, defaultValue]) => effortField({ id, label, defaultValue })).join('')}
                         </div>
@@ -911,7 +912,7 @@ export function renderSettingsPage() {
                              Agents → Delegation (D-10): they bound the agents,
                              not the process pool. Max Workers stays: it is
                              runtime worker processes, not an agent setting. -->
-                        <div class="settings-section-copy">Workers control parallel task capacity. Task liveness is governed automatically by progress, deadlines, the idle rail and the reaper; the per-task round and lifetime limits are optional — a positive number, or <code>unlimited</code> for none (the fresh-install default). Budget limits control runtime cost thresholds. How many subagents a task may run, and how deep they may nest, live in <code>Agents</code>.</div>
+                        <div class="settings-section-copy">Workers control parallel task capacity. Task liveness is governed automatically by progress, deadlines, the idle rail and the reaper; the per-task round and lifetime limits are optional — a positive number, or <code>unlimited</code> for none (the fresh-install default). A settings file from an earlier release that never set them keeps the finite limits it ran under until you change them here; startup names the values once. Budget limits control runtime cost thresholds. How many subagents a task may run, and how deep they may nest, live in <code>Agents</code>.</div>
                         <div class="form-grid two">
                             <div class="form-field ui-field">
                                 <label for="s-workers">Max Workers</label>
@@ -1073,12 +1074,18 @@ export function bindSecretInputs(root) {
     });
 
     root.querySelectorAll('.secret-toggle').forEach((button) => {
-        button.addEventListener('click', () => {
-            const target = root.querySelector(`#${button.dataset.target}`);
-            if (!target) return;
-            const nextType = target.type === 'password' ? 'text' : 'password';
-            target.type = nextType;
-            button.textContent = nextType === 'password' ? 'Show' : 'Hide';
+        const input = root.querySelector(`#${button.dataset.target}`);
+        if (!input) return;
+        const customRow = input.closest('[data-custom-secret-row]');
+        const keyInput = customRow?.querySelector('[data-custom-secret-key]');
+        bindSecretReveal(input, button, {
+            savedSelector: () => {
+                const key = customRow?.dataset.originalKey || input.dataset.secretSetting;
+                return key ? { key } : null;
+            },
+            savedLabel: () => keyInput && keyInput.value.trim().toUpperCase() !== customRow.dataset.originalKey
+                ? `Saved value for ${customRow.dataset.originalKey}` : '',
+            identityInputs: keyInput ? [keyInput] : [],
         });
     });
 

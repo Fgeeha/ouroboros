@@ -58,6 +58,17 @@ Rules:
 - Control chrome keeps its own dimension tokens (`--button-font-size`,
   `--pill-font-size`). They are control geometry, not the reading scale; do not
   replace them with type tokens or vice versa.
+- **The one reading exception: a full rich chat answer.** A chat bubble whose
+  message is rich Markdown (an answer, the Project completion mirror, a
+  `markdown: true` System row) is long text at the bubble's 16px reading
+  size. Its headings step up from that text: `--md-heading-major` (1.25em,
+  20px) for `#` and `##`, `--md-heading-minor` (1.125em, 18px) for `###`,
+  the reading size for deeper levels; its tables read at that size too. The
+  steps are relative to the reading text, not UI sizes, and only the rich
+  answer's heading rules read the two tokens (§5). Nothing else changes
+  size: controls, labels, cards and page chrome keep the four sizes, and so
+  do the compact surfaces (a Skill Review report, a task timeline) and the
+  other rich-content cards (the question card, the update letter).
 
 ## 2. Hierarchy rule
 
@@ -73,6 +84,10 @@ steps down. Concretely:
   `--type-body` semibold. A bare `<h3>`/`<h4>`/`<strong>` that inherits the
   browser default is a defect: it lands at bold 16px full white and ties with,
   or beats, the content it introduces.
+- A Markdown heading is a subsection heading too — a `--type-body` semibold
+  label in a Skill Review report, the question card and the update letter,
+  and its row's own size in a task timeline — except inside a full rich chat
+  answer, which is reading text and follows the §1 ladder instead.
 
 **The 12px UPPERCASE label pattern is retired** on migrated surfaces. All-caps
 at a small size costs legibility, widens every label, and when a panel repeats
@@ -164,6 +179,17 @@ family; `.ui-checkbox` keeps native checkbox behavior. `.ui-field` groups a
 label, control and optional `.ui-field-help`. A placeholder is an example,
 never the field's only name. Help and validation belong to that field without
 changing the alignment of neighboring controls and their actions.
+
+**Secret visibility has one meaning across Settings.** Show reveals the complete
+current value as selectable, read-only text below the unchanged editing field;
+long values wrap within the column. An edited value is shown from the local
+draft; an untouched saved value is read only when requested. A prefix or a
+configured-value placeholder is never a successful reveal. Hide removes that
+text and retains the draft. Viewing changes neither the dirty state nor the
+values submitted by Save or Test. Editing, clearing, reloading or leaving the
+page closes the reveal, and a late read cannot reopen it. Built-in, custom,
+skill-requested and MCP token fields use the same interaction; loading Settings
+keeps saved secrets masked. Pending reads and failures are shown at the field.
 
 Short fixed choices keep native selects, including the platform's own popup.
 A control never widens its column: a select shows its chosen label on one
@@ -259,14 +285,18 @@ Status, owner action, and urgent notification are separate product concepts:
   task as a proxy.
 
 Activity schedule rows use the same factual status rule: `active`, `disabled`,
-`suppressed`, and `consumed once · history` describe lifecycle state, while the
-adjacent Disable/Enable, Restore, and Delete controls state the owner action. A
-consumed one-shot is history even when its task succeeded or failed; the status
-never implies a result. Retained rows — consumed and suppressed — collapse into
-one disclosure rather than padding the standing list or disappearing: history
-the owner can still open, read and act on. A suppressed skill row keeps Restore
-so the owner can ask for it back; a consumed one keeps only Delete, because
-offering Enable on a schedule that cannot fire again would be a lie.
+`suppressed`, `consumed once · history` and `deletion pending` describe lifecycle
+state, while the adjacent Disable/Enable, Restore, and Delete controls state the
+owner action. A consumed one-shot is history even when its task succeeded or
+failed; the status never implies a result. Retained rows — consumed and
+suppressed — collapse into one disclosure rather than padding the standing list
+or disappearing: history the owner can still open, read and act on. A suppressed
+skill row keeps Restore so the owner can ask for it back; a consumed one keeps
+only Delete, because offering Enable on a schedule that cannot fire again would
+be a lie. A deleted row still finishing work it already accepted stays in the
+standing list and says what it waits for. Where generic Restore can cancel the
+pending deletion, the button says Cancel deletion, not Enable. An exact hold
+release stays separate and preserves the deletion intent.
 
 A record of what the owner did earlier is history, not status. A skill's
 OuroborosHub submission (the version it sent and its PR link) lives in the
@@ -294,7 +324,18 @@ a blocking exit still read `Done with warnings` or `Failed`.
 A host fact about a task is a row of that task's card, never a standalone
 bubble beside it. A reviewer panel that settles after its task already ended
 adds one System row naming the reviewed version — delivered, different, or delivery
-unknown — before its verdict. That row lands inside the finished card (its Reviews group carries the note, the timeline
+unknown — before its verdict. Its reviewer lines name the model that answered as an
+engine reported it (else the requested one, labelled so: a direct API route's own
+target is a request, not a report; two seats of one model stay two lines) and
+say each outcome in words — passed it, rejected it, inconclusive, still awaited,
+outcome unknown, not sent, unavailable, or answered without a readable verdict;
+an unavailable reviewer's cause is quoted as the delegated engine's report, never
+as the provider's. A reviewer's shortened note, like an engine cause the host's own
+bound shortened, says only that it was shortened;
+the row offers the exact applied record as a download once the host stored it,
+and a cut of the whole row names that record only then — never a guessed link.
+Slot ids, verdict
+tokens and omission markers stay in that record and the model's mailbox. That row lands inside the finished card (its Reviews group carries the note, the timeline
 keeps the row) without changing the card's chip, title or meta, and a standalone
 row appears only when the task has no card record in the page. Saving and showing
 late criticism does not replace passing it to Ouroboros for consideration: the host
@@ -317,7 +358,15 @@ lives in `log_events.js`). The routing receipt under an owner
 message is such a surface: a refused addressing act carries the host-composed
 `cause` sentence (`project_dialogue.routing_refusal_cause` — one host table for
 the receipt line, the System row and the picker toast), a landed act carries
-none, and an unknown reason stays raw. Host text speaks only for the host's own
+none, and an unknown reason stays raw. A provider failure quotes only the
+provider's own sentence (a long one, or one its producer already cut, shortened in
+words beside the Logs pointer);
+without one it names the host's classification of the failure (beside the
+provider's own error code and parameter when an engine relays them, as the
+provider's) and points at the
+Logs, which keep the host's record of it (a stream error's sentence only as a
+bounded excerpt, so no row promises more) — neither an exception's text nor an
+engine's composed diagnostic reaches the owner's row. Host text speaks only for the host's own
 actions, its own counts and signed quotes; a source it could not read is
 unknown, never zero. A terminal whose preserved output was
 never reviewed shows that output labelled rather than hidden: a short labelled
@@ -395,8 +444,8 @@ Project navigation rows may carry the existing three 4px working dots
 (`chat-live-typing`, 3px gap) for the live `active_chat_activities` census.
 `Working`, `Thinking` and `Finalizing` are the only moving states, using the
 existing 1.4s bounce rhythm; `Queued` stays static at a quieter step.
-Budget-paused work, confirmed model access waits and required owner questions
-are static amber, with `resumed` questions no longer waiting. A wait on the same
+Budget-paused work, confirmed model access waits, required owner questions and
+Project/task scope verification waits are static amber, with `resumed` questions no longer waiting. A wait on the same
 producer row suppresses its working motion; an independent working row keeps
 motion, and the row's accessible name states both facts. Unknown or unconfirmed
 census state stays static and explicitly unavailable. The dots take the row's
@@ -411,6 +460,56 @@ The collapsed Projects header carries the aggregate dots beside its label, and
 an activity repaint preserves the existing row and menu nodes. The dots are
 separate from unread dots and never carry a counter, percent or text
 animation. Reduced-motion clients receive the same state without the bounce.
+
+### Project unread dot
+
+A Project row's unread dot, and the Projects count, mean *there is a new message
+in this Project's conversation that you have not read* — never *something
+moved*. Activity dots, notifications, toasts, task controls and Stop/Panic keep
+their own meaning and are unaffected by it.
+
+Unread revisions follow successfully stored conversation rows. A failed write
+keeps the existing live-delivery behavior but cannot advance saved history's
+revision; this counter is not a guarantee of delivery durability.
+
+- **Counts:** each new standalone message in the conversation — an ordinary or
+  proactive reply, a question, a root task's final answer, a standalone System
+  message (a root task's terminal incident included), a delivered photo, video,
+  file or link card. A question or a delivery is shown alone and counts whichever
+  task sends it, a child task included.
+- **Does not count:** anything that changes a task card rather than the
+  conversation — narration and progress, lifecycle, incidents raised in a
+  task's progress (root worker failures included; they still toast), host rows placed in a card (custody, late
+  review results, merge receipts, a child task's terminal incident), and a child
+  task's own words and final: a child speaks to its parent, and its card shows
+  them. Where a row is shown decides, never its kind: an incident shown alone as
+  a System message counts, one shown in a card does not. A placed row is card
+  content even where the page has not loaded its card and shows it alone.
+- **Read:** only once the newest message is painted in the visible room with
+  the reader at it — on screen, clear of the header and composer, normally at
+  the bottom of the conversation with nothing newer to load. Being at the bottom
+  is not enough when later card rows or the owner's own messages pushed it above
+  the fold. Opening a room, or new messages arriving, while the reader is
+  elsewhere leaves the dot; scrolling to the newest message, `Scroll to latest
+  message`, or showing the page or window again clears it. Collapsed cards need
+  not be expanded. A question opened from its Main mirror is shown first; landing on it
+  is not reading the newer messages below it. The newest message is the one that
+  arrived last: a late answer keeps the time it was written and takes that place
+  in the conversation, so it is read only once it is itself on screen, clear of
+  the header and composer — above the loaded messages, after `Load more history` shows
+  it — and never while the room cannot tell which message arrived last, as
+  while the newest line of the conversation is still being written. A
+  damaged persisted row can leave this unknown until the history is repaired or
+  a newer standalone message arrives; while the unread room is open, existing
+  state refreshes recheck the source. A message that later card rows and the
+  owner's own messages pushed past the newest page is read the same way. A room
+  holding no standalone message is read at the bottom once the history reader
+  reaches its clean start, through the bounded search or `Load more history`.
+  An old child's final whose lineage is available only on another history page
+  can also keep the dot after the readable conversation has been shown.
+- **Several clients** share one read cursor that only moves forward: a room read
+  on one client stops showing the dot on the others at their next state
+  refresh, and nothing read is shown unread again.
 
 ### References and actions
 
@@ -463,6 +562,39 @@ renderer regardless of `markdown`; ordinary System text is escaped unless
 Voice does not confer task finality. The existing untyped terminal-host-notice
 contract remains a documented exception, not a pattern for new notices.
 
+Main's empty-chat greeting speaks in neither voice: it is host copy in a quiet
+`.chat-empty-welcome` placeholder (a `Welcome` label over one sentence), never a
+bubble, a history row or a model reply (`web/modules/welcome_preference.js`). It
+appears only after a successful recent history read whose own window reports
+complete coverage, over a feed with no message or task card (the typing indicator
+and the ephemeral reconnect notice are chrome, by the same rule that gives an empty
+feed its history loading state). Every later read withdraws it while in flight, so
+that loading state, then any failure, shows instead; only a complete answer brings
+it back, and it leaves with the first message or task card. Project rooms never
+show it.
+
+The sentence is a hidden install-wide preference with no Settings control: the
+`welcome` key of `state/ui_preferences.json` under the data root
+(`~/Ouroboros/data` by default). Change only that key and keep the file's others:
+
+```json
+"welcome": {"mode": "default", "text": ""}
+"welcome": {"mode": "hidden", "text": ""}
+"welcome": {"mode": "custom", "text": "Good morning."}
+```
+
+`default` shows the built-in "Ouroboros has awakened", `hidden` shows nothing, and
+`custom` shows `text` as plain text, never markup (nonblank, at most 500
+characters; other modes retain but do not display valid text). The object has
+exactly these two keys. Prefer `POST /api/ui/preferences` with `{"welcome": {...}}`:
+it validates and merges the value (400 on refusal, without writing). For a hand
+edit, stop Ouroboros, back up the file, and preserve valid whole-document JSON
+and neighboring keys. An invalid welcome inside valid JSON falls back to
+`default` independently; the next save stores that default. Malformed JSON
+instead follows the existing whole-file fallback: all preferences read as
+defaults, and a later save may replace the unreadable contents. Main reads the
+preference when it opens and on every reconnect; there is no file watcher.
+
 ## 5. Card and section composition
 
 - A panel is one `.ui-card`-family surface: `--ui-card-border`,
@@ -494,12 +626,57 @@ contract remains a documented exception, not a pattern for new notices.
   content it contains. Where content lives inside a click-to-toggle surface
   (a task card's summary), the surface ignores a pointer click whose drag
   produced a non-empty selection; keyboard activation is unaffected.
-- **A markdown heading inside chat is a subsection label**, never a page
-  title: in chat bubbles every heading level renders at `--type-body`
-  semibold; in a task card's timeline it renders inline, without block
-  margins, at its row's own size, with a copyable line break before the
-  following paragraph. The page-size `md-h1` belongs to non-chat
-  surfaces only.
+- **A markdown heading inside chat is never a page title.** In a full rich
+  answer (§1: answers, the Project completion mirror, `markdown: true` System
+  rows) it is a section of the answer and never smaller than the text it
+  opens: the §1 reading ladder — `#` = `##`, then `###`, then deeper levels
+  at the reading size — semibold, in the bubble's own ink, with clearly more
+  space above than below. The compact renderer's surfaces keep their density
+  (§2): in a Skill Review report every level is a `--type-body` semibold
+  label, and in a task card's timeline a heading renders inline, without
+  block margins, at its row's own size, with a copyable line break before
+  the following paragraph. Other rich-content cards (the question card, the
+  update letter) keep `--type-body` semibold labels. Bold text in chat
+  Markdown and rich-content cards is semibold, so a bold lead sentence never
+  outweighs a heading. The page-size `md-h1` belongs to non-chat surfaces
+  only.
+- **Rendered Markdown keeps its author's structure and text.**
+  - A table stays a grid and fills its column. Cells wrap between words and
+    align to the top; the author's GFM column alignment holds (numbers right,
+    centred columns centred) with tabular figures; only a link, hash or code
+    span may break anywhere. In a full rich answer it reads at the answer's
+    text size; compact surfaces and cards keep `--type-body`. A table in
+    either renderer scrolls sideways only when its columns cannot fit even
+    wrapped, and only then is it a named keyboard region (`Scrollable
+    table`) whose sides that still hide columns fade. No stacked row cards,
+    no guessing a table's purpose from its words, no smaller text to make it
+    fit.
+  - A thematic break is a `--surface-border` hairline with section spacing.
+    Inline code keeps the ink of the text around it on its neutral pill.
+  - Code is the author's literal text: a fence or code span shows and
+    copies exactly what was written (`&amp;`, `<div>`, `**stars**`
+    included), and no formatting rule reaches inside it. A rich answer
+    reads code as its Markdown parser does. The compact renderer keeps the
+    promise for its own narrower grammar only: a fence opened by three
+    backticks, an optional label made of ASCII letters, digits, underscores
+    and `+ # . -` (at least one letter, digit or underscore; `c++`, `c#` and
+    `objective-c` included), optional trailing spaces or tabs, and LF or CRLF,
+    closed by the next three backticks; and a code span of
+    one or two backticks around text on one line. Other code forms (info
+    attributes after a space, a span across lines, a longer backtick run,
+    a `~~~` or indented block) are outside that
+    grammar, and the compact renderer does not promise them literal. Rich
+    prose reads one stored entity layer (`&amp;` shows `&`); an entity never
+    creates structure, and raw HTML stays literal text.
+  - A Markdown image is never loaded. It stays a visible reference,
+    `Image: <alt>`. In a rich answer it is a link through the chat URL policy
+    when its address is allowed, plain text otherwise, and inside an authored
+    link that link's own text; the compact renderer links it like its other
+    links (a refused address becomes their `#` placeholder). Chat media sent
+    through the media path is unaffected.
+- **A narrow chat column gives every bubble its full width.** A column of
+  620px or less — a phone or a narrow Project panel alike — drops the
+  wide-screen gutters; the column, not the viewport, decides.
 - **A task card's summary outranks its details.** The latest-activity line is
   `--type-body`; collapsed timeline rows are a dense log at `--type-meta` in
   `--text-secondary`; an expanded row returns to `--type-body` in
@@ -521,19 +698,68 @@ contract remains a documented exception, not a pattern for new notices.
   facts, not a claim that their union is the current actor. Missing identity
   stays unconfirmed; marks and configured routes never manufacture execution.
 
+A completion notice distinguishes the task's recorded end from the time the
+notification was added. Both dates are absolute local dates outside the answer's
+copyable body. Unknown historical end time says so explicitly. Inside the room,
+the task card's saved end line keeps its notification time and adds the same
+note whenever the recorded end falls in another minute or is unknown; minutes
+are compared as instants, and two that read alike on the local clock (a repeated
+daylight-saving hour) carry zone names. Lines saved before the host recorded end
+times stay as they were. Delivery keeps its present place in Main; an older
+Failed remains that task's result even after a different task succeeds.
+
 ### History edges
 
-A paged transcript loads older portions automatically at the reading edge and
-keeps a keyboard-reachable `Load older messages` button that retries the same
-portion when reading fails. A short or empty portion never claims the beginning
-of the archive; only the source reader establishes that boundary, and an empty
-portion is never a reading position. Distant portions may leave the rendered
-window and return quietly as the reader nears the live edge. There is no
-`load newer` control: the one explicit return to the present is the floating
-`Scroll to latest message` button. An edge control states a fact about the
-rendered transcript, never about an internal cache or cursor. The visible
-passage, selected text, focused control and expanded Reviews retain their
-actual nodes.
+Within one app session a room reopens at the passage being read after its data
+arrives, even on a slow connection; the place is kept in page memory, so a reload
+opens the room at the present. The passage includes how far a bounded full output,
+Review detail or card timeline around it was scrolled. A failed history read
+keeps that destination and offers Retry; a failed read of the present by ↓
+leaves the view in place with the same Retry. A room kept for an unsent file
+reopens where it was left without another read, even after a partial one. A
+failed full-output read keeps the line's capped preview and offers no Retry of
+its own; collapsing and expanding the line asks again. Scrolling, revealing a
+question, sending a message or choosing the existing ↓ supersedes the saved
+destination; a Send that fails keeps it with the draft and files. Reading on,
+even inside a bounded box, supersedes a ↓ or question still loading. A wheel,
+swipe or key over a bounded box moves that box, not the conversation, until the
+box reaches its edge.
+A scrollbar drag follows new replies only when released at the live edge; a
+wheel, swipe or key reading down follows once its scrolling ends there.
+Expanding a line or receiving its full output leaves it in place; only a newer
+line moves a card timeline to its end.
+New replies remain below in the same live conversation without moving the passage.
+
+The common `Load more history` control retries a failed read, fills a known
+missing continuation toward the present, then reads older portions. A positive
+scroll gesture at an unambiguous reading edge may load a bounded continuation;
+a short portion, resize or media layout alone starts no archive read. Empty
+physical pages are traversable and never mean EOF. The existing floating
+`Scroll to latest message` remains the explicit return to the present; when the
+present is already loaded it moves there and follows without a read, and a gap
+note stays. A clean read of the present supersedes an earlier failed one and its
+note.
+
+When loaded fragments are disconnected or their coverage is uncertain, the
+same readable note stays in Main and Project header chrome: `Some saved history
+is not loaded. Shown messages may have gaps.` A failed read says so distinctly.
+Bytes written after a read found a source empty count as missing until a
+later read delivers them from its start.
+Mixed task cards
+keep one node and use this general note: dates, common
+row IDs and an exhausted cursor cannot establish a separator or full coverage.
+`Beginning of saved history` requires complete delivered physical coverage.
+Retained origins say `Saved project context`; a matching canonical source row
+adopts that node and removes the label. The context itself certifies no archive
+coverage. A missing exact bookmark falls back to its card, then a row on the
+same loaded page, then the previous clamped position. The same persistent note
+explains the approximation until explicit navigation clears it.
+Visible rows and card lines, selection, focus and expanded Reviews keep their
+actual nodes during reconciliation.
+Reopening a nested line reads that line's supplying physical page before using a
+card-wide fallback, and restores expansion and full-output hydration. Its logical
+reading identity and physical source survive replay even when equal or older
+content is rejected; neither source adoption nor reopening rolls back revisions.
 
 ### Project work pointer
 
@@ -542,12 +768,10 @@ leads to an unfinished represented root, or the latest represented root when all
 are finished. It occupies one line: it names the card (its coined name, else its
 title) and ellipsizes rather than restating a status headline in full, so the status bar
 never grows into the reading area; the complete text stays on the card itself,
-one click away, not in a mouse-only tooltip. A default desktop panel keeps the
-pointer, the coverage note and the status pill on one row while the pill is
-short (Online, Working, Thinking, Sending, Queued); a longer pill, a narrower
-panel or a phone wraps the bar to a second row, never a third. It states `Loaded messages only`
-unless history coverage is complete; without a represented card the pointer and
-that note are hidden, which is not a claim that the Project has no work.
+one click away, not in a mouse-only tooltip. The pointer and status pill share the
+bar; the common history note wraps below them when needed, readable on touch
+screens. Without a represented card the pointer is hidden; uncertainty, failure
+and approximation remain visible through the shared history status.
 Navigation moves the conversation to the existing card without changing the next
 message's recipient, opening another work pane or manufacturing activity.
 
@@ -621,8 +845,9 @@ not child-task cards and never prove execution by themselves.
   nor awaited (a settled failure, an expired window, lost custody, a refusal)
   adds `· m unavailable` and keeps the warning tone beside the awaited slots; a
   settled plan wave with no awaited slot reads its `no verdict` line in the
-  neutral tone (an acceptance panel with none still keeps the warning tone and
-  its `DEGRADED` verdict), and each unavailable plan reviewer row names the
+  neutral tone (an acceptance panel with none reads the same line but keeps the
+  warning tone; its stored `DEGRADED` stays in the attempt detail), and each
+  unavailable plan reviewer row names the
   model and quotes the engine's reported sentence when one exists — the
   failure code stays in the task detail and Logs.
 - A plan wave the mind ordered weaker than the owner's effort setting says so in
@@ -813,14 +1038,26 @@ with `ensure_project_scope` lives there; Main retains its Started annotation.
 `N notes` in the collapsed header counts timeline items, the evidence row
 among them.
 
+Delegated executor activity keeps its own attributed voice in the root or child
+timeline. Messages lead; thinking stays folded in its own details, and routine
+technical events collapse into counts with per-event detail under Expand.
+Problems, unread ranges and omitted previews stay visible with a full-source
+reference. Preview limits include serialized size; they never erase the carrier
+or its source. Overlapping reads deduplicate by sequence identity, retaining any
+unseen tail's omission notice; equal words alone are not duplicates. A stream end
+before the observed cursor states unresolved coverage. Live, reconnect and replay
+use the same projection. Telegram reserves room for problems and incompleteness
+beside its disclosed speech preview and keeps the complete task reference.
+
 The block's chrome follows the work it stands on
 (`web/modules/chat.js::blockHasWork`, the presence facts minus open attention
 and minus a bare terminal outcome), never the lane that ran the turn (owner
 decision 16.09: real work is a task card, a greeting is nothing). A block with
 work — a review group, a child card, an evidence or narration row, a tool
 error — is the task card whether a managed root or a direct
-conversation turn produced it: a title (the coined name, the latest narration
-headline, or the `Working…`/`Task activity` placeholder), the status chip, Stop
+conversation turn produced it: a title (the coined name or the latest narration
+headline; a finished card with neither reads `Task activity`, a running one
+stays untitled because its status chip already says Working), the status chip, Stop
 while the host attests it, and `Turn into project` in Main unless its origin is
 already bound (a direct turn's later rows then route to the Project room like a
 turn that called `ensure_project_scope`). A nested child card is work inside
@@ -863,7 +1100,7 @@ calls, without error, is a receipt row too — live from the stamped frames, on
 reload from `routing_tool_calls`. So a turn that only
 addressed work («turn this into a project») draws no block, live or on reload:
 the annotation on the owner message and the managed root's own card are its
-whole record (owner decision 11.09). A failed addressing call is an error row
+whole record (owner decision 11.09). Successful local completion acts use the same receipt semantics through the host's `completion_control` fact and `completion_tool_calls` aggregate. They keep their actual call count without manufacturing work, and failed completion calls keep their error. A failed addressing call is an error row
 and therefore content, as is any recorded tool error. A REFUSED addressing act
 is told where the work lives and never in Ouroboros's voice (owner 16.09): the
 receipt line states the cause in the owner's words, the failed call stays the
@@ -910,9 +1147,12 @@ Permanent group-wide Local changes remain in Models.
 A pool confirmed to contain both accounts requiring sign-in and accounts waiting
 for quota says "Waiting for access" and names both causes. It keeps automatic
 continuation and opens Accounts without selecting a profile or initiating login.
-Unknown pool availability is not this state. The confirmed quota component uses
-the same execution-clock pause; an authentication-only wait still consumes that
-clock, and calendar deadlines stay fixed.
+A dated pool refusal without a confirmed cause says "Waiting for an account",
+retains the engine's reset forecast and keeps automatic continuation without
+claiming quota exhaustion or guaranteed availability. It never offers sign-in.
+Only confirmed quota pauses the execution clock; authentication and unconfirmed
+availability waits consume it. Calendar deadlines remain fixed. Configured
+fallback routes are tried before a wait card is shown.
 
 A submitted action is shown as pending until the task reports its application.
 A saved Settings change and a still-pending task change are disclosed separately.
@@ -1141,14 +1381,13 @@ reason the subscription belongs to the client rather than to a room. That is
 deliberate for the first version: we measure how it feels before adding clever
 exceptions.
 
-**Three authorities, one surface.** Every category is one of three kinds:
+**Two authorities, one surface.** Every category is one of two kinds:
 
 | Category | Kind | What decides |
 |---|---|---|
 | A question or decision is waiting | required | a confirmed lifecycle fact: the question carries a positive wait |
 | A task finished or stopped | required | a positive typed terminal fact on a ROOT task |
-| Messages Ouroboros sends while working | LLM-first | Ouroboros chose to speak outside the turn's answer (a proactive message, or an optional question) |
-| Reminders and notices from skills and Ouroboros | skill-first | a reviewed skill, or a model-free schedule, handed the host one finished sentence for the owner (an `owner_notification` event) |
+| Messages Ouroboros sends while working | LLM-first | Ouroboros chose to speak outside the turn's answer (a proactive message in its room or as a Main notice, or an optional question) |
 | Ordinary replies in Main | separate toggle | an ordinary finished reply in the Main thread |
 
 *Required* means the application asks for delivery from its own state rather
@@ -1163,18 +1402,6 @@ mind's; the client only carries it. Stated precisely because the tool contract
 asks for such a message at the START of long work as well: this category means
 "Ouroboros said something while working", not a claim that it weighed whether
 to interrupt you. Judge it by use and turn it off if it is too chatty.
-
-*Skill-first* is a sentence somebody else finished: a reviewed skill with the
-`notify_owner` grant (a calendar's "meeting in 15 minutes"), or a reminder the
-scheduler fires at its instant without a model turn. The host delivers it as
-one event and never judges it; it is not a chat row, so nothing about the
-delivered notice enters the transcript or the mind's context (a deferred
-reminder's sentence is a schedule row Ouroboros can list and cancel), and the banner names its source
-("Reminder from calendar") while the sentence itself stays behind the text
-toggle. Having no source in the transcript, a click opens the conversation.
-While no client is running the same event still reaches the owner through the
-Telegram skill's own subscription (its off-by-default "notices" toggle) — the
-separate path above, not an escalation by this client.
 
 **What never notifies.** Progress, a transient failure, one tool's error and a
 reviewer's finding are not notifications; they stay in the transcript. A child

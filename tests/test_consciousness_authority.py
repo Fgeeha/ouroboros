@@ -683,11 +683,10 @@ def test_observe_does_without_the_work_starting_review_verb():
     # The GitHub write verbs change the world beyond the repository (PLAN §5.4: Observe keeps the reads only).
     for verb in ("create_github_issue", "comment_on_issue", "comment_on_pr", "close_github_issue"):
         assert verb in ca.OBSERVE_DISABLED and verb not in ca.ACT_DISABLED, verb
-    for verb in ("list_github_prs", "get_github_pr", "list_github_issues", "get_github_issue"):
+    for verb in ("list_github_prs", "get_github_pr", "get_github_checks", "list_github_issues", "get_github_issue"):
         assert verb not in ca.OBSERVE_DISABLED, verb
-    # The two built-in execution verbs (astra scope round 5): a skill's script, a push + CI run.
-    for verb in ("skill_exec", "run_ci_tests"):
-        assert verb in ca.OBSERVE_DISABLED and verb not in ca.ACT_DISABLED, verb
+    # The built-in execution verb (astra scope round 5): a skill's script.
+    assert "skill_exec" in ca.OBSERVE_DISABLED and "skill_exec" not in ca.ACT_DISABLED
 
 
 def test_deep_review_request_carries_the_origin_to_the_one_door(tmp_path, monkeypatch):

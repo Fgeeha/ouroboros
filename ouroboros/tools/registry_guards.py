@@ -347,13 +347,14 @@ def disabled_tools_dispatch_only(ctx: Any) -> bool:
 _GITHUB_TOKEN_TOOLS = frozenset({
     "list_github_prs",
     "get_github_pr",
+    "get_github_checks",
     "comment_on_pr",
+    "pr_merge",
     "list_github_issues",
     "get_github_issue",
     "comment_on_issue",
     "close_github_issue",
     "create_github_issue",
-    "run_ci_tests",
     "submit_skill_to_hub",
     "generate_evolution_stats",
 })
@@ -384,7 +385,7 @@ def _builtin_tool_availability(name: str, ctx: Any = None) -> tuple[bool, str, s
             return True, "", ""
     if tool in _GITHUB_TOKEN_TOOLS:
         detail = "GITHUB_TOKEN"
-        if tool in {"run_ci_tests", "submit_skill_to_hub", "generate_evolution_stats"}:
+        if tool in {"submit_skill_to_hub", "generate_evolution_stats"}:
             configured = bool(os.environ.get("GITHUB_TOKEN", "").strip())
         else:
             from ouroboros.tools.github import github_cli_configured

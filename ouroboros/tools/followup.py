@@ -8,11 +8,14 @@ while changing one (including restoring a disabled/suppressed row) stays with
 the owner/root turn and is audited with a reason.  Observe visibility does not
 change that original schedule authority.
 
-``schedule_followup`` registers a one-shot or recurring 5-field cron entry
-in the existing supervisor table. By default its due occurrence enqueues an
-ordinary root task; ``notify=true`` instead delivers the objective as a plain
-owner notification without a model call at firing. The same two-entry cap,
-transaction and lifecycle govern both kinds. No second scheduler exists.
+``schedule_followup`` is the W=A wait affordance: when waiting for an
+external instant (a subscription window reset, an embargo, a slow dependency) beats
+burning rounds, the agent registers a one-shot follow-up in the supervisor's
+scheduled-task table (``state/scheduled_tasks.json``). A task may also register a
+recurring 5-field cron follow-up through that same table. The supervisor's ordinary
+scheduler tick enqueues either form as an ordinary ROOT task (normal admission,
+normal budget). No second scheduler exists: this module only reaches the table the
+supervisor already consumes.
 
 Authority is narrower than the parent's, not wider: a delegated subagent may not
 mint future root tasks (typed refusal), the objective is the agent's own plain
@@ -23,7 +26,7 @@ records.
 
 from __future__ import annotations
 
-from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
+from ouroboros.tools.tool_result import ToolResult, _publish_tool_result, publish_no_effect
 
 import json
 import uuid
@@ -43,7 +46,7 @@ _MAX_CONTEXT_CHARS = 8_000
 
 def _manage_schedules(
     ctx: ToolContext, action: str = "list", schedule_id: str = "", reason: str = "",
-    offset: int = 0, limit: int = 20,
+    offset: int = 0, limit: int = 20, expected_hold_id: str = "", relation: str = "",
 ) -> str:
     """See, or apply one narrow audited change to, the rows already in the table.
 
@@ -59,12 +62,12 @@ def _manage_schedules(
 
     operation = str(action or "list").strip().lower()
     if presence_caller_binding(ctx) is not None:  # a speaker, or work acting for its binding
-        return _publish_tool_result(ctx, ToolResult(
+        return publish_no_effect(ctx, ToolResult(
             status="blocked", code="RESOURCE_CONSTRAINT_BLOCKED",
             text="⚠️ RESOURCE_CONSTRAINT_BLOCKED: a Presence conversation cannot read or change owner schedules.",
         ))
     if operation != "list" and not _root_schedule_mutation_authorized(ctx):
-        return _publish_tool_result(ctx, ToolResult(
+        return publish_no_effect(ctx, ToolResult(
             status="blocked", code="RESOURCE_CONSTRAINT_BLOCKED",
             text=(
                 "⚠️ RESOURCE_CONSTRAINT_BLOCKED: a delegated task may only read schedules "
@@ -77,22 +80,24 @@ def _manage_schedules(
         from ouroboros.tool_capabilities import tool_result_limit
         result_limit = tool_result_limit("manage_schedules")
         if operation == "list":
-            return json.dumps(schedule_tool_projection(load_schedule_store(root),
+            from supervisor.followup_policy import observed_store
+            return json.dumps(schedule_tool_projection(observed_store(root, load_schedule_store(root)),
                                                        offset=offset, limit=limit,
                                                        result_limit=result_limit),
                               ensure_ascii=False, sort_keys=True,
                               separators=(",", ":"))
         if operation not in SCHEDULE_ACTIONS:
-            return json.dumps({"ok": False, "status": "invalid_action",
-                               "allowed": ["list", *sorted(SCHEDULE_ACTIONS)]}, sort_keys=True)
+            return publish_no_effect(ctx, json.dumps({"ok": False, "status": "invalid_action",
+                               "allowed": ["list", *sorted(SCHEDULE_ACTIONS)]}, sort_keys=True), tool_name="manage_schedules")
         # Preserve selectors verbatim. Refuse an identity that cannot fit in a
         # truthful receipt before changing anything, rather than cutting it.
         if len(json.dumps(str(schedule_id or ""), ensure_ascii=False)) > result_limit - 2_000:
-            return json.dumps({"ok": False, "changed": False, "status": "identity_too_large",
-                               "audit": "not_written", "detail": "Schedule identity exceeds the tool result limit; nothing changed."})
+            return publish_no_effect(ctx, json.dumps({"ok": False, "changed": False, "status": "identity_too_large",
+                               "audit": "not_written", "detail": "Schedule identity exceeds the tool result limit; nothing changed."}), tool_name="manage_schedules")
         outcome = mutate_scheduled_task(
             operation, schedule_id, reason=reason, actor="agent",
-            task_id=str(getattr(ctx, "task_id", "") or ""), drive_root=root)
+            task_id=str(getattr(ctx, "task_id", "") or ""), drive_root=root,
+            expected_hold_id=expected_hold_id, relation=relation)
     except ScheduleRefused as exc:
         # Same typed marker the sibling refusals carry: the text channel is the
         # registered ABI, so a refusal must be legible there and not only in the
@@ -153,9 +158,9 @@ def get_tools() -> List[ToolEntry]:
             schema={
                 "name": "schedule_followup",
                 "description": (
-                    "Register a deferred follow-up. By default the supervisor enqueues an ordinary "
-                    "root task; notify=true instead delivers objective as a plain owner notification "
-                    "without a model turn when it fires. Root tasks only; subagents report "
+                    "Register a deferred follow-up task that the supervisor scheduler "
+                    "enqueues as an ordinary root task. Explicitly choose related work (original "
+                    "verified money/deadline and Stop controls) or independent work. Root tasks only; subagents report "
                     "the proposed follow-up to their parent. Supply exactly one trigger: run_at "
                     "for a one-shot ISO 8601 instant (naive = UTC), or cron for a recurring "
                     "5-field expression with an optional IANA timezone. Write the objective "
@@ -167,6 +172,8 @@ def get_tools() -> List[ToolEntry]:
                 "parameters": {
                     "type": "object",
                     "properties": {
+                        "relation": {"type": "string", "enum": ["related", "independent"],
+                                     "description": "Explicit relationship to this work. Related preserves its original money and hard deadline; independent is separate work. Author/cron/text do not decide this."},
                         "run_at": {
                             "type": "string",
                             "description": "One-shot ISO 8601 instant to fire at/after (naive = UTC).",
@@ -183,10 +190,9 @@ def get_tools() -> List[ToolEntry]:
                             "type": "string",
                             "description": (
                                 "Plain-language objective for the future task, in your own words "
-                                f"(max {_MAX_OBJECTIVE_CHARS} chars for a task, 1000 for notify; longer is a typed refusal, never truncated)."
+                                f"(max {_MAX_OBJECTIVE_CHARS} chars; longer is a typed refusal, never truncated)."
                             ),
                         },
-                        "notify": {"type": "boolean", "description": "True: deliver objective as a model-free plain notification at the trigger; default false enqueues a task."},
                         "context": {
                             "type": "string",
                             "description": (
@@ -195,7 +201,7 @@ def get_tools() -> List[ToolEntry]:
                             ),
                         },
                     },
-                    "required": ["objective"],
+                    "required": ["objective", "relation"],
                 },
             },
             handler=_handle_schedule_followup,
@@ -205,17 +211,17 @@ def get_tools() -> List[ToolEntry]:
             "name": "manage_schedules",
             "description": (
                 "See and govern your own existing supervisor schedules. action='list' shows every "
-                "row with its lifecycle: active, disabled, suppressed (a skill row you stopped) or "
-                "consumed (a one-shot that already fired). disable/delete stop FUTURE dispatch — a "
-                "task already admitted from the schedule keeps running — and restore brings a "
-                "suppressed or disabled row back, re-checking the skill rather than enabling it (a reminder "
-                "row simply re-arms). "
+                "row with its lifecycle and relationship: active, disabled, held, waiting, suppressed, "
+                "consumed (a one-shot that already fired) or delete_pending. disable/delete stop FUTURE "
+                "dispatch — a task already admitted from the schedule keeps running — and restore brings a "
+                "suppressed or disabled row back, re-checking the skill rather than enabling it. A deleted "
+                "row still owed accepted work stays delete_pending (a follow-up of your work: until its "
+                "task settles) and then disappears. Generic restore can cancel a pending deletion; "
+                "Held restore requires the observed hold_id; an unknown relation must first be resolved. "
+                "Exact hold release preserves enabled/deletion state, pending task identity, money/deadline and other holds. "
                 "Every change needs a concrete reason and is audited. A consumed one-shot is "
                 "history: schedule a new run_at instead of trying to re-arm it. Deleting a skill "
                 "row keeps it as a suppressed record so the skill lifecycle cannot resurrect it. "
-                "A kind='notify' row is a model-free reminder: Disable holds a skill's key "
-                "suppressed against re-posts until Restore; Delete removes the row immediately "
-                "and the skill may schedule it again. "
                 "Only your own root turn may change a schedule; a delegated task may only list. "
                 "list accepts offset and limit (bounded pages) and returns total/next_offset; "
                 "each row contains only a bounded objective preview, never full context."
@@ -224,6 +230,8 @@ def get_tools() -> List[ToolEntry]:
                 "action": {"type": "string", "enum": ["list", "disable", "delete", "restore"]},
                 "schedule_id": {"type": "string", "description": "Schedule id for a change."},
                 "reason": {"type": "string", "description": "Why this change is needed."},
+                "expected_hold_id": {"type": "string", "description": "Exact hold_id from list, required to restore a held row. A stale identity refuses."},
+                "relation": {"type": "string", "enum": ["related", "independent"], "description": "Resolve a legacy unknown relationship on restore. Related must bind the existing origin; no fresh budget is inferred."},
                 "offset": {"type": "integer", "minimum": 0, "description": "Zero-based list offset."},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 20, "description": "Rows per list page (max 20; responses stay bounded)."},
             }, "required": ["action"], "additionalProperties": False},
@@ -275,9 +283,8 @@ def _pending_followups(records: List[Dict[str, Any]], task_id: str) -> List[Dict
             continue
         if str(record.get("source") or "") != FOLLOWUP_SOURCE:
             continue
-        template = record.get("task") if isinstance(record.get("task"), dict) else {}
-        metadata = template.get("metadata") if isinstance(template.get("metadata"), dict) else {}
-        if str(metadata.get("origin_task_id") or record.get("origin_task_id") or "") == task_id:
+        from supervisor.followup_policy import origin_of
+        if origin_of(record).get("task_id") == task_id:
             out.append(record)
     return out
 
@@ -295,26 +302,18 @@ def _naive_instant(raw: str) -> bool:
 def _handle_schedule_followup(ctx: ToolContext, **params) -> str:
     if _is_delegated_subagent(ctx):
         return (
-            _publish_tool_result(ctx, ToolResult(status="blocked", code="ACCESS_BLOCKED", text=("ERROR: FOLLOWUP_SUBAGENT_REFUSED: a delegated subagent holds narrower-than-parent "
+            publish_no_effect(ctx, ToolResult(status="blocked", code="ACCESS_BLOCKED", text=("ERROR: FOLLOWUP_SUBAGENT_REFUSED: a delegated subagent holds narrower-than-parent "
             "authority and may not mint future root tasks. Report the wait instant to your "
             "parent instead; the parent (or the owner) decides whether to schedule a follow-up.")))
         )
     task_id = str(getattr(ctx, "task_id", "") or "").strip()
     if not task_id:
-        return _publish_tool_result(ctx, ToolResult(status="unavailable", code="CAPABILITY_UNAVAILABLE", text=("ERROR: FOLLOWUP_TASK_ID_REQUIRED: a durable follow-up must belong to a real task.")))
-    notify = params.get("notify", False)
-    if not isinstance(notify, bool):
-        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text="ERROR: FOLLOWUP_NOTIFY_INVALID: notify must be a boolean."))
-    if notify and presence_caller_binding(ctx) is not None:
-        # Presence's positive ceiling selects a tool name, not its arguments.
-        # A model-free owner notification has no Presence destination or carrier.
-        return _publish_tool_result(ctx, ToolResult(status="blocked", code="RESOURCE_CONSTRAINT_BLOCKED",
-            text="ERROR: FOLLOWUP_NOTIFY_PRESENCE_REFUSED: Presence may schedule its selected follow-up task, not an owner notification."))
+        return publish_no_effect(ctx, ToolResult(status="unavailable", code="CAPABILITY_UNAVAILABLE", text=("ERROR: FOLLOWUP_TASK_ID_REQUIRED: a durable follow-up must belong to a real task.")))
     run_at_raw = str(params.get("run_at") or "").strip()
     cron = str(params.get("cron") or "").strip()
     if bool(run_at_raw) == bool(cron):
         return (
-            _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=("ERROR: FOLLOWUP_TRIGGER_REQUIRED: supply exactly one of run_at (one-shot) "
+            publish_no_effect(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=("ERROR: FOLLOWUP_TRIGGER_REQUIRED: supply exactly one of run_at (one-shot) "
             "or cron (recurring).")))
         )
     timezone = str(params.get("timezone") or "").strip()
@@ -325,7 +324,7 @@ def _handle_schedule_followup(ctx: ToolContext, **params) -> str:
             if _naive_instant(run_at_raw):
                 # A zone beside a run_at WITHOUT an offset asks for something: ignoring it would
                 # schedule the naive time as UTC, hours away from what was meant.
-                return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(
+                return publish_no_effect(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(
                     f"ERROR: FOLLOWUP_TIMEZONE_WITH_RUN_AT: run_at={run_at_raw!r} carries no UTC offset and "
                     f"timezone={timezone!r} applies only to recurring cron follow-ups. Put the offset into run_at "
                     "(example: 2026-08-19T12:20:00+03:00) and omit timezone. Nothing was scheduled.")))
@@ -335,7 +334,7 @@ def _handle_schedule_followup(ctx: ToolContext, **params) -> str:
             timezone = ""
         if instant is None:
             return (
-                _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(f"ERROR: FOLLOWUP_RUN_AT_INVALID: {run_at_raw!r} is not a parseable ISO 8601 "
+                publish_no_effect(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(f"ERROR: FOLLOWUP_RUN_AT_INVALID: {run_at_raw!r} is not a parseable ISO 8601 "
                 "instant. Example: 2026-08-19T12:20:00+03:00 (naive times read as UTC).")))
             )
         trigger = {"type": "once", "run_at": instant.isoformat()}
@@ -343,31 +342,24 @@ def _handle_schedule_followup(ctx: ToolContext, **params) -> str:
         from ouroboros.schedule_contract import cron_error, timezone_error
 
         if error := cron_error(cron):
-            return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(f"ERROR: FOLLOWUP_CRON_INVALID: {error}")))
+            return publish_no_effect(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(f"ERROR: FOLLOWUP_CRON_INVALID: {error}")))
         if error := timezone_error(timezone):
-            return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(f"ERROR: FOLLOWUP_TIMEZONE_INVALID: {error}")))
+            return publish_no_effect(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(f"ERROR: FOLLOWUP_TIMEZONE_INVALID: {error}")))
         trigger = {"type": "cron", "expr": cron}
     objective = str(params.get("objective") or "").strip()
     if not objective:
-        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=("ERROR: FOLLOWUP_OBJECTIVE_REQUIRED: write the future task's objective in plain language.")))
+        return publish_no_effect(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=("ERROR: FOLLOWUP_OBJECTIVE_REQUIRED: write the future task's objective in plain language.")))
     # Typed refusal, never a silent cut: the text rides VERBATIM into the future
     # task, so truncating it here would silently change what that task is.
     if len(objective) > _MAX_OBJECTIVE_CHARS:
         return (
-            _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(f"ERROR: FOLLOWUP_TEXT_TOO_LONG: objective is {len(objective)} chars; the limit is "
+            publish_no_effect(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(f"ERROR: FOLLOWUP_TEXT_TOO_LONG: objective is {len(objective)} chars; the limit is "
             f"{_MAX_OBJECTIVE_CHARS}. Shorten it — nothing was truncated and nothing was scheduled.")))
         )
     context = str(params.get("context") or "").strip()
-    if notify and context:
-        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text="ERROR: FOLLOWUP_NOTIFY_CONTEXT: a notification has only plain objective text; omit context."))
-    if notify:
-        from ouroboros.event_bus import OWNER_NOTIFICATION_TEXT_CHARS
-
-        if len(objective) > OWNER_NOTIFICATION_TEXT_CHARS:
-            return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=f"ERROR: FOLLOWUP_NOTIFY_TEXT_TOO_LONG: notification text exceeds {OWNER_NOTIFICATION_TEXT_CHARS} characters."))
     if len(context) > _MAX_CONTEXT_CHARS:
         return (
-            _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(f"ERROR: FOLLOWUP_TEXT_TOO_LONG: context is {len(context)} chars; the limit is "
+            publish_no_effect(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(f"ERROR: FOLLOWUP_TEXT_TOO_LONG: context is {len(context)} chars; the limit is "
             f"{_MAX_CONTEXT_CHARS}. Shorten it — nothing was truncated and nothing was scheduled.")))
         )
     from ouroboros.tool_access import canonical_data_root
@@ -376,7 +368,15 @@ def _handle_schedule_followup(ctx: ToolContext, **params) -> str:
     try:
         drive_root = canonical_data_root(ctx)
     except Exception as exc:
-        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ERROR", text=(f"ERROR: FOLLOWUP_DATA_ROOT_UNRESOLVED: {exc}")))
+        return publish_no_effect(ctx, ToolResult(status="error", code="TOOL_ERROR", text=(f"ERROR: FOLLOWUP_DATA_ROOT_UNRESOLVED: {exc}")))
+    from supervisor.followup_policy import resolve_relation
+    origin = {"task_id": task_id, "root_task_id": str(getattr(ctx, "root_task_id", "") or
+              (getattr(ctx, "task_metadata", None) or {}).get("root_task_id") or task_id)}
+    try:
+        relation = resolve_relation(drive_root, origin, params.get("relation"), declared_by=task_id)
+    except ValueError as exc:
+        return publish_no_effect(ctx, ToolResult(status="unavailable", code="CAPABILITY_UNAVAILABLE",
+                                    text=f"FOLLOWUP_REFUSED: {exc}"))
     # The cap is read from the table this call is about to write, so the count
     # and the write share ONE transaction: two tasks registering at once would
     # otherwise each read the same under-cap count and both land.
@@ -385,7 +385,7 @@ def _handle_schedule_followup(ctx: ToolContext, **params) -> str:
     try:
         with schedule_transaction(drive_root):
             return _register_followup(ctx, task_id, drive_root, objective, context,
-                                      trigger, cron, timezone, timezone_note, notify)
+                                      trigger, cron, timezone, timezone_note, origin, relation)
     except ScheduleStoreUnreadable as exc:
         # A missed table lock (ScheduleLockTimeout) or an unparseable table: the
         # follow-up was NOT registered, and the refusal says so in the text ABI
@@ -409,7 +409,7 @@ def followup_resource_intent(ctx: Any, metadata: Any, project_id: str) -> Dict[s
 
 def _register_followup(ctx: ToolContext, task_id: str, drive_root: Any,
                        objective: str, context: str, trigger: Dict[str, Any], cron: str,
-                       timezone: str, timezone_note: str, notify: bool = False) -> str:
+                       timezone: str, timezone_note: str, origin: dict, relation: dict) -> str:
     """The cap read, the record build and the write — all under the schedule lock."""
     from supervisor.queue import list_scheduled_tasks, upsert_scheduled_task
 
@@ -441,39 +441,6 @@ def _register_followup(ctx: ToolContext, task_id: str, drive_root: Any,
     source_chat_id = getattr(ctx, "current_chat_id", None)
     if source_chat_id in (None, "") and isinstance(metadata_src, dict):
         source_chat_id = metadata_src.get("chat_id")
-    if notify:
-        # The same table and cap, but no task template or future model turn.
-        # The row id supplies a stable identity for each scheduled occurrence.
-        record = {
-            "id": f"followup-{task_id}-{uuid.uuid4().hex[:6]}",
-            "name": "Reminder from Ouroboros", "description": objective,
-            "kind": "notify", "source": FOLLOWUP_SOURCE,
-            "origin_task_id": task_id, "enabled": True,
-            "timezone": timezone, "trigger": trigger,
-            "notification": {"text": objective, "key": ""},
-            **({"chat_id": source_chat_id} if source_chat_id not in (None, "") else {}),
-        }
-        from supervisor.queue import ScheduleRefused
-
-        try:
-            stored = upsert_scheduled_task(
-                record, drive_root=drive_root, actor="agent:schedule_followup",
-                task_id=task_id, reason=f"model-free reminder registered by task {task_id}")
-        except ScheduleRefused as exc:
-            return _publish_tool_result(ctx, ToolResult(
-                status="unavailable", code="CAPABILITY_UNAVAILABLE",
-                text=f"⚠️ CAPABILITY_UNAVAILABLE: FOLLOWUP_REFUSED: {exc.status}: {exc}"))
-        except OSError as exc:
-            return _publish_tool_result(ctx, ToolResult(
-                status="unavailable", code="CAPABILITY_UNAVAILABLE",
-                text=f"⚠️ CAPABILITY_UNAVAILABLE: FOLLOWUP_NOTIFY_OUTCOME_UNKNOWN: schedule write failed ({type(exc).__name__}); inspect the schedule id {record['id']} before retrying."))
-        timing = f"once at/after {trigger['run_at']}" if trigger["type"] == "once" else f"recurring cron {cron} ({timezone or 'system local time'})"
-        audit = str(stored.get("audit") or "")
-        note = "" if audit == "recorded" else f" AUDIT_INCOMPLETE: durable row, audit={audit or 'unknown'}."
-        return (f"FOLLOWUP_SCHEDULED: notification {stored['id']} registered for {timing}. "
-                "The supervisor will deliver its plain text without starting a model task; "
-                f"pending follow-ups: {len(pending) + 1}/{_MAX_PENDING_FOLLOWUPS}. "
-                f"Disable/Restore or Delete in Schedules governs it.{note}{timezone_note}")
     record = {
         "id": f"followup-{task_id}-{uuid.uuid4().hex[:6]}",
         "name": f"Follow-up of task {task_id}",
@@ -527,6 +494,7 @@ def _register_followup(ctx: ToolContext, task_id: str, drive_root: Any,
         stored = upsert_scheduled_task(
             record, drive_root=drive_root, actor="agent:schedule_followup", task_id=task_id,
             reason=f"follow-up registered by task {task_id}",
+            host_followup={"followup_origin": origin, "followup_relation": relation},
             # Host-authored provenance of a NAMED continuation (never payload/prose):
             # it keeps a consciousness follow-up out of the spontaneous-start cap.
             continuation_of={"task_id": task_id, "root_task_id": str(root_task_id or "") or task_id})
@@ -554,9 +522,11 @@ def _register_followup(ctx: ToolContext, task_id: str, drive_root: Any,
         f"be written (audit={audit or 'unknown'}), so this registration is not fully "
         "accounted for in logs/events.jsonl.")
     return (
-        f"FOLLOWUP_SCHEDULED: follow-up {stored.get('id')} registered as {timing}. It will "
-        "enqueue ordinary root tasks through the supervisor scheduler under normal admission; "
+        f"FOLLOWUP_SCHEDULED: follow-up {stored.get('id')} registered as {timing}. Future enqueue "
+        "requires eligible relationship/controls and ordinary supervisor admission; "
         f"pending follow-ups for this task: {len(pending) + 1}/{_MAX_PENDING_FOLLOWUPS}. The "
         f"record is durable in state/scheduled_tasks.json and {lifecycle}; the owner can "
-        f"disable or delete it from the Schedules surface.{audit_note}{timezone_note}"
+        f"disable or delete it from the Schedules surface. Relationship: {relation['kind']}; "
+        f"hold: {stored.get('followup_hold') or 'none'}; wait: {stored.get('followup_wait') or 'none'}."
+        f"{audit_note}{timezone_note}"
     )

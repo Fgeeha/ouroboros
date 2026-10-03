@@ -63,7 +63,7 @@ export function setReviewAnchor(record, enabled, writePhase) {
     } else {
         writePhase(record, 'working');
         if (!record.suggestedName && !record.lastHumanHeadline) {
-            record.titleEl.textContent = 'Working...';
+            record.titleEl.textContent = '';  // the chip says Working; the title waits for a name (#1369)
         }
         record.inlineTypingEl.style.display = '';
     }
@@ -880,11 +880,11 @@ export function taskAcceptanceGroupFromTaskDetail(detail, ownerTaskId = '') {
         const verdict = text(panel?.aggregate_signal || 'UNKNOWN');
         const roster = (Array.isArray(panel?.actors) ? panel.actors : []).filter((actor) => actor && typeof actor === 'object');
         const awaited = roster.some(actorAwaiting);
-        // An awaited panel is activity only while its own task still runs to collect it;
-        // afterwards an unanswered slot is a recorded gap, not a degraded verdict.
+        // An awaited panel is activity only while its own task still runs to collect it; afterwards an unanswered
+        // slot is a recorded gap. A settled panel without a verdict says so in words; DEGRADED stays in its detail.
         const live = awaited && text(detail?.status).toLowerCase() === 'running' && !panel?.superseded && index === panels.length - 1;
         const held = { FAIL: 'FAIL', PASS: live ? 'PASS so far' : 'PASS' }[verdict.toUpperCase()] || (live ? 'in progress' : 'no verdict');
-        const [progress, heldTone] = awaited ? heldProgress(held, roster, (actor) => text(actor.transport_status) === 'success') : ['', ''];
+        const [progress, heldTone] = awaited || verdict.toUpperCase() === 'DEGRADED' ? heldProgress(held, roster, (actor) => text(actor.transport_status) === 'success') : ['', ''];
         // The host composed this sentence; the card prints it verbatim and
         // leads the detail with it, because the renderer shows detailText over
         // summary. The panel's own verdict and identity are untouched.
@@ -1158,9 +1158,8 @@ function reviewRevision(value) {
 }
 
 // Revisions are opaque SHA-256 tokens; one distinct token may trail a live GET.
-export function createReviewHydrator({ fetchDetail, applyDetail, onState = () => {} } = {}) {
+export function createReviewHydrator({ fetchDetail, applyDetail, onState = () => {}, onSettled = () => {} } = {}) {
     const states = new Map();
-
     const start = (taskId, state, revision, onDomWrite) => {
         const generation = ++state.generation;
         state.inFlightRevision = revision;
@@ -1191,7 +1190,7 @@ export function createReviewHydrator({ fetchDetail, applyDetail, onState = () =>
                 return false;
             })
             .finally(() => {
-                if (state.inFlight !== request || state.generation !== generation) return;
+                if (states.get(taskId) !== state || state.inFlight !== request || state.generation !== generation) return;
                 state.inFlight = null;
                 state.inFlightRevision = null;
                 const pending = state.pending;
@@ -1199,12 +1198,18 @@ export function createReviewHydrator({ fetchDetail, applyDetail, onState = () =>
                 if (pending && pending.revision !== state.appliedRevision) {
                     start(taskId, state, pending.revision, pending.onDomWrite);
                 }
+                onSettled(taskId);
             });
         state.inFlight = request;
         return request;
     };
 
     return {
+        // Saved Review: errors await Retry; a successful empty/404 permits fallback.
+        ready(taskId) {
+            const state = states.get(taskId);
+            return !state || (!state.inFlight && state.lastStatus !== 'error');
+        },
         hydrate(taskIdValue, revisionValue = null, { onDomWrite = null } = {}) {
             const taskId = text(taskIdValue);
             if (!taskId) return Promise.resolve(false);
@@ -1229,10 +1234,7 @@ export function createReviewHydrator({ fetchDetail, applyDetail, onState = () =>
                 if (revision !== null && revision === state.pending?.revision) {
                     return state.inFlight.then(() => state.inFlight || false);
                 }
-                if (
-                    revision !== null
-                    && revision !== state.inFlightRevision
-                ) {
+                if (revision !== null && revision !== state.inFlightRevision) {
                     state.pending = { revision, onDomWrite };
                     return state.inFlight.then(() => state.inFlight || false);
                 }
@@ -1247,9 +1249,7 @@ export function createReviewHydrator({ fetchDetail, applyDetail, onState = () =>
                 if (state) state.appliedRevision = null;
                 return;
             }
-            // A full DOM rebuild discards the projection that an applied
-            // revision hydrated, but it must retain and join any physical GET
-            // already in flight. Reset only the applied presentation receipt.
+            // Reset the presentation receipt after rebuild; keep joining any physical GET.
             for (const state of states.values()) state.appliedRevision = null;
         },
         clear() {

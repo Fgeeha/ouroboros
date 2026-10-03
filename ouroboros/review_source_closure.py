@@ -51,7 +51,10 @@ def source_carrier(value: dict, key: str, carrier: str) -> str:
         return {'task_contract': 'contract', 'trace_refs': 'trace', 'plan_review_state': 'plan_state',
                 'review_evidence': 'evidence', 'review_projection': 'metadata', 'loop_outcome': 'metadata',
                 'completion_observations': 'metadata', 'owner_wait': 'metadata',
-                'verification_ledger': 'metadata', 'root_phase_checkpoint': 'metadata'}.get(key, '')
+                'verification_ledger': 'metadata', 'root_phase_checkpoint': 'metadata',
+                'acceptance_debt': 'acceptance_debt'}.get(key, '')
+    if carrier == 'acceptance_debt':
+        return 'metadata' if key == 'source_ref' else ''
     if carrier == 'trace':
         return 'response_ref' if key == 'response' else (
             'metadata' if key in {'request', 'llm_call_refs', 'tool_call_refs', 'log_finalization'} else '')
@@ -279,7 +282,40 @@ def _reader_bindings(value: Any, root: pathlib.Path, task_id: str) -> list[dict]
     return list(rows.values())
 
 
-def retain_review_request_sources(request: Any, *, source_root: Any, custody_root: Any) -> None:
+def _retain_historical_sources(request: Any, source: pathlib.Path, read_root: pathlib.Path, debt: dict) -> list[dict]:
+    """Re-address only the frozen subject and its retained HOST carriers.
+
+    No current result, artifact inventory, workspace or tool log substitutes
+    for a historical source. Manifest-only entries remain the subject's gaps.
+    """
+    from ouroboros.acceptance_history import read_acceptance_history, historical_source_location_owned
+    from ouroboros.artifacts import read_actor_source_bytes, task_artifact_dir_path
+    from ouroboros.task_results import load_task_result
+
+    current = load_task_result(source, request.task_id, strict=True) or {}
+    if current.get('acceptance_debt') != debt:
+        raise ValueError('historical debt is not the canonical pin')
+    frozen = read_acceptance_history(source, request.task_id, debt)
+    if request.subject != frozen['answer'] or request.task_attempt != frozen['task_attempt']:
+        raise ValueError('historical request subject mismatch')
+    rows = []
+    for name, ref in [('historical-subject', debt['source_ref']), *[
+            (item['location'], item['source_ref']) for item in frozen.get('sources', [])
+            if historical_source_location_owned(str(item.get('location') or ''))]]:
+        retained = retain_review_refs(ref, source, read_root, request.task_id)
+        # Observability manifests/blobs keep their existing typed reader in the
+        # re-addressed subject. Promotion already verifies their owned bytes.
+        if retained.get('kind') != 'task_source':
+            continue
+        read_actor_source_bytes(read_root, request.task_id, retained)
+        rows.append({'name': name, 'source_path': ref['path'], 'source_ref': retained,
+                     'retained_path': str(task_artifact_dir_path(read_root, request.task_id) / retained['path']),
+                     'status': 'retained'})
+    return rows
+
+
+def retain_review_request_sources(request: Any, *, source_root: Any, custody_root: Any,
+                                  historical_debt: dict | None = None) -> None:
     """Bind typed request refs and named acceptance sources to durable custody.
 
     Call BEFORE review_operation_scope, serialization, prompt caching or dispatch.
@@ -291,6 +327,8 @@ def retain_review_request_sources(request: Any, *, source_root: Any, custody_roo
     from ouroboros.artifacts import read_actor_source_bytes, task_artifact_dir_path
 
     source, custody = pathlib.Path(source_root), pathlib.Path(custody_root)
+    if not source.is_dir():
+        raise ValueError('original_reader_root_unavailable: cannot retain named sources')
     retained = request.policy.get('review_source_closure')
     if retained:
         read_root = pathlib.Path(retained['read_root']).resolve()
@@ -310,7 +348,8 @@ def retain_review_request_sources(request: Any, *, source_root: Any, custody_roo
     parent.mkdir(parents=True, exist_ok=True)
     read_root = pathlib.Path(tempfile.mkdtemp(prefix='request-', dir=parent))
     bound = dataclasses.replace(bound, **retain_review_refs(dataclasses.asdict(bound), custody, read_root, request.task_id, carrier='request'))
-    named = _retain_named_sources(bound, source, read_root, custody) if request.surface == 'task_acceptance' else []
+    named = (_retain_historical_sources(bound, source, read_root, historical_debt) if historical_debt is not None
+             else _retain_named_sources(bound, source, read_root, custody) if request.surface == 'task_acceptance' else [])
     bindings = _reader_bindings(dataclasses.asdict(bound), read_root, request.task_id)
     bound.policy = {**bound.policy, 'native_data_root': str(read_root), 'review_source_closure': {
         'schema_version': 1, 'task_id': request.task_id, 'read_root': str(read_root),
@@ -325,7 +364,7 @@ def promote_source_payload(raw: bytes, *, source_id: str, extension: str, catego
                            task_id: str, state: dict) -> bytes:
     """Close the host-owned review/checkpoint JSON shapes; preserve opaque bytes."""
     from ouroboros.artifacts import store_actor_source_bytes
-    from ouroboros.observability import _rewrite_child_ref_tree
+    from ouroboros.observability import _rewrite_child_ref_tree, _rewrite_service_payload
 
     plan_wave_source = source_id.startswith("plan-review-wave-")
     if extension == "json" and (category == "context_checkpoints" or source_id == "acceptance_tool_trajectory"):
@@ -345,13 +384,30 @@ def promote_source_payload(raw: bytes, *, source_id: str, extension: str, catego
         checkpoint = isinstance(payload, dict) and all(key in payload for key in (
             'messages', 'selection_fingerprint', 'observed_view_revision', 'selected_unit_ids'))
         retained_review = source_id.startswith('review-retrieval-')
-        if plan_wave or plan_history or native_source or checkpoint or retained_review or (isinstance(payload, list) and source_id == "acceptance_tool_trajectory") or (
+        historical = source_id == 'acceptance_historical'
+        if historical and (not isinstance(payload, dict) or payload.get('schema_version') != 1
+                or payload.get('kind') != 'acceptance_historical_subject' or payload.get('task_id') != task_id):
+            raise ValueError('historical acceptance source owner mismatch')
+        if historical or plan_wave or plan_history or native_source or checkpoint or retained_review or (isinstance(payload, list) and source_id == "acceptance_tool_trajectory") or (
             isinstance(payload, dict) and isinstance(payload.get("request"), dict)
             and payload["request"].get("surface") == "task_acceptance"
         ):
             role = 'plan_wave' if plan_wave else 'plan_history' if plan_history else 'task_result' if source_id == 'review-retrieval-task-result' else (
                 'checkpoint' if checkpoint or native_source else 'metadata')
-            rewritten = _rewrite_child_ref_tree(payload, parent_root, child_root, task_id, state, carrier=role)
+            if historical:
+                from ouroboros.acceptance_history import historical_source_location_owned
+                # Only the history writer's locations carry authority. Answers,
+                # owner corpus, contracts and old unowned refs stay literal data.
+                rewritten = {**payload, 'sources': [{**item, 'source_ref':
+                    _rewrite_child_ref_tree(item.get('source_ref'), parent_root, child_root, task_id, state)
+                    if historical_source_location_owned(str(item.get('location') or '')) else
+                    item.get('source_ref')}
+                    for item in payload.get('sources', [])]}
+            elif isinstance(payload, list) and source_id in {'acceptance_tool_trajectory', 'review-retrieval-tool-trajectory'}:
+                rewritten = [_rewrite_service_payload(call, parent_root, child_root, task_id, state)
+                             for call in payload]
+            else:
+                rewritten = _rewrite_child_ref_tree(payload, parent_root, child_root, task_id, state, carrier=role)
             if checkpoint and rewritten != payload:
                 # Capsules bind raw messages/unit identities. Copying their
                 # relative source closure may not rewrite the captured transcript.

@@ -188,7 +188,7 @@ def summarize_source(
     call: LightCall, text: str, spans: List[Tuple[int, int, str]],
     draft_prompt: Callable[[str, str], str], correct_prompt: Callable[[str, str, str], str],
     *, input_limit: Optional[Dict[str, Any]] = None,
-    on_refusal: Optional[Callable[[Dict[str, Any]], None]] = None,
+    on_refusal: Optional[Callable[[Dict[str, Any]], None]] = None, unit: str = "",
 ) -> Tuple[str, Dict[str, Any]]:
     """Draft and then correct one exact source, splitting only to fit its Light route.
 
@@ -203,7 +203,15 @@ def summarize_source(
     are released only from the CORRECTED response: the draft's trailing block
     travels into the correction, where cumulative revisions use its own note
     reads alongside the episode rather than inheriting the draft's read credit.
+
+    Inside a root late phase (owner D10) the whole ``unit``'s confirmed draft
+    survives a correction an owner Pause stopped; the resumed stage offers it
+    once to the correction, which checks it against the CURRENT source — the
+    draft is useful source, never a frozen request or a second paid draft.
     """
+    from ouroboros.post_task_checkpoint import current_late_phase_run
+
+    late = current_late_phase_run() if unit else None
     pending, summaries, usages = [(0, len(text))], [], []
     entries: List[Dict[str, Any]] = []
     from ouroboros.consolidator import _merge_consolidation_usage
@@ -238,13 +246,21 @@ def summarize_source(
     while pending:
         start, end = pending.pop()
         part, note = text[start:end], source_continuation_note(spans, start, end)
-        draft, usage, _draft_knowledge = call(draft_prompt(part, note), "Room summary", fixed_prompt=draft_prompt("", note),
-                                             input_limit=input_limit, call_type="memory_consolidation")
-        usages.append(usage)
+        whole = late is not None and (start, end) == (0, len(text))
+        draft, usage = (late.drafts.pop(unit, "") if whole else ""), {}
+        if not draft:
+            draft, usage, _draft_knowledge = call(draft_prompt(part, note), "Room summary", fixed_prompt=draft_prompt("", note),
+                                                 input_limit=input_limit, call_type="memory_consolidation")
+            usages.append(usage)
         if draft.strip():
-            corrected, usage, knowledge = call(
-                correct_prompt(draft, part, note), "Room correction", fixed_prompt=correct_prompt(draft, "", note),
-                input_limit=input_limit, call_type="memory_correction")
+            try:
+                corrected, usage, knowledge = call(
+                    correct_prompt(draft, part, note), "Room correction", fixed_prompt=correct_prompt(draft, "", note),
+                    input_limit=input_limit, call_type="memory_correction")
+            except BaseException:
+                if whole:  # a stopped correction keeps its confirmed draft for the resumed stage
+                    late.drafts[unit] = draft
+                raise
             usages.append(usage)
             if corrected.strip():
                 # A part's nominations are the corrected response's, released
@@ -332,8 +348,8 @@ def summarize_block(
                                      identity_text=identity_text, continuation_note=note,
                                      knowledge_instruction=knowledge_instruction)
 
-        content, usage = summarize_source(call, room.text, room.spans, draft, correct,
-                                          input_limit=input_limit, on_refusal=on_refusal)
+        content, usage = summarize_source(call, room.text, room.spans, draft, correct, input_limit=input_limit,
+                                          on_refusal=on_refusal, unit=f"{first_ts}|{last_ts}|{room.room_id}")
         usages.append(usage)
         input_limit = usage["_consolidation_retry"]
         entries.extend(usage.get("_knowledge_entries") or [])

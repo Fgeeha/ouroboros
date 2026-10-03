@@ -210,6 +210,8 @@ def test_quota_wait_reprepares_auto_with_the_new_accounts_capacity(tmp_path, cap
 
     monkeypatch.setattr(client, "_chat_remote", remote)
     source = "all source Ж🙂 " * 1500
+    from ouroboros.task_results import write_task_result
+    write_task_result(tmp_path, "consolidation-fixture", "running")
     with model_wait.task_model_wait_scope(
         task={"id": "consolidation-fixture"}, drive_root=tmp_path, event_queue=queue.Queue(),
         worker_slot_held=False, owner_control=lambda: None,

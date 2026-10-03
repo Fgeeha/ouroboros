@@ -17,6 +17,8 @@ import dataclasses
 
 from ouroboros.model_slots import ResolvedModelTarget, _main_model, _parse_model_list
 from ouroboros.provider_models import (
+    _NON_COMPATIBLE_REMOTE_KEYS,
+    compatible_only_main_model,
     compute_direct_review_models_fallback,
     local_only_review_route_env,
     migrate_model_value,
@@ -56,6 +58,21 @@ def _exclusive_direct_remote_provider_env() -> str:
     return direct[0] if len(direct) == 1 else ""
 
 
+def compatible_only_review_model() -> str:
+    """Main's route when the OpenAI-compatible endpoint is the only remote provider (#1116)."""
+    keys = ("OPENAI_COMPATIBLE_BASE_URL", "OUROBOROS_MODEL", "GIGACHAT_USER", "GIGACHAT_PASSWORD",
+            *_NON_COMPATIBLE_REMOTE_KEYS)
+    return compatible_only_main_model({key: runtime_setting(key, "") for key in keys})
+
+
+def _compatible_only_models(models: list[str]) -> list[str]:
+    """An unreachable (non-compatible) list becomes Main repeated; an explicit compatible list stays."""
+    main = compatible_only_review_model()
+    if not main or (models and all(str(m).startswith("openai-compatible::") for m in models)):
+        return models
+    return [main] * max(1, len(models))
+
+
 def direct_provider_review_models_fallback(provider: str) -> list[str]:
     """Return the exact review-models list a direct-provider fallback emits."""
     if provider not in ("openai", "anthropic", "minimax", "cloudru", "gigachat", "deepseek", "zai"):
@@ -90,7 +107,7 @@ def get_review_models() -> list[str]:
     models = [_main_model()] * max(1, len(models)) if local_only_review_route_env() else models
     provider = _exclusive_direct_remote_provider_env()
     if not provider:
-        return models
+        return _compatible_only_models(models)
 
     main_model = str(runtime_setting("OUROBOROS_MODEL", SETTINGS_DEFAULTS["OUROBOROS_MODEL"]) or "").strip()
     main_model = migrate_model_value(provider, main_model)
@@ -163,7 +180,7 @@ def get_scope_review_models() -> list[str]:
     models = [_main_model()] * max(1, len(models)) if local_only_review_route_env() else models
     provider = _exclusive_direct_remote_provider_env()
     if not provider:
-        return models
+        return _compatible_only_models(models)
     migrated = [migrate_model_value(provider, model) for model in models]
     provider_prefix = f"{provider}::"
     if migrated and all(model.startswith(provider_prefix) for model in migrated):

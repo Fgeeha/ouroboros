@@ -20,16 +20,22 @@ def _stop_restart_watcher(server):
     server._restart_requested.clear()
 
 
-def test_lifespan_shutdown_kills_executor_foreground_before_services():
-    import inspect
+@pytest.mark.parametrize("wait", [True, False])
+def test_lifespan_shutdown_kills_executor_foreground_before_services(monkeypatch, tmp_path, wait):
     import server
 
-    source = inspect.getsource(server.lifespan)
-
-    shell_idx = source.index("kill_all_tracked_subprocesses()")
-    foreground_idx = source.index("kill_all_foreground(lifespan_drive_root)")
-    service_idx = source.index("kill_all_services(lifespan_drive_root)")
-    assert shell_idx < foreground_idx < service_idx
+    order = []
+    def shell_failure():
+        order.append("shell")
+        raise OSError("shell custody unavailable")
+    monkeypatch.setattr("ouroboros.tools.shell.kill_all_tracked_subprocesses", shell_failure)
+    monkeypatch.setattr("ouroboros.workspace_executor.kill_all_foreground",
+                        lambda root, **kw: order.append(("foreground", root, kw)))
+    monkeypatch.setattr("ouroboros.tools.services.kill_all_services",
+                        lambda root, **kw: order.append(("services", root, kw)))
+    server._stop_owned_local_processes(tmp_path, wait=wait)
+    assert order == ["shell", ("foreground", tmp_path, {"wait": wait}),
+                     ("services", tmp_path, {"wait": wait})]
 
 
 def test_shutdown_task_cleanup_args_never_reports_crash_storm():
@@ -678,6 +684,9 @@ def _supervisor_harness(monkeypatch, tmp_path, steps):
     monkeypatch.setattr(server, "ensure_legacy_imported", noop)
     monkeypatch.setattr(server, "_bootstrap_supervisor_repo", lambda _s: (True, "ok"))
     monkeypatch.setattr(server, "_runtime_branch_defaults", lambda: ("dev", "stable"))
+    # Startup notices have their own real delivery/state consumer tests. This
+    # harness records supervisor crash alerts and stubs other boot side effects.
+    monkeypatch.setattr("ouroboros.upgrade_notices.startup_upgrade_notices", noop)
     for name in (
         "_resume_interrupted_project_deletions", "_startup_prune_sweeps", "_startup_custody_sweep",
         "_startup_worktree_prune", "_prune_delegated_snapshots", "_periodic_supervisor_maintenance",
@@ -860,7 +869,7 @@ def test_terminal_custody_precedes_every_best_effort_wait_in_the_teardown():
     append_idx = teardown.index('"server_shutdown"')
     extension_idx = teardown.index("extension_reconcile_task.cancel()")
     host_idx = teardown.index("host_service_listener.close()")
-    sweeps_idx = teardown.index("kill_all_tracked_subprocesses()")
+    sweeps_idx = teardown.index("_stop_owned_local_processes(lifespan_drive_root)")
     assert stop_idx < join_idx < kill_idx < extension_idx < host_idx < sweeps_idx
     assert kill_idx < append_idx < extension_idx
 

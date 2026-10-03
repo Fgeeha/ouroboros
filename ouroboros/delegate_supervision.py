@@ -502,7 +502,7 @@ def _addressed_wakes(ctx: Any, state: dict[str, Any]) -> list[dict[str, Any]]:
             "provenance": str(entry.get("provenance") or "owner"),
             "source_task_id": str(entry.get("source_task_id") or ""),
             "relayed_from_task_id": str(entry.get("relayed_from_task_id") or ""),
-            # The peer relation the drain projected (sibling / parent): the sender's
+            # The peer relation the drain projected (a PEER_RELATION_LABELS key): the sender's
             # typed place, carried so a wake never signs a child or sibling as an
             # ancestor or owner (the same fact the round-top prefix reads).
             **({"relation": str(entry["relation"])} if str(entry.get("relation") or "") else {}),
@@ -1021,6 +1021,13 @@ def supervised_wait(
         )
     owns_transport = wait_once is None
     if wait_once is None:
+        # Validate the checkpoint pair above before custody can refuse the call.
+        # A foreign run may be a proven retry product; read it without entering
+        # live supervision. Missing/unknown ids keep the ordinary wait's refusal.
+        if custody.lookup(custody.custody_root(ctx), str(getattr(ctx, "task_id", "") or ""), run_id)[0] == custody.FOREIGN:
+            from ouroboros.tools.delegate_terminal_evidence import retry_terminal_result
+
+            return retry_terminal_result(ctx, run_id)
         from ouroboros.tools.delegate import _delegate_wait
 
         from functools import partial

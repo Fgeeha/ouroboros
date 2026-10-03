@@ -2,6 +2,7 @@ import { apiFetch, jsonPost } from './api_client.js';
 /** MCP settings cards; preserves masked auth tokens until the user edits them. */
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
 import { revealNewRow } from './ui_helpers.js';
+import { bindSecretReveal, resetSecretReveals } from './settings_secrets.js';
 
 const TRANSPORTS = [
     { value: 'streamable_http', label: 'Streamable HTTP' },
@@ -16,6 +17,9 @@ let mcpStatusByServer = {};
 let mcpStatusEnvelope = null;
 let mcpDirtyTokens = new Set();
 let onChangeCallback = null;
+// Original lookup identity and masked value only; never serialize these into a
+// server draft or use its editable id / current list index to reveal a token.
+const savedMcpSecrets = new WeakMap();
 
 function looksMasked(value) {
     const text = String(value ?? '').trim();
@@ -278,19 +282,21 @@ function bindCardEvents(card) {
     const tokenInput = card.querySelector('[data-mcp-field="auth_token"]');
     const tokenToggle = card.querySelector('[data-mcp-token-toggle]');
     const tokenClear = card.querySelector('[data-mcp-token-clear]');
+    let tokenReveal;
     if (tokenToggle && tokenInput) {
-        tokenToggle.addEventListener('click', () => {
-            if (tokenInput.type === 'password') {
-                tokenInput.type = 'text';
-                tokenToggle.textContent = 'Hide';
-            } else {
-                tokenInput.type = 'password';
-                tokenToggle.textContent = 'Show';
-            }
+        const server = mcpServers[idx];
+        const saved = savedMcpSecrets.get(server);
+        tokenInput.dataset.appliedValue = saved?.value || '';
+        tokenReveal = bindSecretReveal(tokenInput, tokenToggle, {
+            savedSelector: () => saved?.identity ? { mcp_server_id: saved.identity } : null,
+            savedLabel: () => saved && String(server.id || server.slug || server.name || '') !== saved.identity
+                ? `Saved value for ${saved.identity}` : '',
+            identityInputs: ['id', 'name'].map((field) => card.querySelector(`[data-mcp-field="${field}"]`)).filter(Boolean),
         });
     }
     if (tokenClear && tokenInput) {
         tokenClear.addEventListener('click', () => {
+            tokenReveal?.reset();
             tokenInput.value = '';
             tokenInput.type = 'password';
             const server = mcpServers[idx];
@@ -373,6 +379,7 @@ function serverForTest(server) {
 function renderAll() {
     const host = document.getElementById('mcp-servers-list');
     if (!host) return;
+    resetSecretReveals(host);
     if (!mcpServers.length) {
         host.innerHTML = '<div class="muted">No MCP servers configured. Click "Add Server" to start.</div>';
         return;
@@ -477,19 +484,25 @@ export function applyMcpSettings(settings) {
     }
     const incoming = Array.isArray(settings.MCP_SERVERS) ? settings.MCP_SERVERS : [];
     // auth_configured belongs to Settings response metadata, not user config.
-    mcpServers = incoming.map(({ auth_configured: _authConfigured, ...s }) => ({
-        ...s,
-        id: String(s.id ?? ''),
-        name: String(s.name ?? ''),
-        enabled: Boolean(s.enabled),
-        transport: String(s.transport ?? 'streamable_http'),
-        url: String(s.url ?? ''),
-        command: String(s.command ?? ''),
-        args: s.args ?? [],
-        auth_header: String(s.auth_header ?? 'Authorization'),
-        auth_token: String(s.auth_token ?? ''),
-        allowed_tools: Array.isArray(s.allowed_tools) ? s.allowed_tools.map(String) : [],
-    }));
+    mcpServers = incoming.map(({ auth_configured: _authConfigured, ...s }) => {
+        const server = {
+            ...s,
+            id: String(s.id ?? ''),
+            name: String(s.name ?? ''),
+            enabled: Boolean(s.enabled),
+            transport: String(s.transport ?? 'streamable_http'),
+            url: String(s.url ?? ''),
+            command: String(s.command ?? ''),
+            args: s.args ?? [],
+            auth_header: String(s.auth_header ?? 'Authorization'),
+            auth_token: String(s.auth_token ?? ''),
+            allowed_tools: Array.isArray(s.allowed_tools) ? s.allowed_tools.map(String) : [],
+        };
+        savedMcpSecrets.set(server, {
+            identity: String(s.id || s.slug || s.name || ''), value: server.auth_token,
+        });
+        return server;
+    });
     mcpDirtyTokens = new Set();
     renderAll();
     refreshStatus();

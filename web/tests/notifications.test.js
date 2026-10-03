@@ -100,6 +100,16 @@ test('importance rides the existing proactive discriminator', () => {
     assert.equal(candidate.key, 'important:cm-9');
 });
 
+test('a Project root notice addressed to Main is important and opens Main', () => {
+    const notice = { role: 'assistant', system_type: 'main_notice', task_id: 'project-root', chat_id: 1,
+        client_message_id: 'cm-main', content: 'The Cursor account has no included usage left.' };
+    const candidate = classifyLiveFrame(notice, { kind: 'chat', isMain: true });
+    assert.equal(candidate.category, 'important');
+    assert.equal(candidate.target.chatId, 1);
+    // The same frame from a known child never rings.
+    assert.equal(classifyLiveFrame(notice, { kind: 'chat', isMain: true, isRoot: false }), null);
+});
+
 test('a managed root concludes as a log frame, and both shapes share one key', () => {
     const log = classifyLiveFrame(
         { type: 'task_done', status: 'completed', chat_id: 1 },

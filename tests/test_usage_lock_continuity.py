@@ -45,6 +45,16 @@ def held_lock(root, timeout=5):
         assert not thread.is_alive()
 
 
+@pytest.fixture(autouse=True)
+def lifecycle_authority(root):
+    from ouroboros.task_results import write_task_result
+    # Managed model consumers require the same canonical lifecycle authority
+    # as production. A missing result tests unreadable authority, not contention.
+    # Prepare before each test installs its negative lock fault.
+    for tid in ("dominant", "child"):
+        write_task_result(root, tid, "running", root_task_id="dominant")
+
+
 @contextlib.contextmanager
 def owner(root, **values):
     events = queue.Queue()
@@ -256,33 +266,114 @@ def test_after_response_two_accounting_failures_return_exact_response_once(root,
     assert [row["state"] for row in rows(root)] == ["reserved", "dispatched"]
 
 
-def test_async_wait_keeps_loop_responsive_and_context_claim(root, short_acquisitions):
-    async def run():
-        ticks, sent = [], []
+def _observe_async_accounting_wait(root, monkeypatch):
+    facts = {}
 
-        async def heartbeat():
-            for _ in range(25):
-                ticks.append(1)
-                await asyncio.sleep(.01)
+    async def run():
+        loop, sent = asyncio.get_running_loop(), []
+        original = ua._locked
+        facts["loop_thread"] = threading.get_ident()
+        watchdog_fired = threading.Event()
+        response = {"usage": {}}
 
         async def send():
             sent.append(1)
-            return {"usage": {}}
+            return response
 
-        with owner(root), ua.physical_attempt_limit(1), held_lock(root) as release:
-            timer = threading.Timer(.18, release.set)
+        # Only the loop callback (or the cleanup watchdog) may release this hold.
+        with owner(root), ua.physical_attempt_limit(1), held_lock(root, timeout=None) as release:
+            def release_on_loop():
+                facts["callback_while_held"] = not release.is_set()
+                facts["sends_at_callback"] = len(sent)
+                release.set()
+
+            @contextlib.contextmanager
+            def observed_lock(*args, **kwargs):
+                stack = contextlib.ExitStack()
+                try:
+                    heartbeat = stack.enter_context(original(*args, **kwargs))
+                except ledger.UsageLockUnavailable as exc:
+                    if exc.reason == "contention" and "contention_thread" not in facts:
+                        facts["contention_thread"] = threading.get_ident()
+                        loop.call_soon_threadsafe(release_on_loop)
+                    raise
+                with stack:
+                    yield heartbeat
+
+            def release_if_stuck():
+                watchdog_fired.set()
+                release.set()
+
+            monkeypatch.setattr(ua, "_locked", observed_lock)
+            timer = threading.Timer(5, release_if_stuck)
             timer.start()
             try:
-                beat = asyncio.create_task(heartbeat())
-                await ua.execute_physical_attempt_async(request(root), send)
-                assert len(ticks) >= 10
+                # Await in this Task: its ContextVar owns the terminal capture.
+                assert await ua.execute_physical_attempt_async(request(root), send) is response
+                capture = ua.last_physical_attempt_capture()
+                assert capture.state == "settled"
                 assert ua._PHYSICAL_LIMIT.get().used == 1
-                assert ua.last_physical_attempt_capture().state == "settled"
-                await beat
+                assert ua._PHYSICAL_LIMIT.get().claimed_ids == {capture.attempt_id}
             finally:
-                timer.join(2)
+                release.set()
+                timer.cancel()
+                timer.join(3)
+                assert not timer.is_alive()
+            facts["watchdog_fired"] = watchdog_fired.is_set()
         assert sent == [1]
+        attempt_rows = rows(root)
+        assert [row["state"] for row in attempt_rows] == ["reserved", "dispatched", "settled"]
+        assert [row["attempt_id"] for row in attempt_rows] == [capture.attempt_id] * 3
+
     asyncio.run(run())
+    return facts
+
+
+def _assert_loop_ran_during_contention(facts):
+    # A later watchdog expiry during settlement cannot undo observed progress.
+    assert ("contention_thread" in facts and facts.get("callback_while_held")
+            and facts.get("sends_at_callback") == 0), (
+        f"event loop did not run during accounting contention: {facts}")
+
+
+def test_async_wait_keeps_loop_responsive_and_context_claim(root, short_acquisitions, monkeypatch):
+    _assert_loop_ran_during_contention(_observe_async_accounting_wait(root, monkeypatch))
+
+
+def test_async_wait_witness_accepts_watchdog_after_loop_release(root, short_acquisitions, monkeypatch):
+    callbacks = []
+    original_timer, original_account = threading.Timer, ua._account_response
+
+    def record_timer(interval, callback, *args, **kwargs):
+        callbacks.append(callback)
+        return original_timer(interval, callback, *args, **kwargs)
+
+    def account_after_watchdog(*args):
+        # Accounting follows release and send. Fire the real cleanup callback
+        # here to prove the ordering without another wall-clock sleep.
+        callback, = callbacks
+        callback()
+        return original_account(*args)
+
+    monkeypatch.setattr(threading, "Timer", record_timer)
+    monkeypatch.setattr(ua, "_account_response", account_after_watchdog)
+    facts = _observe_async_accounting_wait(root, monkeypatch)
+    assert facts["watchdog_fired"]
+    _assert_loop_ran_during_contention(facts)
+
+
+def test_async_wait_witness_rejects_inline_blocking(root, short_acquisitions, monkeypatch):
+    from ouroboros import _usage_wait
+
+    async def inline(function, *args, on_cancel=None, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(_usage_wait, "presend_off_loop", inline)
+    facts = _observe_async_accounting_wait(root, monkeypatch)
+    assert facts["contention_thread"] == facts["loop_thread"]
+    assert facts["watchdog_fired"]
+    with pytest.raises(AssertionError, match="event loop did not run during accounting contention"):
+        _assert_loop_ran_during_contention(facts)
 
 
 def test_async_cancellation_joins_reservation_committed_at_the_boundary(root, monkeypatch):
@@ -323,6 +414,10 @@ def test_real_loop_round_two_wait_keeps_tool_and_live_leaf(root, short_acquisiti
     from tests.test_loop_transport_wait import _loop_kwargs
 
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
+    from ouroboros.task_results import write_task_result
+
+    # The real owner Pause consumer requires admitted task/root authority.
+    write_task_result(root, "t-wait", "running", root_task_id="t-wait")
     registry = ToolRegistry(repo_dir=root, drive_root=root)
     registry._ctx.task_id = "t-wait"
     leaf = custody.RunCustody(run_id="accounting-live-leaf", task_id="t-wait", route_id="stub", model="stub")
@@ -352,7 +447,7 @@ def test_real_loop_round_two_wait_keeps_tool_and_live_leaf(root, short_acquisiti
                 return {"usage": {"cost": .001}}
             # The real loop owns the operation; the local provider stub uses the
             # same physical wrapper as API/review adapters.
-            ua.execute_physical_attempt(request(root, task_id="t-wait"), send)
+            ua.execute_physical_attempt(request(root, task_id="t-wait", root_task_id="t-wait"), send)
             if round_idx == 1:
                 return {"role": "assistant", "content": "", "tool_calls": [
                     {"id": "read-once", "type": "function", "function": {
@@ -466,8 +561,52 @@ def _churn_lock(root, start, stop, ready):
         time.sleep(.003)
 
 
+def _trace_lock_os_failures(monkeypatch, lock_path):
+    """Observe this fixture's exact lock calls; never classify or retry them."""
+    failures, probes = [], set()
+    opened, read, closed, unlinked = os.open, os.read, os.close, os.unlink
+    selected = lambda path: isinstance(path, (str, os.PathLike)) and os.fspath(path) == str(lock_path)
+
+    def observe(stage, call, *args, **kwargs):
+        try:
+            return call(*args, **kwargs)
+        except OSError as exc:
+            native = getattr(exc, "winerror", None)
+            failures.append({"stage": stage, "exception": type(exc).__name__, "repr": repr(exc),
+                             "errno": exc.errno, "native_error": native,
+                             "native_error_source": "exception.winerror" if native is not None else "unavailable"})
+            raise
+
+    def open_lock(path, flags, *args, **kwargs):
+        if not selected(path):
+            return opened(path, flags, *args, **kwargs)
+        stage = "create_exclusive" if flags & os.O_CREAT else "probe_open"
+        fd = observe(stage, opened, path, flags, *args, **kwargs)
+        if not flags & os.O_CREAT:
+            probes.add(fd)
+        return fd
+
+    def read_lock(fd, *args, **kwargs):
+        return observe("probe_read", read, fd, *args, **kwargs) if fd in probes else read(fd, *args, **kwargs)
+
+    def close_lock(fd, *args, **kwargs):
+        try:
+            return observe("probe_close", closed, fd, *args, **kwargs) if fd in probes else closed(fd, *args, **kwargs)
+        finally:
+            probes.discard(fd)
+
+    def unlink_lock(path, *args, **kwargs):
+        return observe("unlink", unlinked, path, *args, **kwargs) if selected(path) else unlinked(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", open_lock)
+    monkeypatch.setattr(os, "read", read_lock)
+    monkeypatch.setattr(os, "close", close_lock)
+    monkeypatch.setattr(os, "unlink", unlink_lock)
+    return failures
+
+
 @pytest.mark.parametrize("cancel", [False, True])
-def test_owned_process_churn_keeps_single_send_and_controls(root, cancel):
+def test_owned_process_churn_keeps_single_send_and_controls(root, cancel, monkeypatch):
     ctx = multiprocessing.get_context("spawn")
     start, stop, ready = ctx.Event(), ctx.Event(), ctx.Queue()
     children = [ctx.Process(target=_churn_lock, args=(root, start, stop, ready)) for _ in range(3)]
@@ -479,11 +618,19 @@ def test_owned_process_churn_keeps_single_send_and_controls(root, cancel):
         for child in children:
             child.start()
         assert len({ready.get(timeout=10) for _ in children}) == 3
+        lock_failures = _trace_lock_os_failures(monkeypatch, root / "state" / ledger.LOCK_REL.name)
         start.set()
         with owner(root, control=control), ua.physical_attempt_limit(1):
             if cancel:
                 with pytest.raises(PhysicalDispatchInterrupted):
-                    ua.execute_physical_attempt(request(root), lambda: sends.append(1))
+                    try:
+                        ua.execute_physical_attempt(request(root), lambda: sends.append(1))
+                    except ledger.UsageLockUnavailable as exc:
+                        raise AssertionError(
+                            "Accounting acquisition failed before cancellation: "
+                            f"reason={exc.reason!r}, error_number={exc.error_number!r}, "
+                            f"lock_os_failures={lock_failures!r}"
+                        ) from exc
             else:
                 ua.execute_physical_attempt(request(root), lambda: sends.append(1) or {"usage": {}})
                 assert ua._PHYSICAL_LIMIT.get().used == 1

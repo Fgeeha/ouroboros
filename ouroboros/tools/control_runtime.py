@@ -9,7 +9,7 @@ switch the model or reasoning effort for the next round.
 
 from __future__ import annotations
 
-from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
+from ouroboros.tools.tool_result import ToolResult, _publish_tool_result, completed_local_read, publish_no_effect
 
 import logging
 import os
@@ -166,6 +166,7 @@ def _request_deep_self_review(ctx: ToolContext, reason: str) -> str:
     return f"Deep self-review requested (reviewer: {identity}). It will be queued and executed asynchronously."
 
 
+@completed_local_read
 def _chat_history(
     ctx: ToolContext, count: int = 100, offset: int = 0, search: str = "",
     snapshot: str = "", **filters: str,
@@ -224,13 +225,89 @@ def _update_scratchpad(ctx: ToolContext, content: str) -> str:
     return f"OK: scratchpad block appended ({len(content)} chars, ts={block.get('ts', '?')[:16]})"
 
 
-def _send_user_message(ctx: ToolContext, text: str, reason: str = "") -> str:
-    """Send a separate owner reply without completing the ongoing task."""
+def _main_notice_refusal(ctx: ToolContext, chat_id: object) -> str:
+    """Why this caller may not address Main, or "" when it may.
+
+    Main is the owner's own conversation. A delegated child answers its parent,
+    and a Presence or agent-to-agent turn speaks for an external conversation;
+    none of them gains a Main voice through this argument.
+    """
+    from ouroboros.contracts.chat_id_policy import HIDDEN_CHAT_ID, is_a2a_chat_id
+    from ouroboros.dialogue_provenance import presence_caller_binding, run_origin
+
+    for attr in ("task_metadata", "task_contract"):
+        data = getattr(ctx, attr, None)
+        if not isinstance(data, dict):
+            continue
+        lineage = data.get("lineage") if isinstance(data.get("lineage"), dict) else {}
+        if (str(data.get("delegation_role") or lineage.get("delegation_role") or "").strip() == "subagent"
+                or str(data.get("parent_task_id") or lineage.get("parent_task_id") or "").strip()):
+            return "a delegated task reports to its parent (final result, tree_note or escalate), which decides what reaches the owner"
+    if presence_caller_binding(ctx) is not None:
+        return "a Presence turn speaks for its external conversation, not in the owner's main chat"
+    if str(chat_id) == str(HIDDEN_CHAT_ID):
+        return "a hidden/headless conversation is not an owner-visible root room"
+    if is_a2a_chat_id(chat_id):
+        return "an agent-to-agent conversation has no main-chat voice"
+    # Positive external transport ids can share the Project range; neither a
+    # number (Main's own id included: a wake or scheduled root runs there too)
+    # nor an agent-supplied destination proves an owner-visible room.
+    from ouroboros.projects_registry import project_chat_for_task_tree, reserved_project_chat_ids
+    from ouroboros.tool_access import canonical_data_root
+
+    try:
+        visible_chat = int(chat_id)
+    except (TypeError, ValueError):
+        return "the current chat has no proven owner-visible destination"
+    data_root = canonical_data_root(ctx)
+    projects = reserved_project_chat_ids(data_root)
+    # The durable binding is the one truth about a root's Project: a mid-run
+    # conversion or self-scope binds it without ever reaching current_chat_id.
+    bound_chat = project_chat_for_task_tree(data_root, str(getattr(ctx, "task_id", "") or ""))
+    if (visible_chat not in projects and bound_chat not in projects
+            and not run_origin({"metadata": getattr(ctx, "task_metadata", None)})["owner_ingress"]):
+        return "this root is neither bound to a registered Project nor started by the owner"
+    return ""
+
+
+def _send_user_message(ctx: ToolContext, text: str, reason: str = "", destination: str = "current") -> str:
+    """Send a separate owner reply without completing the ongoing task.
+
+    ``destination="main"`` addresses the owner's main chat from an owner-visible
+    root room: the row is typed ``main_notice``, which the supervisor
+    and history replay pin to Main whatever the sender's Project binding, and
+    which never counts as the task's final answer. When to send one is the
+    model's judgment (BIBLE P5); no host counter or timer triggers it.
+    """
     chat_id = getattr(ctx, "current_chat_id", None)
     if chat_id is None or chat_id == "":  # 0 is a real hidden session, not absence
-        return _publish_tool_result(ctx, ToolResult(status="unavailable", code="CAPABILITY_UNAVAILABLE", text=("⚠️ No active chat — cannot send proactive message.")))
+        return publish_no_effect(ctx, ToolResult(status="unavailable", code="CAPABILITY_UNAVAILABLE", text=("⚠️ No active chat — cannot send proactive message.")))
     if not text or not text.strip():
-        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=("⚠️ Empty message.")))
+        return publish_no_effect(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=("⚠️ Empty message.")))
+    # Models may fill optional keys: an empty value is the omitted default.
+    target = str(destination or "").strip().lower() or "current"
+    if target not in ("current", "main"):
+        from ouroboros.tools.arg_feedback import argument_refusal
+
+        return publish_no_effect(ctx, argument_refusal(ctx, "SEND_USER_MESSAGE_DESTINATION", [
+            f"destination={destination!r} is not a destination; use 'current' (this room) or 'main' (the owner's main chat)",
+        ], effect="Nothing was sent."), tool_name="send_user_message")
+    if target == "main":
+        refusal = _main_notice_refusal(ctx, chat_id)
+        if refusal:
+            return publish_no_effect(ctx, ToolResult(status="blocked", code="ACCESS_BLOCKED", text=(
+                f"⚠️ MAIN_NOTICE_BLOCKED: destination='main' refused: {refusal}. Nothing was sent; "
+                "destination='current' still reaches this conversation.")))
+        from ouroboros.contracts.chat_id_policy import WEB_UI_CHAT_ID
+        from ouroboros.project_dialogue import MAIN_NOTICE_TYPE
+
+        chat_id, system_type = WEB_UI_CHAT_ID, MAIN_NOTICE_TYPE
+    else:
+        # Discriminates the row from a bare final on history replay: the
+        # client treats an UNtyped assistant row with a task_id as the task's
+        # last word and would finalize a still-running live card. Persisted
+        # via log_chat(record_type=...) exactly like media rows.
+        system_type = "proactive_message"
 
     from ouroboros.tools.owner_delivery import deliver_owner_event
     from ouroboros.utils import append_jsonl
@@ -240,11 +317,7 @@ def _send_user_message(ctx: ToolContext, text: str, reason: str = "") -> str:
         "text": text,
         "format": "markdown",
         "is_progress": False,
-        # Discriminates the row from a bare final on history replay: the
-        # client treats an UNtyped assistant row with a task_id as the task's
-        # last word and would finalize a still-running live card. Persisted
-        # via log_chat(record_type=...) exactly like media rows.
-        "system_type": "proactive_message",
+        "system_type": system_type,
         "ts": utc_now_iso(),
     })
     append_jsonl(ctx.drive_logs() / "events.jsonl", {
@@ -252,9 +325,12 @@ def _send_user_message(ctx: ToolContext, text: str, reason: str = "") -> str:
         "type": "proactive_message",
         "task_id": str(getattr(ctx, "task_id", "") or ""),
         "reason": reason,
+        "destination": target,
         "transport_mode": mode,
         "text_preview": text[:200],
     })
+    if target == "main":
+        return "OK: notice sent to the main chat." if mode == "live" else "OK: notice queued for delivery to the main chat."
     if mode == "live":
         return "OK: message sent to owner chat."
     return "OK: message queued for delivery."
@@ -481,10 +557,14 @@ def _set_next_wakeup(ctx: ToolContext, seconds: int) -> str:
             "next wake-up (a wake-up already pending keeps its time; a wake-up calling this sets its own next one).")
 
 
-def _switch_model(ctx: ToolContext, model: str = "", effort: str = "") -> str:
+def _switch_model(ctx: ToolContext, model: str = "", effort: str = "", primary: str = "") -> str:
     """LLM-driven model/effort switch (Constitution P5: LLM-first).
 
-    Stored in ToolContext, applied on the next LLM call in the loop.
+    Stored in ToolContext, applied on the next LLM call in the loop. ``primary``
+    returns to this turn's primary binding (the acting model's choice): its model, role,
+    locality and account policy with the owner's live wait-card choice for that
+    role; "wait" also keeps a refusal there on the primary's own wait instead of
+    paid alternatives. Effort intent is untouched.
     """
     from ouroboros.config import EFFORT_SCALE
     from ouroboros.llm import LLMClient
@@ -496,8 +576,26 @@ def _switch_model(ctx: ToolContext, model: str = "", effort: str = "") -> str:
     requested_effort = str(effort or "").strip().lower()
     if requested_effort and requested_effort not in EFFORT_SCALE:
         return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(f"⚠️ Unknown effort: {effort}. Valid: {', '.join(EFFORT_SCALE)}")))
+    requested_primary = str(primary or "").strip().lower()
+    route = getattr(ctx, "primary_route", None)
+    if requested_primary and (requested_primary not in ("return", "wait") or model):
+        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(
+            "⚠️ primary must be 'return' or 'wait', without model.")))
+    if requested_primary and not (isinstance(route, dict) and route.get("model")):
+        return _publish_tool_result(ctx, ToolResult(status="unavailable", code="CAPABILITY_UNAVAILABLE", text=(
+            "⚠️ This turn has no recorded primary route to return to.")))
 
-    if model:
+    if requested_primary:
+        waiter = getattr(ctx, "model_wait_context", None)
+        chosen = ((getattr(waiter, "overrides", None) or {}).get(route["role"]) or {})
+        ctx.active_model_override = str(chosen.get("model") or route["model"])
+        ctx.active_use_local_override = bool(chosen.get("use_local", route["use_local"]))
+        ctx.active_role_override = route["role"]
+        ctx.route_wait_on_primary = requested_primary == "wait"
+        changes.append(f"primary route {ctx.active_model_override}{' (local)' if ctx.active_use_local_override else ''}"
+                       f" (role {route['role']}; if it refuses: "
+                       f"{'wait for it' if requested_primary == 'wait' else 'configured routes again'})")
+    elif model:
         if model not in available:
             return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(f"⚠️ Unknown model: {model}. Available: {', '.join(available)}")))
 
@@ -513,6 +611,7 @@ def _switch_model(ctx: ToolContext, model: str = "", effort: str = "") -> str:
 
         ctx.active_model_override = model
         ctx.active_use_local_override = use_local
+        ctx.route_wait_on_primary, ctx.active_role_override = False, None  # an explicit route ends a declared wait
         changes.append(f"model={model}{' (local)' if use_local else ''}")
 
     if requested_effort:
@@ -520,6 +619,57 @@ def _switch_model(ctx: ToolContext, model: str = "", effort: str = "") -> str:
         changes.append(f"effort={requested_effort}")
 
     if not changes:
-        return f"Current available models: {', '.join(available)}. Pass model and/or effort to switch."
+        return (f"Current available models: {', '.join(available)}. Pass model and/or effort to switch, "
+                "or primary='return'/'wait' to go back to this turn's primary route.")
 
     return f"OK: switching to {', '.join(changes)} on next round."
+
+
+def _finish_task(ctx: ToolContext, action: str, answer: str | None = None,
+                 answer_sha256: str | None = None, rationale: str = "",
+                 acceptance_subject: dict | None = None, pending_review: str | None = None) -> str:
+    """Stage a local author act; the loop owns answer selection and finalization."""
+    return stage_completion_request(ctx, {
+        "action": action, "answer": answer, "answer_sha256": answer_sha256,
+        "rationale": rationale, "acceptance_subject": acceptance_subject,
+        "pending_review": pending_review,
+    })
+
+
+def stage_completion_request(ctx: ToolContext, request: dict, *, source: str = "finish_task",
+                             allow_empty: bool = False, reply_later: bool = False) -> str:
+    import copy
+    import json
+    from ouroboros.task_results import resolve_task_lineage
+
+    action, answer, selector = request.get("action"), request.get("answer"), request.get("answer_sha256")
+    error = ""
+    if action not in {"finish", "stop"}:
+        error = "action must be finish or stop"
+    elif action == "stop" and not str(request.get("rationale") or "").strip():
+        error = "stop requires a rationale naming unfinished work"
+    elif not reply_later and ((answer is None) == (selector is None)):
+        error = "select exactly one of answer and answer_sha256"
+    elif not reply_later and answer is not None and (not isinstance(answer, str) or (not allow_empty and not answer.strip())):
+        error = "answer must be complete nonempty text"
+    elif selector is not None and (not isinstance(selector, str) or not selector):
+        error = "answer_sha256 must name an offered answer"
+    elif request.get("pending_review") not in {None, "wait", "finish"}:
+        error = "pending_review must be wait or finish"
+    elif request.get("pending_review") is not None and not resolve_task_lineage(
+        getattr(ctx, "task_id", ""), metadata=getattr(ctx, "task_metadata", {}),
+        parent_task_id=getattr(ctx, "parent_task_id", None),
+    )["is_root_task"]:
+        error = "pending_review is available only on root tasks"
+    if error:
+        return publish_no_effect(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text="ERROR: COMPLETION_ARGUMENT: " + error))
+    staged = {key: copy.deepcopy(value) for key, value in request.items() if value is not None}
+    staged.update(source=source, reply_later=reply_later, allow_empty=allow_empty,
+                  observation=copy.deepcopy(getattr(ctx, "_completion_observation", {})))
+    previous = getattr(ctx, "_completion_request", None)
+    if previous is not None and previous.get("observation") == staged["observation"] and previous != staged:
+        ctx._completion_conflict = True
+        return publish_no_effect(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR",
+            text="ERROR: COMPLETION_CONFLICT: contradictory completion requests in one response; select again after seeing all results."))
+    ctx._completion_request = staged
+    return json.dumps({"status": "completion_requested", "completion_control": True, "action": action}, ensure_ascii=False)

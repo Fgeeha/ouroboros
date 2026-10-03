@@ -329,7 +329,8 @@ def test_settings_ui_save_flow_pins():
     assert "setStatus('Saving…', 'muted')" in settings_js
     assert "setButtonBusy(saveButton, true)" in settings_js
     assert "setButtonBusy(saveButton, false)" in settings_js
-    assert "cmd: '/restart'" in settings_js
+    assert "confirmAndSendRestart" in settings_js
+    assert "cmd: '/restart'" in (root / "chat_activity.js").read_text(encoding="utf-8")
     assert "btn-restart-now" in settings_js
 
     settings_ui_js = (root / "settings_ui.js").read_text(encoding="utf-8")

@@ -54,7 +54,7 @@ def test_project_followup_consumes_only_a_permanent_refusal(tmp_path, monkeypatc
                       project_id=project["id"], current_chat_id=project["chat_id"])
     ctx.task_metadata = {"resource_intent": {"kind": "room_default", "project_id": project["id"]}}
     assert _handle_schedule_followup(ctx, run_at="2000-01-01T00:00:00Z",
-                                     objective="Continue in the same project").startswith("FOLLOWUP_SCHEDULED")
+                                     objective="Continue in the same project", relation="independent").startswith("FOLLOWUP_SCHEDULED")
     begin_project_deletion(root, project["id"])
     if lifecycle == "tombstoned":
         complete_project_deletion(root, project["id"])

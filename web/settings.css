@@ -464,6 +464,21 @@
     min-width: 0;
 }
 
+.settings-secret-value,
+.settings-secret-source,
+.settings-secret-status {
+    grid-column: 1 / -1;
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.settings-secret-value {
+    white-space: pre-wrap;
+    -webkit-user-select: text;
+    user-select: text;
+    cursor: text;
+}
+
 .available-subagents-editor {
     display: flex;
     flex-direction: column;

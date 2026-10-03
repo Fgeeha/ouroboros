@@ -655,10 +655,8 @@ def _run_supervisor(settings: dict) -> None:
         set_log_sink(make_server_log_sink(bridge, pathlib.Path(DATA_DIR)))
 
         bus_init(
-            drive_root=DATA_DIR,
+            drive_root=DATA_DIR, budget_report_every=10, chat_bridge=bridge,
             total_budget_limit=float(settings.get("TOTAL_BUDGET", SETTINGS_DEFAULTS["TOTAL_BUDGET"])),
-            budget_report_every=10,
-            chat_bridge=bridge,
         )
 
         from supervisor.git_ops import safe_restart
@@ -737,6 +735,8 @@ def _run_supervisor(settings: dict) -> None:
                     )
                 send_with_budget(int(st_boot["owner_chat_id"]), " ".join(notice), role="system", system_type="startup_notice")
         _startup_retired_settings_notice(settings)
+        from ouroboros.upgrade_notices import startup_upgrade_notices
+        startup_upgrade_notices(settings)
 
         auto_resume_after_restart()
 
@@ -1091,6 +1091,7 @@ def _perform_supervisor_restart(
         force=True,
         terminal_status=cleanup_status,
         result_reason=cleanup_reason,
+        stop_source="server_shutdown",
         preserve_running_task_ids=planned_handoffs,
         **restart_kill_kwargs,
     )
@@ -1476,6 +1477,7 @@ async def lifespan(app):
                 force=True,
                 terminal_status=cleanup_status,
                 result_reason=cleanup_reason,
+                stop_source="server_shutdown",
                 **_restart_cleanup_kwargs(),
                 **_managed_update_pending_kwargs(),
             )
@@ -1524,21 +1526,7 @@ async def lifespan(app):
             get_manager().stop_server()
         except Exception:
             pass
-        try:
-            from ouroboros.tools.shell import kill_all_tracked_subprocesses
-            kill_all_tracked_subprocesses()
-        except Exception:
-            pass
-        try:
-            from ouroboros.workspace_executor import kill_all_foreground
-            kill_all_foreground(lifespan_drive_root)
-        except Exception:
-            pass
-        try:
-            from ouroboros.tools.services import kill_all_services
-            kill_all_services(lifespan_drive_root)
-        except Exception:
-            pass
+        _stop_owned_local_processes(lifespan_drive_root)
         try:
             from ouroboros.extension_companion import get_global_supervisor
             supervisor = get_global_supervisor()
@@ -1594,24 +1582,29 @@ def _restart_cleanup_kwargs() -> dict:
     return {}
 
 
-def _emergency_process_cleanup(*, port_sweep: bool = True) -> None:
-    """Kill child processes, workers, companions, and runtime port holders."""
-    _historical_audit.stop()  # forced path may skip lifespan's finally; stop never waits
+def _stop_owned_local_processes(drive_root: pathlib.Path, *, wait: bool = True) -> None:
+    """Shared shutdown order; the emergency path keeps its non-waiting policy."""
     try:
         from ouroboros.tools.shell import kill_all_tracked_subprocesses
         kill_all_tracked_subprocesses()
     except Exception:
-        pass
+        log.debug("Tracked shell cleanup failed", exc_info=True)
     try:
         from ouroboros.workspace_executor import kill_all_foreground
-        kill_all_foreground(DATA_DIR, wait=False)
+        kill_all_foreground(drive_root, wait=wait)
     except Exception:
-        pass
+        log.debug("Foreground executor cleanup failed", exc_info=True)
     try:
         from ouroboros.tools.services import kill_all_services
-        kill_all_services(DATA_DIR, wait=False)
+        kill_all_services(drive_root, wait=wait)
     except Exception:
-        pass
+        log.debug("Owned service cleanup failed", exc_info=True)
+
+
+def _emergency_process_cleanup(*, port_sweep: bool = True) -> None:
+    """Kill child processes, workers, companions, and runtime port holders."""
+    _historical_audit.stop()  # forced path may skip lifespan's finally; stop never waits
+    _stop_owned_local_processes(DATA_DIR, wait=False)
     try:
         from supervisor.workers import kill_workers
         cleanup_kwargs = _restart_cleanup_kwargs()
@@ -1625,6 +1618,7 @@ def _emergency_process_cleanup(*, port_sweep: bool = True) -> None:
                 archive_service_logs=False,
                 terminal_status=cleanup_status,
                 result_reason=cleanup_reason,
+                stop_source="server_shutdown",
                 **cleanup_kwargs,
                 **_managed_update_pending_kwargs(),
             )

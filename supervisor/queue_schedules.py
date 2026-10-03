@@ -1,10 +1,8 @@
-"""Recurring schedules: the durable file, the skill sync, and what they dispatch.
+"""Recurring schedules: the durable file, the skill sync, and what they enqueue.
 
 Owns state/scheduled_tasks.json and the periodic reconciliation of skill-declared
 schedules into it, then turns a schedule that is due into a queued task — skipping
-any whose previous run is still pending or running — or, for a ``kind: "notify"``
-row, into one owner notification with no model turn (the same table, the same
-tick and the same lifecycle; only the dispatch verb differs).
+any whose previous run is still pending or running.
 
 The sync throttle is this module's own clock, not queue state: the writer and the
 reader are both here.
@@ -87,15 +85,11 @@ _RUNTIME_OWNED_FIELDS: tuple[str, ...] = (
 # What an audit event may say about a row: lifecycle facts only. The task template
 # is a private objective, never audit material, and would also be unbounded.
 _AUDIT_ROW_KEYS: tuple[str, ...] = (
-    "id", "name", "kind", "enabled", "source", "skill", "trigger", "timezone",
+    "id", "name", "enabled", "source", "skill", "trigger", "timezone",
     "created_at", "updated_at", "last_run_at", "last_task_id", "completed_at",
     "next_run_at", "manual_override",
+    "followup_relation", "followup_origin", "followup_hold", "followup_wait",
 )
-# The second dispatch verb of the one table: a ``kind: "notify"`` row emits one
-# owner notification when due instead of enqueueing a task — no model turn, no
-# task result; its receipt is the ``owner_notification`` events row itself. An
-# absent ``kind`` (every row written before this verb existed) is a task row.
-SCHEDULE_KIND_NOTIFY = "notify"
 # ``manage_schedules`` is a model-facing tool.  Keep one page comfortably below
 # the tool result cap even when a schedule table contains many rows or hostile
 # (but valid) long strings.  The owner HTTP surface retains its own full rows.
@@ -273,11 +267,8 @@ def _is_consumed_once(record: Dict[str, Any]) -> bool:
 
 
 def _is_suppressed(record: Dict[str, Any]) -> bool:
-    """A skill row the owner disabled or deleted and the resync may not re-arm —
-    or a notify row the owner switched off, which its skill's repeat of the same
-    key may not re-arm either."""
-    return ((str(record.get("source") or "") == "skill_manifest"
-             or str(record.get("kind") or "") == SCHEDULE_KIND_NOTIFY)
+    """A skill row the owner disabled or deleted and the resync may not re-arm."""
+    return (str(record.get("source") or "") == "skill_manifest"
             and str(record.get("manual_override") or "").strip().lower() in SUPPRESSED_OVERRIDES)
 
 
@@ -286,9 +277,17 @@ def schedule_lifecycle_status(record: Dict[str, Any]) -> str:
 
     ``consumed`` and ``suppressed`` are RETAINED history: neither dispatches
     again, and neither is an ``active`` schedule wearing a disabled flag.
+    ``delete_pending`` outranks them: a deleted row that still owes accepted
+    work stays visible until that work no longer needs it, then disappears.
     """
+    if record.get("delete_requested_at"):
+        return "delete_pending"
     if _is_consumed_once(record):
         return "consumed"
+    if record.get("followup_hold"):
+        return "held"
+    if record.get("followup_wait"):
+        return "waiting"
     if _is_suppressed(record):
         return "suppressed"
     return "active" if record.get("enabled", True) else "disabled"
@@ -307,7 +306,7 @@ def _schedule_projection_row(raw: Dict[str, Any]) -> Dict[str, Any]:
     # Keep only lifecycle facts useful to a model.  In particular, the durable
     # task template (including context/attachments) never crosses this seam.
     projection_keys = (
-        "id", "name", "kind", "enabled", "source", "skill", "trigger",
+        "id", "name", "enabled", "source", "skill", "trigger",
         "created_at", "last_run_at", "last_task_id", "completed_at", "next_run_at",
     )
     for key in projection_keys:
@@ -333,10 +332,8 @@ def _schedule_projection_row(raw: Dict[str, Any]) -> Dict[str, Any]:
             row[key] = _bounded_projection_text(value)
 
     template = raw.get("task") if isinstance(raw.get("task"), dict) else {}
-    notification = raw.get("notification") if isinstance(raw.get("notification"), dict) else {}
     objective_source = ""
-    for candidate in (notification.get("text") if str(raw.get("kind") or "") == SCHEDULE_KIND_NOTIFY else None,
-                      template.get("objective"), template.get("text"),
+    for candidate in (template.get("objective"), template.get("text"),
                       template.get("description"), raw.get("description"), raw.get("name")):
         if candidate is not None and str(candidate).strip():
             objective_source = str(candidate)
@@ -357,8 +354,20 @@ def _schedule_projection_row(raw: Dict[str, Any]) -> Dict[str, Any]:
     row["suppressed"] = status == "suppressed"
     # Retained rows are history the owner can still act on; only a suppressed
     # one can come back, and only after its skill is re-evaluated.
-    row["retained"] = status in {"consumed", "suppressed"}
-    row["restorable"] = status == "suppressed"
+    row["retained"] = status in {"consumed", "suppressed", "held"}
+    row["restorable"] = status == "suppressed" or bool(raw.get("followup_hold") and raw.get("hold_persisted", True))
+    row["delete_pending"] = status == "delete_pending"
+    if row["delete_pending"]:
+        row["delete_requested_at"] = _bounded_projection_text(raw.get("delete_requested_at"), 64)
+    from supervisor.followup_policy import relation_kind, origin_of
+    row["relation"] = relation_kind(raw)
+    row["followup_origin"] = origin_of(raw)
+    row["followup_hold"] = raw.get("followup_hold")
+    row["followup_wait"] = raw.get("followup_wait", "")
+    row["hold_persisted"] = raw.get("hold_persisted", bool(raw.get("followup_hold")))
+    relation = raw.get("followup_relation") or {}
+    row["billing_group"] = relation.get("billing_group")
+    row["deadline_at"] = relation.get("deadline_at", "")
     # A due occurrence that WAITS (#1315): the typed reason is the fact; what to say
     # about it, if anything, is the mind's call.
     hold = raw.get("hold") if isinstance(raw.get("hold"), dict) else None
@@ -444,8 +453,10 @@ def schedule_activity_projection(data: Dict[str, Any]) -> Dict[str, Any]:
         row["active"] = status == "active"
         row["consumed"] = status == "consumed"
         row["suppressed"] = status == "suppressed"
-        row["retained"] = status in {"consumed", "suppressed"}
-        row["restorable"] = status == "suppressed"
+        projected = _schedule_projection_row(row)
+        for key in ("retained", "restorable", "relation", "followup_origin", "followup_hold",
+                    "followup_wait", "hold_persisted", "billing_group", "deadline_at", "delete_pending"):
+            row[key] = projected[key]
         tasks.append(row)
     out["tasks"] = tasks
     return out
@@ -589,7 +600,7 @@ def sync_skill_schedules(skills: List[Any], *, drive_root: pathlib.Path | None =
             ):
                 from supervisor.schedule_occurrence import owed
 
-                if owed(record) is False:
+                if owed(record, drive_root=drive_root) is False:
                     by_id.pop(schedule_id, None)
                 else:
                     record.update(enabled=False, delete_requested_at=utc_now_iso())
@@ -612,19 +623,19 @@ def resync_skill_schedules(drive_root: pathlib.Path | None = None) -> Dict[str, 
     )
 
 
-def _rows_hold_schedule(rows: Any, schedule_id: str) -> bool:
+def _rows_hold_schedule(rows: Any, schedule_id: str, task_id: str = "") -> bool:
     """Whether any queue row (a PENDING task or a RUNNING/snapshot wrapper) is its task."""
     for row in rows or []:
         if not isinstance(row, dict):
             continue
         task = row.get("task") if isinstance(row.get("task"), dict) else row
         meta = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
-        if str(meta.get("schedule_id") or "") == schedule_id:
+        if str(meta.get("schedule_id") or "") == schedule_id or (task_id and task.get("id") == task_id):
             return True
     return False
 
 
-def _schedule_running_or_queued(schedule_id: str, drive_root: pathlib.Path | None = None) -> bool | None:
+def _schedule_running_or_queued(schedule_id: str, drive_root: pathlib.Path | None = None, *, task_id: str = "") -> bool | None:
     """Whether a task this schedule already admitted is still pending or running.
 
     ``None`` means UNKNOWN, and it is load-bearing: PENDING/RUNNING are the
@@ -641,8 +652,8 @@ def _schedule_running_or_queued(schedule_id: str, drive_root: pathlib.Path | Non
     if not schedule_id:
         return False
     if not in_worker_process():
-        return (_rows_hold_schedule(_queue().PENDING, schedule_id)
-                or _rows_hold_schedule(_queue().RUNNING.values(), schedule_id))
+        return (_rows_hold_schedule(_queue().PENDING, schedule_id, task_id)
+                or _rows_hold_schedule(_queue().RUNNING.values(), schedule_id, task_id))
     snapshot = read_json_dict(pathlib.Path(drive_root or _queue().DRIVE_ROOT)
                               / "state" / "queue_snapshot.json")
     if not isinstance(snapshot, dict):
@@ -682,12 +693,13 @@ def _schedule_running_or_queued(schedule_id: str, drive_root: pathlib.Path | Non
             return None
     except (TypeError, ValueError, OverflowError):
         return None
-    return (_rows_hold_schedule(snapshot.get("pending"), schedule_id)
-            or _rows_hold_schedule(snapshot.get("running"), schedule_id))
+    return (_rows_hold_schedule(snapshot.get("pending"), schedule_id, task_id)
+            or _rows_hold_schedule(snapshot.get("running"), schedule_id, task_id))
 
 
 def _task_from_schedule(record: Dict[str, Any], *, task_id: str = "") -> Dict[str, Any]:
-    template = dict(record.get("task") or {})
+    from supervisor.followup_policy import normalize_template, bind_task
+    template = normalize_template(record)
     task_id = task_id or uuid.uuid4().hex[:8]
     # Membership, not truthiness: a template's explicit chat 0 is its hidden partition.
     has_chat = template.get("chat_id") not in (None, "")
@@ -723,7 +735,10 @@ def _task_from_schedule(record: Dict[str, Any], *, task_id: str = "") -> Dict[st
         task["allowed_resources"] = allowed_resources
     existing_contract = template.get("task_contract") if isinstance(template.get("task_contract"), dict) else {}
     if existing_contract:
-        task["task_contract"] = existing_contract
+        task["task_contract"] = dict(existing_contract)
+        if task.get("deadline_at"):
+            task["task_contract"]["deadline_at"] = task["deadline_at"]
+    bind_task(_queue().DRIVE_ROOT, task, record)
     task["task_contract"] = build_task_contract(apply_consciousness_authority(task))
     workspace = task["task_contract"]["workspace"]
     # Presence-bound work (a speaker's follow-up, or one acting for a descendant's binding)
@@ -745,86 +760,17 @@ def _task_from_schedule(record: Dict[str, Any], *, task_id: str = "") -> Dict[st
     return task
 
 
-def _notification_chat_id(record: Dict[str, Any]) -> int:
-    """The row's own positive chat, else where any owner notification goes
-    (``event_bus.owner_notification_chat_id``: the bound owner, else Main)."""
-    try:
-        pinned = int(record.get("chat_id") or 0)
-    except (TypeError, ValueError):
-        pinned = 0
-    if pinned > 0:
-        return pinned
-    from ouroboros.event_bus import owner_notification_chat_id
-
-    return owner_notification_chat_id(_queue().DRIVE_ROOT)
-
-
-def _notify_source_silenced(source: str, seen: Dict[str, bool]) -> bool:
-    """A skill's standing reminders fall silent with the skill — disabled,
-    removed, or its ``notify_owner`` grant revoked: the resync never touches
-    ``skill:`` rows, so they would otherwise keep ringing while the card says
-    off. ``seen`` memoises one tick's answers so a burst of due rows costs one
-    discovery per skill, not one per row."""
-    if not source.startswith("skill:"):
-        return False
-    if source not in seen:
-        from ouroboros.skill_loader import find_skill, load_enabled, load_skill_grants
-
-        name, root = source[len("skill:"):], _queue().DRIVE_ROOT
-        # The owner's grant is the consent that armed the row; a grant the owner
-        # withdrew silences the row exactly as disabling the skill does. This
-        # reads the recorded grant itself, not the Host route's content-hash
-        # binding: a payload edit stops NEW posts until the owner re-grants,
-        # but does not withdraw the consent behind reminders already armed.
-        seen[source] = (find_skill(root, name) is None or not load_enabled(root, name)
-                        or "notify_owner" not in load_skill_grants(root, name).get("granted_permissions", []))
-    return seen[source]
-
-
-def _fire_owner_notification(record: Dict[str, Any],
-                             scheduled_for: datetime.datetime) -> tuple[Dict[str, Any] | None, str]:
-    """Persist one due ``kind: "notify"`` row's notification: ``(row, "")`` when
-    fired, ``(None, why)`` when not.
-
-    The caller has already persisted consumption under the table lock before
-    this append; a crash cannot replay this occurrence. Topic publication runs
-    after the lock. The frame key includes the due instant so the NEXT cron
-    occurrence or an explicitly re-armed reminder keeps a distinct identity.
-    """
-    import hashlib
-
-    from ouroboros.event_bus import OWNER_NOTIFICATION_KEY_CHARS, emit_owner_notification
-
-    notification = record.get("notification") if isinstance(record.get("notification"), dict) else {}
-    source = str(record.get("source") or "")
-    # UTC, so the occurrence key does not depend on the host's zone setting.
-    due_iso = scheduled_for.astimezone(datetime.timezone.utc).isoformat()
-    producer_key = str(notification.get("key") or "") or str(record.get("id") or "")
-    if len(producer_key) + 1 + len(due_iso) > OWNER_NOTIFICATION_KEY_CHARS:
-        # The producer may use the whole key; the occurrence key must still
-        # fit the same cap, so a long key rides as its digest.
-        producer_key = hashlib.sha256(producer_key.encode("utf-8")).hexdigest()[:32]
-    try:
-        row = emit_owner_notification(
-            _queue().DRIVE_ROOT, chat_id=_notification_chat_id(record), category="notice",
-            text=str(notification.get("text") or ""), source=source or "scheduler",
-            key=f"{producer_key}@{due_iso}", scheduled_for=due_iso, publish=False,
-        )
-    except ValueError as exc:
-        return None, f"invalid notification: {exc}"
-    return row, ("" if row is not None else "notification log write failed; outcome unknown, no automatic retry")
-
-
 def check_scheduled_tasks() -> None:
-    """Dispatch a due notification without a model; task occurrences use
-    the upstream claim/prepare/admit protocol and its durable custody."""
+    """Admit due cron/once schedules through the occurrence protocol.
+
+    Claims and reconciliation run under the queue+table locks; every expensive
+    step (resource intent, folder checks, memory fork, the allowance read) runs
+    without them; admission rechecks and commits under them again
+    (``supervisor/schedule_occurrence.py``)."""
     global _last_skill_schedule_sync
     from supervisor import schedule_occurrence as occurrences
 
-    fired: List[Dict[str, Any]] = []
     claims: List[Dict[str, Any]] = []
-    retired_claims: list[tuple[str, str]] = []
-    write_failed = False
     with schedule_transaction(_queue().DRIVE_ROOT):
         now_monotonic = time.monotonic()
         if now_monotonic - _last_skill_schedule_sync >= _SKILL_SCHEDULE_SYNC_INTERVAL_SEC:
@@ -842,10 +788,17 @@ def check_scheduled_tasks() -> None:
             return
         changed = False
         collision_names = None
-        silenced_sources: Dict[str, bool] = {}
         now_utc = datetime.datetime.now(datetime.timezone.utc)
         for record in list(data.get("tasks") or []):
             if not isinstance(record, dict):
+                continue
+            from supervisor.followup_policy import control_guard, refresh_policy
+            try:
+                with control_guard(_queue().DRIVE_ROOT, record):
+                    occurrences.repair_followup_binding(record)
+                    view = refresh_policy(_queue().DRIVE_ROOT, data, record)
+            except Exception:
+                log.exception("Follow-up policy persistence unavailable")
                 continue
             if isinstance(record.get("occurrence"), dict):
                 # An occurrence in flight is decided from durable facts first — even on a
@@ -855,15 +808,12 @@ def check_scheduled_tasks() -> None:
                 verdict, stored = occurrences.reconcile(record)
                 changed = changed or verdict != "live"
                 if verdict == "reconsider":
-                    # A positive refusal/fresh claim is not frozen admitted work.
-                    # Drop its old basis without consuming the row; ordinary due
-                    # evaluation below decides the edited timing and controls.
-                    old = record.pop("occurrence")
-                    retired_claims.append((str(_queue().DRIVE_ROOT), str(old.get("token") or "")))
-                    record.pop("hold", None)
+                    # Unstarted work follows the current authored timing/control.
+                    if occurrences.discard_claim(record, data):
+                        continue
                 elif verdict == "settled":
                     occurrences.settle(record)
-                    if record.get("delete_requested_at"):  # its deletion waited for this run
+                    if record.get("delete_requested_at") and occurrences.deletion_settled(record):
                         data["tasks"] = [row for row in data.get("tasks") or [] if row is not record]
                         continue
                 elif verdict in {"prepare", "republish"}:
@@ -871,6 +821,10 @@ def check_scheduled_tasks() -> None:
                     continue
                 else:
                     continue
+            if record.get("delete_requested_at") and occurrences.deletion_settled(record):
+                data["tasks"] = [row for row in data.get("tasks") or [] if row is not record]
+                changed = True
+                continue
             if not record.get("enabled", True) or occurrences.holding(record, now_utc):
                 continue
             schedule_id = str(record.get("id") or "").strip()
@@ -880,16 +834,10 @@ def check_scheduled_tasks() -> None:
                 changed = True
             trigger = record.get("trigger") if isinstance(record.get("trigger"), dict) else {}
             trigger_type = str(trigger.get("type") or "cron").strip().lower()
-            kind = str(record.get("kind") or "task").strip().lower()
-            notify_row = kind == SCHEDULE_KIND_NOTIFY
-            if kind not in ("task", SCHEDULE_KIND_NOTIFY):
-                # A verb this tick does not know is not a task in disguise: the
-                # row is left untouched with a typed error, never dispatched.
-                changed = _record_last_error(record, f"unsupported schedule kind: {kind}") or changed
+            if _schedule_running_or_queued(schedule_id, _queue().DRIVE_ROOT) is not False:
+                # Unknown reads as "still in flight": re-dispatching a schedule
+                # whose previous run may be alive is worse than waiting a pass.
                 continue
-            # Task rows use the upstream occurrence claim/reconcile protocol to
-            # establish in-flight ownership; the older snapshot-only test here
-            # would hold every new occurrence when that projection is unknown.
             tz = _timezone_for_schedule(record)
             now = now_utc.astimezone(tz)
             if trigger_type == "once":
@@ -930,73 +878,7 @@ def check_scheduled_tasks() -> None:
                     collision_names = skill_identity_collision_names(_queue().DRIVE_ROOT)
                 if str(record.get("skill") or "") in collision_names:
                     continue
-
-            if notify_row:
-                # A task claim must reach its own admission seam outside this
-                # lock before a notification precommit can persist the table.
-                # Otherwise a later failed write could strand a claimed task.
-                if claims:
-                    continue
-                if _notify_source_silenced(str(record.get("source") or ""), silenced_sources):
-                    continue
-                due_at = _parse_schedule_time(trigger.get("run_at"), tz) if trigger_type == "once" else next_run
-                successor = None
-                if trigger_type == "cron":
-                    # The successor is settled BEFORE the owner is rung: a durable
-                    # row whose expression cannot advance would otherwise keep its
-                    # stale due instant and ring again on every pass.
-                    try:
-                        successor = _next_cron_time(expr, now)
-                    except Exception as exc:
-                        changed = _record_last_error(record, f"{type(exc).__name__}: {exc}") or changed
-                        continue
-                from ouroboros.event_bus import OWNER_NOTIFICATION_TEXT_CHARS
-
-                notification = record.get("notification") if isinstance(record.get("notification"), dict) else {}
-                text = str(notification.get("text") or "").strip()
-                if not text or len(text) > OWNER_NOTIFICATION_TEXT_CHARS:
-                    changed = _record_last_error(record, "invalid notification text") or changed
-                    continue
-                # Commit the consumed occurrence BEFORE the outward append. An
-                # append may land even when its writer reports an error; writing
-                # the schedule afterward would ring the same occurrence again
-                # whenever that table write fails. Unknown outcomes sacrifice
-                # one reminder, never silently manufacture repeated alerts.
-                record["last_run_at"] = now.isoformat()
-                record["last_error"] = "notification delivery outcome unknown"
-                if trigger_type == "once":
-                    record["enabled"] = False
-                    record["completed_at"] = now.isoformat()
-                    record["next_run_at"] = ""
-                else:
-                    record["next_run_at"] = successor.isoformat()
-                try:
-                    if _write_scheduled_tasks(data) is False:
-                        raise OSError("notification occurrence precommit returned no receipt")
-                except OSError:
-                    log.error("Notification occurrence not confirmed; no outward append", exc_info=True)
-                    write_failed = True
-                    break
-                occurrences._FRESH_CLAIMS.difference_update(retired_claims)
-                retired_claims.clear()
-                changed = False
-                row, why = _fire_owner_notification(record, due_at or now)
-                if row is None:
-                    # The append outcome is not proven absent: keep the consumed
-                    # receipt and a visible error, but never blindly retry.
-                    changed = _record_last_error(record, why) or changed
-                    continue
-                fired.append(row)
-                record["last_error"] = ""
-                changed = True
-                continue
-            # Reconcile the previous occurrence even while its root runs: that
-            # retires the dispatched token and preserves its settlement facts.
-            # Gate every NEW claim by the live schedule id, including a recreated
-            # row with no last_task_id. An unknown queue snapshot holds a row that
-            # records a prior admission; it cannot prevent a first-ever claim.
-            live = _schedule_running_or_queued(schedule_id, _queue().DRIVE_ROOT)
-            if live is True or (live is None and record.get("last_task_id")):
+            if view.get("hold") or view["wait"] or record.get("followup_hold"):
                 continue
             claims.append(occurrences.claim(record, due_at))
             changed = True
@@ -1005,27 +887,12 @@ def check_scheduled_tasks() -> None:
         from ouroboros.retention import age_cutoff, get_gc_retention_days
 
         kept, pruned = _prune_consumed_once(list(data.get("tasks") or []),
-                                            age_cutoff(get_gc_retention_days()))
+                                            age_cutoff(get_gc_retention_days()), work_settled=occurrences.deletion_settled)
         if pruned:
             data["tasks"], changed = kept, True
-        if changed and not write_failed:
-            try:
-                if _write_scheduled_tasks(data) is False:
-                    raise OSError("scheduler table write returned no receipt")
-            except OSError:
-                log.error("Scheduled-task table write not confirmed; holding new claims", exc_info=True)
-                write_failed = True
-            if not write_failed:
-                occurrences._FRESH_CLAIMS.difference_update(retired_claims)
-                _queue().persist_queue_snapshot(reason="scheduled_tasks")
-    if fired:
-        # The durable append happened under the table lock, but subscribers run
-        # outside it, after the schedule row is written.
-        from ouroboros.event_bus import publish_owner_notification
-
-        for row in fired:
-            publish_owner_notification(row)
-    if write_failed:
-        return
+        if changed:
+            if _write_scheduled_tasks(data) is False:
+                return
+            _queue().persist_queue_snapshot(reason="scheduled_tasks")
     if claims:
         occurrences.admit([occurrences.prepare(claimed) for claimed in claims])

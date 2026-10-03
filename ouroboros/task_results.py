@@ -9,15 +9,12 @@ import pathlib
 import re
 from typing import Any, Callable, Dict, List, Optional
 
-from ouroboros.cost_projection import (
-    COST_ALIAS_PAIRS, COST_OPENNESS_FIELDS,
-    normalize_task_result_cost_planes,
-)
-from ouroboros.utils import read_json_dict, update_json_locked, utc_now_iso
-# Read-side custody of a published review projection belongs with the projection
-# owner; the historical name stays resolvable through this module.
+from ouroboros.cost_projection import COST_ALIAS_PAIRS, COST_OPENNESS_FIELDS, normalize_task_result_cost_planes
+from ouroboros.utils import read_json_dict, read_text_across_replace, update_json_locked, utc_now_iso
+# Projection owner retains read custody; this historical import remains compatible.
 from ouroboros.review_projection import merge_review_projection as merge_review_projection
 from ouroboros.review_records import validate_author_disposition
+from ouroboros.terminal_time import preserve_terminal_attempt, terminal_time_patch
 
 log = logging.getLogger(__name__)
 
@@ -153,7 +150,7 @@ def _claim_for_paid_identity(claims: Any, paid_identity: str) -> Optional[Dict[s
 
 
 def project_task_acceptance_review_capacity(
-    ctx: Any, *, binding_hash: str = "", task_id: str = "", paid_identity: str = "",
+    ctx: Any, *, binding_hash: str = "", task_id: str = "", paid_identity: str = "", purpose: str = "",
 ) -> Dict[str, Any]:
     """Read the canonical root's paid acceptance-wallet projection.
 
@@ -198,7 +195,7 @@ def project_task_acceptance_review_capacity(
         "binding_seen": False,
         "dedupe": "task_acceptance_binding_sha256",
     }
-    if config.get_task_review_mode() == "off":
+    if config.get_task_review_mode() == "off" and purpose != "owner_historical_acceptance":
         return {
             **base,
             "state": "unavailable",
@@ -696,7 +693,7 @@ def reopen_reconciled_presence_placeholder(drive_root: Any, task_id: str) -> boo
     # The terminal-projection bookkeeping of the placeholder's failed transition goes with it: the
     # re-run's own terminal transition must originate its own room row, never inherit a failed one.
     projection = ("canonical_terminal_projection", "canonical_terminal_projection_ready",
-                  "canonical_terminal_projection_origin")
+                  "canonical_terminal_projection_origin", "terminal_time")
     cleared = {"reason_code", "outcome_axes", "artifact_status", "artifact_bundle", "result",
                "status_reconciled_from", *projection}
 
@@ -790,7 +787,7 @@ def load_task_result(
             raise
         return None
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(read_text_across_replace(path))
     except FileNotFoundError:
         return None  # This read saw absence even if a writer publishes immediately after it.
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
@@ -843,6 +840,8 @@ def write_task_result(
     _field_projector: Optional[Callable[[Dict[str, Any], Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
     strict_existing_dict: bool = False,
     create_only: bool = False,
+    _terminal_observed: bool = False,
+    _terminal_time_source: Optional[Dict[str, Any]] = None,
     **fields: Any,
 ) -> Dict[str, Any]:
     """Merge-write a task result under a per-file lock.
@@ -853,19 +852,18 @@ def write_task_result(
     ``_field_projector`` runs after review-publication selection under the same
     lock, deriving fields/status from CURRENT or publishing its verified refs;
     repeating the incoming-review merge afterward would undo that handoff.
-    ``strict_existing_dict`` refuses malformed/non-object, empty, wrong-identity
-    or wrong-schema authority under the write lock, never replacing it with {}.
-    ``create_only`` aborts on an existing nonempty row after those checks, before
-    projection, normalization or timestamps. Pair it with strict validation to
-    initialize only absence while preserving unknown bytes.
+    ``strict_existing_dict`` refuses invalid authority under the write lock.
+    ``create_only`` initializes only absence, before projection or timestamps;
+    combined with strict validation it preserves unreadable existing bytes.
     """
     path = task_result_path(results_drive_root, task_id)
     explicit_ts = str(fields.pop("ts", "") or "")
-    from ouroboros.task_custody import capture_unread_mail, merge_unread_mail
+    from ouroboros.task_custody import capture_owner_mail, capture_unread_mail, merge_unread_mail
 
     # TZ-1 V10: the mailbox bytes are read BEFORE the row lock (a bounded union happens
     # under it); a terminal write that the projector turns terminal captures under it.
     captured = capture_unread_mail(results_drive_root, task_id) if status in _TRULY_TERMINAL_STATUSES else None
+    owner_mail = capture_owner_mail(results_drive_root, task_id) if status in _TRULY_TERMINAL_STATUSES else None
 
     def _merge(existing: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if strict_existing_dict and existing and (
@@ -881,6 +879,8 @@ def write_task_result(
         if create_only and existing:
             return None
         prepared_fields = dict(fields)
+        from ouroboros.acceptance_history import preserve_acceptance_history
+        prepared_fields = preserve_acceptance_history(existing, prepared_fields)
         if "review_projection" in prepared_fields:
             prepared_fields["review_projection"] = merge_review_projection(
                 existing.get("review_projection"), prepared_fields["review_projection"],
@@ -889,6 +889,7 @@ def write_task_result(
         if projected_fields is None:  # projector saw a terminal/stale row: no mutation
             return None
         projected_status = str(projected_fields.pop("status", status))
+        projected_fields.pop("terminal_time", None)  # ordinary fields cannot manufacture clock authority
         # Monotonic lifecycle: no stale mirror may overwrite a terminal outcome.
         existing_status = str(existing.get("status") or "")
         if existing and _is_status_regression(existing_status, projected_status):
@@ -906,6 +907,9 @@ def write_task_result(
             if resolve_task_lineage(task_id, metadata=merged.get("metadata"),
                                     **{key: merged.get(key) for key in lineage_keys})["is_root_task"]:
                 projected_fields["canonical_terminal_projection_origin"] = "terminal_transition"
+                # Batch4: the owner's exact rows, ACKed ones included, outlive the mailbox cleanup.
+                projected_fields["owner_mailbox"] = merge_unread_mail(existing.get("owner_mailbox"), owner_mail
+                                                                      or capture_owner_mail(results_drive_root, task_id))
             # TZ-1 V10: this accepted transition keeps the mail no attempt read (no ACK written);
             # later late mail joins through settlement, never through a rejected write.
             projected_fields["unread_mailbox"] = merge_unread_mail(
@@ -916,11 +920,11 @@ def write_task_result(
             existing.get("unread_mailbox"), projected_fields.get("unread_mailbox"))
         if projected_fields["unread_mailbox"] is None:
             projected_fields.pop("unread_mailbox")
+        projected_fields = preserve_terminal_attempt(existing, projected_fields)
         now = utc_now_iso()
-        # ABI-3 write seam: the merge BASE is normalized onto honest cost names first, so a stored alias
-        # neither survives nor outranks this write's fresh value; a legacy spelling IN this write still
-        # wins the final pass and leaves under the honest name. Both passes use the shared deep
-        # normalizer, so nested cost planes (subagent envelope, loop-outcome usage) are rewritten too.
+        projected_fields.update(terminal_time_patch(existing, projected_fields, status=projected_status,
+            task_id=task_id, observed_at=now if _terminal_observed else None, replica=_terminal_time_source))
+        # ABI-3: shared deep cost normalization handles both rows/nested planes; incoming values win.
         return stamp_task_result_schema(normalize_task_result_cost_planes({
             **normalize_task_result_cost_planes(existing),
             **projected_fields,

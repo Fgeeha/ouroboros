@@ -75,7 +75,9 @@ def test_activity_direct_turn_reaches_shared_control_endpoint(direct_server_with
                 button.click()
                 menu = page.locator('body > .task-control-menu')
                 menu.wait_for(state="visible")
-                assert menu.locator('[data-task-control]').all_text_contents() == ["Wrap up", "Hurry up", "Stop now"]
+                # A direct turn is a ROOT: it offers the owner's whole-tree Pause (Batch4 5A) too.
+                assert menu.locator('[data-task-control]').all_text_contents() == [
+                    "Wrap up", "Hurry up", "Pause", "Stop now"]
                 page.screenshot(path=str(evidence / f"activity-{action}.png"), full_page=True)
                 endpoint = "hurry" if action == "hurry" else "cancel"
                 # Direct actors stop cooperatively. Let the held fake provider

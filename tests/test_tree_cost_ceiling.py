@@ -436,6 +436,7 @@ class TestWrapupAffordability:
     def test_wire_recovery_matches_physical_candidate(self, monkeypatch, tmp_path):
         from ouroboros import llm as llm_module
         from ouroboros.llm import LLMClient
+        from ouroboros.request_wire_contract import physical_candidate_bytes, physical_candidate_sha256
 
         monkeypatch.setenv("OPENAI_API_KEY", "unused")
         client = LLMClient(api_key="unused")
@@ -445,9 +446,13 @@ class TestWrapupAffordability:
         captured = {}
         real_prepare = llm_module.prepare_wire_payload_for_send
 
-        def prepare(target_, payload, *, api_surface):
-            prepared = real_prepare(target_, payload, api_surface=api_surface)
+        def prepare(target_, payload, *, api_surface, logical_payload=None):
+            prepared = real_prepare(
+                target_, payload, api_surface=api_surface, logical_payload=logical_payload,
+            )
             prepared["recovered_wire_field"] = True
+            captured.setdefault("prepared", []).append(prepared)
+            captured.setdefault("logical", []).append(logical_payload)
             return prepared
 
         def execute(request, _send, _before_dispatch):
@@ -472,10 +477,20 @@ class TestWrapupAffordability:
                 target, messages, "high", prospective.max_completion_tokens, "auto", None, None,
                 skip_capability_fetch=True, **_MAIN_LOOP_OPTIONS,
             )
+            candidate["timeout"] = 33.0
             client._normalize_payload_cache_ttl(target, candidate)
             client._create_chat_completion_with_retries(lambda **_kwargs: None, candidate, target)
 
         actual = captured["request"]
+        assert len(captured["prepared"]) == len(captured["logical"]) == 2
+        assert captured["logical"][-1] is candidate
+        assert captured["logical"][-1]["timeout"] == 33.0
+        assert all("timeout" not in payload for payload in captured["prepared"])
+        prepared = captured["prepared"][-1]
+        assert prepared["recovered_wire_field"] is True
+        assert actual.candidate_raw_size_bytes == len(physical_candidate_bytes(prepared))
+        assert actual.candidate_raw_sha256 == physical_candidate_sha256(prepared)
+        assert prospective.prompt_tokens_estimate == actual.prompt_tokens_estimate
         assert prospective.candidate_raw_size_bytes == actual.candidate_raw_size_bytes
         assert prospective.candidate_raw_sha256 == actual.candidate_raw_sha256
 
@@ -589,6 +604,10 @@ class TestGlobalOnlyTreeAccounting:
 
 
     def test_an_uncapped_rooted_attempt_refreshes_the_real_tree_cache(self, tmp_path):
+        from ouroboros.task_results import write_task_result
+        write_task_result(tmp_path, 'root-u', 'running', billing_group={
+            'billing_group_id': 'root-u', 'billing_group_limit_usd': None,
+            'billing_group_limit_source': 'initial_task_admission', 'billing_group_limit_revision': 'fixture'})
         scope = usage_accounting.UsageScope(
             drive_root=tmp_path, task_id="child-u", root_task_id="root-u", global_limit_usd=100.0,
         )
@@ -1226,6 +1245,10 @@ class TestOneCeilingPerTree:
 
     def test_acceptance_rails_use_global_wallet_and_tree_spend(self, monkeypatch, tmp_path):
         monkeypatch.setenv("TOTAL_BUDGET", "50")
+        from ouroboros.task_results import write_task_result
+        write_task_result(tmp_path, 'root', 'running', billing_group={
+            'billing_group_id': 'root', 'billing_group_limit_usd': 100.0,
+            'billing_group_limit_source': 'initial_task_admission', 'billing_group_limit_revision': 'fixture'})
         for task_id, root_id, cost in (("child", "root", 42.0), ("other", "other", 7.0)):
             with usage_accounting.usage_scope(usage_accounting.UsageScope(
                 drive_root=tmp_path, task_id=task_id, root_task_id=root_id,

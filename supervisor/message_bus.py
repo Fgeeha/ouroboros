@@ -21,7 +21,7 @@ from ouroboros.tools.core import (
     validate_quiz_payload,
 )
 from ouroboros.utils import utc_now_iso
-from ouroboros.subagent_messages import SUBAGENT_MESSAGE_FIELDS
+from ouroboros.subagent_messages import CARD_ROW_PLACEMENTS, SUBAGENT_MESSAGE_FIELDS, is_task_card_message
 
 log = logging.getLogger(__name__)
 
@@ -49,10 +49,8 @@ def accepted_chat_message(drive_root, chat_id: int, client_message_id: str) -> O
 
 def accept_local_message(bridge, drive_root, text: str, *, retain_inputs=None, dispatch=None, **message) -> tuple[dict, bool]:
     """Accept a named skill delivery once, then schedule/queue its exact source.
-
-    The canonical receipt precedes dispatch under the single ingress lock, including
-    simultaneous requests. A crash after acceptance permits no redispatch; operation
-    reads disclose a lost host session instead.
+    The ingress lock serializes receipt-before-dispatch. After an acceptance crash,
+    reads disclose a lost host session; they never redispatch.
     """
     from ouroboros.project_dialogue import _text_sha256, build_owner_message_ref
 
@@ -89,8 +87,7 @@ def accept_local_message(bridge, drive_root, text: str, *, retain_inputs=None, d
             if retain_inputs is not None:
                 retain_inputs()
         ref = build_owner_message_ref(chat_id=chat_id, client_message_id=message_id, ts=ts, text=logged)
-        # The row rides the item as its in-process witness (``record_inbound_message``); its
-        # acceptance time is this message's receipt stamp.
+        # record_inbound_message gets the row witness and receipt time.
         # Dispatch only schedules/queues; slow work must not hold the ingress lock.
         (dispatch or bridge.enqueue_local_message)(text, **message, accepted_source_ref=ref, accepted_source_row=row, received_at=ts)
         return row, False
@@ -252,7 +249,7 @@ def get_bridge() -> "LocalChatBridge":
 
 
 def _advance_project_visible_revision(chat_id: int) -> None:
-    """Advance unread only for a real owner-visible Project presentation row."""
+    """Advance unread for one new message in a Project's conversation feed."""
     if DATA_DIR is None:
         return
     try:
@@ -826,7 +823,7 @@ class LocalChatBridge:
             owner_id = int(load_state().get("owner_id") or 0)
         except Exception:
             owner_id = 0
-        log_chat(
+        if log_chat(
             "out",
             int(chat_id or 0),
             owner_id,
@@ -838,8 +835,8 @@ class LocalChatBridge:
             download_url=download_url,
             download_url_compat=download_url_compat,
             caption=str(caption or ""),
-        )
-        _advance_project_visible_revision(chat_id)
+        ):
+            _advance_project_visible_revision(chat_id)
         return True, "ok"
 
     def send_video(
@@ -888,7 +885,7 @@ class LocalChatBridge:
             owner_id = int(load_state().get("owner_id") or 0)
         except Exception:
             owner_id = 0
-        log_chat(
+        if log_chat(
             "out",
             int(chat_id or 0),
             owner_id,
@@ -900,8 +897,8 @@ class LocalChatBridge:
             download_url=download_url,
             download_url_compat=download_url_compat,
             caption=str(caption or ""),
-        )
-        _advance_project_visible_revision(chat_id)
+        ):
+            _advance_project_visible_revision(chat_id)
         return True, "ok"
 
     def send_document(
@@ -971,7 +968,7 @@ class LocalChatBridge:
             owner_id = int(load_state().get("owner_id") or 0)
         except Exception:
             owner_id = 0
-        log_chat(
+        if log_chat(
             "out",
             int(chat_id or 0),
             owner_id,
@@ -985,8 +982,8 @@ class LocalChatBridge:
             caption=str(caption or ""),
             size_bytes=size_bytes,
             download_url_compat=download_url_compat,
-        )
-        _advance_project_visible_revision(chat_id)
+        ):
+            _advance_project_visible_revision(chat_id)
         return True, "ok"
 
     def send_links(
@@ -1029,12 +1026,12 @@ class LocalChatBridge:
             owner_id = int(load_state().get("owner_id") or 0)
         except Exception:
             owner_id = 0
-        log_chat(
+        if log_chat(
             "out", int(chat_id or 0), owner_id, safe_title, ts=ts,
             task_id=str(task_id or ""), record_type="links",
             actions=validated, title=safe_title,
-        )
-        _advance_project_visible_revision(chat_id)
+        ):
+            _advance_project_visible_revision(chat_id)
         return True, "ok"
 
     def send_quiz(
@@ -1117,7 +1114,7 @@ class LocalChatBridge:
             owner_id = int(load_state().get("owner_id") or 0)
         except Exception:
             owner_id = 0
-        log_chat(
+        if log_chat(
             "out", int(chat_id or 0), owner_id, payload["question"], ts=ts,
             task_id=str(task_id or ""), record_type="quiz",
             quiz={
@@ -1129,8 +1126,8 @@ class LocalChatBridge:
                 "state": str(state or "open"),
                 **({"host_facts": str(host_facts)} if host_facts else {}),
             },
-        )
-        _advance_project_visible_revision(chat_id)
+        ):
+            _advance_project_visible_revision(chat_id)
         if self._broadcast_fn and msg.get("project_thread"):
             try:
                 from ouroboros.owner_quiz import quiz_states
@@ -1399,6 +1396,7 @@ def log_chat(
     require_write: bool = False,
     ensure_record_boundary: bool = False,
 ) -> Optional[dict]:
+    """Return the stored row, or None on a best-effort failure; require_write still raises."""
     root = drive_root if drive_root is not None else DATA_DIR
     if root:
         from pathlib import Path
@@ -1445,7 +1443,7 @@ def log_chat(
         if "narration" in meta:
             record["narration"] = bool(meta["narration"])
         if record_type in ("project_started", "project_handoff", "project_completion_summary"):
-            for key in ("project_id", "project_name", "target_label", "status", "completion_answer", "handoff_id"):
+            for key in ("project_id", "project_name", "target_label", "status", "completion_answer", "handoff_id", "terminal_time"):
                 if key in meta:
                     record[key] = meta[key]
         if "task_terminal_status" in meta:
@@ -1460,11 +1458,14 @@ def log_chat(
         # to the task's card, not beside it. Only the two named placements are
         # persisted, and the row's stable identity rides with one of them or not
         # at all — a bare id without a placement names nothing on reload.
-        if meta.get("card_row") in ("timeline", "reviews"):
+        if meta.get("card_row") in CARD_ROW_PLACEMENTS:
             record["card_row"] = str(meta["card_row"])
             card_row_id = str(meta.get("card_row_id") or "")
             if card_row_id and len(card_row_id) <= 200:
                 record["card_row_id"] = card_row_id
+                revision = meta.get("card_row_revision")
+                if type(revision) is int and revision >= 0:
+                    record["card_row_revision"] = revision
         if record_type == "acceptance_late_settlement" and isinstance(meta.get("late_evidence"), dict):
             record["late_evidence"] = dict(meta["late_evidence"])
         if filename:
@@ -1492,10 +1493,9 @@ def log_chat(
             root / "logs" / "chat.jsonl", record,
             require_lock=require_write, ensure_record_boundary=ensure_record_boundary,
         )
-        if require_write:
-            if not written:
-                raise RuntimeError("canonical message acceptance could not be persisted")
-            return record
+        if require_write and not written:
+            raise RuntimeError("canonical message acceptance could not be persisted")
+        return record if written else None
     elif require_write:
         raise RuntimeError("canonical message acceptance requires a data root")
 
@@ -1550,7 +1550,7 @@ def send_with_budget(chat_id: int, text: str, log_text: Optional[str] = None,
             progress_record.update(dict(progress_meta))
         append_jsonl(DATA_DIR / "logs" / "progress.jsonl", progress_record)
     else:
-        log_chat(
+        stored = log_chat(
             # S3 (Q4): a typed SYSTEM row persists as direction="system", the
             # role history replay already maps to a system rendering — so the
             # receipt survives reload as system, never as Ouroboros's speech.
@@ -1569,7 +1569,7 @@ def send_with_budget(chat_id: int, text: str, log_text: Optional[str] = None,
 
     if _text.strip() in ("", "\u200b"):
         return
-    if (not is_progress) or bool((progress_meta or {}).get("task_incident")):
+    if not is_progress and stored and not is_task_card_message(progress_meta):  # only stored feed rows count
         _advance_project_visible_revision(chat_id)
     # Budget footers belong in dashboard/status flows, not every chat reply.
     full = _text

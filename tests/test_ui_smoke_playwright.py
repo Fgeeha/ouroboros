@@ -1149,12 +1149,10 @@ def test_ui_smoke_collapsed_activity_line_named_vs_unnamed(
 @pytest.mark.ui_browser
 @pytest.mark.parametrize("browser_engine", ["chromium", "webkit"])
 def test_ui_smoke_live_card_mutations_preserve_viewport(
-    direct_server_with_data,
-    browser_engine,
+    direct_server_with_data, browser_engine, request,
 ):
-    from tests.ui_chat_viewport_smoke import run_chat_viewport_smoke
-
-    run_chat_viewport_smoke(direct_server_with_data, browser_engine)
+    from tests.ui_chat_viewport_smoke import run_chat_viewport_smoke as run
+    run(direct_server_with_data, browser_engine, request)
 
 @pytest.mark.ui_browser
 def test_ui_smoke_chat_chronology_reconnect_and_plain_answer_marker(direct_server_with_data):
@@ -2153,10 +2151,10 @@ def test_ui_smoke_direct_mode_chat_scrolls_on_desktop(direct_server):
                 page.goto(direct_server, wait_until="domcontentloaded", timeout=30_000)
                 page.get_by_role("button", name="Chat").click()
                 page.wait_for_selector("#chat-messages", timeout=30_000)
-                # Wait for the initial history rebuild to finish before injecting
-                # synthetic rows; otherwise that authoritative rebuild may erase
-                # the probe immediately after insertion on slower startup paths.
-                page.wait_for_selector("#chat-messages .chat-bubble.assistant", timeout=30_000)
+                # Wait for the first history rebuild to land (the hydration stamp; empty
+                # Main has no bubble) before injecting synthetic rows, or that rebuild may
+                # erase the probe right after insertion on slower startups.
+                page.wait_for_selector('#chat-messages[data-history-hydrated="true"]', timeout=30_000)
                 # A viewport change can re-render the chat from the (empty) real
                 # history and drop injected probe nodes, so injection is a helper
                 # re-run before every measurement instead of a one-shot setup.

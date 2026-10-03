@@ -3,7 +3,7 @@ import test from 'node:test';
 import { readdirSync, readFileSync } from 'node:fs';
 
 import {
-    taskDoneIsTerminal, taskPresentation, taskReasonDetail, taskReasonPhrase, taskTerminalPhase,
+    taskDoneIsTerminal, taskPresentation, taskReasonDetail, taskReasonPhrase, taskTerminalPhase, summarizeChatLiveEvent,
 } from '../modules/log_events.js';
 
 // A degraded delivery used to name one generic cause on every card. The record
@@ -397,4 +397,18 @@ test('standing limitations are stated beside the primary cause, each once', () =
     'Some sub-task results were deferred instead of being folded into this answer');
     assert.equal(taskReasonDetail({ ...deferred, reason_code: 'owner_requested_finalization' }),
         'Some sub-task results were deferred instead of being folded into this answer · The plan review was still open when this answer was delivered');
+});
+
+
+test('an unfinished child keeps the complete authored result and its stop cause on the collapsed line', () => {
+    const result = 'Complete selected answer, including what has already been done.';
+    const outcome_axes = { execution: { status: 'ok', task_completion: {
+        action: 'stop', rationale: 'The **export** still fails on empty input.',
+    } }, objective: { status: 'fail', source: 'task_completion', reason: 'author_stop' } };
+    const view = summarizeChatLiveEvent({ type: 'send_message', is_progress: true, delegation_role: 'subagent',
+        subagent_task_id: 'child', parent_task_id: 'root', subagent_event: 'completed',
+        status: 'completed', reason_code: 'final_message', outcome_axes, result });
+    assert.equal(view.phase, 'error');
+    assert.equal(view.activityPreview, 'Ouroboros stopped with unfinished work; no review approval was granted · The export still fails on empty input.');
+    assert.ok(view.fullBody.includes(result));
 });

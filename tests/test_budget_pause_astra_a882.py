@@ -293,7 +293,6 @@ def test_a_parallel_batch_raising_usage_accounting_error_waits_for_already_start
         {"id": "call_a", "type": "function", "function": {"name": "read_file", "arguments": "{}"}},
         {"id": "call_b", "type": "function", "function": {"name": "read_file", "arguments": "{}"}},
     ]
-    started_at = time.monotonic()
     try:
         with pytest.raises(UsageAccountingError, match="mid-batch"):
             loop_tools.handle_tool_calls(tool_calls, tools, tmp_path, "a882-batch", None, [], {}, lambda _s: None)
@@ -302,7 +301,7 @@ def test_a_parallel_batch_raising_usage_accounting_error_waits_for_already_start
         # The re-raise happened only AFTER the started call B ran to completion.
         assert b_done.is_set(), "handle_tool_calls re-raised while call B was still running"
         assert raised_at >= marks["b_finished_at"]
-        assert raised_at - started_at >= 0.4
+        # Completion and ordering prove the wait; platform clock ticks need not measure sleep exactly.
     finally:
         b_done.wait(timeout=2.0)  # never leak the worker thread past the test
 

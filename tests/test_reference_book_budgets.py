@@ -1,13 +1,29 @@
 """Per-chapter byte budgets for the two reference books.
 
 Official-CI ``size_ratchet`` lane only (local runs exclude the marker, like the repository size
-gates): a chapter may grow past its budget only in a diff that raises the number here and says
-why. The budget is the chapter's size after the compression pass plus roughly ten percent, so
-ordinary maintenance fits and accretion does not. The same maintenance margin applies to unchanged registry chapters.
+gates). A chapter's limit is its base number in ``CHAPTER_BYTE_BUDGETS`` plus the sum of its grant
+files. A change that needs more room adds its own file and edits no shared line:
+
+    tests/reference_book_grants/<book>/<chapter-stem>/<name>.grant    for docs/<book>/<chapter-stem>.md
+
+    first line    the bytes granted, a positive integer: this change's NET growth of the chapter
+    then          the reason, at least one non-blank line
+
+``<name>`` is free (suggested ``<YYYY-MM-DD>-<slug>``). More room later is another file: the growth
+rule counts the files a change adds, plus any raise of the base number (what a compression pass
+makes, and what a change written before grant files existed still does). A compression pass folds the grants back: it sets the
+chapter's base number to the measured size plus a margin and deletes that chapter's grant files in
+the same change. The layout check is unmarked, so a file the size lane would ignore (dot-files aside) fails every
+default lane instead of landing silently.
 """
 from __future__ import annotations
 
+import ast
+import os
 import pathlib
+import re
+import subprocess
+from typing import Iterable
 
 import pytest
 
@@ -15,7 +31,7 @@ from ouroboros.reference_books import BOOK_ENTRYPOINTS, load_reference_book
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 
-# UTF-8 bytes of each chapter source. Raise a value in the same diff that needs it, with a reason.
+# Base UTF-8 bytes of each chapter source. Growth is a grant file; a number changes only for a new chapter or a fold.
 CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 161453 -> 162200: the module tree gains the `schedule_lifecycle.py` leaf beside
     # queue_schedules.py and names Observe's argument-level narrowing on the
@@ -47,10 +63,9 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 166450 -> 167000 (merge of the moved target into the plan-review branch, measured 166885): both
     # sides' replaced paragraphs land together; no text was appended by the merge itself.
     # 167000 -> 167300 (merge of the moved target into the plan-review branch, measured 167032): both sides' paragraphs land together.
-    # 167300 -> 167800 (notify integration onto 0d610ccc8, measured 167632):
-    # host_notify.py and the scheduled notification's data-flow/map rows coexist
-    # with the upstream occurrence and custody owners; no older node displaced them.
-    "docs/architecture/01-high-level-architecture.md": 167800,
+    # 167300 -> 167600 (measured 167528): the module-map row of the new `tools/github_checks.py`, the
+    # reader split out of `tools/github.py` at the 1000-line band; no older row describes it.
+    "docs/architecture/01-high-level-architecture.md": 167600,
     # 15517 -> 16200 (#1195): the session-custodied startup historical audit is a
     # new node of the startup flow (readiness no longer waits for the historical
     # seal diagnostic); the chapter had no older description of that pass to replace.
@@ -94,12 +109,8 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # earlier-plan facts as read-side projections (one clause); the base sat 22 bytes under.
     # 107300 -> 107500 (merge of the moved target into the plan-review branch, measured 107392): both
     # sides' replaced paragraphs land together; no text was appended by the merge itself.
-    # 107500 -> 107800 (measured 107688): Activity's notify row and owner
-    # Delete semantics extend the upstream waiting-occurrence description.
-    "docs/architecture/03-web-ui-pages-and-buttons.md": 107800,
-    # 26833 -> 27200 (measured 27124): Host Service /notify is a new route;
-    # the gateway endpoint registry records it beside the upstream additions.
-    "docs/architecture/04-server-api-endpoints.md": 27200,
+    "docs/architecture/03-web-ui-pages-and-buttons.md": 107500,
+    "docs/architecture/04-server-api-endpoints.md": 26833,
     # 27137 -> 30400: the schedule table gains a documented write contract the
     # chapter had no text for — one transaction owning the lock ORDER, the strict
     # store read's three refusal cases, intent-then-outcome audit with its
@@ -139,12 +150,7 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # (own latch, the attempt-basis fence, the drive-custody pass: child-ref retry then bounded
     # drive settlements under the queue interlock, generation re-asked per item and commit) and
     # the watchdog watches startup with the stall stack; the sentences they change were replaced.
-    # 34100 -> 35700 (measured 35539): the model-free notify dispatch verb
-    # and owner suppression semantics are a new paragraph next to upstream's
-    # task occurrence protocol, not a replacement for its admission contract.
-    # 35700 -> 35900 (measured 35828): one live-run overlap invariant
-    # preserves task cron behavior while the notification kind bypasses it.
-    "docs/architecture/05-supervisor-loop.md": 35900,
+    "docs/architecture/05-supervisor-loop.md": 34100,
     # 286850 -> 287600: "an answer that has not arrived is a gap" is a new invariant of
     # plan review and task acceptance (the slot census vocabulary, the `awaiting`
     # projection, the only-awaited task outcome); the in-flight sentence it grew from is
@@ -255,7 +261,10 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 327400 -> 328400 (measured 328111): the addressed answer replaces the automatic delta; answers merge by
     # finding_id; continuation per slot; the escalated-question clause (each extended in place).
     # 328400 -> 328500 (measured 328427): the addressed clause names the cases decided before it that carry no note.
-    "docs/architecture/06-agent-core.md": 328500,
+    # Batch5 #1336 restores the official limit by compressing touched acceptance
+    # prose while documenting frozen source/money/operation custody in place.
+    # 328500 -> 328545 (measured 328520): the stale-debt sentence names the band entry kept at 1501-1600 lines.
+    "docs/architecture/06-agent-core.md": 328545,
     # 36991 -> 37300: the facade paragraph names the three loop constants runtime_limits.py
     # gained (events batch bound, budget-projection retry interval); no older text to displace.
     # 37300 -> 38400 (PR #1207): the Z.ai (`zai::`) direct provider gets its own route
@@ -284,7 +293,16 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # the production seam, resolution and doctor; no login or task), CI contracts the chapter had
     # no text for; the same 533 bytes the PR carried on its own base (measured 21317 there), now
     # on top of the #1300 Docker subsection. No text of either paragraph was touched in the merge.
-    "docs/architecture/08-git-branching-ci-and-build.md": 22500,
+    # 22500 -> 22800 (measured 22774): the run-cancellation rule (which CI runs a newer pull-request
+    # head cancels, and why re-runs keep their own group), a workflow contract the chapter had no
+    # text for; the pointer sentence beside it was reworded in place.
+    # 22800 -> 23200 (measured 23005): the CI table names where the provider canaries run for each
+    # event (the shared body and its push wrapper) and that landed pushes get the desktop matrix;
+    # the live-stand row shrank, the other two rows describe wiring the chapter did not have.
+    # 23200 -> 23500 (measured 23386): the browser row describes the four-shard lane, its manifest
+    # witness and the reconciling verdict, and where a partial diagnostic runs; both sentences
+    # replace the single-job description in place.
+    "docs/architecture/08-git-branching-ci-and-build.md": 23500,
     # 12405 -> 14400 (issue #1142): the ordinary-close paragraph gains the mechanism the chapter had
     # no text for — graceful stop signals the server PID only, the server half (stop event at the
     # signal, bounded uvicorn drain) is self-sufficient against an old group-SIGTERM launcher.
@@ -307,8 +325,7 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # room comparison protected nothing; the earlier one-clause form is replaced, and
     # the base sat 34 bytes under the previous budget.
     "docs/architecture/10-key-invariants.md": 21700,
-    # 24194 -> 24300: the host-mediated permission list names `notify_owner` (measured 24193).
-    "docs/architecture/11-frozen-contracts-v1.md": 24300,
+    "docs/architecture/11-frozen-contracts-v1.md": 24194,
     # +400 (#1213): Presence turns are named as actors without cross-focus catalogue or focus authority.
     # 11400 -> 12500: presence PR0 adds rules the chapter lacked, one sentence each (unified
     # conversation key, placeholder re-run and its lost-attempt facts, presence-local liveness,
@@ -332,20 +349,16 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # carried separately from prior speech in the same previous-turn pointer.
     # 14100/14800 -> 17500: TZ2 binding authority and TZ3 Host retry custody
     # coexist in one current Host/Presence map; neither overwrites the other.
-    # 17500 -> 18300 (owner notifications merged onto the TZ2/TZ3 tree, measured 18147): `POST
-    # /notify` joins the frozen route family with its contract (grant, the events-row fact,
-    # deferred `kind: "notify"` rows keyed by the skill, the suppressed-cancel exception).
-    "docs/architecture/12-host-service-companions-and-chat-ids.md": 18300,
+    # +100: source-bound Presence peer mail and shared execution-observation contract.
+    # The existing lifecycle paragraph is replaced and condensed; no new store or transport.
+    "docs/architecture/12-host-service-companions-and-chat-ids.md": 17600,
     # 7764 -> 8600 (#1195): the fresh selected-subject + immutable peer projection
     # execution check (`skill_peer_inventory.py`, `skill_conflicts.py`) replaces
     # whole-inventory hashing; the chapter had no description of that seam to swap out.
     # Dispatcher producer/annotation separation and its retained-source lifetime.
     "docs/architecture/13-external-skills-layer.md": 9500,
     "docs/development/01-role-and-authority.md": 2437,
-    # 36372 -> 36600 (owner notifications merged onto the current tree, measured 36512): the
-    # chat-id paragraph names its one addressed exception, event_bus.owner_notification_chat_id
-    # (a banner sent to chat 0 reaches nobody), beside the two normalizers it keeps.
-    "docs/development/02-naming-and-boundaries.md": 36600,
+    "docs/development/02-naming-and-boundaries.md": 36372,
     # 22873 -> 23100: one new invariant (notifications ring for live events
     # only). Its text was compressed to the load-bearing facts first; the
     # remainder is the cost of stating a rule that did not exist before.
@@ -397,7 +410,9 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 98600 -> 99300 (merge of the moved target into the plan-review branch, measured 99030): both sides' paragraphs land together.
     # 99300 -> 99800 (measured 99712): one bullet — plan-review answers merge by finding_id, the addressed re-ask
     # and its $0 replay rows, the quiz-answer rule; the base sat 270 bytes under.
-    "docs/development/06-rules-by-change-class.md": 99800,
+    # 99800 -> 100000 (measured 99967): one bullet names the retired `run_ci_tests`, its successor for
+    # reading and the archive that holds the dropped outcomes; a retirement record replaces no older text.
+    "docs/development/06-rules-by-change-class.md": 100000,
     "docs/development/07-managed-update-rule.md": 4166,
     "docs/development/08-mutation-attribution-rule.md": 2899,
     "docs/development/09-process-custody-rule.md": 10028,
@@ -419,22 +434,223 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # against the lane bullet; what remains is a mechanism the chapter lacked, so it
     # cannot replace older text. 3283 -> 2969 bytes of section after that pass, plus
     # the `--temp-parent` refusal clause (a nested disposable root is not disposable).
-    "docs/development/14-build-and-ci.md": 19500,
+    # Selected safe CI artifacts and the partial UI diagnostic add a new reader workflow.
+    # 20900 -> 21800 (measured 21627): how to read a red ordinary job — per-pass summaries and
+    # annotations, the `crash` phase, the incremental journal of a killed session and the step
+    # ceilings. The chapter described this only for the provider and UI lanes.
+    # 21800 -> 22700 (measured 22540): how the sharded UI lane is proven (slice rule, session budget,
+    # manifest, reconciliation, re-run attempts) and the one place where evidence is authoritative.
+    # 22700 -> 22848 (measured 22848): the release floor for required provider canaries on an official
+    # release tag, a CI contract the chapter had no text for; one clause on the provider sentence it qualifies.
+    "docs/development/14-build-and-ci.md": 22848,
 }
+
+
+GRANTS_TREE = "tests/reference_book_grants"
+BUDGETS_MODULE = "tests/test_reference_book_budgets.py"
+BASE_REF_ENV = "OURO_SIZE_RATCHET_BASE_REF"
+
+Grants = dict[str, list[tuple[str, int]]]
+
+
+def _grant_files(root: pathlib.Path) -> list[pathlib.Path]:
+    # Dot-files are the desktop's own (a Finder ``.DS_Store``), never a grant and never tracked here.
+    if not root.is_dir():
+        return []
+    return sorted(path for path in root.rglob("*") if path.is_file() and not path.name.startswith("."))
+
+
+def _parse_grant(path: pathlib.Path) -> tuple[int, str]:
+    """``(bytes, "")`` for a well-formed grant file, else ``(0, the rule it breaks)``."""
+    try:
+        # splitlines + strip: a CRLF checkout on Windows reads the same grant.
+        lines = [line.strip() for line in path.read_text(encoding="utf-8").splitlines()]
+    except (OSError, UnicodeDecodeError) as exc:
+        return 0, f"is not readable UTF-8 text ({type(exc).__name__})"
+    if not lines or not re.fullmatch(r"[1-9][0-9]*", lines[0]):
+        return 0, "its first line is the bytes granted, a positive integer and nothing else"
+    if not any(lines[1:]):
+        return 0, "the lines after the byte count give the reason, at least one non-blank line"
+    return int(lines[0]), ""
+
+
+def _suggested_grant(chapter: str) -> str:
+    return f"{GRANTS_TREE}/{chapter[len('docs/'):-len('.md')]}/<YYYY-MM-DD>-<slug>.grant"
+
+
+def read_grants(root: pathlib.Path) -> Grants:
+    """Well-formed grants by chapter path, each ``(path under root, bytes)``.
+
+    A misplaced or malformed file grants nothing; ``grant_layout_faults`` is what reports it.
+    """
+    grants: Grants = {}
+    for path in _grant_files(root):
+        rel = path.relative_to(root)
+        granted, fault = _parse_grant(path)
+        if len(rel.parts) == 3 and rel.suffix == ".grant" and not fault:
+            grants.setdefault(f"docs/{rel.parts[0]}/{rel.parts[1]}.md", []).append((rel.as_posix(), granted))
+    return grants
+
+
+def grant_layout_faults(root: pathlib.Path, chapters: Iterable[str]) -> list[str]:
+    """Every file under the grant tree is a well-formed grant of a current chapter, or is named here."""
+    current = set(chapters)
+    faults: list[str] = []
+    for path in _grant_files(root):
+        rel = path.relative_to(root)
+        where = rel.as_posix()
+        if len(rel.parts) != 3 or rel.suffix != ".grant":
+            faults.append(f"{where}: a grant file sits at <book>/<chapter-stem>/<name>.grant")
+            continue
+        book, stem = rel.parts[0], rel.parts[1]
+        if book not in BOOK_ENTRYPOINTS:
+            faults.append(f"{where}: {book!r} is not a reference book ({', '.join(sorted(BOOK_ENTRYPOINTS))})")
+        elif f"docs/{book}/{stem}.md" not in current:
+            faults.append(f"{where}: docs/{book}/{stem}.md is not a current chapter")
+        fault = _parse_grant(path)[1]
+        if fault:
+            faults.append(f"{where}: {fault}")
+    return faults
+
+
+def budget_faults(sizes: dict[str, int], numbers: dict[str, int], grants: Grants) -> list[str]:
+    """Every chapter has a base number and fits base plus grants; no number outlives its chapter."""
+    faults: list[str] = []
+    for chapter, size in sizes.items():
+        base = numbers.get(chapter)
+        if base is None:
+            faults.append(f"{chapter}: add a byte budget for the new chapter")
+            continue
+        granted = [count for _, count in grants.get(chapter, ())]
+        if size > base + sum(granted):
+            faults.append(
+                f"{chapter}: {size} bytes exceeds its budget {base + sum(granted)} (base {base} + {len(granted)} "
+                f"grant file(s) totalling {sum(granted)}); add {_suggested_grant(chapter)} holding this change's "
+                "NET growth of the chapter (first line the byte count, then the reason), or replace the "
+                "description you touched instead of appending"
+            )
+    stale = sorted(set(numbers) - set(sizes))
+    if stale:
+        faults.append(f"budgets for chapters that no longer exist: {stale}")
+    return faults
+
+
+def growth_faults(
+    base_sizes: dict[str, int],
+    tip_sizes: dict[str, int],
+    base_grants: Iterable[str],
+    tip_grants: Grants,
+    base_numbers: dict[str, int],
+    tip_numbers: dict[str, int],
+) -> list[str]:
+    """A change grows a chapter only by what it brings: the grant files it adds plus any raise of the base number."""
+    present_at_base = set(base_grants)
+    faults: list[str] = []
+    for chapter, tip_size in tip_sizes.items():
+        if chapter not in base_sizes:
+            continue  # new in this change: its base number alone bounds it
+        grew = tip_size - base_sizes[chapter]
+        added = sum(count for path, count in tip_grants.get(chapter, ()) if path not in present_at_base)
+        raised = max(0, tip_numbers.get(chapter, 0) - base_numbers.get(chapter, 0))
+        if grew > added + raised:
+            faults.append(
+                f"{chapter}: grew {grew} bytes in this change, {added + raised} covered ({added} by grant files "
+                f"it adds, {raised} by a raised base number), {grew - added - raised} uncovered; add "
+                f"{_suggested_grant(chapter)} for the uncovered bytes (first line the byte count, then the "
+                "reason), or replace the description you touched instead of appending"
+            )
+    return faults
+
+
+def _git(repo: pathlib.Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", *args], cwd=repo, check=check, capture_output=True)
+
+
+def measures_one_change(environ) -> bool:
+    """A pull request or a push to ``ouroboros`` is one change; a push to ``main`` or ``ouroboros-stable``
+    spans a whole release, whose earlier folds and pre-grant growth the rule cannot attribute."""
+    return environ.get("GITHUB_EVENT_NAME") != "push" or environ.get("GITHUB_REF") == "refs/heads/ouroboros"
+
+
+def growth_base(repo: pathlib.Path, ref: str | None) -> str:
+    """The commit this change is measured from; ``""`` when the growth rule does not apply.
+
+    The event base is the one the manifest transition uses (``test_size_ratchet_transition_against_explicit_base``).
+    Unlike it, a run without a resolvable event base skips: a local or manual run has none, a tag
+    push carries all zeros, and HEAD's parent is not where a multi-commit change began, so measuring
+    from it could redden a release for growth an earlier commit of the same change granted. The
+    chapter limit itself is checked on every run.
+    """
+    ref = (ref or "").strip()
+    if not ref:
+        return ""
+    resolved = _git(repo, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", check=False)
+    return resolved.stdout.decode("ascii").strip() if resolved.returncode == 0 else ""
+
+
+def _budget_numbers(source: str) -> dict[str, int]:
+    for node in ast.parse(source).body:
+        if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if any(isinstance(target, ast.Name) and target.id == "CHAPTER_BYTE_BUDGETS" for target in targets):
+                return dict(ast.literal_eval(node.value))
+    return {}
+
+
+def base_facts(repo: pathlib.Path, base: str) -> tuple[dict[str, int], set[str], dict[str, int]]:
+    """Chapter blob sizes, grant paths and base numbers at ``base``; whatever it lacks is empty.
+
+    Blob sizes are bytes, never decoded text; ``.gitattributes`` pins ``docs/**/*.md`` to LF, so
+    they equal the checked-out sizes on every platform.
+    """
+    books = [f"docs/{book_id}" for book_id in BOOK_ENTRYPOINTS]
+    listing = _git(repo, "ls-tree", "-r", "-l", "-z", "--full-tree", base, "--", *books, GRANTS_TREE, BUDGETS_MODULE)
+    blobs: dict[str, int] = {}
+    for entry in listing.stdout.decode("utf-8").split("\0"):
+        meta, _, path = entry.partition("\t")
+        if path and meta.split()[1] == "blob":
+            blobs[path] = int(meta.split()[3])
+    sizes = {path: size for path, size in blobs.items() if path.startswith("docs/")}
+    grant_paths = {path[len(GRANTS_TREE) + 1:] for path in blobs if path.startswith(GRANTS_TREE + "/")}
+    numbers: dict[str, int] = {}
+    if BUDGETS_MODULE in blobs:
+        numbers = _budget_numbers(_git(repo, "show", f"{base}:{BUDGETS_MODULE}").stdout.decode("utf-8"))
+    return sizes, grant_paths, numbers
+
+
+def _chapter_sizes() -> dict[str, int]:
+    return {
+        chapter.source_path: len(chapter.raw)
+        for book_id in BOOK_ENTRYPOINTS
+        for chapter in load_reference_book(REPO, book_id).chapters
+    }
 
 
 @pytest.mark.size_ratchet
 def test_every_chapter_has_a_budget_and_stays_inside_it():
-    seen = set()
-    for book_id in BOOK_ENTRYPOINTS:
-        for chapter in load_reference_book(REPO, book_id).chapters:
-            seen.add(chapter.source_path)
-            budget = CHAPTER_BYTE_BUDGETS.get(chapter.source_path)
-            assert budget is not None, f"{chapter.source_path}: add a byte budget for the new chapter"
-            size = len(chapter.raw)
-            assert size <= budget, (
-                f"{chapter.source_path}: {size} bytes exceeds its budget {budget}; replace the description "
-                "you touched instead of appending, or raise the budget in this diff with a reason"
-            )
-    stale = set(CHAPTER_BYTE_BUDGETS) - seen
-    assert not stale, f"budgets for chapters that no longer exist: {sorted(stale)}"
+    faults = budget_faults(_chapter_sizes(), CHAPTER_BYTE_BUDGETS, read_grants(REPO / GRANTS_TREE))
+    assert not faults, "Reference-book chapter budgets:\n" + "\n".join(faults)
+
+
+@pytest.mark.size_ratchet
+def test_a_change_grows_a_chapter_only_by_what_it_grants():
+    """Official CI measures each chapter's growth against the event base, not only its size against the limit.
+
+    A grant sized only to the shortfall would let two changes that share the same leftover room land
+    over the limit with no merge conflict, so each change covers every byte it adds.
+    """
+    if not measures_one_change(os.environ):
+        pytest.skip("a push to a release branch spans many changes; the growth rule measures one")
+    base = growth_base(REPO, os.environ.get(BASE_REF_ENV))
+    if not base:
+        pytest.skip(f"{BASE_REF_ENV} names no base commit this clone holds, so this change's growth cannot be measured")
+    base_sizes, base_grants, base_numbers = base_facts(REPO, base)
+    faults = growth_faults(
+        base_sizes, _chapter_sizes(), base_grants, read_grants(REPO / GRANTS_TREE), base_numbers, CHAPTER_BYTE_BUDGETS
+    )
+    assert not faults, f"Reference-book chapter growth since {base[:12]}:\n" + "\n".join(faults)
+
+
+def test_every_grant_file_is_a_well_formed_grant_of_a_current_chapter():
+    faults = grant_layout_faults(REPO / GRANTS_TREE, _chapter_sizes())
+    assert not faults, f"Files under {GRANTS_TREE}/ that are not usable grants:\n" + "\n".join(faults)

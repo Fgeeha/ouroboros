@@ -232,9 +232,9 @@ export function classifyLiveFrame(frame, { kind = 'chat', isMain = false, isRoot
 
     // The model's own in-turn decision to interrupt the owner. The
     // discriminator already exists (tools/control_runtime._send_user_message
-    // stamps it), so importance needs no new host field and no second model
-    // call.
-    if (systemType === 'proactive_message') {
+    // stamps it; `main_notice` is the same decision addressed to Main), so
+    // importance needs no new host field and no second model call.
+    if (systemType === 'proactive_message' || systemType === 'main_notice') {
         if (!notChild) return null;
         return {
             category: 'important',

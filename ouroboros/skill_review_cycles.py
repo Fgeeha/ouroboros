@@ -143,6 +143,10 @@ def skill_review_contract_fingerprint(
         if any(actor_ids):
             for row, actor in zip(rows, actor_ids):
                 row["subagent_id"] = actor
+        # A direct api row saved as native delivery (#1334): same identity rule.
+        for row, flag in zip(rows, delivery.get("retrieves") or []):
+            if flag and row["route"] == "api_chat" and not row.get("subagent_id"):
+                row["delivery"] = "native"
         identity = {"reviewer_rows": sorted(rows, key=lambda row: row["slot_id"])}
         if any(row["route"] == "agent_session" for row in rows):
             from ouroboros.skill_review_passes import skill_review_session_contract_hash

@@ -949,6 +949,8 @@ def test_late_complete_stream_settles_original_attempt(isolated, monkeypatch):
 
 
 def test_cancelled_control_during_recovery_keeps_paid_custody(isolated):
+    from ouroboros.task_results import write_task_result
+    write_task_result(isolated, "stream-task", "running", root_task_id="stream-task")
     reason = [None]
     calls = []
     def send(**kw):
@@ -994,8 +996,8 @@ def test_local_and_model_operation_transports_receive_no_stream_option(isolated,
     import ouroboros.llm_claudexor as operations
     client = LLMClient()
     seen = []
-    def local(messages, tools, max_tokens, choice, *, timeout=None):
-        seen.append({"timeout": timeout})
+    def local(messages, tools, max_tokens, choice, *, timeout=None, reasoning_effort=None):
+        seen.append({"timeout": timeout, "reasoning_effort": reasoning_effort})
         return {"content": "local"}, {}
     def operation(*args, **kwargs):
         seen.append(kwargs)

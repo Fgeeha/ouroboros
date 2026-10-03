@@ -75,7 +75,9 @@ def get_tools():
                     "For a root task in auto/required mode, nominate the complete ready task result: "
                     "after all tool results in this round, the host advances the same review operation "
                     "used by final delivery. Settling review does not finish the task. "
-                    "Child-task and off-mode behavior is unchanged."
+                    "A child task, or a root whose task review is off, gets advisory evidence now: the child "
+                    "from at most ONE configured reviewer row (name it with reviewer_slot_id when several are "
+                    "configured), the off-mode root from its configured panel."
                 ),
                 "parameters": {
                     "type": "object",
@@ -121,6 +123,23 @@ def get_tools():
                             },
                             "required": ["incident_id", "basis", "rationale"],
                         },
+                        "reviewer_slot_id": {
+                            "type": "string",
+                            "description": "Child task only: the one configured triad row (its slot_id) to review with, required when more than one is configured; the host checks membership. Pick by what the claim needs; each row keeps its own delivery.",
+                        },
+                        "late_review": {
+                            "type": "object",
+                            "description": "Owner action on one frozen delivered historical answer. Get debt_id/source_ref with ordinary get_task_result; leave claim and goal empty. Name NEW host-resolvable owner chat/quiz/mailbox words in the caller conversation or its host-bound relayed origin; Main interprets the target across Projects, the action and optional ABSOLUTE original-root cap in USD. Rationale explains that interpretation; hashes and inherited origin alone grant nothing. action=amend_cap only changes that cap (money, also while paused); it never prepares review, Resumes or clears fences. action=review requests the configured advisory panel, first recording any supplied cap; exact delivery and current target/root/caller controls must permit dispatch. Review uses the original wallet and one stable paid identity; existing paid or unknown work is collect-only. The separate supplement preserves the original answer and decision. Frozen source reads use the supplied bounded get_task_result selector.",
+                            "properties": {
+                                "task_id": {"type": "string"},
+                                "debt_id": {"type": "string"},
+                                "owner_source": {"type": "object", "description": "chat: {kind:'chat',ref:{chat_id,client_message_id,ts,text_sha256}}; quiz: {kind:'quiz',task_id:<calling task>,quiz_id}; mailbox: {kind:'mailbox',task_id:<calling task>,msg_id}."},
+                                "action": {"type": "string", "enum": ["review", "amend_cap"], "description": "Name it; omitted means amend_cap when a cap is supplied, else review."},
+                                "new_original_root_cap_usd": {"type": "number", "exclusiveMinimum": 0},
+                                "rationale": {"type": "string"},
+                            },
+                            "required": ["task_id", "debt_id", "owner_source", "rationale"],
+                        },
                         "obligation_dispositions": {
                             "type": "array",
                             "default": [],
@@ -157,7 +176,17 @@ def _handle_task_acceptance_review(
     acceptance_subject: Optional[dict] = None,
     author_action: str = "",
     acceptance_retry: Optional[dict] = None,
+    reviewer_slot_id: str = "",
+    late_review: Optional[dict] = None,
 ) -> str:
+    if late_review is not None:
+        from ouroboros.acceptance_late import owner_historical_acceptance
+        from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
+        result = owner_historical_acceptance(ctx, late_review)
+        return _publish_tool_result(ctx, ToolResult(
+            status="error" if result["status"] == "refused" else "ok",
+            code="TOOL_ARG_ERROR" if result["status"] == "refused" else "OK",
+            text=json.dumps(result, ensure_ascii=False, indent=2)))
     from ouroboros.config import get_task_review_mode
     from ouroboros.review_evidence import (
         build_task_acceptance_evidence,
@@ -165,16 +194,9 @@ def _handle_task_acceptance_review(
     )
     from ouroboros.task_results import resolve_task_lineage
 
-    # v6.51.0 idea-2: the child/off path builds the process-aware evidence packet
-    # (full contract + first-class verification_summary + host-collected redacted
-    # repo_diff + leak-safe artifacts + provenance tags) and dispatches its packet
-    # rows itself. The ROOT nomination (auto/required) never builds it: the host
-    # rebuilds the packet at its own fence, so the nomination records only the
-    # author's claims, stance and any explicit retry — which is what lets an
-    # informed finish/stop register even while that builder is broken (#1223).
-    # The agent's own evidence is preserved under `agent_supplied` (its repo_diff
-    # demoted to agent_supplied_repo_diff) — never promoted to host-fact status;
-    # repo_diff is ALWAYS the HOST-collected structural fact.
+    # Child/off review-only calls build their packet; roots nominate to the host fence.
+    # Explicit author actions stage completion before either dispatch path, even if
+    # packet assembly is unavailable. Agent evidence never becomes host repo_diff.
     legacy_aliases = []
     if str(agent_disposition or "").strip():
         legacy_aliases.append("agent_disposition")
@@ -222,10 +244,7 @@ def _handle_task_acceptance_review(
         dict(evidence) if isinstance(evidence, dict)
         else ({} if evidence is None else {"raw_evidence": truncate_review_artifact(repr(evidence), limit=2000)})
     )
-    # Bind the cheap evidence revision to the agent's actual acceptance claim,
-    # goal, and checklist as well as its supporting references.  Otherwise two
-    # materially different claims over the same evidence dict would share a
-    # misleading revision even though the host panel must treat them separately.
+    # Bind claim, goal and checklist, not only the supporting references.
     agent_evidence["acceptance_request"] = {
         "claim": str(claim or ""),
         "goal": str(goal or ""),
@@ -317,6 +336,13 @@ def _handle_task_acceptance_review(
     )
     task_id = str(lineage["task_id"])
     is_root_task = bool(lineage["is_root_task"])
+    if agent_decision.get("explicit_finish"):
+        from ouroboros.tools.control_runtime import stage_completion_request
+        return stage_completion_request(ctx, {
+            "action": author_action or "finish", "answer": str(claim or ""),
+            "rationale": agent_rationale, "acceptance_subject": acceptance_subject,
+            "agent_decision": agent_decision,
+        }, source="task_acceptance_review")
     if get_task_review_mode() in {"auto", "required"} and is_root_task:
         # The ROOT nomination returns BEFORE any host evidence is built: the
         # host rebuilds host-attested evidence at the authoritative fence, and
@@ -383,28 +409,41 @@ def _handle_task_acceptance_review(
             "max_physical_attempts_per_actor": 2,
         },
         task_id=str(getattr(ctx, "task_id", "") or ""), retry_key=f"task_acceptance:{task_acceptance_evidence_revision(evidence)}",
+        deadline_at=_owner_deadline_at(ctx),  # the task's own window bounds every row
     )
     # Child-task and `off`-mode acceptance is advisory evidence, never the root
-    # verdict, and buys no retrieving panel (owner R2; plan roast item 12): it
-    # runs the configured triad's PACKET rows only, refusing typed when none
-    # remain — never a silently projected default panel (R3).
+    # verdict or its host acceptance (#1334, reviewer_slot_config R2): the rows
+    # follow their configured delivery. A child reviews with at most ONE
+    # configured row; an off-mode root's explicit call keeps the panel's
+    # configured breadth. A malformed config refuses typed (R3).
     try:
-        slots = [
-            slot for slot in triad_delivery_slots(role_hint="task acceptance")
-            if not getattr(slot, "retrieves", False)
-        ]
+        slots = triad_delivery_slots(role_hint="task acceptance")
     except ValueError as exc:
         return json.dumps({
             "status": "not_dispatched",
             "error": f"invalid reviewer-slot configuration blocks task acceptance: {exc}",
         }, ensure_ascii=False)
+    if not is_root_task:
+        from ouroboros.reviewer_slot_config import child_acceptance_slots
+
+        slots, refusal = child_acceptance_slots(slots, reviewer_slot_id)
+        if refusal:
+            return json.dumps(refusal, ensure_ascii=False)
     if not slots:
-        return json.dumps({
-            "status": "not_dispatched", "reason": "no_packet_reviewer_rows",
-            "detail": "every configured triad row retrieves (agent session or configured "
-                      "subagent); child/off task acceptance runs packet rows only, so no "
-                      "reviewer was called",
-        }, ensure_ascii=False)
+        return json.dumps({"status": "not_dispatched", "reason": "no_review_slots",
+                           "detail": "no triad reviewer row is configured; no reviewer was called"},
+                          ensure_ascii=False)
+    retrieving = [slot for slot in slots if slot.retrieves]
+    if retrieving:
+        from ouroboros.acceptance_retrieving import acceptance_retrieving_work_order
+        from ouroboros.review_substrate import review_repo_dirs_for
+
+        try:
+            session_root = str(review_repo_dirs_for(ctx)[1])
+        except Exception:
+            session_root = ""  # the row keeps its own typed `session_root_missing`
+        acceptance_retrieving_work_order(request, retrieving, session_root=session_root,
+                                         data_root=pathlib.Path(ctx.drive_root))
     request.policy["min_successful_slots"] = _cfg.adaptive_quorum(len(slots))
     result = run_review_request(request, slots=slots, drive_root=pathlib.Path(ctx.drive_root), usage_ctx=ctx)
     # Agent self-call (auto): lead with the compact improvement capsule (the
@@ -1065,7 +1104,7 @@ def _prepare_unified_review(ctx: ToolContext, commit_message: str,
     # BEFORE the packet's governance and file evidence: only the api rows
     # receive a packet at all, and their windows size its governance share.
     from ouroboros.review_execution import ReviewRouteKind
-    from ouroboros.reviewer_slot_config import commit_triad_delivery
+    from ouroboros.reviewer_slot_config import commit_triad_delivery, row_plan_retrieves
 
     try:
         row_plan = commit_triad_delivery()
@@ -1078,15 +1117,10 @@ def _prepare_unified_review(ctx: ToolContext, commit_message: str,
         ), True
     models, row_routes = row_plan["models"], row_plan["routes"]
     ctx._last_triad_models = list(models)  # forensic: actual resolved model IDs
-    _row_actors = list(row_plan.get("subagent_ids") or [])
-    # Packet rows only: a configured-subagent api row is the RETRIEVES class —
-    # it neither constrains the fit ladder nor counts as an api seat for the
-    # Q28-A yield arithmetic below.
-    api_indices = [
-        i for i, (m, r) in enumerate(zip(models, row_routes))
-        if r is ReviewRouteKind.API_CHAT
-        and not (i < len(_row_actors) and _row_actors[i])
-    ]
+    # Packet rows only: a retrieving api row (native delivery or a configured
+    # subagent) neither constrains the fit ladder nor counts as an api seat for
+    # the Q28-A yield arithmetic below.
+    api_indices = [i for i in range(len(models)) if not row_plan_retrieves(row_plan, i)]
     api_models = [models[i] for i in api_indices]
     from ouroboros.review_records import ReviewSlot
     api_slots = [ReviewSlot(slot_id=row_plan["slot_ids"][i], model=models[i],
@@ -1238,7 +1272,8 @@ def _prepare_unified_review(ctx: ToolContext, commit_message: str,
             retrieving_indices = list(range(len(models)))
         retrieving_slots = [ReviewSlot(
             slot_id=row_plan["slot_ids"][i], model=models[i], route=row_routes[i],
-            session_profile=row_plan["session_profiles"][i], use_local=row_plan["use_local"][i])
+            session_profile=row_plan["session_profiles"][i], use_local=row_plan["use_local"][i],
+            native_retrieval_override=True if row_plan_retrieves(row_plan, i) else None)
             for i in retrieving_indices]
         session_governance = _triad_governance_context(
             ctx, touched_paths, checklist_section,

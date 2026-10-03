@@ -2,8 +2,10 @@
 
 A DISPATCHED request whose socket died with a typed transport death (httpx
 ReadError / WriteError / RemoteProtocolError, or the requests ProtocolError /
-RemoteDisconnected shape) is `provider_outcome_unknown`; the PRIMARY main-loop
-round dispatch alone may repeat it at most twice per round, each repeat a NEW
+RemoteDisconnected shape) is `provider_outcome_unknown`; an inline Presence
+turn's PRIMARY round dispatch alone may repeat it at most twice per round (every
+other turn's new generation after an unknown outcome is the round recovery,
+``tests/test_unknown_fallback_first.py``), each repeat a NEW
 physical attempt with its own ledger lifecycle (the earlier rows stay unresolved
 at their upper bound). Every other surface keeps the no-resend doctrine, the
 classifier is unchanged, and every durable `llm_api_error` row tells the truth
@@ -325,7 +327,7 @@ def test_admission_refusal_after_a_granted_repeat_keeps_the_unknown_fence(tmp_pa
     llm = _ScriptedLLM(_death, _death, _death)
     notes = []
     kwargs = _loop_kwargs(tmp_path, llm, notes)
-    kwargs["tools"]._ctx.is_direct_chat = True  # This caller retains the bounded repeat rail.
+    _presence_turn(kwargs)  # Inline Presence alone retains the bounded repeat rail.
     _result, usage, trace = run_llm_loop(**kwargs)
 
     assert llm.calls == 1  # the refused repeat and the forced-final rail both dispatched nothing
@@ -503,6 +505,14 @@ def _no_chain(**_kwargs):
     raise AssertionError("unknown physical work must stop the paid fallback chain")
 
 
+def _presence_turn(kwargs):
+    """Inline Presence, the one caller that keeps the bounded paid-repeat rail."""
+    kwargs["task_type"] = "presence"
+    kwargs["tools"]._ctx.is_direct_chat = True
+    kwargs["tools"]._ctx.current_task_type = "presence"
+    return kwargs
+
+
 def test_primary_round_dispatch_exhaustion_takes_the_unknown_no_resend_terminal(tmp_path, monkeypatch, no_sleep):
     """End to end through the real round dispatcher: three deaths, then the
     forced-final rail ships the salvage WITHOUT a provider call and the terminal
@@ -514,7 +524,7 @@ def test_primary_round_dispatch_exhaustion_takes_the_unknown_no_resend_terminal(
     llm = _ScriptedLLM(_death, _death, _death, _death)
     notes = []
     kwargs = _loop_kwargs(tmp_path, llm, notes)
-    kwargs["tools"]._ctx.is_direct_chat = True  # This caller retains the bounded repeat rail.
+    _presence_turn(kwargs)  # Inline Presence alone retains the bounded repeat rail.
     result, usage, trace = run_llm_loop(**kwargs)
 
     assert llm.calls == 3  # zero further dials of any kind: no forced-final resend
@@ -596,7 +606,7 @@ def test_unexpected_loop_error_carries_accumulated_evidence_to_owner_projection(
     assert trace["tool_calls"][0]["trace_ref"]["call_id"]
 
 
-@pytest.mark.parametrize("turn_flag", ["is_direct_chat"])
+@pytest.mark.parametrize("turn_flag", ["presence"])
 def test_counter_survives_the_wait_episodes_free_redial_of_the_same_round(tmp_path, monkeypatch, no_sleep, turn_flag):
     """death → released ConnectError → wait episode → free redial → death →
     death: the round stays bounded by two paid repeats in total (sol s1). The
@@ -612,7 +622,7 @@ def test_counter_survives_the_wait_episodes_free_redial_of_the_same_round(tmp_pa
     notes = []
     kwargs = _loop_kwargs(tmp_path, llm, notes)
     if turn_flag:
-        setattr(kwargs["tools"]._ctx, turn_flag, True)
+        _presence_turn(kwargs)
     _result, usage, trace = run_llm_loop(**kwargs)
 
     assert llm.calls == 4  # death, connect (free), death, death — the fifth script step never runs
@@ -653,13 +663,13 @@ def test_forced_final_call_never_repeats_a_transport_death(tmp_path, no_sleep):
 @pytest.mark.parametrize("attempt_cap,expected_calls", [(None, 3), (2, 1)])
 def test_round_dispatcher_opts_in_only_the_primary(tmp_path, no_sleep, attempt_cap, expected_calls):
     """attempt_cap is set only for fallback-chain candidates (the primary passes
-    None): candidates get zero paid repeats, the primary its bounded two."""
+    None): candidates get zero paid repeats, an inline Presence primary its bounded two."""
     llm = _ScriptedLLM(_death, _death)
     registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
     ctx = SimpleNamespace(
         llm=llm, messages=MESSAGES, tools=registry, active_model="test-model", tool_schemas=None,
         active_effort="low", max_retries=3, drive_logs=tmp_path, task_id="t-cand", round_idx=1,
-        event_queue=None, accumulated_usage={}, task_type="task", active_use_local=False,
+        event_queue=None, accumulated_usage={}, task_type="presence", active_use_local=False,
     )
     msg, _cost = loop_mod._dispatch_round_model(ctx, None, attempt_cap=attempt_cap)
 
@@ -761,7 +771,7 @@ def test_repeat_failing_with_another_class_ends_the_round_on_the_unknown_termina
     llm = _ScriptedLLM(_death, lambda: _status_failure(status), _death, _death)
     notes = []
     kwargs = _loop_kwargs(tmp_path, llm, notes)
-    kwargs["tools"]._ctx.is_direct_chat = True  # This caller retains the bounded repeat rail.
+    _presence_turn(kwargs)  # Inline Presence alone retains the bounded repeat rail.
     result, usage, trace = run_llm_loop(**kwargs)
 
     assert llm.calls == 2  # no burst, no forced-final dial, no chain candidate
@@ -791,7 +801,7 @@ def test_repeat_returning_an_empty_response_ends_the_round_and_keeps_the_record(
     llm = _ScriptedLLM(_death, EMPTY_RESPONSE, _death, _death, _death)
     notes = []
     kwargs = _loop_kwargs(tmp_path, llm, notes)
-    kwargs["tools"]._ctx.is_direct_chat = True  # This caller retains the bounded repeat rail.
+    _presence_turn(kwargs)  # Inline Presence alone retains the bounded repeat rail.
     _result, usage, trace = run_llm_loop(**kwargs)
 
     assert llm.calls == 2  # the empty repeat is not retried; the third death never happens
@@ -910,7 +920,7 @@ def test_repeat_failing_as_context_overflow_takes_the_unknown_terminal(tmp_path,
     llm = _ScriptedLLM(_death, _overflow_failure, _death, _death)
     notes = []
     kwargs = _loop_kwargs(tmp_path, llm, notes)
-    kwargs["tools"]._ctx.is_direct_chat = True  # This caller retains the bounded repeat rail.
+    _presence_turn(kwargs)  # Inline Presence alone retains the bounded repeat rail.
     result, usage, trace = run_llm_loop(**kwargs)
 
     assert llm.calls == 2
@@ -1008,8 +1018,7 @@ def test_proxy_tunnel_failure_keeps_the_base_unknown_terminal(data_root, tmp_pat
         return exc
 
     loop_llm = _ScriptedLLM(scripted, scripted)
-    kwargs = _loop_kwargs(tmp_path, loop_llm, [])
-    kwargs["tools"]._ctx.is_direct_chat = True
+    kwargs = _presence_turn(_loop_kwargs(tmp_path, loop_llm, []))
     _result, loop_usage, trace = run_llm_loop(**kwargs)
     assert loop_llm.calls == 1
     assert _events(tmp_path, "network_wait") == []

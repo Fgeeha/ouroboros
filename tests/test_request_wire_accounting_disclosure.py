@@ -253,6 +253,11 @@ def test_returned_response_discloses_its_exact_wire_candidate(
 
     disclosure = usage["request_wire"]
     assert disclosure == {
+        "original_requested_effort": None,
+        "requested_effort_source": "provider_projection",
+        "applied_effort_source": "sent_candidate",
+        "reported_effort": None,
+        "reported_effort_source": None,
         "requested_effort": "high",
         "applied_effort": "medium",
         "requested_tool_dialect": "function",

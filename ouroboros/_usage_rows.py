@@ -10,13 +10,110 @@ so historical import and monkeypatch sites keep working unchanged.
 from __future__ import annotations
 
 import datetime as _dt
+import math
+from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Sequence
 from decimal import Decimal, InvalidOperation
 
 from ouroboros.usage_ledger import _number
-from ouroboros._usage_money import monetary_scope_key, ZERO_CASH, cash_contribution, change_cash, render_cash, exact_money, decimal_of
+from ouroboros._usage_money import billing_group_key, monetary_scope_key, ZERO_CASH, cash_contribution, change_cash, render_cash, exact_money, decimal_of
 
 REVIEW_ATTRIBUTION_KEYS = ("review_skill", "review_wave_id", "review_slot_id")
+
+# Earliest cap/attribution binding per root and billing group (usage_admission).
+BINDING_KEYS = ("root_task_id", "billing_group_id", "billing_group_limit_usd", "billing_group_limit_source",
+                "billing_group_limit_revision", "root_limit_usd", "root_limit_source", "root_limit_revision")
+_BINDING_CAPS = ("billing_group_limit_usd", "root_limit_usd")
+BINDING_AUTHORITY_FIELD, BINDING_CARRIED = "binding_authority", "carried"  # baseline header stamp
+CARRIED_ROOT_BINDING, CARRIED_GROUP_BINDING = "original_root_binding", "original_group_binding"
+UNKNOWN_BINDING = "unknown"
+# Carried value for an identity the SOURCE had not bound yet: it stays unbound,
+# so a later original row still binds it exactly as it would have uncompacted.
+NO_ORIGINAL_BINDING = "unbound"
+
+
+class LedgerBindingUnknown(ValueError):
+    """A compacted aggregate hid the original binding: unknown, never a cap."""
+
+
+def _carried(value: Any, key: str, owner) -> Any:
+    """A carried binding that is well formed and belongs to ``key``; else UNKNOWN."""
+    if (not isinstance(value, dict) or not set(value) <= set(BINDING_KEYS) or owner(value) != key
+            or not any(cap in value for cap in _BINDING_CAPS)):
+        return UNKNOWN_BINDING
+    for cap in _BINDING_CAPS:
+        item = value.get(cap)
+        if item is not None and (_number(item) is None or not math.isfinite(_number(item))):
+            return UNKNOWN_BINDING
+    return dict(value)
+
+
+@dataclass
+class BindingIndex:
+    """Earliest binding per root and billing group: the first ORIGINAL row wins.
+
+    A baseline aggregate never binds: its cap is a minimum and its position a
+    sort order. A carried block restores the source's bindings verbatim from
+    the first group row of each root/group; an explicit ``NO_ORIGINAL_BINDING``
+    there leaves that member unbound for a later original row. Missing,
+    invalid or unstamped carriage fixes that member's binding as UNKNOWN,
+    never a later row's cap. A verified archived generation may recover only
+    old missing carriage through recover_from. Equality compares the indexes.
+    """
+
+    roots: Dict[str, Any] = field(default_factory=dict)
+    groups: Dict[str, Any] = field(default_factory=dict)
+    carried: bool = field(default=False, compare=False)
+    recovery: dict = field(default_factory=dict, compare=False)
+    recovered: set = field(default_factory=set, compare=False)
+    legacy: bool = field(default=False, compare=False)
+    unbound: set = field(default_factory=set, compare=False)  # (carrier, key) the block left open
+
+    def fold(self, row: Dict[str, Any]) -> None:
+        kind = str(row.get("kind") or "")
+        if kind == "usage_baseline":
+            self.carried = row.get(BINDING_AUTHORITY_FIELD) == BINDING_CARRIED
+            self.legacy = BINDING_AUTHORITY_FIELD not in row
+            return
+        root, group = monetary_scope_key(row), billing_group_key(row)
+        if kind == "usage_baseline_group":
+            for index, key, name, owner in ((self.roots, root, CARRIED_ROOT_BINDING, monetary_scope_key),
+                                            (self.groups, group, CARRIED_GROUP_BINDING, billing_group_key)):
+                if not key or key in index or (name, key) in self.unbound:
+                    continue  # only the first block row of each member decides it
+                if not self.carried:
+                    index[key] = UNKNOWN_BINDING
+                    if self.legacy and not any(field in row for field in (CARRIED_ROOT_BINDING, CARRIED_GROUP_BINDING)):
+                        self.recovery[(name, key)] = True
+                elif row.get(name) == NO_ORIGINAL_BINDING:
+                    self.unbound.add((name, key))
+                else:
+                    index[key] = _carried(row.get(name), key, owner)
+                    if row.get(name) == UNKNOWN_BINDING:
+                        self.recovery[(name, key)] = False
+            return
+        if ((root and root not in self.roots) or (group and group not in self.groups)) and any(
+                cap in row for cap in _BINDING_CAPS):
+            binding = {key: row[key] for key in BINDING_KEYS if key in row}  # verbatim, key presence kept
+            for index, key in ((self.roots, root), (self.groups, group)):
+                if key:
+                    index.setdefault(key, binding)
+
+    def recover_from(self, prior: "BindingIndex") -> None:
+        """Recover old missing carriage, never repair contradictory modern facts.
+
+        A stamped UNKNOWN may only inherit a recovery proved for its exact
+        archived source generation. An unstamped old block can recover the
+        preceding original rows. Missing/invalid modern payloads remain gaps.
+        Original source/revision and explicit unlimited None stay verbatim.
+        """
+        for name, index, previous in ((CARRIED_ROOT_BINDING, self.roots, prior.roots),
+                                       (CARRIED_GROUP_BINDING, self.groups, prior.groups)):
+            for (carrier, key), legacy in self.recovery.items():
+                value = previous.get(key)
+                if carrier == name and isinstance(value, dict) and (legacy or (name, key) in prior.recovered):
+                    index[key] = dict(value)
+                    self.recovered.add((name, key))
 
 
 def row_ts_epoch(row: Any) -> Optional[float]:
@@ -231,7 +328,7 @@ def _with_integrity(summary: Dict[str, Any], degraded: bool) -> Dict[str, Any]:
 
 def _projection_from_final(
     final: list, integrity_degraded: bool, configured_limit: Optional[float] = None,
-    *, root_task_id: str = "", include_roots: bool = True,
+    *, root_task_id: str = "", include_roots: bool = True, billing_group_id: str = "",
 ) -> Dict[str, Any]:
     """Render the money projection from ALREADY-VALIDATED final rows: one
     snapshot, one projection, so a caller deriving the ordering marker from
@@ -240,6 +337,14 @@ def _projection_from_final(
     def limit_of(rows: list) -> Optional[float]:
         known = [v for v in (_number(row.get("root_limit_usd")) for row in rows) if v is not None]
         return min(known) if known else None
+    if billing_group_id:  # a whole-work group: its own rows plus legacy rows of its original root
+        from ouroboros.usage_admission import group_rows
+
+        rows = group_rows(final, billing_group_id)
+        # Explicit None is original unlimited provenance, not a missing cap.
+        caps = [row.get("billing_group_limit_usd", row.get("root_limit_usd")) for row in rows]
+        known = [value for value in map(_number, caps) if value is not None]
+        return _with_integrity(_with_limit(_summary(rows), min(known) if known else None), integrity_degraded)
     if root_task_id:
         rows = [row for row in final if monetary_scope_key(row) == root_task_id]
         return _with_integrity(_with_limit(_summary(rows), limit_of(rows)), integrity_degraded)
@@ -352,7 +457,7 @@ _SKILL_ATTEMPT_FIELDS = (
     "cost_usd", "cost_final", "reservation_upper_bound_usd", "pricing_known",
     "prompt_tokens", "completion_tokens", "cached_tokens", "subscription_route",
     "subscription_reset_at", "credential_profile_id", "access_profile",
-    "processing", "processing_basis", "cost_evidence", "attempt_execution",
+    "effort", "effort_resolution", "processing", "processing_basis", "cost_evidence", "attempt_execution",
 )
 
 

@@ -83,7 +83,7 @@ from ouroboros.tools.plan_review_runtime import (
 )
 from ouroboros.tools.plan_spec import plan_fingerprint as _plan_fingerprint
 from ouroboros.tools.plan_evidence import task_evidence_reader as _task_evidence_reader
-from ouroboros.tools.plan_dialogue import attach_own_dialogue, plan_chat_reader, dialogue_slot_inputs
+from ouroboros.tools.plan_dialogue import attach_own_dialogue, plan_chat_reader, dialogue_slot_inputs, session_input_limits
 from ouroboros.tools.plan_review_artifacts import (
     addressed_notes as _addressed_notes,
     addressed_slots as _addressed_slots,
@@ -672,6 +672,26 @@ def _predecessor_ref(existing: Optional[dict], previous: Optional[dict], state: 
     return dict((previous or {}).get("wave_artifact") or hot.get("wave_artifact") or {})
 
 
+def _plan_slots_for_wave(ctx: ToolContext, slots_fn: Any, existing: dict, resume_in_flight: bool) -> tuple:
+    """Materialize new configured slots or the exact paid historical roster."""
+    from ouroboros.reviewer_slot_config import reviewer_slot_config_error
+
+    if not resume_in_flight and (err := reviewer_slot_config_error()):
+        return [], _plan_unavailable(
+            ctx, f"ERROR: Invalid reviewer-slot configuration blocks plan review — {err}. "
+            "Fix Review lanes on the Agents tab in Settings.", "reviewer_slot_config_invalid")
+    if resume_in_flight:
+        from ouroboros.tools.plan_review_artifacts import frozen_plan_slots
+        try:
+            state_root, task_id = _planning_state_location(ctx)
+            slots = frozen_plan_slots(existing, state_root=state_root, task_id=task_id)
+        except (KeyError, TypeError, ValueError) as exc:
+            return [], _plan_unavailable(ctx, f"ERROR: {exc}", "plan_review_custody_invalid")
+    else:
+        slots = slots_fn()
+    return slots, ""
+
+
 async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, collect: Optional[dict] = None,
                                  address: Optional[dict] = None) -> str:
     """``collect`` = the recorded inputs of an open wave being collected at $0 (window 0);
@@ -781,13 +801,9 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
                                  request_fingerprint=fingerprint)
     # #116: a malformed structured reviewer-slot config must refuse loudly here
     # instead of running the panel on the silently projected default models.
-    from ouroboros.reviewer_slot_config import reviewer_slot_config_error
-
-    if err := reviewer_slot_config_error():
-        return _plan_unavailable(
-            ctx, f"ERROR: Invalid reviewer-slot configuration blocks plan review — {err}. "
-            "Fix Review lanes on the Agents tab in Settings.", "reviewer_slot_config_invalid")
-    slots = slots_fn()
+    slots, slot_error = _plan_slots_for_wave(ctx, slots_fn, existing, resume_in_flight)
+    if slot_error:
+        return slot_error
     if not slots:
         return _plan_unavailable(
             ctx, "ERROR: No review models configured. Configure Review lanes "
@@ -814,7 +830,8 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
 
     cycle_index = int(resume.get("cycle_index") or cycles_paid + 1)
     retry_key = str(resume.get("retry_key") or f"plan_review:{fingerprint}:{cycle_index}")
-    slots = _effective_plan_slots(slots)
+    if not resume_in_flight:
+        slots = _effective_plan_slots(slots)
     system_prompt, user_content, session_task = _build_packet(
         ctx, spec=spec, request=request, manifest=manifest, constitutional=constitutional,
         system_root=system_root, active_root=active_root, cycle_index=cycle_index,
@@ -827,7 +844,8 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
     delivery = dialogue_slot_inputs(dispatch_slots, system_prompt=system_prompt, user_content=user_content,
         session_task=session_task, manifest=manifest, slot_messages=slot_messages,
         native_mandatory_chars=len(system_prompt) + len(user_content), data_root=state_root,
-        frozen=existing if resume_in_flight else None, session_root=str(active_root), task_id=task_id)
+        frozen=existing if resume_in_flight else None, session_root=str(active_root), task_id=task_id,
+        session_limits={} if resume_in_flight else session_input_limits(dispatch_slots))
     slot_messages = delivery["slot_messages"]
     quorum = adaptive_quorum(len(slots))  # the wave's quorum spans the whole roster; the send fits its seats
     fanout = _plan_fanout_inputs(

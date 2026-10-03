@@ -1,6 +1,6 @@
 # Rules by change class
 
-This chapter gives one rule section per change class: tool registration, skill payloads, the live E2E stand, light mode and deliverables, retention, delegated subagents, cancellation, onboarding and settings, transport and late-result custody, LLM calls, timeout/wait control, and loop/acceptance state machines. Each section names its enforcing tests or gates, or marks rules as review-only; check a change against its applicable classes.
+Rules by change class: tool registration, skill payloads, the live E2E stand, light mode and deliverables, retention, delegated subagents, cancellation, onboarding and settings, transport and late-result custody, LLM calls, timeout/wait control, and loop/acceptance state machines. Each section names its enforcing tests or gates, or marks rules as review-only; check a change against its applicable classes.
 
 `docs/CHECKLISTS.md` remains the only reviewer scorer; its `development_compliance` item points at this handbook as a whole.
 
@@ -83,7 +83,7 @@ Admit an attempt only while settled spend plus in-flight reservations plus its o
 
 #### Reports, focused verification and CI
 
-Run roots are append-only outside `repo/` and live `data/`; the focused contracts are the `tests/test_e2e_live_*` modules plus `tests/test_server_runner_absorb_wait.py`, and the `e2e-live` CI job runs only on its nightly cron or an explicit `e2e_live=true` dispatch — see devtools/e2e_live/README.md#reports-focused-verification-and-ci.
+Run roots are append-only outside `repo/` and live `data/`; the focused contracts are the `tests/test_e2e_live_*` modules plus `tests/test_server_runner_absorb_wait.py`, and the `e2e-live` CI job runs only on an explicit `e2e_live=true` dispatch — see devtools/e2e_live/README.md#reports-focused-verification-and-ci.
 
 ### Light mode and external deliverables
 
@@ -99,7 +99,7 @@ Run roots are append-only outside `repo/` and live `data/`; the focused contract
   and declared process `outputs` register/copy the canonical artifact; a
   rewrite keeps the previous copy in non-manifest history with last-5
   retention — recovery, never a second deliverable list. `root=deliverables`
-  stays read/list/search-only and is never granted to children.
+  stays read/list/search-only for every actor, including children.
 - Large task files stream (`artifacts.stream_artifact_file`, atomic
   `copy_artifact_file`): never a whole dataset in a bytes object, and a read is
   rejected as soon as it exceeds the source's initial regular-file size rather
@@ -172,6 +172,9 @@ Run roots are append-only outside `repo/` and live `data/`; the focused contract
   bucket=..., skill_name=...)` — and the api-route advisory successor is the
   native inspection episode (`review_native_episode.py`). Do not resurrect the
   name.
+- `run_ci_tests` is a retired tool name with no alias and no compatibility
+  shim; `get_github_checks` succeeds it for reading a commit's checks, and
+  `docs/CHECKLISTS_ARCHIVE.md` records the outcomes that have no successor.
 - Successor parity: a tool may be called replaced, retired or migrated only
   after a persistent golden test proves every user-visible target class the
   predecessor supported through the successor to the final outcome;
@@ -306,17 +309,19 @@ and 23 (`delegated_transport`), both critical. The imperatives:
   execution" (`tests/test_browser_url_policy.py`,
   `tests/test_browser_isolation.py`, `tests/test_browser_redirect_chain.py`).
 - Acting children return `workspace.patch`; only the parent commits the live body,
-  applying via `integrate_subagent_patch` then its own `commit_reviewed`.
-  `external_workspace` verifies and records without re-applying. Edit/capture text preserves external Git authority and patch-only `self_worktree`. Capture bases prove no authorship; compare via explicit `vcs_diff`. A genesis project's directory is its durable deliverable
-  (until it declares a `.gitignore`, small
-  text build output rides `workspace.patch`, bounded by the
-  per-file source-patch boundary and Git's binary verdict; no total
-  source-patch cap). The canonical/replica terminal field-custody projection
-  is ONE pure reducer for copy-back and effective reads — every change adds a
-  stale-replica regression at BOTH seams
-  (`tests/test_available_subagents_runtime_review_fixes.py`). Do not broaden
-  generic data-tool behavior while fixing isolation (`forward_to_worker`
-  writes only to validated running or queued tasks in the current lineage).
+  through `integrate_subagent_patch` then its own `commit_reviewed`. Isolated Git
+  children copy current eligible source contents, including uncommitted inputs;
+  isolation never identifies a project as Ouroboros's body. Preserve source and
+  baseline through capture, cleanup and integration; apply only the child's delta.
+  `external_workspace` verifies shared effects without re-applying; external Git
+  authority and patch-only `self_worktree` stay distinct. A capture base proves
+  no authorship: use `vcs_diff`. Genesis directories are durable deliverables;
+  until `.gitignore` exists, small text build outputs ride `workspace.patch`,
+  bounded per file and by Git's binary verdict, never by a total source-patch cap.
+  One pure reducer owns canonical/replica terminal fields for copyback and
+  effective reads; changes need stale-replica tests at BOTH seams
+  (`tests/test_available_subagents_runtime_review_fixes.py`). `forward_to_worker`
+  follows shared addressability (ARCHITECTURE §6).
 - A custody row carries its owner's kind; every sweep, audit and counter over
   custody rows states which kinds it covers. A review-owned run
   (`RunCustody.review_owned`) belongs to its panel — never the task's open
@@ -338,10 +343,9 @@ and 23 (`delegated_transport`), both critical. The imperatives:
   `prune_orphans` and genesis excepted)
   (`tests/test_snapshot_file_inputs.py`, `tests/test_subagent_worktrees_lock_scope.py`).
 - Outcome honesty: a delegating parent must not produce a clean no-tool final
-  answer while direct children run undecided — one bounded absorption
-  reminder, then best-effort (`children_unabsorbed`); the delivery candidate
-  is HELD while that gate is open, and the delivery-control instruction never
-  rides the reminder round (`tests/test_v6570_swarm_honesty.py`). `wait_tasks`
+  answer while direct children run undecided. Hold finish until an exact disposition
+  or explicit unfinished stop; reminder counts never terminate the task. Keep selected
+  bytes and children intact (`tests/test_completion_selection.py`). `wait_tasks`
   stays batch-compact;
   `control_task_results._wait_for_tasks` owns its projection, documented under
   ARCHITECTURE's "Waiting on children"; full untruncated handoff belongs to `get_task_result` and a settled `wait_task`, and the
@@ -400,10 +404,9 @@ The imperatives:
   cancellation authority stay separate (`test_zombie_prevention.py`,
   `test_startup_terminal_files.py`, `test_cancel_origin.py`,
   `test_truthful_card_presentation.py`, `web/tests/cancel_origin.test.js`).
-- An owed terminal message whose send was never confirmed is disclosed as "not
-  confirmed", with its saved copy named a copy of that message; only the matching
-  receipt's recorded destination for the same delivery id retires the owner notice,
-  never a bare id (`tests/test_cancel_pending_outbox.py`).
+- Disclose unconfirmed terminal sends as "not confirmed", naming saved copies as
+  copies. Only a same-delivery receipt for the recorded destination retires the
+  notice, never a bare id (`tests/test_cancel_pending_outbox.py`).
 - Cancel INTENT is never a status value: every cancel ingress writes a durable
   intent through `ouroboros/cancel_intents.request_cancel`, fails closed when
   that write fails, checks live physical ownership (a settled RESULT does not
@@ -415,15 +418,15 @@ The imperatives:
   validates through the DURABLE result unconditionally (ARCHITECTURE §10 "Key
   Invariants" 15); only `interrupted` keeps its restore-path exemption, and
   the legacy `cancel_requested` status survives on a read path only.
-- `stop_policy` is an axis on the durable intent, and the owner hurry control
-  is a typed TASK-LOCAL owner-mailbox control — never a chat message, a global
-  settings mutation or a review-gate weakening. Every same-id requeue producer
+- `stop_policy` is an axis on the durable intent; the owner hurry control is a
+  typed TASK-LOCAL owner-mailbox control — never a chat message, global
+  settings mutation or review-gate weakening. Every same-id requeue producer
   calls the ONE shared `owner_hurry.retry_reset`; the durable hurry projection
-  writes only through `update_json_locked` on the `owner_hurry` keys, never
+  writes only via `update_json_locked` on `owner_hurry` keys, never
   `write_task_result`; UI surfaces share `web/modules/task_control_menu.js`;
-  queue-owned hurry admission initializes only an absent pooled result through
-  the task-result writer's atomic `create_only` branch, and direct turns stay
-  outside it.
+  queue-owned Pause/Hurry admission atomically `create_only`-writes an absent
+  pooled result from exact admitted lineage/budget/source facts; terminal rows
+  win; direct turns/billing stay outside.
 - Code owners stay narrow behind one public queue/lifecycle surface:
   retry-aware target/subtree-liveness in `supervisor/queue_transitions.py`,
   capture-miss terminalization/publication in
@@ -585,13 +588,12 @@ Settings, accounts and shared controls. Tests: `test_owner_settings_write_seam.p
   existence, preview or matching prompt prose alone grants authority —
   missing/partial/error/mismatched custody never buys another same-operation
   dispatch.
-- Managed unknown-outcome recovery uses the existing transport-wait owner
-  (`loop_transport.py`) with non-generating upstream observations (what proves
-  recovery and what cannot: ARCHITECTURE §6 "Caller-owned subscription model
-  calls"): keep the old outcome/cost unknown, apply current
-  budget/Stop/deadline before dispatch, and let a control-channel outage first
-  rejoin the same accepted operation. No scheduler, provider/model table, paid
-  readiness probe or automatic manual-restart recovery is introduced.
+- Unknown-outcome recovery is typed (`loop_transport.new_generation_after_unknown`),
+  not silence: configured routes, then transport-wait observations (ARCHITECTURE §6);
+  inline Presence retains its contract. Old outcome/cost stay unknown;
+  new attempts get their own identity and facts-only input; a control-link or read
+  failure only rejoins (`same_operation_recoverable`).
+  No scheduler, pass counter or paid probe (`test_unknown_fallback_first.py`).
 - `delegate_wait` supervision's observation beat is separate from its HTTP
   read allowance, and a typed read-only-retryable transport failure is a quiet
   observation hole, not a wake (the per-class reasons and the once-per-episode
@@ -614,43 +616,43 @@ and what enforces each.
 
 #### Subscription transport
 
-- Claudexor model calls are a transport, not delegated reasoning: model content and
-  native continuation stay byte-faithful through the purpose-bound engine operation;
-  never inject its credentials, run its tools, compact inside the adapter or silently
-  repeat a generation. A lost connection rejoins the same operation ID, unknown stays
-  unknown, ACK only after the private CAS owns the exact result. Failed-response capture
-  uses the catalog's optional query, frozen before create and reused under the same
-  idempotency key (absence keeps the legacy shape); received bytes and exception chains
-  stay private, diagnostics compact. A known terminal with unusable output is a
-  settled provider result plus local rejection (`stream_rejected`), never unknown or
-  not-dispatched — keep both markers across sync, async and process boundaries; a
-  local rejection never rotates accounts. A round the ENGINE says another model answered
-  is not that class; the host matches no model strings.
-- Host hints are chosen by their caller from transport capability; an explicitly
-  unsupported option refuses rather than being silently dropped and retried. Submitted
-  options are recorded beside applied options on the usage row (absent report =
-  unknown), and that record covers every submitted option while the owner line speaks
-  only for the thinking horizon: the first changed reasoning effort of each model in a
-  task emits one typed owner line (keyed by task and model, never per round, naming
-  only the reporting route). A mismatch is disclosure, never a dispatch gate.
-- The engine's active-turn token is a transport fact: the CALLER owns the slot
-  (`llm_claudexor.ModelTurnState` on the loop context, also used by consciousness);
-  only the engine boundary writes it. Fresh slot per logical
-  turn, cleared when dispatch leaves this transport; never derived from message roles,
-  prose or the last stored assistant envelope (BIBLE P5); never checkpointed (a cold
-  restart starts empty); never forked by a reprepare, thread offload or kwargs copy;
-  a dispatched durable result updates it; released `invalid_continuation` repair clears
-  it with message envelopes. Other non-dispatched, unknown or legacy results preserve
-  it; never in usage, events, progress or task cards. Opt-in is gated on the last SUCCESSFUL handshake's version —
-  not the next-spawn pin, not a liveness projection a failed probe can blank (WHY:
-  ARCHITECTURE §6 "The live turn slot"; the `llm_claudexor.py` docstring).
+- Claudexor preserves model content/native continuation bytes: no credential
+  injection, tools, adapter compaction or silent regeneration. Lost control rejoins
+  the same operation ID; unknown stays unknown. ACK after private CAS owns exact
+  result bytes. Freeze catalog-advertised failure/effort queries before create for
+  same-key rejoin; absent flags keep legacy shape. Bytes/exception chains private; diagnostics compact. Unusable terminals settle with
+  `stream_rejected`, never unknown/not-dispatched; keep both across sync/async/process boundaries. Local rejection never rotates accounts.
+  Only the engine classifies substitution; no host model-string matching.
+- Caller hints use capabilities; explicitly unsupported options refuse. Record
+  submitted options and provider `appliedOptions` echoes; absent keys stay unknown.
+  Effort appears in usage/events/Logs, not automatic chat/toasts/incidents or a
+  mismatch gate. Keep substitution/terminal notices and weaker-reviewer plan facts.
+- `effort_evidence.py` validates model `effortResolution` (stored as
+  `effort_resolution`) and the unique final session `final/telemetry.yaml` attempt.
+  Live/late reads share `model_effort_usage`; missing/malformed clears stale reports.
+  `submitted` is preparation, not dispatch; null means omitted, not `none`.
+  Native `parameter` may be known when submitted is null and is required otherwise.
+  Paired `observed`/`observedSource` report provider evidence; `source` names
+  resolution authority. Preserve source-qualified `downward`/`floor` and future
+  tokens in engine-native order, never re-rank by host preference.
+- The engine's active-turn token is transport, owned by the caller's
+  `llm_claudexor.ModelTurnState` slot (including consciousness); only the engine
+  boundary writes it. Start empty per logical turn and cold restart; clear on
+  departure from this transport. Never derive it from messages (BIBLE P5), copy
+  it on reprepare/offload, checkpoint it or publish it in usage/events/cards.
+  A dispatched durable result updates it; released `invalid_continuation` clears
+  it with message envelopes. Other non-dispatched, unknown or legacy results
+  preserve it. Opt in by the last successful handshake version, not a next-spawn
+  pin or failed liveness probe (ARCHITECTURE §6 "The live turn slot";
+  `llm_claudexor.py` docstring).
 - Pass `model_role` and captured account at every helper/reviewer seam: shared model
   names do not share pins; account evidence remains source/profile/fingerprint-bound.
   Manual context sizing grants no scope authority; ACK binds the actual route.
   Density evidence never crosses models. Proven no-send returns the local attempt
   claim even if bounded ledger release fails; the reservation and capture then remain.
   Unknown or dispatched claims stay charged.
-- Resource refusals wait inside the live call, before helper catch-all blocks, on the
+- Resource refusals try configured routes first, never sleep to a reset, and
+  wait inside the live call, before helper catch-all blocks, on the
   existing task owner, mailbox, clocks and settings writer. Reviewer calls use their
   panel's operation wait (§6 Already-paid operations), preserving original task money
   and controls. Reprepare wake input against the new route's tools/capacity/reserve
@@ -680,8 +682,12 @@ and what enforces each.
   dialect, no Responses migration, owner `none` on direct Anthropic =
   `thinking.type=disabled` (`tests/test_request_wire_contract.py`,
   `tests/test_openai_chat_custom_contract.py`, `tests/test_anthropic_native_custody.py`).
-  `usage.request_wire` is one call's terminal candidate; nested aggregation keeps the
-  ordered `request_wire_history` with explicit omission accounting.
+  `usage.request_wire` is a call's terminal candidate; nested aggregation preserves
+  `request_wire_history` order/omissions. Legacy `applied_effort` is sent candidate,
+  never provider-applied. Capture preference before native projection; separate
+  request/sent/report. Positive field-bound enums need
+  no scalar echo; negative quotes prescribe nothing, value rejection cannot drop
+  the carrier. Existing attempt/pricing/Stop/deadline limits apply.
 - Every core-mediated physical provider send goes through
   `usage_accounting.execute_physical_attempt[_async]` (`tests/test_usage_accounting.py`);
   custody classifiers read the explicit `__cause__` chain, never `__context__`, and an
@@ -793,7 +799,7 @@ and what enforces each.
   alone to exceed the window); quota/auth/billing, hard bad-request and
   request-too-large are non-retryable as-is (exact category, recovery hint); a typed
   408/429/5xx or a proven pre-dispatch failure may retry; a dispatched request with no
-  terminal outcome stops same-model and cross-model sends until reconciled. Who may
+  terminal outcome is never resent as is; only an eligible unknown permits a NEW generation. Who may
   repeat after a typed transport death, how often, on whose row, what ends the round:
   ARCHITECTURE §6 "Context fitting, retry, and compaction"
   (`tests/test_transport_death_retry.py`). Call-site rules: decide `retry_same_request`
@@ -805,8 +811,8 @@ and what enforces each.
   untouched); generic transient/empty-response backoffs keep their contract. A budget
   refusal does NOT un-count: the budget rail cannot prove the repeat never left the
   host (`llm.chat` retries on the wire before a later reservation can refuse), so the
-  attempt stays booked and the budget terminal ends the round. Every caller outside the
-  interactive primary rail keeps `transport_death_retries=0`; no
+  attempt stays booked and the budget terminal ends the round. Every caller outside
+  inline Presence's primary rail keeps `transport_death_retries=0`; no
   consumed/terminal/patch-disposition predicate gates a session supervisor's cognition,
   and a successful live-leaf hold closes any prior transport episode so its
   acknowledged wake alone resumes the model.
@@ -855,8 +861,7 @@ and what enforces each.
   the same incident pair naming both models, the account the send's own binding
   selects when the route has accounts (a task-local wait override included, never the
   configured value alone) and the typed failure reason when the round record has one;
-  the applied-option mismatch line rides the same callable, and the frozen
-  `ToolContext.emit_progress_fn` takes one argument, never the pair.
+  the frozen `ToolContext.emit_progress_fn` takes one argument, never the pair.
 - Timeout classes are separate axes. A transport timeout
   (`OUROBOROS_LLM_TRANSPORT_READ_TIMEOUT_SEC`) bounds only a dead socket — never a
   reasoning cutoff or evidence of a stall. API review uses it as a settlement fallback
@@ -902,8 +907,8 @@ and what enforces each.
   in-flight reviewer never counts as final quorum under either enforcement mode; a
   `pending_dispatch` row (released at the barrier) is neither quorum nor a paid fact
   until its settled row proves the send.
-- Every zero-physical acceptance refusal (unresolvable partial source, immutable-core
-  overflow, a slot window too small for the rendered prompt) records a typed
+- Every zero-physical acceptance refusal (packet core overflow/partial source,
+  unreadable retrieving source, or a whole first send exceeding its window) records a typed
   `$0 not_dispatched` row with its cause in `error` and folds the aggregate to
   `DEGRADED` (the one $0 shape: ARCHITECTURE §6 "Review stack"; instances: "Task
   acceptance").
@@ -940,8 +945,8 @@ and what enforces each.
   final-answer path unless that invariant is explicitly tested and documented.
 - Keep a complete loop-local `DeliveryCandidate`; sticky host-control provenance survives
   replacement (`ouroboros/loop_delivery.py`; ARCHITECTURE §6 "Task lifecycle").
-  FORCED resolution: pure, no retry; honor valid keep/replace, preserve malformed controls'
-  candidate with a typed degraded reason; no protocol JSON in chat/durable results.
+  Forced resolution is pure, with no retry: the same action/answer/hash request selects
+  complete bytes; malformed or historical controls stay private and retain the candidate.
   Distinguish consumed owner source from changed requirements; effective criteria and
   material effects (nominated reads included) define the subject; ingress generations
   preserve unread order. Status/narration/working-view changes buy no review. Finalize
@@ -991,12 +996,11 @@ and what enforces each.
   ARCHITECTURE §6 Task acceptance owns waiting, fences, `previous_revision_accepted`
   and `late_settlement`. Freeze request/roster; collect pending paid panels at $0 before
   new evidence or `review_cycles_exhausted`. Reauthoring loses no verdict; settlement
-  wakes carry verdicts regardless of Main's draft. Re-offer only changed control bytes;
-  spent repair stays spent, typed host refusal spends none. Ready feedback skips parking
-  only. Complete prose is valid; optional keep/replace/finish defaults pending-review
-  choice to wait. Preserve effect/owner/child gates, source acknowledgement and forced
-  rails; context mail wakes without owner revision. Empty/malformed controls keep the
-  answer (`test_acceptance_optional_control.py`). Text-only rewrites reuse ready/pending
+  wakes carry verdicts regardless of Main's draft. Every held prose round appends
+  assistant+host rows; rich facts change only when their inputs do. Main selects complete
+  bytes or an offered hash through finish_task; pending-review defaults to wait. Preserve
+  effect/owner/child gates, source acknowledgement and forced rails; context mail grants
+  no owner revision. Refused selections preserve the answer (`test_completion_selection.py`). Text-only rewrites reuse ready/pending
   PASS; changed subject/owner source does not (`_deliver_under_running_panel`). Blocking
   waits; Cyber Pro does not; Advisory finish needs explicit `"pending_review":"finish"`.
   Bind operation wait before windows with original money/deadline/Stop; read back the
@@ -1009,8 +1013,9 @@ and what enforces each.
   Pass late evidence to an admissible cognition turn; settlement starts none. Workers
   never author Main's candidate/decision or make reviewers open delegations; subtree,
   status, findings and Cyber authority stay distinct (BIBLE P0).
-- Delivery-control JSON governs only tool-less final responses; retention leaves tools
-  available. Changed criteria/material evidence mean a new subject even with kept text,
+- One completion request serves native tools, legacy explicit review actions, Presence
+  and pure forced extraction. Retention leaves tools available. Changed criteria/material
+  evidence mean a new subject even with kept text,
   never old verdict authority. Source acknowledgement infers no semantic change from
   generation. File/diff requests impose no commit-or-revert rule; self-modification
   keeps reviewed commits (BIBLE P0/P3).
@@ -1038,8 +1043,10 @@ and what enforces each.
   and failures per operation; repeated edges cannot turn deduplicated failure into
   success. New operations retry durable sources. Capacity, publication order and
   paid identity stay separate.
-- Mirror actual split-root execution start/binding into the canonical result through
-  its terminal-preserving writer. Recover legacy bindings only from positive child
+- Mirror actual split-root or split-subagent execution start/attempt/binding into
+  the canonical result through its terminal-preserving writer; copyback transfers
+  a child's terminal occurrence only for the attempt the canonical row names, and a
+  start written without it stays unknown. Recover legacy bindings only from positive child
   start plus existing queue/worker orphan proof, never while pending/cancelled and
   never as permission to resume.
 - `headless.prepare_terminal_task_files` adopts answer, output files and receipt
@@ -1075,7 +1082,7 @@ and what enforces each.
   (`task_pacing.review_launch_allowed`, `task_acceptance_paid_dispatch_stamp._claim`),
   the clamps on a running panel and the deadline-cut residual are stated once in
   ARCHITECTURE §6 "Task acceptance". Format-repair resends are packet-row only; child
-  and `off`-mode acceptance run packet rows only.
+  and `off`-mode acceptance preserve delivery, children selecting at most one configured row.
 - The host acceptance decision is written ONLY by
   `loop_acceptance._set_acceptance_decision` (re-exported from `loop`): three
   owner-facing states, each with a typed reason from the closed set, unknown fails

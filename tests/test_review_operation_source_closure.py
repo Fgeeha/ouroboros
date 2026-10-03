@@ -49,8 +49,10 @@ def test_exact_review_reader_keeps_physical_identity_and_restrictions(tmp_path):
     write_task_result(canonical, 'author', 'failed', retry_handoff={'state': 'spawned', 'child_task_id': 'replacement'})
     write_task_result(canonical, 'replacement', 'completed', result='different task')
     receiver = prepare_task_drive(canonical, 'next', 'empty')
+    write_task_result(canonical, 'next', 'running', root_task_id='next', task_attempt=1)
     tools = ToolRegistry(repo_dir=repo, drive_root=receiver)
-    ctx = ToolContext(repo_dir=repo, drive_root=receiver, task_id='next', task_metadata={'budget_drive_root': str(canonical)})
+    ctx = ToolContext(repo_dir=repo, drive_root=receiver, task_id='next', budget_drive_root=str(canonical),
+                      task_metadata={'budget_drive_root': str(canonical)})
     tools.set_context(ctx)
     selector = review_source_reader('author', ref)
     assert 'answer A' in read_late_source(tools, selector)
@@ -203,7 +205,9 @@ def test_full_operation_sources_survive_author_drive_cleanup(tmp_path, monkeypat
         assert durable['late_evidence'] == notice['progress_meta']['late_evidence']
         assert bridged and len(checkpoints) == 1
         receiver_root = canonical if receiver_mode == 'canonical' else prepare_task_drive(canonical, 'next-owner', receiver_mode)
+        write_task_result(canonical, 'next-owner', 'running', root_task_id='next-owner', task_attempt=1)
         consumer = ToolContext(repo_dir=repo, drive_root=receiver_root, task_id='next-owner',
+                               budget_drive_root=str(canonical),
                                task_metadata={'budget_drive_root': str(canonical)})
         receiver = ToolRegistry(repo_dir=repo, drive_root=receiver_root)
         receiver.set_context(consumer)
@@ -230,7 +234,9 @@ def test_full_operation_sources_survive_author_drive_cleanup(tmp_path, monkeypat
             def handle_task(self, task):
                 assert panel["applied_source_ref"]["sha256"] in task["text"]
                 assert "late review settled for task source-author" in task["text"]
+                write_task_result(canonical, task["id"], 'running', root_task_id=task["id"], task_attempt=1)
                 tool_ctx = ToolContext(repo_dir=repo, drive_root=receiver_root, task_id=task["id"],
+                                       budget_drive_root=str(canonical),
                                        task_metadata={**task["metadata"], 'budget_drive_root': str(canonical)})
                 wake_tools = ToolRegistry(repo_dir=repo, drive_root=receiver_root)
                 wake_tools.set_context(tool_ctx)

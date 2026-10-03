@@ -666,11 +666,19 @@ def _apply_patch(
     root: str = "active_workspace",
     _resolved_binding: ResolvedResourceBinding | tuple[ResolvedResourceBinding, ...] | None = None,
 ) -> str:
+    def no_effect(text: str) -> str:
+        # Only Phase 1 owns this proof: no planned mutation has run yet.
+        from ouroboros.tools.tool_result import LegacyTextResultAdapter, _publish_tool_result, _replace_tool_result
+
+        result = LegacyTextResultAdapter.from_text("apply_patch", text)
+        return _publish_tool_result(ctx, _replace_tool_result(
+            result, meta_updates={"operation_outcome": "completed_no_effect"}))
+
     if not patch or not patch.strip():
-        return "⚠️ APPLY_PATCH_ERROR: patch is required."
+        return no_effect("⚠️ APPLY_PATCH_ERROR: patch is required.")
     ops, err = _parse_patch(patch)
     if err:
-        return err
+        return no_effect(err)
 
     # Phase 1: resolve + validate everything BEFORE any write (atomicity).
     planned_writes: List[Tuple[pathlib.Path, str, str]] = []  # (target, rel_path, content)
@@ -684,7 +692,7 @@ def _apply_patch(
         else ((_resolved_binding,) if _resolved_binding is not None else ())
     )
     if supplied_bindings and len(supplied_bindings) != len(ops):
-        return "⚠️ APPLY_PATCH_ERROR: internal target binding count mismatch."
+        return no_effect("⚠️ APPLY_PATCH_ERROR: internal target binding count mismatch.")
     binding_iter = iter(supplied_bindings)
     mutation_binding: ResolvedResourceBinding | None = None
     for op in ops:
@@ -696,11 +704,11 @@ def _apply_patch(
             _resolved_binding=next(binding_iter, None),
         )
         if terr:
-            return terr
+            return no_effect(terr)
         mutation_binding = mutation_binding or item_binding
         if op.kind == "add":
             if rel in seen or target.exists():
-                return (
+                return no_effect(
                     f"⚠️ APPLY_PATCH_ERROR: Add File {op.path}: file already exists. "
                     "Use '*** Update File:' to modify it."
                 )
@@ -713,7 +721,7 @@ def _apply_patch(
             continue
         if op.kind == "delete":
             if not target.exists():
-                return f"⚠️ APPLY_PATCH_ERROR: Delete File {op.path}: file not found."
+                return no_effect(f"⚠️ APPLY_PATCH_ERROR: Delete File {op.path}: file not found.")
             planned_deletes.append((target, rel))
             summaries.append(f"✅ Deleted {rel}")
             continue
@@ -722,14 +730,14 @@ def _apply_patch(
             content = seen[rel]
         else:
             if not target.exists():
-                return f"⚠️ APPLY_PATCH_ERROR: Update File {op.path}: file not found."
+                return no_effect(f"⚠️ APPLY_PATCH_ERROR: Update File {op.path}: file not found.")
             try:
                 content = target.read_text(encoding="utf-8")
             except Exception as e:  # noqa: BLE001 - report unreadable target
-                return f"⚠️ APPLY_PATCH_ERROR: cannot read {op.path}: {e}"
+                return no_effect(f"⚠️ APPLY_PATCH_ERROR: cannot read {op.path}: {e}")
         new_content, notes, herr = _apply_hunks_to_text(content, op.hunks, rel)
         if herr:
-            return f"⚠️ APPLY_PATCH_ERROR: {herr}\nNothing was applied (the patch is atomic)."
+            return no_effect(f"⚠️ APPLY_PATCH_ERROR: {herr}\nNothing was applied (the patch is atomic).")
         seen[rel] = new_content
         planned_writes.append((target, rel, new_content))
         added = sum(1 for h in op.hunks for p, _ in h.lines if p == "+")
@@ -896,9 +904,8 @@ def _syntax_check(rel: str, content: str) -> str:
         # compile() raises a bare ValueError for content Python cannot even scan
         # (a NUL byte, for one). Report it against the format actually checked —
         # "not valid JSON" for a .py file sends the fix in the wrong direction.
-        if rel.endswith(".py"):
-            return f"content is not valid Python source: {e}"
-        return f"content is not valid JSON: {e}"
+        kind = "Python source" if rel.endswith(".py") else "JSON"
+        return f"content is not valid {kind}: {e}"
     except Exception:
         return ""
     return ""

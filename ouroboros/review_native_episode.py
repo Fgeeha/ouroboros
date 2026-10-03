@@ -39,7 +39,8 @@ from ouroboros.config import get_finalization_grace_sec
 from ouroboros.deadline_utils import caller_deadline_arguments, owner_deadline_exhausted, review_transport_timeout
 from ouroboros.review_dispatch import bind_api_review_paid_stamp, invoke_review_paid_stamp
 from ouroboros.review_verdict_extraction import canonicalize_session_verdict
-from ouroboros.triad_review import default_output_contract, review_output_shape
+from ouroboros.triad_review import review_output_shape
+from ouroboros.delegate_custody_usage import observe_failed_review_send
 from ouroboros.usage_accounting import (
     POSITIVE_PHYSICAL_ATTEMPT_STATES,
     BudgetExceeded,
@@ -316,6 +317,7 @@ def inspection_registry(root: str, drive_root: Any, task_id: str = "") -> tuple[
         repo_dir=_pathlib.Path(root),
         drive_root=_pathlib.Path(drive_root),
         task_id=str(task_id or "") or None,
+        task_lifecycle_bound=False,  # a standalone inspection episode is an operation
         task_constraint={"mode": "local_readonly_subagent"},
         task_contract={
             "allowed_resources": {"network": False, "web": False},
@@ -324,6 +326,15 @@ def inspection_registry(root: str, drive_root: Any, task_id: str = "") -> tuple[
             ),
         },
     )
+    from ouroboros.usage_accounting import current_usage_scope
+    scope = current_usage_scope()
+    if scope is not None and scope.task_id and not scope.non_task_operation:
+        # A paid review under a task keeps that task's canonical tree controls;
+        # its scratch drive and reviewer label cannot supply Pause authority.
+        ctx.task_id = scope.task_id
+        ctx.task_metadata = {"root_task_id": scope.root_task_id or scope.task_id,
+                             "budget_drive_root": str(scope.drive_root or drive_root)}
+        ctx.task_lifecycle_bound = True
     registry.set_context(ctx)
     schemas = [schema for schema in (registry.get_schema_by_name(name) for name in _INSPECTION_TOOL_NAMES) if schema]
     if not any(s["function"]["name"] == "compact_context" for s in schemas):
@@ -587,10 +598,6 @@ class NativeToolRoundReviewExecutor(ReviewSlotExecutor):
 
     # -- prompt (route-owned; never the api pack) ------------------------------
 
-    def _output_contract(self) -> str:
-        contract = str((self.assignment.request.policy or {}).get("output_contract") or "")
-        return contract or default_output_contract(review_output_shape(self.assignment.request.surface))
-
     def prompt_payload(self) -> Dict[str, Any]:
         return {
             "native_episode_prompt": self.episode_prompt,
@@ -808,7 +815,7 @@ class NativeToolRoundReviewExecutor(ReviewSlotExecutor):
                             self._observe_sent_view(messages, schemas)
                             landing_sent = landing_sent or landed  # the dispatched send carried the notice
                             invoke_review_paid_stamp(self.assignment.dispatch_stamp)
-                        self._observe_failed_send(exc)
+                        observe_failed_review_send(self.usage_observer, exc)
                         if isinstance(exc, BudgetExceeded) and shape == "report" and last_content:
                             break  # nothing was sent; a report keeps its draft
                         raise

@@ -11,7 +11,7 @@ from ouroboros.provider_models import (
     compute_direct_review_models_fallback,
     migrate_model_value,
 )
-from ouroboros.config import SETTINGS_DEFAULTS, _DIRECT_PROVIDER_REVIEW_RUNS, _parse_model_list
+from ouroboros.config import OPENROUTER_DEFAULTS, SETTINGS_DEFAULTS, _DIRECT_PROVIDER_REVIEW_RUNS, _parse_model_list
 from ouroboros.utils import utc_now_iso
 
 
@@ -114,6 +114,7 @@ _PRIOR_SHIPPED_SLOT_DEFAULTS = {
     # routing slug): an upgraded direct-provider install still carries one, and each
     # is just as unreachable without an OpenRouter credential.
     "OUROBOROS_MODEL_DEEP_SELF_REVIEW": {
+        OPENROUTER_DEFAULTS["deep_self_review"],
         "openai/gpt-5.5-pro", "openai::gpt-5.5-pro",
         "openai/gpt-5.6-sol-pro", "openai::gpt-5.6-sol-pro",
     },

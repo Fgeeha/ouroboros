@@ -371,6 +371,15 @@ def test_resume_consumes_grant_restores_cognition_and_never_reexecutes(tmp_path,
 
     queue, state, workers = _install_queue(tmp_path, monkeypatch)
     monkeypatch.setattr(state, "budget_remaining", lambda _st, **_k: 5.0)
+    from tests import _budget_pause_exact_helpers as helpers
+    original_ctx = helpers._loop_ctx
+
+    def with_sent_disclosure(*args, **kwargs):
+        context, limits = original_ctx(*args, **kwargs)
+        limits.accumulated_usage["request_wire"] = {"applied_effort": "low", "original_requested_effort": "high"}
+        return context, limits
+
+    monkeypatch.setattr(helpers, "_loop_ctx", with_sent_disclosure)
     task, row = _parked(tmp_path, monkeypatch, task_id="loop-1")
     assert queue.resume_budget_paused_task("loop-1")["ok"] is True
     handoff = task["_budget_pause_resume"]
@@ -384,6 +393,8 @@ def test_resume_consumes_grant_restores_cognition_and_never_reexecutes(tmp_path,
     model, effort, use_local, mode, round_idx, plan = budget_pause.resume_paused_loop(
         tools, state_blob, messages, trace, usage, seen, budget_remaining_usd=5.0)
     assert (model, round_idx, mode) == ("m", 4, "max")
+    assert effort == "high"  # restored original preference, independent of old wire disclosures
+    assert usage["request_wire"]["applied_effort"] == "low"
     assert usage["cost"] == 1.25 and "execution_status" not in usage
     # The unanswered call is closed as UNKNOWN, not re-run, not declared un-run.
     unknown = [m for m in messages if m.get("role") == "tool" and m.get("tool_call_id") == "call_b"]

@@ -1,6 +1,6 @@
 # Core Governance Artifacts
 
-The **core governance artifacts** — `BIBLE.md`, `docs/ARCHITECTURE.md`, `docs/DEVELOPMENT.md` — are the constitutional, architectural and procedural ground truth. This chapter owns their delivery registry, structural plan tiering, exact premises, earned compaction and disclosed model-only truncation. Availability may be full inline text or complete on-demand sources with visible navigation; a missing source never becomes a claim of full context.
+The **core governance artifacts** — `BIBLE.md`, `docs/ARCHITECTURE.md`, `docs/DEVELOPMENT.md` — ground constitution, architecture and procedure. This chapter owns delivery, structural plan tiering, exact premises, earned compaction and disclosed model-only truncation. Full availability means inline text or complete navigable sources; absence never proves full context.
 
 ### Invariant: Full availability in reasoning flows
 
@@ -21,17 +21,7 @@ sections within that same share. This keeps shared rules consistent without
 letting reference books crowd out the change. A pointer gives a packet row
 no tools or evidence it did not receive.
 
-Plan review tiers its intention pack by ONE structural fact — whether a declared `affected_paths` target resolves under the Ouroboros
-system repository, never prose or a plan-kind taxonomy, which keeps
-classification un-gameable. Tiering is not omission: the subject is an
-INTENTION before any work exists, and nothing is silently omitted (P1). Only a
-REQUIRED governance pack that cannot be assembled stops the review, as a typed
-assembly failure (`PlanPacketError`); evidence the policy cannot attach is a
-named absence the panel still judges with (`[reviewer-requested]` omission row,
-head cut `truncated_to_<N>`), and a re-asked locator stays `need_evidence`
-(`need_evidence_repeat`) without new request memory or paid cycles.
-Classification, packet composition, bounds and wave/replay mechanics: ARCHITECTURE §6 "Plan
-construction and review", `ouroboros/tools/plan_packet.py`, `plan_spec.py`.
+Plan governance tiering uses only declared `affected_paths` resolving under the system repository, never prose or plan-kind taxonomy. The subject is an intention; tiering permits no silent omission. Unassemblable required governance raises typed `PlanPacketError`; unattached evidence remains a named absence (`[reviewer-requested]`, head cut `truncated_to_<N>`). Repeated locators stay `need_evidence`/`need_evidence_repeat` without new memory or paid cycles. Classification, bounds and wave/replay owners: ARCHITECTURE §6 "Plan construction and review", `ouroboros/tools/plan_packet.py`, `plan_spec.py`.
 
 Exact-wave custody is fail-closed: each packet slot continues its recorded
 transcript; the panel goes out fresh only when no exact artifact reference exists
@@ -53,6 +43,8 @@ The context-delivery registry:
 | Skill review (`skill_review.py`) | full inline (`api_chat`) / mandatory full source-root read (`agent_session`) | same two classes | same two classes |
 | Plan review (`tools/plan_review.py`) | full for a SELF-MODIFICATION plan; otherwise a runtime heading-derived navigation map, never a copy | full for a self-modification plan (`api_chat` inline, `agent_session` mandatory full read); otherwise book navigation + a resolvable pointer | not resident: a named on-demand pointer; a reviewer needing it returns `need_evidence` with an exact `::lines=A-B` range |
 | Deep self-review (`deep_self_review.py`) | full inline through shared tier 1 on native and session deliveries, without a duplicate-read demand; the seven-file memory whitelist stays byte-exact inline with per-entry dispositions | Tier 3: book navigation and chapters on demand | Tier 2 within this row’s transcript-bound share; deep keeps its own report criteria and CHECKLISTS navigation (ARCHITECTURE §6 "Deep self-review") |
+
+A scheduled child's `input_sources="declared"` (API model or configured session) selects assignment/common sources; governance delivery and ordinary shared children stay unchanged. Qualify actual physical sends and source receipts, not disk `memory_mode=empty`. Tools/mail may broaden inputs; first position and exchange remain author decisions. Mechanism/limits: ARCHITECTURE §6 "Selected first-input sources".
 
 Scope's change-relative source manifest (`tools/scope_required_sources.py`)
 names touched protected runtime, frozen contracts and prompts, their declared

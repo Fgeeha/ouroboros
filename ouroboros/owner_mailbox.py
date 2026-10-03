@@ -24,14 +24,22 @@ KIND_TASK_MESSAGE = "task_message"
 # own prefix, enters no owner corpus and supersedes no reviewed answer.
 PROVENANCE_INDEPENDENT_TASK = "independent_task"
 # Provenance of a contribution written by a task INSIDE the recipient's tree
-# that holds no authority over it: a sibling (same parent) or a child speaking
-# to its parent. ``relation`` names the recipient's place relative to the
-# sender (``sibling`` / ``parent``) and is stamped at write time; the render
-# prefix reads it, so a peer is never signed "ancestor" or "owner". Like an
-# independent task's words it is context the receiving model judges: it
-# enters no owner corpus and records no directive.
+# that holds no authority over it: a sibling (same parent), a child speaking
+# to its parent, or any other task sharing the recipient's durable root (the
+# blackboard's own scope). ``relation`` names the recipient's place relative
+# to the sender and is stamped at write time; the render prefix reads it, so a
+# peer is never signed "ancestor" or "owner". Like an independent task's words
+# it is context the receiving model judges: it enters no owner corpus and
+# records no directive.
 PROVENANCE_PEER_TASK = "peer_task"
-PEER_TASK_RELATIONS = frozenset({"sibling", "parent"})
+# The one relation map: the recipient-side prefix label and the sender-side
+# receipt phrase are the two perspectives of the same stamped fact. The drain
+# prefix, the forward_to_worker receipts and the telemetry filter all read it.
+PEER_RELATION_LABELS = {
+    "sibling": {"prefix": " (sibling)", "receipt": "your sibling"},
+    "parent": {"prefix": " (your child)", "receipt": "your parent"},
+    "tree": {"prefix": " (same tree)", "receipt": "a task in your tree"},
+}
 # Upper bound on one forwarded task-message body. Every message later enters
 # plan packets through dialogue evidence, so forward_to_worker refuses an
 # oversized body whole — never truncated, never spilled to an artifact handle
@@ -55,6 +63,11 @@ KIND_HURRY = "hurry"
 # chosen option label (plus an optional owner comment) — delivered inside a
 # structural frame, never as forged free-form owner dialogue.
 KIND_QUIZ_ANSWER = "quiz_answer"
+# The owner's Pause of a whole tree (``owner_pause.py``): a WAKE signal, never
+# dialogue and never the authority — the root's durable fence decides. It wakes
+# a warm owner wait so the member reaches its safe boundary without buying a
+# model round; a member whose fence is already open again ignores it.
+KIND_OWNER_PAUSE = "owner_pause"
 # A model-call waiter consumes this control itself, not the conversation loop.
 # The default drain withholds it so it cannot become forged owner dialogue.
 KIND_MODEL_WAIT = "model_wait"
@@ -293,7 +306,7 @@ def write_task_message(
     """Write an addressed task-tree message without forging owner provenance.
 
     ``relation`` is the peer_task sender's typed place relative to the
-    recipient (``sibling`` / ``parent``); stored only when non-empty.
+    recipient (a ``PEER_RELATION_LABELS`` key); stored only when non-empty.
     ``sender_origin`` is the sending run's host-recorded origin (a Presence
     room/event), never the author of the words it quotes.
     """
@@ -426,9 +439,9 @@ def deliver_task_message(
     elif provenance == PROVENANCE_PEER_TASK:
         # A contribution from inside the tree without authority over the
         # recipient: the stamped relation names the sender's place, so a
-        # child writing up or a sibling writing across is never signed
-        # "ancestor" (an authority the sender does not hold).
-        label = {"sibling": " (sibling)", "parent": " (your child)"}.get(relation, "")
+        # child writing up, a sibling writing across or a cousin in the same
+        # tree is never signed "ancestor" (an authority the sender does not hold).
+        label = PEER_RELATION_LABELS.get(relation, {}).get("prefix", "")
         prefix = f"[Message from peer task {source}{label}]"
     else:
         prefix = f"[Message from ancestor task {source}]"

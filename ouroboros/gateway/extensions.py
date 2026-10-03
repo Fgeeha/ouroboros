@@ -699,6 +699,7 @@ class _ApiReviewCtx:
         self.drive_root = drive_root
         self.repo_dir = repo_dir
         self.task_id = "api_skill_review"
+        self.task_lifecycle_bound = False
         self.current_chat_id = 0
         self.pending_events: list = []
         self.emit_progress_fn = None

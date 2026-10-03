@@ -56,7 +56,7 @@ def test_promoted_task_can_read_search_read_runtime_data(
     assert "artifact_store" in affordances["searchable_roots"]
 
 
-def test_specialized_child_searches_ordinary_runtime_data_but_not_owner_settings(tmp_path):
+def test_child_searches_parent_readable_runtime_data(tmp_path):
     repo = tmp_path / "repo"
     data = tmp_path / "data"
     logs = data / "logs"
@@ -78,9 +78,9 @@ def test_specialized_child_searches_ordinary_runtime_data_but_not_owner_settings
     )
 
     assert "CHILD_MUST_NOT_FIND" in result
-    # The read→search closure does not widen the per-file owner-state/secret gate.
+    # Generic settings content is parent-readable; the helper sees the same text.
     (data / "settings.json").write_text('{"OPENAI_API_KEY":"CHILD_OWNER_SECRET"}', encoding="utf-8")
-    blocked = registry.execute("search_code", {"root": "runtime_data", "path": "settings.json",
+    found = registry.execute("search_code", {"root": "runtime_data", "path": "settings.json",
                                                 "query": "CHILD_OWNER_SECRET"})
-    assert "CHILD_OWNER_SECRET" not in blocked
-    assert "Found 1 match" not in blocked
+    assert "CHILD_OWNER_SECRET" in found
+    assert "Found 1 match" in found

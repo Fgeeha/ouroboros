@@ -12,7 +12,7 @@ from ouroboros.knowledge import INDEX_FILE, OVERVIEW_TOPIC
 from ouroboros.knowledge import sanitize_topic as _sanitize_topic
 from ouroboros.tools.arg_feedback import ignored_argument_note
 from ouroboros.tools.registry import ToolEntry, ToolContext
-from ouroboros.tools.tool_result import ToolResult, _MAX_META_BYTES, _publish_tool_result
+from ouroboros.tools.tool_result import ToolResult, _MAX_META_BYTES, _publish_tool_result, completed_local_read
 from ouroboros.utils import append_jsonl, utc_now_iso
 
 KNOWLEDGE_DIR = "memory/knowledge"
@@ -95,17 +95,20 @@ def _knowledge_read(ctx: ToolContext, topic: str, scope: str = "",
         text, meta = _source_view(note, start_char, end_char)
     except ValueError as exc:
         return _publish_tool_result(ctx, ToolResult(
-            status="error", code="TOOL_ARG_ERROR", text=f"⚠️ TOOL_ARG_ERROR: {exc}"))
+            status="error", code="TOOL_ARG_ERROR", text=f"⚠️ TOOL_ARG_ERROR: {exc}",
+            meta={"operation_outcome": "completed_no_effect"}))
     except FileNotFoundError:
         elsewhere = ("" if address.scope == "global"
                      else f" A global note may exist: knowledge_read(topic={sanitized!r}, scope='global').")
         return _publish_tool_result(ctx, ToolResult(
             status="ok", code="LEGACY_WARNING", text=f"Topic {topic!r} not found in {address.scope}. Use knowledge_list to see available topics." + elsewhere,
-            meta={"knowledge_address": address.as_dict(), "knowledge_missing": True}))
+            meta={"knowledge_address": address.as_dict(), "knowledge_missing": True,
+                  "operation_outcome": "completed_no_effect"}))
     except (OSError, UnicodeDecodeError) as exc:
         return _publish_tool_result(ctx, ToolResult(
-            status="error", code="TOOL_REPORTED_FAILURE", text=f"⚠️ TOOL_ERROR: Knowledge source unavailable: {type(exc).__name__}"))
-    return _publish_tool_result(ctx, ToolResult(status="ok", code="OK", text=text, meta=meta))
+            status="error", code="TOOL_REPORTED_FAILURE", text=f"⚠️ TOOL_ERROR: Knowledge source unavailable: {type(exc).__name__}",
+            meta={"operation_outcome": "completed_no_effect"}))
+    return _publish_tool_result(ctx, ToolResult(status="ok", code="OK", text=text, meta={**meta, "operation_outcome": "completed_no_effect"}))
 
 
 def _record_backlog_history(backlog_file: Path, topic: str, mode: str, task_id: str) -> None:
@@ -143,17 +146,35 @@ def _bound_delta_meta(meta: dict) -> None:
 
 
 def _knowledge_write(
-    ctx: ToolContext, topic: str, content: str, mode: str = "overwrite",
+    ctx: ToolContext, topic: str, content: str | None = None, mode: str = "overwrite",
     scope: str = "", expected_revision: str | None = None, old_str: str | None = None,
+    summary: str | None = None,
 ) -> str:
     try:
         sanitized = _sanitize_topic(topic)
-        if mode not in ("overwrite", "append", "edit") or not isinstance(content, str):
+        if mode not in ("overwrite", "append", "edit") or not isinstance(content, (str, type(None))):
             raise ValueError("content must be Markdown; mode must be overwrite, append or edit")
+        summary = None if summary == "" else summary  # an empty summary asks for nothing
+        if summary is not None and (not isinstance(summary, str) or not summary.strip()):
+            raise ValueError(f"summary={summary!r} is not summary text; pass the revised summary, "
+                             "or omit summary to keep the current one")
         if mode != "edit" and old_str is not None:
             raise ValueError("old_str is used only with mode=edit")
-        if mode == "edit" and (not isinstance(old_str, str) or not old_str):
-            raise ValueError("mode=edit requires a non-empty old_str")
+        if mode != "edit" and summary is not None:
+            raise ValueError(f"summary is used only with mode=edit, not mode={mode}; revise it with "
+                             "mode=edit, or in the frontmatter of an overwrite's content")
+        if mode != "edit" and content is None:
+            raise ValueError(f"mode={mode} requires content")
+        if mode == "edit" and summary is not None and old_str in (None, ""):  # "" asks for nothing
+            if content:
+                raise ValueError(f"content ({len(content)} chars) has no old_str to replace; pass old_str "
+                                 "for a body edit, or omit content to revise only the summary")
+            content, old_str = "", None
+        elif mode == "edit" and (not isinstance(old_str, str) or not old_str):
+            raise ValueError("mode=edit requires a non-empty old_str, or a summary")
+        elif mode == "edit" and content is None:
+            raise ValueError("mode=edit with old_str requires content, its replacement "
+                             "(empty text deletes the old_str span)")
         if sanitized == BACKLOG_TOPIC:
             if mode == "edit":
                 raise ValueError("The improvement backlog has its own merge writer; edit is not supported")
@@ -171,6 +192,7 @@ def _knowledge_write(
             _address(ctx, sanitized, scope), content, mode, expected_revision,
             str(getattr(ctx, "task_id", "") or ""), old_str, writer="turn",
             route=(getattr(ctx, "_accumulated_usage", None) or {}).get("_observed_route") or None,
+            summary=summary,
         )
     except ValueError as exc:
         return _publish_tool_result(ctx, ToolResult(
@@ -204,6 +226,7 @@ def _knowledge_write(
         status="error", code="TOOL_REPORTED_FAILURE", text=text, meta=meta))
 
 
+@completed_local_read
 def _knowledge_list(ctx: ToolContext, scope: str = "") -> str:
     try:
         address = _address(ctx, "topic", scope)
@@ -231,14 +254,15 @@ def get_tools() -> List[ToolEntry]:
         }, _knowledge_read),
         ToolEntry("knowledge_write", {
             "name": "knowledge_write",
-            "description": "Create, revise or append durable understanding in the shared Markdown knowledge corpus. New notes, and legacy notes you meaningfully revise, carry YAML type, optional title and an authored multiline summary, with ordinary Markdown links and source-grounded body; unknown metadata survives. The summary is what stays resident in the index: include it in frontmatter to revise it, while a body-only overwrite keeps the previous frontmatter, including its summary (supplied fields merge with retained ones). Existing legacy notes stay readable. The improvement backlog retains its global merge semantics.",
+            "description": "Create, revise or append durable understanding in the shared Markdown knowledge corpus. New notes, and legacy notes you meaningfully revise, carry YAML type, optional title and an authored multiline summary, with ordinary Markdown links and source-grounded body; unknown metadata survives. The summary is what stays resident in the index, and body text never replaces it: revise it with mode=edit and summary, or in an overwrite's frontmatter, while a body-only write keeps it (supplied fields merge with retained ones). Existing legacy notes stay readable. The improvement backlog retains its global merge semantics.",
             "parameters": {"type": "object", "properties": {
                 "topic": topic, "scope": scope,
-                "content": {"type": "string", "description": "Markdown, optionally with YAML frontmatter. Write understanding and its sources/uncertainty in your own words; no summary is generated from the body."},
-                "mode": {"type": "string", "enum": ["overwrite", "append", "edit"], "description": "overwrite (default) replaces the body; append adds to the source; edit replaces one exact occurrence of old_str in the body without reconstructing the rest. Missing notes are created by overwrite/append only."},
-                "old_str": {"type": "string", "description": "Required non-empty exact body substring for mode=edit; it must occur once. content is the replacement, including empty text for a justified deletion."},
+                "content": {"type": "string", "description": "Markdown, optionally with YAML frontmatter. Write understanding and its sources/uncertainty in your own words; no summary is generated from the body. Required except for a summary-only edit."},
+                "mode": {"type": "string", "enum": ["overwrite", "append", "edit"], "description": "overwrite (default) replaces the body; append adds to the source; edit replaces one exact occurrence of old_str in the body without reconstructing the rest, and/or revises summary. Missing notes are created by overwrite/append only."},
+                "old_str": {"type": "string", "description": "Non-empty exact body substring for mode=edit; it must occur once. content is the replacement, including empty text for a justified deletion. Omit both to change only the summary."},
+                "summary": {"type": "string", "description": "mode=edit only: the new authored summary, alone or beside the old_str replacement, in the same revision-checked write."},
                 "expected_revision": {"type": "string", "description": "Source revision returned by knowledge_read. Omit or pass an empty string to create a missing note; an empty string never replaces an existing note. Required for overwriting or editing an existing note; drift returns the newer source without replacing it."},
-            }, "required": ["topic", "content"]},
+            }, "required": ["topic"]},
         }, _knowledge_write),
         ToolEntry("knowledge_list", {
             "name": "knowledge_list",

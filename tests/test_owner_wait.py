@@ -143,7 +143,7 @@ def test_the_granted_resume_row_records_the_bound_expiry(tmp_path, monkeypatch):
     through the ordinary grant, so the projection can say a bound ended it."""
     from types import SimpleNamespace
 
-    from ouroboros.task_results import load_task_result
+    from ouroboros.task_results import load_task_result, write_task_result
     from supervisor import worker_owner_wait as supervisor_wait
 
     import supervisor.message_bus as mb
@@ -155,6 +155,7 @@ def test_the_granted_resume_row_records_the_bound_expiry(tmp_path, monkeypatch):
     bridge = mb.LocalChatBridge()
     bridge._broadcast_fn = frames.append
     monkeypatch.setattr(mb, "get_bridge", lambda: bridge)
+    write_task_result(tmp_path, "root-1", "running")
     wait = {"wait_id": "w1", "task_attempt": 1, "quiz_id": "q1", "source_ref": "ref"}
     set_owner_wait(tmp_path, "root-1", {**wait, "state": "waiting"})
     worker = SimpleNamespace(in_q=queue.Queue(), busy_task_id="root-1",

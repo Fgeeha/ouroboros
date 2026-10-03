@@ -1,20 +1,19 @@
-"""The paid `e2e-live` CI job: the live E2E stand (devtools/e2e_live) on a nightly
-cron or an OPTED-IN manual dispatch, sized to a $30 cap, skipped honestly without
-its secret.
+"""The paid `e2e-live` CI job: the live E2E stand (devtools/e2e_live) on an
+OPTED-IN manual dispatch only, sized to a $30 cap, skipped honestly without its
+secret.
 
-Pinned as a contract, not as text: the job fires only on its OWN cron string or a
-dispatch whose `e2e_live` input is true (never a plain dispatch — the pre-tag
-3-OS matrix must not spend money — nor push, pull_request, tag, or the keyless
-lane's cron); the input changes no other job's gate; the nightly checks out and
-seeds the `ouroboros` branch tip (a schedule fires on the default branch, the
-promoted release line) while a dispatch seeds its own sha; it names
+Pinned as a contract, not as text: the job fires only on a dispatch whose
+`e2e_live` input is true (never a plain dispatch — the pre-tag 3-OS matrix must
+not spend money — nor push, pull_request, tag, or any schedule: the workflow's
+one cron belongs to the keyless lane); the input changes no other job's gate;
+the dispatch checks out and seeds its own sha; it names
 exactly one secret, `OUROBOROS_E2E_LIVE_OPENROUTER_KEY`, gated through a
 non-secret job-level env (GitHub rejects `secrets.*` inside `if:`); a missing
 secret is one step-summary line and a green exit, not a red run and not a
 pretend run; the stand is invoked with the operator's flag set on a clean
 detached seed of the checked-out sha; the run size is FEASIBLE under the cap by
 the stand's own worst-case reservation rule computed from the code (a set that
-can never be admitted would be a nightly red by construction); artifacts are
+can never be admitted would be a red run by construction); artifacts are
 uploaded even on failure and never include a lane settings file (0600, carries
 the key); and the step summary renders EVERY manifest shape — verdicts on
 completion, the typed refusal or error otherwise — and never fails on its own.
@@ -40,9 +39,8 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 CI_PATH = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 JOB = "e2e-live"
 SECRET = "OUROBOROS_E2E_LIVE_OPENROUTER_KEY"
-LIVE_CRON = "17 3 * * *"
+KEYLESS_CRON = "37 4 * * *"
 DISPATCH_INPUT = "e2e_live"
-NIGHTLY_REF = "ouroboros"
 SKIP_LINE = f"skipped: secret {SECRET} not configured"
 TOTAL_BUDGET_USD = 30.0
 
@@ -79,11 +77,13 @@ def _stand_args() -> dict[str, str | None]:
     return args
 
 
-def test_the_paid_lane_fires_only_on_its_own_cron_or_an_opted_in_dispatch():
+def test_the_paid_lane_fires_only_on_an_opted_in_dispatch():
     workflow = _workflow()
     triggers = workflow.get("on") or workflow.get(True)
+    # The schedule carries the keyless lane's cron alone: the paid stand runs on
+    # no schedule (tests/test_platform_ci_events.py evaluates the gate per event).
     crons = [str(entry["cron"]) for entry in triggers["schedule"]]
-    assert LIVE_CRON in crons, crons
+    assert crons == [KEYLESS_CRON], crons
     # The opt-in: a boolean dispatch input, OFF by default, naming the cost and
     # the secret. A plain `gh workflow run CI --ref <branch>` (the pre-tag 3-OS
     # matrix) therefore never runs the paid lane.
@@ -94,8 +94,7 @@ def test_the_paid_lane_fires_only_on_its_own_cron_or_an_opted_in_dispatch():
     assert "$30" in spec["description"] and SECRET in spec["description"], spec
     condition = " ".join(str(_job()["if"]).split())
     assert condition == (
-        f"(github.event_name == 'workflow_dispatch' && github.event.inputs.{DISPATCH_INPUT} == 'true')"
-        f" || (github.event_name == 'schedule' && github.event.schedule == '{LIVE_CRON}')"
+        f"github.event_name == 'workflow_dispatch' && github.event.inputs.{DISPATCH_INPUT} == 'true'"
     )
     # The input gates THIS job only: no other job reads dispatch inputs, so the
     # `github.event_name == 'workflow_dispatch'` gates elsewhere keep firing on
@@ -107,7 +106,7 @@ def test_the_paid_lane_fires_only_on_its_own_cron_or_an_opted_in_dispatch():
     # One SM1 lane with --self-mod: the task, the evolution cycle, the absorb
     # wait and two hermetic preflight suites on a 4-vCPU runner.
     assert int(_job()["timeout-minutes"]) >= 120
-    # No job downstream of the release chain may wait for a paid nightly lane.
+    # No job downstream of the release chain may wait for a paid opt-in lane.
     for name, job in workflow["jobs"].items():
         needs = job.get("needs") or []
         assert JOB not in ([needs] if isinstance(needs, str) else needs), name
@@ -147,8 +146,8 @@ def test_a_missing_secret_is_one_summary_line_and_a_green_exit():
 def test_the_stand_runs_with_the_operator_flag_set_on_a_clean_seed_of_the_checkout():
     args = _stand_args()
     assert args["--source-repo"] == "$GITHUB_WORKSPACE"
-    # HEAD of the checkout, never $GITHUB_SHA: on a schedule GITHUB_SHA names
-    # the DEFAULT branch (main) while the checkout below is the ouroboros tip.
+    # HEAD of the checkout: the stand seeds exactly the commit the checkout
+    # step below materialized.
     assert args["--seed"] == "HEAD"
     assert args["--out"].startswith("$RUNNER_TEMP/")
     assert args["--self-mod"] is None
@@ -158,9 +157,9 @@ def test_the_stand_runs_with_the_operator_flag_set_on_a_clean_seed_of_the_checko
     # The seed's `git describe` and the release admission gate read history and tags.
     checkout = _job()["steps"][0]
     assert checkout["uses"].startswith("actions/checkout@")
-    # Nightly = the development line's tip; dispatch = the dispatched sha.
+    # The dispatched sha, with no event-dependent branch.
     assert checkout["with"] == {
-        "ref": f"${{{{ github.event_name == 'schedule' && '{NIGHTLY_REF}' || github.sha }}}}",
+        "ref": "${{ github.sha }}",
         "fetch-depth": 0, "persist-credentials": False,
     }
     # The gate's node lane and the UI probe need node 22 and Chromium, as in ui-smoke.
@@ -172,7 +171,7 @@ def test_the_stand_runs_with_the_operator_flag_set_on_a_clean_seed_of_the_checko
 def test_the_run_size_is_feasible_under_the_cap_by_the_worst_case_reservation_rule():
     """Every requested attempt must be admissible when each earlier attempt spent
     its whole reservation — the stand records an inadmissible one as `not_run`
-    and fails the verdict, which would make the nightly red by construction."""
+    and fails the verdict, which would make every run red by construction."""
     args = _stand_args()
     per_task, attempts = float(args["--per-task-usd"]), int(args["--attempts"])
     scenarios = [s for s in str(args["--scenarios"]).split(",") if s]
@@ -197,7 +196,7 @@ def test_the_summary_header_and_the_job_comment_state_the_current_reservation_ar
     """rc.15 review MINOR 4: the summary header carried the retired 2x rule ($360
     for the full set). Its numbers are re-derived here from the stand's own ledger
     (per-task x (roots + the self-mod evolution root)), so a rule change trips
-    this pin instead of leaving stale arithmetic in the nightly report; the run's
+    this pin instead of leaving stale arithmetic in the run report; the run's
     OWN reservations are rendered from the manifest's budget_preflight."""
     args = _stand_args()
     budget = RunBudget(TOTAL_BUDGET_USD, float(args["--per-task-usd"]), self_mod=args["--self-mod"] is None)

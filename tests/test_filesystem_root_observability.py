@@ -281,6 +281,6 @@ def test_new_readonly_roots_access_policy():
             for op in ("write", "edit", "shell"):
                 assert not decide_tool_access(profile=profile, root=root, operation=op).allow, (profile, root, op)
     for profile in ("acting_subagent", "local_readonly_subagent"):
-        assert not decide_tool_access(profile=profile, root="subagent_projects", operation="read").allow, profile
+        assert decide_tool_access(profile=profile, root="subagent_projects", operation="read").allow, profile
     assert decide_tool_access(profile="local_readonly_subagent", root="deliverables", operation="read").allow
-    assert not decide_tool_access(profile="acting_subagent", root="deliverables", operation="read").allow
+    assert decide_tool_access(profile="acting_subagent", root="deliverables", operation="read").allow

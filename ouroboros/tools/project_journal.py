@@ -29,6 +29,7 @@ from ouroboros.project_facts import (
 from ouroboros.dialogue_provenance import is_presence_task, presence_caller_binding
 from ouroboros.focus import normalize_focus
 from ouroboros.tools.registry import ToolContext, ToolEntry
+from ouroboros.tools.tool_result import completed_local_read
 from ouroboros.utils import (
     append_jsonl,
     jsonl_generation_signature,
@@ -386,6 +387,7 @@ def _journal_snapshot_rows(
     return rows, snapshot, False, unreadable
 
 
+@completed_local_read
 def _journal_read(
     ctx: ToolContext,
     project_id: str = "",
@@ -459,6 +461,7 @@ def _journal_read(
     return f"## Project journal ({pid})\n\n" + "\n".join(lines)
 
 
+@completed_local_read
 def _workpad_read(ctx: ToolContext, project_id: str = "") -> str:
     pid, scope_error = _resolve_project_id(ctx, project_id, write=False)
     if scope_error:

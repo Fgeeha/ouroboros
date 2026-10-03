@@ -228,7 +228,7 @@ body.resizing-panels { user-select: none; }
     line-height: 1;
 }
 
-/* Per-project "new activity" indicator: a standard small red dot at the row's end. */
+/* Per-project unread-messages indicator: a standard small red dot at the row's end. */
 .nav-project-row { position: relative; }
 .nav-unread-dot {
     flex: 0 0 auto;
@@ -1269,6 +1269,14 @@ body.resizing-panels { user-select: none; }
     border-color: var(--accent);
 }
 .chat-load-older-btn:disabled { opacity: 0.6; cursor: default; }
+
+/* A completed Continue is a persistent reference, still readable when inert. */
+.btn[data-continue-successor]:disabled {
+    opacity: 1;
+    color: var(--text-secondary);
+    cursor: default;
+}
+
 /* First read of an empty feed: the pill is the only thing in the panel, so it
    carries the shared in-progress pulse rather than reading as a dead control. */
 .chat-load-older[aria-busy="true"] .chat-load-older-btn {
@@ -1278,11 +1286,25 @@ body.resizing-panels { user-select: none; }
     outline: 2px solid var(--focus-accent-border);
     outline-offset: 2px;
 }
+.msg-provenance {
+    font-size: var(--type-meta);
+    color: var(--text-meta);
+    margin-top: var(--space-2);
+}
 .chat-load-older-note {
     font-size: var(--type-meta);
     color: var(--text-meta);
     text-align: center;
     max-width: 460px;
+}
+.chat-history-status {
+    grid-column: 1 / -1;
+    flex: 0 0 100%;
+    order: 1;
+    max-width: none;
+    text-align: left;
+    overflow-wrap: anywhere;
+    background: var(--bg-primary);
 }
 
 .typing-bubble { opacity: 0.7; }
@@ -1473,6 +1495,29 @@ body.resizing-panels { user-select: none; }
     word-wrap: break-word;
     overflow-wrap: anywhere;
     min-width: 0;
+}
+
+/* Host-owned empty state, never an assistant or historical chat bubble. */
+.chat-empty-welcome {
+    align-self: flex-start;
+    max-width: min(80%, 520px);
+    min-width: 0;
+    padding: var(--space-3) var(--space-4);
+    border: 1px solid var(--surface-border);
+    border-radius: var(--radius-lg);
+    background: var(--bg-hover);
+    overflow-wrap: anywhere;
+}
+.chat-empty-welcome-label {
+    color: var(--text-secondary);
+    font-size: var(--type-meta);
+    font-weight: 600;
+}
+.chat-empty-welcome p {
+    margin: var(--space-1) 0 0;
+    color: var(--text-primary);
+    font-size: var(--type-section);
+    white-space: pre-wrap;
 }
 
 .chat-bubble.user {
@@ -2232,8 +2277,10 @@ body.resizing-panels { user-select: none; }
     display: none;
 }
 
-/* The root card width is owned by the CHAT COLUMN and therefore stays late
-   enough to beat the base 80% rule above. Ordinary bubble gutters are separate. */
+/* The one narrow-column rule: any chat column of 620px or less (a phone, a
+   narrow Project panel) gives bubbles and root cards its full width, without the
+   wide-screen gutters. It is owned by the COLUMN, not the viewport, and stays
+   late enough to beat the base 80% rules above. */
 @container chatcol (max-width: 620px) {
     .chat-bubble {
         max-width: 100%;
@@ -2511,6 +2558,58 @@ body.resizing-panels { user-select: none; }
     overflow-y: auto;
 }
 
+/* A delegated run's observation (#1350): the executor's words are the row's reading
+   text in primary ink; thinking, counts, gaps and notes stay in the row's quieter ink.
+   Problems use the warn pair — a failed step is not a failed task. */
+.chat-delegated-activity > * + * {
+    margin-top: var(--space-1);
+}
+
+.chat-delegated-message {
+    color: var(--text-primary);
+}
+
+.chat-delegated-actor {
+    display: block;
+    color: var(--text-muted);
+}
+
+.chat-delegated-problem {
+    color: var(--status-warn-fg);
+}
+
+/* A disclosure among quieter notes reads as a control: control ink, native marker. */
+.chat-delegated-thinking > summary {
+    cursor: pointer;
+    color: var(--text-primary);
+}
+
+.chat-delegated-thought + .chat-delegated-thought {
+    margin-top: var(--space-1);
+}
+
+.chat-delegated-gap,
+.chat-delegated-note,
+.chat-delegated-seq {
+    color: var(--text-meta);
+}
+
+/* A range the wait could not read before returning stays in the warn pair. */
+.chat-delegated-final {
+    color: var(--status-warn-fg);
+}
+
+.chat-delegated-source {
+    overflow-wrap: anywhere;
+}
+
+/* Ordered by the journal; each entry already carries its seq, so no list numbers. */
+.chat-delegated-events {
+    margin: 0;
+    padding-inline-start: 0;
+    list-style: none;
+}
+
 .chat-live-line-loading {
     margin-top: 6px;
     font-size: var(--type-meta);
@@ -2562,13 +2661,16 @@ body.resizing-panels { user-select: none; }
     font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
     font-size: var(--type-body);
 }
+/* Code keeps the ink of the text around it: in the accent-tinted assistant
+   bubble the link colour made a code span read as a link or an error. The
+   neutral pill alone marks it as code. */
 .ui-rich-content .inline-code,
 .chat-bubble .message .inline-code {
     background: rgba(var(--neutral-rgb), 0.08);
     padding: 1px 5px;
     border: 1px solid var(--surface-border);
     border-radius: var(--radius-xs);
-    color: var(--accent-light);
+    color: inherit;
     font-size: var(--type-body);
 }
 .chat-bubble .message del {
@@ -2626,26 +2728,43 @@ body.resizing-panels { user-select: none; }
    lines, quiz cards, skill review bodies, review attempt details — but the
    table styling was scoped to the chat bubble, so every other surface showed
    an unseparated run of cells. The class travels with the renderer, like
-   .md-h1 / .md-quote / .md-link above. */
+   .md-h1 / .md-quote / .md-link above. A table keeps its grid and fills its
+   column; cells wrap like prose, so it scrolls sideways only when its columns
+   cannot fit even wrapped. */
 .md-table {
-    width: max-content;
-    min-width: 100%;
+    width: 100%;
     border-collapse: collapse;
     color: var(--text-primary);
     font-size: var(--type-body);
+    font-variant-numeric: tabular-nums;
 }
 .md-table th,
 .md-table td {
-    min-width: 140px;
     padding: var(--space-2) var(--space-3);
     border-bottom: 1px solid var(--surface-border);
-    text-align: left;
-    white-space: nowrap;
+    text-align: start;
+    vertical-align: top;
+    /* Words stay whole: the bubble's `anywhere` or a timeline row's
+       `break-word` would let the table layout squeeze a short column (a
+       figure, a name) to a letter per line instead of scrolling. */
+    overflow-wrap: normal;
+    word-break: normal;
 }
+/* A link, hash or code span has no space to wrap at, so it may break anywhere
+   rather than widen its column past the bubble. */
+.md-table :is(a, code) { overflow-wrap: anywhere; }
+/* The author's GFM alignment (marked writes it as `align`, which any rule here
+   would otherwise override). */
+.md-table :is(th, td)[align="left"] { text-align: left; }
+.md-table :is(th, td)[align="center"] { text-align: center; }
+.md-table :is(th, td)[align="right"] { text-align: right; }
 .md-table th {
     font-weight: 600;
     color: var(--text-primary);
 }
+/* A full rich answer's table reads at the answer's own text size (DESIGN.md
+   §5); compact and card tables keep --type-body. */
+.chat-bubble .message:where(.ui-rich-content) .md-table { font-size: inherit; }
 
 /* Global markdown rendering classes. */
 .md-h1 {
@@ -2676,20 +2795,52 @@ body.resizing-panels { user-select: none; }
     font-weight: 600;
     margin-block: var(--space-3) var(--space-2);
 }
-/* Chat-scoped heading clamp: a markdown heading inside a chat bubble is a
-   section label, never a page title (--type-page stays for real page titles). */
+/* Compact Markdown in a bubble (a Skill Review report) keeps its dense
+   labels (DESIGN.md §2): every heading level at --type-body semibold, in the
+   transcript's established rhythm. */
 .chat-bubble .message .md-h1,
 .chat-bubble .message .md-h2,
 .chat-bubble .message .md-h3 {
     font-size: var(--type-body);
     font-weight: 600;
 }
-/* The ordinary transcript keeps its established heading rhythm. */
 .chat-bubble .message .md-h1 { margin-block: var(--space-5) var(--space-3); }
 .chat-bubble .message .md-h2 { margin-block: var(--space-4) var(--space-2); }
 .chat-bubble .message .md-h3 { margin-block: var(--space-3) var(--space-2); }
+/* Chat reading ladder (DESIGN.md §1, §5), for a full rich answer only: the
+   bubble whose message chat.js marks `.ui-rich-content`. A heading there is a
+   section of the answer, never a page title, and never smaller than the text
+   it opens: `#` = `##`, `###` one step down, deeper levels at the reading
+   size; all in the bubble's own ink, with clearly more space above than below.
+   `:where` keeps the rich scope weightless, so these rules win over the
+   compact ones above by order and the first/last-child rules below still apply. */
+.chat-bubble .message:where(.ui-rich-content) :is(.md-h1, .md-h2, .md-h3) {
+    color: inherit;
+    font-weight: 600;
+    line-height: var(--line-title);
+    text-wrap: balance;
+    margin-block: var(--space-5) var(--space-2);
+}
+.chat-bubble .message:where(.ui-rich-content) :is(.md-h1, .md-h2) { font-size: var(--md-heading-major); }
+.chat-bubble .message:where(.ui-rich-content) .md-h3 { font-size: var(--md-heading-minor); }
+/* h4-h6 carry .md-h3 (the compact demotion); `:where` keeps this rule no
+   stronger than the class rule it follows. */
+.chat-bubble .message:where(.ui-rich-content) :where(h4, h5, h6).md-h3 {
+    font-size: inherit;
+    margin-block: var(--space-4) var(--space-1);
+}
 .chat-bubble .message > :first-child { margin-block-start: 0; }
 .chat-bubble .message > :last-child { margin-block-end: 0; }
+/* Bold text never outweighs the heading above it. */
+.ui-rich-content :is(strong, b),
+.chat-bubble .message :is(strong, b) { font-weight: 600; }
+/* A thematic break is a quiet section rule, not the browser's inset double line. */
+.ui-rich-content hr {
+    height: 0;
+    border: 0;
+    border-top: 1px solid var(--surface-border);
+    margin-block: var(--space-5);
+}
 .md-li {
     display: block;
     padding-left: 12px;
@@ -2709,6 +2860,28 @@ body.resizing-panels { user-select: none; }
     -webkit-overflow-scrolling: touch;
     max-width: 100%;
     scrollbar-color: var(--text-disabled) var(--surface-card-soft);
+    --table-fade-start: 0px;
+    --table-fade-end: 0px;
+}
+/* A table that really scrolls fades on each side that still hides columns, the
+   `.scroll-fade-y` idiom turned sideways: `data-scroll-start`/`-end` come from
+   `bindMarkdownTables` (chat_markdown.js), shared by the rich enhancement and
+   compact surfaces, which also makes that wrapper a focusable region. A mask
+   fades the content itself, so it reads on every bubble tint. */
+.md-table-wrap[data-scroll-start] { --table-fade-start: var(--space-5); }
+.md-table-wrap[data-scroll-end] { --table-fade-end: var(--space-5); }
+.md-table-wrap:is([data-scroll-start], [data-scroll-end]) {
+    -webkit-mask-image: linear-gradient(to right, transparent 0, black var(--table-fade-start),
+        black calc(100% - var(--table-fade-end)), transparent 100%);
+    mask-image: linear-gradient(to right, transparent 0, black var(--table-fade-start),
+        black calc(100% - var(--table-fade-end)), transparent 100%);
+}
+/* Focused, the whole table and its ring show. */
+.md-table-wrap:focus-visible {
+    outline: 2px solid var(--focus-accent-border);
+    outline-offset: 2px;
+    -webkit-mask-image: none;
+    mask-image: none;
 }
 
 .md-code-block {
@@ -2869,20 +3042,8 @@ body.resizing-panels { user-select: none; }
         font-size: 16px !important;
     }
 
-    .chat-bubble {
-        max-width: 92%;
-    }
-    .chat-bubble.user {
-        margin-left: 8%;
-    }
-    .chat-bubble.assistant,
-    .chat-bubble.system {
-        margin-right: 8%;
-    }
-    .chat-bubble.progress {
-        max-width: 100%;
-        margin-right: 0;
-    }
+    /* Bubble width is not set here: the `chatcol` container rule is the one
+       narrow-column rule, for a phone and a narrow Project panel alike. */
 
     #app {
         grid-template-columns: minmax(0, 1fr);
@@ -4043,6 +4204,20 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     align-items: center;
     gap: 6px;
     flex-shrink: 0;
+}
+
+.activity-schedule {
+    flex-wrap: wrap;
+}
+
+.activity-schedule .activity-row-main {
+    flex: 1 1 240px;
+}
+
+.activity-schedule .activity-sub {
+    white-space: normal;
+    overflow: visible;
+    overflow-wrap: anywhere;
 }
 
 .activity-tag {
@@ -6357,6 +6532,8 @@ textarea.chat-input {
         width: 100%;
         z-index: 60;
         border-left: none;
+        /* A full-screen room must occlude Main, not show its text through glass. */
+        background: var(--bg-primary);
         transform: translateY(14px);
     }
 
@@ -7415,7 +7592,6 @@ textarea.chat-input {
     white-space: nowrap;
     text-overflow: ellipsis;
 }
-.project-work-coverage { font-size: var(--type-meta); color: var(--text-meta); }
 /* Compact horizontal spacing leaves room for wider native system-font metrics. */
 .chat-panel-statusbar { flex-wrap: wrap; gap: var(--space-2) var(--space-1); }
 .chat-live-executor-chip { max-width: 100%; white-space: normal; }

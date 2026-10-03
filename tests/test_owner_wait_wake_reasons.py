@@ -316,12 +316,17 @@ def test_a_cold_handoff_is_refused_once_the_task_deadline_passed(tmp_path):
 ])
 def test_the_pool_grant_announces_every_non_control_wake(tmp_path, monkeypatch, reason, announced):
     from ouroboros.owner_wait import set_owner_wait
+    from ouroboros.task_results import write_task_result
     from supervisor import worker_owner_wait as supervisor_wait
 
+    wait = {"wait_id": "w1", "task_attempt": 1, "quiz_id": "q1", "source_ref": "ref"}
+    # The wait projection lives on the running task's lifecycle row, never on a bare one.
+    with pytest.raises(ValueError, match="lifecycle owner"):
+        set_owner_wait(tmp_path, "root-1", {**wait, "state": "waiting"})
+    write_task_result(tmp_path, "root-1", "running", root_task_id="root-1", chat_id=1)
     record_asked(tmp_path, "root-1", quiz_id="q1", question="?", options=["a", "b"],
                  chat_id=1, wait_for_answer=True)
     frames = _bridge(monkeypatch)
-    wait = {"wait_id": "w1", "task_attempt": 1, "quiz_id": "q1", "source_ref": "ref"}
     set_owner_wait(tmp_path, "root-1", {**wait, "state": "waiting"})
     worker = SimpleNamespace(in_q=queue.Queue(), busy_task_id="root-1",
                              proc=SimpleNamespace(pid=7), reaping=False, active_capacity=False)

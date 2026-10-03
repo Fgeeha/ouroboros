@@ -366,14 +366,17 @@ def compact_review_projection(review_runs: Any) -> Dict[str, Any]:
                 if key in raw_run:
                     panel[key] = copy.deepcopy(raw_run[key])
             # A panel that settled after its task ended carries the host's own
-            # sentence about it; the card prints those bytes verbatim, so the
-            # projection copies them under the same disclosed bound every other
-            # owner-facing review artifact uses.
+            # sentence about it; the card and the owner's row print those bytes
+            # verbatim, so the projection copies them under the same disclosed
+            # bound every other owner-facing review artifact uses, a cut said in
+            # words. The raw run keeps every byte, so a STORED applied record is
+            # named as the home of the rest (many reviewers can pass the bound).
             if isinstance(raw_run.get("late_settlement"), dict):
-                from ouroboros.utils import truncate_review_artifact
+                from ouroboros.acceptance_settlement import owner_bounded_text
 
                 late = copy.deepcopy(raw_run["late_settlement"])
-                late["note"] = truncate_review_artifact(str(late.get("note") or ""), 2000)
+                late["note"] = owner_bounded_text(str(late.get("note") or ""), 2000,
+                                                  in_record=panel["applied_source_status"] == "available")
                 panel["late_settlement"] = late
         for key in (
             "candidate_hash", "evidence_revision", "fence_hash", "binding_hash",

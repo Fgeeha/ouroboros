@@ -30,22 +30,14 @@ from ouroboros.tool_call_log import (
     elapsed_ms, invocation_fields, new_invocation, start_log_field, persist_dispatch_source,
 )
 from ouroboros.tool_capabilities import (
-    FOREGROUND_MUTATIVE_TOOLS,
-    PARALLEL_SAFE_ENQUEUE_TOOLS,
+    FOREGROUND_MUTATIVE_TOOLS, PARALLEL_SAFE_ENQUEUE_TOOLS,
     READ_ONLY_PARALLEL_TOOLS,
     REVIEWED_MUTATIVE_TOOLS,
     STATEFUL_BROWSER_TOOLS,
-)
-from ouroboros.tool_capabilities import (
     UNTRUNCATED_REPO_READ_PATHS as _UNTRUNCATED_REPO_READ_PATHS,
     UNTRUNCATED_REPO_READ_PREFIXES as _UNTRUNCATED_REPO_READ_PREFIXES,
-)
-from ouroboros.tool_capabilities import (
     UNTRUNCATED_TOOL_RESULTS as _UNTRUNCATED_TOOL_RESULTS,
-)
-from ouroboros.tool_capabilities import routing_action_for_tool
-from ouroboros.tool_capabilities import (
-    tool_result_limit as _tool_result_limit,
+    routing_action_for_tool, completion_control_call, substantive_tool_calls, tool_result_limit as _tool_result_limit,
 )
 from ouroboros.tools.registry import ToolRegistry
 from ouroboros.tools.tool_result import (
@@ -82,8 +74,7 @@ def _emit_live_log(tools: ToolRegistry, payload: Dict[str, Any]) -> None:
     for key in ("parent_task_id", "root_task_id"):
         if meta.get(key) and not enriched.get(key):
             enriched[key] = meta.get(key)
-    # Tool execution is another physical wait surface.  Keep the idle rail
-    # aware of it through the same typed operation seam as LLM/review calls;
+    # Tools share the cognitive-operation idle lease;
     # a timeout/late notice deliberately does NOT close the lease because the
     # worker thread may still be running after the logical caller returned.
     operation_id = str(enriched.get("invocation_id") or enriched.get("tool_call_id") or "")
@@ -108,6 +99,8 @@ def _emit_live_log(tools: ToolRegistry, payload: Dict[str, Any]) -> None:
 
 
 def _publish_settlement(tools, drive_logs, row):
+    if completion_control_call(str(row.get("tool") or ""), row.get("args")):
+        row["completion_control"] = True
     action = routing_action_for_tool(str(row.get("tool") or ""))
     if action:
         row["routing_action"] = action
@@ -624,6 +617,7 @@ def _execute_single_tool(
     drive_logs: pathlib.Path,
     task_id: str = "",
     invocation: Optional[Dict[str, Any]] = None,
+    *, host_refusal: Optional[ToolResult] = None,
 ) -> Dict[str, Any]:
     """
     Execute a single tool call and return all needed info.
@@ -704,7 +698,7 @@ def _execute_single_tool(
 
     tool_ok = True
     try:
-        tool_result = tools.execute_result(fn_name, args)
+        tool_result = host_refusal if host_refusal is not None else tools.execute_result(fn_name, args)
         result = tool_result.text
     except UsageAccountingError:
         raise
@@ -1028,13 +1022,12 @@ def _execute_with_timeout(
         arguments = {"raw_arguments": tc.get("function", {}).get("arguments")}
     persist_dispatch_source(_tool_task_metadata(tools), drive_logs, task_id, invocation, fn_name, arguments)
     args_for_log = sanitize_tool_args_for_log(fn_name, _tc_args(tc))
-    # The addressing stamp of the live frames: the routing action this call
-    # represents (tool_capabilities owns the family); the chat block renders a
-    # stamped call as a receipt row, never as content the block stands on.
+    # Host-stamped control calls are receipts, not substantive work.
     action = routing_action_for_tool(fn_name)
     receipt = {"routing_action": action} if action else {}
-    # ONE payload for the durable start row and the live frame (same ts), so a
-    # history backfill dedupes against the frame the page already rendered.
+    if completion_control_call(fn_name, _tc_args(tc)):
+        receipt["completion_control"] = True
+    # Durable/live start share identity for replay deduplication.
     live = _with_correlation({
         "ts": utc_now_iso(), "type": CALL_STARTED, "task_id": task_id, "tool": fn_name,
         "timeout_sec": None if is_reviewed_mutative else timeout_sec,
@@ -1105,10 +1098,17 @@ def _await_stateful_tool(tools: ToolRegistry, tc: Dict[str, Any], drive_logs: pa
     # reaches the tool body, the wrapper refuses instead of letting the
     # abandoned call build a session in the NEXT command's state.
     submit_generation = getattr(tool_ctx, "browser_state", None)
-    with execution_deadline_scope(monotonic_now() + timeout_sec):
-        future = stateful_executor.submit(
-            _execute_browser_tool_bound, tools, tc, drive_logs, task_id, submit_generation, invocation,
-        )
+    from ouroboros.owner_pause import OwnerPauseRefused, submit_tool
+    try:
+        with execution_deadline_scope(monotonic_now() + timeout_sec):
+            future = submit_tool(tool_ctx, fn_name, stateful_executor.submit,
+                _execute_browser_tool_bound, tools, tc, drive_logs, task_id, submit_generation, invocation)
+    except OwnerPauseRefused as exc:
+        from ouroboros.tools.tool_result import launch_refusal_result
+
+        result = _execute_single_tool(tools, tc, drive_logs, task_id, invocation,
+                                      host_refusal=launch_refusal_result(str(exc)))
+        return _emit_finished(tools, live, result, started_at)
     # The registration PINS settlement ownership until this call's own
     # handling is over (result in time, or the late hold claimed below):
     # released in the finally, after either branch (#1196).
@@ -1200,6 +1200,11 @@ def handle_tool_calls(
         custom_validation_by_call_id,
     )
 
+    from ouroboros.loop_delivery import completion_observation
+    if not isinstance(getattr(tools._ctx, "_completion_observation", None), dict):
+        tools._ctx._completion_observation = completion_observation(tools._ctx, llm_trace)
+    tools._ctx._completion_conflict = False
+    initial_count = len(llm_trace.get("tool_calls") or [])
     validation = tuple(
         getattr(tools._ctx, "_request_wire_custom_receipts", ()) or ()
     )
@@ -1222,7 +1227,9 @@ def handle_tool_calls(
                 "is_code_tool": fn_name in tools.CODE_TOOLS,
                 "result_meta": _extract_result_metadata(fn_name, result, True),
             }
-        return _execute_with_timeout(
+        from ouroboros.presence_context import confirmed_delivery_receipts
+        before = confirmed_delivery_receipts(tools._ctx)
+        result = _execute_with_timeout(
             tools,
             tc,
             drive_logs,
@@ -1234,6 +1241,10 @@ def handle_tool_calls(
             task_id,
             stateful_executor,
         )
+        confirmed = confirmed_delivery_receipts(tools._ctx) - before
+        if confirmed and not result.get("is_error"):
+            result.setdefault("result_meta", {})["presence_delivery_confirmed"] = sorted(confirmed)
+        return result
 
     can_parallel = tool_calls_can_run_parallel(tool_calls)
 
@@ -1290,7 +1301,10 @@ def handle_tool_calls(
             # started ones (each bounded by its own tool timeout) (#1196, Astra #4).
             executor.shutdown(wait=batch_raised, cancel_futures=True)
 
-    return process_tool_results(results, messages, llm_trace, emit_progress, tools=tools)
+    errors = process_tool_results(results, messages, llm_trace, emit_progress, tools=tools)
+    if substantive_tool_calls(llm_trace.get("tool_calls", [])[initial_count:]):
+        tools._ctx._skill_finalization_injected = False
+    return errors
 
 
 def _maybe_auto_attach_image(
@@ -1478,14 +1492,10 @@ def process_tool_results(
             trace_args = {"_repr": repr(exec_result["args_for_log"])}
         llm_trace["tool_calls"].append({
             "tool": fn_name,
+            **({"completion_control": True} if completion_control_call(fn_name, trace_args) else {}),
             "tool_call_id": exec_result["tool_call_id"],
             "args": trace_args,
-            # Evidence-parity (v6.71.1): store the SAME view the agent saw
-            # (per-tool TOOL_RESULT_LIMITS, head-truncated) rather than a hidden
-            # 700-char head+tail copy. A decider (acceptance reviewer, reflection)
-            # must never adjudicate less of a tool result than the actor did —
-            # the old 700 cap cut the middle out and produced false
-            # "not shown in trace" verdicts → acceptance loops (BIBLE P1/P3).
+            # Review sees the same complete/bounded tool view that Main saw.
             "result": truncated_result,
             "is_error": is_error,
             "trace_ref": exec_result.get("trace_ref"), **({"round_id": exec_result["round_id"]} if exec_result.get("round_id") else {}),

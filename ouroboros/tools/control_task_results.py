@@ -29,7 +29,7 @@ from ouroboros.task_status import (
 )
 from ouroboros.tools.registry import ToolContext, ToolEntry
 from ouroboros.utils import truncate_review_artifact, utc_now_iso
-from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
+from ouroboros.tools.tool_result import ToolResult, _publish_tool_result, completed_local_read
 
 
 def disclosable_capability_delta(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -55,6 +55,8 @@ def _subtask_outcome_summary(data: Dict[str, Any], receipts: list | None = None)
     summary: Dict[str, Any] = {
         "outcome_axes": normalize_outcome_axes(data),
     }
+    if isinstance(data.get("execution_observation"), dict):
+        summary["execution_observation"] = dict(data["execution_observation"])
     # R5: CURRENT delegated-custody reconciliation state next to the historical
     # axes, on the full single-child handoff surfaces only (get_task_result /
     # wait_task — wait_tasks' batch projection is a pinned compact contract).
@@ -184,6 +186,7 @@ def _unchanged_result_reference(task_id: str, current_hash: str, known_hash: Any
     }
 
 
+@completed_local_read
 def _get_task_result(
     ctx: ToolContext, task_id: str, include_authority: bool = False,
     include_work_order_source: bool = False, source_start_char: Any = None,
@@ -343,6 +346,16 @@ def _get_task_result(
     except Exception:
         receipts = []
     outcome_summary = _subtask_outcome_summary(data, receipts=receipts)
+    debt = data.get("acceptance_debt")
+    if isinstance(debt, dict) and debt.get("source_ref"):
+        from ouroboros.acceptance_history import historical_source_reference
+
+        summary = json.loads(outcome_summary)
+        summary["acceptance_debt"] = {key: debt.get(key) for key in (
+            "debt_id", "task_id", "accounting_root_task_id", "delivery_status")}
+        summary["acceptance_debt"]["source_ref"] = historical_source_reference(
+            status_drive_root, str(data.get("task_id") or task_id), debt["source_ref"], subject=True)
+        outcome_summary = json.dumps(summary, ensure_ascii=False, indent=2)
     from ouroboros.tools.join_ledger import _child_result_sha256
 
     child_result_sha256 = _child_result_sha256(data)
@@ -387,6 +400,9 @@ def _get_task_result(
         )
     if isinstance(data.get("cancel_origin"), dict):
         output += f"\n\n[CANCELLED_BY] {json.dumps(data['cancel_origin'], ensure_ascii=False)}"
+    if data.get("retired_tool_invocations"):
+        output += ("\n\n[INTERRUPTED_TOOL_CALLS] Local execution ended; external effects remain unknown.\n"
+                   + json.dumps(data["retired_tool_invocations"], ensure_ascii=False))
     from ouroboros.task_custody import unread_mail_notice
 
     if unread := unread_mail_notice(data.get("unread_mailbox")):
@@ -740,7 +756,8 @@ def _wait_window(
     return window, bound
 
 
-def _await_messages(ctx: ToolContext, timeout_sec: int) -> str:
+def _await_messages(ctx: ToolContext, timeout_sec: int = 0, mode: str = "in_slot", senders: Any = None,
+                    tasks: Any = None, runs: Any = None, wake_at: Any = None, wake_after_sec: Any = None) -> str:
     """Hold this task's worker slot until an unread mailbox entry exists or the
     window elapses. Delivers nothing: the round-top drain owns delivery and
     acknowledgement, exactly as after a wait_task early return. An owner Stop
@@ -765,6 +782,9 @@ def _await_messages(ctx: ToolContext, timeout_sec: int) -> str:
     from ouroboros.loop_transport import _owner_signal_pending
     from ouroboros.owner_mailbox import OwnerMailboxPeek
 
+    if mode != "in_slot" or senders or tasks or runs or wake_at or wake_after_sec:
+        return _await_as_sleep(ctx, mode, senders=senders, tasks=tasks, runs=runs,
+                               wake_at=wake_at, wake_after_sec=wake_after_sec)
     try:
         requested = int(timeout_sec)
     except (TypeError, ValueError):
@@ -810,6 +830,25 @@ def _await_messages(ctx: ToolContext, timeout_sec: int) -> str:
     return json.dumps(out, ensure_ascii=False)
 
 
+def _await_as_sleep(ctx: ToolContext, mode: str, **chosen: Any) -> str:
+    """The model's own warm/cold SLEEP (``ouroboros/model_sleep.py``): validate the
+    selected sources, answer at once when one is already ready, else arm the park
+    that follows this tool batch."""
+    from ouroboros import model_sleep
+
+    try:
+        if mode not in (model_sleep.MODE_WARM, model_sleep.MODE_COLD):
+            raise ValueError("senders/tasks/runs/wake_at/wake_after_sec select a sleep: give mode warm or cold")
+        if not callable(getattr(ctx, "owner_wait_callback", None)):
+            raise ValueError("this task has no continuation owner to sleep under")
+        outcome = model_sleep.request_sleep(ctx, model_sleep.selectors(ctx, **chosen), mode)
+    except (TypeError, ValueError) as exc:
+        return _publish_tool_result(ctx, ToolResult(
+            status="error", code="TOOL_ARG_ERROR", text=f"⚠️ TOOL_ARG_ERROR (await_messages): {exc}",
+            meta={"operation_outcome": "completed_no_effect"}))
+    return json.dumps(outcome, ensure_ascii=False)
+
+
 def await_messages_entry() -> ToolEntry:
     """The await_messages catalog entry, owned beside its handler; the kill timeout
     sits 60s above the largest window the tool can choose (the per-call ceiling)."""
@@ -829,12 +868,29 @@ def await_messages_entry() -> ToolEntry:
             "off you and its completion counts as progress, so your next round starts inside a "
             "full idle window — call again to keep waiting. It delivers nothing itself: the message "
             "reaches you at the next round top, exactly as after a wait_task early return. The "
-            "result says when the applied prompt-cache horizon elapsed since the last model response."
+            "result says when the applied prompt-cache horizon elapsed since the last model response. "
+            "mode=warm or mode=cold instead SLEEPS without holding your model slot, until what you select: "
+            "mail from `senders`, the terminal of `tasks` you can read, the terminal of delegated `runs` you "
+            "own, and/or `wake_at`/`wake_after_sec`; with nothing selected any addressed mail wakes you. The "
+            "owner's messages and controls always wake you; unselected mail waits unread. Warm keeps your "
+            "process and browser (a pooled slot is lent meanwhile); you choose which fits. A source that is "
+            "already ready answers at once. Sleep does not count as execution time; an explicit deadline "
+            "still applies. A settled task is not a successful one: read its result when you wake."
         ),
-        "parameters": {"type": "object", "required": ["timeout_sec"], "properties": {
+        "parameters": {"type": "object", "properties": {
             "timeout_sec": {"type": "integer", "description":
-                            "Seconds to wait; clamped to the per-call timeout ceiling and to the "
-                            "deadline emit window (the bound is reported in the result)."},
+                            "In-slot wait only: seconds to wait; clamped to the per-call timeout ceiling and to "
+                            "the deadline emit window (the bound is reported in the result)."},
+            "mode": {"type": "string", "enum": ["in_slot", "warm", "cold"],
+                     "description": "in_slot (default) holds your slot for timeout_sec; warm/cold is a sleep."},
+            "senders": {"type": "array", "items": {"type": "string"},
+                        "description": "Sleep: task ids whose mail wakes you (others' mail stays unread)."},
+            "tasks": {"type": "array", "items": {"type": "string"},
+                      "description": "Sleep: task ids whose terminal (any settled status) wakes you."},
+            "runs": {"type": "array", "items": {"type": "string"},
+                     "description": "Sleep: your delegated run ids whose terminal wakes you."},
+            "wake_at": {"type": "string", "description": "Sleep: an absolute ISO-8601 wake time (with timezone)."},
+            "wake_after_sec": {"type": "integer", "description": "Sleep: wake after this many seconds."},
         }},
     }, _await_messages, timeout_sec=get_per_call_timeout_ceiling_sec() + 60)
 
@@ -956,6 +1012,8 @@ def _children_roster_projection(
             "accounted_upper_bound_usd": _cost["accounted_upper_bound_usd"],
             "child_result_sha256": _child_result_sha256(row),
             "outcome_axes": normalize_outcome_axes(row),
+            **({"execution_observation": dict(row["execution_observation"])}
+               if isinstance(row.get("execution_observation"), dict) else {}),
         })
     return disclosed_list_projection(
         roster, key="children_roster", limit=max(1, int(limit)), item=lambda entry: entry,
@@ -982,6 +1040,8 @@ def _compact_child_projection(tid: str, data: Dict[str, Any], known_hash: Any) -
         "result": data.get("result"),
         "trace_summary": data.get("trace_summary"),
     }
+    if isinstance(data.get("execution_observation"), dict):
+        projected["execution_observation"] = dict(data["execution_observation"])
     # The result hash binds this limitation too; keep its host authorship
     # separate from the unchanged model answer, including an empty answer.
     from ouroboros.task_finalization import terminal_host_notice_text

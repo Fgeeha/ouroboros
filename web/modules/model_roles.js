@@ -217,7 +217,7 @@ export function createModelRolesEditor({ hostId, store = claudexorStatus,
                     ${slot.settingsToggleId ? `<label class="local-toggle ui-field ui-field-inline"><input class="ui-checkbox" id="${escapeHtml(slot.settingsToggleId)}" type="checkbox" data-model-local aria-label="${escapeHtml(slot.label)} local runtime" ${local ? 'checked' : ''}> Local</label>` : ''}
                     ${slot.slot === 'fallback' ? '<button type="button" class="btn btn-default" data-model-add>Add fallback</button>' : ''}
                 </div>
-                ${slot.slot === 'fallback' ? '<p class="model-role-copy">Tried in this order. Subscription quota waits for your choice before using API.</p>' : ''}
+                ${slot.slot === 'fallback' ? '<p class="model-role-copy">Tried in this order when the acting model refuses, cannot be reached or loses its answer. A wait starts only when none of them answers.</p>' : ''}
                 ${matching.map((row, index) => rowHtml(row, index, matching.length)).join('')}
             </section>`;
         }).join('');

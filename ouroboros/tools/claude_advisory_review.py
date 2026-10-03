@@ -167,10 +167,12 @@ def _same_model_payable_spelling(model: str) -> str:
 
 
 def _advisory_default_model() -> str:
-    """The shipped advisory default on a route this install can actually pay."""
+    """The shipped advisory default on a route this install can actually pay —
+    Main's own route on an OpenAI-compatible-only install (#1116)."""
     from ouroboros.provider_models import OPENROUTER_REVIEW_DEFAULTS
+    from ouroboros.review_model_routes import compatible_only_review_model
 
-    return _same_model_payable_spelling(str(OPENROUTER_REVIEW_DEFAULTS["advisory"]))
+    return compatible_only_review_model() or _same_model_payable_spelling(str(OPENROUTER_REVIEW_DEFAULTS["advisory"]))
 
 
 def _advisory_native_model(slot=None) -> str:
@@ -1398,6 +1400,7 @@ def _handle_review_status(
         task_id=task_id,
         attempt=attempt,
         snapshot_hash_fn=compute_snapshot_hash,
+        reader_task_id=str(getattr(ctx, "task_id", "") or ""),
     )
     next_step = _next_step_guidance(
         projection["guidance_run"],

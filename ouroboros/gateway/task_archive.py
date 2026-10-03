@@ -9,11 +9,12 @@ is refused too) one ``O_DIRECTORY | O_NOFOLLOW`` directory-relative open per pat
 segment, and the file itself opened ``O_NOFOLLOW | O_NONBLOCK`` from its parent's
 descriptor. A component swapped for a symlink after attribution is ELOOP, a planted FIFO
 never blocks, and the open descriptor must fstat as a regular file. Nothing re-opens a
-pathname after the check. A captured file (an immutable row, or content-addressed chat
-media whose name is its sha256) is verified INTO a private spool and only the spool is
-served, so the bytes on the wire are exactly the verified ones. The same holds for any
-row that records a digest: a mutable file's bytes that no longer match it are refused
-typed (409 ``artifact_identity_changed``, naming the recorded digest) rather than served
+pathname after the check. A captured file (an immutable row, content-addressed chat media
+whose name is its sha256, or a delegated run's retained journal range named by its digest)
+is verified INTO a private spool and only the spool is served, so the bytes on the wire
+are exactly the verified ones. The same holds for any row that records a digest: a
+mutable file's bytes that no longer match it are refused typed (409
+``artifact_identity_changed``, naming the recorded digest) rather than served
 under an identity a parent's disposition may have bound; a listing without a digest
 streams its current bytes and says so (``x-ouroboros-artifact-identity: unmeasured``).
 
@@ -67,6 +68,8 @@ _DIR_FLAGS = (os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOL
 _FILE_FLAGS = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
                | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOCTTY", 0))
 _CHAT_MEDIA_DIGEST_RE = re.compile(r"chat-media-([0-9a-f]{64})\.[a-z0-9]+")
+_DELEGATED_SOURCE_RE = re.compile(r"source_handles/delegated_activity/([A-Za-z0-9][A-Za-z0-9_.-]*-([0-9a-f]{64})\.jsonl)")
+_ACCEPTANCE_SOURCE_RE = re.compile(r"source_handles/context_checkpoints/(acceptance-([0-9a-f]{64})\.json)")
 
 Route = Tuple[pathlib.Path, List[str]]  # (directory opened by absolute path, segments below it)
 
@@ -307,6 +310,47 @@ def chat_media_identity(name: str) -> Dict[str, Any]:
     if match is None:
         raise ValueError(f"not a content-addressed chat media name: {name!r}")
     return {"sha256": match.group(1)}
+
+
+def serve_task_source(drive_root: Any, stores: List[pathlib.Path], result: Dict[str, Any], task_id: str,
+                      name: str, source: str) -> Response:
+    """``?source=<store-relative path>``: one source a task's own records name.
+
+    A delegated run's retained journal range (``delegate_activity``) is content-addressed
+    like chat media: only ``source_handles/delegated_activity/<id>-<sha256>.jsonl`` whose
+    basename is ``name`` qualifies, read from the task's own stores (canonical first)
+    through the confined descent and verified against the digest its name carries. Any
+    other path must be a source the task result publishes, returned as its verified JSON,
+    or this author's own host acceptance record named by its digest: a late notice keeps
+    linking the record it was sent with after a newer publication replaced its panel's
+    ref (#1369), resolved by the same membership ``get_task_result(review_source_sha256=)``
+    verifies (``task_finalization.host_acceptance_source``).
+    """
+    match = _DELEGATED_SOURCE_RE.fullmatch(str(source or ""))
+    if match:
+        if match.group(1) != name:
+            return json_error("source must end in the requested name", 400, reason_code="task_source_invalid",
+                              task_id=task_id, artifact=name)
+        # New delegated JSONL sources retain the ordinary file route's fail-closed
+        # platform boundary (#1297); the result-published review-source branch below is unchanged.
+        present = [store for store in stores if os.path.lexists(store.joinpath(*source.split("/")))] if CONFINED else []
+        return serve_task_file(drive_root, (present or stores)[0], source, name, {"sha256": match.group(2)},
+                               task_id=task_id)
+    try:
+        return Response(artifact_store.read_task_result_source_bytes(drive_root, result, name, source),
+                        media_type="application/json")
+    except (OSError, ValueError, RuntimeError):
+        pass
+    record = _ACCEPTANCE_SOURCE_RE.fullmatch(str(source or ""))
+    try:
+        if record and record.group(1) == name:
+            from ouroboros.task_finalization import host_acceptance_source
+
+            return Response(host_acceptance_source(drive_root, task_id, record.group(2))[1],
+                            media_type="application/json")
+    except (OSError, ValueError, RuntimeError):
+        pass
+    return json_error("task source is unavailable or does not match its recorded identity", 404)
 
 
 class _DescriptorResponse(Response):

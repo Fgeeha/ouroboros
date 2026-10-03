@@ -49,7 +49,7 @@ def test_settings_defaults_include_phase2_keys():
     assert SETTINGS_DEFAULTS["OUROBOROS_MODEL_FALLBACKS"] == "openai/gpt-5.6-luna"
     assert (
         SETTINGS_DEFAULTS["OUROBOROS_MODEL_DEEP_SELF_REVIEW"]
-        == "openai/gpt-5.6-sol"
+        == ""  # unauthored; the getter resolves the route's default
     )
     assert SETTINGS_DEFAULTS["TOTAL_BUDGET"] == 200.0
     assert SETTINGS_DEFAULTS["OUROBOROS_PER_TASK_COST_USD"] == 50.0
@@ -1055,10 +1055,19 @@ def test_default_lane_allows_minusC_retarget_from_default_cwd(tmp_path, monkeypa
 
 
 @pytest.mark.parametrize("mode", ["advanced", "pro"])
-def test_shell_python_writer_reaches_the_selected_process(tmp_path, monkeypatch, mode):
+def test_shell_python_writer_reaches_the_selected_process(tmp_path, tmp_path_factory, monkeypatch, mode):
     """Source text is executed under selected supervision without guessed targets."""
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", mode)
     monkeypatch.setenv("OUROBOROS_SAFETY_MODE", "off")
+    # Only an argv LIST is interpreter-resolved; this string form launches the bare
+    # `python` from PATH, which a host shipping only `python3` (stock macOS) lacks.
+    # Put the running interpreter there under that name, outside the repo root.
+    executable = pathlib.Path(sys.executable)
+    python_dir = executable.parent
+    if os.name != "nt" and executable.name != "python":
+        python_dir = tmp_path_factory.mktemp("bare-python")
+        (python_dir / "python").symlink_to(executable)
+    monkeypatch.setenv("PATH", str(python_dir) + os.pathsep + os.environ.get("PATH", ""))
     reg = _registry(tmp_path)
     result = reg.execute(
         "run_command",

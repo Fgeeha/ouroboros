@@ -393,15 +393,14 @@ def test_normalize_server_config_rejects_unsafe_auth_token(bad_token):
     assert mcp_client.normalize_server_config(_good_server(auth_token=bad_token)) is None
 
 
-def test_parse_servers_drops_duplicates_and_invalid():
-    raw = [
-        {"id": "good", "url": "https://e.example/mcp"},
-        {"id": "good", "url": "https://other.example/mcp"},  # duplicate
-        {"id": "bad-url", "url": "ftp://no"},
-        "not a dict",
-    ]
-    servers = mcp_client.parse_servers(raw)
-    assert [s.id for s in servers] == ["good"]
+def test_parse_servers_refuses_ambiguous_ids_and_drops_invalid():
+    raw = [{"id": "good", "url": "https://e.example/mcp"}, {"id": "good", "url": "https://other.example/mcp"},
+           {"id": "unique", "url": "https://unique.example/mcp"}, {"id": "bad-url", "url": "ftp://no"}, "not a dict"]
+    errors: list = []
+    servers = mcp_client.parse_servers(raw, errors=errors)
+    assert [s.id for s in servers] == ["unique"]
+    assert {(row["id"], row["code"]) for row in errors} == {
+        ("bad_url", "MCP_CONFIG_ERROR"), ("", "MCP_CONFIG_ERROR"), ("good", "MCP_ID_AMBIGUOUS")}
 
 
 def test_redact_servers_for_status_masks_tokens():
@@ -574,11 +573,11 @@ def test_manager_reconfigure_drops_invalid_entries():
     settings = _settings(
         _good_server(),
         {"id": "bad", "url": "ftp://nope"},
-        {"id": "demo", "url": "https://other.example/mcp"},  # duplicate id
+        _good_server(id="other"),
     )
     mgr.reconfigure(settings)
-    assert mgr.server_count() == 1
-    assert mgr.server_ids() == ["demo"]
+    assert mgr.server_count() == 2
+    assert mgr.server_ids() == ["demo", "other"]
 
 
 def test_manager_refresh_populates_tools_and_status():

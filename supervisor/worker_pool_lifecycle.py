@@ -61,22 +61,21 @@ def _serialized_worker_lifecycle(fn):
     return wrapped
 
 
-def _recorded_cancel_fields(task_id: str) -> dict:
-    """The cancel origin an existing intent for ``task_id`` records, else ``{}``.
+def _recorded_cancel_fields(task_id: str, *, stop_source: str = "", reason: str = "") -> dict:
+    """Keep the recorded intent's cause; only an absent intent permits a door fallback.
 
-    A pool teardown that terminalizes as ``cancelled`` (an owner Restart mints
-    its intent first, then kills the pool) must keep the SAME recorded cause the
-    custody writer would: one helper, ``_intent_outcome_fields``. No intent means
-    no origin -- a teardown never invents one. Fail-soft: an unreadable
-    projection leaves the result without an origin rather than blocking it.
+    An unreadable authority supplies neither a recorded cause nor proof of absence.
     """
     try:
         from ouroboros.cancel_intents import active_intent
         from supervisor.cancel_publication import _intent_outcome_fields
 
-        return _intent_outcome_fields(active_intent(_pool().DRIVE_ROOT, task_id) or {})
+        intent = active_intent(_pool().DRIVE_ROOT, task_id, strict=True)
+        if intent:
+            return _intent_outcome_fields(intent)
+        return {"cancel_origin": {"source": stop_source, "reason": reason}} if stop_source else {}
     except Exception:
-        log.debug("cancel origin unreadable for %s", task_id, exc_info=True)
+        log.warning("Stop cause of %s is unreadable; none recorded", task_id, exc_info=True)
         return {}
 
 
@@ -84,12 +83,21 @@ def _write_failure_result(
     task_id: str,
     reason: str = "Worker process crashed (crash storm). Task was not completed.",
     status: str = "",
+    stop_source: str = "",
 ) -> str:
     """Write failure result for a crashed/orphaned task.
 
     Returns the FINAL persisted status: if the task already reached a terminal
     state, the monotonic guard preserves it and that existing status is returned
     (so the UI event matches disk); otherwise the written failure status.
+
+    ``stop_source`` is the typed cause a known stop door passes (the owner's
+    Restart, a graceful server shutdown). It lands as ``cancel_origin`` — the
+    field a settled cancel intent records — and never outranks an earlier
+    stop: an active intent for the task is the cause as recorded (an owner
+    Stop stays a Stop), only a task no intent names takes the door's own
+    cause, and an unreadable intent store records none. A cancelled result
+    without a door source still retains its recorded intent (including Panic).
     """
     if not task_id:
         return ""
@@ -107,6 +115,8 @@ def _write_failure_result(
         # Reconstruct from durable llm_usage so an abnormally-finalized task does
         # not record zero cost/rounds (understating per-task + campaign metrics).
         f_cost_fields = _pool().reconstruct_task_cost(str(task_id), fields=True)
+        cause = (_recorded_cancel_fields(task_id, stop_source=stop_source, reason=reason)
+                 if stop_source or final_status == STATUS_CANCELLED else {})
         stored = write_task_result(
             _pool().DRIVE_ROOT,
             task_id,
@@ -121,7 +131,7 @@ def _write_failure_result(
                 review_trigger="worker_terminal",
             ),
             **f_cost_fields,
-            **(_recorded_cancel_fields(task_id) if final_status == STATUS_CANCELLED else {}),
+            **cause,
         )
         persisted_status = str((stored or {}).get("status") or "").strip()
         if (
@@ -520,13 +530,17 @@ def _record_worker_pids() -> None:
 
         for w in _pool().WORKERS.values():
             if w.proc.pid:
-                record_process(
+                was_alive = w.proc.is_alive()
+                record = record_process(
                     _pool().DRIVE_ROOT,
                     pid=int(w.proc.pid),
                     cmd=f"ouroboros-worker-{w.wid}",
                     purpose=f"worker:{w.wid}",
                     scope="session",
                 )
+                if was_alive and w.proc.is_alive() and not getattr(w, "process_birth", ""):
+                    fingerprint = record["fingerprint"]
+                    w.process_birth = fingerprint.get("start_time_boot") or fingerprint.get("start_time") or ""
     except Exception:
         log.debug("Failed to ledger worker pids", exc_info=True)
 

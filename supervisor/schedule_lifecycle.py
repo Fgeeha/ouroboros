@@ -12,6 +12,7 @@ second scheduler or a second store.
 from __future__ import annotations
 
 import logging
+import copy
 import pathlib
 import uuid
 from typing import Any, Dict, Optional
@@ -149,16 +150,16 @@ def _merge_onto_current(existing: Dict[str, Any], incoming: Dict[str, Any]) -> D
                 "a skill-manifest schedule is enabled by its skill's readiness; use the "
                 "disable/restore lifecycle action, which records the owner's decision so "
                 "the skill resync cannot undo it")
-        if _is_suppressed(merged):
-            merged["enabled"] = False
-    elif _is_suppressed(merged):
-        # A suppressed notify row stays off whatever its skill re-posts.
+    if _is_suppressed(merged) or merged.get("delete_requested_at"):
+        # A suppressed skill row, or a deleted row waiting only for work it
+        # already accepted: neither an edit nor a save re-arms future runs.
         merged["enabled"] = False
     return merged
 
 
 def upsert_scheduled_task(record: Dict[str, Any], *, drive_root: pathlib.Path | None = None,
                           actor: str = "", task_id: str = "", reason: str = "",
+                          host_followup: dict | None = None,
                           continuation_of: Optional[Dict[str, Any]] = None,
                           new_resource_intent: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Create or replace a scheduled task record.
@@ -181,6 +182,30 @@ def upsert_scheduled_task(record: Dict[str, Any], *, drive_root: pathlib.Path | 
         schedule_id = str(incoming.get("id") or "").strip() or uuid.uuid4().hex[:8]
         incoming["id"] = schedule_id
         existing = next((item for item in tasks if str(item.get("id") or "") == schedule_id), None)
+        from supervisor.followup_policy import HOST_FIELDS, origin_of, normalize_template, policy_view, control_guard
+        # Host-only keyword is never populated from a template or public payload.
+        for key in HOST_FIELDS:
+            incoming.pop(key, None)
+        if existing is not None:
+            for key in HOST_FIELDS:
+                if key in existing:
+                    incoming[key] = copy.deepcopy(existing[key])
+            if origin_of(existing):
+                incoming["followup_origin"] = origin_of(existing)
+        elif host_followup is not None:
+            incoming.update(copy.deepcopy(host_followup))
+        elif incoming.get("source") != "task_followup":
+            incoming["source"] = "owner"
+            incoming["followup_relation"] = {"kind": "independent", "revision": uuid.uuid4().hex}
+        elif origin_of(incoming):
+            # Normalization below drops template lineage; keep its provenance.
+            incoming["followup_origin"] = origin_of(incoming)
+        incoming["task"] = normalize_template(incoming)
+        if incoming.get("followup_origin"):
+            incoming["task"]["metadata"]["objective_author"] = {
+                "kind": "task", "task_id": incoming["followup_origin"]["task_id"]}
+        if existing is None and not (root / "state/owner_restart_no_resume.flag").exists():
+            incoming["followup_restart_seen"] = (data.get("followup_restart") or {}).get("control_id", "")
         if new_resource_intent is not None:
             # The producer may describe a NEW row. Editing an old followup cannot
             # turn absent intent into self-work; preserve its current evidence.
@@ -219,6 +244,11 @@ def upsert_scheduled_task(record: Dict[str, Any], *, drive_root: pathlib.Path | 
         incoming.setdefault("enabled", True)
         incoming.setdefault("created_at", utc_now_iso())
         incoming["updated_at"] = utc_now_iso()
+        with control_guard(root, incoming):
+            view = policy_view(root, data, incoming)
+            if view.get("hold"):
+                incoming["followup_hold"] = view["hold"]
+            incoming["followup_wait"] = view["wait"]
         if not incoming.get("next_run_at"):
             incoming["next_run_at"] = _schedule_next_run(incoming)
         tasks = [item for item in tasks if str(item.get("id") or "") != schedule_id]
@@ -234,7 +264,8 @@ def upsert_scheduled_task(record: Dict[str, Any], *, drive_root: pathlib.Path | 
 
 def mutate_scheduled_task(action: str, schedule_id: str, *, reason: str,
                           actor: str, task_id: str = "",
-                          drive_root: pathlib.Path | None = None) -> Dict[str, Any]:
+                          drive_root: pathlib.Path | None = None,
+                          expected_hold_id: str = "", relation: str = "") -> Dict[str, Any]:
     """Apply one owner-governed future-dispatch mutation, audited intent-first.
 
     Affects DISPATCH only: a task already admitted from this schedule keeps
@@ -252,6 +283,16 @@ def mutate_scheduled_task(action: str, schedule_id: str, *, reason: str,
         return {"ok": False, "changed": False, "status": "reason_required",
                 "schedule_id": wanted, "audit": "not_written"}
     root = pathlib.Path(drive_root or _store._queue().DRIVE_ROOT)
+    from supervisor.followup_policy import origin_of, policy_view, resolve_relation, restore_followup
+    resolved = None
+    if operation == "restore" and relation:
+        observed = next((r for r in load_schedule_store(root)["tasks"] if r.get("id") == wanted), {})
+        try:
+            origin = origin_of(observed)
+            resolved = (origin, resolve_relation(root, origin, relation, declared_by=task_id or actor))
+        except ValueError as exc:
+            return {"ok": False, "changed": False, "status": str(exc), "schedule_id": wanted,
+                    "audit": "not_written"}
     try:
         with schedule_transaction(root):
             try:
@@ -264,6 +305,12 @@ def mutate_scheduled_task(action: str, schedule_id: str, *, reason: str,
             if current is None:
                 return {"ok": False, "changed": False, "status": "not_found",
                         "schedule_id": wanted, "audit": "not_written"}
+            # An exact release request never becomes generic enable on replay,
+            # and a relationship decision only resolves an observed hold.
+            if operation == "restore" and (expected_hold_id or resolved or current.get("followup_hold") or
+                    (not _is_consumed_once(current) and policy_view(root, data, current).get("hold"))):
+                return restore_followup(root, data, current, expected_hold_id=expected_hold_id,
+                                        resolved=resolved, actor=actor, task_id=task_id, reason=reason)
             before = dict(current)
             from supervisor.schedule_occurrence import remember_claim_basis
 
@@ -279,61 +326,48 @@ def mutate_scheduled_task(action: str, schedule_id: str, *, reason: str,
                         "detail": "the schedule audit log could not be written; nothing was changed"}
             running = _store._schedule_running_or_queued(wanted, root)
             skill_row = str(current.get("source") or "") == "skill_manifest"
-            # A skill's notify row is re-posted by its key, so the owner's off
-            # switch needs the same durable marker a skill-manifest row keeps.
-            # The owner acts from Activity (`owner:gateway`) or through
-            # Ouroboros's manage_schedules at their word (`agent`) — both are
-            # the owner's hand here, as for a skill-manifest row; only the row's
-            # own source is the skill, and its cancel of its own row really
-            # removes it — nothing of the owner's is being overridden there.
-            notify_row = str(current.get("kind") or "") == _store.SCHEDULE_KIND_NOTIFY
-            owner_over_notify = notify_row and str(actor or "") != str(current.get("source") or "")
-            detail, removed, kept = "", False, False
+            detail, removed = "", False
             if operation == "disable":
                 current["enabled"] = False
-                if skill_row or owner_over_notify:
+                if skill_row:
                     current["manual_override"] = "disabled"
                 status = "updated"
             elif operation == "delete":
-                if owner_over_notify:
-                    # Delete means remove this schedule, whether armed, disabled or
-                    # already fired. Disable is the separate durable veto against
-                    # a skill re-posting the same key (owner decision 1A/2B).
-                    tasks = [item for item in tasks if str(item.get("id") or "") != wanted]
-                    status, removed = "deleted", True
-                elif notify_row and not owner_over_notify and _is_suppressed(current):
-                    # The skill cancelling a row the OWNER switched off: the marker
-                    # is the owner's, so the record stays untouched — otherwise
-                    # cancel plus a repeat of the same key would lift the owner's
-                    # decision. Reported as the suppression it is, and unchanged.
-                    status, kept = "suppressed", True
-                elif skill_row:
-                    # Manifest resync would recreate a deleted row, so retain
-                    # its owner-authored suppression instead.
+                if skill_row:
+                    # Retained as a suppressed record: dropping the row would only
+                    # have it recreated by the next lifecycle resync, and the owner
+                    # would never see that their delete did not hold.
                     current["enabled"] = False
                     current["manual_override"] = "deleted"
                     status = "suppressed"
                 else:
-                    from supervisor.schedule_occurrence import owed
+                    from supervisor.followup_policy import relation_kind
+                    from supervisor.schedule_occurrence import deletion_settled, owed
 
-                    status, owes = "deleted", owed(current)
-                    if owes is not False:
+                    status, owes = "deleted", owed(current, drive_root=root)
+                    continuation = relation_kind(current) != "independent"
+                    if owes is not False or not deletion_settled(current, drive_root=root):
                         # An accepted run waits to be re-queued: removal is deferred until it
                         # starts, because deleting a row never takes back an admission (#1315).
+                        # A continuation's row also carries its task's Stop/Restart release
+                        # and start binding, so it stays until that task settles.
                         current["enabled"], current["delete_requested_at"] = False, utc_now_iso()
-                        detail = "an accepted run of this schedule is still owed; the row goes once that run starts"
+                        status = "delete_deferred"
+                        if owes is None:
+                            detail = ("the occurrence receipt is missing, unreadable or conflicting; the disabled "
+                                      "row is retained until its execution history can be established")
+                        elif owes:
+                            detail = ("an accepted run is still owed; the row will be removed once that run starts"
+                                      + (" and its task settles" if continuation else ""))
+                        else:
+                            detail = ("no new run starts; this row continues a task that has not settled "
+                                      "and is removed once it settles")
                     else:
                         tasks = [item for item in tasks if str(item.get("id") or "") != wanted]
                         removed = True
             elif _is_consumed_once(current):
                 status = "consumed_not_rearmed"
                 detail = "a one-shot that already fired is history; schedule a new run_at instead"
-            elif notify_row:
-                # Nothing to probe: a reminder has no skill readiness, so restore
-                # is the owner lifting their own marker and re-arming the row.
-                current.pop("manual_override", None)
-                current["enabled"] = True
-                status = "updated"
             elif skill_row:
                 # Probed UNDER the transaction: readiness is skill state on disk,
                 # not a row field, so a probe taken before the lock could be
@@ -366,10 +400,12 @@ def mutate_scheduled_task(action: str, schedule_id: str, *, reason: str,
                     if not dispatchable:
                         status, detail = "restored_not_ready", blocker
             else:
+                # A new explicit Restore may cancel a still-pending deletion;
+                # exact hold releases return above and never change this intent.
                 current["enabled"] = True
-                current.pop("delete_requested_at", None)  # restoring withdraws a deferred delete
+                current.pop("delete_requested_at", None)
                 status = "updated"
-            changed = status not in UNCHANGED_STATUSES and not kept
+            changed = status not in UNCHANGED_STATUSES
             if changed:
                 if not removed:
                     current["updated_at"] = utc_now_iso()
@@ -378,7 +414,7 @@ def mutate_scheduled_task(action: str, schedule_id: str, *, reason: str,
             recorded = _audit_schedule_mutation(
                 phase="outcome", result=status, before=before,
                 after=(None if removed else current), **audit)
-            achieved = status in {"updated", "deleted", "suppressed"}
+            achieved = status in {"updated", "deleted", "delete_deferred", "suppressed"}
             if changed and not recorded:
                 # Keep the lifecycle blocker beside the audit disclosure: a lost
                 # outcome record must not erase WHY the row is still not ready.
@@ -411,4 +447,3 @@ def remove_scheduled_task(schedule_id: str, *, drive_root: pathlib.Path | None =
         actor=str(actor or "").strip() or "host",
         reason=str(reason or "").strip() or "schedule_removed")
     return bool(outcome.get("changed"))
-

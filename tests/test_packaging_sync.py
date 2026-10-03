@@ -178,7 +178,8 @@ def test_readme_prioritizes_macos_dmg_install_and_model_access():
     assert "Ouroboros-<version>.dmg" in readme
     assert "drag `Ouroboros.app` onto the **Applications** shortcut" in readme
     assert 'src="assets/install-macos.png"' in readme
-    assert "at least one supported remote provider API key or a local GGUF model" in readme
+    assert "Codex account as the Main model source" in readme
+    assert "supported remote provider API key, or use a local GGUF model" in readme
     assert "https://ouroboros-agent.ai/install/#linux" in readme
     assert (
         "badges%2Fdownloads.json)](https://ouroboros-agent.ai/install/)"
@@ -203,7 +204,8 @@ def test_install_page_matches_macos_quick_start_and_model_prerequisite():
     assert macos_section.count("<li>") == 3
     assert "Applications</strong> shortcut" in install_page
     assert 'src="/assets/install-macos.png?v=' in install_page
-    assert "at least one supported remote provider API key or a local GGUF model" in install_page
+    assert "Codex account as the Main model source" in install_page
+    assert "supported remote provider API key, or use a local GGUF model" in install_page
     assert "Normal installation does not require cloning the repository, Python, or uv" in install_page
     assert "verification evidence, not additional installers" in install_page
     assert install_page.index("platform-downloads") < install_page.index(

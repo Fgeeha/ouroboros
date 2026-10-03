@@ -84,6 +84,7 @@ def test_tool_descriptor_owner_facades_preserve_identity():
         ("browser_state", "factory:BrowserState"),
         ("event_queue", None),
         ("task_id", None),
+        ("task_lifecycle_bound", False),
         ("messages", None),
         ("_execution_trace", None),
         ("task_constraint", None),

@@ -18,6 +18,8 @@ def test_configured_readonly_session_receives_own_scope_and_real_lineage_inputs(
     from tests.test_delegated_skill_payload import _payload_ctx, _StartStub
 
     ctx = _payload_ctx(tmp_path, monkeypatch)
+    from ouroboros.task_results import write_task_result
+    write_task_result(ctx.drive_root, ctx.task_id, "running", root_task_id=ctx.task_id)
     ctx.task_metadata.update(resource_intent={"kind": "explicit_none"}, parent_task_id="parent")
     parent = tmp_path / "data/task_drives/parent"
     parent.mkdir(parents=True)
@@ -65,7 +67,7 @@ def test_readonly_input_scan_failure_and_symlink_refuse_before_engine(tmp_path, 
     assert list(outside.iterdir()) == []
 
 
-def test_restored_claim_missing_receipt_and_delete_preserve_unknown(q, monkeypatch):  # noqa: F811
+def test_restored_unstarted_claim_recovers_and_delete_preserves_accepted_work(q, monkeypatch):  # noqa: F811
     from supervisor import schedule_occurrence as occurrence
 
     _row(q, intent={"kind": "system_repo"})
@@ -74,12 +76,12 @@ def test_restored_claim_missing_receipt_and_delete_preserve_unknown(q, monkeypat
     with pytest.raises(RuntimeError):
         q.queue.check_scheduled_tasks()
     claimed = copy.deepcopy(_rows(q)["s1"]["occurrence"])
-    occurrence._FRESH_CLAIMS.clear()  # fresh process: no local proof of no admission
     monkeypatch.setattr(occurrence, "prepare", real_prepare)
     q.queue.check_scheduled_tasks()
-    assert not q.pending and _rows(q)["s1"]["hold"]["reason"] == "occurrence_evidence_missing"
-    q.queue.mutate_scheduled_task("delete", "s1", reason="owner", actor="owner")
-    assert _rows(q)["s1"]["occurrence"] == claimed
+    assert [task["id"] for task in q.pending] == [claimed["task_id"]]
+    outcome = q.queue.mutate_scheduled_task("delete", "s1", reason="owner", actor="owner")
+    assert outcome["status"] == "delete_deferred"
+    assert _rows(q)["s1"]["occurrence"]["token"] == claimed["token"]
 
 
 def test_late_owner_hold_survives_republish_and_cannot_dispatch(q):  # noqa: F811
@@ -132,7 +134,9 @@ def test_wait_end_and_late_accounting_failure_settle_once(tmp_path):
     _, logs = _call(registry, tmp_path, timeout=0.05)
     release.set()
     deadline = time.monotonic() + 3
-    while time.monotonic() < deadline and len(tool_rows(logs / "tools.jsonl")) < 3:
+    # The settlement callback appends the durable row, THEN publishes its live frame: await both.
+    while time.monotonic() < deadline and (len(tool_rows(logs / "tools.jsonl")) < 3
+                                           or not any(frame.get("type") == "tool_call" for frame in registry.frames)):
         time.sleep(0.01)
     rows = tool_rows(logs / "tools.jsonl")
     assert [row["type"] for row in rows] == ["tool_call_started", "tool_call_timeout", "tool_call"]

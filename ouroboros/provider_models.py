@@ -6,6 +6,8 @@ deep_self_review.py)."""
 from __future__ import annotations
 
 
+from typing import Any, Mapping
+
 from ouroboros.model_slots import ResolvedModelTarget, parse_fallback_chain
 from ouroboros.settings_defaults import OPENROUTER_DEFAULTS, OPENROUTER_REVIEW_DEFAULTS, SETTINGS_DEFAULTS  # noqa: F401
 from ouroboros.settings_integrity import runtime_setting
@@ -240,11 +242,13 @@ def resolve_model_target(
     )
 
 
-def fallback_candidate_targets(active_model: str = "") -> tuple[ResolvedModelTarget, ...]:
+def fallback_candidate_targets(active_model: str = "", *, preserve_slots: bool = False) -> tuple[ResolvedModelTarget, ...]:
     """The cross-model fallback candidate ladder as typed targets (ABI-4).
 
     Same membership and order as ``model_slots.get_fallback_models`` — a typed
-    view over the ONE chain SSOT, not a second resolver. Effort stays the ""
+    view over the ONE chain SSOT, not a second resolver. ``preserve_slots`` keeps
+    repeated model ids so callers can compare their distinct configured account bindings.
+    Effort stays the ""
     sentinel: the ladder resolves destinations, the dispatching round owns the
     active effort. ``provider_route`` stays the ``""`` sentinel DELIBERATELY:
     the chain's local-vs-remote dispatch lane is the loop's single global
@@ -252,11 +256,11 @@ def fallback_candidate_targets(active_model: str = "") -> tuple[ResolvedModelTar
     through the ABI-4 sweep), so a per-candidate route here would be a
     fabricated fact no dispatcher consumes.
     """
-    from ouroboros.model_slots import get_fallback_models
+    from ouroboros.model_slots import get_fallback_models, parse_fallback_chain
 
     return tuple(
         ResolvedModelTarget(model_id=model, provider_route="")
-        for model in get_fallback_models(active_model)
+        for model in (parse_fallback_chain() if preserve_slots else get_fallback_models(active_model))
     )
 
 
@@ -613,6 +617,34 @@ def migrate_model_value(provider: str, value: str) -> str:
             return f"zai::{text[len('zai/'):]}"
         return text
     return text
+
+
+# Every credential that gives an install a remote route other than the
+# OpenAI-compatible endpoint (the direct providers, OpenRouter, the legacy base).
+_NON_COMPATIBLE_REMOTE_KEYS = (
+    "OPENROUTER_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "MINIMAX_API_KEY",
+    "DEEPSEEK_API_KEY", "ZAI_API_KEY", "CLOUDRU_FOUNDATION_MODELS_API_KEY", "GIGACHAT_CREDENTIALS",
+)
+
+
+def compatible_only_main_model(settings: Mapping[str, Any]) -> str:
+    """Main's exact ``openai-compatible::`` route when that endpoint is the install's
+    ONLY remote provider, else ''.
+
+    #1116: the shipped reviewer defaults are OpenRouter ids such an install cannot
+    reach, and the direct-provider remap deliberately excludes the compatible
+    endpoint. Review defaults then use the one model this install demonstrably
+    pays for — never a guessed id from another provider (less diversity, disclosed).
+    """
+    def text(key: str) -> str:
+        return str(settings.get(key) or "").strip()
+
+    if not text("OPENAI_COMPATIBLE_BASE_URL") or any(text(key) for key in _NON_COMPATIBLE_REMOTE_KEYS):
+        return ""
+    if text("GIGACHAT_USER") and text("GIGACHAT_PASSWORD"):
+        return ""
+    main = text("OUROBOROS_MODEL")
+    return main if main.startswith("openai-compatible::") else ""
 
 
 def compute_direct_review_models_fallback(

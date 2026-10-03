@@ -146,7 +146,7 @@ def test_child_reads_its_headless_roots_artifact_named_and_inferred(geometry):
 
 # --- nothing outside the lineage, and no drive x id cross-product ----------------
 
-def test_sibling_stranger_and_cross_paired_headless_files_stay_refused(geometry):
+def test_named_task_roots_stay_strict_but_canonical_runtime_reads_other_tasks(geometry):
     registry, ctx = child_registry(geometry)
 
     for root, path, secret in (
@@ -156,7 +156,7 @@ def test_sibling_stranger_and_cross_paired_headless_files_stay_refused(geometry)
     ):
         named, inferred = _reads(registry, root, path)
         assert secret not in named and f"outside selected root={root}" in named, named
-        assert secret not in inferred and "outside selected root=active_workspace" in inferred, inferred
+        assert secret in inferred and "runtime_data:" in inferred, inferred
         assert lineage_read_base(ctx, root, path) is None
 
 
@@ -165,8 +165,9 @@ def test_a_symlink_inside_the_parents_headless_drive_does_not_escape(geometry):
     link = geometry.parent_brief.parent / "escape"
     _symlink_or_skip(link, geometry.sibling_notes.parent)
 
-    for out in _reads(registry, "task_drive", link / "notes.txt"):
-        assert "SIBLING_BYTES" not in out and "outside selected root" in out, out
+    named, inferred = _reads(registry, "task_drive", link / "notes.txt")
+    assert "SIBLING_BYTES" not in named and "outside selected root" in named, named
+    assert "SIBLING_BYTES" in inferred and "runtime_data:" in inferred, inferred
 
 
 @pytest.mark.parametrize("linked", ["task_drive", "headless_drive"])

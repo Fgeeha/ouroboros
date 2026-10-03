@@ -241,7 +241,8 @@ def review_wave_budget_gate(
     dispatched whole; one that does not is refused before any seat spends.
     Fail-open on any error/unknown."""
     try:
-        from ouroboros.usage_accounting import current_usage_scope, review_wave_admission
+        from ouroboros.usage_accounting import current_usage_scope
+        from ouroboros.usage_admission import review_wave_admission
 
         scope = current_usage_scope()
         if scope is None or not scope.root_task_id:
@@ -254,6 +255,7 @@ def review_wave_budget_gate(
             max_completion_tokens=max_completion_tokens,
             task_id=str(scope.task_id or ""),
             root_limit_usd=scope.root_limit_usd,
+            root_limit_source=scope.root_limit_source,
             global_limit_usd=scope.global_limit_usd,
             categories=categories,
             slot_ids=slot_ids,
