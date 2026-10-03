@@ -324,6 +324,65 @@ class TestPartialWritesAndRetry:
 
 
 class TestRestartRecovery:
+    def test_startup_keeps_paused_synthesis_on_its_existing_resume_path(self, tmp_path, monkeypatch):
+        from ouroboros import agent_task_pipeline as pipeline, post_task_synthesis
+        from supervisor import owner_pause_control
+
+        _store(tmp_path, phase="paused")
+        calls = []
+        monkeypatch.setattr(post_task_synthesis, "revoke_late_phase_grant",
+                            lambda root, tid, **kw: calls.append(("revoke", tid, kw["reason"])))
+        monkeypatch.setattr(owner_pause_control, "retain_late_phase_latch",
+                            lambda root, tid: calls.append(("retain", tid)))
+        monkeypatch.setattr(pipeline, "_settle_terminal_projection",
+                            lambda *_a, **_kw: pytest.fail("paused synthesis has not settled"))
+        monkeypatch.setattr(pipeline, "_run_post_task_processing_async",
+                            lambda *_a, **_kw: pytest.fail("Pause needs an explicit Resume"))
+        assert pipeline.recover_pending_root_post_task_synthesis(tmp_path) == 0
+        assert calls == [("revoke", "root-1", "restart_no_resume"), ("retain", "root-1")]
+
+    @pytest.mark.parametrize("ready", [False, True])
+    def test_startup_selects_publication_debt_before_mail_capture(self, project_root, monkeypatch, ready):
+        from ouroboros import agent_task_pipeline as pipeline, task_custody
+        from ouroboros.task_result_schema import stamp_task_result_schema
+
+        _store(project_root.root, phase="completed", chat_id=project_root.project["chat_id"])
+        if ready:
+            stored = load_task_result(project_root.root, "root-1")
+            append_terminal_task_projection(project_root.root, "root-1", project_root.task, stored, DONE)
+        # Historical terminals, retired publication obligations and children
+        # share the startup scan but owe no Project/Main publication work.
+        folder = project_root.root / "task_results"
+        for index in range(64):
+            tid = f"history-{index}"
+            row = {"task_id": tid, "status": "completed"}
+            if index % 3 == 1:
+                row.update(canonical_terminal_projection_origin="terminal_transition",
+                           canonical_terminal_projection={"main_disposition": "owed"})
+            elif index % 3 == 2:
+                row.update(parent_task_id="root-1", root_task_id="root-1",
+                           canonical_terminal_projection_origin="terminal_transition")
+            (folder / f"{tid}.json").write_text(json.dumps(stamp_task_result_schema(row)), encoding="utf-8")
+        calls = []
+        for name in ("capture_unread_mail", "capture_owner_mail"):
+            original = getattr(task_custody, name)
+
+            def capture(root, tid, *args, _name=name, _original=original, **kwargs):
+                calls.append((_name, tid))
+                return _original(root, tid, *args, **kwargs)
+
+            monkeypatch.setattr(task_custody, name, capture)
+        monkeypatch.setattr(pipeline, "_run_post_task_processing_async",
+                            lambda *_a, **_kw: pytest.fail("publication buys no cognition"))
+
+        assert pipeline.recover_pending_root_post_task_synthesis(project_root.root) == 0
+        assert calls and {tid for _name, tid in calls} == {"root-1"}
+        assert len(_project_rows(project_root.root, "root-1")) == len(project_root.queued) == 1
+        assert load_task_result(project_root.root, "root-1")["canonical_terminal_projection_ready"] is None
+        calls.clear()
+        assert pipeline.recover_pending_root_post_task_synthesis(project_root.root) == 0
+        assert calls == []
+
     def test_the_existing_scan_retries_an_owed_terminal_row_without_paid_cognition(
         self, project_root, monkeypatch,
     ):

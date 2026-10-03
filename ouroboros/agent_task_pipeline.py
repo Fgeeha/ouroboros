@@ -400,6 +400,7 @@ def recover_pending_root_post_task_synthesis(
     from types import SimpleNamespace
     from ouroboros.post_task_synthesis import resume_paused_late_phase, revoke_late_phase_grant
     from ouroboros.task_results import list_task_results
+    from ouroboros.terminal_projection import terminal_projection_owed
 
     root = pathlib.Path(drive_root).resolve(strict=False)
     if resume_task_id:
@@ -424,7 +425,8 @@ def recover_pending_root_post_task_synthesis(
             # established last pass. Replaying it here is pure bookkeeping on this
             # existing startup scan: no model call, no new timer, no new store. It is not
             # counted as a recovered synthesis, which is what this number means.
-            _settle_terminal_projection(root, task_id, task={**stored, "id": task_id})
+            if terminal_projection_owed(task_id, stored):
+                _settle_terminal_projection(root, task_id, task={**stored, "id": task_id})
             continue
         if phase == "paused":
             try:

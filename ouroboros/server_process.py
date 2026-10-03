@@ -1,6 +1,6 @@
 """Facts one server process shares with every server leaf.
 
-The drive root it was launched against, the ``server`` logger every server
+The drive root and source baseline it was launched against, the ``server`` logger every server
 module writes to, and the restart-request signals plus the setter that raises
 them, and the two uvicorn shapes that decide who owns the process signals
 (``_SignalStopServer`` for the main server, ``_embedded_uvicorn_server`` for a server
@@ -52,6 +52,28 @@ _owner_restart_requested = threading.Event()
 _applied_restart_settings: dict = {}
 _applied_server_host_source = "unknown"
 _applied_settings_lock = threading.Lock()
+_source_baseline: str | None = None
+
+
+def capture_server_source_baseline(repo_dir: pathlib.Path) -> str:
+    """Capture this server generation's source before startup can change the checkout.
+
+    This is the startup baseline, not a claim about every lazy/hot-loaded module.
+    An unreadable initial identity stays unknown; later disk HEAD cannot replace it.
+    """
+    from ouroboros.gateway.state import _git_checkout_identity
+
+    global _source_baseline
+    with _applied_settings_lock:
+        if _source_baseline is None:
+            _source_baseline = _git_checkout_identity(repo_dir)[1]
+        return _source_baseline
+
+
+def server_source_baseline() -> str:
+    """Read the captured source, never infer adoption from mutable checkout state."""
+    with _applied_settings_lock:
+        return _source_baseline or ""
 
 
 def record_applied_restart_settings(values: dict, *, server_host_source: str | None = None) -> None:

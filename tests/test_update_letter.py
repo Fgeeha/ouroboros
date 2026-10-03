@@ -507,21 +507,22 @@ def test_refresh_writes_record_and_keeps_last_good_on_failure(tmp_path, monkeypa
     record = ul.refresh_after_check(_status(), drive_root=drive)
     assert record["state"] == "ready" and ul.read_record(drive)["text"] == "first letter"
 
-    failed = dict(ready, state="failed", text="", error_kind="timeout", written_at="t2")
+    failed = dict(ready, key=ul._key_from_status(_status(latest_sha="c" * 40)),
+                  state="failed", text="", error_kind="timeout", written_at="t2")
     monkeypatch.setattr(ul, "write_letter", lambda status, material, **k: dict(failed))
-    record = ul.refresh_after_check(_status(), drive_root=drive)
+    record = ul.refresh_after_check(_status(latest_sha="c" * 40), drive_root=drive)
     assert record["state"] == "failed" and record["last_good"]["text"] == "first letter"
     stored = json.loads(ul.record_path(drive).read_text())
     assert stored["last_good"]["text"] == "first letter"
 
     # An applied update (available=False) leaves the letter untouched.
-    kept = ul.refresh_after_check(_status(available=False), drive_root=drive)
+    kept = ul.refresh_after_check(_status(available=False, latest_sha="a" * 40), drive_root=drive)
     assert kept["last_good"]["text"] == "first letter"
 
     # A newer target whose letter fails still carries the older good letter (D-KEEP).
-    moved = dict(failed, key=ul._key_from_status(_status(latest_sha="c" * 40)), target_version="6.115.0")
+    moved = dict(failed, key=ul._key_from_status(_status(latest_sha="d" * 40)), target_version="6.115.0")
     monkeypatch.setattr(ul, "write_letter", lambda status, material, **k: dict(moved))
-    record = ul.refresh_after_check(_status(latest_sha="c" * 40), drive_root=drive)
+    record = ul.refresh_after_check(_status(latest_sha="d" * 40), drive_root=drive)
     assert record["last_good"]["text"] == "first letter"
     view = ul.project_letter(record, head_sha="a" * 40, latest_sha="c" * 40)
     assert view["text"] == "first letter" and view["target_version"] == "6.114.0"
@@ -537,7 +538,7 @@ def test_refresh_records_a_typed_failure_when_the_range_cannot_be_read(tmp_path,
                         lambda *a, **k: (_ for _ in ()).throw(ul.MaterialUnavailable("git log failed (rc=128)")))
     monkeypatch.setattr(ul, "write_letter",
                         lambda *a, **k: (_ for _ in ()).throw(AssertionError("no model call without material")))
-    record = ul.refresh_after_check(_status(), drive_root=drive)
+    record = ul.refresh_after_check(_status(latest_sha="c" * 40), drive_root=drive)
     assert record["state"] == "failed" and record["error_kind"] == "material_unavailable"
     assert "git log failed" in record["error_text"]
     # D-KEEP: the previous good letter survives an unreadable range.
@@ -555,11 +556,11 @@ def test_mark_checked_takes_the_same_lock_as_the_writer(tmp_path, monkeypatch):
     monkeypatch.setattr(ul, "_default_git", lambda: (lambda argv: (0, "6.114.0", "")))
     assert ul._REFRESH_LOCK.acquire(blocking=False)
     try:
-        assert ul.refresh_after_check(_status(available=False), drive_root=drive) is None
+        assert ul.refresh_after_check(_status(available=False, latest_sha="a" * 40), drive_root=drive) is None
         assert not ul.record_path(drive).exists(), "the letterless mark must not bypass the lock"
     finally:
         ul._REFRESH_LOCK.release()
-    assert ul.refresh_after_check(_status(available=False), drive_root=drive)["state"] == "none"
+    assert ul.refresh_after_check(_status(available=False, latest_sha="a" * 40), drive_root=drive)["state"] == "none"
 
 
 def test_refresh_is_single_flight(tmp_path, monkeypatch):

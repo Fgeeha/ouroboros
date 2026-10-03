@@ -313,6 +313,25 @@ def settle_terminal_projection(drive_root: Any, task_id: str, *, task: dict | No
         return SETTLEMENT_DEFERRED
 
 
+def terminal_projection_owed(task_id: str, row: dict) -> bool:
+    """Select publication debt, including readiness already recorded before a crash.
+
+    Both recovery scans use this before entering the writer's mailbox capture.
+    Open synthesis still owns its continuation; this predicate never settles it.
+    """
+    if not row or not _settled(row):
+        return False
+    ready = row.get("canonical_terminal_projection_ready")
+    if (not isinstance(ready, dict)
+            and row.get("canonical_terminal_projection_origin") != "terminal_transition"):
+        return False
+    marker = row.get("canonical_terminal_projection")
+    if isinstance(marker, dict) and not isinstance(ready, dict):
+        if "attempt" not in marker or marker["attempt"] == _attempt(row):
+            return False
+    return _lineage(task_id, row)["is_root_task"] and not _open(row)
+
+
 def reconcile_terminal_projections(drive_root: Any) -> int:
     """Discover the terminal-write/readiness-write crash gap on the existing pass.
 
@@ -326,19 +345,8 @@ def reconcile_terminal_projections(drive_root: Any) -> int:
     for path in sorted(task_results_dir(drive_root, create=False).glob("*.json")):
         try:
             row = load_task_result(drive_root, path.stem, strict=True)
-            if not row or not _settled(row):
-                continue
-            ready = row.get("canonical_terminal_projection_ready")
-            if (not isinstance(ready, dict)
-                    and row.get("canonical_terminal_projection_origin") != "terminal_transition"):
-                continue
-            marker = row.get("canonical_terminal_projection")
-            if isinstance(marker, dict) and not isinstance(ready, dict):
-                if "attempt" not in marker or marker["attempt"] == _attempt(row):
-                    continue
-            tid = row["task_id"]
-            if _lineage(tid, row)["is_root_task"] and not _open(row):
-                settled += settle_terminal_projection(drive_root, tid) == SETTLEMENT_SETTLED
+            if terminal_projection_owed(path.stem, row):
+                settled += settle_terminal_projection(drive_root, row["task_id"]) == SETTLEMENT_SETTLED
         except Exception:
             log.warning("Terminal projection reconciliation deferred for %s", path, exc_info=True)
     return settled

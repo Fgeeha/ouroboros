@@ -94,12 +94,9 @@ def _refresh_costs(root: pathlib.Path, owners: set[str], recovery_tasks: dict) -
                 root, task_id, current, breakdown=breakdown, canonical_only=True)
             if outcome == "equal":
                 authority_path = str(current.get("budget_drive_root") or root)
-                # Unknown/non-final prices are still compared each pass. Neither
-                # equality nor a False refresh response confirms their finality.
-                if (fields.get("cost_final") is True
-                        and fields.get("accounted_upper_bound_usd") is not None
-                        and not fields.get("unknown_unmetered")
-                        and not fields.get("non_final_rows")
+                # Equality proves only that these exact inputs need no rewrite;
+                # unknown/non-final cost stays so, and recovery runs independently.
+                if (fields.get("accounted_upper_bound_usd") is not None
                         and not breakdown.get("integrity_degraded")
                         and (not scopes[0] or fields.get("accounted_upper_bound_usd_with_children") is not None)
                         and pathlib.Path(authority_path).resolve() == root

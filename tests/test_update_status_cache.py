@@ -10,6 +10,7 @@ LATEST = "b" * 40
 
 def _wire(monkeypatch, *, cache_channel="stable", cache_ref="refs/ouroboros-managed/tags/v6.87.5", ancestor=False):
     import ouroboros.update_channels as update_channels
+    monkeypatch.setattr("ouroboros.server_process.server_source_baseline", lambda: CURRENT)
 
     monkeypatch.setattr(update_channels, "get_update_channel", lambda settings=None: "stable")
     monkeypatch.setattr(git_ops, "_read_managed_repo_meta", lambda: {"managed_remote_name": "managed"})
@@ -131,6 +132,7 @@ def test_passive_status_exposes_cache_checked_at_without_from_cache(monkeypatch)
     _wire(monkeypatch, ancestor=True)  # consumed target: overlay must not fire
     state = git_ops.compute_managed_update_status(fetch=False)
     assert state["checked_at"] == "2026-08-03T00:00:00Z"
+    assert state["checked_target_sha"] == LATEST
     assert not state.get("from_cache")
     assert not state.get("available")
 

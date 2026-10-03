@@ -736,8 +736,10 @@ def _iter_process_records(drive_root: pathlib.Path | None = None) -> list[tuple[
             roots.append(state_dir)
         try:
             state_root = pathlib.Path(drive_root).resolve(strict=False) / "state"
-            if state_root.exists():
-                roots.extend(path for path in state_root.rglob(_PROCESS_STATE_DIR) if path.is_dir())
+            # Match named directory symlinks, but never descend through them.
+            roots.extend(pathlib.Path(parent) / _PROCESS_STATE_DIR
+                         for parent, dirs, _files in os.walk(state_root)
+                         if _PROCESS_STATE_DIR in dirs)
         except Exception:
             pass
     with _STATE_LOCK:

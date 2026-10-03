@@ -142,9 +142,7 @@ Every `/api/files/*` operation resolves its requested path and refuses the opera
 | POST | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/notify` | `gateway.host_notify._api_notify` (`notify_owner` grant: one signed `skill_notice` System row in the owner's chat; no model turn) |
 | WS | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/events` | `gateway.host_service._ws_events` |
 
-Rationale: `server.py` owns process startup/lifespan/static mounting, while `gateway/*` owns browser-facing HTTP/WS contracts; this keeps UI and runtime coupling explicit and testable.
-
-
+`server.py` owns startup/lifespan/static files; `gateway/*` owns HTTP/WS. Update status, log-tail and schedule-list reads run off-loop; passive status generates no letter.
 
 Cancel accepts optional `cascade`, `stop_policy` and `stop_action_id` (≤200 characters). Reuse identity for the same action after uncertain response; later Stop uses a new ID. Legacy omission keeps existing ingress semantics without exact replay assurance.
 

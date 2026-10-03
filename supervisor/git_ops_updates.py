@@ -280,6 +280,9 @@ def compute_managed_update_status(fetch: bool = False) -> Dict[str, Any]:
                 # date, checked N ago" over a check whose availability can no
                 # longer be validated (final-review finding, 2026-08-31).
                 state["checked_at"] = str(cache.get("checked_at") or "")
+                # A consumed checkout target still matters to a server generation
+                # that has not restarted. Keep this fact separate from availability.
+                state["checked_target_sha"] = cached_sha
             # Availability is recomputed against the cached official tip on
             # every passive read (NOT read off the cached "available" flag):
             # a HEAD that moved after the check — e.g. a rollback below a
@@ -345,6 +348,7 @@ def compute_managed_update_status(fetch: bool = False) -> Dict[str, Any]:
         # read present the failure as a verified "up to date" (wave-2 review
         # finding, 2026-08-31).
         return state
+    state["checked_target_sha"] = latest_sha
     try:
         from supervisor.state import update_state
         snapshot = {

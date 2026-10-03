@@ -7,12 +7,7 @@ import pytest
 
 
 def _stop_restart_watcher(server):
-    """Stop the restart watcher ``server.main()`` starts (an unnamed daemon polling
-    ``_restart_requested`` on a 0.5 s ``time.sleep``). Its only stop seam is the flag it polls,
-    so a test that returns from ``main()`` with the flag clear — or clears it before the next
-    poll — leaves the poller running on the xdist worker for good (the ``sleeps`` polluter
-    tests/test_delegate_hold.py pinned around). Raise the flag, join, then restore it."""
-    server._restart_requested.set()
+    """Ordinary server return retires its watcher without inventing a restart."""
     for thread in threading.enumerate():
         if thread.name.endswith("(_check_restart)"):
             thread.join(timeout=5)
@@ -474,9 +469,6 @@ def test_main_graceful_restart_cleanup_avoids_port_sweep(monkeypatch, tmp_path):
             server._restart_requested.set()
             return None
 
-    class ExitCalled(RuntimeError):
-        pass
-
     monkeypatch.setattr(server, "load_settings", lambda: {"OUROBOROS_SERVER_HOST": "127.0.0.1"})
     monkeypatch.setattr(server, "parse_server_args", lambda *_a, **_k: SimpleNamespace(host="127.0.0.1", port=0, host_explicit=False))
     monkeypatch.setattr(server, "DATA_DIR", tmp_path)
@@ -489,18 +481,18 @@ def test_main_graceful_restart_cleanup_avoids_port_sweep(monkeypatch, tmp_path):
     monkeypatch.setattr(server, "_SignalStopServer", FakeServer)  # the main() server seam (#1142)
     monkeypatch.setattr(server, "_LAUNCHER_MANAGED", True)
     monkeypatch.setattr(server, "_emergency_process_cleanup", lambda **kw: cleanup_calls.append(kw))
-    monkeypatch.setattr(server.os, "_exit", lambda code: (_ for _ in ()).throw(ExitCalled(code)))
+    exits = []
+    monkeypatch.setattr(server.os, "_exit", exits.append)
     monkeypatch.setattr(server, "_event_loop", None)  # the watcher's close_all_ws hop needs no loop here
     server._restart_requested.clear()
 
     try:
         server.main()
-    except ExitCalled:
-        pass
     finally:
         _stop_restart_watcher(server)
 
     assert cleanup_calls == [{"port_sweep": False}]
+    assert exits == [server.RESTART_EXIT_CODE]
 
 
 def test_emergency_cleanup_kills_services_without_log_finalization(monkeypatch):
