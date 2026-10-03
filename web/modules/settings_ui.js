@@ -4,6 +4,7 @@ import { renderAgentAccountsSection, renderAgentsServiceBanner } from './harness
 import { renderReviewerSlotsSection } from './reviewer_slots.js';
 import { renderSubagentsSection } from './subagents_settings.js';
 import { modelRolesHost } from './model_roles.js';
+import { bindSecretReveal } from './settings_secrets.js';
 
 // Reads as a sequence: keys → secrets → which API models → who among the agents
 // does what → behavior → technical. "Agents", not "Coding agents" (D-10): the
@@ -1103,12 +1104,18 @@ export function bindSecretInputs(root) {
     });
 
     root.querySelectorAll('.secret-toggle').forEach((button) => {
-        button.addEventListener('click', () => {
-            const target = root.querySelector(`#${button.dataset.target}`);
-            if (!target) return;
-            const nextType = target.type === 'password' ? 'text' : 'password';
-            target.type = nextType;
-            button.textContent = nextType === 'password' ? 'Show' : 'Hide';
+        const input = root.querySelector(`#${button.dataset.target}`);
+        if (!input) return;
+        const customRow = input.closest('[data-custom-secret-row]');
+        const keyInput = customRow?.querySelector('[data-custom-secret-key]');
+        bindSecretReveal(input, button, {
+            savedSelector: () => {
+                const key = customRow?.dataset.originalKey || input.dataset.secretSetting;
+                return key ? { key } : null;
+            },
+            savedLabel: () => keyInput && keyInput.value.trim().toUpperCase() !== customRow.dataset.originalKey
+                ? `Saved value for ${customRow.dataset.originalKey}` : '',
+            identityInputs: keyInput ? [keyInput] : [],
         });
     });
 

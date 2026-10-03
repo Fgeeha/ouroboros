@@ -37,6 +37,10 @@ systemctl --user restart ouroboros
 systemctl --user status ouroboros
 ```
 
+After Panic, automatic startup and manual `systemctl --user start` or `restart`
+leave Ouroboros stopped; the journal reports "Ouroboros is stopped. Use Start to resume."
+Resume explicitly through the desktop entry or `ouroboros run --start ...`.
+
 To start it automatically with the user session:
 
 ```bash
@@ -90,6 +94,12 @@ started by the unit, including the launcher, server, and workers.
 in-flight tool call will finish. It is the upper bound systemd waits before
 escalating to `SIGKILL` while remaining cgroup processes follow their own
 shutdown paths.
+
+This also stops a shared Claudexor daemon if it was spawned inside this unit's
+cgroup, even if it started a separate process session; other clients using that
+daemon lose it too. A daemon already running outside the unit is unaffected.
+Use the ordinary desktop launch path when the daemon must survive an Ouroboros
+service stop.
 
 ## Why this is a user unit
 
