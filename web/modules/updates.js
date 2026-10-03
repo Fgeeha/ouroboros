@@ -251,17 +251,17 @@ export function updateVerdict(data = {}, phase = '') {
 // offering, and the backend hands it to the client inside the ordinary status
 // payload as the additive `letter` key. It is never deleted once the update
 // lands: the same text, relabelled, becomes "What changed in this version".
-// The letter is a fact, never an action — it adds no button and never touches
-// the verdict.
+// Refresh uses the existing fetching check. Description work and its failures
+// stay separate from the primary installation action.
 
 // Hidden where the letter could only mislead: a checkout that managed updates
-// do not own (unmanaged), a status the panel could not read (check_failed,
-// unknown), a target no fetching check has named yet (unchecked), and the
+// do not own (unmanaged), an unknown status, a target no fetching check has
+// named yet (unchecked), and the
 // restart phase, whose served-SHA reload owns the card. Loading and checking
 // KEEP it: the paragraph is still the last known fact, and a passive refresh
-// or a running check must not blank it — that is what the letter renderer's
+// or a failed/running check must not blank it — that is what the letter renderer's
 // content key is for.
-const LETTER_HIDDEN_VERDICTS = new Set(['unmanaged', 'check_failed', 'unknown', 'unchecked']);
+const LETTER_HIDDEN_VERDICTS = new Set(['unmanaged', 'unknown', 'unchecked']);
 const LETTER_HIDDEN_PHASES = new Set(['restarting']);
 const LETTER_RELATIONS = new Set(['pending', 'applied', 'superseded', 'other']);
 // `applied` is the one relation whose label changes: the running version IS
@@ -314,26 +314,23 @@ export function updateLetterView(data = {}, phase = '') {
         writtenAt: String(letter.written_at || ''),
         ageText: relativeAge(letter.written_at),
     };
-    const failure = state === 'failed'
-        ? { kind: String(letter.error_kind || ''), text: String(letter.error_text || '') }
-        : null;
-
-    const notes = [];
-    if (relation === 'applied' && meta.targetVersion && data.current_version
-        && meta.targetVersion !== String(data.current_version)) {
-        // The kept letter describes a version that this one includes but has moved past.
-        notes.push(`written about ${meta.targetVersion}; the running version is ${data.current_version}`);
-    }
-    if (relation === 'superseded' || relation === 'other') {
-        notes.push(meta.authorVersion && meta.targetVersion
-            ? `written for ${meta.authorVersion} → ${meta.targetVersion}`
-            : 'written for an earlier update');
-    }
+    const runningBase = String(data.running_sha || '');
+    const latestTarget = String(data.checked_target_sha || data.latest_sha || '');
+    // The server compares the successful body's complete source range. Neither
+    // the version label nor mutable checkout HEAD proves server adoption here.
+    const descriptionCurrent = letter.description_current === true;
+    const failedKey = letter.latest_failed_key;
+    const failure = state === 'failed' && !descriptionCurrent && (!failedKey
+        || (failedKey.base_sha === runningBase && failedKey.target_sha === latestTarget))
+        ? { kind: String(letter.error_kind || ''), text: String(letter.error_text || ''),
+            failedAt: String(letter.failed_at || ''), key: failedKey || null } : null;
+    let note = descriptionCurrent || (relation === 'applied' && !data.available) ? '' : data.available
+        ? 'Description needs refreshing.'
+        : 'This description was written for an earlier update.';
     if (failure) {
-        const reason = failure.text || failure.kind || 'unknown reason';
-        notes.push(markdown
-            ? `rewriting this letter failed (${reason}); showing the last one that succeeded`
-            : `Ouroboros could not write an update letter (${reason})`);
+        const when = letterTimestamp(failure.failedAt);
+        note = `Refresh failed${when ? ` on ${when}` : ''}. ${markdown
+            ? 'Previous description kept.' : 'No description is available yet.'}`;
     }
 
     return {
@@ -342,23 +339,26 @@ export function updateLetterView(data = {}, phase = '') {
         markdown,
         meta,
         failure,
+        descriptionCurrent,
         label: LETTER_LABELS[relation],
-        note: notes.join(' · '),
+        note,
     };
 }
 
-/** Provenance sentence for the letter head: who wrote it, about what, when. */
-function letterProvenance({ authorVersion, targetVersion, ageText }) {
-    const who = authorVersion ? `written by Ouroboros ${authorVersion}` : 'written by Ouroboros';
-    return [targetVersion ? `${who} about ${targetVersion}` : who, ageText]
-        .filter(Boolean).join(' · ');
+function letterTimestamp(value) {
+    const date = new Date(value);
+    if (!value || Number.isNaN(date.getTime())) return '';
+    return new Intl.DateTimeFormat('en-GB', {
+        day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false,
+    }).format(date);
 }
 
 /** Content identity of a rendered letter: re-render only when this changes.
  *  The markdown itself, never a length proxy — two different paragraphs of equal length
  *  are a different letter, and one paragraph is small enough to compare outright. */
 function letterContentKey(view) {
-    return [view.state, view.relation, view.markdown].join('|');
+    // Status and provenance updates must not replace the text being read.
+    return view.markdown;
 }
 
 // Mirrors the two boot-recovery phases admitted by server.py's serialized
@@ -443,11 +443,23 @@ export function initUpdates({ mount, state, ws, openSettingsTab }) {
                 </div>
                 <section class="updates-letter" id="updates-letter" aria-labelledby="updates-letter-label" hidden>
                     <div class="updates-letter-head">
-                        <h4 class="updates-letter-label" id="updates-letter-label"></h4>
-                        <span class="updates-letter-meta" id="updates-letter-meta"></span>
+                        <div class="updates-letter-heading">
+                            <h4 class="updates-letter-label" id="updates-letter-label"></h4>
+                            <time class="updates-letter-meta" id="updates-letter-meta"></time>
+                        </div>
+                        <button type="button" class="btn btn-ghost btn-sm updates-letter-refresh" id="updates-letter-refresh"
+                            aria-label="Refresh description" aria-describedby="updates-letter-resources">
+                            <span aria-hidden="true">↻</span><span id="updates-letter-refresh-label">Refresh</span>
+                        </button>
                     </div>
-                    <div class="updates-letter-note" id="updates-letter-note" hidden></div>
+                    <div class="updates-letter-note" id="updates-letter-note" role="status" aria-live="polite" hidden></div>
                     <div class="updates-letter-body ui-rich-content" id="updates-letter-body"></div>
+                    <details class="updates-letter-details" id="updates-letter-details">
+                        <summary>Details</summary>
+                        <p id="updates-letter-provenance"></p>
+                        <p id="updates-letter-error" hidden></p>
+                        <p id="updates-letter-resources">Refresh checks for changes. A new description uses your configured model and may use subscription limits, local resources, or API budget.</p>
+                    </details>
                 </section>
                 <details class="updates-recovery">
                     <summary>Recovery</summary>
@@ -484,6 +496,12 @@ export function initUpdates({ mount, state, ws, openSettingsTab }) {
     const letterMeta = page.querySelector('#updates-letter-meta');
     const letterNote = page.querySelector('#updates-letter-note');
     const letterBody = page.querySelector('#updates-letter-body');
+    const letterRefresh = page.querySelector('#updates-letter-refresh');
+    const letterRefreshLabel = page.querySelector('#updates-letter-refresh-label');
+    const letterProvenance = page.querySelector('#updates-letter-provenance');
+    const letterError = page.querySelector('#updates-letter-error');
+    let letterRefreshing = false;
+    let letterRefreshError = null;
     let letterDisposer = null;
     let letterKey = null;
     let latestStatus = null;
@@ -533,13 +551,36 @@ export function initUpdates({ mount, state, ws, openSettingsTab }) {
             return;
         }
         letterSection.hidden = false;
+        letterSection.setAttribute('aria-busy', String(letterRefreshing));
         letterLabel.textContent = view.label;
-        letterMeta.textContent = letterProvenance(view.meta);
-        letterNote.textContent = view.note;
-        letterNote.hidden = !view.note;
-        letterNote.className = view.state === 'failed'
-            ? 'updates-letter-note updates-letter-note-failed'
-            : 'updates-letter-note';
+        const written = letterTimestamp(view.meta.writtenAt);
+        letterMeta.textContent = written ? `Written ${written}` : '';
+        letterMeta.dateTime = view.meta.writtenAt;
+        letterMeta.hidden = !written;
+        letterRefresh.disabled = letterRefreshing || ['preflighting', 'updating', 'restarting'].includes(phase);
+        letterRefreshLabel.textContent = letterRefreshing ? 'Refreshing…' : 'Refresh';
+        letterRefresh.setAttribute('aria-label', letterRefreshing ? 'Refreshing description' : 'Refresh description');
+        const note = letterRefreshing ? (view.markdown
+            ? 'Previous description shown while refreshing.' : 'Writing description…')
+            : letterRefreshError ? 'Could not refresh description. Previous description kept.' : view.note;
+        letterNote.textContent = note;
+        letterNote.hidden = !note;
+        const letter = latestStatus?.letter || {};
+        const source = letter.key?.base_sha && letter.key?.target_sha
+            ? ` Changes ${letter.key.base_sha.slice(0, 8)} → ${letter.key.target_sha.slice(0, 8)}.` : '';
+        letterProvenance.textContent = `Written by Ouroboros${view.meta.authorVersion
+            ? ` ${view.meta.authorVersion}` : ''}${view.meta.targetVersion
+            ? ` about ${view.meta.targetVersion}` : ''}.${source}`;
+        const lastFailure = letterRefreshError?.text || letter.error_text || letter.error_kind || '';
+        const failedAt = letterTimestamp(letterRefreshError?.at || letter.failed_at);
+        // Failed-attempt provenance must never borrow the shown
+        // body's range, which may describe an earlier, already-applied update.
+        const failedKey = letterRefreshError ? null : letter.latest_failed_key;
+        const failedRange = failedKey?.base_sha && failedKey?.target_sha
+            ? ` for changes ${failedKey.base_sha.slice(0, 8)} → ${failedKey.target_sha.slice(0, 8)}` : '';
+        letterError.textContent = lastFailure
+            ? `Last refresh failed${failedAt ? ` on ${failedAt}` : ''}${failedRange}: ${lastFailure}` : '';
+        letterError.hidden = !lastFailure;
         const nextKey = letterContentKey(view);
         if (nextKey === letterKey) return;
         releaseLetterBody();
@@ -549,8 +590,8 @@ export function initUpdates({ mount, state, ws, openSettingsTab }) {
         if (!view.markdown) return;
         // No anchored scroll to protect on this page, so markdown's deferred
         // writes (highlight, latex, mermaid, charts) run directly.
-        // The card carries exactly ONE action and it is never inside the letter. The shared
-        // markdown pipeline adds controls of its own to some blocks (a Copy button on a
+        // The authored body keeps no controls of its own. The shared
+        // markdown pipeline adds controls to some blocks (a Copy button on a
         // fenced one, and another when a mermaid block DEGRADES asynchronously), so the
         // scrub runs after every write it makes, not once. The text stays untouched.
         stripLetterControls();
@@ -562,6 +603,31 @@ export function initUpdates({ mount, state, ws, openSettingsTab }) {
         });
         stripLetterControls();
     }
+
+    // One fetching-check seam coalesces this with ordinary status refreshes.
+    // The backend reuses successful exact ranges; installation stays independent.
+    letterRefresh.addEventListener('click', async () => {
+        if (letterRefreshing || letterRefresh.disabled) return;
+        letterRefreshing = true;
+        letterRefreshError = null;
+        renderLetter();
+        const previous = latestStatus?.letter;
+        const previousView = updateLetterView(latestStatus || {}, phase);
+        try {
+            await loadStatus({ fetchRemote: true, preservePhase: true });
+            const current = latestStatus?.letter;
+            if (!letterRefreshError && latestStatus?.check_ok === true && previousView.descriptionCurrent
+                && updateLetterView(latestStatus, phase).descriptionCurrent && previous?.text === current?.text
+                && previous?.written_at === current?.written_at
+                && ['base_sha', 'target_sha', 'update_channel', 'target_ref'].every(
+                    key => previous?.key?.[key] === current?.key?.[key])) {
+                showToast('Description is up to date.', 'info');
+            }
+        } finally {
+            letterRefreshing = false;
+            render();
+        }
+    });
 
     function render() {
         const verdict = updateVerdict(latestStatus || {}, phase);
@@ -657,6 +723,7 @@ export function initUpdates({ mount, state, ws, openSettingsTab }) {
                 if (!options.preservePhase) setPhase(options.fetchRemote ? 'checking' : 'loading');
                 try {
                     const data = await (options.fetchRemote ? apiClient.updateCheck() : apiClient.updateStatus());
+                    if (options.fetchRemote) letterRefreshError = null;
                     // The explicit check owns release discovery. A queued progress
                     // refresh has no tags and must not erase that successful read.
                     if (options.fetchRemote || officialTagsDiv.childElementCount === 0) {
@@ -671,6 +738,9 @@ export function initUpdates({ mount, state, ws, openSettingsTab }) {
                     } else render();
                 } catch (err) {
                     if (statusRefreshNext) continue;
+                    if (options.fetchRemote) letterRefreshError = {
+                        at: new Date().toISOString(), text: String(err.message || err),
+                    };
                     latestStatus = { ...latestStatus, managed: true, warnings: [`status_error:${err.message || err}`], check_ok: false };
                     if (!options.preservePhase) setPhase(restartNeeded ? 'restart_needed' : '');
                     else render();

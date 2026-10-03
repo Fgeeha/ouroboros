@@ -45,7 +45,7 @@ from ouroboros.server_process import (  # noqa: F401
     _request_restart_exit, _restart_requested,
     _supervisor_stop, _exit_signalled,
     _SignalStopServer, _embedded_uvicorn_server,
-    log,
+    capture_server_source_baseline, log,
 )
 from ouroboros.server_routing_context import (  # noqa: F401
     _active_direct_roots,
@@ -102,6 +102,7 @@ from ouroboros.server_restart import (  # noqa: F401
 )
 
 REPO_DIR = pathlib.Path(os.environ.get("OUROBOROS_REPO_DIR", pathlib.Path(__file__).parent))
+capture_server_source_baseline(REPO_DIR)
 DEFAULT_HOST = os.environ.get("OUROBOROS_SERVER_HOST", "127.0.0.1")
 DEFAULT_PORT = int(os.environ.get("OUROBOROS_SERVER_PORT", "8765"))
 PORT_FILE = DATA_DIR / "state" / "server_port"
@@ -1144,9 +1145,9 @@ def _boot_managed_update_tasks() -> None:
             return
         update_status = compute_managed_update_status(fetch=True)
         try:
-            from ouroboros.update_letter import refresh_after_check
+            from ouroboros.update_letter import refresh_after_check, runtime_status
 
-            refresh_after_check(update_status)
+            refresh_after_check(runtime_status(update_status))
         except Exception:
             log.debug("boot update letter refresh failed", exc_info=True)
         broadcast_ws_sync({
@@ -1504,6 +1505,12 @@ async def lifespan(app):
                 log.debug("Failed to record server_shutdown event", exc_info=True)
         except Exception:
             pass
+        if _restart_requested.is_set():
+            try:
+                _stop_owned_daemon_for_new_pin()
+            except Exception:
+                log.critical("Planned restart: engine pin check raised; the owned daemon is left serving",
+                             exc_info=True)
         if extension_reconcile_task is not None:
             extension_reconcile_task.cancel()
             with suppress(asyncio.CancelledError, asyncio.TimeoutError):
@@ -1538,14 +1545,6 @@ async def lifespan(app):
                 supervisor.stop_all()
         except Exception:
             pass
-        if _restart_requested.is_set():
-            try:
-                # A planned restart whose landed checkout pins another engine ends
-                # the owned daemon here so the next generation starts on that pin.
-                _stop_owned_daemon_for_new_pin()
-            except Exception:
-                log.critical("Planned restart: engine pin check raised; the owned daemon is left serving",
-                             exc_info=True)
         try:
             from supervisor.message_bus import get_bridge
             get_bridge().shutdown()
@@ -1608,7 +1607,6 @@ def _stop_owned_local_processes(drive_root: pathlib.Path, *, wait: bool = True) 
 def _emergency_process_cleanup(*, port_sweep: bool = True) -> None:
     """Kill child processes, workers, companions, and runtime port holders."""
     _historical_audit.stop()  # forced path may skip lifespan's finally; stop never waits
-    _stop_owned_local_processes(DATA_DIR, wait=False)
     try:
         from supervisor.workers import kill_workers
         cleanup_kwargs = _restart_cleanup_kwargs()
@@ -1617,24 +1615,22 @@ def _emergency_process_cleanup(*, port_sweep: bool = True) -> None:
             # here; finalize running tasks as an honest interrupted-by-restart,
             # not a worker crash storm.
             cleanup_status, cleanup_reason = _shutdown_task_cleanup_args(True)
-            kill_workers(
-                force=True,
-                archive_service_logs=False,
+            cleanup_kwargs.update(
                 terminal_status=cleanup_status,
                 result_reason=cleanup_reason,
                 stop_source="server_shutdown",
-                **cleanup_kwargs,
-                **_managed_update_pending_kwargs(),
             )
-        else:
-            kill_workers(
-                force=True,
-                archive_service_logs=False,
-                **cleanup_kwargs,
-                **_managed_update_pending_kwargs(),
-            )
+        kill_workers(force=True, archive_service_logs=False,
+                     **cleanup_kwargs, **_managed_update_pending_kwargs())
     except Exception:
         pass
+    if _restart_requested.is_set():
+        try:
+            _stop_owned_daemon_for_new_pin()
+        except Exception:
+            log.critical("Planned restart: engine pin check raised; the owned daemon is left serving",
+                         exc_info=True)
+    _stop_owned_local_processes(DATA_DIR, wait=False)
     import multiprocessing
     from ouroboros.platform_layer import force_kill_pid, kill_process_on_port
     for child in multiprocessing.active_children():
@@ -1711,9 +1707,10 @@ def main() -> int:
     _uvicorn_exited = threading.Event()
 
     def _check_restart():
-        """Monitor restart signal, then shut down uvicorn."""
-        while not _restart_requested.is_set():
-            time.sleep(0.5)
+        """Own final cleanup and transfer, whether or not uvicorn returns."""
+        while not _restart_requested.wait(0.5):
+            if _uvicorn_exited.is_set():
+                return
         log.info("Restart requested — closing WebSocket clients and shutting down server.")
 
         loop = _event_loop
@@ -1726,19 +1723,28 @@ def main() -> int:
 
         server.should_exit = True
 
-        # Force-exit only if uvicorn never returns; direct-server mode needs cleanup/re-exec time.
+        # This bounds the graceful wait, not full cleanup: retained executor
+        # records still belong to this stop, including backend-only processes.
         force_exit_timeout_sec = 5 if _LAUNCHER_MANAGED else 30
-        if _uvicorn_exited.wait(timeout=force_exit_timeout_sec):
-            return
-        log.warning(
-            "Uvicorn did not exit within %ss — running emergency cleanup before os._exit(%d)",
-            force_exit_timeout_sec,
-            RESTART_EXIT_CODE,
-        )
-        _emergency_process_cleanup()
+        if not _uvicorn_exited.wait(timeout=force_exit_timeout_sec):
+            log.warning("Uvicorn did not exit within %ss; finishing cleanup before restart",
+                        force_exit_timeout_sec)
+        try:
+            # Our listeners close on exit/exec; port sweeps add no ownership proof.
+            _emergency_process_cleanup(port_sweep=False)
+            if not _LAUNCHER_MANAGED:
+                if _planned_delegate_restart_transaction_id:
+                    from ouroboros.delegate_recovery import PLANNED_RESTART_TRANSACTION_ENV
+
+                    os.environ[PLANNED_RESTART_TRANSACTION_ENV] = _planned_delegate_restart_transaction_id
+                _restart_current_process(args.host, actual_port)
+        except Exception:
+            log.exception("Restart failed; cleanup or transfer is unconfirmed, custody retained")
+            return os._exit(1)  # A watcher exception must not silently return success or leave main hung.
         os._exit(RESTART_EXIT_CODE)
 
-    threading.Thread(target=_check_restart, daemon=True).start()
+    restart_thread = threading.Thread(target=_check_restart, daemon=True)
+    restart_thread.start()
 
     try:
         with bound_service_socket(DATA_DIR, "main", args.host, actual_port,
@@ -1749,19 +1755,8 @@ def main() -> int:
             server.run(sockets=[listener])
     finally:
         _uvicorn_exited.set()
-
-    if _restart_requested.is_set():
-        log.info("Exiting with code %d (restart signal).", RESTART_EXIT_CODE)
-        _emergency_process_cleanup(port_sweep=False)
-        if not _LAUNCHER_MANAGED:
-            if _planned_delegate_restart_transaction_id:
-                from ouroboros.delegate_recovery import PLANNED_RESTART_TRANSACTION_ENV
-
-                os.environ[PLANNED_RESTART_TRANSACTION_ENV] = (
-                    _planned_delegate_restart_transaction_id
-                )
-            _restart_current_process(args.host, actual_port)
-        os._exit(RESTART_EXIT_CODE)
+        if _restart_requested.is_set():
+            restart_thread.join()  # uvicorn returning does not complete cleanup or direct re-exec
 
     return 0
 

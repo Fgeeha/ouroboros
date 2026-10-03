@@ -6983,7 +6983,7 @@ textarea.chat-input {
 /* The update letter: Ouroboros's own short paragraph about the update this
    panel offers, kept after it lands as "What changed in this version". A fact
    block, so it is separated from the action row the way Recovery is — a rule,
-   not a card — and it contributes no control of its own. */
+   not a card, with a small description-only refresh action. */
 .updates-letter {
     display: flex;
     flex-direction: column;
@@ -6993,10 +6993,20 @@ textarea.chat-input {
     padding-top: var(--space-3);
 }
 .updates-letter-head {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: var(--space-2);
+}
+.updates-letter-heading {
     display: flex;
     flex-wrap: wrap;
     align-items: baseline;
     gap: var(--space-2);
+    min-width: 0;
+}
+.updates-letter-refresh {
+    white-space: nowrap;
 }
 .updates-letter-label {
     margin: 0;
@@ -7005,8 +7015,7 @@ textarea.chat-input {
     font-weight: 600;
     color: var(--text-primary);
 }
-/* Provenance sits at meta ink beside the label and WRAPS at narrow widths
-   instead of truncating: the versions it names are the whole point of it. */
+/* The real writing time stays quiet; detailed range provenance is disclosed below. */
 .updates-letter-meta {
     font-size: var(--type-meta);
     line-height: var(--line-meta);
@@ -7014,17 +7023,25 @@ textarea.chat-input {
     overflow-wrap: anywhere;
     min-width: 0;
 }
-/* Two note tones, each complete: a stale letter is a warning (the text still
-   holds, it was written for another range), a failed rewrite is an error. */
+/* Description freshness is separate from installation status and never a banner. */
 .updates-letter-note {
     font-size: var(--type-meta);
     line-height: var(--line-meta);
-    color: var(--status-warn-fg);
+    color: var(--text-meta);
 }
-.updates-letter-note-failed {
+.updates-letter-details {
     font-size: var(--type-meta);
     line-height: var(--line-meta);
-    color: var(--status-error-fg);
+    color: var(--text-meta);
+    margin-top: var(--space-2);
+    overflow-wrap: anywhere;
+}
+.updates-letter-details summary {
+    cursor: pointer;
+    width: fit-content;
+}
+.updates-letter-details p {
+    margin: var(--space-2) 0 0;
 }
 .updates-letter-body {
     font-size: var(--type-body);

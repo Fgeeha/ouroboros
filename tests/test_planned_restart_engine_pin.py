@@ -173,6 +173,8 @@ def test_the_check_lives_in_the_restart_teardown_and_the_handoff_performer_is_un
     kill = source.index("kill_workers(\n                force=True,\n                terminal_status=cleanup_status")
     check = source.index("_stop_owned_daemon_for_new_pin()")
     assert kill < check < source.index("get_bridge().shutdown()")
+    assert check < source.index("if extension_reconcile_task is not None:")
+    assert check < source.index("_stop_owned_local_processes(lifespan_drive_root)")
     assert source.rindex("if _restart_requested.is_set():", 0, check) > kill
     assert "_stop_owned_daemon_for_new_pin" not in inspect.getsource(server._perform_supervisor_restart)
 
