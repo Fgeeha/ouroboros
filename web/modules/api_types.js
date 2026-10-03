@@ -472,6 +472,9 @@
  * @property {string=} handoff_id  // immutable origin/destination receipt identity
  * @property {Object=} terminal_time  // host-owned occurrence; ts remains publication time
  * @property {string=} completion_answer  // a Project root's model-authored final answer, mirrored into Main
+ * @property {string=} set_at  // a `reminder` row: when its words were written (live frame only; the text carries the signature)
+ * @property {string=} scheduled_for  // a `reminder` row: the due point it was written for
+ * @property {string=} delivered_at  // a `reminder` row: when the host showed it (later than due after downtime)
  * @property {number=} chat_id
  * @property {boolean=} project_thread  // server-stamped: chat_id is a reserved Project thread; Main never adopts it even before projectChatIds learns the project
  */

@@ -59,3 +59,19 @@ test('the exact hold release stays reachable on a pending-delete continuation', 
     assert.match(unknown, /resolve relationship in conversation/);
     assert.doesNotMatch(unknown, /data-act="schedule-toggle"/);
 });
+
+test('a note row is named by its own words and offers the same lifecycle', () => {
+    const note = {
+        id: 'followup-t1-abc123', name: 'Reminder of task t1', kind: 'notify', status: 'active', enabled: true,
+        relation: 'independent', trigger: { type: 'once', run_at: '2027-01-15T09:00:00Z' },
+        notification: { text: 'Call <mother>', set_at: '2027-01-15T08:00:00Z' },
+    };
+    const html = scheduleRowHtml(note);
+    assert.match(html, /<span class="activity-name" title="Call &lt;mother&gt;">Call &lt;mother&gt;<\/span>/);
+    assert.match(html, /<span class="activity-sub">reminder · one-shot · at\/after /);
+    assert.match(html, /data-act="schedule-toggle" data-id="followup-t1-abc123" data-action="disable">Disable</);
+    assert.match(html, /data-act="schedule-delete" data-id="followup-t1-abc123" data-managed="" data-note="1">Delete</);
+    const task = scheduleRowHtml({ ...note, kind: undefined });
+    assert.match(task, /<span class="activity-name">Reminder of task t1<\/span>/, 'a task row keeps its schedule name');
+    assert.match(task, /data-note="">Delete</);
+});

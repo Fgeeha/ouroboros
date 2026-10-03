@@ -556,6 +556,15 @@ completion mirror). New host producers stamp both fields. Relays
 preserve them through live delivery, persistence and history. Model narration,
 proactive replies and questions remain model-authored even when typed.
 
+Authorship also has a time axis. Ouroboros's voice means *the model, now*. Words
+the mind wrote earlier for a later moment — a note left with
+`schedule_followup(notify=true)` — reach the owner at that moment as a System row
+(`system_type="reminder"`), never as a live reply: the host prepends one signature
+line, `Reminder · Ouroboros · written <when> · for <when>` (plus `· delivered
+<when>` when downtime held it back), and keeps the words verbatim. The host does
+not rewrite, summarize or re-time them; the next turn reads the row as a host fact
+(`📋 [reminder]`), so Ouroboros knows what the owner was shown.
+
 Formatting is asymmetric: assistant text always uses the sanitized chat markdown
 renderer regardless of `markdown`; ordinary System text is escaped unless
 `markdown: true`. The typed `skill_review` row keeps its dedicated renderer.
@@ -1388,6 +1397,7 @@ exceptions.
 | A question or decision is waiting | required | a confirmed lifecycle fact: the question carries a positive wait |
 | A task finished or stopped | required | a positive typed terminal fact on a ROOT task |
 | Messages Ouroboros sends while working | LLM-first | Ouroboros chose to speak outside the turn's answer (a proactive message in its room or as a Main notice, or an optional question) |
+| A note Ouroboros left for this moment (same toggle) | LLM-first | when it wrote the note, Ouroboros chose to leave these words for this time; the host only shows the signed `reminder` row |
 | Ordinary replies in Main | separate toggle | an ordinary finished reply in the Main thread |
 
 *Required* means the application asks for delivery from its own state rather

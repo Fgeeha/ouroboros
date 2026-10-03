@@ -94,6 +94,10 @@ export function scheduleRowHtml(s) {
     const timing = once
         ? `one-shot · at/after ${scheduleInstantHtml(trigger.run_at)}`
         : `${esc(trigger.expr || s.cron || '')} (${s.timezone ? esc(s.timezone) : 'server time zone'})`;
+    // A note (kind "notify") is shown to the owner as written, with no task: its
+    // row names it by its own words rather than by a schedule label.
+    const note = String(s.kind || '') === 'notify';
+    const noteText = note ? String(s.notification?.text || '') : '';
     const next = s.next_run_at ? scheduleInstantHtml(s.next_run_at) : '';
     const status = scheduleStatus(s);
     const enabled = status === 'active';
@@ -118,7 +122,7 @@ export function scheduleRowHtml(s) {
     const pendingDetail = pendingDelete ? ` · deletion waits for ${relation === 'independent'
         ? 'its accepted run to start' : 'its task to finish'}` : '';
     const statusLabel = pendingDelete ? 'deletion pending' : status;
-    const sub = `${timing}${next && !consumed && !pendingDelete ? ` · next ${next}` : ''} · ${esc(statusLabel)}${pendingDetail} · ${esc(relation)}${binding}${s.deadline_at ? ` · deadline ${scheduleInstantHtml(s.deadline_at, { includeYear: true })}` : ''}${hold.reason ? ` · ${esc(explanations[hold.reason] || hold.reason)}` : ''}${s.followup_wait ? ` · ${esc(explanations[s.followup_wait] || s.followup_wait)}` : ''}${s.completed_at ? ' · already fired' : ''}${managed && s.skill ? ` · ${esc(s.skill)}` : ''}${waiting}`;
+    const sub = `${note ? 'reminder · ' : ''}${timing}${next && !consumed && !pendingDelete ? ` · next ${next}` : ''} · ${esc(statusLabel)}${pendingDetail} · ${esc(relation)}${binding}${s.deadline_at ? ` · deadline ${scheduleInstantHtml(s.deadline_at, { includeYear: true })}` : ''}${hold.reason ? ` · ${esc(explanations[hold.reason] || hold.reason)}` : ''}${s.followup_wait ? ` · ${esc(explanations[s.followup_wait] || s.followup_wait)}` : ''}${s.completed_at ? ' · already fired' : ''}${managed && s.skill ? ` · ${esc(s.skill)}` : ''}${waiting}`;
     // The exact hold release stays available wherever a hold exists, including on a
     // deleted row whose accepted task still needs it; it never re-enables the row.
     const holdControl = !hold.hold_id ? ''
@@ -150,11 +154,11 @@ export function scheduleRowHtml(s) {
                         : `<button type="button" class="btn btn-xs btn-default" data-act="schedule-toggle" data-id="${id}" data-action="${suppressed || !enabled ? 'restore' : 'disable'}">${enabled ? 'Disable' : (suppressed ? 'Restore' : 'Enable')}</button>`;
     return `<div class="activity-row activity-schedule${enabled || hold.hold_id || s.followup_wait ? '' : ' off'}">
         <div class="activity-row-main">
-            <span class="activity-name">${esc(s.name || s.id || 'schedule')}</span>
+            <span class="activity-name"${noteText ? ` title="${esc(noteText)}"` : ''}>${esc(noteText || s.name || s.id || 'schedule')}</span>
             <span class="activity-sub">${sub}</span>
         </div>
         <div class="activity-row-actions">${lifecycle}
-           <button type="button" class="btn btn-xs btn-danger" data-act="schedule-delete" data-id="${id}" data-managed="${managed ? '1' : ''}">Delete</button></div>
+           <button type="button" class="btn btn-xs btn-danger" data-act="schedule-delete" data-id="${id}" data-managed="${managed ? '1' : ''}" data-note="${note ? '1' : ''}">Delete</button></div>
     </div>`;
 }
 
@@ -490,11 +494,12 @@ export function initActivity({ mount, ws } = {}) {
                 // would recreate it. Delete SUPPRESSES it durably, and the dialog
                 // says so before anything is sent.
                 const managedRow = btn.dataset.managed === '1';
+                const noun = btn.dataset.note === '1' ? 'reminder' : 'schedule';
                 const confirmedDelete = await openConfirmDialog({
-                    title: managedRow ? 'Suppress skill schedule' : 'Delete schedule',
+                    title: managedRow ? 'Suppress skill schedule' : `Delete ${noun}`,
                     body: managedRow
                         ? 'This schedule is declared by an installed skill and cannot be removed; Delete keeps it suppressed until you Restore it. Suppress it?'
-                        : 'Delete this schedule?',
+                        : `Delete this ${noun}?`,
                     confirmLabel: managedRow ? 'Suppress' : 'Delete',
                     danger: true,
                 });

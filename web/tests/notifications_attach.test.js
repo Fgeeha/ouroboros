@@ -232,3 +232,13 @@ test('attach without a socket is a no-op disposer, never a throw', () => {
     assert.equal(typeof release, 'function');
     release();
 });
+
+test('a reminder rings once from its live frame; history replay never reaches the notifier', () => {
+    const fx = fixture();
+    const frame = { role: 'system', system_type: 'reminder', chat_id: 1, source: 'Ouroboros',
+        ts: '2026-10-03T12:00:01+00:00', content: 'Reminder · Ouroboros · for Oct 3 15:00 (UTC+3)\nCall mother' };
+    fx.send('chat', frame);
+    fx.send('chat', frame);
+    assert.deepEqual(fx.titles(), ['Reminder from Ouroboros'], 'one row, one banner');
+    assert.equal(fx.handlers.has('history'), false, 'the notifier subscribes to live frames only');
+});

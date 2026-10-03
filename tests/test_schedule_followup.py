@@ -226,60 +226,65 @@ def test_schedule_followup_registers_a_one_shot_entry(tmp_path):
     assert record["task"]["context"] == "plan review for root-1 was quorum-unreachable"
 
 
-def test_schedule_followup_notify_mode_fires_without_a_task_or_chat_row(tmp_path):
+def test_schedule_followup_notify_leaves_a_note_in_the_one_table(tmp_path):
+    """notify=true writes a ``kind: "notify"`` row: the agent's words and when they were
+    written, independent work, counted in the same cap; no future task text is stored."""
     from supervisor import queue
 
     ctx = _ctx(tmp_path)
-    queue.init(tmp_path / "data")
-    queue.init_queue_refs([], {}, {"value": 0})
-    out = _followup(ctx, notify=True, objective="Call mother")
-    assert out.startswith("FOLLOWUP_SCHEDULED: notification ")
+    out = _followup(ctx, notify=True, relation="related", objective="Call mother")
+    assert out.startswith("FOLLOWUP_SCHEDULED: note "), out
+    assert "relation='related' ignored" in out, "a note carries no money or deadline"
     [record] = queue.list_scheduled_tasks(tmp_path / "data")["tasks"]
-    assert record["kind"] == "notify" and record["origin_task_id"] == ctx.task_id
-    assert record["notification"] == {"text": "Call mother", "key": ""}
-    assert "task" not in record
-    # The same root cap counts notify and task follow-ups together.
-    assert _followup(ctx, notify=True, objective="Second") .startswith("FOLLOWUP_SCHEDULED")
-    assert "FOLLOWUP_CAP_REACHED" in _followup(ctx, objective="Third")
-    record["trigger"]["run_at"] = "2000-01-01T00:00:00+00:00"
-    from supervisor import queue_schedules
-
-    store = queue.load_schedule_store(tmp_path / "data")
-    store["tasks"][0]["trigger"] = record["trigger"]
-    queue_schedules._write_scheduled_tasks(store, tmp_path / "data")
-    queue.check_scheduled_tasks()
-    notices = [r for r in _events(tmp_path / "data") if r.get("type") == "owner_notification"]
-    assert len(notices) == 1 and notices[0]["text"] == "Call mother"
-    assert not (tmp_path / "data" / "logs" / "chat.jsonl").exists()
+    assert record["kind"] == "notify" and record["source"] == "task_followup"
+    assert record["notification"]["text"] == "Call mother" and record["notification"]["set_at"]
+    assert record["followup_relation"]["kind"] == "independent"
+    assert record["followup_origin"]["task_id"] == "root-1"
+    assert "text" not in record["task"], "a note has no future task objective"
+    assert _followup(ctx, notify=True, objective="Second").startswith("FOLLOWUP_SCHEDULED")
+    assert "FOLLOWUP_CAP_REACHED" in _followup(ctx, objective="Third"), "notes and wake-ups share the cap"
 
 
-def test_presence_selected_followup_retains_tasks_but_cannot_notify_owner(tmp_path):
-    """A Presence ceiling selects the tool, not notify's argument mode."""
+@pytest.mark.parametrize(("metadata", "contract", "chat_id"), [
+    ({"presence": {"binding_id": "b" * 32}}, None, 1),
+    ({"presence_binding_authority": {"binding_id": "mail-room"}}, None, 1),
+    ({}, {"capability_ceiling": {"tools": ["schedule_followup"]}}, 1),  # a lost carrier under a ceiling
+    ({}, None, -1001),  # agent-to-agent
+], ids=["presence-speaker", "presence-work", "lost-carrier", "a2a"])
+def test_notes_are_refused_to_callers_that_do_not_speak_for_the_owner(tmp_path, metadata, contract, chat_id):
     from supervisor.queue import list_scheduled_tasks
 
     ctx = _ctx(tmp_path)
-    ctx.task_metadata["presence_binding_authority"] = {"binding_id": "mail-room"}
-    blocked = _followup(ctx, notify=True, objective="Wake owner")
-    assert "FOLLOWUP_NOTIFY_PRESENCE_REFUSED" in blocked
+    ctx.task_metadata.update(metadata)
+    if contract is not None:
+        ctx.task_contract.update(contract)
+    ctx.current_chat_id = chat_id
+    assert "FOLLOWUP_NOTIFY_REFUSED" in _followup(ctx, notify=True, objective="Wake owner")
     assert list_scheduled_tasks(ctx.drive_root)["tasks"] == []
-    assert _followup(ctx, notify=False, objective="Continue related work").startswith("FOLLOWUP_SCHEDULED")
-    [record] = list_scheduled_tasks(ctx.drive_root)["tasks"]
-    assert record["task"]["text"] == "Continue related work"
 
 
-def test_lost_presence_carrier_with_ceiling_still_refuses_model_free_notify(tmp_path):
+def test_a_note_from_a_consciousness_root_in_main_is_a_legitimate_contact(tmp_path):
+    """No room check: a root consciousness started (neither a Project nor owner ingress) may leave one."""
     ctx = _ctx(tmp_path)
-    ctx.task_contract["capability_ceiling"] = {"tools": ["schedule_followup"]}
-    assert "FOLLOWUP_NOTIFY_PRESENCE_REFUSED" in _followup(ctx, notify=True, objective="Wake owner")
+    ctx.current_chat_id = 1
+    ctx.task_metadata["initiator"] = "consciousness"
+    assert _followup(ctx, notify=True, objective="The kettle is on.").startswith("FOLLOWUP_SCHEDULED: note ")
 
 
-def test_schedule_followup_notify_rejects_context_and_oversized_text(tmp_path):
+def test_a_delegated_subagent_cannot_leave_a_note(tmp_path):
+    ctx = _ctx(tmp_path, role="subagent")
+    assert "FOLLOWUP_SUBAGENT_REFUSED" in _followup(ctx, notify=True, objective="Wake owner")
+
+
+def test_schedule_followup_notify_refuses_context_and_non_boolean_mode(tmp_path):
     ctx = _ctx(tmp_path)
     assert "FOLLOWUP_NOTIFY_CONTEXT" in _followup(ctx, notify=True, context="hidden")
-    assert "FOLLOWUP_NOTIFY_TEXT_TOO_LONG" in _followup(ctx, notify=True, objective="x" * 1001)
+    assert "FOLLOWUP_NOTIFY_INVALID" in _followup(ctx, notify="yes")
+    assert "FOLLOWUP_TEXT_TOO_LONG" in _followup(ctx, notify=True, objective="x" * 4001)
     from supervisor import queue
 
     assert queue.list_scheduled_tasks(tmp_path / "data")["tasks"] == []
+    assert _followup(ctx, notify=None).startswith("FOLLOWUP_SCHEDULED: follow-up "), "null is the default wake-up"
 
 
 def test_a_timer_follow_up_is_framed_as_task_authored_and_its_note_never_enters_the_owner_corpus(tmp_path):
@@ -883,377 +888,3 @@ def test_schedule_followup_registration_surfaces():
     # Reading the table is research; changing it is refused inside the tool.
     assert "manage_schedules" in LOCAL_READONLY_SUBAGENT_TOOL_NAMES
     assert "manage_schedules" not in ACTING_SUBAGENT_TOOL_NAMES
-
-
-# ------------------------------------------------- kind: "notify" rows (5B)
-
-
-def _events(tmp_path):
-    import json
-
-    path = tmp_path / "logs" / "events.jsonl"
-    if not path.exists():
-        return []
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
-
-
-def _notify_row(schedule_id, *, source="task_followup", trigger=None, key="k1", text="Call mother"):
-    return {
-        "id": schedule_id, "name": f"Reminder ({key})", "kind": "notify", "enabled": True, "source": source,
-        "trigger": trigger or {"type": "once", "run_at": "2000-01-01T00:00:00+00:00"},
-        "notification": {"text": text, "key": key},
-    }
-
-
-def test_notify_once_row_emits_one_owner_notification_and_is_consumed(tmp_path):
-    """The second dispatch verb of the one table: a due ``kind: "notify"`` row
-    becomes an ``owner_notification`` events row (its live frame rides the log
-    sink) plus a topic publish AFTER the table lock — never a queued task."""
-    from ouroboros import event_bus
-
-    queue, pending = _queue(tmp_path)
-    bus = event_bus.init_global_event_bus()
-    seen: list = []
-    bus.subscribe("telegram", event_bus.OWNER_NOTIFICATION, seen.append)
-    queue.upsert_scheduled_task(_notify_row("n-due"))
-    queue.upsert_scheduled_task(_notify_row("n-future", trigger={"type": "once", "run_at": "2999-01-01T00:00:00+00:00"}))
-    queue.check_scheduled_tasks()
-    queue.check_scheduled_tasks()  # a consumed one-shot never re-fires
-    assert pending == [], "a notify row admits no task"
-    notices = [row for row in _events(tmp_path) if row.get("type") == "owner_notification"]
-    assert len(notices) == 1
-    notice = notices[0]
-    assert notice["text"] == "Call mother" and notice["source"] == "task_followup"
-    assert notice["chat_id"] == 1 and "task_id" not in notice
-    assert notice["scheduled_for"] == "2000-01-01T00:00:00+00:00"
-    # The frame key carries the due instant: a re-armed or recurring reminder
-    # rings on every occurrence, a crash replay of the same one collapses.
-    assert notice["key"] == f"k1@{notice['scheduled_for']}"
-    assert len(seen) == 1 and seen[0]["key"] == notice["key"]
-    records = {r["id"]: r for r in queue.list_scheduled_tasks(tmp_path)["tasks"]}
-    done = records["n-due"]
-    assert done["enabled"] is False and done["completed_at"] and done["last_run_at"]
-    assert done.get("last_task_id") is None and done["next_run_at"] == ""
-    assert records["n-future"]["enabled"] is True and not records["n-future"].get("last_run_at")
-    event_bus.init_global_event_bus()
-
-
-def test_notify_cron_row_fires_and_advances_like_a_task_row(tmp_path):
-    queue, pending = _queue(tmp_path)
-    queue.upsert_scheduled_task(_notify_row(
-        "n-cron", trigger={"type": "cron", "expr": "* * * * *"}, key="daily"))
-    # Force the first occurrence into the past, as an offline gap would.
-    store = queue.load_schedule_store(tmp_path)
-    store["tasks"][0]["next_run_at"] = "2000-01-01T00:00:00+00:00"
-    from supervisor import queue_schedules
-
-    queue_schedules._write_scheduled_tasks(store, tmp_path)
-    queue.check_scheduled_tasks()
-    queue.check_scheduled_tasks()  # the next occurrence is in the future now
-    assert pending == []
-    notices = [row for row in _events(tmp_path) if row.get("type") == "owner_notification"]
-    assert len(notices) == 1 and notices[0]["key"] == "daily@2000-01-01T00:00:00+00:00"
-    record = queue.list_scheduled_tasks(tmp_path)["tasks"][0]
-    assert record["enabled"] is True and not record.get("completed_at")
-    assert record["next_run_at"] > "2000-01-02"
-
-
-@pytest.mark.parametrize("actor", ["owner:gateway", "task_followup"], ids=["owner", "its-own-source"])
-def test_a_fired_reminder_is_removed_outright_by_either_hand(tmp_path, actor):
-    """A consumed one-shot reminder is a receipt: the owner's Delete or the
-    producer's own cancel removes it at once instead of retaining a suppressed
-    record that Activity would still show as consumed with no Restore."""
-    queue, _pending = _queue(tmp_path)
-    queue.upsert_scheduled_task(_notify_row("n-fired", key="fired"))
-    queue.check_scheduled_tasks()
-    assert queue.list_scheduled_tasks(tmp_path)["tasks"][0]["completed_at"]
-    outcome = queue.mutate_scheduled_task("delete", "n-fired", reason="cleared the receipt",
-                                          actor=actor, drive_root=tmp_path)
-    assert outcome["ok"] and outcome["status"] == "deleted"
-    assert queue.list_scheduled_tasks(tmp_path)["tasks"] == []
-
-
-def test_a_fired_reminder_the_owner_switched_off_keeps_its_marker_against_the_skill(tmp_path):
-    """The receipt shortcut never undoes the owner: a fired reminder the owner
-    disabled (through manage_schedules or the action API) stays for the owner's
-    own delete; the skill's cancel is answered as the suppression it is."""
-    queue, _pending = _queue(tmp_path)
-    queue.upsert_scheduled_task(_notify_row("n-fired-off", key="fired-off"))
-    queue.check_scheduled_tasks()
-    assert queue.list_scheduled_tasks(tmp_path)["tasks"][0]["completed_at"]
-    queue.mutate_scheduled_task("disable", "n-fired-off", reason="owner: off", actor="owner:gateway", drive_root=tmp_path)
-    skill = queue.mutate_scheduled_task("delete", "n-fired-off", reason="skill cancel", actor="task_followup", drive_root=tmp_path)
-    assert skill["status"] == "suppressed" and not skill["changed"]
-    assert len(queue.list_scheduled_tasks(tmp_path)["tasks"]) == 1
-    owner = queue.mutate_scheduled_task("delete", "n-fired-off", reason="owner: clear", actor="owner:gateway", drive_root=tmp_path)
-    assert owner["status"] == "deleted" and queue.list_scheduled_tasks(tmp_path)["tasks"] == []
-
-
-def test_notify_cron_row_that_cannot_advance_never_rings(tmp_path):
-    """A durable cron row whose expression no longer parses but whose stored
-    due instant is in the past must not ring the owner on every pass: the
-    successor is settled before the notification goes out."""
-    queue, pending = _queue(tmp_path)
-    queue.upsert_scheduled_task(_notify_row(
-        "n-bad-cron", trigger={"type": "cron", "expr": "* * * * *"}, key="broken"))
-    store = queue.load_schedule_store(tmp_path)
-    store["tasks"][0]["trigger"]["expr"] = "not-a-cron"
-    store["tasks"][0]["next_run_at"] = "2000-01-01T00:00:00+00:00"
-    from supervisor import queue_schedules
-
-    queue_schedules._write_scheduled_tasks(store, tmp_path)
-    queue.check_scheduled_tasks()
-    queue.check_scheduled_tasks()
-    assert pending == []
-    assert [row for row in _events(tmp_path) if row.get("type") == "owner_notification"] == []
-    record = queue.list_scheduled_tasks(tmp_path)["tasks"][0]
-    assert record["enabled"] is True and record["last_error"] and "2000-01-01" in record["next_run_at"]
-
-
-def test_notify_row_of_a_disabled_or_missing_skill_stays_silent(tmp_path, monkeypatch):
-    """The resync never touches ``skill:`` rows, so the tick itself must not
-    ring for a skill the owner switched off or removed; and it asks about each
-    skill once per pass, not once per due row."""
-    import ouroboros.skill_loader as skill_loader
-    from ouroboros.skill_loader import compute_content_hash, save_enabled, save_skill_grants
-
-    queue, pending = _queue(tmp_path)
-    skill_dir = tmp_path / "skills" / "external" / "cal"
-    skill_dir.mkdir(parents=True)
-    (skill_dir / "SKILL.md").write_text(
-        "---\nname: cal\ndescription: calendar\nversion: 0.1\ntype: extension\nentry: plugin.py\n"
-        "permissions: [notify_owner]\n---\n# cal\n", encoding="utf-8")
-    (skill_dir / "plugin.py").write_text("def register(api): pass\n", encoding="utf-8")
-    queue.upsert_scheduled_task(_notify_row("n-ghost", source="skill:ghost", key="g"))
-    queue.upsert_scheduled_task(_notify_row("n-cal", source="skill:cal", key="c"))
-    queue.upsert_scheduled_task(_notify_row("n-cal-2", source="skill:cal", key="c2"))
-    save_skill_grants(tmp_path, "cal", [], content_hash=compute_content_hash(skill_dir, manifest_entry="plugin.py"), requested_keys=[],
-                      granted_permissions=["notify_owner"], requested_permissions=["notify_owner"])
-    save_enabled(tmp_path, "cal", False)
-    looked_up: list[str] = []
-    real_find_skill = skill_loader.find_skill
-    monkeypatch.setattr(skill_loader, "find_skill",
-                        lambda root, name: looked_up.append(name) or real_find_skill(root, name))
-    queue.check_scheduled_tasks()
-    assert [row for row in _events(tmp_path) if row.get("type") == "owner_notification"] == []
-    assert sorted(looked_up) == ["cal", "ghost"], "one discovery per skill per tick, not per due row"
-    save_enabled(tmp_path, "cal", True)
-    queue.check_scheduled_tasks()
-    notices = [row for row in _events(tmp_path) if row.get("type") == "owner_notification"]
-    assert [n["source"] for n in notices] == ["skill:cal", "skill:cal"]
-    records = {r["id"]: r for r in queue.list_scheduled_tasks(tmp_path)["tasks"]}
-    assert records["n-ghost"]["enabled"] is True and not records["n-ghost"].get("completed_at")
-    assert records["n-cal"]["enabled"] is False and records["n-cal"]["completed_at"]
-    assert records["n-cal-2"]["enabled"] is False and records["n-cal-2"]["completed_at"]
-
-
-def test_notify_row_of_a_skill_whose_grant_was_revoked_stays_silent(tmp_path):
-    """The owner's grant is the consent that armed the row: revoking it keeps
-    the row silent (and visible in Activity) exactly as disabling the skill."""
-    from ouroboros.skill_loader import compute_content_hash, save_enabled, save_skill_grants
-
-    queue, _pending = _queue(tmp_path)
-    skill_dir = tmp_path / "skills" / "external" / "cal"
-    skill_dir.mkdir(parents=True)
-    (skill_dir / "SKILL.md").write_text(
-        "---\nname: cal\ndescription: calendar\nversion: 0.1\ntype: extension\nentry: plugin.py\n"
-        "permissions: [notify_owner]\n---\n# cal\n", encoding="utf-8")
-    (skill_dir / "plugin.py").write_text("def register(api): pass\n", encoding="utf-8")
-    save_enabled(tmp_path, "cal", True)
-    queue.upsert_scheduled_task(_notify_row("n-cal", source="skill:cal", key="c"))
-    queue.check_scheduled_tasks()  # no grant yet: silent, still armed
-    assert [row for row in _events(tmp_path) if row.get("type") == "owner_notification"] == []
-    assert queue.list_scheduled_tasks(tmp_path)["tasks"][0]["enabled"] is True
-    save_skill_grants(tmp_path, "cal", [], content_hash=compute_content_hash(skill_dir, manifest_entry="plugin.py"), requested_keys=[],
-                      granted_permissions=["notify_owner"], requested_permissions=["notify_owner"])
-    queue.check_scheduled_tasks()
-    assert len([row for row in _events(tmp_path) if row.get("type") == "owner_notification"]) == 1
-
-
-def test_notify_row_unknown_append_does_not_retry_or_duplicate(tmp_path, monkeypatch):
-    from ouroboros import utils
-
-    queue, pending = _queue(tmp_path)
-    queue.upsert_scheduled_task(_notify_row("n-retry"))
-    real_append = utils.append_jsonl
-    monkeypatch.setattr(utils, "append_jsonl", lambda path, obj, **kw: False if path.name == "events.jsonl" and obj.get("type") == "owner_notification" else real_append(path, obj, **kw))
-    queue.check_scheduled_tasks()
-    record = queue.list_scheduled_tasks(tmp_path)["tasks"][0]
-    assert record["enabled"] is False and record.get("completed_at")
-    assert "notification log write failed" in str(record.get("last_error") or "")
-    monkeypatch.setattr(utils, "append_jsonl", real_append)
-    queue.check_scheduled_tasks()
-    record = queue.list_scheduled_tasks(tmp_path)["tasks"][0]
-    assert record["enabled"] is False and record["completed_at"]
-    assert [row for row in _events(tmp_path) if row.get("type") == "owner_notification"] == []
-
-
-def test_notify_append_that_landed_but_lost_its_receipt_does_not_repeat(tmp_path, monkeypatch):
-    from ouroboros import utils
-
-    queue, _pending = _queue(tmp_path)
-    queue.upsert_scheduled_task(_notify_row("n-ambiguous"))
-    real_append = utils.append_jsonl
-
-    def lost_receipt(path, obj, **kw):
-        landed = real_append(path, obj, **kw)
-        return False if obj.get("type") == "owner_notification" else landed
-
-    monkeypatch.setattr(utils, "append_jsonl", lost_receipt)
-    queue.check_scheduled_tasks()
-    monkeypatch.setattr(utils, "append_jsonl", real_append)
-    queue.check_scheduled_tasks()
-    assert len([r for r in _events(tmp_path) if r.get("type") == "owner_notification"]) == 1
-    record = queue.list_scheduled_tasks(tmp_path)["tasks"][0]
-    assert record["completed_at"] and "notification log write failed" in record["last_error"]
-
-
-def test_notify_precommits_table_before_append_even_when_later_write_fails(tmp_path, monkeypatch):
-    """An append can reach Telegram before the table write fails. The next tick
-    must not repeat that already-accepted occurrence."""
-    from supervisor import queue_schedules
-
-    queue, pending = _queue(tmp_path)
-    queue.upsert_scheduled_task(_notify_row("n-once"))
-    real_write = queue_schedules._write_scheduled_tasks
-    writes = 0
-
-    def write_then_fail(data, drive_root=None):
-        nonlocal writes
-        writes += 1
-        if writes > 1:
-            raise OSError("later table write failed")
-        return real_write(data, drive_root)
-
-    monkeypatch.setattr(queue_schedules, "_write_scheduled_tasks", write_then_fail)
-    queue.check_scheduled_tasks()
-    assert len([r for r in _events(tmp_path) if r.get("type") == "owner_notification"]) == 1
-    queue.check_scheduled_tasks()
-    assert len([r for r in _events(tmp_path) if r.get("type") == "owner_notification"]) == 1
-    assert queue.list_scheduled_tasks(tmp_path)["tasks"][0]["completed_at"]
-
-
-def test_notify_never_appends_if_the_table_cannot_record_the_attempt(tmp_path, monkeypatch):
-    from supervisor import queue_schedules
-
-    queue, pending = _queue(tmp_path)
-    queue.upsert_scheduled_task(_notify_row("n-no-table"))
-    monkeypatch.setattr(queue_schedules, "_write_scheduled_tasks", lambda *a, **kw: (_ for _ in ()).throw(OSError("disk")))
-    queue.check_scheduled_tasks()
-    assert [r for r in _events(tmp_path) if r.get("type") == "owner_notification"] == []
-    assert queue.list_scheduled_tasks(tmp_path)["tasks"][0]["enabled"] is True
-
-
-def test_task_claim_before_due_notify_is_admitted_before_notify_precommit(tmp_path, monkeypatch):
-    """A notify precommit cannot strand an earlier task claim in the table if
-    a later write fails before that task's out-of-lock admission."""
-    queue, pending = _queue(tmp_path)
-    queue.upsert_scheduled_task({
-        "id": "task-first", "name": "one task", "source": "task_followup", "enabled": True,
-        "trigger": {"type": "once", "run_at": "2000-01-01T00:00:00+00:00"},
-        "task": {"type": "task", "text": "Admit me first", "chat_id": 1,
-                 "metadata": {"resource_intent": {"kind": "system_repo"}}},
-    })
-    queue.upsert_scheduled_task(_notify_row("notify-second"))
-    from supervisor import queue_schedules
-
-    real_write = queue_schedules._write_scheduled_tasks
-
-    def fail_before_write(*_a, **_kw):
-        raise OSError("table unavailable before rename")
-
-    monkeypatch.setattr(queue_schedules, "_write_scheduled_tasks", fail_before_write)
-    queue.check_scheduled_tasks()
-    assert pending == []
-    assert [r for r in _events(tmp_path) if r.get("type") == "owner_notification"] == []
-    assert not queue.list_scheduled_tasks(tmp_path)["tasks"][0].get("occurrence")
-    monkeypatch.setattr(queue_schedules, "_write_scheduled_tasks", real_write)
-    queue.check_scheduled_tasks()
-    assert len(pending) == 1 and pending[0]["text"] == "Admit me first"
-    assert [r for r in _events(tmp_path) if r.get("type") == "owner_notification"] == []
-    queue.check_scheduled_tasks()
-    assert len([r for r in _events(tmp_path) if r.get("type") == "owner_notification"]) == 1
-
-
-def test_followup_notify_write_oserror_is_not_a_scheduled_success(tmp_path, monkeypatch):
-    from supervisor import queue
-
-    ctx = _ctx(tmp_path)
-
-    def unavailable(*_a, **_kw):
-        raise OSError("disk unavailable")
-
-    monkeypatch.setattr(queue, "upsert_scheduled_task", unavailable)
-    result = _followup(ctx, notify=True, objective="Call mother")
-    assert "FOLLOWUP_NOTIFY_OUTCOME_UNKNOWN" in result
-    assert not result.startswith("FOLLOWUP_SCHEDULED")
-
-
-def test_notify_row_projects_its_text_as_the_model_preview_and_audits_its_kind(tmp_path):
-    queue, _pending = _queue(tmp_path)
-    queue.upsert_scheduled_task(_notify_row("n-view", text="Dentist at 9"))
-    from supervisor.queue_schedules import _schedule_projection_row
-
-    row = _schedule_projection_row(queue.list_scheduled_tasks(tmp_path)["tasks"][0])
-    assert row["kind"] == "notify" and row["objective_preview"] == "Dentist at 9"
-    audits = [row for row in _events(tmp_path) if row.get("type") == "schedule_mutation"]
-    assert audits and all("Dentist" not in json_dumps(a) for a in audits), "the sentence never enters the audit"
-    assert any((a.get("after") or {}).get("kind") == "notify" for a in audits)
-
-
-def json_dumps(value):
-    import json
-
-    return json.dumps(value, ensure_ascii=False)
-
-
-def test_suppressed_notify_row_never_fires_until_the_owner_restores_it(tmp_path):
-    queue, pending = _queue(tmp_path)
-    queue.upsert_scheduled_task(_notify_row("n-off"))
-    off = queue.mutate_scheduled_task("disable", "n-off", reason="owner: stop", actor="owner:gateway", drive_root=tmp_path)
-    assert off["status"] == "updated"
-    queue.check_scheduled_tasks()
-    assert [row for row in _events(tmp_path) if row.get("type") == "owner_notification"] == []
-    record = queue.list_scheduled_tasks(tmp_path)["tasks"][0]
-    assert queue.schedule_lifecycle_status(record) == "suppressed" and record["enabled"] is False
-    # An upsert of the same row (the skill re-posting) cannot re-arm it either.
-    queue.upsert_scheduled_task({**_notify_row("n-off"), "trigger": {"type": "once", "run_at": "2000-01-02T00:00:00+00:00"}})
-    queue.check_scheduled_tasks()
-    assert [row for row in _events(tmp_path) if row.get("type") == "owner_notification"] == []
-    assert queue.mutate_scheduled_task("restore", "n-off", reason="owner: back", actor="owner:gateway", drive_root=tmp_path)["ok"] is True
-    queue.check_scheduled_tasks()
-    assert len([row for row in _events(tmp_path) if row.get("type") == "owner_notification"]) == 1
-
-
-def test_unknown_schedule_kind_is_left_untouched_with_a_typed_error(tmp_path):
-    queue, pending = _queue(tmp_path)
-    queue.upsert_scheduled_task({**_notify_row("n-weird"), "kind": "future_action"})
-    queue.check_scheduled_tasks()
-    assert pending == [], "an unknown verb never dispatches a model task"
-    record = queue.list_scheduled_tasks(tmp_path)["tasks"][0]
-    assert record["enabled"] is True and not record.get("completed_at") and not record.get("last_run_at")
-    assert "unsupported schedule kind: future_action" in record["last_error"]
-    assert [row for row in _events(tmp_path) if row.get("type") == "owner_notification"] == []
-
-
-def test_notify_row_with_the_longest_producer_key_still_fires(tmp_path):
-    """The route accepts 128-character keys; the occurrence key must fit the
-    same cap, so a long key rides as its digest instead of never firing."""
-    queue, pending = _queue(tmp_path)
-    long_key = "k" * 128
-    queue.upsert_scheduled_task(_notify_row("n-long", key=long_key))
-    queue.check_scheduled_tasks()
-    notices = [row for row in _events(tmp_path) if row.get("type") == "owner_notification"]
-    assert len(notices) == 1 and len(notices[0]["key"]) <= 128 and notices[0]["key"].endswith("@2000-01-01T00:00:00+00:00")
-    record = queue.list_scheduled_tasks(tmp_path)["tasks"][0]
-    assert record["enabled"] is False and record["completed_at"] and record.get("last_error") == ""
-
-
-def test_notify_row_that_the_emitter_rejects_records_why(tmp_path):
-    queue, pending = _queue(tmp_path)
-    queue.upsert_scheduled_task({**_notify_row("n-empty"), "notification": {"text": "   ", "key": "e"}})
-    queue.check_scheduled_tasks()
-    record = queue.list_scheduled_tasks(tmp_path)["tasks"][0]
-    assert record["enabled"] is True and not record.get("completed_at")
-    assert "invalid notification" in str(record.get("last_error") or ""), "the durable row says why it never rings"
-    assert [row for row in _events(tmp_path) if row.get("type") == "owner_notification"] == []

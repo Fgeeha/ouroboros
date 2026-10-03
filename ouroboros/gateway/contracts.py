@@ -257,6 +257,10 @@ class ChatOutbound(TypedDict):
     handoff_id: NotRequired[str]  # immutable origin/destination receipt identity
     terminal_time: NotRequired[Dict[str, Any]]  # host-owned occurrence, separate from publication ts
     completion_answer: NotRequired[str]  # a Project root's model-authored final answer, mirrored into Main (DESIGN)
+    # A `reminder` System row's provenance (live frame only; the row's text carries the signature).
+    set_at: NotRequired[str]  # when its words were written
+    scheduled_for: NotRequired[str]  # the due point it was written for
+    delivered_at: NotRequired[str]  # when the host showed it (later than due after downtime)
     chat_id: NotRequired[int]  # present on some transport re-broadcast paths
     # Server-stamped when chat_id is a reserved Project thread: Main never
     # adopts it, even before the browser has learned the project.
