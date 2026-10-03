@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import pathlib
 from typing import Any, Dict, List
 
@@ -28,6 +29,11 @@ _ALLOWED_LOGS = {
 
 
 async def api_logs_tail(request: Request) -> JSONResponse:
+    # Child discovery, archived reads and projection can all touch disk.
+    return await asyncio.to_thread(_logs_tail, request)
+
+
+def _logs_tail(request: Request) -> JSONResponse:
     name = str(request.path_params.get("name") or "").strip().lower()
     filename = _ALLOWED_LOGS.get(name)
     if not filename:

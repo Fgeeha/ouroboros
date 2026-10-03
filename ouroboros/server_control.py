@@ -173,7 +173,8 @@ def restart_current_process(
             )
             log.info("Spawned replacement server process after exec failure.")
         except Exception:
-            log.exception("Spawned restart fallback failed; exiting with restart code only.")
+            log.exception("Spawned restart fallback failed; no successor was started.")
+            raise
 
 
 def execute_panic_stop(

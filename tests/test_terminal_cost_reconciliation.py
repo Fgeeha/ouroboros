@@ -194,19 +194,52 @@ def test_detached_basis_detects_in_place_changes_and_absent_bucket_integrity(env
     assert row["ledger_integrity_degraded"] and not row["cost_final"]
 
 
-def test_unknown_same_amount_is_not_final_and_never_memoized(env):
+@pytest.mark.parametrize("price", ["unresolved", "estimated", "unknown_component"])
+def test_equal_nonfinal_projection_is_reused_until_inputs_change(env, monkeypatch, price):
     task(env)
     reservation = attempt(env, final=False)
+    if price == "estimated":
+        usage.settle_attempt(reservation, cost_usd=1.0, cost_final=False)
+    elif price == "unknown_component":
+        usage.settle_attempt(reservation, cost_usd=1.0, cost_final=True)
+        usage.record_subscription_session("unknown", drive_root=env.root, route="subscription",
+                                          task_id="root", root_task_id="root")
+    warm(env)
+    before = task_results.load_task_result(env.root, "root")
+    assert before["accounted_upper_bound_usd"] == 1.0 and not before["cost_final"]
+    counts = observe(monkeypatch)
+    maintenance._reconcile_abandoned_usage(env.root)
+    assert counts == {}, "equality reuses an observation without declaring its cost final"
+    if price != "unresolved":
+        # Settled estimates are immutable; a genuinely new receipt changes the
+        # full bucket even if the amount of the prior estimate remains equal.
+        attempt(env, cost=0.0)
+    else:
+        usage.settle_attempt(reservation, cost_usd=1.0, cost_final=True)
+    counts.clear()
+    maintenance._reconcile_abandoned_usage(env.root)
+    assert counts["projections"] >= 1
+    after = task_results.load_task_result(env.root, "root")
+    assert after["accounted_upper_bound_usd"] == 1.0
+    if price == "unresolved":
+        assert after["cost_final"]
+        assert after["cost_presentation"] != before["cost_presentation"]
+    else:
+        assert not after["cost_final"]
+
+
+def test_equal_unknown_amount_still_has_no_memo(env):
+    task(env)
+    reservation = usage.reserve_attempt(usage.AttemptRequest(
+        model="test", provider="opaque", force_unknown_reservation=True,
+        drive_root=env.root, task_id="root", root_task_id="root", global_limit_usd=100.0))
+    usage.mark_dispatched(reservation)
+    usage.settle_attempt(reservation, cost_usd=None, cost_final=False)
     for _ in range(3):
         maintenance._reconcile_abandoned_usage(env.root)
         assert key(env) not in reconciliation._EQUAL_PROJECTIONS
-    before = task_results.load_task_result(env.root, "root")
-    assert before["accounted_upper_bound_usd"] == 1.0 and not before["cost_final"]
-    usage.settle_attempt(reservation, cost_usd=1.0, cost_final=True)
-    warm(env)
-    after = task_results.load_task_result(env.root, "root")
-    assert after["accounted_upper_bound_usd"] == 1.0 and after["cost_final"]
-    assert after["cost_presentation"] != before["cost_presentation"]
+    row = task_results.load_task_result(env.root, "root")
+    assert row["accounted_upper_bound_usd"] is None and not row["cost_final"]
 
 
 @pytest.mark.parametrize("change", ["deleted", "malformed", "schema", "postwork", "replacement"])
@@ -354,9 +387,14 @@ def test_retained_remote_recovery_is_independent_of_prior_equal_proof(env, monke
     # ledger: a retained receipt can arrive without any local accounting append.
     usage.terminalize_abandoned_attempt(reservation, reason="owner_task_terminal")
     maintenance._reconcile_abandoned_usage(env.root)
+    maintenance._reconcile_abandoned_usage(env.root)  # separately confirm the rewritten fields
+    assert key(env) in reconciliation._EQUAL_PROJECTIONS
+    counts = observe(monkeypatch)
+    maintenance._reconcile_abandoned_usage(env.root)
+    assert counts["projections"] == 0
     receipt[0] = ("settled", {"prompt_tokens": 2}, 0.2, True)
     maintenance._reconcile_abandoned_usage(env.root)
-    assert calls == [reservation.attempt_id] * 3
+    assert calls == [reservation.attempt_id] * 5
     assert task_results.load_task_result(env.root, "root")["accounted_upper_bound_usd"] == 0.6
 
 

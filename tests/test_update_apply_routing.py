@@ -722,7 +722,15 @@ def test_replace_apply_publishes_smoke_proof_only_after_pass(monkeypatch):
     assert [tx["pre_restart_smoke"] for tx in writes] == ["pending", "pending", "passed"]
 
 
-def test_writer_fence_order(monkeypatch):
+@pytest.mark.parametrize("service, blocked", [
+    ({"state": "stopped"}, False),
+    ({"state": "stopped", "cleanup_dispatched": True}, False),
+    ({"state": "running"}, True),
+    ({"state": "cleanup_pending"}, True),
+    ({"lifecycle": "cleanup_pending"}, True),
+    ({"state": "stopped", "cleanup_dispatched": False}, True),
+])
+def test_writer_fence_order(monkeypatch, service, blocked):
     import ouroboros.process_custody as process_custody
     import ouroboros.tools.services as services
     import supervisor.workers as workers
@@ -738,7 +746,7 @@ def test_writer_fence_order(monkeypatch):
     monkeypatch.setattr(
         services,
         "kill_all_services",
-        lambda *_args, **_kwargs: calls.append("kill_services") or [],
+        lambda *_args, **_kwargs: calls.append("kill_services") or [{"service_id": "test", **service}],
     )
     # The custody sweep is the fence's fifth step and reads
     # supervisor.git_ops.DRIVE_ROOT. The shared pytest bootstrap now rebinds it
@@ -752,7 +760,7 @@ def test_writer_fence_order(monkeypatch):
         lambda *_args, **_kwargs: (calls.append("quiesce_custody") or (True, [])),
     )
 
-    assert control._quiesce_repo_writers("test") == []
+    assert control._quiesce_repo_writers("test") == (["service:test"] if blocked else [])
     assert calls == ["close", "drain", "kill_workers", "kill_services", "quiesce_custody"]
 
 

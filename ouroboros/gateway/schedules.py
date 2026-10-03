@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
@@ -19,6 +21,10 @@ def _enabled_value(payload: dict) -> bool | str:
 
 
 async def api_schedules_list(_request: Request) -> JSONResponse:
+    return await asyncio.to_thread(_schedules_list, _request)
+
+
+def _schedules_list(_request: Request) -> JSONResponse:
     try:
         from supervisor.queue import ScheduleStoreUnreadable, load_schedule_store, schedule_activity_projection
 

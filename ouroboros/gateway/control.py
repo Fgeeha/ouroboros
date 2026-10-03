@@ -52,11 +52,13 @@ def _managed_update_payload(*, fetch: bool, include_tags: bool) -> dict[str, Any
 
     status = compute_managed_update_status(fetch=fetch)
     # The update letter rides the same payload: written only after a FETCHING
-    # check (never on the passive read), projected against the live HEAD/target.
+    # check (never on the passive read), with the running source separate from
+    # the mutable checkout HEAD that binds apply/preflight.
     letter = None
     try:
         from ouroboros import update_letter as _letter
 
+        status = _letter.runtime_status(status)
         if fetch:
             _letter.refresh_after_check(status)
         letter = _letter.project_letter_for_panel(status)
@@ -348,7 +350,9 @@ async def api_git_promote(request: Request) -> JSONResponse:
 async def api_update_status(_request: Request) -> JSONResponse:
     """Return passive managed-update status without fetching."""
     try:
-        return JSONResponse(_managed_update_payload(fetch=False, include_tags=False))
+        return JSONResponse(await asyncio.to_thread(
+            _managed_update_payload, fetch=False, include_tags=False,
+        ))
     except Exception as exc:
         return json_exception(exc)
 
@@ -476,7 +480,9 @@ def _quiesce_repo_writers(reason: str) -> list[str]:
         str(item.get("service_id") or item.get("name") or "unknown")
         for item in stopped
         if isinstance(item, dict)
-        and (item.get("stop_failed") or item.get("state") == "running" or item.get("lifecycle") == "running")
+        and (item.get("stop_failed") or item.get("cleanup_dispatched") is False
+             or item.get("state") in {"running", "cleanup_pending"}
+             or item.get("lifecycle") in {"running", "cleanup_pending"})
     ]
     try:
         from ouroboros.process_custody import quiesce_custodied_services

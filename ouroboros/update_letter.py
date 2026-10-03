@@ -22,11 +22,10 @@ Storage is one file, ``data/state/update_letter.json``, with one writer —
 ``refresh_after_check``, which runs synchronously inside a FETCHING update check (boot and
 the Updates panel's "Check for updates" button) — and one reader shape, ``project_letter``,
 shared by the Updates panel payload and the agent's Runtime context
-(``official_update_projection``). The projection compares recorded SHAs with the live HEAD by
-equality plus ONE ancestry fact the check recorded (``target_in_head``; no git on the hot
-context path): a divergent install consumes an official target through a merge commit
-(``supervisor/update_merge.py``), so ``applied`` cannot mean HEAD == target; a HEAD that merely
-moved elsewhere reads as ``other``.
+(``official_update_projection``). Exact ranges and recorded ancestry keep Git off hot
+reads. The panel uses the captured server-generation baseline; task context retains its
+own checkout origin. Separate ancestry witnesses prevent a merge landed on disk from
+claiming that the still-running server adopted it. Successful unchanged ranges are reused.
 """
 
 from __future__ import annotations
@@ -301,11 +300,11 @@ def _request_text(status: Dict[str, Any], material: Dict[str, Any], target_versi
     from ouroboros import get_version
 
     facts = {
-        "running": {"version": get_version(), "sha": str(status.get("current_sha") or "")},
-        "official_target": {"version": target_version, "sha": str(status.get("latest_sha") or "")},
+        "running": {"version": get_version(), "sha": _key_from_status(status)["base_sha"]},
+        "official_target": {"version": target_version, "sha": _key_from_status(status)["target_sha"]},
         "update_channel": str(status.get("update_channel") or ""),
-        "commits_behind": status.get("behind"),
-        "commits_ahead": status.get("ahead"),
+        "checkout": {"sha": str(status.get("current_sha") or ""),
+                     "commits_behind": status.get("behind"), "commits_ahead": status.get("ahead")},
         "checked_at": str(status.get("checked_at") or ""),
     }
     return (
@@ -595,10 +594,21 @@ def read_record(drive_root: Optional[pathlib.Path] = None) -> Optional[Dict[str,
     return record if record and isinstance(record.get("key"), dict) else None
 
 
+def runtime_status(status: Dict[str, Any]) -> Dict[str, Any]:
+    """Add the startup source baseline without changing checkout/apply pins.
+
+    Target validation belongs to git_ops_updates, including a consumed target.
+    This reader never fetches or reconstructs that cache's authority.
+    """
+    from ouroboros.server_process import server_source_baseline
+
+    return {**status, "running_sha": server_source_baseline()}
+
+
 def _key_from_status(status: Dict[str, Any]) -> Dict[str, str]:
     return {
-        "base_sha": str(status.get("current_sha") or ""),
-        "target_sha": str(status.get("latest_sha") or ""),
+        "base_sha": str(status.get("running_sha", status.get("current_sha")) or ""),
+        "target_sha": str(status.get("checked_target_sha") or status.get("latest_sha") or ""),
         "update_channel": str(status.get("update_channel") or ""),
         "target_ref": str(status.get("target_ref") or ""),
     }
@@ -610,23 +620,21 @@ def refresh_after_check(
     drive_root: Optional[pathlib.Path] = None,
     llm_client: Any = None,
 ) -> Optional[Dict[str, Any]]:
-    """Write the letter after a successful FETCHING check; never raise, never delete.
+    """Refresh on a successful fetch, reusing a successful identical source range.
 
-    Every successful check records the HEAD it checked (``checked_head_sha``), letter or
-    not, so the Runtime fact can tell "checked and current" from "moved since". No
-    available update leaves any stored letter as it is (an applied update keeps its
-    letter — that is the "what changed in this version" text). ``check_ok`` other than
-    True writes nothing. A concurrent refresh waits for the in-flight one (bounded by the
-    letter timeout) and shares its result for the same key instead of paying twice.
+    The source is the server generation's captured baseline, independently of the
+    checkout used to apply an update. No new range leaves the stored letter intact.
+    Concurrent checks share the in-flight write, failed attempts keep the last good
+    text, and the existing check remains the only writer (no background paid retry).
     """
     try:
         current = read_record(drive_root)
         if status.get("check_ok") is not True:
             return current
         key = _key_from_status(status)
-        if not key["base_sha"]:
-            return current
-        no_update = not status.get("available") or not key["target_sha"]
+        checkout_sha = str(status.get("current_sha") or "")
+        no_update = (not key["target_sha"] or key["base_sha"] == key["target_sha"]
+                     or (not status.get("available") and key["base_sha"] == checkout_sha))
         seen = _WRITE_SEQ
         # EVERY record write goes through this lock, the letterless mark included: a
         # no-update check that read the record before a letter landed would otherwise
@@ -637,10 +645,22 @@ def refresh_after_check(
             # The writer that held the lock may have produced this very letter: share it
             # (one physical attempt for concurrent checks of the same key).
             if _WRITE_SEQ > seen and _LAST_WRITTEN[:2] == (key, _root_id(drive_root)):
-                return _LAST_WRITTEN[2]
+                return _mark_checked(_LAST_WRITTEN[2], key, drive_root, checkout_sha=checkout_sha)
             current = read_record(drive_root)
+            if not key["base_sha"]:
+                record = _new_record(key, "")
+                record.update(error_kind="runtime_source_unavailable",
+                              error_text="The running server's source baseline is unavailable; no description was requested.")
+                if current:
+                    record["last_good"] = shown_letter(current)[0] if shown_letter(current)[1] else None
+                record = _mark_checked(record, key, drive_root, checkout_sha=checkout_sha)
+                _note_written(key, drive_root, record)
+                return record
             if no_update:
-                return _mark_checked(current, key, drive_root)
+                return _mark_checked(current, key, drive_root, checkout_sha=checkout_sha)
+            shown, text, _last_good = shown_letter(current) if current else ({}, "", None)
+            if shown.get("state") == "ready" and text and shown.get("key") == key:
+                return _mark_checked(current, key, drive_root, checkout_sha=checkout_sha)
             try:
                 material = collect_range_material(key["base_sha"], key["target_sha"])
             except MaterialUnavailable as exc:
@@ -652,15 +672,14 @@ def refresh_after_check(
                 material = None
             else:
                 if not material.get("commits") and not material.get("releases"):
-                    return _mark_checked(current, key, drive_root)
+                    return _mark_checked(current, key, drive_root, checkout_sha=checkout_sha)
                 record = write_letter(status, material, drive_root=drive_root, llm_client=llm_client)
             if record.get("state") != "ready" and current:
                 # D-KEEP for the supersede case too: a good letter is never lost to a
                 # failed rewrite, whatever range the failed attempt was for.
                 previous_good = current if current.get("state") == "ready" else current.get("last_good")
                 record["last_good"] = previous_good or None
-            record["target_in_head"] = _shown_target_in_head(record, key["base_sha"])
-            atomic_write_json(record_path(drive_root), record)
+            record = _mark_checked(record, key, drive_root, checkout_sha=checkout_sha)
             _note_written(key, drive_root, record)
             return record
         finally:
@@ -683,7 +702,8 @@ def _note_written(key: Dict[str, str], drive_root: Optional[pathlib.Path], recor
 
 
 def _mark_checked(current: Optional[Dict[str, Any]], key: Dict[str, str],
-                  drive_root: Optional[pathlib.Path], *, git: Optional[GitCapture] = None) -> Dict[str, Any]:
+                  drive_root: Optional[pathlib.Path], *, git: Optional[GitCapture] = None,
+                  checkout_sha: Optional[str] = None) -> Dict[str, Any]:
     """Record the checked HEAD without touching any letter. A letterless record (``state: none``)
     follows the check it describes — its key and the official target's VERSION — so the Runtime
     fact can name the version an up-to-date install is current with."""
@@ -691,8 +711,11 @@ def _mark_checked(current: Optional[Dict[str, Any]], key: Dict[str, str],
     if record.get("state") == "none":
         record["key"] = key
         record["target_version"] = _version_at(git or _default_git(), key["target_sha"] or key["base_sha"])
-    record["checked_head_sha"] = key["base_sha"]
-    record["target_in_head"] = _shown_target_in_head(record, key["base_sha"], git=git)
+    record["checked_running_sha"] = key["base_sha"]
+    record["target_in_running"] = _shown_target_in_head(record, key["base_sha"], git=git)
+    record["checked_head_sha"] = key["base_sha"] if checkout_sha is None else checkout_sha
+    record["target_in_head"] = (record["target_in_running"] if record["checked_head_sha"] == key["base_sha"]
+                                else _shown_target_in_head(record, record["checked_head_sha"], git=git))
     atomic_write_json(record_path(drive_root), record)
     return record
 
@@ -782,6 +805,10 @@ def project_letter(
         "error_text": str(record.get("error_text") or ""),
         "key": dict(key),
         "has_last_good": bool(last_good and last_good.get("text")),
+        "description_current": bool(provenance.get("state") == "ready" and text
+                                    and base and head == base and latest == target),
+        "failed_at": str(record.get("written_at") or "") if record.get("state") == "failed" else "",
+        "latest_failed_key": dict(record.get("key") or {}) if record.get("state") == "failed" else None,
     }
 
 
@@ -790,12 +817,19 @@ def project_letter_for_panel(
     *,
     drive_root: Optional[pathlib.Path] = None,
 ) -> Optional[Dict[str, Any]]:
-    """The Updates panel's projection: the same record, the same reader, the same answer as
-    the Runtime context — the ancestry fact was recorded by the check, so no git runs here."""
+    """Project against the server baseline; task context retains its own checkout origin.
+
+    Both use the same reader; separate recorded ancestry facts prevent checkout
+    movement from claiming server adoption. No git runs on either read path.
+    """
+    record = read_record(drive_root)
+    if record and "running_sha" in status:
+        record = {**record, "checked_head_sha": record.get("checked_running_sha"),
+                  "target_in_head": record.get("target_in_running", False)}
     return project_letter(
-        read_record(drive_root),
-        head_sha=str(status.get("current_sha") or ""),
-        latest_sha=str(status.get("latest_sha") or ""),
+        record,
+        head_sha=_key_from_status(status)["base_sha"],
+        latest_sha=_key_from_status(status)["target_sha"],
     )
 
 
