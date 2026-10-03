@@ -1,5 +1,17 @@
 # DEPLOYMENT.md — Deployment Notes
 
+## Container Restart Policy and Panic
+
+The Docker image starts `server.py` directly, outside the desktop launcher's
+automatic-start check. Docker restart policies `always` and `unless-stopped`
+can therefore restart it after Panic and consume the saved stop marker; Panic
+inside Ouroboros is not a manual `docker stop`. `on-failure` also restarts it
+because Panic exits the server with code 99. Use `restart: "no"` (the Docker
+default) when Panic must keep the container stopped, and start it again only
+when the owner intends to resume. The server currently has no
+`OUROBOROS_LAUNCH_INTENT` guard. See Docker's
+[restart policy documentation](https://docs.docker.com/engine/containers/start-containers-automatically/).
+
 ## Trusted Docker / Kubernetes Non-Local Binds
 
 By default, saving `OUROBOROS_SERVER_HOST=0.0.0.0` through the Settings UI

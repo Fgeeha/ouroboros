@@ -6,7 +6,7 @@ Documentation=https://github.com/razzant/ouroboros
 Type=simple
 # Native packages install the release-reviewed launcher at this fixed path.
 # The launcher remains the sole owner of bootstrap, restart, panic, and cleanup.
-ExecStart=/opt/ouroboros/Ouroboros
+ExecStart=/opt/ouroboros/Ouroboros --launch-intent automatic
 
 # Stop the complete launcher/server/worker tree started by this unit.
 KillMode=control-group
