@@ -26,6 +26,7 @@ from ouroboros.server_auth import (
     validate_network_auth_configuration,
 )
 from ouroboros.server_entrypoint import bound_service_socket, find_free_port, parse_server_args, write_port_file
+from ouroboros.launcher_bootstrap import automatic_launch_allowed
 from ouroboros.server_web import NoCacheStaticFiles, make_index_page, resolve_web_dir
 from ouroboros.usage_accounting import ensure_legacy_imported
 from ouroboros.task_finalization import host_operation_reply_kwargs
@@ -1659,6 +1660,8 @@ def _emergency_process_cleanup(*, port_sweep: bool = True) -> None:
         pass
 
 def main() -> int:
+    if not automatic_launch_allowed(os.environ.get("OUROBOROS_LAUNCH_INTENT", "owner"), DATA_DIR, log):
+        return 0
     # A benchmark-owned child may receive an integrity pin from its parent.
     # Verify the exact bytes before even resolving the saved bind host; a
     # malformed/replaced snapshot must not be converted into product defaults.

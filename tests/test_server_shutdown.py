@@ -388,6 +388,44 @@ def test_failed_boot_rollback_does_not_restart(monkeypatch):
     assert calls == ["update_status_ready"]
 
 
+@pytest.mark.parametrize("intent,marker,starts", [
+    ("automatic", "panic", False),
+    ("automatic", "owner_restart_no_resume", True),
+    ("automatic", None, True),
+    ("owner", "panic", True),
+    (None, "panic", True),
+])
+def test_main_automatic_start_preserves_panic(monkeypatch, tmp_path, capsys, intent, marker, starts):
+    import server
+
+    monkeypatch.setattr(server, "DATA_DIR", tmp_path)
+    if intent is None:
+        monkeypatch.delenv("OUROBOROS_LAUNCH_INTENT", raising=False)
+    else:
+        monkeypatch.setenv("OUROBOROS_LAUNCH_INTENT", intent)
+    flag = tmp_path / "state" / "panic_stop.flag"
+    if marker is not None:
+        flag.parent.mkdir()
+        flag.write_text(marker, encoding="utf-8")
+
+    class ReachedStartup(Exception):
+        pass
+
+    def start():
+        raise ReachedStartup()
+
+    monkeypatch.setattr(server, "verify_settings_integrity", start)
+    if starts:
+        with pytest.raises(ReachedStartup):
+            server.main()
+    else:
+        assert server.main() == 0
+        assert "Ouroboros is stopped. Use Start to resume." in capsys.readouterr().out
+    assert flag.exists() is (marker is not None)
+    if marker is not None:
+        assert flag.read_text(encoding="utf-8") == marker
+
+
 def test_main_normal_exit_does_not_run_emergency_cleanup(monkeypatch, tmp_path):
     import server
 
