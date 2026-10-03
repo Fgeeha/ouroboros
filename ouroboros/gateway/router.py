@@ -140,6 +140,7 @@ def collect_routes(
         api_settings_get,
         api_settings_post,
     )
+    from ouroboros.gateway.settings_secrets import api_settings_secret
     from ouroboros.gateway.presence_settings import api_owner_skill_presence_runtime
     from ouroboros.gateway.ws import ws_endpoint
     settings_handlers = settings_handlers or {}
@@ -213,13 +214,10 @@ def collect_routes(
             endpoint=api_onboarding_subagents_preview,
             methods=["POST"],
         ),
-        Route(
-            "/api/onboarding/complete",
-            endpoint=api_onboarding_complete,
-            methods=["POST"],
-        ),
+        Route("/api/onboarding/complete", endpoint=api_onboarding_complete, methods=["POST"]),
         Route("/api/settings", endpoint=settings_get, methods=["GET"]),
         Route("/api/settings", endpoint=settings_post, methods=["POST"]),
+        Route("/api/settings/secret", endpoint=api_settings_secret, methods=["POST"]),
         Route("/api/ui/preferences", endpoint=api_ui_preferences_get, methods=["GET"]),
         Route("/api/ui/preferences", endpoint=api_ui_preferences_post, methods=["POST"]),
         Route("/api/owner/runtime-mode", endpoint=api_owner_runtime_mode, methods=["POST"]),
