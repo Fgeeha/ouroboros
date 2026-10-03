@@ -818,7 +818,6 @@ export function renderSettingsPage() {
                             <div class="settings-inline-note" data-notify-attention-status role="status" aria-live="polite"></div>
                         </div>
                     </div>
-
                 </section>
 
                 <section class="settings-panel" data-settings-panel="advanced">
