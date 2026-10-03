@@ -1282,7 +1282,6 @@
  * @property {string=} cleanupWarning
  * @property {ClaudexorVendorCredentialDisposition=} vendorCredentialDisposition
  */
-
 /**
  * Mirrors `gateway/schedule_contracts.py`, which states what each field means.
  * @typedef {Object} ScheduledTasksResponse
@@ -1315,7 +1314,6 @@
  * @typedef {Object} ScheduleDeleteResponse
  * @property {boolean} ok
  */
-
 /**
  * @typedef {Object} TaskPauseRequest
  * @property {string} request_id
@@ -1419,13 +1417,11 @@
  * @property {boolean=} duplicate
  * @property {string=} error
  */
-
 /**
  * @typedef {Object} LogTailResponse
  * @property {string} name
  * @property {Object[]} entries
  */
-
 /**
  * @typedef {Object} SkillDeleteResponse
  * @property {boolean} ok
@@ -1437,7 +1433,6 @@
  * @property {string} extension_reason
  * @property {string=} error
  */
-
 /**
  * @typedef {Object} UiPreferencesResponse
  * @property {string[]} widget_order
@@ -1449,7 +1444,12 @@
  * @property {{mode:'default'|'hidden'|'custom',text:string}} welcome  // install-wide empty-Main UI copy, not chat history
  * @property {boolean=} ok
  */
-
+/**
+ * Host sign-in registration as its OS reports it; `reason` only when unavailable.
+ * @typedef {Object} DesktopAutostartResponse
+ * @property {'unavailable'|'off'|'on'|'other_copy'|'disabled_by_os'} state
+ * @property {string=} reason
+ */
 /**
  * @typedef {Object} UpdateMergePlan
  * @property {boolean=} available

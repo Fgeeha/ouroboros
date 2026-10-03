@@ -790,6 +790,11 @@
     cursor: pointer;
 }
 
+[data-autostart-settings] .local-toggle {
+    white-space: normal;
+    flex-wrap: nowrap;
+}
+
 .local-toggle[data-warning="1"] {
     color: var(--status-warn-fg);
 }

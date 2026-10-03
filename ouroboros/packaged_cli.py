@@ -28,7 +28,9 @@ from typing import Iterable, Sequence
 sys.dont_write_bytecode = True
 os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
 
-from ouroboros.launcher_bootstrap import BootstrapContext, bootstrap_repo, check_git, embedded_python_env
+from ouroboros.launcher_bootstrap import (
+    BootstrapContext, appimage_extracts_and_runs, bootstrap_repo, check_git, embedded_python_env,
+)
 from ouroboros.platform_layer import (
     BUNDLE_DIR_ENV,
     IS_MACOS,
@@ -435,14 +437,7 @@ def _linux_appimage_relaunch_env(app: pathlib.Path) -> dict[str, str] | None:
     appimage = os.environ.get("APPIMAGE", "").strip()
     if not appimage or pathlib.Path(appimage) != app:
         return None
-    appdir = os.environ.get("APPDIR", "").strip()
-    extract_and_run = "APPIMAGE_EXTRACT_AND_RUN" in os.environ
-    if not extract_and_run and appdir:
-        # The type-2 runtime removes the explicit --appimage-extract-and-run
-        # argument before execing AppRun. Its APPDIR is then a regular directory;
-        # a normal FUSE-backed APPDIR is a mount point.
-        extract_and_run = not os.path.ismount(appdir)
-    if not extract_and_run:
+    if not appimage_extracts_and_runs():
         return None
 
     env = os.environ.copy()

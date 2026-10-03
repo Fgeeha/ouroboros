@@ -183,7 +183,8 @@ def owner_write_guard(endpoint: Callable) -> Callable:
     return _guarded
 
 
-def _owner_audit(request: Request, action: str, payload: Dict[str, Any]) -> None:
+def owner_audit(request: Request, action: str, payload: Dict[str, Any]) -> None:
+    """Record an owner action, including OS controls outside settings.json."""
     try:
         drive_root = request_drive_root(request)
     except Exception:
@@ -206,6 +207,9 @@ def _owner_audit(request: Request, action: str, payload: Dict[str, Any]) -> None
         )
     except Exception:
         log.debug("Failed to write owner API audit event", exc_info=True)
+
+
+_owner_audit = owner_audit  # Existing settings writers retain their import surface.
 
 
 def settings_document_digest() -> str:
@@ -380,6 +384,7 @@ __all__ = [
     "settings_document_mutation",
     "_CONTEXT_MODE_KEYS",
     "_owner_audit",
+    "owner_audit",
     "_owner_read_settings_raw",
     "_owner_update_settings",
     "_owner_write_settings",
