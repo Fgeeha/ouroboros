@@ -84,6 +84,53 @@ def test_an_overdue_note_still_arrives_and_shows_both_times(host):
     assert " · for Jan 1 " in signature and " · delivered " in signature, signature
 
 
+def test_an_overdue_note_reaches_extension_subscribers_on_a_provider_boot(host, monkeypatch):
+    """The first scheduler tick may consume an overdue note and the event bus keeps no
+    history, so a provider boot attaches the extensions' subscriptions (Telegram's
+    ``chat.outbound``) before it starts the supervisor. Real lifespan, scheduler tick,
+    message bus and global event bus; the supervisor start runs that first tick to its
+    end, the race's worst case (extension loading slower than supervisor init)."""
+    import threading
+
+    from starlette.testclient import TestClient
+
+    import server as srv
+    from ouroboros import event_bus, extension_loader
+    from supervisor import message_bus
+    from tests._shared import clean_extension_runtime_state
+    from tests.test_extensions_api import _patch_lifespan_for_drive_root_test
+
+    monkeypatch.setattr(message_bus, "publish_event", event_bus.publish_event)  # the real bus, not the capture
+    _note(host.queue)
+    monkeypatch.setattr(srv.app.app.state, "drive_root", host.root, raising=False)
+    monkeypatch.setattr(srv.app.app.state, "repo_dir", host.root / "repo", raising=False)
+    _patch_lifespan_for_drive_root_test(monkeypatch, srv, {})
+    monkeypatch.setattr(srv, "has_startup_ready_provider", lambda _settings: True)
+    monkeypatch.setattr(srv, "_boot_managed_update_tasks", lambda: None)
+    delivered = []
+
+    def reload_extensions(_root, _reader, *, repo_path=None):
+        event_bus.get_global_event_bus().subscribe("telegram", event_bus.CHAT_OUTBOUND, delivered.append)
+        return {}
+
+    def start_supervisor(_settings):
+        first_tick = threading.Thread(target=host.queue.check_scheduled_tasks)
+        first_tick.start()
+        first_tick.join(timeout=30)
+        return True
+
+    monkeypatch.setattr(extension_loader, "reload_all", reload_extensions)
+    monkeypatch.setattr(srv, "_start_supervisor_if_needed", start_supervisor)
+    try:
+        with TestClient(srv.app):
+            pass
+    finally:
+        event_bus.init_global_event_bus()
+        clean_extension_runtime_state()
+    assert len(_chat_rows(host.root)) == 1 and _row(host.queue, host.root)["completed_at"]
+    assert [event.get("system_type") for event in delivered] == ["reminder"], "the late subscriber missed the note"
+
+
 def test_the_note_is_consumed_on_disk_before_it_is_shown_and_never_retried(host, monkeypatch):
     """A crash or an unknown write after consumption may lose one note; it can never show twice."""
     from supervisor import message_bus
