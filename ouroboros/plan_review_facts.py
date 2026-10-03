@@ -38,9 +38,11 @@ _SECTION_HEADING = "TASK PLAN REVIEW (host-recorded facts; which advice mattered
 
 
 def _cut(value: Any, limit: int) -> str:
-    """A visible display cut for one field (an ellipsis marks it); whole-row cuts are counted in ``omitted``."""
-    text = " ".join(str(value or "").split())
-    return text if len(text) <= limit else text[: max(1, limit - 1)] + "…"
+    """One field bounded by the shared strict helper (the omission marker rides inside the
+    budget); whole-row cuts are counted in ``omitted``."""
+    from ouroboros.utils import truncate_within_limit
+
+    return truncate_within_limit(" ".join(str(value or "").split()), limit)
 
 
 def _spec_texts(spec: Mapping[str, Any]) -> Dict[str, str]:
@@ -79,32 +81,39 @@ def _answer_text(answers: List[Dict[str, Any]]) -> str:
 
 
 def _element_fates(critic_texts: Mapping[str, str], selected_texts: Optional[Mapping[str, str]]) -> Dict[str, str]:
-    """``id -> same|changed|removed|added|renumbered→<id>`` from the two specs' identifying texts.
+    """``id -> same|changed|removed|renumbered→<id>`` for the reviewed plan's elements, plus
+    ``selected:<id> -> added`` for selected elements no reviewed element accounts for.
 
-    Ids are positional, so dropping one element shifts its neighbours: an element whose text
-    now sits under another id is ``renumbered``; an element whose text is gone is ``removed``
-    (also when a moved neighbour now occupies its id); an element whose id kept a text that is
-    new to the plan is ``changed``. Selected elements with a text the reviewed plan never had
-    are ``added``. The goal is compared like any element.
+    Ids are positional, so dropping one element shifts its neighbours. Each reviewed element
+    claims at most ONE selected occurrence (same id and text first, then the same text under
+    another id = ``renumbered``); a reviewed text that no selected occurrence carries is
+    ``removed`` — also when a moved neighbour now occupies its id — unless its id kept a text
+    new to the plan (``changed``). Every selected occurrence left unclaimed is ``added``, under
+    its own ``selected:`` key so a reused id never hides it. The goal is compared like any element.
     """
     if selected_texts is None:
         return {}
-    selected_by_text = {text: eid for eid, text in selected_texts.items() if text}
-    critic_by_text = {text: eid for eid, text in critic_texts.items() if text}
+    unclaimed: Dict[str, str] = dict(selected_texts)
+    critic_values = set(critic_texts.values())
     fates: Dict[str, str] = {}
     for eid, text in critic_texts.items():
-        selected = selected_texts.get(eid)
-        if selected == text:
+        if unclaimed.get(eid) == text:
             fates[eid] = "same"
-        elif text and selected_by_text.get(text) not in (None, eid):
-            fates[eid] = f"renumbered→{selected_by_text[text]}"
-        elif selected is None or (selected in critic_by_text and critic_by_text[selected] != eid):
+            unclaimed.pop(eid)
+            continue
+        moved = next((sid for sid, stext in unclaimed.items() if text and stext == text and sid != eid), None)
+        if moved is not None:
+            fates[eid] = f"renumbered→{moved}"
+            unclaimed.pop(moved)
+            continue
+        selected = selected_texts.get(eid)
+        if selected is None or selected in critic_values:
             fates[eid] = "removed"
         else:
             fates[eid] = "changed"
-    for eid, text in selected_texts.items():
-        if eid not in critic_texts and (not text or text not in critic_by_text):
-            fates[eid] = "added"
+            unclaimed.pop(eid, None)
+    for sid in unclaimed:
+        fates[f"selected:{sid}"] = "added"
     return fates
 
 
@@ -194,10 +203,21 @@ def facts_from_state(
         if row["class"] == "need_evidence" and not str(finding.get("locator") or "").strip() and element:
             questions.append({"finding_id": fid, "breaks": element, "question": row["summary"], "answer": row["disposition"]})
     touched = set(findings_by_element) | {eid for eid, fate in fates.items() if fate != "same"}
+
+    def fate(eid: str) -> str:
+        if eid in fates:
+            return fates[eid]
+        if eid in texts:
+            return "same" if selected_texts is not None else "n/a"
+        return "not an element of the reviewed plan"
+
+    def text_of(eid: str) -> str:
+        if eid.startswith("selected:"):
+            return (selected_texts or {}).get(eid[len("selected:"):], "")
+        return texts.get(eid, "")
+
     elements = [{
-        "id": eid,
-        "text": _cut(texts.get(eid) or (selected_texts or {}).get(eid, ""), _TEXT_CHARS),
-        "changed_in_selected_plan": fates.get(eid, "same" if selected_texts is not None else "n/a"),
+        "id": eid, "text": _cut(text_of(eid), _TEXT_CHARS), "changed_in_selected_plan": fate(eid),
         "findings": findings_by_element.get(eid, []),
     } for eid in sorted(touched, key=lambda e: (e == "(no element)", e))]
     unresolved: Dict[str, Any] = {}
@@ -253,8 +273,20 @@ def _fit(facts: Dict[str, Any]) -> Dict[str, Any]:
     while over() and slots:
         slots.pop()
         omitted["unresolved_slots"] += 1
-    if over() and isinstance(facts.get("selected_plan"), dict) and facts["selected_plan"].get("rationale"):
-        facts["selected_plan"]["rationale"] = _cut(facts["selected_plan"]["rationale"], 80)
+    selected = facts.get("selected_plan") if isinstance(facts.get("selected_plan"), dict) else None
+    if over() and selected and isinstance(selected.get("delta"), dict):
+        # The delta's id lists are variable-length too: collapse them to counts, keeping the booleans.
+        selected["delta"] = {key: (len(value) if isinstance(value, list) else value) for key, value in selected["delta"].items()}
+        omitted["delta_id_lists_collapsed_to_counts"] = True
+    if over() and selected and selected.get("rationale"):
+        selected["rationale"] = _cut(selected["rationale"], 80)
+    if over():  # last resort: the wave history to its newest two rows and the notes to a count
+        waves = facts.get("waves") or []
+        omitted["waves"] = max(0, len(waves) - 2)
+        facts["waves"] = waves[-2:]
+        notes = facts.get("reviewed_plan", {}).get("closure_notes")
+        if isinstance(notes, list):
+            facts["reviewed_plan"]["closure_notes"] = []
     return facts
 
 

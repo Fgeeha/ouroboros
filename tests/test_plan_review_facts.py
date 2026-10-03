@@ -119,13 +119,50 @@ def test_element_fates_follow_the_texts_not_the_positional_ids():
 
     fates = {row["id"]: row["changed_in_selected_plan"] for row in facts["elements"]}
     assert fates == {"claim_1": "removed", "claim_2": "renumbered→claim_1", "invariant_1": "changed",
-                     "goal": "changed", "claim_2_added": "added"} or fates == {
-        "claim_1": "removed", "claim_2": "renumbered→claim_1", "invariant_1": "changed", "goal": "changed"}
-    assert fates["claim_1"] == "removed" and fates["claim_2"] == "renumbered→claim_1"
-    assert fates["invariant_1"] == "changed" and fates["goal"] == "changed"
+                     "goal": "changed", "selected:claim_2": "added"}
+    [added] = [row for row in facts["elements"] if row["id"] == "selected:claim_2"]
+    assert added["text"] == "C"
     assert facts["unchanged_elements_without_findings"] == 1  # invariant_2 kept its text
     assert facts["selected_plan"]["delta"]["goal_changed"] is True
     assert facts["selected_plan"]["delta"]["renumbered"] == [{"from": "claim_2", "to": "claim_1"}]
+
+
+def test_duplicate_texts_and_reused_ids_claim_each_selected_occurrence_once():
+    from ouroboros.plan_review_facts import _element_fates
+
+    # [A, A] -> [A]: one survives, the other is removed (never "both renumbered into one").
+    assert _element_fates({"claim_1": "A", "claim_2": "A"}, {"claim_1": "A"}) == {"claim_1": "same", "claim_2": "removed"}
+    # [A, B] -> [B, C]: A removed, B renumbered, C added under its own key although claim_2 is reused.
+    assert _element_fates({"claim_1": "A", "claim_2": "B"}, {"claim_1": "B", "claim_2": "C"}) == {
+        "claim_1": "removed", "claim_2": "renumbered→claim_1", "selected:claim_2": "added"}
+    # An empty reviewed text never borrows its replacement's text.
+    assert _element_fates({"claim_1": ""}, {"claim_1": "X"}) == {"claim_1": "changed"}
+
+
+def test_a_finding_on_an_id_the_reviewed_plan_lacks_is_named_as_such():
+    wave = _wave(findings=[{"finding_id": "s1:f9", "id": "f9", "slot": "s1", "model": "m", "class": "note",
+                            "breaks": "claim_99", "locator": "", "summary": "points nowhere"}], dispositions=[])
+
+    facts = facts_from_state({"waves": [wave]}, critic=wave, author_plan=_author_plan())
+
+    [row] = [r for r in facts["elements"] if r["id"] == "claim_99"]
+    assert row["changed_in_selected_plan"] == "not an element of the reviewed plan" and row["text"] == ""
+
+
+def test_the_bound_holds_when_only_the_selected_plan_delta_is_left_to_shrink():
+    """201 changed decisions: once every element is gone, the delta's id lists are the last
+    variable-length field; they collapse to counts and the section (metadata included) fits."""
+    decisions = [{"id": f"decision_{i}", "choice": f"Choice {i} " + "y" * 40} for i in range(1, 202)]
+    changed = [{"id": f"decision_{i}", "choice": f"Choice {i} changed " + "z" * 40} for i in range(1, 202)]
+    wave = _wave(spec={"goal": "g", "acceptance_claims": [], "decisions": decisions, "deferred": []}, findings=[], dispositions=[])
+    author = {**_author_plan(), "spec": {"goal": "g", "acceptance_claims": [], "decisions": changed, "deferred": []}}
+
+    facts = facts_from_state({"waves": [wave]}, critic=wave, author_plan=author)
+
+    assert len(render_plan_review_section(facts)) <= PLAN_REVIEW_REFLECTION_CHARS
+    assert facts["omitted"]["elements"] == 201
+    assert facts["omitted"]["delta_id_lists_collapsed_to_counts"] is True
+    assert facts["selected_plan"]["delta"]["changed"] == 201
 
 
 def test_two_answers_to_one_finding_in_one_call_are_reported_as_the_open_contradiction_they_are():
