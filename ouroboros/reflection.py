@@ -553,9 +553,19 @@ def generate_reflection(
         panels = compact_review_projection(llm_trace.get("review_runs") or []).get("panels")
     except Exception:
         log.debug("Acceptance panel projection unavailable for reflection", exc_info=True)
+    plan_facts = None
+    try:  # D15 -> D06 is a lazy-only edge; the facts are bounded by their builder and never score
+        from ouroboros.config import DATA_DIR as _data_dir
+        from ouroboros.plan_review_facts import plan_review_reflection_slice
+        plan_facts = plan_review_reflection_slice(
+            pathlib.Path(task.get("budget_drive_root") or task.get("drive_root") or _data_dir),
+            str(task.get("id") or task.get("task_id") or ""), task=task)
+    except Exception:
+        log.debug("Plan-review facts unavailable for reflection", exc_info=True)
     try:
         from ouroboros.review_evidence import format_review_evidence_for_prompt
-        review_evidence_text = format_review_evidence_for_prompt(review_evidence or {}, max_chars=8000, acceptance_panels=panels)
+        review_evidence_text = format_review_evidence_for_prompt(
+            review_evidence or {}, max_chars=8000, acceptance_panels=panels, plan_review=plan_facts)
     except Exception:
         review_evidence_text = "(review evidence unavailable)"
 
