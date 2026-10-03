@@ -467,7 +467,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     // owns delegated handlers, so mounting only paints current state.
     getNotifier().mountSettings(page);
     // Language applies on click and persists on its own; it never marks the page dirty.
-    bindLanguageSegments(page, (language) => apiClient.saveUiPreferences({ language })
+    bindLanguageSegments(page, (language) => apiClient.saveUiLanguage(language)
         .catch(() => showToast('Language choice could not be saved.', 'error')));
     const disposeLocalModel = bindLocalModelControls({ state,
         onApplication: (local) => syncRestartState({ ...restartState, local_model: local }) });

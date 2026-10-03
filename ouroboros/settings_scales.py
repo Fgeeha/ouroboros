@@ -120,6 +120,9 @@ _SAFETY_MODE_RANK = {"full": 2, "light": 1, "off": 0}
 # Effect vocabulary shared by the owner gateway and task-local runtime readers.
 IMMEDIATE_SETTINGS = frozenset({
     "TOTAL_BUDGET",
+    # The interface language is read live by the gateway (every /api/ui/i18n read) and by
+    # the Telegram skill; a running task's runtime block keeps the tag it started with.
+    "OUROBOROS_UI_LANGUAGE",
     # The OUTER per-call tool cap reads settings.json BEFORE env on every tool
     # call in every process (loop_tool_execution.py), so a saved change bites
     # the currently running task's next tool call. The inner shell subprocess

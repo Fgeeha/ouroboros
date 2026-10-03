@@ -891,11 +891,16 @@ apiFetch('/api/ui/preferences', { cache: 'no-store' })
     .then((prefs) => {
         mergeProjectSeenRevisions(prefs?.project_seen_revision);
         setupResizablePanels(prefs || {});
-        setLanguage((prefs && prefs.language) || 'en');
         // Re-evaluate unread now that revision cursors are known.
         if (Array.isArray(lastProjectRows)) { knownProjectsJson = null; renderProjectsNav(lastProjectRows, Array.from(state.projectChatIds || [])); }
     })
-    .catch(() => { setupResizablePanels({}); setLanguage(storedLanguage()); });
+    .catch(() => setupResizablePanels({}));
+
+// The interface language is an install-wide setting, not a UI preference: the gateway
+// answers the chosen tag (and the memory the overlay paints from) at /api/ui/i18n.
+apiClient.uiI18n()
+    .then((i18n) => setLanguage(i18n && !i18n.english ? i18n.language : 'en'))
+    .catch(() => setLanguage(storedLanguage()));
 
 ws.on('open', () => {
     activitySocketDisconnected = false;

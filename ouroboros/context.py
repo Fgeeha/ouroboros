@@ -62,6 +62,7 @@ from ouroboros.context_health import (
 from ouroboros.contracts.task_contract import normalize_bool, task_input_sources
 from ouroboros.memory import Memory, render_scratchpad_markdown
 from ouroboros.update_letter import official_update_projection  # contract: never raises
+from ouroboros.i18n_memory import current_language as _ui_language_tag
 from ouroboros.utils import (
     get_git_info,
     read_json_dict,
@@ -367,6 +368,12 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None, sc
             "presentation": os.environ.get("OUROBOROS_PRESENTATION", "").strip() or "web",
             "platform": sys.platform,
         },
+        # The interface language my human chose for this install (OUROBOROS_UI_LANGUAGE):
+        # the chrome, the task rows and Telegram render in it; "chosen": false means the
+        # English source renders because no choice was made. One fact, captured once per
+        # attempt — the live readers (gateway, Telegram) follow a change at once, this
+        # block at the next attempt.
+        "ui_language": {"tag": _ui_language_tag() or "en", "chosen": bool(_ui_language_tag())},
     }
     runtime_data.update(_task_authority_projection(env, task))
     if declared:

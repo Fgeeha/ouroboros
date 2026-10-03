@@ -142,6 +142,11 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     # Hard ceiling (seconds) a provider call waits for a concurrency slot when the task has
     # NO deadline; past it the call proceeds WITHOUT a slot (never blocks forever). SSOT here.
     "OUROBOROS_MODEL_SLOT_MAX_WAIT_SEC": 180,
+    # The owner's interface language for this install: a BCP-47 tag ("ru", "pt-BR", "art-x-<slug>"
+    # for an invented language); "" = not chosen, the English source renders. Written by
+    # POST /api/ui/i18n/language, read live by the SPA and the Telegram skill, by the mind at its
+    # next attempt (ouroboros/ui_language.py, ouroboros/i18n_memory.py). Never an enumeration.
+    "OUROBOROS_UI_LANGUAGE": "",
     # LIGHT one-shot ceilings (naming, its gateway wait, the update letter): SSOT here, never consumer magic numbers.
     "OUROBOROS_UPDATE_LETTER_TIMEOUT_SEC": 120,
     "OUROBOROS_PROJECT_NAMING_TIMEOUT_SEC": 60,

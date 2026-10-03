@@ -129,6 +129,14 @@ def collect_routes(
         api_ui_preferences_get,
         api_ui_preferences_post,
     )
+    from ouroboros.gateway.ui_i18n import (
+        api_ui_i18n_export_get,
+        api_ui_i18n_get,
+        api_ui_i18n_import_post,
+        api_ui_i18n_language_post,
+        api_ui_i18n_missing_post,
+        api_ui_i18n_regenerate_post,
+    )
     from ouroboros.gateway.onboarding_host import onboarding_page
     from ouroboros.gateway.settings import (
         api_acknowledge_capability,
@@ -222,6 +230,12 @@ def collect_routes(
         Route("/api/settings", endpoint=settings_post, methods=["POST"]),
         Route("/api/ui/preferences", endpoint=api_ui_preferences_get, methods=["GET"]),
         Route("/api/ui/preferences", endpoint=api_ui_preferences_post, methods=["POST"]),
+        Route("/api/ui/i18n", endpoint=api_ui_i18n_get, methods=["GET"]),
+        Route("/api/ui/i18n/language", endpoint=api_ui_i18n_language_post, methods=["POST"]),
+        Route("/api/ui/i18n/missing", endpoint=api_ui_i18n_missing_post, methods=["POST"]),
+        Route("/api/ui/i18n/import", endpoint=api_ui_i18n_import_post, methods=["POST"]),
+        Route("/api/ui/i18n/export", endpoint=api_ui_i18n_export_get, methods=["GET"]),
+        Route("/api/ui/i18n/regenerate", endpoint=api_ui_i18n_regenerate_post, methods=["POST"]),
         Route("/api/owner/runtime-mode", endpoint=api_owner_runtime_mode, methods=["POST"]),
         Route("/api/owner/auto-grant", endpoint=api_owner_auto_grant, methods=["POST"]),
         Route("/api/owner/context-mode", endpoint=api_owner_context_mode, methods=["POST"]),
