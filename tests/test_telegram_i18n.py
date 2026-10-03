@@ -240,3 +240,40 @@ def test_settings_form_no_longer_offers_a_bridge_language(plugin, tmp_path):
 
     assert "TELEGRAM_LANGUAGE" not in _SETTINGS_FORM_KEYS
     assert plugin.telegram_i18n.drive_root() == plugin._data_dir(api)
+
+
+def test_a_row_the_memory_lacks_is_reported_once_and_wakes_the_generator(plugin, tmp_path, monkeypatch):
+    i18n = plugin.telegram_i18n
+    monkeypatch.setenv("OUROBOROS_UI_LANGUAGE", "ru")
+    _seed(tmp_path / "data", "ru", {"code:tg.menu.btn_back": {"text": "⬅️ Назад"}})
+    woken = []
+    monkeypatch.setattr(i18n, "_wake_generator", lambda r, tag: woken.append(tag))
+    monkeypatch.setattr(i18n, "_REPORTED", {})
+    texts = plugin._LOCALIZED_TEXTS["ru"]
+    assert texts["btn_back"] == "⬅️ Назад" and woken == []
+    assert texts["btn_metrics"] == "📉 Status & Metrics"
+    assert texts["btn_metrics"] == "📉 Status & Metrics"
+    assert woken == ["ru"], "one wake for the first miss, none for the repeat"
+    pending = dict(memory.take_pending(tmp_path / "data", "ru", 10))
+    assert pending["code:tg.menu.btn_metrics"]["context"] == {"source": "📉 Status & Metrics", "table": "tg.menu", "role": "telegram"}
+
+
+def test_format_falls_back_to_the_english_row_when_a_generated_template_does_not_fit(plugin, tmp_path, monkeypatch):
+    monkeypatch.setenv("OUROBOROS_UI_LANGUAGE", "ru")
+    _seed(tmp_path / "data", "ru", {"code:tg.menu.lang_changed": {"text": "✅ Язык: {langauge}"}})  # a mangled placeholder
+    texts = plugin._LOCALIZED_TEXTS["ru"]
+    assert texts.format("lang_changed", language="Русский") == "✅ Interface language changed to Русский"
+    _seed(tmp_path / "data", "ru", {"code:tg.menu.lang_changed": {"text": "✅ Язык: {language}"}})
+    assert plugin._LOCALIZED_TEXTS["ru"].format("lang_changed", language="Русский") == "✅ Язык: Русский"
+
+
+def test_proactive_pushes_read_the_install_language_not_the_retired_bridge_key(plugin, monkeypatch):
+    import sys
+
+    notifier = sys.modules["tg_i18n_test.lib.telegram_notifier"]
+    monkeypatch.setenv("OUROBOROS_UI_LANGUAGE", "de")
+    assert notifier._notifier_language() == "de"
+    monkeypatch.setenv("OUROBOROS_UI_LANGUAGE", "")
+    assert notifier._notifier_language() == ""
+    source = (Path(_ROOT / "lib" / "telegram_notifier.py")).read_text(encoding="utf-8")
+    assert 'settings.get("TELEGRAM_LANGUAGE")' not in source, "no second language authority in the bridge"

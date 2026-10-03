@@ -55,6 +55,7 @@ class Stub {
         this.files = [];
         this.focused = 0;
         this.clicked = 0;
+        this.dataset = {};
     }
 
     matches(selector) {
@@ -126,8 +127,13 @@ function fakeClient(initial) {
                     profile: { label: 'Vaelic' }, stats: { entries: 0, pending: 0 }, languages: current.languages };
                 return current;
             }
-            if (body.language === 'art-x-vael') {
-                current = { ...current, plural_select: body.plural_select || null, plural_categories: body.plural_categories || null };
+            if (body.language === 'Russian please') {
+                current = { language: 'ru', english: false, chosen: true, entries: {}, revision: 1, plural_select: null,
+                    profile: { label: 'Русский' }, stats: { entries: 0, pending: 0 }, languages: current.languages };
+                return current;
+            }
+            if (body.language === 'ru' && body.plural_select && current.language === 'ru') {  // the completing second save
+                current = { ...current, plural_select: body.plural_select, plural_categories: body.plural_categories || null };
                 return current;
             }
             current = { language: body.language, english: false, chosen: true, entries: {}, revision: 1,
@@ -140,14 +146,31 @@ function fakeClient(initial) {
     };
 }
 
-function withDocument(fn) {
-    const had = 'document' in globalThis;
-    const saved = globalThis.document;
-    globalThis.document = { createElement: (tag) => new Stub(tag), body: null };
-    return Promise.resolve(fn()).finally(() => {
-        if (had) globalThis.document = saved;
-        else delete globalThis.document;
+function withDocument(fn, { body = null, window = null } = {}) {
+    const keys = ['document', 'window', 'localStorage'];
+    const saved = keys.map((key) => [key, key in globalThis, globalThis[key]]);
+    globalThis.document = { createElement: (tag) => new Stub(tag), body, documentElement: { lang: '', dir: '', removeAttribute() {} } };
+    if (window) globalThis.window = window;
+    globalThis.localStorage = { getItem: () => null, setItem() {} };
+    // Module state is process-wide: every test starts from "no payload applied yet".
+    const reset = import('../modules/i18n.js').then(({ applyPayload }) => applyPayload(null));
+    return reset.then(fn).finally(() => {
+        for (const [key, existed, value] of saved) {
+            if (existed) globalThis[key] = value;
+            else delete globalThis[key];
+        }
     });
+}
+
+/** A real synchronous event target: dispatch runs the listeners before it returns, as a browser does. */
+function syncWindow() {
+    const listeners = new Map();
+    return {
+        addEventListener(type, fn) { listeners.set(type, [...(listeners.get(type) || []), fn]); },
+        removeEventListener(type, fn) { listeners.set(type, (listeners.get(type) || []).filter((f) => f !== fn)); },
+        dispatchEvent(event) { for (const fn of listeners.get(event.type) || []) fn(event); return true; },
+        count(type) { return (listeners.get(type) || []).length; },
+    };
 }
 
 const ENGLISH = { language: '', english: true, chosen: false, entries: {}, revision: 0, stats: null,
@@ -259,13 +282,77 @@ test('import reads the chosen file into the import endpoint and reloads; export 
     assert.equal(toasts.at(-1)[1], 'success');
 }));
 
+test('with a real document and window the binder reads once and re-renders on the event without a fetch', () => {
+    const win = syncWindow();
+    const body = new Stub('body');
+    return withDocument(async () => {
+        const { applyPayload } = await import('../modules/i18n.js');
+        const p = page();
+        const client = fakeClient(ENGLISH);
+        const dispose = bindLanguageSettings(p.doc, { client, toast: () => {}, navigatorLanguages: [] });
+        await settle();
+        await settle();
+        assert.equal(client.calls.filter(([name]) => name === 'uiI18n').length, 1, 'one boot read, no read loop');
+        assert.equal(win.count('ouro:language-changed'), 1);
+        // The SPA applies a gateway payload (a ui_i18n_updated frame, a switch from another client):
+        // the binder paints from it and never fetches again.
+        applyPayload({ ...ENGLISH, language: 'ru', english: false, chosen: true, entries: {}, revision: 3,
+            profile: { label: 'Русский' }, stats: { entries: 7, pending: 1 }, generator: { state: 'running' } });
+        await settle();
+        assert.equal(client.calls.filter(([name]) => name === 'uiI18n').length, 1);
+        assert.equal(p.status.textContent, 'Русский: 7 translated · 1 pending · translating…');
+        assert.equal(p.select.value, 'ru');
+        assert.equal(p.status.dataset.i18nSkip, '', 'the status line is never an overlay key');
+        dispose();
+        assert.equal(win.count('ouro:language-changed'), 0);
+        applyPayload(ENGLISH);
+    }, { body, window: win });
+});
+
+test('choosing a tag the engine knows the direction of saves it with the profile', () => withDocument(async () => {
+    const { localeDirection } = await import('../modules/i18n.js');
+    const expected = localeDirection('ar');
+    const p = page();
+    const client = fakeClient(ENGLISH);
+    bindLanguageSettings(p.doc, { client, toast: () => {}, navigatorLanguages: [] });
+    await settle();
+    p.select.value = OTHER_VALUE;
+    p.select.fire('change');
+    p.otherInput.value = 'ar';
+    p.otherApply.fire('click');
+    await settle();
+    const body = client.calls.find(([name, b]) => name === 'saveUiLanguage' && b.language === 'ar')[1];
+    if (expected) assert.deepEqual(body.profile, { direction: expected });
+    else assert.equal(body.profile, undefined, 'an engine without text info sends no direction');
+}));
+
 test('a page without the block binds nothing and disposes harmlessly', () => {
     const dispose = bindLanguageSettings(new Stub('div'), { client: {}, toast: () => {} });
     assert.equal(typeof dispose, 'function');
     dispose();
 });
 
-test('a described language the gateway resolved to a tag gets its plural map completed in a second save', () => withDocument(async () => {
+test('a described language the gateway resolved to a known tag gets its plural map completed in a second save', () => withDocument(async () => {
+    const p = page();
+    const client = fakeClient(ENGLISH);
+    bindLanguageSettings(p.doc, { client, toast: () => {}, navigatorLanguages: [] });
+    await settle();
+    p.select.value = OTHER_VALUE;
+    p.select.fire('change');
+    p.otherInput.value = 'Russian please';
+    p.otherApply.fire('click');
+    await settle();
+    const saves = client.calls.filter(([name]) => name === 'saveUiLanguage').map(([, body]) => body);
+    assert.equal(saves.length, 2, 'the description, then the resolved tag with this engine\'s plural rules');
+    assert.equal(saves[0].language, 'Russian please');
+    assert.equal(saves[0].plural_select, undefined, 'no plural map can be computed for free text');
+    assert.equal(saves[1].language, 'ru');
+    assert.equal(saves[1].plural_select.map['1'], 'one');
+    assert.equal(p.select.value, 'ru');
+    assert.ok(p.status.textContent.startsWith('Русский: 0 translated'), p.status.textContent);
+}));
+
+test('an invented language gets no plural map: the engine does not know it, so the memory keeps `other`', () => withDocument(async () => {
     const p = page();
     const client = fakeClient(ENGLISH);
     bindLanguageSettings(p.doc, { client, toast: () => {}, navigatorLanguages: [] });
@@ -276,11 +363,8 @@ test('a described language the gateway resolved to a tag gets its plural map com
     p.otherApply.fire('click');
     await settle();
     const saves = client.calls.filter(([name]) => name === 'saveUiLanguage').map(([, body]) => body);
-    assert.equal(saves.length, 2, 'the description, then the resolved tag with this engine\'s plural rules');
+    assert.equal(saves.length, 1, 'no second save: Intl would silently hand an invented language the default locale\'s grammar');
     assert.equal(saves[0].language, 'invent a language');
-    assert.equal(saves[0].plural_select, undefined, 'no plural map can be computed for free text');
-    assert.equal(saves[1].language, 'art-x-vael');
-    assert.equal(typeof saves[1].plural_select.map['1'], 'string');
     assert.equal(p.select.value, 'art-x-vael');
     assert.ok(p.status.textContent.startsWith('Vaelic: 0 translated'), p.status.textContent);
 }));

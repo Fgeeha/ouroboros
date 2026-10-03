@@ -261,9 +261,14 @@ test('a 503 settings_save_timeout keeps the wizard open with "Check status", whi
         stepOrder: ['summary', ...BOOTSTRAP.stepOrder.filter((step) => step !== 'summary')],
         initialState: { ...BOOTSTRAP.initialState, openrouterKey: 'sk-or-v1-abcdefghijklmnop' },
     };
-    const calls = [];
+    const requests = [];
+    // The summary step's Language control reads the translation memory when it mounts (once per
+    // page; settings_language.test.js pins that). This test is about the completion write, so the
+    // memory read is left out of the request list it asserts.
+    const calls = { filter: (fn) => requests.filter(fn) };
+    Object.defineProperty(calls, 'list', { get: () => requests.filter((call) => call !== 'GET /api/ui/i18n') });
     const fetch = async (url, init = {}) => {
-        calls.push(`${init.method || 'GET'} ${String(url)}`);
+        requests.push(`${init.method || 'GET'} ${String(url)}`);
         if (String(url) === '/api/onboarding/complete') {
             return {
                 ok: false, status: 503, text: async () => '',
@@ -288,7 +293,7 @@ test('a 503 settings_save_timeout keeps the wizard open with "Check status", whi
     await withWizard(summaryFirst, 'save=timeout', async ({ doc }) => {
         doc.getElementById('next-btn').fire('click');   // "Start Ouroboros"
         await settle();
-        assert.deepEqual(calls, ['POST /api/onboarding/complete']);
+        assert.deepEqual(calls.list, ['POST /api/onboarding/complete']);
         const html = doc.getElementById('root').innerHTML;
         assert.match(html, /is unknown — the save is still running/);
         assert.match(html, /id="check-save-btn"[^>]*>Check status</);
@@ -304,12 +309,12 @@ test('a 503 settings_save_timeout keeps the wizard open with "Check status", whi
 
         doc.getElementById('next-btn').fire('click');   // the explicit retry path stays reachable
         await settle();
-        assert.deepEqual(calls, ['POST /api/onboarding/complete', 'POST /api/onboarding/complete']);
+        assert.deepEqual(calls.list, ['POST /api/onboarding/complete', 'POST /api/onboarding/complete']);
         assert.match(doc.getElementById('root').innerHTML, /class="btn btn-primary" id="check-save-btn"/);
 
         doc.getElementById('check-save-btn').fire('click');
         await settle();
-        assert.deepEqual(calls, ['POST /api/onboarding/complete', 'POST /api/onboarding/complete', 'GET /api/onboarding']);
+        assert.deepEqual(calls.list, ['POST /api/onboarding/complete', 'POST /api/onboarding/complete', 'GET /api/onboarding']);
         // 204 = the readiness gate passes: the transaction landed. The plain
         // browser shell proceeds as it does on a receipt (no restart needed —
         // the runtime mode the wizard holds is the one the page loaded with).

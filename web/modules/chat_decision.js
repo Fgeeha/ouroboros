@@ -400,7 +400,7 @@ export function createChatDecision({
     function hostFactsLine(text) {
         const line = document.createElement('div');
         line.className = 'chat-quiz-host-facts';
-        line.textContent = text;
+        line.textContent = tx(text);
         return line;
     }
 
@@ -409,7 +409,7 @@ export function createChatDecision({
         if (button.querySelector('.chat-quiz-option-recommended')) return;
         const badge = document.createElement('span');
         badge.className = 'chat-quiz-option-recommended';
-        badge.textContent = 'recommended';
+        badge.textContent = tr('quiz.recommended', 'recommended');
         button.append(badge);
     }
 
@@ -640,7 +640,7 @@ export function createChatDecision({
         head.className = 'chat-quiz-head';
         const chip = document.createElement('span');
         chip.className = 'chat-quiz-chip';
-        chip.textContent = 'Question';
+        chip.textContent = tr('quiz.chip_question', 'Question');
         const status = document.createElement('span');
         status.className = 'chat-quiz-status';
         const dot = document.createElement('span');
@@ -708,7 +708,7 @@ export function createChatDecision({
         if (complete && quiz.options.length && quiz.detailsUnavailable) {
             const note = document.createElement('div');
             note.className = 'chat-quiz-stake chat-quiz-details-unavailable';
-            note.textContent = 'Option details were not retained for this older question.';
+            note.textContent = tr('quiz.details_not_retained', 'Option details were not retained for this older question.');
             card.append(note);
         }
 
@@ -727,7 +727,7 @@ export function createChatDecision({
             const send = document.createElement('button');
             send.type = 'button';
             send.className = 'chat-quiz-send';
-            send.textContent = 'Send my answer';
+            send.textContent = tr('quiz.send_answer', 'Send my answer');
             send.disabled = true;
             const syncSend = () => {
                 const enabled = commentPresent() && commentText().length <= MAX_DECISION_COMMENT;
@@ -860,7 +860,7 @@ export function createChatDecision({
         head.className = 'chat-quiz-head';
         const chip = document.createElement('span');
         chip.className = 'chat-quiz-chip';
-        chip.textContent = 'Route';
+        chip.textContent = tr('routing.chip_route', 'Route');
         const status = document.createElement('span');
         status.className = 'chat-quiz-status';
         const dot = document.createElement('span');

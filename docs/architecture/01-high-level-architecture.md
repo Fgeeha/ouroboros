@@ -682,6 +682,7 @@ Bundled resources use the CLI / Headless Boundary lookup order rather than assum
 │   │   ├── projects.json.committed ← registry commit witness: beside it a missing registry is unavailable, not empty
 │   │   ├── project_task_bindings.json ← schema v1 root↔Project bindings with REQUIRED typed origin; one-way enrichment; tombstoning never removes a binding
 │   │   ├── ui_preferences.json    ← owner-local layout/`welcome` prefs + monotonic project_seen_revision ACKs
+│   │   ├── i18n/<tag>.json        ← one translation memory per interface language (schema 1: entries by code or rendered English, provenance owner > imported > generated, `refused` ledger; i18n_memory.py), beside `<tag>.pending.json`, the generator's bounded miss queue
 │   │   ├── cancel_intents.json    ← compact locked projection of ACTIVE cancel intents; the forensic trail is typed cancel_intent rows in logs/supervisor.jsonl, never read back (cancel_intents.py)
 │   │   ├── terminal_deliveries.json ← delivery-id dedupe, emitted-byte receipts, pending outbox (terminal_delivery.py)
 │   │   ├── extension_companions.json ← runtime snapshot of live companion processes

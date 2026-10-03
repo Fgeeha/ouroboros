@@ -1093,6 +1093,10 @@ def test_the_brief_of_a_three_file_change_on_the_real_tree_is_measured(tmp_path)
           f"({without_diff:,} without the diff slot)")
     for name, chars in sorted(sections.items(), key=lambda item: -item[1]):
         print(f"  {name:32s} {chars:>9,}")
-    assert without_diff < 200_000, without_diff
+    # 200_000 -> 205_000 (PR #940 rework, 2026-10-03): the base sat 285 chars under the
+    # ceiling, so the repository index alone (+~1k chars: the interface-language modules,
+    # their tests and the per-chapter grant files) crossed it; still a measured sum, raised
+    # by what those files are, not by aspiration.
+    assert without_diff < 205_000, without_diff
     assert sections["repository_index"] > 20_000          # the index really ran
     assert sections["governance_stable_inline"] > 40_000  # BIBLE really inline

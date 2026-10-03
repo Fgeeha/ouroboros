@@ -19,7 +19,8 @@ class UiI18nProfile(TypedDict):
     label: str  # display name the owner typed or the generator chose
     instruction: str  # free-text description for the generator (an invented language's brief)
     direction: Literal["ltr", "rtl"]
-    lexicon: str  # generator-written vocabulary/rules for rare or invented languages
+    lexicon: NotRequired[str]  # generator-written vocabulary/rules for rare or invented languages (file and export only)
+    lexicon_chars: NotRequired[int]  # the GET carries the lexicon's size, not its text
 
 
 class UiI18nEntry(TypedDict):
@@ -35,6 +36,7 @@ class UiI18nEntry(TypedDict):
     pack: NotRequired[str]
     pack_version: NotRequired[str]
     context: NotRequired[str]
+    source: NotRequired[str]  # the English a code entry translated (the browser's reword check)
 
 
 class UiI18nStats(TypedDict):
@@ -44,6 +46,7 @@ class UiI18nStats(TypedDict):
     imported: int
     stale: int | None  # None = the current English of code keys was not available
     pending: int  # queued misses awaiting the generator
+    refused: int  # keys the generator gave up on (cleared by Regenerate)
 
 
 class UiI18nLanguageSummary(TypedDict):

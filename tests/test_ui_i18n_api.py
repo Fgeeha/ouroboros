@@ -153,7 +153,7 @@ def test_language_post_resolves_a_free_text_language_through_the_generator(tmp_p
         body = ok.json()
         assert body["language"] == "art-x-vael" and body["english"] is False
         assert body["profile"] == {"label": "Vaelic", "instruction": "soft, archaic", "direction": "ltr",
-                                   "lexicon": "task = vael, settings = norim"}
+                                   "lexicon_chars": len("task = vael, settings = norim")}, "the lexicon stays on disk"
         assert body["generator"]["state"] in ("idle", "running", "no_model", "failed")
         assert config.load_settings()["OUROBOROS_UI_LANGUAGE"] == "art-x-vael"
         assert asked == ["invent a language and translate everything into it"]
@@ -166,3 +166,20 @@ def test_language_post_resolves_a_free_text_language_through_the_generator(tmp_p
         bad = client.post("/api/ui/i18n/language", json={"language": "Quenya"})
         assert bad.status_code == 502 and bad.json()["code"] == "language_resolve_failed"
         assert config.load_settings()["OUROBOROS_UI_LANGUAGE"] == "art-x-vael"
+
+
+def test_get_omits_the_lexicon_and_import_checks_its_schema(tmp_path, monkeypatch):
+    monkeypatch.setenv("OUROBOROS_UI_LANGUAGE", "qya")
+    memory.update_memory(tmp_path, "qya", lambda doc: None, create=True,
+                         profile={"label": "Quenya", "lexicon": "x" * 5000, "instruction": "formal"})
+    with _client(tmp_path) as client:
+        body = client.get("/api/ui/i18n").json()
+        assert "lexicon" not in body["profile"] and body["profile"]["lexicon_chars"] == 5000
+        assert body["profile"]["label"] == "Quenya" and body["stats"]["refused"] == 0
+        exported = client.get("/api/ui/i18n/export").json()
+        assert exported["profile"]["lexicon"] == "x" * 5000, "the file and the export keep it"
+        bad = client.post("/api/ui/i18n/import", json={"schema": 999, "language": "qya", "entries": {}})
+        assert bad.status_code == 400 and bad.json()["code"] == "memory_invalid"
+        assert memory.load_memory(tmp_path, "qya")["schema"] == 1
+        ok = client.post("/api/ui/i18n/import", json={"schema": 1, "language": "qya", "entries": {"Settings": {"text": "Sanyar"}}})
+        assert ok.status_code == 200, ok.text

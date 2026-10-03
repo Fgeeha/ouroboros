@@ -92,6 +92,7 @@ from ouroboros.server_maintenance import (  # noqa: F401
     _startup_prune_sweeps,
     _startup_worktree_prune,
 )
+from ouroboros.ui_translation import start_background as _start_ui_translation, stop_background as _stop_ui_translation
 from ouroboros.server_restart import (  # noqa: F401
     _live_running_task_ids, _managed_update_pending_kwargs,
     _perform_owner_restart, _safe_restart_serialized,
@@ -1261,27 +1262,6 @@ from contextlib import ExitStack, asynccontextmanager, suppress
 
 
 @asynccontextmanager
-def _start_ui_translation(drive_root) -> None:
-    """Boot of the translation generator: register its gateway hook and re-check the chosen
-    interface language (catalog codes the memory lacks, misses left queued). No model call
-    on the boot path; the worker runs in its own thread when there is work."""
-    try:
-        from ouroboros.ui_translation import start_background
-
-        start_background(drive_root)
-    except Exception:
-        log.warning("UI translation generator boot re-check failed", exc_info=True)
-
-
-def _stop_ui_translation() -> None:
-    try:
-        from ouroboros.ui_translation import stop_background
-
-        stop_background()
-    except Exception:
-        log.debug("UI translation generator stop failed", exc_info=True)
-
-
 async def lifespan(app):
     global _event_loop
     _event_loop = asyncio.get_running_loop()
@@ -1338,9 +1318,6 @@ async def lifespan(app):
             reconcile_projects(lifespan_drive_root)
     except Exception:
         log.warning("Project registry boot reconcile failed", exc_info=True)
-
-    if not pytest_default_real_data_dir:
-        _start_ui_translation(lifespan_drive_root)
 
     if not _exit_signalled.is_set():
         _supervisor_stop.clear()  # a fresh lifespan owns a fresh generation (symmetric with the teardown set)
@@ -1447,6 +1424,8 @@ async def lifespan(app):
             _reload_extensions(lifespan_drive_root, _load_settings, repo_path=repo_path or None)
     except Exception:
         log.error("Extension reload_all at startup failed", exc_info=True)
+    if not pytest_default_real_data_dir:
+        _start_ui_translation(lifespan_drive_root)  # after the skills registered their tables; fail-soft, no model call
 
     try:
         from ouroboros.mcp_client import (

@@ -488,7 +488,11 @@ _DISK_AUTHORED_SETTINGS = ("OUROBOROS_CONTEXT_MODE", "OUROBOROS_CONTEXT_MODE_AUT
 
 # ENDPOINT-AUTHORED, DISK-ONLY: install-time facts POST /api/onboarding/complete alone writes. The ratchets above are
 # disk-authored yet DO project once the file carries them; these never leave disk in EITHER direction — an env timestamp alone closed the onboarding window on a fresh install, and an env marker was then persisted by a save.
-ENDPOINT_AUTHORED_SETTINGS = frozenset({"OUROBOROS_SUBSCRIPTION_PRESET_VERSION", "OUROBOROS_SUBAGENT_PRESET_RECEIPT", "OUROBOROS_ONBOARDING_COMPLETED_AT"})
+# OUROBOROS_UI_LANGUAGE has ONE writer, POST /api/ui/i18n/language (and the Host Service relay):
+# the generic settings save skips it, so a language change always creates the memory header,
+# fires the generator hooks and broadcasts.
+ENDPOINT_AUTHORED_SETTINGS = frozenset({"OUROBOROS_SUBSCRIPTION_PRESET_VERSION", "OUROBOROS_SUBAGENT_PRESET_RECEIPT",
+                                        "OUROBOROS_ONBOARDING_COMPLETED_AT", "OUROBOROS_UI_LANGUAGE"})
 
 
 # Settings keys deliberately NOT projected into the environment. Everything else in SETTINGS_DEFAULTS IS

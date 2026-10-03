@@ -35,7 +35,7 @@ import weakref
 from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Tuple
 
 from .telegram_api import _TELEGRAM_TEXT_LIMIT, _u16len
-from .telegram_i18n import Index
+from .telegram_i18n import Index, phrase
 from .telegram_state import _read_json_file, _state_file
 
 _QUIZ_STATE_FILE = "quiz_state.json"
@@ -156,7 +156,7 @@ def render_quiz_text(question: str, labels: List[str], stake: str, assumption: s
     details = list(option_details or [])
     lines = _project_line(project_name, lang)
     if host_facts:
-        lines.append(host_facts)
+        lines.append(phrase(host_facts, lang))  # the host's sentence, translated when the memory knows it
     lines.append(f"{texts['question']}: {question}")
     if stake:
         lines.append(f"{texts['stake']}: {stake}")
@@ -278,7 +278,7 @@ def _outcome_text(status: int, payload: Dict[str, Any], lang: str) -> str:
     if status == 409:
         answered = payload.get("answered_index") is not None or str(payload.get("state") or "") == "answered"
         return texts["already"] if answered else texts["expired"]
-    return texts["failed"].format(status=status)
+    return texts.format("failed", status=status)
 
 
 def _echo(answer: str) -> str:
@@ -287,7 +287,7 @@ def _echo(answer: str) -> str:
 
 def _answered_text(record: Dict[str, Any], answer: str, lang: str) -> str:
     texts = _texts(lang)
-    line = texts["answered_line"].format(answer=answer) if answer else texts["answered_plain"]
+    line = texts.format("answered_line", answer=answer) if answer else texts["answered_plain"]
     return f"{record.get('text') or ''}\n{line}"
 
 

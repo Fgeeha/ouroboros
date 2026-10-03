@@ -79,7 +79,7 @@ def unsupported_text(lang: str) -> str:
 
 def refusal_text(info: Dict[str, Any], lang: str) -> str:
     size_mb = f"{int(info.get('size') or 0) / (1024 * 1024):.1f}"
-    return _texts(lang)["too_large"].format(size=size_mb)
+    return _texts(lang).format("too_large", size=size_mb)
 
 
 @dataclass

@@ -37,6 +37,9 @@ log = logging.getLogger(__name__)
 CATALOG_PREFIX = "tg"
 _DRIVE_ROOT: Optional[pathlib.Path] = None
 _REGISTERED: Dict[str, Dict[str, str]] = {}
+# Keys already reported as missing in this process, per language: a row the memory lacks is
+# reported once, not on every render (the pending file dedupes too; this spares the disk).
+_REPORTED: Dict[str, set] = {}
 
 
 def configure(drive_root: Optional[pathlib.Path]) -> None:
@@ -91,9 +94,25 @@ class Texts(Mapping[str, str]):
         source = self._rows[key]
         if english(self._tag):
             return source
-        found = memory.tr(f"{memory.CODE_PREFIX}{CATALOG_PREFIX}.{self._table}.{key}", self._tag,
-                          None, drive_root=drive_root())
-        return found if isinstance(found, str) and found else source
+        code = f"{memory.CODE_PREFIX}{CATALOG_PREFIX}.{self._table}.{key}"
+        found = memory.tr(code, self._tag, None, drive_root=drive_root())
+        if isinstance(found, str) and found:
+            return found
+        # English for now; the miss goes to the generator exactly as a browser miss would, so a
+        # table registered after the language was chosen (a skill enabled later, a new line) is
+        # translated without another language event.
+        _report_miss(code, self._tag, {"source": source, "table": f"{CATALOG_PREFIX}.{self._table}", "role": "telegram"})
+        return source
+
+    def format(self, key: str, **params: Any) -> str:
+        """``self[key].format(**params)`` that never breaks the bridge: a generated template
+        whose placeholders do not fit the call renders the English row instead."""
+        template = self[key]
+        try:
+            return template.format(**params)
+        except (KeyError, IndexError, ValueError):
+            log.warning("telegram i18n: template %s.%s does not take its parameters; English used", self._table, key)
+            return self._rows[key].format(**params)
 
     def get(self, key: str, default: Any = None) -> Any:  # type: ignore[override]
         return self[key] if key in self._rows else default
@@ -133,6 +152,19 @@ class Index:
         return self.rows
 
 
+def _report_miss(key: str, tag: str, context: Dict[str, Any]) -> None:
+    seen = _REPORTED.setdefault(tag, set())
+    if key in seen:
+        return
+    seen.add(key)
+    try:
+        root = drive_root()
+        if memory.record_missing(root, tag, [{"key": key, "context": context}])["accepted"]:
+            _wake_generator(root, tag)
+    except Exception:
+        log.debug("telegram i18n: miss not recorded", exc_info=True)
+
+
 def phrase(text: str, lang: Optional[str] = None) -> str:
     """A host-composed English sentence this transport relays (a task's reason line).
     Translated when the memory knows the exact sentence; otherwise sent in English and
@@ -146,11 +178,7 @@ def phrase(text: str, lang: Optional[str] = None) -> str:
     if isinstance(found, str) and found:
         return found
     if not memory.looks_volatile(source):
-        try:
-            memory.record_missing(root, tag, [{"key": source, "context": {"role": "telegram"}}])
-            _wake_generator(root, tag)
-        except Exception:
-            log.debug("telegram i18n: miss not recorded", exc_info=True)
+        _report_miss(source, tag, {"role": "telegram"})
     return source
 
 

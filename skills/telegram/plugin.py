@@ -122,7 +122,7 @@ def _build_menu_keyboard(command_mode: str, lang: str = "en") -> tuple[str, list
             [[{"text": t["btn_settings"], "callback_data": "nav:settings"}]],
         )
 
-    header = t["menu_title"].format(command_mode=command_mode, language=telegram_i18n.label(lang))
+    header = t.format("menu_title", command_mode=command_mode, language=telegram_i18n.label(lang))
     keyboard = [
         [
             {"text": t["btn_metrics"], "callback_data": "nav:status"},
@@ -141,7 +141,7 @@ def _build_menu_keyboard(command_mode: str, lang: str = "en") -> tuple[str, list
 def _build_menu_status(command_mode: str, lang: str = "en", info_text: str = "") -> tuple[str, list[list[dict]]]:
     """Return status header and keyboard with Refresh and Back button."""
     t = _LOCALIZED_TEXTS[lang]
-    header = t["metrics_title"].format(info_text=info_text)
+    header = t.format("metrics_title", info_text=info_text)
     keyboard = [
         [{"text": t["btn_refresh"], "callback_data": "cmd_act:update_status"}],
         [{"text": t["btn_back"], "callback_data": "nav:menu"}]
@@ -153,9 +153,9 @@ def _build_menu_mind(command_mode: str, lang: str = "en", bg_enabled: bool = Fal
     """Return mind controlling header and buttons."""
     t = _LOCALIZED_TEXTS[lang]
     state_str = t["mind_state_active"] if bg_enabled else t["mind_state_sleeping"]
-    header = t["mind_title"].format(state_str=state_str)
+    header = t.format("mind_title", state_str=state_str)
     if thoughts_text:
-        header += t["mind_thoughts"].format(thoughts_text=thoughts_text)
+        header += t.format("mind_thoughts", thoughts_text=thoughts_text)
 
     row = []
     if command_mode == _COMMAND_MODE_FULL:
@@ -259,7 +259,7 @@ def _build_language_keyboard(lang: str = "") -> tuple[str, list[list[dict]]]:
     every language with a translation memory on disk (the current one marked), and the
     hint that any other language is one ``/language <name>`` away."""
     t = _LOCALIZED_TEXTS[lang]
-    header = t["lang_title"].format(language=telegram_i18n.label(lang))
+    header = t.format("lang_title", language=telegram_i18n.label(lang))
     rows = [[{"text": t["lang_english"], "callback_data": "set_lang:en"}]]
     for item in telegram_i18n.known_languages():
         tag = str(item.get("language") or "")
@@ -279,17 +279,17 @@ async def _choose_language(api, requested: str, lang: str, notify) -> str:
     try:
         status, body = await _host_post(api, "/ui/language", {"language": requested})
     except Exception as exc:
-        await notify(t["lang_failed"].format(reason=type(exc).__name__))
+        await notify(t.format("lang_failed", reason=type(exc).__name__))
         return ""
     if status < 400:
         new_lang = str(body.get("language") or "")
-        await notify(_LOCALIZED_TEXTS[new_lang]["lang_changed"].format(language=telegram_i18n.label(new_lang)))
+        await notify(_LOCALIZED_TEXTS[new_lang].format("lang_changed", language=telegram_i18n.label(new_lang)))
         return new_lang
     code = str(body.get("code") or "")
     if code == "language_needs_model":
         await notify(t["lang_needs_model"])
     else:
-        await notify(t["lang_failed"].format(reason=str(body.get("error") or body.get("message") or status)))
+        await notify(t.format("lang_failed", reason=str(body.get("error") or body.get("message") or status)))
     return ""
 
 
@@ -552,18 +552,8 @@ async def _compile_status_text(api, lang: str = "en") -> str:
         else f"{max(0.0, total_budget - spent_usd):.4f}"
     )
 
-    template = t["metrics_budget_status"]
-    template = template.replace("{spent_usd:.4f}", "{spent_usd_str}")
-    template = template.replace("{total_budget:.2f}", "{total_budget_str}")
-    template = template.replace("{rem:.4f}", "{rem_str}")
-
-    status_str = template.format(
-        spent_usd_str=spent_spec,
-        total_budget_str=total_spec,
-        rem_str=rem_spec,
-        branch=branch,
-        bg_status=bg_status_raw
-    )
+    status_str = t.format("metrics_budget_status", spent_usd=spent_spec, total_budget=total_spec, rem=rem_spec,
+                          branch=branch, bg_status=bg_status_raw)
     status_str += "\n" + await asyncio.to_thread(_collect_health, api, lang)
     return status_str
 
@@ -1196,17 +1186,18 @@ def _make_document(api):
                     task_id = str(event.get("task_id") or file_ref.get("task_id") or "")
                     source = await asyncio.to_thread(resolve_task_file_reference, _data_dir(api), task_id, file_ref)
                     if file_ref["size"] > _MAX_TELEGRAM_UPLOAD_BYTES:
-                        notice = f"{filename} is saved in Ouroboros. This file exceeds the Telegram upload limit and cannot be mirrored here."
+                        t = _LOCALIZED_TEXTS[telegram_i18n.language()]
+                        notice = t.format("file_too_large_notice", filename=filename)
                         status = await asyncio.to_thread(_read_status, api)
                         if status.get("state") == "ready" and status.get("public_url"):
                             try:
                                 await client.send_message_with_inline_keyboard(chat_id, notice,
-                                    [[{"text": "Open Ouroboros", "web_app": {"url": status["public_url"]}}]])
+                                    [[{"text": t["btn_open_app"], "web_app": {"url": status["public_url"]}}]])
                                 return
                             except TelegramRequestRejected as exc:
                                 if not exc.plain_retry_safe:
                                     raise
-                        await client.send_message(chat_id, notice + " Open the app to download it.", parse_mode="")
+                        await client.send_message(chat_id, notice + t["file_open_app_hint"], parse_mode="")
                         return
                     file_handle = source.open("rb")
                     file_bytes = file_handle

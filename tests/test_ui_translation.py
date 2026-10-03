@@ -370,8 +370,12 @@ def test_resolve_language_request_failures_are_typed(tmp_path, light):
 
     garbage = FakeLight([("I would rather not.", "stop")])
     light.setattr(gen, "_light_route", lambda: ("fake/light", False, True))
-    profile = gen.resolve_language_request("Klingon", drive_root=tmp_path, client=garbage)
-    assert profile["tag"] == "art-x-klingon" and profile["label"] == "Klingon", "no JSON → the owner's own word becomes an invented tag"
+    with pytest.raises(gen.LanguageResolveError) as unusable:
+        gen.resolve_language_request("Klingon", drive_root=tmp_path, client=garbage)
+    assert unusable.value.code == "language_resolve_failed", "no profile in the answer → no language is invented by the host"
+    unnamed = FakeLight([(json.dumps({"tag": "", "direction": "ltr"}), "stop")])
+    with pytest.raises(gen.LanguageResolveError):
+        gen.resolve_language_request("Klingon", drive_root=tmp_path, client=unnamed)
 
 
 def test_the_batch_at_the_model_still_counts_as_pending_for_the_gateway(tmp_path, light):
@@ -396,3 +400,89 @@ def test_the_batch_at_the_model_still_counts_as_pending_for_the_gateway(tmp_path
     assert seen["in_flight"] == 2 and seen["payload_pending"] == 2, "the gateway still reports the two keys as pending"
     assert gen.generator_status()["in_flight"] == 0
     assert memory.pending_count(tmp_path, "ru") == 0
+
+
+def test_a_satisfied_queue_row_buys_nothing_and_an_identity_entry_stays(tmp_path, light):
+    _ru(tmp_path)
+    memory.update_memory(tmp_path, "ru", lambda doc: (memory.apply_generated(doc, {"Ouroboros": {"text": "Ouroboros"}}, model="t"), doc)[1])
+    memory.record_missing(tmp_path, "ru", [{"key": "Ouroboros", "context": {}}, {"key": "Files", "context": {}}])
+    client = FakeLight([_answer([{"id": 1, "text": "Файлы"}])])
+    light.setattr(gen, "_broadcast", lambda frame: None)
+    facts = gen.translate_batch(tmp_path, "ru", client=client)
+    assert facts["applied"] == 1 and facts["satisfied"] == 1
+    rows = json.loads(client.calls[0]["messages"][1]["content"].split("\n", 1)[1])
+    assert [row["text"] for row in rows] == ["Files"], "the already-translated key is not sent to the model"
+    assert memory.load_memory(tmp_path, "ru")["revision"] == 2
+
+
+def test_keys_that_exhaust_their_attempts_are_refused_durably_until_regenerate(tmp_path, light):
+    _ru(tmp_path)
+    memory.record_missing(tmp_path, "ru", [{"key": "Settings", "context": {}}])
+    pending = dict(memory.take_pending(tmp_path, "ru", 10))
+    pending["Settings"]["attempts"] = gen.MAX_ATTEMPTS - 1
+    memory.requeue_pending(tmp_path, "ru", list(pending.items()))
+    light.setattr(gen, "_broadcast", lambda frame: None)
+    facts = gen.translate_batch(tmp_path, "ru", client=FakeLight([_answer([{"id": 0, "text": "<b>Настройки</b>"}])]))
+    assert facts["dropped"] == 1
+    doc = memory.load_memory(tmp_path, "ru")
+    assert "Settings" in doc["refused"] and doc["refused"]["Settings"]["reason"]
+    assert memory.stats(doc)["refused"] == 1
+    # The next page load reports the same string again: the queue refuses it without a model call.
+    result = memory.record_missing(tmp_path, "ru", [{"key": "Settings", "context": {}}])
+    assert result == {"accepted": 0, "dropped": 1, "pending": 0}
+    # Regenerate forgets the ledger together with the generated entries.
+    memory.update_memory(tmp_path, "ru", lambda d: (memory.regenerate_reset(d), d)[1])
+    assert memory.load_memory(tmp_path, "ru")["refused"] == {}
+    assert memory.record_missing(tmp_path, "ru", [{"key": "Settings", "context": {}}])["accepted"] == 1
+
+
+def test_answers_must_keep_the_exact_placeholders_specs_and_every_plural_category(light):
+    item = {"key": "x", "text": "Spent: ${spent_usd:.4f} of {total}", "plural": False}
+    assert gen._validate_answer(item, {"text": "Потрачено: ${spent_usd:.4f} из {total}"}, []) == {"text": "Потрачено: ${spent_usd:.4f} из {total}"}
+    assert gen._validate_answer(item, {"text": "Потрачено: ${spent_usd:.2f} из {total}"}, []) is None, "a changed format spec is a changed placeholder"
+    assert gen._validate_answer(item, {"text": "Потрачено: ${spent_usd:.4f}"}, []) is None, "a dropped placeholder breaks the consumer"
+    plural = {"key": "{n} notes", "text": "{n} notes", "plural": True}
+    assert gen._validate_answer(plural, {"forms": {"one": "{n} заметка", "other": "{n} заметки"}}, ["one", "few", "many", "other"]) is None, "every recorded category"
+    assert gen._validate_answer(plural, {"forms": {"one": "{n} заметка", "few": "{n} заметки", "many": "{n} заметок", "other": "{n} заметки"}}, ["one", "few", "many", "other"]) is not None
+    assert gen._validate_answer(plural, {"forms": {"one": "заметка", "other": "{n} заметки"}}, ["one", "other"]) is None, "a form without {n}"
+    inline = {"key": "Type <1>pt-BR</1> here", "text": "Type <1>pt-BR</1> here", "plural": False}
+    assert gen._validate_answer(inline, {"text": "Введите <1>pt-BR здесь"}, []) is None, "an unbalanced inline slot"
+
+
+def test_a_catalog_code_translates_the_hosts_english_not_a_clients_copy(light):
+    catalog = gen.catalog_entries()
+    assert gen._source_text("code:task.headline.done", {"context": {"source": "Finished (stale tab)"}}, catalog) == "Done"
+    assert gen._source_text("code:task.progress.working_on_it", {"context": {"source": "Working on it"}}, catalog) == "Working on it"
+    assert gen._source_text("Settings", {"context": {}}, catalog) == "Settings"
+
+
+def test_a_table_registered_after_boot_queues_itself_for_the_chosen_language(tmp_path, light):
+    light.setenv("OUROBOROS_UI_LANGUAGE", "ru")
+    _ru(tmp_path)
+    scheduled = []
+    light.setattr(gen._WORKER, "schedule", lambda root: scheduled.append(root))
+    gen.start_background(tmp_path)          # the boot re-check queues the core catalog
+    core = memory.pending_count(tmp_path, "ru")
+    assert core == len(gen.catalog_entries()) and scheduled == [tmp_path]
+    gen.register_catalog("tg.late", lambda: {"hello": "Hello there"}, "a skill enabled after the choice")
+    assert memory.pending_count(tmp_path, "ru") == core + 1, "the late table's rows are queued at once"
+    assert scheduled == [tmp_path, tmp_path]
+    pending = dict(memory.take_pending(tmp_path, "ru", 10_000))
+    assert pending["code:tg.late.hello"]["context"]["source"] == "Hello there"
+
+
+def test_generated_code_entries_remember_the_english_they_translated(tmp_path, light):
+    _ru(tmp_path)
+    memory.record_missing(tmp_path, "ru", [{"key": "code:task.progress.thinking", "context": {"source": "Thinking"}}])
+    light.setattr(gen, "_broadcast", lambda frame: None)
+    gen.translate_batch(tmp_path, "ru", client=FakeLight([_answer([{"id": 0, "text": "Думаю"}])]))
+    entry = memory.load_memory(tmp_path, "ru")["entries"]["code:task.progress.thinking"]
+    assert entry["text"] == "Думаю" and entry["source"] == "Thinking"
+
+
+def test_answers_may_keep_the_sources_own_angle_bracket_text(light):
+    item = {"key": "x", "text": "Tools appear as <1>mcp_<server>__<tool></1> after refresh.", "plural": False}
+    kept = {"text": "Инструменты появляются как <1>mcp_<server>__<tool></1> после обновления."}
+    assert gen._validate_answer(item, kept, []) == kept
+    assert gen._validate_answer(item, {"text": "Инструменты <em>появляются</em> как <1>mcp_<server>__<tool></1>."}, []) is None, "a tag the source lacks"
+    assert gen._validate_answer(item, {"text": "Инструменты появляются как <1>mcp_<server>__<tool>.</1>"}, []) == {"text": "Инструменты появляются как <1>mcp_<server>__<tool>.</1>"}

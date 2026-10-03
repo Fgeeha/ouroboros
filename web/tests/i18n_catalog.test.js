@@ -10,6 +10,7 @@ import { taskPresentation, taskReasonPhrase } from '../modules/log_events.js';
 import { questionPresentation } from '../modules/question_presentation.js';
 import { acceptanceIncidentClauses } from '../modules/acceptance_incident_presentation.js';
 import { formatMsgTime, routingAnnotationText, routingOptionLabel } from '../modules/chat_activity.js';
+import { cancelCauseClauses } from '../modules/cancel_presentation.js';
 
 setMissTransport(() => Promise.resolve(null));
 
@@ -31,6 +32,8 @@ const RU = {
         [CODE_PREFIX + 'time.at']: { text: 'в' },
         'New task in {name}': { text: 'Новая задача в {name}' },
         'Not started: the request was empty': { text: 'Не запущено: запрос пуст' },
+        [CODE_PREFIX + 'cancel.source.http_single']: { text: 'Остановлена из приложения (Stop now)' },
+        [CODE_PREFIX + 'cancel.scope_cascade']: { text: 'эта задача и её подзадачи' },
     },
 };
 const EN = { language: '', english: true, revision: 0, entries: {} };
@@ -51,6 +54,7 @@ function englishReadings() {
         refusedUnknown: routingAnnotationText({ status: 'refused', cause: 'Not started: something new' }),
         steered: routingAnnotationText({ action: 'steer_task', status: 'delivered', target: 'abc' }),
         option: routingOptionLabel({ action: 'new_task_in_project', project_name: 'Docs' }),
+        cancel: cancelCauseClauses({ source: 'http_single', scope: 'cascade' }, { task_id: 't1' }),
         yesterday: formatMsgTime(yesterday.toISOString()),
         older: formatMsgTime('2026-01-05T10:00:00'),
     };
@@ -70,6 +74,7 @@ test('in English every catalog reading is the source text and matches the twin f
     assert.equal(en.pending, 'Choosing the right destination…');
     assert.equal(en.refused, 'Not started: the request was empty');
     assert.equal(en.steered, 'Steered task · Task');
+    assert.deepEqual(en.cancel.filter(Boolean), ['Stopped from the app (Stop now)', 'this task and its sub-tasks']);
     assert.equal(en.option, 'New task in Docs');
     assert.equal(en.yesterday.short, 'Yesterday, 10:05');
     assert.equal(en.older.short, 'Jan 5, 10:00');
@@ -96,6 +101,8 @@ test('an install language reads the same tables by code; what the memory lacks s
     assert.equal(ru.refused, 'Не запущено: запрос пуст', 'a host-composed refusal the memory knows reads translated');
     assert.equal(ru.refusedUnknown, 'Not started: something new', 'one it does not know stays English');
     assert.equal(ru.steered, 'Задача направлена · Задача');
+    assert.deepEqual(ru.cancel.filter(Boolean), ['Остановлена из приложения (Stop now)', 'эта задача и её подзадачи'],
+        'the control word inside the clause stays English by decision 5=A; the clause itself reads by code');
     assert.equal(ru.option, 'Новая задача в Docs');
     assert.equal(ru.yesterday.short, 'Вчера, 10:05');
     assert.equal(ru.older.short, `${new Intl.DateTimeFormat('ru', { month: 'short' }).format(new Date('2026-01-05T10:00:00'))} 5, 10:00`);

@@ -64,7 +64,6 @@ USAGE_CATEGORY = "ui_translation"
 # fraction of this; the stop marker, not the number, decides a cut).
 UI_TRANSLATION_MAX_TOKENS = 16384
 BATCH_KEYS = 100
-RETRY_BATCH_KEYS = 25
 MAX_ATTEMPTS = 3
 _OUTPUT_LIMIT_STOPS = frozenset({"length", "max_tokens"})
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
@@ -92,8 +91,19 @@ class LanguageResolveError(RuntimeError):
 
 def register_catalog(prefix: str, table: CatalogTable, note: str) -> None:
     """A host table of ``key → English sentence`` translated by code ``code:<prefix>.<key>``
-    (Telegram's lines register here from the skill; the core tables are built in)."""
+    (Telegram's lines register here from the skill; the core tables are built in). A table
+    registered after boot — a skill enabled later, a self-modification — is queued for the
+    chosen language at once, so its rows never wait for the next language event."""
     _EXTRA_CATALOGS[str(prefix)] = (table, str(note))
+    root = _WORKER.drive_root
+    tag = memory.current_language()
+    if root is None or not tag or is_english(tag):
+        return
+    try:
+        if enqueue_catalog(root, tag, prefixes=(str(prefix),)):
+            _WORKER.schedule(root)
+    except Exception:
+        log.debug("ui translation: late catalog %s not queued", prefix, exc_info=True)
 
 
 def _core_catalogs() -> Dict[str, Tuple[Dict[str, str], str]]:
@@ -131,13 +141,16 @@ def catalog_source_hashes() -> Dict[str, str]:
     return {key: memory.source_hash(item["text"]) for key, item in catalog_entries().items()}
 
 
-def enqueue_catalog(drive_root: pathlib.Path, tag: str) -> int:
+def enqueue_catalog(drive_root: pathlib.Path, tag: str, *, prefixes: Optional[Tuple[str, ...]] = None) -> int:
     """Queue every catalog code the memory lacks, and every generated one whose English
-    moved. Owner pins and imported entries are never queued. Returns the count queued."""
+    moved. Owner pins and imported entries are never queued. ``prefixes`` narrows the pass to
+    the tables named (a late registration). Returns the count queued."""
     doc = memory.cached_memory(drive_root, tag)
     entries = (doc or {}).get("entries", {})
     items: List[Dict[str, Any]] = []
     for key, item in catalog_entries().items():
+        if prefixes is not None and item["context"].get("table") not in prefixes:
+            continue
         current = entries.get(key)
         if current is None:
             items.append({"key": key, "context": {"source": item["text"], **item["context"]}})
@@ -278,28 +291,31 @@ def _batch_request(batch: List[Dict[str, Any]]) -> str:
 
 
 def _source_text(key: str, facts: Dict[str, Any], catalog: Dict[str, Dict[str, Any]]) -> str:
-    """The English a queued key stands for: the context's ``source`` (the browser passes the
-    table's English with every code and template), the catalog's text, or — for rendered
-    chrome — the key itself."""
+    """The English a queued key stands for: the host catalog's own text for a catalog code
+    (never a client's possibly stale copy), the context's ``source`` for a browser-only code
+    or a template, or — for rendered chrome — the key itself."""
+    if key in catalog:
+        return catalog[key]["text"]
     context = facts.get("context") if isinstance(facts.get("context"), dict) else {}
     source = str(context.get("source") or "").strip()
     if source:
         return source
-    if key in catalog:
-        return catalog[key]["text"]
     return "" if memory.is_code_key(key) else memory.split_scope(key)[0]
 
 
 def _validate_answer(item: Dict[str, Any], answer: Dict[str, Any], categories: List[str]) -> Optional[Dict[str, Any]]:
-    """``{"text"}`` or ``{"forms"}`` for a well-formed answer, else ``None``."""
+    """``{"text"}`` or ``{"forms"}`` for a well-formed answer, else ``None``: the SAME placeholders
+    as the source (specs included), no markup the source lacks, balanced inline slots, and for a
+    plural key one form per recorded category."""
     allowed = memory.placeholders(item["text"])
+    source_markup = memory.markup_tokens(item["text"])
 
     def _ok(value: Any) -> bool:
         if not isinstance(value, str) or not value.strip() or len(value) > memory.MAX_VALUE_CHARS:
             return False
-        if memory._MARKUP_RE.search(value):  # noqa: SLF001 — the memory's own markup rule
+        if memory.markup_tokens(value) - source_markup:  # no markup the source did not have
             return False
-        return memory.placeholders(value) <= allowed
+        return memory.placeholders(value) == allowed and memory.inline_slots_balanced(value)
 
     forms = answer.get("forms")
     if item["plural"]:
@@ -308,7 +324,9 @@ def _validate_answer(item: Dict[str, Any], answer: Dict[str, Any], categories: L
         cleaned = {str(k): v for k, v in forms.items() if _ok(v) and isinstance(k, str) and k and len(k) <= 16}
         if len(cleaned) != len(forms):
             return None
-        if categories and (set(cleaned) - set(categories) or "other" not in cleaned):
+        if categories and set(cleaned) != set(categories):
+            return None
+        if not categories and "other" not in cleaned:
             return None
         return {"forms": cleaned}
     text = answer.get("text")
@@ -324,6 +342,14 @@ def _broadcast(message: Dict[str, Any]) -> None:
         broadcast_ws_sync(message)
     except Exception:
         log.debug("ui translation broadcast skipped", exc_info=True)
+
+
+def _refuse(drive_root: pathlib.Path, tag: str, keys: List[str], reason: str) -> None:
+    """Remember keys that exhausted their attempts, so pages stop re-reporting them."""
+    try:
+        memory.update_memory(drive_root, tag, lambda doc: doc if memory.refuse_keys(doc, keys, reason=reason) else None, create=True)
+    except Exception:
+        log.debug("ui translation: refused keys not recorded", exc_info=True)
 
 
 def translate_batch(drive_root: pathlib.Path, tag: str, *, client: Any = None,
@@ -346,12 +372,19 @@ def _translate_taken(drive_root: pathlib.Path, tag: str, taken: List[Tuple[str, 
                      facts: Dict[str, Any], *, client: Any = None) -> Dict[str, Any]:
     doc = memory.cached_memory(drive_root, tag)
     catalog = catalog_entries()
+    entries = (doc or {}).get("entries", {})
     batch: List[Dict[str, Any]] = []
     back: List[Tuple[str, Dict[str, Any]]] = []
+    refused: List[str] = []
     for index, (key, queued) in enumerate(taken):
         text = _source_text(key, queued, catalog)
         if not text:
             facts["dropped"] += 1  # a code nobody can read the English of
+            continue
+        current = entries.get(key)
+        context_flags = queued.get("context") if isinstance(queued.get("context"), dict) else {}
+        if current is not None and not context_flags.get("stale"):
+            facts["satisfied"] = facts.get("satisfied", 0) + 1  # already in the memory: nothing to buy
             continue
         context = dict(queued.get("context") or {})
         context.pop("source", None)
@@ -367,6 +400,7 @@ def _translate_taken(drive_root: pathlib.Path, tag: str, taken: List[Tuple[str, 
             queued["last_error"] = error[:200]
             if queued["attempts"] >= MAX_ATTEMPTS:
                 facts["dropped"] += 1
+                refused.append(item["key"])
                 log.warning("ui translation: dropping %r after %d failed batches (%s)", item["key"], queued["attempts"], error[:120])
             else:
                 back.append((item["key"], queued))
@@ -385,11 +419,15 @@ def _translate_taken(drive_root: pathlib.Path, tag: str, taken: List[Tuple[str, 
         error = f"{type(exc).__name__}: {exc}"
         _requeue(batch, error=error)
         memory.requeue_pending(drive_root, tag, back)
+        if refused:
+            _refuse(drive_root, tag, refused, error[:120])
         facts["error"] = error[:200]
         return facts
     if stop in _OUTPUT_LIMIT_STOPS:
         _requeue(batch, error=f"output budget hit ({stop})")
         memory.requeue_pending(drive_root, tag, back)
+        if refused:
+            _refuse(drive_root, tag, refused, f"output budget hit ({stop})")
         facts["error"] = "output_truncated"
         return facts
     parsed = _json_object(content) or {}
@@ -415,14 +453,19 @@ def _translate_taken(drive_root: pathlib.Path, tag: str, taken: List[Tuple[str, 
     if rejected:
         _requeue(rejected, error="no valid answer in the batch")
         memory.requeue_pending(drive_root, tag, back)
+    if refused and not accepted:
+        _refuse(drive_root, tag, refused, "no valid answer after the attempt bound")
     if accepted:
         hashes = {key: memory.source_hash(item["text"]) for item in batch for key in [item["key"]] if key in accepted}
+        sources = {item["key"]: item["text"] for item in batch if item["key"] in accepted and memory.is_code_key(item["key"])}
         model, _use_local, _available = _light_route()
         applied = {"count": 0}
 
         def _apply(current: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-            applied["count"] = memory.apply_generated(current, accepted, model=model, source_hashes=hashes)
-            return current if applied["count"] else None
+            applied["count"] = memory.apply_generated(current, accepted, model=model, source_hashes=hashes, sources=sources)
+            if refused:
+                memory.refuse_keys(current, refused, reason="no valid answer after the attempt bound")
+            return current if applied["count"] or refused else None
 
         try:
             written = memory.update_memory(drive_root, tag, _apply, create=True)
@@ -467,7 +510,11 @@ class _Worker:
     def _run(self) -> None:
         while not self.stop.is_set():
             if not self.wake.wait(timeout=0.5):
-                break  # nothing more to do: the thread ends, the next hook starts a new one
+                with self.lock:
+                    if not self.wake.is_set():
+                        self.thread = None  # nothing more to do: the next hook starts a new thread
+                        break
+                continue
             self.wake.clear()
             root = self.drive_root
             tag = memory.current_language()
@@ -530,29 +577,34 @@ def on_language_event(event: str, drive_root: pathlib.Path, tag: str) -> None:
 
 
 def start_background(drive_root: pathlib.Path) -> None:
-    """Server boot: register the hook and re-check the chosen language (missing or stale
-    catalog codes, misses left in the queue) without any model call on the boot path."""
-    from ouroboros.gateway.ui_i18n import register_language_hook
-
-    register_language_hook(on_language_event)
-    tag = memory.current_language()
-    if not tag or is_english(tag):
-        return
+    """Server boot (fail-soft, no model call): register the gateway hook, remember the data
+    root so a table registered later can queue itself, and re-check the chosen language —
+    catalog codes the memory lacks or whose English moved, misses left in the queue."""
     try:
+        from ouroboros.gateway.ui_i18n import register_language_hook
+
+        register_language_hook(on_language_event)
+        _WORKER.drive_root = pathlib.Path(drive_root)
+        tag = memory.current_language()
+        if not tag or is_english(tag):
+            return
         queued = enqueue_catalog(pathlib.Path(drive_root), tag)
+        if queued or memory.pending_count(pathlib.Path(drive_root), tag):
+            _WORKER.schedule(pathlib.Path(drive_root))
     except Exception:
-        log.warning("ui translation: boot re-check failed for %s", tag, exc_info=True)
-        return
-    if queued or memory.pending_count(pathlib.Path(drive_root), tag):
-        _WORKER.schedule(pathlib.Path(drive_root))
+        log.warning("ui translation: boot re-check failed", exc_info=True)
 
 
 def stop_background(timeout: float = 2.0) -> None:
-    _WORKER.stop.set()
-    _WORKER.wake.set()
-    thread = _WORKER.thread
-    if thread is not None and thread.is_alive() and thread is not threading.current_thread():
-        thread.join(timeout=timeout)
+    """Lifespan teardown (fail-soft): stop the worker thread."""
+    try:
+        _WORKER.stop.set()
+        _WORKER.wake.set()
+        thread = _WORKER.thread
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=timeout)
+    except Exception:
+        log.debug("ui translation: stop failed", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -598,12 +650,16 @@ def resolve_language_request(text: str, *, drive_root: Optional[pathlib.Path] = 
     except Exception as exc:  # noqa: BLE001 — the gateway answers a typed 502
         raise LanguageResolveError("language_resolve_failed",
                                    f"the model could not be asked about this language ({type(exc).__name__})") from exc
-    parsed = _json_object(content) or {}
+    parsed = _json_object(content)
     if stop in _OUTPUT_LIMIT_STOPS and not parsed:
         raise LanguageResolveError("language_resolve_failed", "the model's answer was cut by the output budget")
-    label = str(parsed.get("label") or request)[:120].strip()
+    if not parsed or not isinstance(parsed.get("label"), str) or not parsed["label"].strip():
+        # No profile in the answer: the host does not invent a language the model did not name.
+        raise LanguageResolveError("language_resolve_failed", "the model's answer was not a language profile")
+    label = parsed["label"][:120].strip()
     tag = normalize_language_tag(parsed.get("tag"))
     if not tag:
+        # The model named a language without a usable tag: an invented one, carried as private use.
         slug = _SLUG_RE.sub("-", label.lower()).strip("-")[:8].strip("-") or "lang"
         tag = invented_language_tag(slug)
     if is_english(tag):

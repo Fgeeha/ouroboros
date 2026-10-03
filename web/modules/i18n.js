@@ -49,7 +49,7 @@ export const EXCLUDE_SELECTOR = [
     '.log-task-timeline', '.files-editor', '.files-preview-content', '.files-preview-path',
     '.files-preview-meta', '.chat-live-line-body', '.chat-live-line-time',
     '.chat-live-line-repeat', '.chat-live-meta', 'input', 'textarea',
-    '[contenteditable="true"]',
+    '[contenteditable="true"]', '[data-i18n-fmt]', '[data-i18n-skip]',
 ].join(',');
 
 /** Subtrees the overlay never enters: every chat transcript (Main's `#chat-messages` and
@@ -65,7 +65,7 @@ export const SKIP_ROOTS = [
  *  whole, like SKIP_ROOTS: the name reaches `.nav-project-row` as the `title` attribute as
  *  well as its label's text. Composed strings that merely embed a name are a `fmt` job. */
 export const USER_CONTENT = [
-    '.nav-project-row', '#project-panel-title', '.chat-live-project-name',
+    '.nav-project-row', '.nav-project-kebab', '#project-panel-title', '.chat-live-project-name',
     '.files-entry-name', '.files-crumb',
 ].join(',');
 
@@ -75,7 +75,7 @@ export const USER_CONTENT = [
 
 const state = {
     language: '', english: true, revision: 0, entries: Object.create(null), scopes: [],
-    plural: null, profile: null, stats: null, languages: [],
+    plural: null, profile: null, stats: null, languages: [], payload: null,
 };
 let translator = null;
 // Every switch runs on ONE chain: two concurrent setLanguage calls cannot each build a
@@ -93,6 +93,17 @@ export function dictionaryRevision() { return state.revision; }
 export function languageProfile() { return state.profile; }
 export function languageStats() { return state.stats; }
 export function knownLanguages() { return state.languages.slice(); }
+/** The last gateway payload applied (GET /api/ui/i18n or a language POST), or null before boot. */
+export function currentPayload() { return state.payload; }
+
+/** `ltr` | `rtl` when the engine knows the tag's script direction, else `` (unknown). */
+export function localeDirection(tag) {
+    try {
+        const locale = new Intl.Locale(String(tag || ''));
+        const info = typeof locale.getTextInfo === 'function' ? locale.getTextInfo() : locale.textInfo;
+        return info && (info.direction === 'rtl' || info.direction === 'ltr') ? info.direction : '';
+    } catch { return ''; }
+}
 
 function makePluralRules(tag) {
     if (!tag || typeof Intl === 'undefined' || typeof Intl.PluralRules !== 'function') return null;
@@ -102,6 +113,9 @@ function makePluralRules(tag) {
 /** `{map: {"0": "other", …}, period, categories}` for a tag, as the memory stores it so Python
  *  (which has no Intl) can select the same plural form. Null when the engine does not know the tag. */
 export function pluralSelectMap(tag) {
+    try {
+        if (!Intl.PluralRules.supportedLocalesOf([String(tag || '')]).length) return null;
+    } catch { return null; }
     const rules = makePluralRules(tag);
     if (!rules) return null;
     const map = {};
@@ -145,27 +159,50 @@ const NUMBER_RE = /^([\s\S]*?)(-?\d+(?:[.,]\d+)?)([\s\S]*)$/;
  * number tries its `{n}` template and selects the plural form for that number.
  */
 export function translateString(text, element = null, entries = state.entries) {
-    if (typeof text !== 'string') return text;
+    return lookupString(text, element, entries).text;
+}
+
+// A key is the text as the reader sees it: runs of ASCII whitespace (a template literal's line
+// breaks and indentation) collapse to one space, so the same sentence has one key in every
+// source layout and in every client. The memory applies the same rule to reported keys.
+const KEY_WHITESPACE_RE = /[ \t\n\r\f\v]+/g;
+export function keyText(text) { return String(text ?? '').replace(KEY_WHITESPACE_RE, ' ').trim(); }
+
+/** The single-number template a rendered string reports as its miss ("12.3 KB" → "{n} KB"),
+ *  or the string itself. One memory entry then covers every value instead of one per value. */
+export function missKeyFor(text) {
+    const core = keyText(text);
+    const numbered = NUMBER_RE.exec(core);
+    if (numbered && !/\d/.test(numbered[1] + numbered[3]) && /\p{L}/u.test(numbered[1] + numbered[3])) {
+        return `${numbered[1]}{n}${numbered[3]}`;
+    }
+    return core;
+}
+
+/** `{text, found}`: the translation (or the input) and whether the memory HAD an entry — an
+ *  entry whose text equals its source ("Ouroboros") is found, not missing. */
+export function lookupString(text, element = null, entries = state.entries) {
+    if (typeof text !== 'string') return { text, found: false };
     const parts = /^(\s*)([\s\S]*?)(\s*)$/.exec(text);
-    const core = parts[2];
-    if (!core) return text;
+    const core = keyText(parts[2]);
+    if (!core) return { text, found: false };
     if (element && state.scopes.length) {
         for (const scope of state.scopes) {
             if (!matchesScope(element, scope)) continue;
             const scoped = entryText(entries[core + SCOPE_SEPARATOR + scope]);
-            if (typeof scoped === 'string') return parts[1] + scoped + parts[3];
+            if (typeof scoped === 'string') return { text: parts[1] + scoped + parts[3], found: true };
         }
     }
     const exact = entryText(entries[core]);
-    if (typeof exact === 'string') return parts[1] + exact + parts[3];
+    if (typeof exact === 'string') return { text: parts[1] + exact + parts[3], found: true };
     const numbered = NUMBER_RE.exec(core);
     if (numbered && !/\d/.test(numbered[1] + numbered[3])) {
         const key = `${numbered[1]}{n}${numbered[3]}`;
         const value = Number(numbered[2].replace(',', '.'));
         const templated = entryText(entries[key], value);
-        if (typeof templated === 'string') return parts[1] + templated.split('{n}').join(numbered[2]) + parts[3];
+        if (typeof templated === 'string') return { text: parts[1] + templated.split('{n}').join(numbered[2]) + parts[3], found: true };
     }
-    return text;
+    return { text, found: false };
 }
 
 // ---------------------------------------------------------------------------
@@ -180,9 +217,13 @@ let missTransport = (payload) => apiClient.reportI18nMissing(payload);
 /** Test seam: replace the transport (default: POST /api/ui/i18n/missing). */
 export function setMissTransport(fn) { missTransport = typeof fn === 'function' ? fn : missTransport; }
 
+// The memory's own bound on a key (ouroboros/i18n_memory.py MAX_KEY_CHARS): a Settings help
+// paragraph of several sentences is an ordinary key; the gateway refuses anything longer.
+const MAX_KEY_CHARS = 2000;
+
 function looksVolatile(text) {
     const value = String(text || '').trim();
-    if (!value || value.length > 400) return true;
+    if (!value || value.length > MAX_KEY_CHARS) return true;
     if (/^[\W\d_]*$/.test(value) || /^(?:https?:\/\/|\/|~\/|[A-Za-z]:\\)/.test(value) || /^\d{4}-\d{2}-\d{2}[T ]/.test(value)) return true;
     let letters = 0;
     for (const ch of value) if (/\p{L}/u.test(ch)) letters += 1;
@@ -225,8 +266,16 @@ export function pendingMisses() { return Array.from(misses.keys()); }
 /** A catalog sentence by its stable code; `english` is the table's own text and the fallback. */
 export function tr(code, english = '') {
     if (state.english) return english;
-    const text = entryText(state.entries[CODE_PREFIX + code]);
-    if (typeof text === 'string') return text;
+    const entry = state.entries[CODE_PREFIX + code];
+    const text = entryText(entry);
+    if (typeof text === 'string') {
+        // The entry remembers the English it translated; a reworded source is a stale miss.
+        if (typeof entry.source === 'string' && entry.source !== english) {
+            noteMiss(CODE_PREFIX + code, { source: english, stale: true });
+            return english;
+        }
+        return text;
+    }
     noteMiss(CODE_PREFIX + code, { source: english });
     return english;
 }
@@ -238,7 +287,7 @@ export function tr(code, english = '') {
  * Never for model prose or owner-supplied names.
  */
 export function tx(text) {
-    const source = String(text ?? '').trim();
+    const source = keyText(text);
     if (!source || state.english) return source;
     const found = entryText(state.entries[source]);
     if (typeof found === 'string') return found;
@@ -307,7 +356,18 @@ function inlineKey(element) {
             key += `<${slots.length}>${inner}</${slots.length}>`;
         }
     }
-    return { key: key.trim(), slots };
+    return { key: keyText(key), slots };
+}
+
+function slotTexts(slots) {
+    return slots.map((slot) => (slot.childNodes && slot.childNodes.length === 1 && slot.childNodes[0].nodeType === TEXT_NODE
+        ? slot.childNodes[0].nodeValue : null));
+}
+
+function restoreSlotTexts(slots, texts) {
+    slots.forEach((slot, index) => {
+        if (texts && typeof texts[index] === 'string' && slot.childNodes && slot.childNodes[0]) slot.childNodes[0].nodeValue = texts[index];
+    });
 }
 
 function rebuildInline(element, translated, slots, doc) {
@@ -355,9 +415,9 @@ export function createTranslator({
         // Our own last output still in place → retranslate from the stored English;
         // anything else means the app rewrote the node, so that value is the source.
         const source = node.__ouroOut !== undefined && current === node.__ouroOut ? node.__ouroSrc : current;
-        const out = translateString(source, node.parentElement);
+        const { text: out, found } = lookupString(source, node.parentElement);
         if (out === source) {
-            if (String(source).trim()) noteMiss(String(source).trim(), { role: roleOf(node.parentElement) });
+            if (!found && String(source).trim()) noteMiss(missKeyFor(source), { role: roleOf(node.parentElement) });
             delete node.__ouroSrc;
             delete node.__ouroOut;
             if (current !== source) node.nodeValue = source;
@@ -380,10 +440,10 @@ export function createTranslator({
         if (current === null) return;
         const stash = el.__ouroAttrs?.[attr];
         const source = stash && current === stash.out ? stash.src : current;
-        const out = translateString(source, el);
+        const { text: out, found } = lookupString(source, el);
         if (out === source) {
             if (el.__ouroAttrs) delete el.__ouroAttrs[attr];
-            if (String(source).trim()) noteMiss(String(source).trim(), { role: attr });
+            if (!found && String(source).trim()) noteMiss(missKeyFor(source), { role: attr });
             if (current !== source) el.setAttribute(attr, source);
             return;
         }
@@ -404,22 +464,38 @@ export function createTranslator({
         if (!doc || typeof doc.createTextNode !== 'function' || typeof el.replaceChildren !== 'function') return;
         const { key, slots } = inlineKey(el);
         const stash = el.__ouroInline;
+        // Our own output still in place → the source is the stashed English, with the slots'
+        // English text put back before anything is rebuilt; otherwise the app rewrote the
+        // composite and what stands now IS the source.
+        if (stash && key === stash.out) restoreSlotTexts(stash.slots, stash.slotTexts);
         const source = stash && key === stash.out ? stash.src : key;
-        const translated = translateString(source, el);
+        const { text: translated, found } = lookupString(source, el);
         if (translated === source) {
             if (stash) {
                 el.replaceChildren(...stash.nodes);
                 delete el.__ouroInline;
-            } else if (source) {
+            } else if (!found && source) {
                 noteMiss(source, { role: 'inline', tags: slots.length });
             }
             return;
         }
-        if (stash && key === stash.out && translated === stash.out) return;
         const originals = stash ? stash.nodes : [...el.childNodes];
+        const originalSlots = stash ? stash.slots : slots;
+        const originalTexts = stash ? stash.slotTexts : slotTexts(slots);
         if (stash) el.replaceChildren(...stash.nodes);
-        rebuildInline(el, translated, slots, doc);
-        el.__ouroInline = { src: source, out: inlineKey(el).key, nodes: originals };
+        rebuildInline(el, translated, originalSlots, doc);
+        el.__ouroInline = { src: source, out: inlineKey(el).key, nodes: originals, slots: originalSlots, slotTexts: originalTexts };
+    }
+
+    /** The composite a text node belongs to: its parent, or — for the text of an inline
+     *  element such as <strong> — the grandparent that holds the sentence. */
+    function compositeOf(node) {
+        const parent = node.parentElement;
+        if (!parent) return null;
+        if (parent.__ouroInline || isInlineComposite(parent)) return parent;
+        const holder = INLINE_TAGS.has(parent.tagName) ? parent.parentElement : null;
+        if (holder && !excluded(holder) && (holder.__ouroInline || isInlineComposite(holder))) return holder;
+        return null;
     }
 
     function applyTo(root) {
@@ -427,7 +503,8 @@ export function createTranslator({
         if (root.nodeType === TEXT_NODE) {
             const parent = root.parentElement;
             if (!parent || excluded(parent)) return;
-            if (parent.__ouroInline || isInlineComposite(parent)) applyInline(parent);
+            const composite = compositeOf(root);
+            if (composite) applyInline(composite);
             else applyTextNode(root);
             return;
         }
@@ -440,7 +517,8 @@ export function createTranslator({
             const parent = node.parentElement;
             if (!parent || parent.tagName === 'SCRIPT' || parent.tagName === 'STYLE') continue;
             if (excluded(parent)) continue;
-            if (parent.__ouroInline || isInlineComposite(parent)) { composites.add(parent); continue; }
+            const composite = compositeOf(node);
+            if (composite) { composites.add(composite); continue; }
             applyTextNode(node);
         }
         for (const el of composites) applyInline(el);
@@ -463,7 +541,10 @@ export function createTranslator({
         const elements = [root, ...root.querySelectorAll('*')];
         for (const el of elements) {
             if (el.__ouroInline) {
-                if (inlineKey(el).key === el.__ouroInline.out) el.replaceChildren(...el.__ouroInline.nodes);
+                if (inlineKey(el).key === el.__ouroInline.out) {
+                    restoreSlotTexts(el.__ouroInline.slots, el.__ouroInline.slotTexts);
+                    el.replaceChildren(...el.__ouroInline.nodes);
+                }
                 delete el.__ouroInline;
             }
             if (el.__ouroAttrs) {
@@ -544,6 +625,7 @@ export function applyPayload(payload) {
     state.profile = data.profile && typeof data.profile === 'object' ? data.profile : null;
     state.stats = data.stats && typeof data.stats === 'object' ? data.stats : null;
     state.languages = Array.isArray(data.languages) ? data.languages : [];
+    state.payload = payload && typeof payload === 'object' ? payload : null;
     reportedAtRevision.clear();
     misses.clear();
     try {

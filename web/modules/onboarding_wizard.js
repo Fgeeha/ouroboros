@@ -9,6 +9,7 @@ import {
     readCompletionAnswer,
 } from './onboarding_agents_step.js';
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
+import { bindLanguageSettings, languageBlockHtml } from './settings_language.js';
 import { installAltMenuSuppression, installDesktopShellLinkInterceptor } from './ui_helpers.js';
 import { createModelRolesEditor, modelRolesHost, modelRoleMap, parseModelSource } from './model_roles.js';
 import { availableSubagentsEditorHost } from './subagents_settings.js';
@@ -107,6 +108,7 @@ import { accountRowFacts } from './harness_accounts.js';
     let modelCatalog = {};
     let catalogRequest = null;
     let disposed = false;
+    let disposeLanguage = null;
     let catalogGeneration = 0;
     const stepScrollPositions = new Map();
     const modelRoles = createModelRolesEditor({ hostId: 'onboarding-model-roles', onChange: (settings) => {
@@ -381,9 +383,7 @@ import { accountRowFacts } from './harness_accounts.js';
         const filename = trim(state.localFilename);
         if (!source && !filename) return '';
         for (const [presetId, preset] of Object.entries(LOCAL_PRESETS)) {
-            if (source === trim(preset.source) && filename === trim(preset.filename)) {
-                return presetId;
-            }
+            if (source === trim(preset.source) && filename === trim(preset.filename)) return presetId;
         }
         return 'custom';
     }
@@ -429,18 +429,14 @@ import { accountRowFacts } from './harness_accounts.js';
         if (localSource && (!Number.isInteger(Number(state.localContextLength)) || Number(state.localContextLength) <= 0)) {
             return 'Local context length must be a positive integer.';
         }
-        if (localSource && !Number.isInteger(Number(state.localGpuLayers))) {
-            return 'Local GPU layers must be an integer.';
-        }
+        if (localSource && !Number.isInteger(Number(state.localGpuLayers))) return 'Local GPU layers must be an integer.';
         return '';
     }
 
     function validateModelsStep() {
         // Only Main is required; the remaining active slots are optional or
         // already carry a default. Don't force the owner to fill every slot.
-        if (!trim(state.mainModel)) {
-            return 'Confirm the Main model before starting Ouroboros.';
-        }
+        if (!trim(state.mainModel)) return 'Confirm the Main model before starting Ouroboros.';
         const { source } = parseModelSource(state.mainModel);
         const supported = source.startsWith('subscription:')
             ? modelSources.some((entry) => entry.id === source.slice(13) && state.agentsConnected.includes(entry.credentialHarness))
@@ -452,9 +448,7 @@ import { accountRowFacts } from './harness_accounts.js';
     }
 
     function validateReviewStep() {
-        if (!['advisory', 'blocking'].includes(trim(state.reviewEnforcement))) {
-            return 'Choose advisory or blocking review mode.';
-        }
+        if (!['advisory', 'blocking'].includes(trim(state.reviewEnforcement))) return 'Choose advisory or blocking review mode.';
         return '';
     }
 
@@ -995,6 +989,7 @@ import { accountRowFacts } from './harness_accounts.js';
                 </div>
             </div>
             <div class="summary-card">${summaryRowsHtml()}</div>
+            ${languageBlockHtml({ onboarding: true })}
             ${state.recoveryPrepared ? `<div class="wizard-inline-note">Automatic subscription presets were skipped. ${state.recoveryMain === mainBinding() ? 'Reviewers were assigned to Main.' : 'Main changed; reviewers keep the assignments shown above. Use Main for reviewers again if you want to update them.'} Check the assignments, then Start Ouroboros to save this draft. Later changes in Settings are manual.</div>` : ''}
         `;
     }
@@ -1090,6 +1085,8 @@ import { accountRowFacts } from './harness_accounts.js';
             </div>
         `;
         bindEvents();
+        disposeLanguage?.();   // the Language block lives on the summary step only; its binder owns its listeners
+        disposeLanguage = state.currentStep === 'summary' && !state.completedRestartMode ? bindLanguageSettings(root) : null;
         renderLocalStatus();
     }
 
@@ -1590,6 +1587,7 @@ import { accountRowFacts } from './harness_accounts.js';
     window.addEventListener('pagehide', (event) => {
         if (event.persisted) return;
         disposed = true;
+        disposeLanguage?.();
         catalogGeneration += 1;
         catalogRequest?.controller.abort();
         modelRoles.destroy();

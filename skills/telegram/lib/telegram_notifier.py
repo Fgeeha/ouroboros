@@ -114,7 +114,7 @@ async def _check_budget_notify(
     notified = int(state.get("budget_threshold") or 0)
     delivered = False
     if crossed > notified:
-        msg = _NOTIFY[lang]["budget"].format(pct=f"{pct:.0f}", spent=f"{spent:.2f}", total=f"{total:.2f}")
+        msg = _NOTIFY[lang].format("budget", pct=f"{pct:.0f}", spent=f"{spent:.2f}", total=f"{total:.2f}")
         outcome, exc = await _push_notification(api, chat_id, msg, trust_env=trust_env)
         if outcome == "transient":
             return exc, False
@@ -262,7 +262,7 @@ async def _check_tasks_notify(
             if outcome and outcome not in ("completed", "done"):
                 parts.append(outcome)
         tail = (" · " + " · ".join(parts)) if parts else ""
-        msg = _NOTIFY[lang]["task_finished"].format(icon=icon, id=tid[:8], word=word, tail=tail)
+        msg = _NOTIFY[lang].format("task_finished", icon=icon, id=tid[:8], word=word, tail=tail)
         # The card's reason line, exactly as the host composed it for this task's
         # durable row — never a second sentence written here, and never a second
         # rendering of the cause table; the memory may know the sentence's translation.
@@ -286,6 +286,12 @@ async def _check_tasks_notify(
     return transient, delivered
 
 
+def _notifier_language() -> str:
+    """The install's interface language for proactive pushes — the same reader the poller and the
+    outbound mirror use, never the bridge's retired private setting."""
+    return telegram_i18n.language()
+
+
 def _make_notifier(api, *, trust_env: bool = False):
     """Periodic, file-based proactive notifications (task done / budget threshold).
     Read-only over durable files; sends only when a pinned chat + toggle are set."""
@@ -301,7 +307,7 @@ def _make_notifier(api, *, trust_env: bool = False):
             # the budget lane self-gates on its own toggle, so a pinned owner chat is
             # the only precondition left.
             if chat_id:
-                lang = str(settings.get("TELEGRAM_LANGUAGE") or "en").strip().lower()
+                lang = _notifier_language()
                 state = _load_notif_state(api)
                 transient, delivered = await _check_budget_notify(
                     api, settings, chat_id, state, lang, trust_env=trust_env,

@@ -1,4 +1,5 @@
 import { plainCauseText } from './utils.js';
+import { tr } from './i18n.js';
 
 // Twin of supervisor.cancel_publication.cancel_cause_clauses. IDs stay in
 // cancel_origin/lineage details; a compact sentence never guesses an actor.
@@ -26,7 +27,7 @@ export const CANCEL_REASON_PREVIEW_NOTE = ' (preview; the full reason is kept wi
 function reasonPreview(value) {
     const whole = plainCauseText(value, 0);
     const shown = plainCauseText(value, CANCEL_REASON_MAX_CHARS);
-    return shown === whole ? shown : `${shown}${CANCEL_REASON_PREVIEW_NOTE}`;
+    return shown === whole ? shown : `${shown}${tr('cancel.reason_preview_note', CANCEL_REASON_PREVIEW_NOTE)}`;
 }
 
 export function cancelCauseClauses(origin, record = {}) {
@@ -39,16 +40,18 @@ export function cancelCauseClauses(origin, record = {}) {
     const root = String(record.root_task_id || '');
     const actor = origin.request_origin?.kind === 'agent_task' && origin.request_origin.task_id;
     const relation = asked && asked !== self && asked === parent
-        ? (asker ? 'Requested by its parent task' : 'Stopped with its parent task')
+        ? (asker ? tr('cancel.relation.requested_by_parent', 'Requested by its parent task') : tr('cancel.relation.stopped_with_parent', 'Stopped with its parent task'))
         : asked && asked !== self && parent && asked === root
-            ? (asker ? 'Requested by an ancestor task' : 'Stopped with an ancestor task') : '';
+            ? (asker ? tr('cancel.relation.requested_by_ancestor', 'Requested by an ancestor task') : tr('cancel.relation.stopped_with_ancestor', 'Stopped with an ancestor task')) : '';
     const stated = String(origin.reason || '');
     const label = Object.hasOwn(CANCEL_SOURCE_LABELS, source) ? CANCEL_SOURCE_LABELS[source] : null;
+    // The English phrases stay the source (twin of the Python table); an install language reads
+    // them by code (web/modules/i18n.js). A source with no phrase stays raw in every language.
     return [
-        Object.hasOwn(CANCEL_SOURCE_PHRASES, source) ? CANCEL_SOURCE_PHRASES[source] : source,
+        Object.hasOwn(CANCEL_SOURCE_PHRASES, source) ? tr(`cancel.source.${source}`, CANCEL_SOURCE_PHRASES[source]) : source,
         stated.split(/\s+/).filter(Boolean).join(' ') === label ? '' : reasonPreview(stated),
-        origin.scope === 'cascade' ? 'this task and its sub-tasks' : '',
+        origin.scope === 'cascade' ? tr('cancel.scope_cascade', 'this task and its sub-tasks') : '',
         relation,
-        actor && !(asker && relation && String(actor) === asked) ? 'Requested by a task' : '',
+        actor && !(asker && relation && String(actor) === asked) ? tr('cancel.relation.requested_by_task', 'Requested by a task') : '',
     ];
 }

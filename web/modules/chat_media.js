@@ -1,4 +1,5 @@
 import { escapeHtmlAttr, escapeHtmlText as escapeHtml } from './utils.js';
+import { tr } from './i18n.js';
 import { showToast } from './toast.js';
 import { downloadViaHostBridge, normalizeTone, openViaHostBridge } from './ui_helpers.js';
 import { MAX_LINK_ACTIONS } from './api_types.js';
@@ -506,11 +507,11 @@ export function createChatMedia({
 
     function photoActionsHtml() {
         return `<details class="chat-photo-actions">
-            <summary aria-label="Photo actions" aria-haspopup="menu" aria-expanded="false">•••</summary>
-            <div class="chat-photo-menu ui-popup" role="menu" aria-label="Photo actions" hidden>
-                <button type="button" role="menuitem" data-photo-action="open">Open in new tab</button>
-                <button type="button" role="menuitem" data-photo-action="download">Download</button>
-                <button type="button" role="menuitem" data-photo-action="copy">Copy to clipboard</button>
+            <summary aria-label="${tr('media.photo_actions', 'Photo actions')}" aria-haspopup="menu" aria-expanded="false">•••</summary>
+            <div class="chat-photo-menu ui-popup" role="menu" aria-label="${tr('media.photo_actions', 'Photo actions')}" hidden>
+                <button type="button" role="menuitem" data-photo-action="open">${tr('media.open_in_new_tab', 'Open in new tab')}</button>
+                <button type="button" role="menuitem" data-photo-action="download">${tr('media.download', 'Download')}</button>
+                <button type="button" role="menuitem" data-photo-action="copy">${tr('media.copy_to_clipboard', 'Copy to clipboard')}</button>
             </div>
         </details>`;
     }

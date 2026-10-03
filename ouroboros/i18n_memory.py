@@ -18,7 +18,8 @@ Two kinds of keys live in ``entries``, because two kinds of owner-visible Englis
 * the rendered English string itself (optionally ``\\x1f<dom scope>``) — scattered
   interface chrome translated by the browser overlay (``web/modules/i18n.js``). The
   key IS the English, so a reword is a new key and the old entry is orphaned; that is
-  the gettext trade-off and the status reports such entries as *unused*, never stale.
+  the gettext trade-off; such entries are never reported stale (nothing can tell them apart
+  from a string a page has simply not rendered yet).
 
 Composed strings carry placeholders: ``{n}`` (a count), ``{name}`` (an opaque owner
 span), ``<1>…</1>`` (an inline formatting element the browser maps onto the element's
@@ -76,7 +77,10 @@ PLURAL_SELECT_RANGE = 101  # select(n) for n in 0..100 as the browser writes it
 CODE_PREFIX = "code:"
 SCOPE_SEPARATOR = "\x1f"
 _FORBIDDEN_KEYS = frozenset({"__proto__", "constructor", "prototype"})
-_PLACEHOLDER_RE = re.compile(r"\{[A-Za-z_][A-Za-z0-9_]*\}|</?\d+>")
+# `{name}` and `{name:spec}` (the spec is part of the token: a changed spec is a changed
+# placeholder), plus numbered inline slots `<1>`…`</1>`.
+_PLACEHOLDER_RE = re.compile(r"\{[A-Za-z_][A-Za-z0-9_]*(?::[^{}]*)?\}|</?\d+>")
+_SLOT_RE = re.compile(r"<(/?)(\d+)>")
 _MARKUP_RE = re.compile(r"<(?!/?\d+>)[^>]*>")
 _MEMORY_LOCK_TIMEOUT_SEC = 4.0
 
@@ -117,7 +121,7 @@ def source_hash(text: object) -> str:
 
 
 def placeholders(text: object) -> set:
-    """``{n}``, ``{name}`` and inline tags as ``<1>`` (open and close fold to one token)."""
+    """``{n}``, ``{name}``, ``{name:spec}`` and inline tags as ``<1>`` (open and close fold to one token)."""
     out = set()
     for match in _PLACEHOLDER_RE.finditer(str(text or "")):
         token = match.group(0)
@@ -125,6 +129,15 @@ def placeholders(text: object) -> set:
             token = "<" + token[2:]
         out.add(token)
     return out
+
+
+def inline_slots_balanced(text: object) -> bool:
+    """Every numbered inline slot opens and closes exactly once (`<1>…</1>`)."""
+    opened: Dict[str, int] = {}
+    closed: Dict[str, int] = {}
+    for match in _SLOT_RE.finditer(str(text or "")):
+        (closed if match.group(1) else opened)[match.group(2)] = (closed if match.group(1) else opened).get(match.group(2), 0) + 1
+    return opened == closed and all(count == 1 for count in opened.values())
 
 
 def is_code_key(key: object) -> bool:
@@ -233,17 +246,31 @@ def _validate_value(key: str, entry: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def markup_tokens(text: object) -> set:
+    """The angle-bracket tokens of ``text`` other than numbered inline slots. A translation may
+    carry exactly the ones its source has (``<code>mcp_<server>__<tool></code>`` is text, not
+    markup) and no others."""
+    return set(_MARKUP_RE.findall(str(text or "")))
+
+
 def _validate_text(key: str, value: Any, allowed: Optional[set]) -> str:
     if not isinstance(value, str):
         raise MemoryFormatError(f"entry {key!r} value must be a string")
     if len(value) > MAX_VALUE_CHARS:
         raise MemoryFormatError(f"entry {key!r} value is too long")
-    if _MARKUP_RE.search(value):
+    # No markup the source did not have: a text key IS its source; a code key's English is not
+    # at hand here, so a code entry carries no angle-bracket text at all.
+    source_tokens = markup_tokens(split_scope(key)[0]) if not is_code_key(key) else set()
+    if markup_tokens(value) - source_tokens:
         raise MemoryFormatError(f"entry {key!r} value carries markup")
+    if not inline_slots_balanced(value):
+        raise MemoryFormatError(f"entry {key!r} value has an unbalanced inline slot")
     if allowed is not None:
-        extra = placeholders(value) - allowed
-        if extra:
-            raise MemoryFormatError(f"entry {key!r} value uses placeholders its source lacks: {sorted(extra)}")
+        # The same placeholders, no more and no fewer: a consumer formats with exactly the
+        # source's parameters, and a dropped or invented one breaks it in every language.
+        found = placeholders(value)
+        if found != allowed:
+            raise MemoryFormatError(f"entry {key!r} value placeholders {sorted(found)} differ from the source's {sorted(allowed)}")
     return value
 
 
@@ -265,6 +292,13 @@ def _validate_entry(key: Any, raw: Any) -> Dict[str, Any]:
             if not isinstance(value, str) or len(value) > 400:
                 raise MemoryFormatError(f"entry {key!r}.{field} must be a short string")
             entry[field] = value
+    # The English a code entry translated: the browser compares it with the current English
+    # to catch a reword of a code it alone renders (no Python twin, so no source hash to check).
+    source = raw.get("source")
+    if source is not None:
+        if not isinstance(source, str) or len(source) > MAX_KEY_CHARS:
+            raise MemoryFormatError(f"entry {key!r}.source must be a string")
+        entry["source"] = source
     return entry
 
 
@@ -290,6 +324,9 @@ def validate_memory(doc: Any) -> Dict[str, Any]:
     revision = doc.get("revision", 0)
     if not isinstance(revision, int) or isinstance(revision, bool) or revision < 0:
         raise MemoryFormatError("memory.revision must be a non-negative integer")
+    refused = doc.get("refused", {})
+    if not isinstance(refused, dict) or not all(isinstance(k, str) and isinstance(v, dict) for k, v in refused.items()):
+        raise MemoryFormatError("memory.refused must be an object of key → facts")
     out = dict(doc)
     out.update({
         "schema": SCHEMA, "language": tag, "revision": revision,
@@ -297,7 +334,7 @@ def validate_memory(doc: Any) -> Dict[str, Any]:
         "plural_select": _normalize_plural_select(doc.get("plural_select")),
         "plural_categories": _normalize_plural_categories(doc.get("plural_categories")),
         "glossary_hash": str(doc.get("glossary_hash") or ""),
-        "entries": entries, "shadow": shadow,
+        "entries": entries, "shadow": shadow, "refused": refused,
     })
     return out
 
@@ -414,8 +451,10 @@ def cached_memory(drive_root: pathlib.Path, tag: str) -> Optional[Dict[str, Any]
 
 def apply_generated(doc: Dict[str, Any], items: Dict[str, Dict[str, Any]], *, model: str,
                     attempt_id: str = "", source_hashes: Optional[Dict[str, str]] = None,
-                    at: Optional[str] = None) -> int:
-    """Write generated translations for keys that have no owner/imported entry. Returns the count."""
+                    sources: Optional[Dict[str, str]] = None, at: Optional[str] = None) -> int:
+    """Write generated translations for keys that have no owner/imported entry. Returns the count.
+    ``sources`` is the English each code key translated (kept on the entry for the browser's
+    reword check); a key written here leaves the ``refused`` ledger."""
     applied = 0
     stamp = at or utc_now_iso()
     for key, value in items.items():
@@ -429,9 +468,25 @@ def apply_generated(doc: Dict[str, Any], items: Dict[str, Dict[str, Any]], *, mo
             entry["attempt_id"] = str(attempt_id)[:400]
         if source_hashes and key in source_hashes:
             entry["source_hash"] = source_hashes[key]
+        if sources and is_code_key(key) and isinstance(sources.get(key), str):
+            entry["source"] = sources[key][:MAX_KEY_CHARS]
         doc["entries"][key] = entry
+        doc.setdefault("refused", {}).pop(key, None)
         applied += 1
     return applied
+
+
+def refuse_keys(doc: Dict[str, Any], keys: Iterable[str], *, reason: str) -> int:
+    """Remember keys the generator gave up on, so the queue stops taking them (a transport
+    bound: nothing judges the text). Regenerate clears the ledger."""
+    ledger = doc.setdefault("refused", {})
+    stamp = utc_now_iso()
+    count = 0
+    for key in keys:
+        if isinstance(key, str) and key and key not in ledger and len(ledger) < MAX_ENTRIES:
+            ledger[key] = {"reason": str(reason or "")[:200], "at": stamp}
+            count += 1
+    return count
 
 
 def apply_import(doc: Dict[str, Any], imported: Dict[str, Any]) -> Dict[str, int]:
@@ -502,9 +557,11 @@ def remove_owner_entry(doc: Dict[str, Any], key: str) -> bool:
 
 
 def regenerate_reset(doc: Dict[str, Any]) -> int:
+    """Drop generated entries and forget refused keys; owner and imported entries stay."""
     removed = [key for key, entry in doc["entries"].items() if entry.get("provenance") == "generated"]
     for key in removed:
         del doc["entries"][key]
+    doc["refused"] = {}
     return len(removed)
 
 
@@ -514,8 +571,9 @@ def stats(doc: Optional[Dict[str, Any]], *, source_hashes: Optional[Dict[str, st
     (``source_hashes``); without them it is reported as unknown (``None``), never as zero."""
     if not doc:
         return {"entries": 0, "generated": 0, "owner": 0, "imported": 0, "stale": None if source_hashes is None else 0,
-                "pending": pending}
-    counts = {"entries": len(doc["entries"]), "generated": 0, "owner": 0, "imported": 0, "pending": pending}
+                "pending": pending, "refused": 0}
+    counts = {"entries": len(doc["entries"]), "generated": 0, "owner": 0, "imported": 0, "pending": pending,
+              "refused": len(doc.get("refused") or {})}
     stale = 0 if source_hashes is not None else None
     for key, entry in doc["entries"].items():
         counts[entry.get("provenance", "generated")] += 1
@@ -638,11 +696,21 @@ _VOLATILE_RE = re.compile(
 )
 
 
+_KEY_WHITESPACE_RE = re.compile(r"[ \t\n\r\f\v]+")
+
+
+def key_text(text: object) -> str:
+    """A text key as the reader sees it: runs of ASCII whitespace collapse to one space (the
+    browser overlay applies the same rule in ``keyText``), so a help paragraph written over
+    several indented source lines has one key everywhere."""
+    return _KEY_WHITESPACE_RE.sub(" ", str(text or "")).strip()
+
+
 def looks_volatile(text: object) -> bool:
     """Shape, not meaning: strings that can never translate (ids, paths, timestamps,
     bare numbers) are refused before the queue so they cannot buy a model call."""
     value = str(text or "").strip()
-    if not value or len(value) > 400:
+    if not value or len(value) > MAX_KEY_CHARS:
         return True
     if _VOLATILE_RE.search(value):
         return True
@@ -654,12 +722,15 @@ def record_missing(drive_root: pathlib.Path, tag: str, items: Iterable[Dict[str,
     """Queue keys the renderer could not translate. Bounded; duplicates count up."""
     path = pending_path(drive_root, tag)
     accepted = dropped = 0
+    refused = (cached_memory(drive_root, tag) or {}).get("refused") or {}
     with _memory_lock(path):
         queue = read_json_dict(path) or {}
         entries = queue.get("items") if isinstance(queue.get("items"), dict) else {}
         for item in items:
             key = str((item or {}).get("key") or "") if isinstance(item, dict) else str(item or "")
-            if not key or len(key) > MAX_KEY_CHARS or key in _FORBIDDEN_KEYS:
+            if not is_code_key(key):
+                key = key_text(key)  # the browser's rule: one key per sentence, whatever the source layout
+            if not key or len(key) > MAX_KEY_CHARS or key in _FORBIDDEN_KEYS or key in refused:
                 dropped += 1
                 continue
             source_text = split_scope(key)[0] if not is_code_key(key) else key
@@ -744,8 +815,8 @@ def list_languages(drive_root: pathlib.Path) -> List[Dict[str, Any]]:
 __all__ = [
     "SCHEMA", "MEMORY_DIR_REL", "CODE_PREFIX", "SCOPE_SEPARATOR", "MemoryFormatError", "RevisionConflict",
     "memory_dir", "memory_path", "pending_path", "source_hash", "placeholders", "is_code_key", "split_scope",
-    "new_memory", "validate_memory", "load_memory", "cached_memory", "update_memory",
-    "apply_generated", "apply_import", "set_owner_entry", "remove_owner_entry", "regenerate_reset", "stats",
+    "new_memory", "validate_memory", "load_memory", "cached_memory", "update_memory", "inline_slots_balanced",
+    "apply_generated", "refuse_keys", "apply_import", "set_owner_entry", "remove_owner_entry", "regenerate_reset", "stats",
     "current_language", "plural_category", "entry_text", "tr", "fmt",
     "looks_volatile", "record_missing", "pending_count", "take_pending", "requeue_pending", "list_languages",
 ]

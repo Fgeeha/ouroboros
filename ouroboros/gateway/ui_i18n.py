@@ -117,12 +117,15 @@ def memory_payload(drive_root: pathlib.Path, tag: str) -> Dict[str, Any]:
     pending = 0 if english else memory.pending_count(drive_root, tag)
     if not english and generator.get("language") == tag:
         pending += int(generator.get("in_flight") or 0)  # a batch out at the model is still pending work
+    # The lexicon (up to 60k chars of an invented language's rules) is the generator's prompt
+    # material, kept in the file and the export, never shipped to every client on every frame.
+    profile = ({k: v for k, v in doc["profile"].items() if k != "lexicon"} | {"lexicon_chars": len(doc["profile"].get("lexicon") or "")}) if doc else None
     return {
         "language": tag,
         "chosen": tag != LANGUAGE_NOT_CHOSEN,
         "english": english,
         "revision": int(doc["revision"]) if doc else 0,
-        "profile": doc["profile"] if doc else None,
+        "profile": profile,
         "plural_select": doc.get("plural_select") if doc else None,
         "plural_categories": doc.get("plural_categories") if doc else None,
         "entries": doc["entries"] if doc else {},
@@ -217,6 +220,9 @@ def choose_language(drive_root: pathlib.Path, body: Any, *,
                 plural_categories=plural_categories)
         except memory.MemoryFormatError as exc:
             memory_error = str(exc)
+        except TimeoutError as exc:
+            # The setting is written; the header waits for the next writer. Said, not hidden.
+            memory_error = f"the translation memory was busy: {exc}"
     if audit is not None:
         audit({"ui_language": tag, "previous_ui_language": previous})
     _broadcast({"type": "ui_language_changed", "language": tag})
@@ -278,6 +284,9 @@ async def api_ui_i18n_import_post(request: Request) -> JSONResponse:
     tag = normalize_language_tag(body.get("language"))
     if not tag or is_english(tag):
         return json_error("import needs a non-English language tag in `language`", 400, code="memory_invalid")
+    if "schema" in body and body.get("schema") != memory.SCHEMA:
+        return json_error(f"unsupported translation memory schema {body.get('schema')!r}; this install reads schema {memory.SCHEMA}",
+                          400, code="memory_invalid")
     drive_root = request_drive_root(request)
     counts: Dict[str, int] = {}
 

@@ -29,7 +29,7 @@ import { initUpdateStatus } from './modules/update_status.js';
 import { initDashboard } from './modules/dashboard.js';
 import { hydrateNavIcons } from './modules/page_icons.js';
 
-import { refreshDictionary, setLanguage, storedLanguage } from './modules/i18n.js';
+import { fmt, refreshDictionary, setLanguage, storedLanguage } from './modules/i18n.js';
 import { initOnboardingOverlay } from './modules/onboarding_overlay.js';
 import { installAltMenuSuppression, installDesktopShellLinkInterceptor } from './modules/ui_helpers.js';
 import { nameProjectReference, projectReference } from './modules/project_reference.js';
@@ -707,7 +707,7 @@ function paintProjectsNav() {
             kebab.className = 'nav-project-kebab';
             kebab.textContent = '⋯';
             kebab.title = 'Project actions';
-            kebab.setAttribute('aria-label', `Actions for ${project.name || project.id}`);
+            kebab.setAttribute('aria-label', fmt('Actions for {name}', { name: project.name || project.id }));
             kebab.addEventListener('click', (event) => {
                 event.stopPropagation();
                 openProjectRowMenu(project, {
@@ -910,6 +910,7 @@ ws.on('open', () => {
     activitySocketDisconnected = false;
     stateSnapshots.fail(stateSnapshots.begin());
     refreshProjectsNav(true); // the in-flight read predates the socket: one coalesced post-open read
+    refreshDictionary(); // frames missed while offline: the memory may have moved on
 });
 ws.on('close', () => {
     activitySocketDisconnected = true;

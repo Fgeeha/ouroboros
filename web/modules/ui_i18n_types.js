@@ -6,7 +6,8 @@
  * @property {string} label  // display name the owner typed or the generator chose
  * @property {string} instruction  // free-text brief for the generator (an invented language's description)
  * @property {'ltr'|'rtl'} direction
- * @property {string} lexicon  // generator-written vocabulary/rules for rare or invented languages
+ * @property {string=} lexicon  // generator-written vocabulary/rules for rare or invented languages (file and export only)
+ * @property {number=} lexicon_chars  // the GET carries the lexicon's size, not its text
  */
 
 /**
@@ -22,6 +23,7 @@
  * @property {string=} pack
  * @property {string=} pack_version
  * @property {string=} context
+ * @property {string=} source  // the English a code entry translated (the browser's reword check)
  */
 
 /**
@@ -32,6 +34,7 @@
  * @property {number} imported
  * @property {number|null} stale  // null = the current English of code keys was not available
  * @property {number} pending  // queued misses awaiting the generator
+ * @property {number} refused  // keys the generator gave up on (cleared by Regenerate)
  */
 
 /**
