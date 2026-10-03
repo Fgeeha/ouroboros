@@ -3,6 +3,7 @@ export { accountCatalogRefreshKey } from './settings_catalog.js';
 import { getNotifier } from './notifications.js';
 import { bindEffortSegments, syncEffortSegments, readCustomSecretDraft, collectCustomSecretDraft, paintSettingsFieldErrors, settingsWriteFailure } from './settings_controls.js';
 import { bindLocalModelControls } from './settings_local_model.js';
+import { bindAutostartControl } from './settings_autostart.js';
 import { applyMcpSettings, collectMcpSettings, initMcpSettings, validateMcpSettings } from './mcp_settings.js';
 import { adoptSubagentRoster, collectReviewerSlots, initReviewerSlots, reloadReviewerSlots, validateReviewerSlots, noteReviewerSlotsSaveAttempt, discardReviewerSlotsDraft, setReviewerProcessingPreference, setReviewerSourceContext } from './reviewer_slots.js';
 import {
@@ -470,6 +471,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     // Notification preferences are client-local for the same reason; the module
     // owns delegated handlers, so mounting only paints current state.
     getNotifier().mountSettings(page);
+    bindAutostartControl(page); // host OS entry applied on click, never in the draft; self-disposing
     const disposeLocalModel = bindLocalModelControls({ state,
         onApplication: (local) => syncRestartState({ ...restartState, local_model: local }) });
     // Best-effort About version from /api/health.
@@ -1127,12 +1129,12 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         });
     }
 
-    // Client-local blocks (appearance, notifications) live on the Appearance
-    // tab but never enter the /api/settings payload, so their controls must not
-    // make the server draft dirty — otherwise toggling one would ask the owner
-    // to discard "unsaved settings" that do not exist.
+    // Blocks outside the server draft (theme, notifications on Appearance; host
+    // sign-in startup on Behavior) never enter the /api/settings payload, so their
+    // controls must not make the server draft dirty — otherwise toggling one would
+    // ask the owner to discard "unsaved settings" that do not exist.
     const onServerSettingEdited = (event) => {
-        if (event?.target?.closest?.('[data-notify-settings]')) return;
+        if (event?.target?.closest?.('[data-notify-settings], [data-autostart-settings]')) return;
         onSettingsEdited();
     };
     page.addEventListener('input', onServerSettingEdited);
