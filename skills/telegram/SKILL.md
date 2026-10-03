@@ -1,7 +1,7 @@
 ---
 name: telegram
 description: Owner-only Telegram text bridge and Mini App gateway for the existing Ouroboros interface.
-version: 1.2.10
+version: 1.2.11
 type: extension
 entry: plugin.py
 plugin_api: "2.0"
@@ -74,6 +74,13 @@ and never reads its stored credentials back into the browser.
 Version 1.2.10 also forwards the owner's notes and skill notices (`reminder` and
 `skill_notice` System rows, written for the owner) to the pinned chat when the
 mirror mode is `telegram_only`; mode `all` already mirrored them.
+
+Version 1.2.11 speaks the install's interface language: `/language` lists English
+and the languages the install already has, `/language <name or tag>` chooses one
+for the whole installation through the host's one writer, and the bridge's own
+menu, buttons, card hints and notifications are read through the install's
+translation memory (a line it lacks is generated like a browser miss). The
+retired bridge-only `TELEGRAM_LANGUAGE` setting is migrated once.
 
 The Mini App exposes the unchanged Ouroboros SPA through the established
 owner-authenticated sidecar and a pinned Cloudflare Quick Tunnel. It is enabled

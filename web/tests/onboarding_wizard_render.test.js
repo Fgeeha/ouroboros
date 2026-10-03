@@ -357,7 +357,7 @@ test('a staged language whose writer is still busy keeps the wizard open; the ne
     };
     const requests = [];
     const languageAnswers = [
-        { ok: false, status: 503, body: { ok: false, error: 'another settings save is still running', code: 'settings_document_busy' } },
+        { ok: false, status: 503, body: { ok: false, error: 'another settings save is still running', code: 'settings_busy' } },
         { ok: true, status: 200, body: { language: '', english: true, chosen: true, entries: {}, revision: 0, languages: [] } },
     ];
     const fetch = async (url, init = {}) => {

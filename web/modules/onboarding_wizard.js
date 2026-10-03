@@ -1407,7 +1407,7 @@ import { accountRowFacts } from './harness_accounts.js';
         if (status === 204) {
             // The transaction landed. Its staged language needs the settings lock the finishing save may still hold: while that writer answers busy, stay with the draft so the next check applies it.
             if (!(await applyStagedLanguage())) {
-                state.error = 'Setup is saved. The interface language is still being applied — check again in a moment.';
+                state.error = 'Setup is saved. The interface language is still being applied — check again in a moment. If this repeats, choose English or a code such as pt-BR in the control above and check again.';
                 return render();
             }
             state.saveUnknown = false;
