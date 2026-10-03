@@ -677,7 +677,7 @@ Bundled resources use the CLI / Headless Boundary lookup order rather than assum
 │   │   ├── scheduled_tasks.json   ← cron (5-field + tz) and one-shot {type:"once", run_at} schedules, each a task row or a `kind:"notify"` note; consumed one-shot receipts age out past the unified GC retention
 │   │   ├── claudexor_rotation_provisioning.json ← receipt of the last rotation-reconcile settings POST
 │   │   ├── subagent_last_delegation.json ← bounded dated helper observations owned by subagent_history.py, with the compatible latest receipt; never live health or dispatch authority
-│   │   ├── update_letter.json     ← the last update letter (key = base/target/channel/ref, state, text, `last_good`); kept after apply and projected against the live HEAD (update_letter.py)
+│   │   ├── update_letter.json     ← update letter (base/target/channel/ref, state, text, `last_good`); kept after apply; panel uses startup source, context its checkout (update_letter.py)
 │   │   ├── projects.json          ← Project registry: immutable id/chat identity, working folder, lifecycle/routing fence, revision; tombstones are durable and never age-pruned
 │   │   ├── projects.json.committed ← registry commit witness: beside it a missing registry is unavailable, not empty
 │   │   ├── project_task_bindings.json ← schema v1 root↔Project bindings with REQUIRED typed origin; one-way enrichment; tombstoning never removes a binding

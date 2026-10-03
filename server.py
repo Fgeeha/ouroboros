@@ -1730,7 +1730,7 @@ def main() -> int:
             log.warning("Uvicorn did not exit within %ss; finishing cleanup before restart",
                         force_exit_timeout_sec)
         try:
-            # Our listeners close on exit/exec; a port kill could interrupt transfer.
+            # Our listeners close on exit/exec; port sweeps add no ownership proof.
             _emergency_process_cleanup(port_sweep=False)
             if not _LAUNCHER_MANAGED:
                 if _planned_delegate_restart_transaction_id:

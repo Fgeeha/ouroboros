@@ -431,11 +431,32 @@ def test_owner_restart_copy_is_explicit_about_stopped_task(tmp_path, monkeypatch
 
 def test_owner_restart_cleanup_disables_second_custody_reconcile(monkeypatch):
     import server
+    import threading
 
-    monkeypatch.setattr(server._owner_restart_requested, "is_set", lambda: True)
-    assert server._restart_cleanup_kwargs() == {"reconcile_delegate_custody": False}
-    source = inspect.getsource(server._emergency_process_cleanup)
-    assert source.count("**cleanup_kwargs") == 2
+    owner, restart = threading.Event(), threading.Event()
+    monkeypatch.setattr(server, "_owner_restart_requested", owner)
+    monkeypatch.setattr(server, "_restart_requested", restart)
+    monkeypatch.setattr(server._historical_audit, "stop", lambda: None)
+    monkeypatch.setattr(server, "_managed_update_pending_kwargs", lambda: {})
+    monkeypatch.setattr(server, "_stop_owned_daemon_for_new_pin", lambda: None)
+    monkeypatch.setattr(server, "_stop_owned_local_processes", lambda *a, **k: None)
+    monkeypatch.setattr("multiprocessing.active_children", lambda: [])
+    monkeypatch.setattr("ouroboros.extension_companion.panic_kill_all", lambda: None)
+    calls = []
+    monkeypatch.setattr("supervisor.workers.kill_workers", lambda **kwargs: calls.append(kwargs))
+    for owner_requested in (False, True):
+        owner.set() if owner_requested else owner.clear()
+        for restarting in (False, True):
+            restart.set() if restarting else restart.clear()
+            calls.clear()
+            server._emergency_process_cleanup(port_sweep=False)
+            expected = {"force": True, "archive_service_logs": False}
+            if owner_requested:
+                expected["reconcile_delegate_custody"] = False
+            if restarting:
+                status, reason = server._shutdown_task_cleanup_args(True)
+                expected.update(terminal_status=status, result_reason=reason, stop_source="server_shutdown")
+            assert calls == [expected]
     lifespan = inspect.getsource(server.lifespan)
     assert "**_restart_cleanup_kwargs()" in lifespan
 

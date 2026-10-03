@@ -129,7 +129,8 @@ def test_restart_fallback_runs_pin_handoff_before_retained_executor_cleanup(monk
     assert calls[3][1] == calls[4][1] == {"wait": False}
 
 
-@pytest.mark.parametrize("failure", ["", "cleanup", "reexec"], ids=["reexec-ok", "cleanup-error", "reexec-error"])
+@pytest.mark.parametrize("failure", ["", "fallback", "cleanup", "reexec"],
+                         ids=["reexec-ok", "spawn-fallback-ok", "cleanup-error", "reexec-error"])
 @pytest.mark.parametrize("uvicorn_returns", [False, True], ids=["held", "returned"])
 def test_direct_watchdog_physically_transfers_or_fails(tmp_path, failure, uvicorn_returns):
     """Thread outcomes are physical exec or nonzero exit, never success/hang after an error."""
@@ -193,8 +194,18 @@ server.write_port_file = lambda *args: None
 server.uvicorn.Config = lambda *args, **kwargs: None
 server._SignalStopServer = HeldServer
 server._emergency_process_cleanup = cleanup
-if failure == "reexec":
-    server._restart_current_process_impl = reexec_failure
+if failure in {"reexec", "fallback"}:
+    from ouroboros import server_control, process_custody
+    server_control.os.execvpe = reexec_failure
+    if failure == "reexec":
+        process_custody.spawn_supervised = reexec_failure
+    else:
+        spawn = process_custody.spawn_supervised
+        def joined_spawn(*args, **kwargs):
+            child = spawn(*args, **kwargs)
+            assert child.wait(timeout=10) == 0
+            return child
+        process_custody.spawn_supervised = joined_spawn
 supervisor.update_merge.read_update_tx_strict = lambda: ("absent", {})
 sys.exit(server.main())
 ''', encoding="utf-8")
@@ -205,15 +216,15 @@ sys.exit(server.main())
     result = subprocess.run([sys.executable, str(script), str(receipt), failure,
                              "returned" if uvicorn_returns else "held"], env=env,
                             capture_output=True, text=True, timeout=15)
-    if failure:
+    if failure in {"cleanup", "reexec"}:
         assert result.returncode == 1, result.stdout + result.stderr
         assert "Restart failed; cleanup or transfer is unconfirmed" in result.stderr
         assert "fixture " + failure + " failure" in result.stderr
         assert not receipt.exists()
         return
-    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.returncode == (42 if failure == "fallback" else 0), result.stdout + result.stderr
     observed = json.loads(receipt.read_text(encoding="utf-8"))
     assert observed["transaction"] == "physical-handoff"
     assert observed["port"] == "9123" and observed["cleanup"] == "completed"
     if os.name != "nt":
-        assert observed["pid"] == observed["previous_pid"]  # POSIX exec replaces this exact process.
+        assert (observed["pid"] == observed["previous_pid"]) is (failure != "fallback")
