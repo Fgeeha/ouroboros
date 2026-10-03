@@ -11,6 +11,8 @@ re-fired).
 
 from __future__ import annotations
 
+import pytest
+
 import datetime
 import pathlib
 
@@ -222,6 +224,67 @@ def test_schedule_followup_registers_a_one_shot_entry(tmp_path):
     # the agent's own words ride verbatim — no host template
     assert record["task"]["text"] == "Re-run the plan panel once the reviewer window resets."
     assert record["task"]["context"] == "plan review for root-1 was quorum-unreachable"
+
+
+def test_schedule_followup_notify_leaves_a_note_in_the_one_table(tmp_path):
+    """notify=true writes a ``kind: "notify"`` row: the agent's words and when they were
+    written, independent work, counted in the same cap; no future task text is stored."""
+    from supervisor import queue
+
+    ctx = _ctx(tmp_path)
+    out = _followup(ctx, notify=True, relation="related", objective="Call mother")
+    assert out.startswith("FOLLOWUP_SCHEDULED: note "), out
+    assert "relation='related' ignored" in out, "a note carries no money or deadline"
+    [record] = queue.list_scheduled_tasks(tmp_path / "data")["tasks"]
+    assert record["kind"] == "notify" and record["source"] == "task_followup"
+    assert record["notification"]["text"] == "Call mother" and record["notification"]["set_at"]
+    assert record["followup_relation"]["kind"] == "independent"
+    assert record["followup_origin"]["task_id"] == "root-1"
+    assert "text" not in record["task"], "a note has no future task objective"
+    assert _followup(ctx, notify=True, objective="Second").startswith("FOLLOWUP_SCHEDULED")
+    assert "FOLLOWUP_CAP_REACHED" in _followup(ctx, objective="Third"), "notes and wake-ups share the cap"
+
+
+@pytest.mark.parametrize(("metadata", "contract", "chat_id"), [
+    ({"presence": {"binding_id": "b" * 32}}, None, 1),
+    ({"presence_binding_authority": {"binding_id": "mail-room"}}, None, 1),
+    ({}, {"capability_ceiling": {"tools": ["schedule_followup"]}}, 1),  # a lost carrier under a ceiling
+    ({}, None, -1001),  # agent-to-agent
+], ids=["presence-speaker", "presence-work", "lost-carrier", "a2a"])
+def test_notes_are_refused_to_callers_that_do_not_speak_for_the_owner(tmp_path, metadata, contract, chat_id):
+    from supervisor.queue import list_scheduled_tasks
+
+    ctx = _ctx(tmp_path)
+    ctx.task_metadata.update(metadata)
+    if contract is not None:
+        ctx.task_contract.update(contract)
+    ctx.current_chat_id = chat_id
+    assert "FOLLOWUP_NOTIFY_REFUSED" in _followup(ctx, notify=True, objective="Wake owner")
+    assert list_scheduled_tasks(ctx.drive_root)["tasks"] == []
+
+
+def test_a_note_from_a_consciousness_root_in_main_is_a_legitimate_contact(tmp_path):
+    """No room check: a root consciousness started (neither a Project nor owner ingress) may leave one."""
+    ctx = _ctx(tmp_path)
+    ctx.current_chat_id = 1
+    ctx.task_metadata["initiator"] = "consciousness"
+    assert _followup(ctx, notify=True, objective="The kettle is on.").startswith("FOLLOWUP_SCHEDULED: note ")
+
+
+def test_a_delegated_subagent_cannot_leave_a_note(tmp_path):
+    ctx = _ctx(tmp_path, role="subagent")
+    assert "FOLLOWUP_SUBAGENT_REFUSED" in _followup(ctx, notify=True, objective="Wake owner")
+
+
+def test_schedule_followup_notify_refuses_context_and_non_boolean_mode(tmp_path):
+    ctx = _ctx(tmp_path)
+    assert "FOLLOWUP_NOTIFY_CONTEXT" in _followup(ctx, notify=True, context="hidden")
+    assert "FOLLOWUP_NOTIFY_INVALID" in _followup(ctx, notify="yes")
+    assert "FOLLOWUP_TEXT_TOO_LONG" in _followup(ctx, notify=True, objective="x" * 4001)
+    from supervisor import queue
+
+    assert queue.list_scheduled_tasks(tmp_path / "data")["tasks"] == []
+    assert _followup(ctx, notify=None).startswith("FOLLOWUP_SCHEDULED: follow-up "), "null is the default wake-up"
 
 
 def test_a_timer_follow_up_is_framed_as_task_authored_and_its_note_never_enters_the_owner_corpus(tmp_path):

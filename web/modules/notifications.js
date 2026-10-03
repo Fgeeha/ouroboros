@@ -116,6 +116,22 @@ function trimBody(value) {
     return `${body.slice(0, BODY_CHARS - 1)}…`;
 }
 
+/* A reminder (a note Ouroboros wrote earlier, shown now by the host) and a
+   granted skill's notice are System rows whose first line is the host's
+   signature; the banner names the author from `source` and shows only the words
+   after that line. Never the row's sentence in the title (§9: private by default). */
+export function noticeTitle(systemType, source) {
+    const author = text(source).trim();
+    if (systemType === 'skill_notice') return author ? `Notice from ${author}` : 'Notice from a skill';
+    return `Reminder from ${author || 'Ouroboros'}`;
+}
+
+function noticeBody(content) {
+    const raw = text(content);
+    const cut = raw.indexOf('\n');
+    return cut >= 0 ? raw.slice(cut + 1) : raw;
+}
+
 /**
  * Classify ONE live frame into a notification candidate, or null.
  *
@@ -215,6 +231,18 @@ export function classifyLiveFrame(frame, { kind = 'chat', isMain = false, isRoot
             key: `important:${rowKey}`,
             title: NOTIFY_TITLES.important,
             body: trimBody(frame.content),
+            target: { chatId: frame.chat_id, taskId },
+        };
+    }
+
+    // A message for the owner that nobody speaks NOW: no new category, the same
+    // `important` toggle (DESIGN §9).
+    if (systemType === 'reminder' || systemType === 'skill_notice') {
+        return {
+            category: 'important',
+            key: `important:${rowKey}`,
+            title: noticeTitle(systemType, frame.source),
+            body: trimBody(noticeBody(frame.content)),
             target: { chatId: frame.chat_id, taskId },
         };
     }

@@ -1312,6 +1312,8 @@ def test_plugin_api_version_matches_documented_surface():
 
     assert PLUGIN_API_VERSION == "2.0"
     assert "presence" in VALID_EXTENSION_PERMISSIONS
+    # Additive (owner A4=A, 2026-10-03): a granted skill may leave the owner a signed System row.
+    assert "notify_owner" in VALID_EXTENSION_PERMISSIONS
     # ABI-1: absent manifest field binds the LEGACY generation by construction
     # (owner-ratified: 1.3, deliberately NOT 1.4), and the version's surface
     # fingerprint is recorded (fail-closed in both directions).

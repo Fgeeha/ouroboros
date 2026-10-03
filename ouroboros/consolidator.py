@@ -1203,7 +1203,7 @@ def _format_entries_for_block(
             author = "Ouroboros"
         elif dir_raw == "system":
             direction_prefix = "[system] "
-            author = "Ouroboros"
+            author = "System"  # host-written, as dialogue_evidence attributes it; never the mind's voice
         else:
             direction_prefix = ""
             author = dialogue_author(e)

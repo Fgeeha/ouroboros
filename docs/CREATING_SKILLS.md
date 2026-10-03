@@ -595,6 +595,7 @@ calls and runtime behaviours:
 | `subscribe_event` | The skill may subscribe to manifest-declared host event topics such as `chat.outbound` or `skill.lifecycle`. Chat topics require owner permission grants; `skill.lifecycle` does not. |
 | `inject_chat` | The skill may request Host Service chat injection after an explicit owner permission grant: `POST /chat/inject` carries text, an inline image, or `attachments` (`[{path, name?, mime?}]` — regular files under the skill's own state root, at most 25 per message, which the host copies without the former 50 MiB upload cap into the shared `data/uploads` chat-upload store and stages for the task; a file-only message needs no text). The same grant lets the skill relay the owner's decision-card answer through `POST /chat/decision` (`{request_id, decision_id, option_index?, comment?}`, the `POST /api/decisions` contract). A message that carries a `client_message_id` becomes an addressable operation: the host answers with its `operation_ref` (`<chat_id>:<client_message_id>`) on 202, 200 and 504; a repeated delivery of the same message rejoins it instead of enqueueing again (a different message under a reused id is refused with 409); `GET /chat/operations/{operation_ref}` reports the skill's own accepted message (`pending`, `running` with its task or turn, the durable answer, a terminal task status, or `lost` after a host restart); and `POST /chat/cancel` (`{operation_ref, reason?}`) runs the existing cancellation owner on work that message started, answering `cancelled`, `already_terminal`, `unresolved` or `cancel_unsupported` — never a cancellation that did not happen. |
 | `presence` | A reviewed transport skill may submit authenticated non-owner conversation events to the Host Service Presence boundary and poll only their correlated late work. Requires an explicit content-hash-bound owner grant. |
+| `notify_owner` | The skill may tell the owner one thing through `POST /notify` after an explicit owner permission grant (see "Telling the owner something" below): one bounded plain sentence the host shows in the owner's chat as a System row signed with the skill's name. It wakes no model; narrower than `inject_chat`. |
 
 A missing permission causes the matching `register_*` call to raise
 `ExtensionRegistrationError`, surfaced as a skill load error in the
@@ -608,8 +609,8 @@ Some settings keys are protected: `OPENROUTER_API_KEY`,
 `GITHUB_TOKEN`, `OUROBOROS_NETWORK_PASSWORD`. These keys are NEVER
 forwarded to a skill by default, even when listed in
 `env_from_settings`. Custom secret keys stored in Settings → Secrets
-are treated the same way. Host permissions such as `inject_chat`, `presence`, and
-chat event subscriptions also require explicit, content-hash-bound owner
+are treated the same way. Host permissions such as `inject_chat`, `presence`,
+`notify_owner` and chat event subscriptions also require explicit, content-hash-bound owner
 consent. The desktop launcher's owner-grant bridge records these grants.
 
 The Skills UI surfaces missing grants on the skill card. The agent
@@ -845,6 +846,39 @@ subscribe_events: [skill.lifecycle]
 permission grant. Skills that perform multi-step external work should still
 print a concise success/failure marker or write structured state under
 `OUROBOROS_SKILL_STATE_DIR` so the agent can decide whether to fix or report.
+
+## Telling the owner something (`POST /notify`)
+
+A skill that must reach the owner with a finished sentence (a calendar's
+"meeting in 15 minutes", an external job that ended) declares `notify_owner`,
+waits for the owner's grant and posts it:
+
+```json
+{"text": "⏰ 14:45 · Meeting with Ivan (in 15 min)"}
+```
+
+The host writes one System row (`system_type: "skill_notice"`) in the owner's
+chat: the signature line `Notice · <your skill name>`, stamped by the host, then
+your sentence verbatim. Like any System row it stays in history, the Telegram
+skill mirrors it (in `telegram_only` mode too, to the pinned Chat ID), a running
+client with notifications on rings it under "Messages Ouroboros sends you while it
+works, its reminders, and skill notices" (titled `Notice from <skill>`, the
+sentence only with message text on), and
+Ouroboros reads it on its next turn as `📋 [skill_notice]`, so it
+knows what you told the owner. No model turn starts.
+
+`text` is required, plain, at most 400 characters. `200 {ok, ts, chat_id}`: the
+row is written. `400`: not one plain sentence. `403`: no live grant (a disabled
+skill, a stale review or a revoked grant included); nothing is written. `429`:
+the 60-per-minute lane. `503 {status: "not_confirmed"}`: the row is not
+confirmed, so check the chat before posting again (a notice is not
+server-idempotent); a host without a configured model provider has no chat
+writer yet and answers it too. `GET /identity` advertises `notify_version: 1`; on
+an older host it is absent, so degrade to your own widget. Timing is yours: post
+at the moment you chose (a calendar keeps its own clock).
+
+Prefer `inject_chat` when the event needs Ouroboros to think or act (it starts a
+turn); `notify_owner` is for facts the owner should simply see.
 
 ## Iterative skill development
 

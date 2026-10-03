@@ -53,6 +53,15 @@ def test_notification_controls_are_client_local():
         )
 
 
+def test_the_important_toggle_names_everything_it_silences():
+    """Reminders and skill notices ring under ``important`` (no category of their own),
+    so the one checkbox that silences their banners says so; the chat rows stay."""
+    assert "systemType === 'reminder' || systemType === 'skill_notice'" in _read("web/modules/notifications.js")
+    panel = _appearance_panel(_read("web/modules/settings_ui.js"))
+    label = re.search(r'data-notify-pref="important">\s*([^<]+?)\s*</label>', panel).group(1)
+    assert "while it works" in label and "reminders" in label and "skill notices" in label, label
+
+
 def test_settings_mounts_the_notifier_like_the_theme():
     source = _read("web/modules/settings.js")
     assert "getNotifier().mountSettings(page)" in source
