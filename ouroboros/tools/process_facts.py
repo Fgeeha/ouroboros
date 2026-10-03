@@ -110,7 +110,8 @@ def process_environment_tool(handler):
             arguments.setdefault("contract_kind", args[0])
         with process_environment_scope(ctx, name, arguments) as error:
             if error is not None:
-                return _publish_tool_result(ctx, error)
+                return _publish_tool_result(ctx, _replace_tool_result(
+                    error, meta_updates={"operation_outcome": "completed_no_effect"}))
             try:
                 result = handler(ctx, *args, **kwargs)
             except Exception as exc:
@@ -207,6 +208,32 @@ def signal_name_for_returncode(returncode) -> str:
 
 
 _process_facts_tls = threading.local()
+
+
+@contextlib.contextmanager
+def process_facts_handoff(function):
+    """Bridge this invocation's channel to its joined handler executor.
+
+    The admitted environment is a snapshot, not a request to resolve Settings
+    again. Only the joined invocation returns its measured facts to the loop.
+    """
+    fields = ("environment", "runtime_provenance", "facts")
+    state = {key: getattr(_process_facts_tls, key, None) for key in fields}
+    def invoke(*args, **kwargs):
+        prior = {key: getattr(_process_facts_tls, key, None) for key in fields}
+        try:
+            for key, value in state.items():
+                setattr(_process_facts_tls, key, value)
+            return function(*args, **kwargs)
+        finally:
+            state.update({key: getattr(_process_facts_tls, key, None) for key in fields})
+            for key, value in prior.items():
+                setattr(_process_facts_tls, key, value)
+    try:
+        yield invoke
+    finally:
+        for key in ("facts", "runtime_provenance"):
+            setattr(_process_facts_tls, key, state[key])
 
 # The complete typed fact family this channel owns. When typed facts exist for
 # a call, they are authoritative for EVERY member — including the ABSENCE of a

@@ -20,6 +20,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from ouroboros.acceptance_preparation import incident_cause_clauses
 from ouroboros.platform_layer import acquire_exclusive_file_lock, release_exclusive_file_lock
+from ouroboros.review_records import recorded_author_stop
 from ouroboros.task_finalization import TERMINAL_ORIGIN_HOST_SALVAGE
 from ouroboros.utils import append_jsonl, iter_jsonl_objects, jsonl_append_lock_path, replace_atomic, strip_markdown, utc_now_iso
 
@@ -134,6 +135,7 @@ def project_question_pointer(row: Dict[str, Any], block: Any, project: Any,
     question = str(quiz.get("question") or row.get("text") or block.get("question") or "")
     assumption = str(quiz.get("assumption") or block.get("assumption") or "")
     stake = str(quiz.get("stake") or block.get("stake") or "")
+    host_facts = str(quiz.get("host_facts") or block.get("host_facts") or "")
     recommended = block.get("recommended_index")
     if not isinstance(recommended, int) or isinstance(recommended, bool):
         recommended = next((i for i, option in enumerate(options)
@@ -147,10 +149,11 @@ def project_question_pointer(row: Dict[str, Any], block: Any, project: Any,
         "text": f"{lead} in {name}", "is_progress": False, "markdown": False,
         # Display fields only when known: a narrower producer must never blank a complete row.
         **({"question": question} if question else {}),
-        **({"options": labels} if labels else {}),
+        **({"options": labels} if isinstance(quiz.get("options"), list) or isinstance(block.get("options"), list) else {}),
         **({"option_details": details} if details else {}),
         **({"stake": stake} if stake else {}),
         **({"assumption": assumption} if assumption else {}),
+        **({"host_facts": host_facts} if host_facts else {}),
         **({"recommended_index": recommended} if recommended is not None else {}),
         **facts,
         **({"source_status": "unavailable"} if not known else {}),
@@ -261,7 +264,7 @@ def project_origin_rows(drive_root: Any, project_chat_id: int) -> List[Dict[str,
         if identity in seen:
             continue
         seen.add(identity)
-        rows.append({"ref": dict(ref), "text": text})
+        rows.append({"ref": dict(ref), "text": text, "origin_id": project_origin_identity(ref)})
     return rows
 
 
@@ -290,7 +293,7 @@ def room_membership(chat_id: int, project_chat_ids: set, source_refs: list,
         # A routing refusal belongs to the issuing chat, even when the target
         # is bound to another Project. Its lineage must not move the notice.
         bound = 0 if row.get("type") in ORIGIN_ADDRESSED_NOTICE_TYPES else bound_room_chat(bindings, row)
-        lifecycle = row.get("type") in {"project_started", "project_handoff", "project_completion_summary"}
+        lifecycle = row.get("type") in MAIN_PINNED_ROW_TYPES
         if chat_id in project_chat_ids:
             return not lifecycle and (bound == chat_id or entry_chat == chat_id
                                       or entry_matches_source_ref(row, source_refs))
@@ -352,7 +355,7 @@ def _entry_source_identities(entry: Dict[str, Any]) -> set:
     if str(entry.get("direction") or "") != "in":
         return set()
     try:
-        chat_id = int(entry.get("chat_id", 1) or 1)
+        chat_id = int(entry.get("chat_id", 1))
     except (TypeError, ValueError):
         chat_id = 1
     client_id = str(entry.get("client_message_id") or "")
@@ -371,6 +374,16 @@ def entry_matches_source_ref(entry: Dict[str, Any], refs: Iterable[Dict[str, Any
         if (key := _source_ref_identity(ref)) is not None
     }
     return bool(_entry_source_identities(entry) & ref_keys)
+
+
+def project_origin_identity(ref: dict) -> str:
+    """Same binding identity on retained context and its eventual physical row."""
+    return _text_sha256(json.dumps(_source_ref_identity(ref), separators=(",", ":")))
+
+
+def matching_project_origin(entry: dict, refs: list) -> str:
+    keys = _entry_source_identities(entry)
+    return next((project_origin_identity(ref) for ref in refs if _source_ref_identity(ref) in keys), "")
 
 
 def resolve_owner_message_source(drive_root: Any, ref: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -610,6 +623,7 @@ ROUTING_REFUSAL_CAUSES: Dict[str, str] = {
     "task_id_lookup_failed": "the task record could not be read",
     "empty_objective": "the request was empty",
     "project_routing_fence": "the project no longer accepts new work",
+    "project_routing_fence_changed": "the project changed while the task was being prepared",
     "project_routing_fence_lookup_failed": "the project state could not be checked",
     "project_binding_failed": "the project could not be set up",
     "project_registration_failed": "the project could not be set up",
@@ -652,6 +666,13 @@ ROUTING_REFUSAL_CAUSES: Dict[str, str] = {
 # Host routing refusals stay in the issuing chat regardless of the target's
 # Project binding (room_membership); they are never terminal task facts.
 ORIGIN_ADDRESSED_NOTICE_TYPES = frozenset({"task_not_started", "task_start_unconfirmed", "steer_not_delivered"})
+
+# A root's deliberate plain-text notice to Main (send_user_message
+# destination="main"); never a task's final answer.
+MAIN_NOTICE_TYPE = "main_notice"
+# Rows pinned to Main whatever the sender's Project binding: the supervisor
+# send handler and room_membership replay read this one set.
+MAIN_PINNED_ROW_TYPES = frozenset({"project_started", "project_handoff", "project_completion_summary", MAIN_NOTICE_TYPE})
 
 # Statuses of an act that LANDED (or is still in flight): no cause sentence.
 _LANDED_ROUTING_STATUSES = frozenset({"scheduled", "delivered", "pending", "dispatch_pending", "accepted"})
@@ -779,9 +800,30 @@ TASK_CAUSE_PHRASES = {
     "host_child_status_suffix": "A child task had not settled when the answer was delivered",
     "invalid_delivery_control_after_repair": "Ouroboros's final delivery instruction could not be read even after repair, so the answer stands as delivered.",
     "budget_exhausted": "The task ran out of budget before it could finish cleanly",
+    # The other forced-finalization rails (outcomes.BEST_EFFORT_REASON_CODES and
+    # the keys of ACCEPTANCE_BYPASS_REASON_BY_RAIL): the loop's typed reason_code
+    # when a limit ended the task. Each sentence names only the limit its code
+    # states; whether an answer was still delivered is the status word's to say.
+    "round_limit": "The task hit its round limit before it could finish cleanly",
+    "finalization_grace": "The task hit a time limit and had to wrap up before it could finish cleanly",
+    "deadline_local": "The task reached its deadline before it could finish cleanly",
+    "context_overflow": "The task outgrew its context before it could finish cleanly",
+    "children_unabsorbed": "Some sub-task results were never folded in, so the task had to wrap up",
+    # The supervisor's timeout rails (queue_timeouts.TIMEOUT_TERMINAL_REASONS): the
+    # reaper's task_done reason_code, spoken on its grace toast, its kill notice
+    # and its salvage line through this same table, never as the code.
+    "absolute_ceiling": "The task reached its maximum running time",
+    "deadline": "The task reached its deadline",
+    "idle_timeout": "The task made no progress for too long",
+    # The reason codes outcomes.derive_loop_outcome stamps from typed terminal facts.
+    "provider_failure": "The model provider failed to answer, so the task could not finish",
+    "empty_final_text": "The task ended without a final answer",
+    "deep_self_review_unavailable": "The deep self-review could not run",
+    "deep_self_review_error": "The deep self-review stopped on an error",
     # #869: the provider-death rail's terminal words; the amount of retained text is
     # said by the notice, this clause only names why the task ended.
     "provider_unavailable": "The model provider stopped answering, so the task could not finish",
+    "accounting_wait_expired": "Accounting access did not recover within this turn’s wait window",
     "delivery_control_degraded": "Ouroboros's final delivery instruction could not be applied, so the answer stands as delivered.",
     "authoring_handover_incomplete": "The replacement model stopped before resuming tool work.",
     "delegated_custody_unreconciled": "Some delegated work was never reconciled.",
@@ -1247,16 +1289,9 @@ def _join_cause_clauses(clauses: List[str]) -> str:
 def _completion_verdict(result: Dict[str, Any], event: Dict[str, Any]) -> str:
     """Every simultaneous cause this record holds, as ONE terminated host clause.
 
-    The primary cause is what ENDED the task. A deferred child, a plan review
-    still open at delivery and an unreconciled custody debt are standing
-    limitations of the SAME answer, so they are stated BESIDE it instead of
-    replacing it or being replaced by it: a card that can show one cause has to
-    choose, and choosing is why the host had to write the second fact as chat
-    prose. Nothing here ranks or folds; equivalent clauses state themselves once.
-    A held task (a blocking plan exit) speaks through its objective's own reason,
-    so it never reads "the work went on". The stored reviewer rationale never
-    reaches the row — it stays in the card, the task result and Logs. The Python
-    twin of ``taskReasonDetail``; callers add no punctuation.
+    Primary cause and standing limitations each appear once. Held tasks state
+    their objective's reason. Only the author's stop rationale reaches this line; reviewer
+    prose stays in review detail. Python twin of ``taskReasonDetail``.
     """
     from ouroboros.outcomes import (
         ACCEPTANCE_ACCEPTED, REASON_FINAL_MESSAGE, REASON_OWNER_REQUESTED_FINALIZATION, plan_review_awaiting,
@@ -1265,8 +1300,13 @@ def _completion_verdict(result: Dict[str, Any], event: Dict[str, Any]) -> str:
     decision: Dict[str, Any] = {}
     veto: Dict[str, Any] = {}
     objective: Dict[str, Any] = {}
+    completion: Dict[str, Any] = {}
     for source in (event, result):
         axes = source.get("outcome_axes") if isinstance(source.get("outcome_axes"), dict) else {}
+        execution = axes.get("execution") if isinstance(axes.get("execution"), dict) else {}
+        value = source.get("task_completion", execution.get("task_completion"))
+        if isinstance(value, dict):
+            completion = value
         objective = axes.get("objective") if isinstance(axes.get("objective"), dict) else objective
         if isinstance(objective.get("receipt_veto"), dict):
             veto = objective["receipt_veto"]
@@ -1285,7 +1325,10 @@ def _completion_verdict(result: Dict[str, Any], event: Dict[str, Any]) -> str:
     if raw_reason == REASON_OWNER_REQUESTED_FINALIZATION:
         clause = ""  # an owner-requested stop is a success and carries its own marker
     elif (status and (status != ACCEPTANCE_ACCEPTED or cause in TASK_CAUSE_PHRASES)
-            and phase in {"done", "warn"}):
+            and (phase in {"done", "warn"} or (recorded_author_stop(decision) and phase == "error"))):
+        # An explicit author stop is the fact that ended the task (its objective is
+        # blocked, so the card is red); the decision's typed reason — its TRUE cause,
+        # not always ``author_stop`` — speaks over the delivery step.
         clause = TASK_CAUSE_PHRASES.get(cause, cause)
     elif phase == "cancelled" and isinstance(origin, dict) and origin:
         # The recorded cause and the relation the record PROVES (#1061).
@@ -1296,8 +1339,8 @@ def _completion_verdict(result: Dict[str, Any], event: Dict[str, Any]) -> str:
         # A task HELD by a blocking plan review states the objective's own reason.
         clause = TASK_CAUSE_PHRASES.get(str(objective.get("reason") or ""), str(objective.get("reason") or ""))
     elif raw_reason in {REASON_FINAL_MESSAGE, ""}:
-        clause = (TASK_CAUSE_PHRASES["plan_review_awaiting"]
-                  if plan_review_awaiting(event, result) and phase == "done" else "")
+        clause = (TASK_CAUSE_PHRASES["author_stop"] if completion.get("action") == "stop" and phase != "cancelled"
+                  else TASK_CAUSE_PHRASES["plan_review_awaiting"] if plan_review_awaiting(event, result) and phase == "done" else "")
     else:
         # A healed debt is never restored here: naming the code again would
         # state a debt the same record shows as empty. The recorded open-review
@@ -1306,10 +1349,21 @@ def _completion_verdict(result: Dict[str, Any], event: Dict[str, Any]) -> str:
         key = _plan_review_key(result, event, reason) if reason == "plan_review_advisory" else reason
         clause = (" ".join(strip_markdown(str(detail)).split()) if detail
                   else TASK_CAUSE_PHRASES.get(key, key))
-    line = _join_cause_clauses([clause, *incident_cause_clauses(decision, reason, TASK_CAUSE_PHRASES),
+    line = _join_cause_clauses([clause, _author_stop_rationale(decision, completion),
+                                *incident_cause_clauses(decision, reason, TASK_CAUSE_PHRASES),
                                 *_terminal_limitations(result, event, reason, held=held),
                                 TASK_CAUSE_PHRASES.get(custody, custody) if custody else ""])
     return line if not line or line.endswith((".", "!", "?", "…", ")")) else line + "."
+
+
+def _author_stop_rationale(decision: Dict[str, Any], completion: Optional[Dict[str, Any]] = None) -> str:
+    """The agent's own reason for an explicit stop, beside the typed sentence (TZ-2 C4).
+
+    Only the AUTHOR's recorded rationale reaches the row: the reviewer rationale
+    stays in the card; a finish carries none. The twin of ``authorStopRationale``."""
+    author = completion if (completion or {}).get("action") == "stop" else (
+        decision.get("author_disposition") if recorded_author_stop(decision) else None)
+    return " ".join(strip_markdown(str(author.get("rationale") or "")).split()) if isinstance(author, dict) else ""
 
 
 def _run_lives_in_its_project(
@@ -1428,6 +1482,8 @@ def project_completion_delivery_outcome(
         lead = f"{verdict} " if verdict else ""
         if excerpt:
             excerpt = f"{excerpt} Open the Project for details."
+        from ouroboros.terminal_time import terminal_time_fact
+
         event = {
             "type": "send_message", "chat_id": 1, "task_id": tid,
             "text": (f"{snapshot['target_label']} · "
@@ -1439,6 +1495,7 @@ def project_completion_delivery_outcome(
                 "project_id": snapshot["project_id"],
                 "project_name": snapshot["project_name"],
                 "target_label": snapshot["target_label"], "status": status,
+                "terminal_time": terminal_time_fact(result),
                 **mirrored_answer(result, outcome_phase(result, task_done_event)),
             },
         }

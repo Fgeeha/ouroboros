@@ -33,6 +33,7 @@ from ouroboros.skill_loader import (
 from ouroboros.skill_review import review_skill as _review_skill_impl
 from ouroboros.skill_review_status import normalize_skill_review_status
 from ouroboros.tools.registry import ToolContext, ToolEntry
+from ouroboros.tools.tool_result import completed_local_read
 from ouroboros.tool_access import (
     ResolvedResourceBinding,
     build_resolved_resource_binding,
@@ -562,6 +563,7 @@ def _skill_tool_preflight(
     )
 
 
+@completed_local_read
 def _handle_list_skills(ctx: ToolContext, **_kwargs: Any) -> str:
     err = _skill_tool_preflight(ctx)
     if err:

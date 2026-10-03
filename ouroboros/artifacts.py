@@ -20,6 +20,7 @@ from typing import Any, Dict, Iterable, List, Optional, Union
 from ouroboros.utils import atomic_write_json, read_json_dict, update_json_locked, write_bytes_atomic
 from ouroboros.headless import ARTIFACT_STATUS_FAILED, ARTIFACT_STATUS_READY, SCRATCH_MANIFEST_NAME, task_artifacts_dir
 from ouroboros.outcome_receipt_store import is_verification_receipts_path
+from ouroboros.task_custody import fence_publication
 from ouroboros.task_results import validate_task_id
 
 log = logging.getLogger(__name__)
@@ -64,7 +65,7 @@ _MAX_SCRATCH_PATHS = 1000
 _ATTACHMENTS_SUBDIR = "attachments"
 _CHAT_MEDIA_SUBDIR = "chat_media"
 _SOURCE_HANDLES_SUBDIR = "source_handles"
-_SOURCE_HANDLE_CATEGORIES = frozenset({"tool_results", "context_checkpoints"})
+_SOURCE_HANDLE_CATEGORIES = frozenset({"tool_results", "context_checkpoints", "delegated_activity"})
 _LEGACY_TOOL_RESULT_TRUNCATION_RE = re.compile(
     r"\n\.\.\. \(truncated from (?P<original>[1-9][0-9]*) chars, "
     r"limit=(?P<limit>[1-9][0-9]*)\)"
@@ -707,6 +708,7 @@ def store_actor_source_bytes(
     except OSError:
         already_stored = False
     if not already_stored:
+        fence_publication()  # a closed publication generation writes no new source
         write_bytes_atomic(target, bytes(data))
     return {
         "kind": "task_source",
@@ -737,8 +739,7 @@ def read_actor_source_bytes(
     if ref.get("root") != "artifact_store":
         raise ValueError("actor source ref has an unexpected root")
     rel = pathlib.PurePosixPath(str(ref.get("path") or ""))
-    valid_path = bool(rel.parts and rel.parts[0] == _SOURCE_HANDLES_SUBDIR)
-    if not valid_path or rel.is_absolute():
+    if not rel.parts or rel.parts[0] != _SOURCE_HANDLES_SUBDIR or rel.is_absolute():
         raise ValueError("actor source ref has an invalid path")
     base = task_artifact_dir_path(drive_root, task_id, create=False).resolve(strict=False)
     target = base.joinpath(*rel.parts)
@@ -747,8 +748,9 @@ def read_actor_source_bytes(
     try:
         target = target.resolve(strict=True)
         target.relative_to(base)
-    except FileNotFoundError as exc:
-        raise FileNotFoundError(f"actor source unavailable: {rel.as_posix()}") from exc
+    except FileNotFoundError:
+        from ouroboros.source_retention import read_retained_task_source
+        return read_retained_task_source(drive_root, task_id, ref)
     except ValueError as exc:
         raise ValueError("actor source ref escapes its task artifact root") from exc
     raw = target.read_bytes()
@@ -770,9 +772,9 @@ def read_task_result_source_bytes(
     review = result.get("review_projection")
     panels = review.get("panels") if isinstance(review, dict) else []
     refs = [row.get("applied_source_ref") for row in (panels if isinstance(panels, list) else []) if isinstance(row, dict)]
-    observations = result.get("completion_observations")
-    if isinstance(observations, dict):
-        refs.append(observations.get("source_ref"))
+    for key in ("completion_observations", "acceptance_debt"):
+        if isinstance(value := result.get(key), dict):
+            refs.append(value.get("source_ref"))
     for ref in refs:
         if isinstance(ref, dict) and ref.get("path") == source_path and pathlib.PurePosixPath(source_path).name == name:
             return read_actor_source_bytes(drive_root, validate_task_id(result.get("task_id")), ref)
@@ -1083,24 +1085,19 @@ DELEGATED_CAPTURE_PREFIX = "delegated_runs"
 def delegated_capture_read_target(
     canonical_root: Any, task_id: str, rel_text: str, resolved_base: pathlib.Path,
 ) -> Optional[pathlib.Path]:
-    """Canonical-drive anchor for READS of delegated-run capture artifacts (CR1-2).
+    """Canonical-drive anchor for READS of own delegated captures and activity.
 
-    The capture writer always writes under the CANONICAL (budget) drive
-    (`delegate_custody.custody_root` — the capture must survive child-drive
-    pruning), while a child task's ``artifact_store`` base resolves from the
-    CHILD's drive_root — so a split-drive nanny that owns the run got NOT_FOUND
-    for its own patch/manifest and could only dispose blindly. Reads of exactly
-    the capture prefix (the owning task's own capture dir, never a broader
-    surface) re-anchor here. Returns None when the path is not a capture path
-    or the base already IS canonical (ordinary single-drive tasks).
+    Writers retain captures and activity under ``delegate_custody.custody_root``
+    (the canonical budget drive) so they survive child-drive pruning. The child's
+    ``artifact_store`` otherwise resolves on its execution drive and misses them.
+    Only these two prefixes in the caller's OWN task store re-anchor here; other
+    paths and already-canonical bases return None. Writes keep their original base.
 
-    This anchor is deliberately OWNER-ONLY: it rebinds the caller's own
-    ``<task_id>`` prefix. A capture the ORPHAN disposition rule authorizes
-    lives under ANOTHER task's prefix and is resolved by the sibling
-    ``delegate_shared.orphan_capture_read_target``, which asks
-    ``orphan_disposition_status`` before returning a path.
+    Another task's capture requires ``delegate_shared.orphan_capture_read_target``
+    and its ``orphan_disposition_status`` proof; this binding grants no orphan access.
     """
-    prefix = DELEGATED_CAPTURE_PREFIX
+    activity_prefix = f"{_SOURCE_HANDLES_SUBDIR}/delegated_activity"
+    prefix = activity_prefix if rel_text == activity_prefix or rel_text.startswith(activity_prefix + "/") else DELEGATED_CAPTURE_PREFIX
     if rel_text != prefix and not rel_text.startswith(prefix + "/"):
         return None
     canonical_base = task_artifact_dir_path(
@@ -1109,10 +1106,13 @@ def delegated_capture_read_target(
     if canonical_base == pathlib.Path(resolved_base):
         return None
     anchored = (canonical_base / rel_text).resolve(strict=False)
+    # The new source binding grants only this subtree, including after symlink
+    # resolution; it cannot expose sibling source categories on the canonical drive.
+    allowed_base = canonical_base / prefix if prefix == activity_prefix else canonical_base
     try:
-        anchored.relative_to(canonical_base)
+        anchored.relative_to(allowed_base)
     except ValueError as exc:
-        raise ValueError(f"path escapes {canonical_base}") from exc
+        raise ValueError(f"path escapes {allowed_base}") from exc
     return anchored
 
 
@@ -1226,11 +1226,13 @@ def stream_artifact_file(path: Any, sink: Any = None, *, expected: Any = None) -
 
 
 def copy_artifact_file(source: Any, destination: pathlib.Path, *, expected: Any = None) -> Dict[str, Any]:
-    """Publish a verified file copy atomically; preserve any prior bytes on failure."""
+    """Publish a verified file copy atomically; preserve any prior bytes on failure. Inside a
+    ``task_custody.publication_fence`` a closed generation starts no copy."""
     source_path = pathlib.Path(source) if isinstance(source, (str, os.PathLike)) else None
     destination = pathlib.Path(destination)
     if source_path is not None and not destination.is_symlink() and source_path.resolve(strict=False) == destination.resolve(strict=False):
         return stream_artifact_file(source, expected=expected)
+    fence_publication()
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(f".{uuid.uuid4().hex}.tmp")
     try:
@@ -1340,6 +1342,7 @@ def _archive_previous_artifact_version(drive_root: pathlib.Path, task_id: str, d
     copy_artifact_file(dest, version_path, expected=previous)
     versions = sorted((p for p in version_dir.iterdir() if p.is_file()), key=lambda p: p.name)
     for stale in versions[:-_ARTIFACT_VERSION_RETENTION]:
+        fence_publication()  # a closed generation deletes no retained version, even after its backup landed
         try:
             stale.unlink()
         except OSError:
@@ -1502,9 +1505,13 @@ def copy_directory_to_task_artifacts(
     return records
 
 
-def collect_task_artifact_records(drive_root: Union[pathlib.Path, str], task_id: str) -> List[Dict[str, Any]]:
-    """Collect deliverables while excluding internal task metadata and source handles."""
-
+def collect_task_artifact_records(
+    drive_root: Union[pathlib.Path, str], task_id: str, *, measure: bool = True, strict: bool = False,
+    require_registered: bool = False,
+) -> List[Dict[str, Any]]:
+    """List deliverables (nested ones carry ``relpath``), excluding metadata/inputs.
+    ``measure=False`` uses lstat/recorded identities, with ``measured: False``. Strict
+    listing raises on unreadable files; review's ``require_registered`` requires all entries."""
     try:
         artifact_dir = task_artifact_dir_path(pathlib.Path(drive_root), validate_task_id(task_id), create=False)
     except ValueError:
@@ -1512,41 +1519,49 @@ def collect_task_artifact_records(drive_root: Union[pathlib.Path, str], task_id:
     records: List[Dict[str, Any]] = []
     if not artifact_dir.exists():
         return records
-    data = read_json_dict(artifact_dir / _ARTIFACT_MANIFEST) or {}
-    raw_manifest = data.get("artifacts") if isinstance(data.get("artifacts"), dict) else {}
+    manifest_path = artifact_dir / _ARTIFACT_MANIFEST
+    data = read_json_dict(manifest_path)
+    if data is None and strict and (manifest_path.exists() or manifest_path.is_symlink()):
+        raise OSError(f"artifact registration is unreadable: {manifest_path}")
+    raw_manifest = (data or {}).get("artifacts") if isinstance((data or {}).get("artifacts"), dict) else {}
     manifest = {str(key): dict(value) for key, value in raw_manifest.items() if isinstance(value, dict)}
     artifact_root = artifact_dir.resolve(strict=False)
-    for path in sorted(p for p in artifact_dir.rglob("*") if p.is_file() and not p.is_symlink()):
-        # Internal task-metadata files (the artifact manifest and the v6.52.2 scratch manifest)
-        # are NOT deliverables — never record them as produced artifacts.
-        if path.name in (_ARTIFACT_MANIFEST, SCRATCH_MANIFEST_NAME):
-            continue
-        if path == artifact_dir / (_ARTIFACT_MANIFEST + ".lock"):
-            continue  # an in-flight registration lock is not a deliverable
-        # Verification receipts live beside artifacts for durable custody, but
-        # they are an append-only authority stream, not a deliverable.  Letting
-        # generic materialization register/copy this file can replace a newer
-        # canonical-only lifecycle row with a stale child replica.
-        if is_verification_receipts_path(drive_root, task_id, path):
+    if require_registered:
+        for name in manifest:
+            path = artifact_dir / name
+            if path.is_symlink() or not path.resolve().is_relative_to(artifact_root) or not path.is_file():
+                raise OSError(f"registered artifact is unavailable or outside its owner: {name}")
+    members = iter_artifact_tree(artifact_dir) if strict else artifact_dir.rglob("*")
+    for path in sorted(p for p in members if p.is_file() and not p.is_symlink()):
+        # Metadata (manifests, the registration lock) and the receipt stream (its own
+        # union writer) are not deliverables.
+        if (path.name in (_ARTIFACT_MANIFEST, SCRATCH_MANIFEST_NAME) or path == artifact_dir / (_ARTIFACT_MANIFEST + ".lock")
+                or is_verification_receipts_path(drive_root, task_id, path)):
             continue
         try:
             rel_parts = path.resolve(strict=False).relative_to(artifact_root).parts
         except (OSError, ValueError):
-            continue
-        # v6.52.0 (P1): staged INPUT attachments live under attachments/ and are NOT
-        # task deliverables — never record them as produced artifacts.
-        if rel_parts and rel_parts[0] in {
-            _ATTACHMENTS_SUBDIR, _CHAT_MEDIA_SUBDIR, _SOURCE_HANDLES_SUBDIR,
-        }:
+            continue  # reached through a link: not this store's material
+        # Staged inputs, chat media and source handles are not deliverables.
+        if rel_parts and rel_parts[0] in {_ATTACHMENTS_SUBDIR, _CHAT_MEDIA_SUBDIR, _SOURCE_HANDLES_SUBDIR}:
             continue
         manifest_record = manifest.get(path.name) if path.parent == artifact_dir else None
+        nested = {"relpath": "/".join(rel_parts)} if len(rel_parts) > 1 else {}
         try:
-            record = artifact_record(path)
+            if not measure:  # an immutable registration keeps its recorded identity; nothing else is claimed
+                registered = manifest_record or {}
+                records.append({"kind": str(registered.get("kind") or "task_artifact"), "name": path.name,
+                                "path": str(path), **nested, "size": path.lstat().st_size, "measured": False,
+                                **({key: registered.get(key) for key in ("immutable", "size", "sha256")}
+                                   if registered.get("immutable") else {})})
+                continue
+            record = artifact_record(path) | nested
             if manifest_record:
                 record = merge_artifact_records([{**manifest_record, "path": str(path)}], [record])[0]
             records.append(record)
         except OSError:
-            continue
+            if strict:
+                raise
     return records
 
 

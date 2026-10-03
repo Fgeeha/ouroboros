@@ -279,50 +279,45 @@ def _decide_promotion(env: Any, task: Dict[str, Any], reflection_entry: Optional
         closed=closed or "(none)", active_objective=active_objective or "(no active campaign)",
         force_note=force_note,
     )
-    try:
-        from ouroboros.config import SETTINGS_DEFAULTS
-        from ouroboros.llm import LLMClient
-        from ouroboros.llm_observability import chat_observed
+    # Failures raise to the post-task stage: only an abstention returns None.
+    from ouroboros.config import SETTINGS_DEFAULTS
+    from ouroboros.llm import LLMClient
+    from ouroboros.llm_observability import chat_observed
 
-        client = llm_client or LLMClient()
-        # Main-slot chooser (plan 5C): picking the next evolution objective is a
-        # high-leverage cognitive decision, not a cheap-lane formatting call.
-        chooser_model = str(
-            runtime_setting("OUROBOROS_MODEL", "") or SETTINGS_DEFAULTS["OUROBOROS_MODEL"]
-        ).strip()
-        resp, usage = chat_observed(
-            client,
-            drive_root=drive_root,
-            task_id=str(task.get("id") or "post_task_evolution"),
-            call_type="post_task_evolution_decision",
-            model_role="main",
-            messages=[{"role": "user", "content": prompt}],
-            model=chooser_model,
-            reasoning_effort="medium",
-            max_tokens=8192,
-        )
-        if usage:
-            try:
-                from supervisor.state import update_budget_from_usage
+    client = llm_client or LLMClient()
+    # Main-slot chooser (plan 5C): picking the next evolution objective is a
+    # high-leverage cognitive decision, not a cheap-lane formatting call.
+    chooser_model = str(
+        runtime_setting("OUROBOROS_MODEL", "") or SETTINGS_DEFAULTS["OUROBOROS_MODEL"]
+    ).strip()
+    resp, usage = chat_observed(
+        client,
+        drive_root=drive_root,
+        task_id=str(task.get("id") or "post_task_evolution"),
+        call_type="post_task_evolution_decision",
+        model_role="main",
+        messages=[{"role": "user", "content": prompt}],
+        model=chooser_model,
+        reasoning_effort="medium",
+        max_tokens=8192,
+    )
+    if usage:
+        try:
+            from supervisor.state import update_budget_from_usage
 
-                update_budget_from_usage(usage)
-            except Exception:
-                pass
-        obj = _loose_json((resp.get("content") or "").strip())
-        if not obj:
-            return None
-        return {
-            "promote": bool(obj.get("promote")),
-            "objective": str(obj.get("objective") or "").strip(),
-            # Default to requiring plan review (preserve the advisory->reviewed boundary).
-            "requires_plan_review": bool(obj.get("requires_plan_review", True)),
-            "backlog_id": str(obj.get("backlog_id") or "").strip(),
-        }
-    except Exception as exc:
-        from ouroboros.llm_claudexor import propagate_model_error
-        propagate_model_error(exc)
-        log.debug("post_task_evolution: decision LLM call failed", exc_info=True)
+            update_budget_from_usage(usage)
+        except Exception:
+            pass
+    obj = _loose_json((resp.get("content") or "").strip())
+    if not obj:
         return None
+    return {
+        "promote": bool(obj.get("promote")),
+        "objective": str(obj.get("objective") or "").strip(),
+        # Default to requiring plan review (preserve the advisory->reviewed boundary).
+        "requires_plan_review": bool(obj.get("requires_plan_review", True)),
+        "backlog_id": str(obj.get("backlog_id") or "").strip(),
+    }
 
 
 def _write_request(drive_root: pathlib.Path, decision: Dict[str, Any], task: Dict[str, Any]) -> None:
@@ -352,45 +347,41 @@ def maybe_promote(env: Any, task: Dict[str, Any], reflection_entry: Optional[Dic
                   llm_client: Any = None) -> Optional[Dict[str, Any]]:
     """Worker-side: write a durable promotion signal if the envelope is on and a
     qualifying task surfaced a worthwhile self-improvement. Returns the decision
-    or None. NEVER enqueues/enables evolution (that is the supervisor's job)."""
-    try:
-        from ouroboros.config import (
-            get_post_task_evolution_cadence,
-            get_post_task_evolution_enabled,
-            get_runtime_mode,
-        )
+    or None. NEVER enqueues/enables evolution (that is the supervisor's job).
+    A failure raises to the post-task promotion stage (TZ-2 C3): None is only
+    a genuine no-op, never a swallowed chooser failure."""
+    from ouroboros.config import (
+        get_post_task_evolution_cadence,
+        get_post_task_evolution_enabled,
+        get_runtime_mode,
+    )
 
-        if not get_post_task_evolution_enabled():
-            return None
-        if get_runtime_mode() == "light":
-            return None
-        if not _eligible(task) or not _is_canonical_run(env, task):
-            return None
-        # A project-scoped task never triggers GLOBAL self-evolution (defense in
-        # depth; the post-task pipeline also gates this). Project work stays isolated.
-        from ouroboros.project_facts import resolve_project_id
-
-        if resolve_project_id(task):
-            return None
-        cadence = get_post_task_evolution_cadence()
-        if cadence == "off":
-            return None
-        drive_root = pathlib.Path(str(env.drive_root))
-        force = not cadence.startswith("llm")
-        if cadence.startswith("every_n") and not _counter_due(drive_root, _parse_every_n(cadence)):
-            return None
-        decision = _decide_promotion(env, task, reflection_entry, llm_client, force=force)
-        if not decision or not decision.get("promote") or not decision.get("objective"):
-            return None
-        _write_request(drive_root, decision, task)
-        log.info("post_task_evolution: durable promotion signal written (origin task=%s)",
-                 str(task.get("id") or ""))
-        return decision
-    except Exception as exc:
-        from ouroboros.llm_claudexor import propagate_model_error
-        propagate_model_error(exc)
-        log.debug("post_task_evolution.maybe_promote failed", exc_info=True)
+    if not get_post_task_evolution_enabled():
         return None
+    if get_runtime_mode() == "light":
+        return None
+    if not _eligible(task) or not _is_canonical_run(env, task):
+        return None
+    # A project-scoped task never triggers GLOBAL self-evolution (defense in
+    # depth; the post-task pipeline also gates this). Project work stays isolated.
+    from ouroboros.project_facts import resolve_project_id
+
+    if resolve_project_id(task):
+        return None
+    cadence = get_post_task_evolution_cadence()
+    if cadence == "off":
+        return None
+    drive_root = pathlib.Path(str(env.drive_root))
+    force = not cadence.startswith("llm")
+    if cadence.startswith("every_n") and not _counter_due(drive_root, _parse_every_n(cadence)):
+        return None
+    decision = _decide_promotion(env, task, reflection_entry, llm_client, force=force)
+    if not decision or not decision.get("promote") or not decision.get("objective"):
+        return None
+    _write_request(drive_root, decision, task)
+    log.info("post_task_evolution: durable promotion signal written (origin task=%s)",
+             str(task.get("id") or ""))
+    return decision
 
 
 def _safe_unlink(path: pathlib.Path) -> None:
@@ -425,13 +416,19 @@ def apply_pending_request(drive_root: Any) -> bool:
             _safe_unlink(path)
             return False
 
-        from supervisor.evolution_lifecycle import evolution_block_reason, start_evolution_campaign
-        from supervisor.state import load_state
+        from supervisor.evolution_lifecycle import evolution_block_reason, evolution_stop_reason, start_evolution_campaign
+        from supervisor.state import control_value, load_state
 
         if evolution_block_reason():  # light runtime mode, etc.
             _safe_unlink(path)
             return False
         st = load_state()
+        if not all(control_value(st, key)[0] for key in (
+                "evolution_owner_stopped", "evolution_mode_enabled", "owner_chat_id")) or evolution_stop_reason():
+            # An autonomous re-arm needs KNOWN current controls and no received Stop/Panic
+            # (#1307): unknown is neither "not stopped" nor "not enabled". The durable
+            # request stays for a later tick; only a known stop drops it (below).
+            return False
         if not st.get("owner_chat_id"):
             # Evolution requires an owner-bound chat; without it the cycle could
             # never run. Drop the stale request rather than leaking it.
@@ -509,15 +506,22 @@ def apply_pending_request(drive_root: Any) -> bool:
             # are already serialized ahead of this on the supervisor loop). Honor the
             # LIVE flag inside the atomic update so evolution is never enabled against a
             # fresh owner stop, even in that window.
-            if bool(live.get("evolution_owner_stopped")):
+            known, stopped = control_value(live, "evolution_owner_stopped")
+            if not known or stopped:
                 return
             live["evolution_mode_enabled"] = True
             live["evolution_consecutive_failures"] = 0
             live["post_task_autostop"] = True
 
-        st_after = update_state(_activate_one_shot)
-        _safe_unlink(path)
-        if not bool(st_after.get("evolution_mode_enabled")):
+        from supervisor.state import StateUnavailable
+
+        try:
+            st_after = update_state(_activate_one_shot)
+        except StateUnavailable:
+            st_after = None  # the request stays durable for a later tick; the minted campaign closes below
+        else:
+            _safe_unlink(path)
+        if st_after is None or not bool(st_after.get("evolution_mode_enabled")):
             # Owner stop won the race: the atomic re-check refused the enable. Terminal-
             # close the campaign this now-stale path minted so no dangling active campaign
             # survives, and do NOT audit a self-enable that did not happen. The durable

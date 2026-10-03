@@ -9,9 +9,9 @@ P7 makes context fit a maintenance constraint, not a line-count aesthetic.
   excluded) target roughly 1000 lines. The deterministic hard gates read
   exact-path debt from the manifest: 1600 lines per module
   (`ouroboros/size_ratchet_manifest.py::GIANT_PATHS`), 200,000 UTF-8 bytes per
-  module (`BYTE_DEBT`, shrink-only) and the exact-current 1001–1500 band
-  (`BAND_PATHS`; a new or re-entered path requires a nonblank rationale) — all
-  three apply to Python and JavaScript alike — and 300 lines per
+  module (`BYTE_DEBT`, shrink-only) and the 1001–1500 band (`BAND_PATHS`; an
+  entry may stay at 1501–1600 lines; a new entry needs a nonblank rationale) —
+  all three apply to Python and JavaScript alike — and 300 lines per
   non-grandfathered function (`FUNCTION_DEBT`, exact `(path, qualname)` keys),
   which sees the runtime-Python function inventory only (the iterator skips
   `tests/`, `devtools/`, JavaScript and `FUNCTION_COUNT_EXCLUDED_FILES`). A
@@ -37,20 +37,21 @@ P7 makes context fit a maintenance constraint, not a line-count aesthetic.
 - Methods above 150 lines and more than eight parameters are decomposition
   signals (BIBLE P7, CHECKLISTS item 2(c)), not deterministic gates; existing
   baseline debt is not retroactively a failing tree.
-- Runtime Python function/method count stays under
-  `ouroboros/review.py::MAX_TOTAL_FUNCTIONS` (the same runtime-only iterator;
-  the module gates include tests/devtools) — a high-water alarm with ample
-  headroom, raised only with a one-line campaign rationale in the same commit
-  (the current 10500 ceiling came with the exact budget-pause lifecycle,
-  owner-approved within 10%, after that change's own single-caller inlines).
+- Runtime Python function/method totals are descriptive inventory, with no
+  aggregate ceiling or remaining quota. A repository-wide count does not
+  measure per-unit complexity and can penalize useful decomposition. Module
+  line/UTF-8 byte limits, function-length limits, exact debt manifests and
+  shrink-only debt transitions retain their authority; their inventories and
+  scope remain unchanged.
 - Enforcement: the OFFICIAL repository's CI runs the dedicated `size_ratchet`
   pytest lane as a blocking step (`OURO_SIZE_RATCHET_BASE_REF` names the event
   base; lane placement and base fallback: ARCHITECTURE §8 "CI topology").
   Local surfaces never block on size: the default pytest lanes exclude the
   marker, and `check_worktree_readiness` and `codebase_health` report the same
   `validate_size_ratchet` findings as "official CI will enforce" warnings.
-  Both readouts also show capacity from the same inventory and current limits;
-  readiness passes it separately from warnings and focuses on touched paths.
+  Both readouts also show descriptive totals and per-unit capacity from the
+  same inventory and current limits; readiness passes this information
+  separately from warnings and focuses on touched paths.
   Registered debt and omitted rows are labelled; a nearly full valid module
   remains admissible. Why a locally evolved fork is never trapped by inherited
   debt (no committed-history replay): ARCHITECTURE §6 "Review stack".

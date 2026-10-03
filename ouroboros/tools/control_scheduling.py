@@ -20,9 +20,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ouroboros.artifacts import attachment_manifest_projection, resolve_attachment_manifest
-from ouroboros.config import get_max_subagent_depth
+from ouroboros.config import get_max_subagent_depth, runtime_settings
 from ouroboros.consciousness_authority import consciousness_origin_metadata
 from ouroboros.depth_evidence import parse_task_depth
+from ouroboros.dialogue_provenance import presence_binding_authority_metadata
 from ouroboros.contracts.task_contract import (
     build_task_contract,
     effective_acceptance_claims,
@@ -57,20 +58,21 @@ from ouroboros.tools.control_subagent_spec import (
     _validated_schedule_fields,
     schedule_subagent_param_names,
 )
+from ouroboros.tool_access import folderless_scratch_dir
 from ouroboros.tools.registry import ToolContext, active_repo_dir_for, system_repo_dir_for
 from ouroboros.utils import append_jsonl, utc_now_iso
 from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
-from ouroboros.config import runtime_settings
 
 
-def _publish_scheduling_refusal(ctx: Any, status: str, code: str, text: str) -> str:
+def _publish_scheduling_refusal(ctx: Any, status: str, code: str, text: str, *, reason: str = "") -> str:
     """Publish one scheduling refusal at the branch that composed it (D02).
 
     The validator helpers stay pure functions with no invocation to publish
     into; the single caller that turns a refusal into the result of a call
     publishes it here, with the code the one adapter already assigns.
     """
-    return _publish_tool_result(ctx, ToolResult(status=status, code=code, text=text))
+    return _publish_tool_result(ctx, ToolResult(
+        status=status, code=code, text=text, meta={"reason": reason} if reason else {}))
 
 log = logging.getLogger(__name__)
 
@@ -362,11 +364,12 @@ def _build_acting_constraint(
             f"{allowed} (or omit it for a read-only subagent)."
         )
     from ouroboros.consciousness_authority import task_mode_capped_light
+    from ouroboros.workspace_copies import workspace_copy_source_is_system
 
-    # A per-task mode cap (a consciousness Act/Observe tree: light) keeps a self_worktree
-    # child off in EVERY install mode and toggle state — the tree may write, but never into
-    # its own repository, its children included (В21=A).
-    if write_surface == "self_worktree" and task_mode_capped_light(getattr(ctx, "task_metadata", None)):
+    system_copy = write_surface == "self_worktree" and (
+        not parent_workspace_root or workspace_copy_source_is_system(ctx, parent_workspace_root))
+    # The inherited light cap excludes own-body mutation, including through copies.
+    if system_copy and task_mode_capped_light(getattr(ctx, "task_metadata", None)):
         return _publish_tool_result(ctx, ToolResult(
             status="blocked", code="ACCESS_BLOCKED",
             text=(
@@ -376,7 +379,7 @@ def _build_acting_constraint(
                 "Schedule a read-only subagent (omit write_surface) or use an external surface."
             ),
         ))
-    if not get_allow_mutative_subagents(write_surface):
+    if not get_allow_mutative_subagents(write_surface, source_is_system_repo=system_copy):
         return _publish_tool_result(ctx, ToolResult(
             status="blocked", code="ACCESS_BLOCKED",
             text=(
@@ -386,8 +389,8 @@ def _build_acting_constraint(
             "true/false applies to every surface; when it is empty the runtime mode "
             "decides — advanced/pro allow every surface, light allows the external "
             "build surfaces (external_workspace, genesis — they write outside the "
-            "Ouroboros runtime) and keeps self_worktree (a checkout of the live body) "
-            "off. Schedule a read-only subagent (omit write_surface), use an external "
+            "Ouroboros runtime, including isolated copies of foreign projects) and keeps "
+            "own-body copies off. Schedule a read-only subagent (omit write_surface), use an external "
             "surface, or have the owner enable the toggle."
             ),
         ))
@@ -523,6 +526,31 @@ def _build_child_subagent_contract(spec: Dict[str, Any]) -> Dict[str, Any]:
     from _schedule_task to keep it under the method size gate; one dict param to stay
     within the parameter-count discipline; pure construction)."""
     parent_contract = spec.get("parent_contract")
+    input_source_fields = {}
+    if isinstance(parent_contract, dict) and "input_sources" in parent_contract:
+        input_source_fields["input_sources"] = parent_contract["input_sources"]
+    if "input_sources" in spec:
+        input_source_fields["input_sources"] = spec["input_sources"]
+    if (isinstance(parent_contract, dict) and parent_contract.get("input_sources") == "declared"
+            and input_source_fields.get("input_sources") != "declared"):
+        raise ValueError("input_sources=shared cannot widen an inherited declared selection")
+    if input_source_fields.get("input_sources") == "declared":
+        # Omit whole prior-case narrative carriers; keep the predecessor source
+        # that grants lineage reads. Input selection must not alter that access.
+        predecessor = (parent_contract or {}).get("predecessor_authority")
+        parent_contract = {
+            key: value for key, value in (parent_contract or {}).items()
+            if key not in {"notes", "review_notes", "predecessor_authority"}
+        }
+        if isinstance(predecessor, dict) and predecessor:
+            reference_keys = {"source", "task_id", "authority_sha256", "authority_chars", "digest_semantics"}
+            reference = {key: value for key, value in predecessor.items() if key in reference_keys}
+            omitted = predecessor.get("omitted_fields")
+            reference["omitted_fields"] = sorted(set(
+                [str(key) for key in predecessor if key not in reference_keys | {"omitted_fields"}]
+                + (list(omitted) if isinstance(omitted, list) else [])))
+            parent_contract["predecessor_authority"] = reference
+        input_source_fields["context"] = str(spec.get("context") or "")
     objective = spec.get("objective", "")
     expected_output = spec.get("expected_output", "")
     constraints = spec.get("constraints", "")
@@ -565,6 +593,9 @@ def _build_child_subagent_contract(spec: Dict[str, Any]) -> Dict[str, Any]:
                 "objective": objective,
                 "expected_output": expected_output,
                 "constraints": constraints,
+                "workspace": {"root": spec.get("workspace_root", ""), "mode": spec.get("workspace_mode", "")},
+                "workspace_root": spec.get("workspace_root", ""),
+                "workspace_mode": spec.get("workspace_mode", ""),
                 # The spread above hands the child EVERY parent field, and this merged
                 # mapping outranks the task-level keys in build_task_contract. Any field we
                 # deliberately narrow must therefore be re-stated after it, or the parent's
@@ -580,12 +611,14 @@ def _build_child_subagent_contract(spec: Dict[str, Any]) -> Dict[str, Any]:
                 # child verify receipts would "support" claims the child never owned.
                 "acceptance_claims": child_claims,
                 "success_criteria": [],
+                **input_source_fields,
             } if isinstance(parent_contract, dict) else {
                 "delegation_budget": delegation_budget,
                 "resource_policy": spec.get("resource_policy", {}),
                 "acceptance_claims": child_claims,
                 "attachment_manifest": spec.get("attachment_manifest") or [],
                 "attachment_manifest_ref": spec.get("attachment_manifest_ref"),
+                **input_source_fields,
             },
         },
     })
@@ -610,14 +643,36 @@ def _inherited_workspace_from_active_repo(
     """Inherit an external active workspace for readonly children when metadata is absent."""
     if workspace_root:
         return workspace_root, workspace_mode
-    try:
+    try:  # a folderless parent's scratch is a default cwd, never an inherited workspace (#1315)
         active = active_repo_dir_for(ctx).resolve(strict=False)
         system = system_repo_dir_for(ctx).resolve(strict=False)
-        if active != system:
+        if active != system and folderless_scratch_dir(ctx) is None:
             return str(active), workspace_mode or "external"
     except Exception:
         pass
     return workspace_root, workspace_mode
+
+
+def _child_workspace(ctx, metadata, params):
+    """Bind the parent's observed source before selecting the child's start."""
+    workspace_root = str(getattr(ctx, "workspace_root", "") or metadata.get("workspace_root") or "").strip()
+    workspace_mode = str(getattr(ctx, "workspace_mode", "") or metadata.get("workspace_mode") or "").strip()
+    from ouroboros.tool_access_reads import admit_child_start_folder, capture_parent_workspace
+    parent_workspace = capture_parent_workspace(ctx)
+    workspace_root, workspace_mode = _inherited_workspace_from_active_repo(ctx, workspace_root, workspace_mode)
+    selected_folder = str(params.get("workspace_root") or "").strip()
+    if selected_folder:
+        try:
+            selected_path = Path(selected_folder).expanduser()
+            if not selected_path.is_absolute() and (not parent_workspace["root"]
+                    or parent_workspace.get("availability") == "unavailable"):
+                raise ValueError("relative workspace_root needs an available parent folder; name an absolute readable folder")
+            workspace_root = admit_child_start_folder(ctx,
+                selected_path if selected_path.is_absolute() else Path(parent_workspace["root"]) / selected_path, params)
+            workspace_mode = "read_only"
+        except (OSError, ValueError, RuntimeError) as exc:
+            return workspace_root, workspace_mode, parent_workspace, f"⚠️ TOOL_ARG_ERROR (schedule_subagent): {exc}"
+    return workspace_root, workspace_mode, parent_workspace, ""
 
 
 def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, **params: Any) -> str:
@@ -635,7 +690,7 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
         return _publish_scheduling_refusal(
             ctx, "error", "TOOL_ARG_ERROR", "⚠️ TOOL_ARG_ERROR (schedule_subagent): unsupported argument(s): "
             f"{bad}. Use the strict schema: subagent_id, objective, expected_output, "
-            "optional role/context/constraints/memory_mode and (for mutative children) "
+            "optional role/context/constraints/memory_mode/workspace_root and (for mutative children) "
             "write_surface/write_root/protected_paths_grant/external_tool_grants.")
     internal = dict(internal or {})
     if set(internal) - _INTERNAL_SCHEDULE_OPTIONS:
@@ -643,7 +698,8 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
                         f"{sorted(set(internal) - _INTERNAL_SCHEDULE_OPTIONS)}")
     fields, arg_error = _validated_schedule_fields(params, ctx=ctx)
     if arg_error:
-        return _publish_scheduling_refusal(ctx, "error", "TOOL_ARG_ERROR", arg_error)
+        return _publish_scheduling_refusal(
+            ctx, "error", "TOOL_ARG_ERROR", arg_error, reason=fields.get("reason", ""))
     deadline_at = fields["deadline_at"]
     objective = fields["objective"]
     expected_output = fields["expected_output"]
@@ -708,20 +764,24 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
                             if root_task_id_seed == current_task_id else metadata.get("root_cost_ceiling_usd"))
     if refusal := schedule_delegation_refusal(parent_contract, status_drive_root, parent_task_id):
         return refusal
-    workspace_root = str(getattr(ctx, "workspace_root", "") or metadata.get("workspace_root") or "").strip()
-    workspace_mode = str(getattr(ctx, "workspace_mode", "") or metadata.get("workspace_mode") or "").strip()
-    workspace_root, workspace_mode = _inherited_workspace_from_active_repo(ctx, workspace_root, workspace_mode)
+    workspace_root, workspace_mode, parent_workspace, folder_error = _child_workspace(ctx, metadata, params)
+    if folder_error:
+        return folder_error
     parent_project_id = str(getattr(ctx, "project_id", "") or "").strip()
     requested_surface = str(params.get("write_surface") or "").strip().lower()
-    # `read_only` is a first-class, provider-safe alias for "omit write_surface" (NOT a
-    # VALID_WRITE_SURFACES acting surface) — normalize it to the read-only path so
-    # constraint selection, mutating detection, and the event all treat it as read-only (P5).
+    # The explicit read-only alias selects the same authority as omission.
     if requested_surface == "read_only":
         requested_surface = ""
+    from ouroboros.delegate_directory import git_directory_options_refusal
+    if requested_surface and (error := git_directory_options_refusal(
+            params.get("write_root") or workspace_root or system_repo_dir_for(ctx),
+            fields.get("directory_strategy"), fields.get("scope_paths"),
+            git_workspace=requested_surface in {"self_worktree", "genesis"})):
+        return _publish_scheduling_refusal(ctx, "error", "TOOL_ARG_ERROR", f"⚠️ TOOL_ARG_ERROR (schedule_subagent): {error}")
     if requested_surface:
         from ouroboros.presence_authority import presence_ceiling_allows_delegated_surface
 
-        if not presence_ceiling_allows_delegated_surface(ctx, requested_surface):
+        if not presence_ceiling_allows_delegated_surface(ctx, requested_surface, workspace_root):
             return (
                 "⚠️ PRESENCE_DELEGATION_BLOCKED: mutative delegation requires an exact "
                 "selected write root for this surface in the inherited capability ceiling."
@@ -755,11 +815,7 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
         or {}
     )
     executor_ref = _resolve_executor_ref(ctx)
-    # SCHEDULING STATES INTENT AND NOTHING ELSE. The lane, the model, the effort, the
-    # route, the profile and the effective executor are all resolved ONCE, at
-    # dispatch, by `subagents.resolve_subagent_dispatch` — see it for why. What is
-    # recorded here is what the parent ASKED for, plus the parent's own lane, which
-    # is the fact an omitted lane inherits and which only the parent knows.
+    # Dispatch resolves the exact actor later; scheduling records requested intent.
     tid = uuid.uuid4().hex[:8]
     created_at = utc_now_iso()
     root_task_id = root_task_id_seed or tid
@@ -772,10 +828,12 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
         tid, status_drive_root, memory_mode, parent_project_id)
     if _drive_err:
         return _publish_scheduling_refusal(ctx, "error", "TOOL_ERROR", _drive_err)
-    child_attachment_authority, attachment_error = _materialize_child_attachment_manifest(
-        parent_contract, child_drive or status_drive_root, tid,
-        owner_drive=Path(ctx.drive_root), owner_task_id=parent_task_id,
-    )
+    child_attachment_authority, attachment_error = ({"attachment_manifest": []}, "")
+    if fields.get("input_sources") != "declared":
+        child_attachment_authority, attachment_error = _materialize_child_attachment_manifest(
+            parent_contract, child_drive or status_drive_root, tid,
+            owner_drive=Path(ctx.drive_root), owner_task_id=parent_task_id,
+        )
     if attachment_error:
         shutil.rmtree(task_state_dir(status_drive_root, tid), ignore_errors=True)
         return f"⚠️ SUBTASK_ATTACHMENT_ERROR: {attachment_error}"
@@ -797,6 +855,8 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
         "parent_task_id": parent_task_id, "root_task_id": root_task_id, "session_id": session_id,
         "child_delegation_budget": child_delegation_budget, "deadline_at": str(deadline_at or ""),
         "acceptance_claims": fields["acceptance_claims"], "resource_policy": fields["resource_policy"],
+        "context": context,
+        **({"input_sources": fields["input_sources"]} if "input_sources" in fields else {}),
         **child_attachment_authority,
     })
     # The requested-status envelope carries the REQUEST. Its derived half stays
@@ -821,16 +881,11 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
         "parent_cognitive_route": parent_cognitive_route,
         **{key: fields[key] for key in ("directory_strategy", "scope_paths") if key in fields},
     }
-    evt = {
-        "type": "schedule_subagent",
-        "description": objective,
+    child_facts = {
         "objective": objective,
         "expected_output": expected_output,
         "constraints": constraints,
         "role": role,
-        "task_id": tid,
-        "depth": new_depth,
-        "ts": utc_now_iso(),
         "root_task_id": root_task_id,
         "session_id": session_id,
         "actor_id": f"subagent:{role}",
@@ -840,14 +895,25 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
         "budget_drive_root": budget_drive_root,
         "root_cost_ceiling_usd": root_cost_ceiling_usd,
         "task_constraint": task_constraint,
-        "write_surface": requested_surface,
+        "parent_workspace": parent_workspace,
         "task_contract": child_contract,
         "allowed_resources": allowed_resources,
         "required_capabilities": required_caps,
         **intent_fields,
         "subagent_envelope": envelope,
-        # A child of a consciousness turn/tree carries the origin (label, category, level).
-        "origin_metadata": consciousness_origin_metadata(metadata),
+    }
+    evt = {
+        **child_facts,
+        "type": "schedule_subagent",
+        "description": objective,
+        "task_id": tid,
+        "depth": new_depth,
+        "ts": utc_now_iso(),
+        "write_surface": requested_surface,
+        "resource_intent": ({"kind": "explicit_none"} if folderless_scratch_dir(ctx) is not None
+                            else dict(metadata.get("resource_intent") or {})),
+        "origin_metadata": consciousness_origin_metadata(metadata),  # a consciousness child: label, category, level
+        **presence_binding_authority_metadata(metadata, task_contract=getattr(ctx, "task_contract", None)),  # never speaker
     }
     _populate_subagent_event_extras(
         evt, current_chat_id=current_chat_id, child_drive=child_drive,
@@ -861,32 +927,15 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
             STATUS_REQUESTED,
             created_at=created_at,
             parent_task_id=parent_task_id or None,
-            root_task_id=root_task_id,
-            session_id=session_id,
-            actor_id=f"subagent:{role}",
-            delegation_role="subagent",
-            project_id=parent_project_id,
-            role=role,
             description=objective,
-            objective=objective,
-            expected_output=expected_output,
-            constraints=constraints,
             context=context,
             workspace_root=workspace_root,
             workspace_mode=workspace_mode,
             executor_ref=executor_ref,
-            allowed_resources=allowed_resources,
-            task_contract=child_contract,
-            required_capabilities=required_caps,
             chat_id=current_chat_id,
-            memory_mode=memory_mode,
             drive_root=str(child_drive) if child_drive is not None else "",
             child_drive_root=str(child_drive) if child_drive is not None else "",
-            budget_drive_root=budget_drive_root,
-            root_cost_ceiling_usd=root_cost_ceiling_usd,
-            task_constraint=task_constraint,
-            **intent_fields,
-            subagent_envelope=envelope,
+            **child_facts,
             result="Subagent request queued. Awaiting supervisor acceptance.",
         )
     except Exception:

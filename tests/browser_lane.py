@@ -10,6 +10,15 @@ Completeness is judged against the test modules on disk, not only against what
 was collected: `--ignore`, `--ignore-glob`, `--last-failed` file skipping or an
 overridden collection setting drop modules BEFORE any marker comparison could
 see them, so those controls are refused and every module must be collected.
+
+`--ui-browser-shard=K/N` splits the run, never the proof of the lane: each shard
+collects and checks the complete lane exactly as above, then keeps every N-th node
+of the sorted node ids starting at the K-th and reconciles that slice. The lane
+facts (complete sorted lane, shard, assigned slice) are left on the config for the
+evidence export; `tests/ci_evidence.py reconcile-shards` proves the slices of one
+run add up to the lane an unsharded collection sees. Shards are separate processes
+that agree on node IDS: a parametrization must give each case a stable id and order
+(no iteration over a set, no unsorted glob), or one id names different cases per shard.
 """
 import fnmatch
 import os
@@ -46,10 +55,24 @@ _COLLECTION_INI = {"python_files", "python_classes", "python_functions", "testpa
 def pytest_addoption(parser):
     parser.addoption("--require-ui-browser", action="store_true",
                      help="Require the full ui_browser lane, installed engines, and no silent skips")
+    parser.addoption("--ui-browser-shard", default=None, metavar="K/N",
+                     help="With --require-ui-browser: run slice K of N of the complete sorted lane")
 
 
 def _required(config) -> bool:
     return bool(config.getoption("--require-ui-browser"))
+
+
+def _shard(config):
+    """(K, N) of `--ui-browser-shard=K/N`, 1-based, or None for the whole lane."""
+    value = config.getoption("--ui-browser-shard")
+    if value is None:
+        return None
+    match = re.fullmatch(r"([1-9][0-9]*)/([1-9][0-9]*)", str(value))
+    if match is None or int(match[1]) > int(match[2]) or not _required(config):
+        raise pytest.UsageError("UI_BROWSER_SHARD: --ui-browser-shard takes K/N with 1 <= K <= N "
+                                f"and needs --require-ui-browser, got {value!r}")
+    return int(match[1]), int(match[2])
 
 
 def _skip_reason(report) -> str:
@@ -148,6 +171,7 @@ def _collection_gaps(config) -> list:
 
 
 def pytest_configure(config):
+    _shard(config)  # A malformed or unguarded shard is refused before collection starts.
     if not _required(config):
         return
     # Every collecting process tracks its modules; under xdist that is each worker.
@@ -168,10 +192,27 @@ def pytest_collection_modifyitems(config, items):
     actual = {item.nodeid for item in items}
     if not expected or actual != expected or config.args != ["tests/"]:
         raise pytest.UsageError("UI_BROWSER_INCOMPLETE: require tests/ and the complete -m ui_browser lane")
-    config._required_ui_nodes = expected
+    # The complete lane is recorded BEFORE slicing: every shard and the unsharded
+    # manifest collection must report the same list for their slices to add up.
+    lane = {"full": sorted(expected)}
+    assigned, shard = lane["full"], _shard(config)
+    if shard is not None:
+        index, count = shard
+        assigned = lane["full"][index - 1::count]
+        if not assigned:
+            raise pytest.UsageError(f"UI_BROWSER_INCOMPLETE: shard {index}/{count} of "
+                                    f"{len(expected)} nodes is empty")
+        kept = set(assigned)
+        deselected = [item for item in items if item.nodeid not in kept]
+        items[:] = [item for item in items if item.nodeid in kept]
+        config.hook.pytest_deselected(items=deselected)
+        lane.update(shard=[index, count], assigned=assigned)
+    config._ui_browser_lane = lane
+    # Reconciliation covers this process's slice, so "not executed" names its own nodes only.
+    config._required_ui_nodes = set(assigned)
     reconciliation = _reconciliation(config)
     if reconciliation is not None:
-        reconciliation.required.update(expected)
+        reconciliation.required.update(assigned)
 
 
 def pytest_collection_finish(session):
@@ -210,6 +251,10 @@ def pytest_runtest_makereport(item, call):
 
 
 def pytest_terminal_summary(terminalreporter, exitstatus, config):  # noqa: ARG001
+    lane = getattr(config, "_ui_browser_lane", {})
+    if "shard" in lane:
+        terminalreporter.write_line("UI_BROWSER_SHARD {}/{}: assigned {} of {}".format(
+            *lane["shard"], len(lane["assigned"]), len(lane["full"])))
     reconciliation = _reconciliation(config)
     if reconciliation is None or config.option.collectonly:
         return

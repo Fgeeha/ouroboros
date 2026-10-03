@@ -22,6 +22,13 @@ from tests._git_review_pipeline_shared import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _packet_default_panel(monkeypatch):
+    """This module pins the PACKET assembly of the default panel; the shipped
+    default triad reads the work itself since #1334, so pin packet explicitly."""
+    monkeypatch.setattr("ouroboros.reviewer_slot_config.DEFAULT_TRIAD_DELIVERY", "")
+
+
 @pytest.fixture
 def review_ctx(tmp_path):
     """Yield ``(review_module, ToolContext)``."""

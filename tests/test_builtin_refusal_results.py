@@ -1,5 +1,6 @@
 """Real builtin refusals keep producer facts through the string handler ABI."""
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -111,7 +112,12 @@ def test_presence_contract_refusal_and_valid_completion_remain_distinct():
     assert result.status == "unavailable"
     assert not hasattr(ctx, "_presence_completion")
     ctx.task_contract = {"capability_ceiling": {}}
-    assert _finish_presence(ctx, "message", "hello").startswith("PRESENCE_COMPLETION_RECORDED")
+    assert json.loads(_finish_presence(ctx, "message", "hello")) == {
+        "status": "completion_requested", "completion_control": True, "action": "finish",
+    }
+    assert ctx._completion_request["source"] == "presence_finish"
+    assert ctx._completion_request["answer"] == "hello"
+    assert ctx._presence_completion_accepted is False
     assert ctx._presence_completion == {"outcome": "message", "message": "hello"}
 
 
@@ -144,9 +150,9 @@ def test_existing_warning_and_review_policy_are_not_blanket_reclassified(text, c
 
 # --- the external-executor family (owner Q8A) --------------------------------
 #
-# `delegate_start`/`delegate_wait`/`delegate_cancel`/`delegate_answer` speak a
-# native `ToolResult` among themselves and project a `str` at their four
-# registered entries. The incident these pin: `_fail` used to render
+# `delegate_start`/`delegate_wait`/`delegate_cancel`/`delegate_answer`/
+# `delegate_message` speak a native `ToolResult` among themselves and project a
+# `str` at their five registered entries. The incident these pin: `_fail` used to render
 # `{"status": "refused", ...}` as a plain string, which the registry's legacy
 # adapter classified as OK — so a refused wait/cancel (daemon unreachable, run
 # not owned, containment fault, refused cancel) was recorded as a SUCCESSFUL
@@ -155,16 +161,19 @@ def test_existing_warning_and_review_policy_are_not_blanket_reclassified(text, c
 
 
 def _delegate_registry(tmp_path, monkeypatch, task_id="t-family"):
-    """A real registry, with the family's four entries registered as production does."""
+    """A real registry, with the family's five entries registered as production does."""
     from ouroboros.tools.registry import ToolRegistry
     import ouroboros.safety as safety
 
     monkeypatch.setattr(safety, "check_safety", lambda *_a, **_k: (True, ""))
     registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
     registry._ctx.task_id = task_id
+    from ouroboros.task_results import write_task_result
+
+    write_task_result(tmp_path, task_id, "running", root_task_id=task_id, task_attempt=1)
     registry._ctx.task_metadata = {"root_task_id": task_id, "parent_task_id": task_id}
-    assert {"delegate_start", "delegate_wait", "delegate_cancel", "delegate_answer"} <= set(
-        registry._entries)
+    assert {"delegate_start", "delegate_wait", "delegate_cancel", "delegate_answer",
+            "delegate_message"} <= set(registry._entries)
     return registry
 
 
@@ -174,9 +183,14 @@ _PRE_DAEMON_REFUSALS = [
     ("delegate_start", {"prompt": "do the work"}, "subagent_selection_required", "TOOL_ARG_ERROR"),
     ("delegate_wait", {"run_id": "run-1", "checkpoint_after_sec": 60},
      "checkpoint_requires_time_and_reason", "TOOL_ARG_ERROR"),
+    ("delegate_wait", {"run_id": "run-1", "checkpoint_reason": "inspect"},
+     "checkpoint_requires_time_and_reason", "TOOL_ARG_ERROR"),
+    ("delegate_wait", {"run_id": ""}, "missing_run_id", "TOOL_ARG_ERROR"),
     ("delegate_cancel", {"run_id": ""}, "missing_run_id", "TOOL_ARG_ERROR"),
     ("delegate_answer", {"run_id": "", "interaction_id": "i-1", "answers": [{"question_id": "q"}]},
      "missing_run_id", "TOOL_ARG_ERROR"),
+    ("delegate_message", {"run_id": "run-1", "text": "   "},
+     "message_text_required", "TOOL_ARG_ERROR"),
 ]
 
 
@@ -377,17 +391,22 @@ def test_an_unsupported_engine_build_refuses_the_answer_typed(tmp_path, monkeypa
     assert json.loads(result.text)["reason"] == "interaction_answers_unsupported"
 
 
-def test_the_expired_wait_window_and_its_cache_horizon_note_stay_valid_json(tmp_path, monkeypatch):
-    """The note is a FIELD of the window payload; appended after the JSON it made
-    the whole result unparseable for every reader of this family."""
+def test_the_supervising_wake_and_its_cache_horizon_note_stay_valid_json(tmp_path, monkeypatch):
+    """The note is a FIELD of the wake payload, stamped once at the wake's publication
+    (never per 3 s tick, never appended after the rendered JSON, which once left the
+    whole result unparseable for every reader of this family). Drives the REAL
+    observing tick through the supervising wait: an event during a quiet tick wakes
+    with the note, and without the per-tick window's waited_sec or cancel advice."""
     import json
 
+    import ouroboros.delegate_supervision as supervision
     import ouroboros.tools.control as control
     import ouroboros.tools.delegate as delegate
     from ouroboros.gateways import claudexor as gw
 
     _own_run(tmp_path)
     monkeypatch.setattr(control, "cache_horizon_note", lambda *_a, **_k: "the prompt cache expires soon")
+    monkeypatch.setattr(delegate.time, "sleep", lambda _sec: None)
 
     class _Alive:
         engine_version = "3.10.2"
@@ -398,11 +417,18 @@ def test_the_expired_wait_window_and_its_cache_horizon_note_stay_valid_json(tmp_
         def close(self): pass
 
     monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _Alive())
-    ctx = SimpleNamespace(repo_dir=tmp_path, drive_root=tmp_path, task_id="t-family")
-    raw = delegate._delegate_wait(ctx, "run-1", wait_sec=1, since_seq=0)
+    checks = []
+    # First check lets the tick observe; the second (after it) delivers a control.
+    monkeypatch.setattr(supervision, "_control_wakes",
+                        lambda _ctx: checks.append(1) or ([{"type": "deadline"}] if len(checks) > 1 else []))
+    ctx = SimpleNamespace(repo_dir=tmp_path, drive_root=tmp_path, task_id="t-family", task_attempt=1)
+    raw = supervision.supervised_wait(ctx, "run-1").text
     payload = json.loads(raw)          # the contract: still ONE JSON object
     assert payload["cache_horizon_note"] == "the prompt cache expires soon"
     assert payload["status"] in {"progress", "no_progress"}
+    assert payload["wake_events"] == [{"type": "deadline"}]
+    assert "waited_sec" not in payload and "delegate_cancel" not in str(payload.get("note") or "")
+    assert payload["sleep"]["quiet_renewals"] == 0
 
 
 def _wait_ctx(tmp_path, task_id="t-nanny"):

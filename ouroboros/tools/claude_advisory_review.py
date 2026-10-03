@@ -43,6 +43,7 @@ from ouroboros.tools.review_helpers import (
     check_worktree_readiness,
     check_worktree_version_sync as _check_worktree_version_sync_shared,
     CRITICAL_FINDING_CALIBRATION,  # noqa: F401 -- facade import surface; leaves read it through the call-time handle
+    REVIEW_REPAIR_JUDGMENT,
     get_advisory_runtime_diagnostics as _get_runtime_diagnostics,  # noqa: F401 -- facade import surface; leaves read it through the call-time handle
     format_advisory_error as _format_advisory_error,  # noqa: F401 -- facade import surface; leaves read it through the call-time handle
     load_governance_doc,  # noqa: F401 -- facade import surface; leaves read it through the call-time handle
@@ -166,10 +167,12 @@ def _same_model_payable_spelling(model: str) -> str:
 
 
 def _advisory_default_model() -> str:
-    """The shipped advisory default on a route this install can actually pay."""
+    """The shipped advisory default on a route this install can actually pay —
+    Main's own route on an OpenAI-compatible-only install (#1116)."""
     from ouroboros.provider_models import OPENROUTER_REVIEW_DEFAULTS
+    from ouroboros.review_model_routes import compatible_only_review_model
 
-    return _same_model_payable_spelling(str(OPENROUTER_REVIEW_DEFAULTS["advisory"]))
+    return compatible_only_review_model() or _same_model_payable_spelling(str(OPENROUTER_REVIEW_DEFAULTS["advisory"]))
 
 
 def _advisory_native_model(slot=None) -> str:
@@ -789,7 +792,7 @@ def _next_step_guidance(latest: Optional["AdvisoryRunRecord"], state: "AdvisoryR
             parts.append(f"{len(open_debts)} commit-readiness debt item(s) surfaced by review_status")
         return (" ".join(parts) + ". ") if parts else ""
 
-    regroup = "After the first blocked review, stop patching one finding at a time: re-read the full diff, group obligations by root cause, rewrite the plan, finish all remaining edits, then run preflight_review(commit_message='...')."
+    open_review_work = f"{REVIEW_REPAIR_JUDGMENT} When your edits are complete, run preflight_review(commit_message='...')."
 
     def _with_choices(message: str) -> str:
         return f"{message.rstrip()} {ADVISORY_REVIEW_CHOICE_GUIDANCE}"
@@ -830,7 +833,7 @@ def _next_step_guidance(latest: Optional["AdvisoryRunRecord"], state: "AdvisoryR
             )
         if latest and status == "parse_failure" and not stale_from_edit:
             suffix = (
-                regroup + " Or bypass: commit_reviewed(skip_advisory_review=True) (audited)."
+                open_review_work + " Or bypass: commit_reviewed(skip_advisory_review=True) (audited)."
                 if (open_obs or open_debts)
                 else "Re-run: preflight_review(commit_message='...'), or bypass: commit_reviewed(skip_advisory_review=True) (audited)."
             )
@@ -839,7 +842,7 @@ def _next_step_guidance(latest: Optional["AdvisoryRunRecord"], state: "AdvisoryR
             )
         if open_obs or open_debts:
             prefix = f"Advisory was invalidated by a worktree edit at {stale_from_edit_ts}. " if stale_from_edit else "Advisory is stale or missing for the current snapshot. "
-            return _with_choices(prefix + _debt_hint() + regroup)
+            return _with_choices(prefix + _debt_hint() + open_review_work)
         if stale_from_edit:
             return _with_choices(
                 f"Advisory was invalidated by a worktree edit at {stale_from_edit_ts}. Complete ALL remaining edits, then run: preflight_review(commit_message='...')"
@@ -852,10 +855,10 @@ def _next_step_guidance(latest: Optional["AdvisoryRunRecord"], state: "AdvisoryR
     if open_obs or open_debts:
         if enforcement == "blocking":
             return _with_choices(
-                f"Advisory is current but unresolved review debt remains. {_debt_hint()}commit_reviewed will be blocked until that debt is cleared. Re-read the full diff, group obligations by root cause, and rewrite the plan. Fix the issues, re-run preflight_review so it marks them PASS, or bypass: commit_reviewed(skip_advisory_review=True) (audited)."
+                f"Advisory is current but unresolved review debt remains. {_debt_hint()}commit_reviewed will be blocked until that debt is cleared. {REVIEW_REPAIR_JUDGMENT} Then re-run preflight_review so it can mark addressed items PASS, or bypass: commit_reviewed(skip_advisory_review=True) (audited)."
             )
         return _with_choices(
-            f"Advisory is current and unresolved review debt remains recorded durably. {_debt_hint()}Enforcement is advisory: you decide which findings to apply — commit_reviewed is available. Re-read the full diff, group obligations by root cause, and rewrite the plan; re-run preflight_review so addressed items are marked PASS."
+            f"Advisory is current and unresolved review debt remains recorded durably. {_debt_hint()}Enforcement is advisory: you decide which findings to apply — commit_reviewed is available. {REVIEW_REPAIR_JUDGMENT} Re-running preflight_review lets it mark addressed items PASS."
         )
 
     if latest and latest.status == "skipped":
@@ -1397,6 +1400,7 @@ def _handle_review_status(
         task_id=task_id,
         attempt=attempt,
         snapshot_hash_fn=compute_snapshot_hash,
+        reader_task_id=str(getattr(ctx, "task_id", "") or ""),
     )
     next_step = _next_step_guidance(
         projection["guidance_run"],
@@ -1499,7 +1503,7 @@ def get_tools() -> list:
             schema={
                 "name": "review_status",
                 "description": (
-                    "Show recent advisory pre-review run history. Read-only diagnostic — use to check advisory freshness before commit_reviewed; deterministic-only release diagnostics confer no freshness and create no history. Also shows: last commit attempt state (reviewing/blocked/succeeded/failed) with block reason and actionable guidance; whether advisory is stale because of a worktree edit; open obligations from previous blocking rounds; open commit-readiness debt (durable repo-scoped anti-thrashing signal with fields `commit_readiness_debts`, `commit_readiness_debts_count`); `repo_commit_ready` (an advisory-readiness projection only: a fresh/bypassed/skipped advisory and no open advisory obligations or debt, not the full commit gate); `retry_anchor` (non-null, currently `commit_readiness_debt`, when debt is open — start the next retry from that record instead of patching one obligation at a time); and a concrete next_step recommendation. "
+                    "Show recent advisory pre-review run history. Read-only diagnostic — use to check advisory freshness before commit_reviewed; deterministic-only release diagnostics confer no freshness and create no history. Also shows: last commit attempt state (reviewing/blocked/succeeded/failed) with block reason and actionable guidance; whether advisory is stale because of a worktree edit; open obligations from previous blocking rounds; open commit-readiness debt (durable repo-scoped anti-thrashing signal with fields `commit_readiness_debts`, `commit_readiness_debts_count`); `repo_commit_ready` (an advisory-readiness projection only: a fresh/bypassed/skipped advisory and no open advisory obligations or debt, not the full commit gate); `retry_anchor` (non-null, currently `commit_readiness_debt`, when debt is open — names the durable record that consolidates repeated blockers; how the next attempt uses it is the author's judgment); and a concrete next_step recommendation. "
                     f"{ADVISORY_REVIEW_CHOICE_GUIDANCE} "
                     "Pass include_raw=true to surface the full per-actor evidence (triad_raw_results, scope_raw_result) for the targeted attempt."
                 ),

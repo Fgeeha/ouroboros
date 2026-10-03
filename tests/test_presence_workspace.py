@@ -198,6 +198,10 @@ def test_promotion_and_scheduled_followup_keep_admitted_folder_and_shared_memory
     from tests.test_promote_chat_flow import _confirm_promote
 
     task = _build_task(_admit(installed), _event(), drive_root=installed.data, staged_files=())
+    from ouroboros.usage_admission import task_billing_fields
+    from ouroboros.task_results import write_task_result
+    billing = task_billing_fields(task, task["id"], 0.75, installed.data, pin_initial=True)
+    write_task_result(installed.data, task["id"], "running", root_task_id=task["id"], metadata=task["metadata"])
     ctx = _context(installed, task)
     _confirm_promote(monkeypatch)
     monkeypatch.setattr(workers, "DRIVE_ROOT", installed.data)
@@ -222,11 +226,14 @@ def test_promotion_and_scheduled_followup_keep_admitted_folder_and_shared_memory
     queue.init(installed.data)
     queue.init_queue_refs([], {}, {"value": 0})
     for params in ({"run_at": "2030-01-01T00:00:00Z"}, {"cron": "0 9 * * *", "timezone": "UTC"}):
-        result = _handle_schedule_followup(ctx, objective="Revisit the report", **params)
+        result = _handle_schedule_followup(ctx, objective="Revisit the report", relation="related", **params)
         assert result.startswith("FOLLOWUP_SCHEDULED"), result
     # A future configuration cannot retarget work already admitted/scheduled.
     _configure_presence(installed.ctx, "workspace", behavior_skill=installed.skill.name, workspace_root="")
     for record in queue.list_scheduled_tasks(installed.data)["tasks"]:
+        assert record["followup_relation"]["kind"] == "related"
+        assert record["followup_relation"]["billing_group"] == {
+            key: value for key, value in billing.items() if key.startswith("billing_group_")}
         scheduled = queue._task_from_schedule(record)
         assert scheduled["workspace_root"] == str(installed.workspace)
         assert scheduled["workspace_mode"] == "external" and scheduled["memory_mode"] == "shared"

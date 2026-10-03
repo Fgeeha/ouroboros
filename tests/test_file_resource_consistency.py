@@ -14,26 +14,20 @@ from ouroboros.tools.registry import ToolContext, ToolRegistry
 pytestmark = pytest.mark.serial
 
 
-@pytest.mark.parametrize('location,relative,restricted_file', [
-    ('repo', 'config/.env', True),
-    ('repo', 'deploy/credentials.json', False),
-    ('data', 'claudexor/profile/session/auth.json', True),
+@pytest.mark.parametrize('location,relative', [
+    ('repo', 'config/.env'),
+    ('repo', 'deploy/credentials.json'),
+    ('data', 'claudexor/profile/session/auth.json'),
 ])
-def test_child_file_admission_distinguishes_project_data_and_runtime_stores(environment, location, relative, restricted_file):
-    from ouroboros.tools.core_secret_paths import _is_subagent_secret_repo_target
-
+def test_child_file_reads_match_command_reads(environment, location, relative):
     reg, ctx, _home, work, data = environment
     ctx.task_constraint = TaskConstraint(mode='acting_subagent', surface='external_workspace', write_root=str(work))
     target = (work if location == 'repo' else data) / relative
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text('unprefixed-credential-canary', encoding='utf-8')
-    assert _is_subagent_secret_repo_target(target, work, ctx=ctx) is restricted_file
     command = [sys.executable, '-c', f'from pathlib import Path; print(Path({str(target)!r}).read_text())']
     read = reg.execute('read_file', {'root': 'active_workspace' if location == 'repo' else 'runtime_data', 'path': relative})
-    if restricted_file:
-        assert 'unprefixed-credential-canary' not in read and 'BLOCKED' in read
-    else:
-        assert 'unprefixed-credential-canary' in read
+    assert 'unprefixed-credential-canary' in read
     shell = reg.execute('run_command', {'cmd': command, 'cwd': str(work)})
     assert 'unprefixed-credential-canary' in shell, shell
 
@@ -225,10 +219,10 @@ def test_readonly_child_can_review_auth_sources_and_scoped_knowledge(environment
     token = 'sk-' + 'a' * 48
     path.write_text('def login():\n    return "' + token + '"  # AUTH_SOURCE\n', encoding='utf-8')
     read = reg.execute('read_file', {'path': 'src/auth/login.py'})
-    assert 'def login' in read and token not in read and '***' in read
+    assert 'def login' in read and token in read
     assert 'auth/' in reg.execute('list_files', {'path': 'src'})
     search = reg.execute('search_code', {'query': 'AUTH_SOURCE', 'path': 'src'})
-    assert 'AUTH_SOURCE' in search and token not in search
+    assert 'AUTH_SOURCE' in search and token in search
     assert 'login' in reg.execute('query_code', {'op': 'symbols', 'path': 'src/auth/login.py'})
     knowledge = data / 'projects' / project_id / 'knowledge' if project_id else data / 'memory' / 'knowledge'
     knowledge.mkdir(parents=True)
@@ -304,9 +298,8 @@ def test_child_source_names_and_certificates_do_not_confer_credential_authority(
     token = 'sk-' + 'a' * 48
     source.write_text('def login():\n    return "' + token + '"  # SOURCE_AVAILABLE\n', encoding='utf-8')
     result = reg.execute('read_file', {'root': root, 'path': source.relative_to(base).as_posix()})
-    assert 'SOURCE_AVAILABLE' in result and token not in result and '***' in result
-    # A public PEM must survive unchanged; a private block uses existing byte
-    # egress masking, including when the caller asks for a window past its header.
+    assert 'SOURCE_AVAILABLE' in result and token in result
+    # Both public and private PEM fixture content survive whole and partial reads.
     certificate = '-----BEGIN CERTIFICATE-----\n' + 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789' * 2 + '\n-----END CERTIFICATE-----\n'
     public = source.parent / 'public.pem'
     public.write_text(certificate, encoding='utf-8')
@@ -316,7 +309,7 @@ def test_child_source_names_and_certificates_do_not_confer_credential_authority(
     private.write_text('-----BEGIN PRIVATE KEY-----\n' + material + '\n-----END PRIVATE KEY-----\n', encoding='utf-8')
     for start_line in (1, 2):
         read = reg.execute('read_file', {'root': root, 'path': private.relative_to(base).as_posix(), 'start_line': start_line})
-        assert material not in read
+        assert material in read
         assert ctx.last_read_view['total_lines'] == 3
 
 
@@ -330,9 +323,10 @@ def test_child_own_task_content_is_not_a_repository_credential_store(environment
     target.write_text('TASK_CONTENT_AVAILABLE', encoding='utf-8')
     assert 'TASK_CONTENT_AVAILABLE' in reg.execute('read_file', {'root': root, 'path': path})
     assert path.split('/')[0] in reg.execute('list_files', {'root': root, 'path': '.'})
-    # The profile grants read/list here, not search. Shared path policy must
-    # preserve that independent resource matrix instead of granting a new verb.
-    assert 'TOOL_ACCESS_BLOCKED' in reg.execute('search_code', {'root': root, 'path': '.', 'query': 'TASK_CONTENT_AVAILABLE'})
+    # The matrix is closed under read⇒search (TZ-1 E): the child searches its own
+    # task content exactly where it reads it, and the shared path policy still does
+    # not mistake an ordinary auth/ path in task content for a credential store.
+    assert 'TASK_CONTENT_AVAILABLE' in reg.execute('search_code', {'root': root, 'path': '.', 'query': 'TASK_CONTENT_AVAILABLE'})
 
 
 @pytest.mark.skipif(sys.platform == 'win32', reason='the test SSH fixture uses a POSIX executable shim')
@@ -496,3 +490,156 @@ def test_child_known_root_source_read_keeps_shell_capability(environment, monkey
     result = reg.execute_result('run_command', {'cmd': command, 'cwd': str(work)})
     assert result.status == 'ok' and 'SOURCE_READ_OK' in result.text and 'token' in result.text
     assert '$HOME/project/README.md' in command[2]
+
+
+@pytest.mark.parametrize('mode', ['light', 'advanced', 'pro', 'cyber_pro'])
+@pytest.mark.parametrize('actor', ['parent', 'local_readonly_subagent', 'acting_subagent'])
+def test_parent_runtime_read_rules_follow_physical_files_across_root_labels(tmp_path, monkeypatch, mode, actor):
+    from ouroboros import config
+    from ouroboros.tools import vision
+
+    repo = tmp_path / 'repo'
+    data = repo / 'runtime'
+    data.mkdir(parents=True)
+    monkeypatch.setattr(config, 'DATA_DIR', data)
+    monkeypatch.setenv('OUROBOROS_RUNTIME_MODE', mode)
+    monkeypatch.setenv('OUROBOROS_SAFETY_MODE', 'off')
+    registry = ToolRegistry(repo, data)
+    ctx = registry._ctx
+    if actor != 'parent':
+        ctx.task_constraint = TaskConstraint(mode=actor, surface='external_workspace', write_root=str(repo))
+    sources = {'.git/HEAD': 'ref: refs/heads/synthetic\n', '.env': 'SYNTHETIC_ENV_CONTENT',
+               'runtime/settings.json': '{"key": "SYNTHETIC_SETTINGS_CONTENT"}'}
+    for relative, content in sources.items():
+        target = repo / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding='utf-8')
+        assert content in registry.execute('read_file', {'path': relative})
+    assert '.git/' in registry.execute('list_files', {})
+    project = data / 'projects' / 'other' / 'hidden.py'
+    project.parent.mkdir(parents=True)
+    project.write_text('def hidden_project_fact():\n    pass\n', encoding='utf-8')
+    owner = data / 'state' / 'skills' / 'sample' / 'grants.json'
+    owner.parent.mkdir(parents=True)
+    owner.write_text('{"value": "SYNTHETIC_OWNER_STATE"}', encoding='utf-8')
+    for root, prefix in [('runtime_data', ''), ('active_workspace', 'runtime/')]:
+        blocked = registry.execute('read_file', {'root': root, 'path': prefix + 'projects/other/hidden.py'})
+        assert 'ACCESS_DENIED' in blocked and 'hidden_project_fact' not in blocked
+        listing = registry.execute('list_files', {'root': root, 'path': prefix or '.'})
+        assert 'projects/' not in listing
+        viewed = registry.execute('read_file', {'root': root, 'path': prefix + 'state/skills/sample/grants.json'})
+        assert ('SYNTHETIC_OWNER_STATE' in viewed) is (mode == 'cyber_pro')
+        search = registry.execute('search_code', {'root': root, 'path': prefix or '.', 'query': 'SYNTHETIC'})
+        assert 'SYNTHETIC_SETTINGS_CONTENT' in search
+        assert ('SYNTHETIC_OWNER_STATE' in search) is (mode == 'cyber_pro')
+    assert 'ACCESS_DENIED' in vision._read_file_parity_block(ctx, project)
+    assert bool(vision._read_file_parity_block(ctx, owner)) is (mode != 'cyber_pro')
+    # Admission precedes source hashing/parsing, including a previously cached
+    # projection. A partial policy view must not overwrite the shared cache.
+    from ouroboros import code_intelligence
+    cached = code_intelligence.inventory_cache_path(repo, data)
+    cached.parent.mkdir(parents=True, exist_ok=True)
+    cached.write_text('{"synthetic": "unchanged cache"}', encoding='utf-8')
+    cache_before = cached.read_bytes()
+    original_read = pathlib.Path.read_bytes
+
+    def permitted_read(path):
+        if path == project:
+            pytest.fail('project-store source was read before admission')
+        return original_read(path)
+
+    monkeypatch.setattr(pathlib.Path, 'read_bytes', permitted_read)
+    for op, options in [('symbols', {}), ('digest', {}), ('structural', {'query': 'FunctionDef'})]:
+        result = registry.execute('query_code', {'op': op, **options})
+        assert 'hidden_project_fact' not in result
+        assert 'projects/other/hidden.py' not in result
+    assert cached.read_bytes() == cache_before
+
+
+def test_project_settings_source_is_readable_by_verify_guard(tmp_path):
+    from ouroboros.tools.shell_guards import process_shell_guard_args
+    from tests._typed_guard_shared import _shell_guard_text
+
+    repo, data = tmp_path / "repo", tmp_path / "runtime"
+    (repo / "data").mkdir(parents=True)
+    data.mkdir()
+    (repo / "data" / "settings.json").write_text('{"ordinary": "project fixture"}', encoding="utf-8")
+    registry = ToolRegistry(repo, data)
+    registry._ctx.task_constraint = TaskConstraint(mode="acting_subagent", surface="external_workspace", write_root=str(repo))
+    mapped = process_shell_guard_args("verify_and_record", {"check": "cat data/settings.json", "cwd": str(repo)})
+    result = _shell_guard_text(registry, mapped, "advanced")
+    assert result is None, result
+    assert "project fixture" in registry.execute("read_file", {"path": "data/settings.json"})
+
+
+@pytest.mark.parametrize('mode', ['light', 'advanced', 'pro', 'cyber_pro'])
+@pytest.mark.parametrize('actor', ['parent', 'local_readonly_subagent', 'acting_subagent'])
+@pytest.mark.parametrize('fallback', [False, True])
+def test_explicit_user_files_retains_parent_mode_policy(tmp_path, monkeypatch, mode, actor, fallback):
+    from ouroboros import config
+    from ouroboros.tools import media, vision
+    from tests.test_media_tools import _patch_pypdf, _FakePage
+
+    home = tmp_path / 'home'
+    repo, data = home / 'Ouroboros/repo', home / 'Ouroboros/data'
+    repo.mkdir(parents=True)
+    source = data / 'projects/p1/knowledge/source.py'
+    source.parent.mkdir(parents=True)
+    source.write_text('def parent_project_source():\n    pass\n', encoding='utf-8')
+    monkeypatch.setattr(config, 'DATA_DIR', data)
+    monkeypatch.setenv('OUROBOROS_USER_FILES_ROOT', str(home))
+    monkeypatch.setenv('OUROBOROS_RUNTIME_MODE', mode)
+    monkeypatch.setenv('OUROBOROS_SAFETY_MODE', 'off')
+    registry = ToolRegistry(repo, data)
+    ctx = registry._ctx
+    if actor != 'parent':
+        ctx.task_constraint = TaskConstraint(mode=actor, surface='external_workspace', write_root=str(repo))
+    if fallback:
+        monkeypatch.setattr('ouroboros.code_search_rg._rg_binary', lambda: '')
+    else:
+        from tests.test_code_search_rg import _install_fake_rg
+        _install_fake_rg(tmp_path, monkeypatch)
+    for tool, args, expected in (
+        ('read_file', {'path': str(source)}, 'parent_project_source'),
+        ('list_files', {'path': str(source.parent)}, 'source.py'),
+        ('search_code', {'path': str(source.parent), 'query': 'parent_project_source'}, 'parent_project_source'),
+        ('query_code', {'op': 'symbols', 'path': str(source.parent)}, 'parent_project_source'),
+        ('query_code', {'op': 'digest', 'path': str(source.parent)}, 'parent_project_source'),
+    ):
+        result = registry.execute(tool, {'root': 'user_files', **args})
+        assert (expected in result) is (mode == 'cyber_pro'), result
+        if mode != 'cyber_pro':
+            assert 'BLOCKED' in result or 'blocked' in result, result
+    # The explicitly selected runtime root and the implicit media reader keep
+    # their pre-existing project-store policy even in Cyber, for every actor.
+    runtime = registry.execute('read_file', {'root': 'runtime_data', 'path': str(source)})
+    assert 'ACCESS_DENIED' in runtime and 'parent_project_source' not in runtime
+    assert 'ACCESS_DENIED' in vision._read_file_parity_block(ctx, source)
+    pdf = source.parent / 'note.pdf'
+    pdf.write_bytes(b'%PDF-1.4 fake')
+    _patch_pypdf(monkeypatch, [_FakePage('parent_project_source')])
+    assert 'ACCESS_DENIED' in media._ocr_pdf(ctx, str(pdf))
+
+
+def test_query_code_user_files_child_matches_parent_read_scope(tmp_path, monkeypatch):
+    from ouroboros.contracts.task_constraint import TaskConstraint
+    from ouroboros.tools.query_code import _query_code
+    from ouroboros.tools.registry import ToolContext
+
+    home = tmp_path / "home"
+    source = home / "project"
+    source.mkdir(parents=True)
+    (source / "source.py").write_text("def parent_visible():\n    pass\n", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "source.py").write_text("def outside_source():\n    pass\n", encoding="utf-8")
+    monkeypatch.setenv("OUROBOROS_USER_FILES_ROOT", str(home))
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
+    ctx = ToolContext(repo_dir=tmp_path / "repo", drive_root=tmp_path / "data")
+    for constraint in (None, TaskConstraint(mode="local_readonly_subagent")):
+        ctx.task_constraint = constraint
+        for op in ("symbols", "digest"):
+            result = _query_code(ctx, op, root="user_files", path=str(source))
+            assert "parent_visible" in result
+        refused = _query_code(ctx, "symbols", root="user_files", path=str(outside))
+        assert "outside the user_files home" in refused and "outside_source" not in refused

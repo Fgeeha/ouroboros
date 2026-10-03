@@ -130,6 +130,7 @@ def resolve_room_workspace(
     project_id: str,
     explicit_workspace: str = "",
     workspace_sentinel: str = "",
+    project_admission: Optional[dict] = None,
 ) -> tuple[str, str]:
     """Resolve the workspace_root for a task born in a project room (promote/route).
 
@@ -153,9 +154,12 @@ def resolve_room_workspace(
     source = "explicit workspace_root"
     if not requested and str(project_id or "").strip():
         try:
-            from ouroboros.projects_registry import get_project
+            from ouroboros.projects_registry import project_admission_view
 
-            project = get_project(drive_root, project_id) or {}
+            view = project_admission if project_admission is not None else project_admission_view(drive_root, project_id)
+            project = view["project"]
+            if project is None:
+                raise ValueError("Registered Project is missing")
         except Exception as exc:
             # BIND-OR-LOUD-FAIL. "The registry could not be read" is NOT the same
             # fact as "this project has no working_dir", and collapsing the two was a
@@ -277,9 +281,12 @@ def room_chat_lens_dir(drive_root: Any, project_id: str) -> tuple[str, str]:
     if not pid:
         return "", ""
     try:
-        from ouroboros.projects_registry import get_project
+        from ouroboros.projects_registry import get_reserved_project
 
-        project = get_project(drive_root, pid) or {}
+        # Strict: an unreadable registry is a note, never a folderless room (#1315).
+        project = get_reserved_project(drive_root, pid, strict=True) or {}
+        if str(project.get("lifecycle") or "active") != "active":
+            project = {}
         raw = str(project.get("working_dir") or "").strip()
     except Exception as exc:
         return "", (

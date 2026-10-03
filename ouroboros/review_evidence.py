@@ -417,8 +417,12 @@ def build_task_acceptance_evidence(
         if arts:
             ev["artifacts"] = arts
             prov["artifacts"] = "artifact"
-            if any(isinstance(row, dict) and row.get("name") == "…" for row in arts):
-                partial_sources.append({"tool": "artifact_manifest", "status": "source_unavailable", "reason": "artifact_manifest_truncated_without_exact_range", "source_ref": {}})
+            for row in arts:
+                if row.get("name") == "…":
+                    ref = row.get("source_ref") or {}
+                    partial_sources.append({"tool": "artifact_manifest", "source_ref": ref,
+                        "status": "not_materialized_for_reviewer" if ref else "source_unavailable",
+                        "reason": "artifact_manifest_preview" if ref else "artifact_inventory_unavailable"})
     if ev.get("skill_lifecycle_complete") is False:
         coverage = ev.get("skill_lifecycle_history_coverage") or {}
         partial_sources.append({"tool": "skill_lifecycle", "status": "not_materialized_for_reviewer",
@@ -737,7 +741,9 @@ def collect_review_evidence(
     holds only rows this task owns (plus legacy rows with no recorded owner),
     while another task's rows on the same checkout are carried separately under
     ``foreign_advisory_runs`` so a reader cannot mistake them for this task's
-    own work.
+    own work. The repository stale marker is attributed the same way: shown to
+    every task on the checkout, with ``stale_task_id``/``stale_attribution``
+    naming whose mutation or review wrote it.
     """
     from ouroboros.review_state import (
         _LEGACY_CURRENT_REPO_KEY,
@@ -803,6 +809,8 @@ def collect_review_evidence(
             "bypass_reason": str(getattr(current_run, "bypass_reason", "") or ""),
             "stale_reason": str(getattr(state, "last_stale_reason", "") or "") if stale_matches_repo else "",
             "stale_ts": str(getattr(state, "last_stale_from_edit_ts", "") or "") if stale_matches_repo else "",
+            # Whose mutation or review wrote the marker; it never hides the marker.
+            **{key: value if stale_matches_repo else "" for key, value in state.stale_marker_provenance(task_id).items()},
         },
         "recent_attempts": [_attempt_to_dict(item) for item in (scoped_attempts[-max_attempts:] if max_attempts > 0 else [])],
         "omitted_attempts": max(0, len(scoped_attempts) - max_attempts) if max_attempts > 0 else len(scoped_attempts),

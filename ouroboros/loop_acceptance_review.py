@@ -45,14 +45,14 @@ _ACCEPTANCE_REVIEW_CHECKLIST = (
     "the interface/surface the task itself names (not a weaker "
     "surrogate self-test), and "
     "whether the final response should be changed before release. "
-    "SCOPE CUTS (v6.60.0): did the agent knowingly narrow the task's scope "
+    "SCOPE CUTS (v6.60.0): did the agent knowingly narrow the task's requirements "
     "(dropped/limited requirements, simplified formats, skipped inputs)? "
     "A DISCLOSED, task-justified cut is honest best_effort; an unjustified "
     "or silent cut is a finding — name it with severity high and a concrete "
     "recommendation (under blocking enforcement it becomes an obligation). "
-    "Classify the deliverable tier (solved / best_effort / "
-    "blocked_with_evidence) and name the single highest-value change "
-    "that would move it one tier up. If the task asks for a specific "
+    "Replacing a means the author may change is not itself a scope cut when the requirement "
+    "stays verified; an owner- or parent-fixed method is not the author's to drop. "
+    "If the task asks for a specific "
     "value or short answer, check the FINAL ANSWER line matches the "
     "requested format exactly."
 )
@@ -158,7 +158,7 @@ def prepare_acceptance_observation(ctx: Any, trace: dict, incoming: Any, message
 
 def wait_for_acceptance_feedback(tools: Any, limit_ctx: Any, trace: dict,
                                  tool_schemas: list, seen: set) -> None:
-    """Park a pending answer with optional controls and a complete prose continuation."""
+    """Park paid criticism without losing the retained answer or explicit selection."""
     ctx = tools._ctx
     binding = getattr(ctx, "_task_acceptance_pending", "")
     if not binding:
@@ -200,19 +200,17 @@ def advance_explicit_acceptance(tools: Any, limit_ctx: Any, trace: dict,
             return
     tools._ctx._acceptance_review_only = True
     try:
-        # The tool's claim is a new complete nomination, not prose responding
-        # to an earlier keep/replace prompt. Readiness and review stay shared.
+        # The tool explicitly nominates complete bytes; readiness and review stay shared.
         _loop()._replace_delivery_candidate(tools, limit_ctx, trace, request.get("subject") or "", control="candidate")
         _loop()._no_tool_final_answer(request.get("subject") or "", limit_ctx, trace,
-                                      tools, incoming, seen, emit, review_only=True)
+                                      tools, incoming, seen, emit, review_only=True, explicit_candidate=True)
     finally:
         tools._ctx._acceptance_review_only = False
     if (getattr(tools._ctx, "_task_acceptance_pending", "")
             or getattr(tools._ctx, "_task_acceptance_reviewed", False)
             or not review_enforcement_blocks("blocking")):
         # Explicit submission retained a complete answer without delivering it.
-        # Teach the existing keep/replace reader that this is a control episode;
-        # otherwise the subject-observation's requested keep JSON becomes prose.
+        # Retained review nominations require an explicit completion selection.
         _loop()._arm_delivery_control(tools, limit_ctx, trace, control="acceptance_feedback")
 
 
@@ -602,8 +600,11 @@ def _finish_cyber_acceptance(ctx: _TaskAcceptanceContext, result: Any) -> bool:
     ctx.tools._ctx._task_acceptance_reviewed = False  # final ingress, not review, owns delivery sealing
     clean = not pending and task_acceptance_is_clean(result)
     signal = "" if pending else str(getattr(result, "aggregate_signal", "") or "")
+    # The submitted final is Main's act (finish); Main stated no stance toward
+    # the criticism, so the record carries the act and no invented disposition.
     author = build_author_disposition(
-        disposition="accepted", rationale="Main submitted this complete response for delivery; independent review remains advisory.",
+        disposition="", action="finish",
+        rationale="Main submitted this complete response for delivery; independent review remains advisory.",
         # Evidence assembly can fail before a review binding exists. Bind the
         # author's decision to its real subject without inventing a reviewed pack.
         subject_hash=ctx.review_binding.get("binding_hash") or delivery_subject_hash(ctx.tools._ctx, ctx.llm_trace, ctx.content),
@@ -635,14 +636,22 @@ def _finish_advisory_author(ctx: _TaskAcceptanceContext) -> bool:
     if not feedback and outcome.get("feedback_delivered"):
         feedback = outcome
     disposition = str(stance.get("agent_disposition") or "")
-    from ouroboros.loop_delivery import delivery_evidence_fingerprint
-
-    if (not intent or disposition not in {"accepted", "rejected", "partial", "deferred"}
-            or (action != "stop" and (not feedback or intent.get("review_binding_hash") != feedback.get("binding_hash")))
-            or intent.get("tool_count") != len(ctx.llm_trace.get("tool_calls") or [])
-            or intent.get("owner_directives") != len(getattr(ctx.tools._ctx, "_owner_directives", []) or [])
-            or intent.get("evidence_fingerprint") != delivery_evidence_fingerprint(ctx.tools._ctx, ctx.llm_trace)):
+    if not intent or (disposition and disposition not in {"accepted", "rejected", "partial", "deferred"}):
         return False
+    # Only a FINISH binds to the reviewed feedback and to the three freshness
+    # facts. A stop grants nothing, so nothing about it has to be fresh (TZ-2
+    # C4): the service teardown before the panel changes the evidence
+    # fingerprint, and rejecting the stop for that bought a panel whose
+    # advisory author_finish then read as Done over "not ready".
+    if action != "stop":
+        from ouroboros.loop_delivery import delivery_evidence_fingerprint
+        from ouroboros.tool_capabilities import completion_observation_calls
+
+        if (not feedback or intent.get("review_binding_hash") != feedback.get("binding_hash")
+                or completion_observation_calls((ctx.llm_trace.get("tool_calls") or [])[int(intent.get("tool_count") or 0):])
+                or intent.get("owner_directives") != len(getattr(ctx.tools._ctx, "_owner_directives", []) or [])
+                or intent.get("evidence_fingerprint") != delivery_evidence_fingerprint(ctx.tools._ctx, ctx.llm_trace)):
+            return False
     from ouroboros.review_records import build_author_disposition
 
     author = build_author_disposition(
@@ -650,18 +659,23 @@ def _finish_advisory_author(ctx: _TaskAcceptanceContext) -> bool:
         subject_hash=ctx.review_binding["binding_hash"],
         reviewer_signal=str((feedback or {}).get("aggregate_signal") or ""),
         enforcement="blocking" if review_enforcement_blocks(_loop().get_review_enforcement()) else "advisory",
+        action=action,
     )
-    author["action"] = action
     from ouroboros.task_results import project_task_acceptance_review_capacity
 
     capacity = project_task_acceptance_review_capacity(ctx.tools._ctx, task_id=ctx.task_id) if action == "stop" else {}
     terminal_reason = (REASON_REVIEW_CYCLES_EXHAUSTED if action == "stop" and capacity.get("reason") == REASON_REVIEW_CYCLES_EXHAUSTED
                        else "author_stop" if action == "stop" else "author_finish")
-    ended = _loop()._end_task_acceptance_fence(ctx.tools._ctx, outcome="terminal")
+    ended = _loop()._end_task_acceptance_fence(ctx.tools._ctx, outcome="author_stop" if action == "stop" else "terminal")
     if ended.status == "refused":  # a gap is not a refusal: the final seal asks again and discloses
         _loop()._supersede_task_acceptance_for_owner_followup(ctx.tools._ctx, ctx.llm_trace)
         return True
     ctx.tools._ctx._task_acceptance_reviewed = True
+    if action == "stop":
+        # A stop binds no subject, so an earlier panel's cannot reopen review on the next
+        # delivery pass; only the author's next decision (merge_agent_acceptance_stance)
+        # or owner input does.
+        ctx.tools._ctx._task_acceptance_reviewed_subject = ""
     ctx.tools._ctx._task_acceptance_pending = ""
     _loop()._mark_root_acceptance_checkpoint(
         ctx.tools._ctx, ctx.llm_trace, status=author["reviewer_signal"].lower(), pass_index=ctx.passes_done,
@@ -1195,6 +1209,8 @@ def _skip_task_acceptance_for_launch_reason(
         ),
     })
     emit_progress("Task acceptance skipped: spendable at or below floor.")
+    from ouroboros.acceptance_history import seed_acceptance_history
+    seed_acceptance_history(tools_ctx, llm_trace, launch_reason)
     return False
 
 

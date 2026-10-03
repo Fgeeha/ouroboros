@@ -603,7 +603,7 @@ Skills UI.
 ## Grants for protected keys and host permissions
 
 Some settings keys are protected: `OPENROUTER_API_KEY`,
-`OPENAI_API_KEY`, `OPENAI_COMPATIBLE_API_KEY`, `ANTHROPIC_API_KEY`, `MINIMAX_API_KEY`, `DEEPSEEK_API_KEY`,
+`OPENAI_API_KEY`, `OPENAI_COMPATIBLE_API_KEY`, `ANTHROPIC_API_KEY`, `MINIMAX_API_KEY`, `DEEPSEEK_API_KEY`, `ZAI_API_KEY`,
 `CLOUDRU_FOUNDATION_MODELS_API_KEY`, `GIGACHAT_CREDENTIALS`, `GIGACHAT_PASSWORD`, `TELEGRAM_BOT_TOKEN`,
 `GITHUB_TOKEN`, `OUROBOROS_NETWORK_PASSWORD`. These keys are NEVER
 forwarded to a skill by default, even when listed in
@@ -734,11 +734,29 @@ ceiling and reply context rather than widening authority.
 
 Transport custody preserves provider arrival order before Host admission; the
 host serializes one conversation and enforces the installation-wide active-turn
-limit across processes. A current Presence turn may cancel only its own
-binding-and-conversation-correlated `work_ref`. Owner chat or Background
-Consciousness may initiate an existing binding, but the resulting cycle must use
-an explicitly selected transport tool and finish `tool_delivered` to claim that
-an external message was sent.
+limit across processes. By default, the host-provided own-work readers, messaging
+and cancellation reach only independent work started from the same nonempty binding,
+across its conversations. A profile that explicitly selects global `recent_tasks` or
+`get_task_result` retains those readers' global scope, including other bindings and
+owner work; binding-scoped steering and cancellation do not widen with those reads.
+Owner chat or Background Consciousness may initiate an existing binding, but
+its cycle must use an explicitly selected transport tool and finish
+`tool_delivered` to claim an external message was sent.
+
+A turn's source identity is its binding, source event ID, provider/account,
+conversation/thread, actor ID and text. Keep those facts stable on retry;
+`staged_files` paths and delivery-reporting negotiation may change. A collision
+returns HTTP 409 `presence_event_identity_conflict` with `disposition: rejected`,
+not another room's answer. HTTP 409 `presence_attempt_outcome_unknown` and
+`presence_resources_unavailable` carry `disposition: retry` and no external
+text: retain the original event in the transport. A refusal may carry a
+previously admitted child's `work_ref`; poll it through `/presence/work`,
+not as a completed reply to the original event. A failed durable start is
+also retryable; no agent effect began unless its start was recorded. A quota
+refusal after a terminal task does not itself prove safe regeneration on the
+same ID; if prior effects remain unproven the conversation may need explicit
+owner recovery. Never treat these refusals as `completed/silent` or resend a
+confirmed provider effect merely because a Host receipt failed.
 
 #### Reporting actual Presence delivery
 
@@ -765,6 +783,8 @@ status notices stay in the owner task; an empty deferred body sends nothing but
 still requires polling. Cached and late results preserve that empty body rather
 than substituting the task diagnostic. This does not turn failure into success.
 Ordinary implicit replies and genuine authored best-effort answers remain valid.
+A forced final separates the task record from the reply: only a `presence_finish`
+declared in that answer is spoken, so an undeclared record sends nothing new.
 
 `GET /identity` advertises `presence_delivery_version: 1` on supporting hosts.
 Only then request `delivery_reporting_version: 1` alongside `binding_id` and
@@ -1539,15 +1559,33 @@ A successful publication also writes a durable local receipt to
 `data/state/skills/<name>/ouroboroshub.json` (`published` section: slug,
 version, content hash, repository, PR number/url, timestamp). The receipt is
 best-effort: a write failure is disclosed as `publication_recorded: false` in
-the tool result and never cancels the real PR. The Skills UI reads it for the
-"Submitted PR #N" badge and the adopt confirmation copy; it survives
-uninstall and adopt, and a republish overwrites it.
+the tool result and never cancels the real PR. Both Skills views show it as
+quiet submission history — the submitted version (not the current local one),
+the PR link and whether the local files now differ from the submitted copy —
+in the card's details on My skills and under **Submission history** on the
+OuroborosHub card. It is history, not a status: it never claims that the PR
+merged or that the served Hub copy is yours, and it never gates an action. When
+the catalog lists the name, a local copy offers **Use Hub version** whichever
+way the versions differ. The receipt survives uninstall (including the startup
+cleanup of uninstalled state), adopt and reinstall; a republish overwrites it,
+and an explicit **Delete** of a local skill removes it with the rest of that
+skill's state.
 
-If a submission is no longer being pursued, **Clear local submission** on its
-OuroborosHub card removes that local waiting state. The action preserves the
-installed files, review and grants, and does not close or change the GitHub PR.
-It clears the receipt shown on the card; if another publication replaced it,
-refresh the card first. Returning to My skills refreshes the submission badge.
+**Clear local submission** in that history deliberately forgets the local
+receipt. Nothing else needs it: the installed files, review and grants stay,
+the GitHub PR is not closed or changed, and Install, Use Hub version and Update
+never wait for it. It clears the receipt shown on the card; if another
+publication replaced it, refresh the card first.
+
+**Use Hub version** and **Update** (on the OuroborosHub card or the My skills
+menu) both confirm before anything changes: the local files, including any
+local edits, are replaced with the copy the Hub serves when the action runs —
+the version shown is the last one seen, not a pinned package. The skill's saved
+data, enablement and review history stay; the new files are reviewed again and
+may need access granted again. Cancelling sends nothing. Grants are bound to
+the content hash, so with auto-grant off an enabled extension whose new files
+need a granted key cannot reload: the replacement fails and rolls back to the
+previous copy, and a failed restore is reported.
 
 For a catalog update, the tool result and PR body name both the current catalog
 version and the proposed version. Versions are opaque strings: an older-looking

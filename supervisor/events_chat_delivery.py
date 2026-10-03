@@ -28,7 +28,7 @@ log = logging.getLogger(__name__)
 # episode it had just opened was withdrawn before the worker could ever drain it.
 from supervisor.log_addressing import bound_project_chat_id as _bound_project_chat_id
 from supervisor.message_bus import notification_chat_route
-from ouroboros.subagent_messages import executor_observation_meta, subagent_message_meta
+from ouroboros.subagent_messages import delegated_activity_meta, executor_observation_meta, subagent_message_meta
 
 
 HOST_NARRATION = "host_narration"
@@ -120,14 +120,29 @@ def _handle_typing_start(evt: Dict[str, Any], ctx: Any) -> None:
 _DELIVERED_MESSAGE_IDS: "deque[str]" = deque(maxlen=256)
 
 
-def _register_delivered(ctx: Any, delivery_id: str) -> None:
-    """Atomically mark one id delivered and clear its pending-outbox row."""
+def _register_delivered(ctx: Any, delivery_id: str, emitted: "Dict[str, Any] | None" = None, *, task_id: str = '') -> None:
+    """Atomically mark one id delivered and clear its pending-outbox row.
+
+    ``emitted`` is what THIS handler just sent (exact text, routed chat, task):
+    a terminal answer's receipt of its bytes, never inferred elsewhere.
+    """
     try:
         from supervisor.terminal_delivery import register_delivery
 
-        register_delivery(ctx.DRIVE_ROOT, delivery_id)
+        register_delivery(ctx.DRIVE_ROOT, delivery_id, emitted=emitted)
+        _handoff_delivered_review(ctx, task_id or str((emitted or {}).get('task_id') or ''), delivery_id)
     except Exception:
         log.debug("durable delivery registration failed", exc_info=True)
+
+
+def _handoff_delivered_review(ctx: Any, task_id: str, delivery_id: str) -> None:
+    try:
+        from ouroboros.acceptance_late import handoff_delivered_acceptance
+
+        if task_id:
+            handoff_delivered_acceptance(ctx, task_id, delivery_id)
+    except Exception:
+        log.debug('historical acceptance remains owed before operation handoff', exc_info=True)
 
 
 def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
@@ -184,7 +199,7 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
             # This copy is suppressed because the FIRST one was sent, so record
             # that durably: it also clears any pending-outbox row, which would
             # otherwise be replayed (and suppressed again) until it gave up.
-            _register_delivered(ctx, delivery_id)
+            _register_delivered(ctx, delivery_id, task_id=str(evt.get('task_id') or ''))
             return
         if delivery_id:
             try:
@@ -195,6 +210,7 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
                         "send_message suppressed as durably delivered (delivery_id=%s)",
                         delivery_id,
                     )
+                    _handoff_delivered_review(ctx, str(evt.get('task_id') or ''), delivery_id)
                     return
             except Exception:
                 # Fail open toward delivery — never lose an answer to a dedupe read.
@@ -284,6 +300,11 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
             )
             if observation:
                 progress_meta["executor_observation"] = observation
+        if progress_meta and "delegated_activity" in progress_meta:
+            progress_meta = dict(progress_meta)
+            activity = delegated_activity_meta(progress_meta.pop("delegated_activity"), task_id=task_id)
+            if activity:
+                progress_meta["delegated_activity"] = activity
         meta = progress_meta or {}
         bound_chat = _bound_project_chat_id(
             ctx, task_id,
@@ -291,8 +312,15 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
             meta.get("root_task_id") or evt.get("root_task_id"),
         )
         system_type = str(evt.get("system_type") or "")
-        # Project lifecycle rows pin Main; others keep lineage routing.
-        chat_id = int(evt["chat_id"]) if system_type in ("project_started", "project_handoff", "project_completion_summary") else bound_chat or int(evt["chat_id"])
+        from ouroboros.project_dialogue import MAIN_PINNED_ROW_TYPES
+
+        # Project lifecycle rows and a root's Main notice pin Main; others keep lineage routing.
+        chat_id = int(evt["chat_id"]) if system_type in MAIN_PINNED_ROW_TYPES else bound_chat or int(evt["chat_id"])
+        if system_type == "acceptance_late_settlement":
+            from ouroboros.acceptance_late import supplement_chat
+            retained_chat = supplement_chat(ctx.DRIVE_ROOT, evt)
+            if retained_chat is not None:
+                chat_id = retained_chat
         ctx.send_with_budget(
             chat_id,
             str(evt.get("text") or ""),
@@ -309,7 +337,12 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
         # Register only after send; a failed first copy must not suppress retry.
         if delivery_id:
             _DELIVERED_MESSAGE_IDS.append(delivery_id)
-            _register_delivered(ctx, delivery_id)
+            _register_delivered(ctx, delivery_id, emitted={
+                "text": str(evt.get("text") or ""), "chat_id": chat_id, "task_id": task_id, "format": fmt,
+                "role": str(evt.get("role") or ""), "system_type": system_type,
+                "terminal_origin": str(evt.get("terminal_origin") or ""),
+                "routing": {"basis": "terminal_sender_bound_project", "intended_chat_id": int(evt["chat_id"]),
+                            "routed_chat_id": chat_id} if bound_chat == chat_id else None})
             if system_type == "cancel_receipt":
                 from supervisor.terminal_delivery import record_cancel_receipt_delivery
 
@@ -441,7 +474,7 @@ def _handle_send_quiz(evt: Dict[str, Any], ctx: Any) -> None:
     try:
         chat_id = _delivery_chat_id(evt, ctx)
         options = evt.get("options")
-        if chat_id is None or not isinstance(options, list) or not options:
+        if chat_id is None or not isinstance(options, list):
             return
         if chat_id == 0:
             # Deliberate exception to the "0 is a real hidden session" policy:
@@ -457,6 +490,7 @@ def _handle_send_quiz(evt: Dict[str, Any], ctx: Any) -> None:
             assumption=str(evt.get("assumption") or ""),
             state=str(evt.get("state") or "open"),
             task_id=str(evt.get("task_id") or ""),
+            host_facts=str(evt.get("host_facts") or ""),
             **({"wait_for_answer": True} if evt.get("wait_for_answer") is True else {}),
         )
         if not ok:

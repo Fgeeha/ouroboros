@@ -143,13 +143,17 @@ export class ElementStub {
         }
         return [];
     }
+    matches(selector) { return selector.split(',').some((part) => part.trim().startsWith('.')
+        && this.classList.contains(part.trim().slice(1))); }
     closest(selector) {
         if (selector === '.page.active' && this.classList.contains('page') && this.classList.contains('active')) return this;
         return this.parentElement?.closest?.(selector) || null;
     }
     getBoundingClientRect() { return { top: 0, bottom: 20, left: 0, right: 100, width: 100, height: 20 }; }
     getClientRects() { return [this.getBoundingClientRect()]; }
-    focus() { if (this.ownerDocument) this.ownerDocument.activeElement = this; } click() {}
+    focus() { if (this.ownerDocument) this.ownerDocument.activeElement = this; }
+    // Like a browser, a disabled button dispatches no click.
+    click() { if (!this.disabled) for (const fn of this.listeners.get('click') || []) fn({ target: this }); }
 }
 export function installDom(fetchImpl = async () => ({ ok: true, json: async () => ({ active_direct_turns: [] }) })) {
     const prior = {

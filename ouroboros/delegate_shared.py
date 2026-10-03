@@ -10,9 +10,9 @@ so every existing reference and monkeypatch target keeps the same objects.
 
 This module also owns the external-executor family's RESULT ENVELOPE. Inside the
 family (``delegate_start``/``delegate_wait``/``delegate_cancel``/
-``delegate_answer``, their producers and their host consumers) a result is a
-native ``ToolResult``; only the four registered entries project it back to the
-``str`` handler ABI. The envelope is two additive JSON keys — ``ok`` and
+``delegate_answer``/``delegate_message``, their producers and their host
+consumers) a result is a native ``ToolResult``; only the five registered entries
+project it back to the ``str`` handler ABI. The envelope is two additive JSON keys — ``ok`` and
 ``host_code`` — written beside the domain payload, never instead of it: the
 domain ``reason`` keeps its own name and its own vocabulary, and nothing here
 renames it into ``ToolResult.code``.
@@ -64,10 +64,15 @@ _AGENT_FAULT_REASONS = frozenset({
     "configured_actor_resource_mismatch",
     "configured_actor_route_mismatch",
     "empty_prompt",
+    # The engine's typed rejection of a live message whose message_id was
+    # replayed with DIFFERENT text: the caller reused an invocation identity.
+    "idempotency_conflict",
+    "message_text_required",
     "missing_interaction_id",
     "missing_run_id",
     "payload_binding_mismatch",
     "payload_selector_incomplete",
+    "payload_selector_unresolved",
     "retry_prompt_mismatch",
     "retry_selector_conflict",
     "selector_on_retry",
@@ -185,8 +190,8 @@ def _owned_run(ctx: ToolContext, tool: str, run_id: str) -> Tuple[Optional[ToolR
         # to ask (get_task_result(owner_task_id) is the legitimate cross-task
         # read that already carries the delegated_runs_* counters).
         return _fail(tool, "run_not_owned",
-                     "That run belongs to another task. A delegated run may only be "
-                     "waited on or cancelled by the task that started it.",
+                     "That run belongs to another task. Live control belongs to its starter; "
+                     "completed-result access also permits a host-confirmed retry successor.",
                      run_id=run_id,
                      owner_task_id=str(getattr(entry, "task_id", "") or ""),
                      run_settled=bool(getattr(entry, "settled", False)),
@@ -194,21 +199,129 @@ def _owned_run(ctx: ToolContext, tool: str, run_id: str) -> Tuple[Optional[ToolR
     return None, entry
 
 
+def _retry_lineage(task_id: str, row: Mapping[str, Any]) -> Dict[str, Any]:
+    from ouroboros.task_results import resolve_task_lineage
+
+    return resolve_task_lineage(task_id, **{
+        key: row.get(key) for key in (
+            "metadata", "root_task_id", "parent_task_id", "delegation_role",
+            "original_task_id", "timeout_retry_from")})
+
+
+def _confirmed_retry_chain(drive: Any, starter: str, reader: str) -> Tuple[str, ...]:
+    """Host result edges plus the worker-visible physical-ownership projection.
+
+    Retry publication follows kill+join in task_reaper. Neither a shared root
+    nor a task-authored predecessor is an edge. Read the whole root chain so a
+    run started by an intermediate attempt has the same custody as the first.
+    Queue-local supervisor globals are not available authority in a worker.
+    """
+    from ouroboros.task_results import load_task_result, _TRULY_TERMINAL_STATUSES
+    from ouroboros.task_status import _load_queue_snapshot, queue_snapshot_observation
+
+    try:
+        start = load_task_result(drive, starter, strict=True) or {}
+        shape = _retry_lineage(starter, start)
+        if not shape["is_root_task"]:
+            return ()
+        root = str(shape["root_task_id"])
+        current, chain = root, {}
+        while current not in chain:
+            row = load_task_result(drive, current, strict=True) or {}
+            lineage = _retry_lineage(current, row)
+            if not row or not lineage["is_root_task"] or lineage["root_task_id"] != root:
+                return ()
+            chain[current] = row
+            successor = str(row.get("superseded_by") or "")
+            retry = str(row.get("retry_task_id") or "")
+            if not successor and retry in {"", current}:
+                break  # same-id recovery is not a new-id edge
+            if (not successor or retry != successor
+                    or row.get("status") not in {"interrupted", *_TRULY_TERMINAL_STATUSES}):
+                return ()
+            nxt = load_task_result(drive, successor, strict=True) or {}
+            if any(str(nxt.get(key) or "") != current for key in (
+                    "supersedes_task_id", "original_task_id", "timeout_retry_from")):
+                return ()
+            current = successor
+        else:
+            return ()  # cycle
+        if current != reader or starter not in chain or starter == reader:
+            return ()
+        snapshot = _load_queue_snapshot(pathlib.Path(drive))
+        if not queue_snapshot_observation(snapshot)["fresh"]:
+            return ()
+        active = []
+        for bucket in ("pending", "running"):
+            rows = snapshot.get(bucket)
+            if not isinstance(rows, list):
+                return ()
+            for row in rows:
+                if not isinstance(row, dict):
+                    return ()
+                tid = str(row.get("id") or row.get("task_id") or "")
+                task = row.get("task")
+                if not tid or not isinstance(task, dict):
+                    return ()
+                live = _retry_lineage(tid, task)
+                if tid in chain:
+                    # Any old pending/running attempt defeats quiescence. The
+                    # surviving row must independently describe this retry.
+                    if (tid != reader or not live["is_retry_root_attempt"]
+                            or live["root_task_id"] != root
+                            or live["original_task_id"] != chain[reader].get("original_task_id")):
+                        return ()
+                    active.append(tid)
+                elif (live["root_task_id"] == root and not live["parent_task_id"]
+                      and live["delegation_role"] != "subagent"):
+                    return ()  # ambiguous live attempt outside the chain
+        return tuple(chain) if active == [reader] else ()
+    except (OSError, ValueError, TypeError, KeyError):
+        return ()
+
+
+def retry_result_status(ctx: ToolContext, drive: Any, run_id: str, *,
+                        state: Optional[Mapping[str, _RunCustody]] = None,
+                        ) -> Tuple[str, Optional[_RunCustody], str]:
+    """Additional authority for a completed product, never starter/live control.
+
+    Refresh from durable custody, or reuse one read-side audit snapshot.
+    CLOSED_ABSENT and panel-owned runs do not prove a task work product;
+    a failed/cancelled terminal result does.
+    Existing tool/file profile guards and materializer target guards still apply.
+    """
+    reader = str(getattr(ctx, "task_id", "") or "")
+    if custody.custody_log_unreadable(drive):
+        return custody.UNKNOWN, None, ""
+    entry = (state if state is not None else custody.replay(drive)).get(str(run_id or ""))
+    if entry is None:
+        return custody.UNKNOWN, None, ""
+    if reader and reader == entry.task_id:
+        return custody.OWNED, entry, ""
+    if (reader and entry.task_id and not entry.review_owned and entry.settled
+            and entry.terminal_state in custody.TERMINAL_STATES
+            and _confirmed_retry_chain(drive, entry.task_id, reader)):
+        return custody.OWNED, entry, entry.task_id
+    return custody.FOREIGN, entry, ""
+
+
 def orphan_disposition_status(
-    ctx: ToolContext, drive: Any, run_id: str,
+    ctx: ToolContext, drive: Any, run_id: str, *,
+    state: Optional[Mapping[str, _RunCustody]] = None,
 ) -> Tuple[str, Optional[_RunCustody], str]:
-    """Custody for a DISPOSITION, with the orphan rule applied.
+    """Custody for a DISPOSITION, with retry and orphan result authority.
 
     An obligation is held by the run's durable rows, not by the task that
-    created them. While the owning task is LIVE, only that identity may decide
-    its captured patch. Once that task is terminal, a live TOP-LEVEL task may
+    created them. Its starter or confirmed retry successor may decide its
+    completed captured patch. Once the starter is terminal, a live TOP-LEVEL task may
     apply or reject the orphan; every apply-path guard still runs unchanged
     (recorded-target match, protected paths, proven drift, the whole-payload
     CAS), and the PATCH_DISPOSED row records who wrote it.
 
-    This is a DISPOSITION-ONLY upgrade. ``_owned_run`` governs wait/cancel/
-    answer and is deliberately NOT widened: cancelling or answering a foreign
-    run destroys work instead of closing an obligation.
+    ``_owned_run`` remains the starter/live-control fact. Successor wait uses
+    a separate terminal-result branch, never live supervision or control.
+    Mutators omit ``state`` and repeat this fresh check under their run lock;
+    capture readers may share the existing read-side audit snapshot.
 
     Returns ``(status, entry, orphan_of)``, where ``orphan_of`` is the terminal
     owner's task id when the upgrade applied and "" otherwise.
@@ -216,7 +329,35 @@ def orphan_disposition_status(
     from ouroboros.delegate_terminal import _task_is_terminal
     from ouroboros.tool_access import _TOP_LEVEL_PRINCIPAL_PROFILES, active_tool_profile
 
-    status, entry = custody.lookup(drive, str(getattr(ctx, "task_id", "") or ""), run_id)
+    reader = str(getattr(ctx, "task_id", "") or "")
+    if custody.custody_log_unreadable(drive):
+        return custody.UNKNOWN, None, ""
+    if state is None:
+        state = custody.replay(drive)
+    durable = state.get(str(run_id or ""))
+    if durable is not None:
+        custody._CUSTODY[str(run_id)] = durable
+    status, entry = custody.lookup(drive, reader, run_id)
+    if reader:
+        # A dead worker's late call must not race the admitted successor. Same
+        # id recovery keeps authority; orphan recovery cannot revive a superseded caller.
+        from ouroboros.task_results import load_task_result
+
+        try:
+            row = load_task_result(drive, reader, strict=True) or {}
+            successor = str(row.get("superseded_by") or "")
+            if successor and successor != reader and row.get("retry_task_id") == successor:
+                nxt = load_task_result(drive, successor, strict=True) or {}
+                if all(nxt.get(key) == reader for key in (
+                        "supersedes_task_id", "original_task_id", "timeout_retry_from")):
+                    return custody.FOREIGN, entry, ""
+        except (OSError, ValueError, TypeError):
+            return custody.UNKNOWN, entry, ""
+    if status == custody.FOREIGN:
+        retry_status, retry_entry, predecessor = retry_result_status(ctx, drive, run_id, state=state)
+        if retry_status == custody.OWNED and predecessor:
+            # A successor is not an orphan aggregator: keep exact target rules.
+            return retry_status, retry_entry, ""
     if (status == custody.FOREIGN and entry is not None
             and entry.settled and not entry.patch_disposed
             and str(active_tool_profile(ctx)) in _TOP_LEVEL_PRINCIPAL_PROFILES
@@ -263,15 +404,15 @@ def orphan_capture_read_target(
     ctx: ToolContext, candidate: Any, *,
     snapshot: Optional[Mapping[str, Any]] = None,
 ) -> Optional[pathlib.Path]:
-    """READ anchor for the capture of a TERMINAL OWNER's orphan, or None.
+    """READ anchor for a confirmed retry's product or terminal owner's orphan.
 
     ``artifacts.delegated_capture_read_target`` rebinds ``artifact_store``
     reads for the caller's OWN ``delegated_runs/`` prefix only, so the task the
     orphan rule already authorizes to APPLY a foreign capture could not READ
     it: the sanctioned recovery root got ``outside selected root=artifact_store``
     twice on the very patch it was told to dispose. Authority is not widened
-    here -- ``orphan_disposition_status`` remains the single decision, and this
-    only lets the actor that MAY apply also read.
+    here: the same result authority permits the read. Retry evidence remains
+    readable after disposition, while the ordinary orphan rule is unchanged.
 
     Resolution is by PATH SHAPE first: a candidate must sit under
     ``<canonical data root>/task_results/artifacts/<owner_tid>/delegated_runs/
@@ -297,19 +438,25 @@ def orphan_capture_read_target(
         return None  # the caller's OWN prefix is delegated_capture_read_target's job
     drive = custody.custody_root(ctx)
     state = (snapshot or {}).get("state")
-    rows = (custody.undisposed_patches(drive, state=state) if state is not None
-            else custody.undisposed_patches(drive))
+    # Successor evidence remains readable after disposition; the ordinary
+    # orphan door still requires an undisposed patch through its own predicate.
+    if state is None:
+        state = custody.replay(drive)
+    rows = state.values()
     for row in rows:
         if str(row.task_id or "") != owner_tid:
             continue
         cap_dir = custody.delegated_capture_dir(drive, row.task_id, row.snapshot_id or row.run_id)
         if cap_dir.name != capture_name or not path_is_relative_to(resolved, cap_dir):
             continue
+        retry_status, _entry, predecessor = retry_result_status(ctx, drive, str(row.run_id), state=state)
+        if retry_status == custody.OWNED and predecessor:
+            return resolved
         # The rows we just read ARE the durable authority; seeding the memo the
         # ownership lookup consults keeps this read at the traversal budget
         # above instead of replaying the same log a second time.
         custody._CUSTODY.setdefault(str(row.run_id), row)
-        status, _entry, orphan_of = orphan_disposition_status(ctx, drive, str(row.run_id))
+        status, _entry, orphan_of = orphan_disposition_status(ctx, drive, str(row.run_id), state=state)
         if status == custody.OWNED and orphan_of:
             return resolved
     return None
@@ -318,4 +465,4 @@ def orphan_capture_read_target(
 __all__ = ["AGENT_FAULT_CODE", "SUBSTRATE_REFUSAL_CODE", "_emit", "_fail", "_owned_run",
            "delegate_payload", "delegate_result", "orphan_apply_target_ok",
            "orphan_capture_read_target", "orphan_disposition_status",
-           "publish_delegate_result", "refusal_host_code"]
+           "publish_delegate_result", "refusal_host_code", "retry_result_status"]

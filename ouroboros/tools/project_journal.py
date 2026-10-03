@@ -26,9 +26,10 @@ from ouroboros.project_facts import (
     sanitize_project_id,
     explicit_project_id_ok,
 )
-from ouroboros.dialogue_provenance import is_presence_task
+from ouroboros.dialogue_provenance import is_presence_task, presence_caller_binding
 from ouroboros.focus import normalize_focus
 from ouroboros.tools.registry import ToolContext, ToolEntry
+from ouroboros.tools.tool_result import completed_local_read
 from ouroboros.utils import (
     append_jsonl,
     jsonl_generation_signature,
@@ -55,7 +56,7 @@ def _scope_authority(ctx: ToolContext) -> tuple[str, Dict[str, Any]]:
     delegation_role = str(lineage.get("delegation_role") or metadata.get("delegation_role") or "").strip()
     root_task_id = str(lineage.get("root_task_id") or metadata.get("root_task_id") or "").strip()
     child = bool(parent_task_id) or delegation_role == "subagent"
-    if is_presence_task(task):
+    if is_presence_task(task) or presence_caller_binding(ctx) is not None:  # a speaker, or acting for its binding
         return "presence", metadata
     if child:
         return "child", metadata
@@ -386,6 +387,7 @@ def _journal_snapshot_rows(
     return rows, snapshot, False, unreadable
 
 
+@completed_local_read
 def _journal_read(
     ctx: ToolContext,
     project_id: str = "",
@@ -459,6 +461,7 @@ def _journal_read(
     return f"## Project journal ({pid})\n\n" + "\n".join(lines)
 
 
+@completed_local_read
 def _workpad_read(ctx: ToolContext, project_id: str = "") -> str:
     pid, scope_error = _resolve_project_id(ctx, project_id, write=False)
     if scope_error:
@@ -764,8 +767,12 @@ def get_tools() -> List[ToolEntry]:
             {
                 "name": "update_focus",
                 "description": (
-                    "Publish a short authored focus for this live root. The source_ref is a "
-                    "typed reader/cursor reference; focus is awareness, never an owner directive."
+                    "Optionally publish one short line on what this live root is working on, for the OTHER "
+                    "live roots: their roster note and live_roots show it, dated, while this task is unsettled "
+                    "(waits included) until you publish a newer one; once it settles it is only history on its "
+                    "task result. It is task-scoped, not a project-level record; journal/workpad writes do not "
+                    "publish it and nothing refreshes it. source_ref names a reader whose current answer is "
+                    "kept as the evidence. Awareness, never an owner directive."
                 ),
                 "parameters": {
                     "type": "object",

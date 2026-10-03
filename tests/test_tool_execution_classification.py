@@ -582,7 +582,8 @@ def test_live_tool_log_payload_includes_structured_result_metadata(tmp_path, mon
     # with the tools.jsonl row (typed-process-facts lane), so the payload names
     # every member the merge produced — exit_code and signal included — and a
     # member the call never published stays absent instead of reading as null.
-    assert source.count("**_process_fact_fields(result_meta)") >= 3
+    # (the live finished frame of every branch comes from _emit_finished; #1316).
+    assert source.count("**_process_fact_fields(result_meta)") >= 2
     projected = loop_tool_execution._process_fact_fields(
         {"status": "x", "exit_code": -9, "signal": "SIGKILL", "killed_by_host": True}
     )
@@ -732,7 +733,7 @@ def test_reviewed_mutator_soft_timeout_keeps_foreground_custody(tmp_path, monkey
 
 
 
-def test_timed_out_stateful_tool_retires_the_generation_and_closes_on_the_worker(monkeypatch):
+def test_timed_out_stateful_tool_retires_the_generation_and_closes_on_the_worker(monkeypatch, tmp_path):
     """The #409/#440 wiring: a stateful-tool timeout RETIRES the browser
     generation immediately (the shared slot gets a fresh state; no cross-thread
     Playwright calls), queues the close on the RETIRING executor so it runs on
@@ -740,6 +741,7 @@ def test_timed_out_stateful_tool_retires_the_generation_and_closes_on_the_worker
     already-settled race), retires the executor WITHOUT cancelling that queued
     cleanup, and closes handles the worker created even AFTER the detach."""
     from types import SimpleNamespace
+    from contextvars import Context, ContextVar
 
     import ouroboros.loop_tool_execution as lte
     from ouroboros.tools.registry import BrowserState
@@ -755,9 +757,8 @@ def test_timed_out_stateful_tool_retires_the_generation_and_closes_on_the_worker
     setattr(bs, "_browser_context", context)
     setattr(bs, "_thread_id", 1)
 
-    class HungFuture:
-        def result(self, timeout=None):
-            raise TimeoutError()
+    # A real unfinished Future retains the settlement callback while the wait expires.
+    from concurrent.futures import Future
 
     class CleanupFuture:
         def __init__(self):
@@ -766,7 +767,7 @@ def test_timed_out_stateful_tool_retires_the_generation_and_closes_on_the_worker
         def add_done_callback(self, callback):
             self.callbacks.append(callback)
 
-    hung = HungFuture()
+    hung = Future()
     cleanup_future = CleanupFuture()
 
     class FakeExecutor:
@@ -804,12 +805,15 @@ def test_timed_out_stateful_tool_retires_the_generation_and_closes_on_the_worker
     monkeypatch.setattr(lte, "load_settings", lambda: {})
     monkeypatch.delenv("OUROBOROS_TOOL_TIMEOUT_SEC", raising=False)
 
-    import pathlib as _pl
-
-    result = lte._execute_with_timeout(
-        tools, tc, _pl.Path("."), 1, task_id="task",
-        stateful_executor=executor,
-    )
+    marker = ContextVar("stateful-test")
+    token = marker.set("owning-execution")
+    try:
+        result = lte._execute_with_timeout(
+            tools, tc, tmp_path, 1, task_id="task",
+            stateful_executor=executor,
+        )
+    finally:
+        marker.reset(token)
     assert result["is_error"] is True
     # The shared slot holds a FRESH generation; the retired one keeps the
     # handles for its owner thread.
@@ -821,7 +825,10 @@ def test_timed_out_stateful_tool_retires_the_generation_and_closes_on_the_worker
     assert kind == "cleanup" and executor.retired and not executor.reset_called
     # The TOOL submit goes through the generation-bound wrapper (a revert to
     # plain _execute_single_tool would reopen the pre-capture window).
-    assert executor.queued[0][1] is lte._execute_browser_tool_bound
+    _, submitted, submitted_args = executor.queued[0]
+    assert isinstance(submitted.__self__, Context) and submitted.__name__ == "run"
+    assert submitted.__self__.get(marker) == "owning-execution"
+    assert submitted_args[0] is lte._execute_browser_tool_bound
     assert closed == []
     # The hung worker creates one more handle AFTER the detach — it lands in
     # the retired generation and is reaped too.
@@ -899,10 +906,12 @@ def test_already_settled_call_still_cleans_on_the_worker_thread():
     assert cleanup_thread[0] != threading.get_ident()
 
 
-def test_bound_wrapper_refuses_a_call_that_starts_after_retirement():
+def test_bound_wrapper_refuses_a_call_that_starts_after_retirement(tmp_path):
     """A browser call whose timeout fired before the worker reached the tool
     body must refuse instead of building a session in the NEXT command's
-    state (sol MAJOR: the pre-capture window)."""
+    state (sol MAJOR: the pre-capture window). The started call still gets its
+    settlement row (#1316)."""
+    import json
     from types import SimpleNamespace
 
     import ouroboros.loop_tool_execution as lte
@@ -911,9 +920,11 @@ def test_bound_wrapper_refuses_a_call_that_starts_after_retirement():
     old, replacement = BrowserState(), BrowserState()
     tools = SimpleNamespace(_ctx=SimpleNamespace(browser_state=replacement))
     tc = {"id": "c1", "function": {"name": "browse_page", "arguments": "{}"}}
-    out = lte._execute_browser_tool_bound(tools, tc, None, "task", old)
+    out = lte._execute_browser_tool_bound(tools, tc, tmp_path, "task", old, {"invocation_id": "inv-1"})
     assert out["is_error"] is True
     assert "BROWSER_SESSION_RETIRED" in out["result"]
+    row = json.loads((tmp_path / "tools.jsonl").read_text(encoding="utf-8"))
+    assert (row["type"], row["invocation_id"], row["status"]) == ("tool_call", "inv-1", "refused")
     # Same generation → falls through to the real executor path (patched out).
     tools._ctx.browser_state = old
     called = []

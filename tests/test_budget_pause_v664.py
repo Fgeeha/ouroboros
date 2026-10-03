@@ -33,7 +33,7 @@ def test_queued_task_does_not_auto_resume_after_budget_increase(tmp_path, monkey
         in_q=SimpleNamespace(put=lambda task: sent.append(dict(task))),
     )
     workers.WORKERS[0] = worker
-    task = {"id": "paused-task", "type": "task", "chat_id": 0, "priority": 1}
+    task = {"id": "paused-task", "admitted_dispatch": "none", "type": "task", "chat_id": 0, "priority": 1}
     workers.PENDING.append(task)
 
     monkeypatch.setattr(state, "budget_remaining", lambda _st, **_kwargs: 0.0)
@@ -55,10 +55,12 @@ def test_queued_task_does_not_auto_resume_after_budget_increase(tmp_path, monkey
     assert workers.PENDING == []
 
 
-def test_resume_rejects_replay_unsafe_pause(tmp_path, monkeypatch):
+@pytest.mark.parametrize("dispatch", [None, "possible", "none"])
+def test_resume_rejects_replay_unsafe_pause(tmp_path, monkeypatch, dispatch):
     queue, _state, workers = _install_queue(tmp_path, monkeypatch)
     workers.PENDING.append({
         "id": "unsafe-task",
+        **({"admitted_dispatch": dispatch} if dispatch is not None else {}),
         "type": "task",
         "_budget_pause": {
             "status": "resource_limited",
@@ -69,7 +71,7 @@ def test_resume_rejects_replay_unsafe_pause(tmp_path, monkeypatch):
 
     assert queue.resume_budget_paused_task("unsafe-task") == {
         "ok": False,
-        "error": "replay_unsafe",
+        "error": "replay_unsafe" if dispatch == "none" else "dispatch_outcome_unknown",
         "action": "cancel_or_new_run",
     }
     assert "_budget_pause" in workers.PENDING[0]
@@ -232,7 +234,7 @@ def test_root_budget_resume_selects_one_task_and_keeps_tree_marker(tmp_path, mon
         "fence_id": fence_id, "auto_resume": False, "paused_at": "now",
     }
     workers.PENDING.append({
-        "id": "safe-child", "type": "task", "chat_id": 1,
+        "id": "safe-child", "admitted_dispatch": "none", "type": "task", "chat_id": 1,
         "root_task_id": "safe-root",
     })
     monkeypatch.setattr(queue, "reconstruct_task_cost", lambda *_a, **_k: {
@@ -255,9 +257,9 @@ def test_root_budget_selection_leaves_unsafe_pending_sibling_held(tmp_path, monk
         "status": "paused", "scope": "root", "root_task_id": "mixed-root",
         "fence_id": fence_id, "auto_resume": False, "paused_at": "now",
     }
-    safe = {"id": "safe-child", "type": "task", "root_task_id": "mixed-root"}
+    safe = {"id": "safe-child", "admitted_dispatch": "none", "type": "task", "root_task_id": "mixed-root"}
     unsafe = {
-        "id": "retry-child", "type": "task", "root_task_id": "mixed-root",
+        "id": "retry-child", "admitted_dispatch": "none", "type": "task", "root_task_id": "mixed-root",
         "_attempt": 2, "original_task_id": "first-child",
     }
     workers.PENDING.extend([safe, unsafe])

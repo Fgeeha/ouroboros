@@ -4,6 +4,8 @@ import json
 
 import pytest
 
+from tests.ui_chat_viewport_smoke import _OBSERVE_STATE_READS, _wait_state_reads_quiescent
+
 pytest_plugins = ("tests.test_ui_smoke_playwright",)
 
 
@@ -24,6 +26,7 @@ def test_task_status_stays_factual_in_main_and_project_chat(
     from playwright.sync_api import sync_playwright
 
     from ouroboros.projects_registry import create_project
+    from ouroboros.task_results import write_task_result
 
     url = direct_server_with_data["url"]
     data_dir = direct_server_with_data["data_dir"]
@@ -62,6 +65,9 @@ def test_task_status_stays_factual_in_main_and_project_chat(
         )
 
     def emit_progress(page, chat_id, task_id, content):
+        # A later real census/detail refresh must find this synthetic task.
+        # Socket-only rows otherwise become correctly "Outcome unavailable".
+        write_task_result(data_dir, task_id, "running", chat_id=chat_id)
         emit(page, {
             "type": "chat",
             "role": "assistant",
@@ -76,6 +82,10 @@ def test_task_status_stays_factual_in_main_and_project_chat(
         lifecycle = "cancelled" if status == "cancelled" else "completed"
         execution = "failed" if status == "failed" else "ok"
         objective = "fail" if status == "failed" else "pass"
+        write_task_result(data_dir, task_id, status, chat_id=chat_id, outcome_axes={
+            "lifecycle": {"status": lifecycle}, "execution": {"status": execution},
+            "objective": {"status": objective},
+        })
         emit(page, {
             "type": "log",
             "chat_id": chat_id,
@@ -363,6 +373,7 @@ def test_task_status_stays_factual_in_main_and_project_chat(
             page = browser.new_page(viewport={"width": width, "height": height})
             try:
                 page.add_init_script(f"({capture_socket})()")
+                page.add_init_script(f"({_OBSERVE_STATE_READS})()")
                 # The initial rebuildAll replay wipes and rebuilds the feed
                 # from durable history (chat.js syncHistory). Frames emitted
                 # on the test socket exist nowhere durable, so one emitted
@@ -384,6 +395,11 @@ def test_task_status_stays_factual_in_main_and_project_chat(
                 page.evaluate(
                     "() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))"
                 )
+                # The frames below exist only on the test socket. Let the
+                # socket-open census land before emitting them: a complete
+                # census whose request starts after a frame concludes that card
+                # by absence, exactly as it would a task the queue really lost.
+                _wait_state_reads_quiescent(page)
 
                 run_thread_flow(
                     page,
@@ -422,6 +438,10 @@ def test_task_status_stays_factual_in_main_and_project_chat(
                 page.evaluate(
                     "() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))"
                 )
+                # The panel's own hydrating census read (forced on mount) may
+                # start behind an in-flight page read; let it land before the
+                # panel's synthetic frames, for the same reason as in Main.
+                _wait_state_reads_quiescent(page)
                 run_thread_flow(
                     page,
                     project_scope,

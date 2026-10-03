@@ -76,6 +76,9 @@ const navProjectsActivity = document.getElementById('nav-projects-activity');
 const navProjectsList = document.getElementById('nav-projects-list');
 const projectInstances = new Map();
 const projectPaintRequests = new Map();
+// The question reveal the current showing is still making (revealProjectQuestion):
+// no read decides during it. A close or another showing retires it.
+const projectReveals = new Map();
 let knownProjectsJson = '';
 let lastProjectRows = [];
 let projectActivityRows = new Map();
@@ -309,13 +312,20 @@ function hydrateOpenChatsFromState(data, snapshotRequestedAt) {
 // instance's first paint.
 const projectScrollStash = new Map();
 
+// A cancelled paint can no longer read, so its request is retired with it: a
+// reopened pending-work survivor must start its own read, never join that one.
+function cancelProjectPaint(pid, inst) {
+    inst?.cancelHistoryPaint?.();
+    projectPaintRequests.delete(pid);
+}
+
 function destroyProjectInstance(pid) {
     const inst = projectInstances.get(pid);
     if (!inst) return;
     if (inst.hasPendingWork?.()) {
         inst.page.hidden = true;
         inst.page.dataset.pendingWork = '1';
-        inst.cancelHistoryPaint?.();
+        cancelProjectPaint(pid, inst);
         return;
     }
     const scroll = inst.getScrollState?.();
@@ -328,13 +338,14 @@ function destroyProjectInstance(pid) {
 let projectNavigationGeneration = 0;
 function closeProjectPanel({ sync = true } = {}) {
     projectNavigationGeneration += 1;
+    projectReveals.clear();
     const activeId = navState.activeProjectId;
     navState.activeProjectId = null;
     if (activeId) destroyProjectInstance(activeId);
     // Anything left is a hidden pending-work survivor; keep it hidden.
-    for (const inst of projectInstances.values()) {
+    for (const [pid, inst] of projectInstances) {
         inst.page.hidden = true;
-        inst.cancelHistoryPaint?.();
+        cancelProjectPaint(pid, inst);
     }
     if (sync) syncNavigationState();
 }
@@ -344,14 +355,10 @@ async function openProjectPanel(project, { closeDrawer = true, openOnly = false,
     const navigation = ++projectNavigationGeneration;
     if (navState.activeProjectId === project.id) {
         if (!openOnly) closeProjectPanel();
-        else if (taskId && quizId) {
-            const inst = projectInstances.get(project.id);
-            await acknowledgeProjectAfterPaint(project, inst, { forcePaint: true });
-            if (navigation === projectNavigationGeneration && navState.activeProjectId === project.id)
-                await inst?.revealQuestion?.(taskId, quizId);
-        }
+        else if (taskId && quizId) await revealProjectQuestion(project, projectInstances.get(project.id), taskId, quizId);
         return;
     }
+    projectReveals.clear();
     // perf2 P4.2: signal chat.js that a panel open is in flight so Main's
     // deferred first hydration yields the CPU to this build/paint.
     projectPanelOpeningSince = Date.now();
@@ -378,8 +385,9 @@ async function openProjectPanel(project, { closeDrawer = true, openOnly = false,
                 initialScrollState: projectScrollStash.get(project.id) || null,
                 // The panel's Retry reruns the open transaction (fetch, paint, ACK)
                 // against the newest known revision, so a recovered read is also seen.
-                onHistoryRetry: () => acknowledgeProjectAfterPaint(
-                    lastProjectRows.find((row) => row.id === project.id) || project, null, { forcePaint: true }),
+                onHistoryRetry: () => acknowledgeProjectAfterPaint(freshProjectRow(project), null, { forcePaint: true }),
+                // Arriving at the newest messages retries a withheld acknowledgement.
+                onReadingLatest: () => acknowledgeProjectAfterPaint(freshProjectRow(project)),
             });
             projectScrollStash.delete(project.id);
             projectInstances.set(project.id, inst);
@@ -388,7 +396,7 @@ async function openProjectPanel(project, { closeDrawer = true, openOnly = false,
         delete inst.page.dataset.pendingWork;
         for (const [pid, other] of projectInstances) {
             other.page.hidden = pid !== project.id;
-            if (pid !== project.id) other.cancelHistoryPaint?.();
+            if (pid !== project.id) cancelProjectPaint(pid, other);
         }
         if (closeDrawer) navState.mobileDrawerOpen = false;
         syncNavigationState();
@@ -398,19 +406,49 @@ async function openProjectPanel(project, { closeDrawer = true, openOnly = false,
         // ACK only the exact revision whose history was fetched and painted. chat.js
         // owns the paint receipt; an already-painted instance skips the forced
         // refetch — the server clamps the ACK, so no repaint is needed.
-        await acknowledgeProjectAfterPaint(project, inst, { forcePaint: Boolean(quizId) || !inst.hasPaintedHistory?.() });
-        if (taskId && quizId && navigation === projectNavigationGeneration
-            && navState.activeProjectId === project.id && projectInstances.get(project.id) === inst)
-            await inst.revealQuestion?.(taskId, quizId);
+        if (taskId && quizId) await revealProjectQuestion(project, inst, taskId, quizId);
+        else {
+            // Every showing is a navigation: a plain reopen addresses no question
+            // and so voids a reveal that a hidden pending-work survivor still awaits.
+            void inst.revealQuestion?.(taskId, quizId);
+            await acknowledgeProjectAfterPaint(project, inst, { forcePaint: !inst.hasPaintedHistory?.() });
+        }
     } finally {
         projectPanelOpeningSince = 0;
     }
 }
 
+function freshProjectRow(project) {
+    return lastProjectRows.find((row) => row.id === project.id) || project;
+}
+
+// A question opened from Main is revealed BEFORE the read decision: landing on it
+// is not reading the newer messages below it. The reveal is one transaction: the
+// addressed question owns the viewport before either history or detail I/O (its
+// chat-owned generation yields to later navigation), its paint supersedes any
+// request in flight, and no acknowledgement decides until the reveal has ended,
+// when this one does (DESIGN "Project unread dot") — unless a close or a later
+// showing retired it meanwhile: that navigation owns the room's read instead.
+async function revealProjectQuestion(project, inst, taskId, quizId) {
+    const reveal = {};
+    let current = false;
+    projectReveals.set(project.id, reveal);
+    try {
+        const revealed = inst?.revealQuestion?.(taskId, quizId);
+        await acknowledgeProjectAfterPaint(project, inst, { forcePaint: true, paintOnly: true });
+        await revealed;
+    } finally {
+        current = projectReveals.get(project.id) === reveal;
+        if (current) projectReveals.delete(project.id);
+    }
+    if (current) await acknowledgeProjectAfterPaint(freshProjectRow(project), inst);
+}
+
 // A Project can receive a new visible revision while its panel remains open.
 // Coalesce polling updates per Project, but never acknowledge a newer revision
-// until that exact history snapshot has completed a real browser paint.
-async function acknowledgeProjectAfterPaint(project, instance = null, { forcePaint = false } = {}) {
+// until a history read covering it has been painted while the reader is at the
+// newest messages (DESIGN "Project unread dot"); `paintOnly` paints without that decision.
+async function acknowledgeProjectAfterPaint(project, instance = null, { forcePaint = false, paintOnly = false } = {}) {
     if (!project?.id || navState.activeProjectId !== project.id) return;
     const inst = instance || projectInstances.get(project.id);
     if (!inst || inst.page.hidden) return;
@@ -418,9 +456,13 @@ async function acknowledgeProjectAfterPaint(project, instance = null, { forcePai
     const alreadySeen = Math.max(0, Number(state.projectSeenRevision?.[project.id]) || 0);
     if (!forcePaint && revision <= alreadySeen) return;
 
+    // A question paint never joins an acknowledging request (it would inherit its
+    // decision); a request may join a question paint. One that overlaps a question
+    // reveal paints but decides nothing.
     const current = projectPaintRequests.get(project.id);
-    if (current && current.revision >= revision) return current.promise;
+    if (current && current.revision >= revision && (current.paintOnly || !paintOnly)) return current.promise;
     inst.cancelHistoryPaint?.();
+    const revealing = projectReveals.has(project.id);
     const promise = (async () => {
         let paint = null;
         // A failed read is drawn by the instance itself (error + Retry in its
@@ -430,7 +472,7 @@ async function acknowledgeProjectAfterPaint(project, instance = null, { forcePai
             console.error('Project history paint failed:', err);
         }
         if (
-            paint?.painted
+            !paintOnly && !revealing && !projectReveals.has(project.id) && paint?.read
             && Number(paint.revision) === revision
             && navState.activeProjectId === project.id
             && !inst.page.hidden
@@ -445,7 +487,7 @@ async function acknowledgeProjectAfterPaint(project, instance = null, { forcePai
             projectPaintRequests.delete(project.id);
         }
     });
-    projectPaintRequests.set(project.id, { revision, promise });
+    projectPaintRequests.set(project.id, { revision, promise, paintOnly });
     return promise;
 }
 
@@ -488,6 +530,7 @@ function renderProjectsNav(projects, projectChatIds, activityIndex = projectActi
     if (rows.some(p => p.id === navState.activeProjectId && p.lifecycle === 'deleting')) {
         closeProjectPanel();
     }
+    if (rows.some(p => p._unread)) refreshSharedProjectSeen();
     const json = JSON.stringify(rows.map(p => [
         p.id, p.name, p.chat_id, p.lifecycle, p.visible_revision, p._unread, p.delete_error,
     ]));
@@ -496,12 +539,15 @@ function renderProjectsNav(projects, projectChatIds, activityIndex = projectActi
     // rename action or keyboard navigation. Patch marker attributes in place.
     if (json === knownProjectsJson) {
         patchProjectActivityMarkers(activityIndex);
-        return;
+    } else {
+        knownProjectsJson = json;
+        lastProjectRows = rows;
+        paintProjectsNav();
+        syncNavigationState();
     }
-    knownProjectsJson = json;
-    lastProjectRows = rows;
-    paintProjectsNav();
-    syncNavigationState();
+    // Every snapshot that still shows the open room unread offers the read decision
+    // again, so an acknowledgement whose POST failed is retried by the next poll
+    // while its reader stays at the newest message; the receipt still decides.
     const active = rows.find((project) => project.id === navState.activeProjectId);
     if (active?._unread && active.lifecycle === 'active') {
         acknowledgeProjectAfterPaint(active);
@@ -558,12 +604,14 @@ function patchProjectActivityMarkers(activityIndex = projectActivityIndex) {
 }
 
 // ACK exactly the revision painted. The server max-merges and clamps the cursor,
-// so stale tabs cannot move it backwards or acknowledge unseen future output.
+// so stale tabs cannot move it backwards or acknowledge unseen future output; the
+// cursors it answers with, never the requested number, become this client's.
 async function markProjectViewed(projectId, revision) {
     if (!projectId) return false;
     const seen = Math.max(0, Number(revision) || 0);
+    let prefs;
     try {
-        await fetchJson('/api/ui/preferences', {
+        prefs = await fetchJson('/api/ui/preferences', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ project_seen_revision: { [projectId]: seen } }),
         });
@@ -572,21 +620,39 @@ async function markProjectViewed(projectId, revision) {
         // unread locally so polling or the next open retries the same revision.
         return false;
     }
-    state.projectSeenRevision = state.projectSeenRevision || {};
-    state.projectSeenRevision[projectId] = Math.max(
-        Number(state.projectSeenRevision[projectId]) || 0,
-        seen,
-    );
-    if (Array.isArray(lastProjectRows)) {
-        let changed = false;
-        for (const row of lastProjectRows) {
-            if (row.id !== projectId) continue;
-            const unread = (Number(row.visible_revision) || 0) > state.projectSeenRevision[projectId];
-            if (row._unread !== unread) { row._unread = unread; changed = true; }
-        }
-        if (changed) paintProjectsNav();
-    }
+    mergeProjectSeenRevisions(prefs?.project_seen_revision);
     return true;
+}
+
+// Shared read cursors only move forward here, so a late or stale answer can
+// clear a dot another client read but never revive one.
+function mergeProjectSeenRevisions(cursors) {
+    state.projectSeenRevision = state.projectSeenRevision || {};
+    let advanced = false;
+    for (const [projectId, value] of Object.entries(cursors || {})) {
+        const seen = Math.max(0, Number(value) || 0);
+        if (seen <= (Number(state.projectSeenRevision[projectId]) || 0)) continue;
+        state.projectSeenRevision[projectId] = seen;
+        advanced = true;
+    }
+    if (!advanced || !Array.isArray(lastProjectRows)) return advanced;
+    let changed = false;
+    for (const row of lastProjectRows) {
+        const unread = row._unread && (Number(row.visible_revision) || 0)
+            > (Number(state.projectSeenRevision[row.id]) || 0);
+        if (row._unread !== unread) { row._unread = unread; changed = true; }
+    }
+    if (changed) paintProjectsNav();
+    return advanced;
+}
+
+// Another client may already have read what this one still shows unread. Each
+// state snapshot that shows unread re-reads the shared cursors, one read at a time.
+let sharedSeenRead = null;
+function refreshSharedProjectSeen() {
+    sharedSeenRead ||= fetchJson('/api/ui/preferences', { cache: 'no-store' })
+        .then((prefs) => mergeProjectSeenRevisions(prefs?.project_seen_revision), () => false)
+        .finally(() => { sharedSeenRead = null; });
 }
 
 // Paint the collapsible, scrollable projects list from the cached rows.
@@ -624,7 +690,7 @@ function paintProjectsNav() {
         if (project._unread && !deleting) {
             const dot = document.createElement('span');
             dot.className = 'nav-unread-dot';
-            dot.title = 'New activity';
+            dot.title = 'Unread messages';
             btn.appendChild(dot);
             btn.classList.add('has-unread');
         }
@@ -823,7 +889,7 @@ function setupResizablePanels(prefs) {
 apiFetch('/api/ui/preferences', { cache: 'no-store' })
     .then((r) => (r.ok ? r.json() : null))
     .then((prefs) => {
-        state.projectSeenRevision = (prefs && prefs.project_seen_revision) || {};
+        mergeProjectSeenRevisions(prefs?.project_seen_revision);
         setupResizablePanels(prefs || {});
         setLanguage((prefs && prefs.language) || 'en');
         // Re-evaluate unread now that revision cursors are known.

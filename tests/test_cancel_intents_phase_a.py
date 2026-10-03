@@ -212,6 +212,10 @@ def test_claim_settle_and_release_lifecycle(tmp_path):
     reclaimed = ci.claim_intent(tmp_path, "t2", owner="cancel_task_custody")
     assert reclaimed["generation"] == 2
 
+    # The real custody owner writes the terminal result before retiring intent.
+    # G1 transfers accepted Stop to this same result, including completion wins.
+    from ouroboros.task_results import write_task_result
+    write_task_result(tmp_path, "t2", "cancelled", result="teardown ok")
     settled = ci.settle_intent(tmp_path, "t2", outcome="cancelled", detail="teardown ok")
     assert settled["request_id"] == row["request_id"]
     # Settled rows LEAVE the projection (compactness is the design).

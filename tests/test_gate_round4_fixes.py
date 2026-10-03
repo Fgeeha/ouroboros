@@ -400,6 +400,7 @@ def test_gr4_6_toggle_evolution_clears_owner_stop_before_the_campaign_mint(
     from supervisor import evolution_lifecycle as el
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     state.update_state(lambda live: live.update(
         owner_chat_id=7, evolution_owner_stopped=True,
     ))
@@ -428,18 +429,18 @@ def test_gr4_6_toggle_evolution_clears_owner_stop_before_the_campaign_mint(
 
 
 def test_gr4_6_server_evolve_start_clears_the_flag_before_the_campaign():
-    """The owner-chat `/evolve` ingress is exercised inside the bridge drain
-    loop; the ordering is pinned at the source (the same style as the GR3-5
-    ordering pin)."""
-    src = (REPO_ROOT / "server.py").read_text(encoding="utf-8")
-    clear_at = src.index(
-        '_evo_update_state(lambda live: live.__setitem__("evolution_owner_stopped", False))'
-    )
-    start_at = src.index('start_evolution_campaign(objective, source="owner_chat")')
-    assert clear_at < start_at, (
-        "GR4-6: /evolve start must clear evolution_owner_stopped before the campaign mint"
-    )
+    """The owner-chat `/evolve` ingress and the owner-sourced toggle share ONE start
+    transaction (#1307); its clear-before-mint ordering is pinned at the source."""
+    import inspect
 
+    from supervisor.events_runtime_controls import owner_evolution_start
+
+    src = (REPO_ROOT / "server.py").read_text(encoding="utf-8")
+    assert 'owner_evolution_start(objective, source="owner_chat")' in src
+    body = inspect.getsource(owner_evolution_start)
+    assert body.index("update_state(_clear_owner_stop") < body.index("start_evolution_campaign("), (
+        "GR4-6: the owner-stop flag is cleared BEFORE the campaign is minted"
+    )
 
 def test_gr4_6_backstop_defers_while_another_evolution_task_is_live(tmp_path, monkeypatch):
     import supervisor.queue as q
@@ -448,6 +449,7 @@ def test_gr4_6_backstop_defers_while_another_evolution_task_is_live(tmp_path, mo
     from supervisor import evolution_lifecycle as el
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     q.init(tmp_path)
     assert el.start_evolution_campaign("Improve", source="test").get("status") == "active"
     state.update_state(lambda live: live.update(evolution_owner_stopped=True))

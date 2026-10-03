@@ -33,6 +33,14 @@ from ouroboros.context_fit import (
 from ouroboros.context_fit import (
     estimate_context_prompt_tokens as estimate_context_prompt_tokens,
 )
+from ouroboros.context_input_selection import (
+    _capture_declared_context_core,
+    _explicit_self_body_docs_flag as _explicit_self_body_docs_flag,
+    _task_requires_development_context,
+    _task_requires_self_body_docs,
+    _task_uses_external_context,
+    _validate_declared_input_task,
+)
 from ouroboros.context_health import (
     _compute_cache_hit_rate as _compute_cache_hit_rate,
 )
@@ -51,7 +59,7 @@ from ouroboros.context_health import (
 from ouroboros.context_health import (
     safe_read as safe_read,
 )
-from ouroboros.contracts.task_contract import normalize_bool
+from ouroboros.contracts.task_contract import normalize_bool, task_input_sources
 from ouroboros.memory import Memory, render_scratchpad_markdown
 from ouroboros.update_letter import official_update_projection  # contract: never raises
 from ouroboros.utils import (
@@ -72,6 +80,11 @@ def build_user_content(task: Dict[str, Any]) -> Any:
 
     text = task.get("text", "")
     metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    author = metadata.get("objective_author")
+    if isinstance(author, dict) and author.get("kind") == "task":
+        text = (f"[OBJECTIVE_AUTHOR] The objective below was drafted by task {author.get('task_id')}, "
+                "not spoken by the owner. The owner's words retain their own source. "
+                "[/OBJECTIVE_AUTHOR]\n\n" + str(text or ""))
     if metadata.get("force_plan"):
         source = str(metadata.get("force_plan_source") or "operator").strip() or "operator"
         from ouroboros.config import get_review_enforcement
@@ -192,61 +205,6 @@ def _build_attachment_image_blocks(task: Dict[str, Any]) -> List[Dict[str, Any]]
     return blocks
 
 
-def _task_requires_development_context(task: Dict[str, Any]) -> bool:
-    """Return whether low mode should inline the engineering handbook.
-
-    Web chat tasks are direct-chat but still may ask for code/self-modification.
-    Err toward preserving engineering competence unless a structured caller
-    explicitly declares that this task does not need DEVELOPMENT.md.
-    """
-    explicit = task.get("context_requires_development")
-    if explicit is not None:
-        return normalize_bool(explicit)
-    return str(task.get("type") or "") == "task" or not bool(task.get("_is_direct_chat"))
-
-
-def _explicit_self_body_docs_flag(task: Dict[str, Any]) -> Optional[bool]:
-    """Explicit context_requires_self_body_docs from the task or its contract;
-    None when neither declares it."""
-    explicit = task.get("context_requires_self_body_docs")
-    if explicit is not None:
-        return normalize_bool(explicit)
-    contract = task.get("task_contract") if isinstance(task.get("task_contract"), dict) else {}
-    explicit = contract.get("context_requires_self_body_docs") if isinstance(contract, dict) else None
-    if explicit is not None:
-        return normalize_bool(explicit)
-    return None
-
-
-def _task_requires_self_body_docs(task: Dict[str, Any]) -> bool:
-    """Return True when the task is structurally about Ouroboros itself."""
-
-    explicit = _explicit_self_body_docs_flag(task)
-    if explicit is not None:
-        return explicit
-    contract = task.get("task_contract") if isinstance(task.get("task_contract"), dict) else {}
-    task_type = str(task.get("type") or contract.get("task_type") or "").strip().lower()
-    return task_type in {"evolution", "deep_self_review", "review"}
-
-
-def _task_uses_external_context(task: Dict[str, Any]) -> bool:
-    """Return True for structured headless/workspace/delegated task surfaces."""
-
-    metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
-    source = str(metadata.get("source") or task.get("source") or "").strip().lower()
-    actor = str(task.get("actor_id") or metadata.get("actor_id") or "").strip().lower()
-    delegation_role = str(task.get("delegation_role") or metadata.get("delegation_role") or "").strip().lower()
-    if str(task.get("workspace_root") or metadata.get("workspace_root") or "").strip():
-        return True
-    if delegation_role == "subagent":
-        return True
-    if source in {"api_task", "cli", "scheduled_task", "skill_scheduled_task"}:
-        return True
-    if actor in {"cli", "scheduler"}:
-        return True
-    return False
-
-
 def _scheduled_tasks_digest(env: Any, *, limit: int = 8) -> Optional[Dict[str, Any]]:
     """Compact digest of active schedules (cron + one-shot) for task/consciousness
     context. Keeps the agent aware of standing schedules without inlining the full
@@ -257,29 +215,28 @@ def _scheduled_tasks_digest(env: Any, *, limit: int = 8) -> Optional[Dict[str, A
     except Exception:
         log.debug("Failed to read scheduled tasks for context digest", exc_info=True)
         return None
-    tasks = [
-        t for t in (data.get("tasks") or [])
-        if isinstance(t, dict) and t.get("enabled", True)
-    ]
+    from supervisor.followup_policy import observed_store
+    from supervisor.queue_schedules import schedule_lifecycle_status
+    root = pathlib.Path(env.drive_path("state/scheduled_tasks.json")).parent.parent
+    data = observed_store(root, data)
+    # A deleted row still finishing accepted work stays in view until it goes.
+    tasks = [t for t in data.get("tasks", []) if isinstance(t, dict) and (t.get("enabled", True)
+             or t.get("followup_hold") or t.get("followup_wait") or t.get("delete_requested_at"))]
     if not tasks:
         return None
-    digest: List[Dict[str, Any]] = []
+    out: Dict[str, Any] = {"active": [], "held": [], "waiting": []}
     for record in tasks[:limit]:
-        trigger = record.get("trigger") if isinstance(record.get("trigger"), dict) else {}
-        entry = {
-            "id": str(record.get("id") or ""),
-            "name": str(record.get("name") or ""),
-            "timezone": str(record.get("timezone") or "") or "local",
-            "next_run_at": str(record.get("next_run_at") or ""),
-        }
-        if str(trigger.get("type") or "cron") == "once":
-            # One-shot records (schedule_followup) have no cron cadence: project
-            # the fire instant instead of an empty-string cron.
-            entry["run_at"] = str(trigger.get("run_at") or "")
-        else:
-            entry["cron"] = str(trigger.get("expr") or record.get("cron") or "")
-        digest.append(entry)
-    out: Dict[str, Any] = {"active": digest}
+        trigger = record.get("trigger") or {}
+        status = schedule_lifecycle_status(record)
+        entry = {"id": record.get("id"), "name": record.get("name"), "status": status,
+                 "relation": record.get("relation"), "followup_hold": record.get("followup_hold"),
+                 "followup_wait": record.get("followup_wait"), "hold_persisted": record.get("hold_persisted"),
+                 "timezone": record.get("timezone") or "local", "next_run_at": record.get("next_run_at") or ""}
+        entry["run_at" if trigger.get("type") == "once" else "cron"] = trigger.get("run_at" if trigger.get("type") == "once" else "expr", "")
+        if status == "delete_pending":
+            out.setdefault("delete_pending", []).append(entry)
+            continue
+        out["held" if record.get("followup_hold") else "waiting" if record.get("followup_wait") else "active"].append(entry)
     if len(tasks) > limit:
         out["omitted_count"] = len(tasks) - limit
     return out
@@ -304,10 +261,14 @@ _OWNER_CLIENT_NOTE = (
 # builder below and the tests that monkeypatch these names address them on THIS
 # surface.
 from ouroboros.context_runtime_facts import (  # noqa: E402,F401 — re-exported public surface
+    _context_clock_note,
+    snapshot_labelled,
     _delegation_capability_fact,
     _project_room_fact,
     _queue_context_fact,
     _runtime_budget_info,
+    task_execution_clock_fact,
+    task_schedule_fact,
 )
 
 
@@ -348,7 +309,8 @@ def _task_authority_projection(env: Any, task: Dict[str, Any]) -> Dict[str, Any]
     return projection
 
 
-def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None, scheduled_tasks_digest_out: Optional[Dict[str, Any]] = None) -> str:
+def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None, scheduled_tasks_digest_out: Optional[Dict[str, Any]] = None, captured_at: str = "") -> str:
+    declared = task_input_sources(task) == "declared"
     try:
         git_branch, git_sha = get_git_info(env.repo_dir)
     except Exception:
@@ -371,7 +333,8 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None, sc
         if is_consciousness_origin(task.get("metadata")):
             runtime_mode = effective_runtime_mode(str(runtime_mode or ""), task.get("metadata"))
     runtime_data = {
-        "utc_now": utc_now_iso(),
+        "context_captured_at": captured_at or utc_now_iso(),
+        "clock_note": _context_clock_note(task),
         "repo_dir": str(env.repo_dir),
         "drive_root": str(env.drive_root),
         "git_head": git_sha,
@@ -390,6 +353,8 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None, sc
             "child_drive_root": task.get("child_drive_root"),
             "budget_drive_root": task.get("budget_drive_root"),
             "deadline_at": task.get("deadline_at"),
+            **task_execution_clock_fact(task, ctx),
+            **task_schedule_fact(task),
             "allowed_resources": task.get("allowed_resources"),
             "context": task.get("context"),
         },
@@ -404,6 +369,8 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None, sc
         },
     }
     runtime_data.update(_task_authority_projection(env, task))
+    if declared:
+        runtime_data["task_constraint"] = task.get("task_constraint") or getattr(ctx, "task_constraint", {})
     runtime_data["operational_reality_rule"] = (
         "This captured runtime context is authoritative over stale paths, tool lists, "
         "or capability assumptions embedded in the task text. Use the visible "
@@ -434,11 +401,14 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None, sc
     try:
         from ouroboros.config import get_allow_mutative_subagents
         from ouroboros.contracts.task_constraint import VALID_WRITE_SURFACES
+        from ouroboros.workspace_copies import workspace_copy_source_is_system
 
+        copy_source_is_system = workspace_copy_source_is_system(ctx or env, str(task.get("workspace_root") or ""))
         runtime_data["capabilities"] = {
             "allow_mutative_subagents": bool(get_allow_mutative_subagents()),
             "mutative_subagent_surfaces": sorted(
-                s for s in VALID_WRITE_SURFACES if get_allow_mutative_subagents(s)
+                s for s in VALID_WRITE_SURFACES
+                if get_allow_mutative_subagents(s, source_is_system_repo=copy_source_is_system)
             ),
             "write_surfaces": sorted(VALID_WRITE_SURFACES),
             "web_search_backend": runtime_setting("OUROBOROS_WEBSEARCH_BACKEND", "auto"),
@@ -451,7 +421,8 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None, sc
                 "applies to every surface; when it is empty the runtime mode decides, "
                 "SURFACE-AWARE: advanced/pro/cyber_pro allow every surface, light allows "
                 "external_workspace/genesis — they build outside the Ouroboros runtime — "
-                "and keeps self_worktree off). mutative_subagent_surfaces lists what is "
+                "including isolated project copies; own-body self_worktree stays off). "
+                "mutative_subagent_surfaces lists what is "
                 "actually schedulable RIGHT NOW. Read THIS before declaring you cannot "
                 "spawn acting subagents."
             ),
@@ -459,7 +430,7 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None, sc
         # B4-lite: honestly-labeled HISTORY, never live health. Own nested
         # fail-soft inside the helper: a failure there must
         # never drop the whole capabilities digest above.
-        _delegation_fact = _delegation_capability_fact()
+        _delegation_fact = None if declared else _delegation_capability_fact()
         if _delegation_fact is not None:
             runtime_data["capabilities"]["delegation"] = _delegation_fact
         if ctx is not None:
@@ -490,7 +461,7 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None, sc
         log.debug("Failed to build queue digest for context", exc_info=True)
     if budget_info:
         runtime_data["budget"] = budget_info
-    schedule_digest = _scheduled_tasks_digest(env)
+    schedule_digest = None if declared else _scheduled_tasks_digest(env)
     if schedule_digest:
         runtime_data["scheduled_tasks"] = schedule_digest
         if scheduled_tasks_digest_out is not None:
@@ -513,7 +484,7 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None, sc
         runtime_data["owner_client"] = dict(_owner_client)
         runtime_data["owner_client_note"] = _OWNER_CLIENT_NOTE
     _current_chat = _meta.get("current_chat") if isinstance(_meta.get("current_chat"), dict) else None
-    if _current_chat and (_current_chat.get("running_tasks") or _current_chat.get("addressable_root_tasks")):
+    if not declared and _current_chat and (_current_chat.get("running_tasks") or _current_chat.get("addressable_root_tasks")):
         runtime_data["current_chat"] = _current_chat
         runtime_data["current_chat_rule"] = (
             "addressable_root_tasks are RUNNING/PENDING roots in THIS chat. If a new message continues or "
@@ -531,19 +502,19 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None, sc
         "main_routing_manifest", "project_routing_manifest", "project_last_task_result",
     ):
         _routing_fact = _meta.get(_routing_key)
-        if isinstance(_routing_fact, dict) and _routing_fact:
+        if not declared and isinstance(_routing_fact, dict) and _routing_fact:
             runtime_data[_routing_key] = _routing_fact
     _routing_contract = (
         _meta.get("routing_contract")
         if isinstance(_meta.get("routing_contract"), dict)
         else None
     )
-    if _routing_contract:
+    if not declared and _routing_contract:
         # Host-built facts and choices, not model-authored routing state.  Keeping
         # the compact contract beside the manifest closes the former split where
         # server.py computed both but the decision model could see neither.
         runtime_data["routing_contract"] = _routing_contract
-    _room_fact = _project_room_fact(task)
+    _room_fact = None if declared else _project_room_fact(task)
     if _room_fact:
         runtime_data["project_room"] = _room_fact
     # v6.60.0 answer protocol (quiz 16b, C+B): the FINAL ANSWER marker doctrine moved
@@ -576,8 +547,11 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None, sc
             }
     except Exception:
         log.debug("Failed to inject answer_protocol rule", exc_info=True)
-    runtime_data["official_update"] = official_update_projection(git_sha)
+    if not declared:
+        runtime_data["official_update"] = official_update_projection(git_sha)
     out = "## Runtime context\n\n" + json.dumps(runtime_data, ensure_ascii=False, indent=2)
+    if declared:
+        return out
     try:
         from ouroboros.task_tree_ledger import tree_ledger_tail_digest
         _root_id = str(task.get("root_task_id") or task.get("id") or "")
@@ -1147,12 +1121,19 @@ def _drive_state_section(env: Any) -> str:
             "evolution_owner_stopped", "evolution_cycle", "evolution_consecutive_failures",
             "last_evolution_task_at", "bg_consciousness_enabled", "post_task_autostop",
             "budget_drift_pct", "budget_drift_alert", "last_owner_message_at")
-    raw = read_json_dict(env.drive_path("state/state.json")) or {}
-    projected = {k: raw[k] for k in keys if k in raw}
-    omitted = sorted(set(raw) - set(projected))
+    from supervisor.state import CONTROL_KEYS, RECOVERY_KEY, control_value, read_state
+
+    observed = read_state(env.drive_path("state/state.json").parent.parent)
+    raw = observed.values
+    authority = observed.projection()
+    projected = {k: (raw[k] if k not in CONTROL_KEYS or control_value(authority, k)[0]
+                     else {"status": "unknown"}) for k in keys if k in raw or k in observed.unconfirmed}
+    omitted = sorted(set(raw) - set(projected) - {RECOVERY_KEY})
     note = ("Projection of state/state.json (spend/budget facts live in the Runtime "
             "section, from the usage-accounting authority)."
-            + ((" Omitted keys: " + ", ".join(omitted) + ". Full file: "
+            + (f" State authority is {observed.quality}: {observed.reason}. "
+               f"UNKNOWN controls: {', '.join(observed.unconfirmed)}." if observed.quality != "current" else "")
+            + ((" Omitted keys: " + ", ".join(omitted) + ". Full raw source: "
                 "read_file(root='runtime_data', path='state/state.json').") if omitted else ""))
     return ("## Drive state\n\n"
             + json.dumps(projected, ensure_ascii=False, indent=1, sort_keys=True, default=str)
@@ -1167,6 +1148,10 @@ def _capture_context_core(
     ctx: Any,
 ) -> _ContextCore:
     """Read each context source once before producing route-specific views."""
+    declared = task_input_sources(task) == "declared"
+    if declared:
+        _validate_declared_input_task(task)
+    captured_at = utc_now_iso()  # one capture instant for the runtime fact and every snapshot label
     base_prompt = safe_read(
         env.repo_path("prompts/SYSTEM.md"),
         fallback="You are Ouroboros. Your base prompt could not be loaded."
@@ -1188,6 +1173,14 @@ def _capture_context_core(
             book_text[book_id] = ""
     architecture_md = book_text["architecture"]
     development_md = book_text["development"]
+
+    if declared:
+        return _capture_declared_context_core(
+            env, memory, task, ctx, runtime_builder=build_runtime_section,
+            user_builder=build_user_content, captured_at=captured_at, base_prompt=base_prompt,
+            bible_md=bible_md, architecture_md=architecture_md, development_md=development_md,
+            books=books, book_errors=book_errors,
+        )
 
     # A fork is an execution boundary, not a second mind.  Keep the agent's
     # writable Memory object task-local, but capture identity/dialogue from the
@@ -1282,8 +1275,8 @@ def _capture_context_core(
     if installed_skills:
         dynamic_parts.append(installed_skills)
     dynamic_parts.extend([
-        _drive_state_section(context_env),
-        build_runtime_section(env, task, ctx=ctx),
+        snapshot_labelled(_drive_state_section(context_env), captured_at),
+        build_runtime_section(env, task, ctx=ctx, captured_at=captured_at),
         (
             "## Task Contract Discipline\n\n"
             "For non-trivial work, state your success criteria early in your plan or reasoning, "
@@ -1345,20 +1338,21 @@ def _capture_context_core(
         # A child keeps its own process memory too (owner decision 2026-09-22):
         # its execution drive holds exactly its worker rows, progress is canonical.
         own_drive = memory if context_memory is not memory else None
-        dynamic_parts.extend(context_memory.recent_activity_sections(
-            str(task.get("id") or ""), own_drive=own_drive,
-        ))
+        recent = context_memory.recent_activity_sections(str(task.get("id") or ""), own_drive=own_drive)
     else:
-        dynamic_parts.extend(build_recent_sections(
+        recent = build_recent_sections(
             context_memory, env, task_id=task.get("id", ""), thread_chat_id=int(task.get("chat_id") or 0),
             project_id=_reflections_pid,
-        ))
+        )
+    dynamic_parts.extend(snapshot_labelled(section, captured_at) for section in recent)
     try:
         from ouroboros.presence_context import build_presence_context_section
 
         presence_section = build_presence_context_section(
             pathlib.Path(env.drive_root),
             task_metadata.get("presence"),
+            str(task.get("id") or ""),
+            status_root=canonical_root,  # a forked promoted root finds its binding's work canonically
         )
         if presence_section:
             dynamic_parts.append(presence_section)
@@ -1432,7 +1426,7 @@ def build_llm_messages(
         ctx=ctx,
     )
     maintenance = None
-    if plan.preferred_mode == "nano" and llm is not None and ctx is not None:
+    if plan.preferred_mode == "nano" and llm is not None and ctx is not None and task_input_sources(task) != "declared":
         from ouroboros.context_budget import NANO_MIN_HEADROOM_TOKENS, OWNER_NANO_TARGET_TOKENS
         from ouroboros.consolidator import maintain_memory_pressure
         import copy

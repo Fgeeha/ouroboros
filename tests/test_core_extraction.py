@@ -27,7 +27,6 @@ _MOVED_NAMES = frozenset({
     "_MAX_VIDEO_FILE_BYTES",
     "_MEMORY_AT_DRIVE_MEMORY",
     "_SKILL_OWNER_STATE_FILENAMES",
-    "_SUBAGENT_SECRET_FILE_NAMES",
     "_access_or_block",
     "_annotate_reread",
     "_coerce_line_window",
@@ -38,17 +37,11 @@ _MOVED_NAMES = frozenset({
     "_detect_image_mime",
     "_detect_video_mime",
     "_direct_resource_binding",
-    "_filter_subagent_secret_listing",
-    "_filter_subagent_secret_repo_listing",
     "_is_cognitive_data_path",
     "_is_skill_owner_state_target",
-    "_is_subagent_secret_data_path",
-    "_is_subagent_secret_repo_path",
-    "_is_subagent_secret_repo_target",
     "_list_dir",
     "_list_files",
     "_list_user_files_dir",
-    "_local_readonly_resource_block",
     "_normalize_data_read_path",
     "_profile_roots_hint",
     "_read_file",
@@ -59,7 +52,6 @@ _MOVED_NAMES = frozenset({
     "_send_file",
     "_send_photo",
     "_send_video",
-    "is_restricted_subagent_profile",
 })
 
 
@@ -122,9 +114,25 @@ def test_core_catalog_schema_bytes_and_handler_owners_are_stable():
     # names its peer addressees (your own parent or a sibling, delivered as a message from a
     # peer task naming the relation; relay refused there), the 8000-char body bound and the
     # await_messages companion (395 -> 698 bytes); the `message` parameter description states
-    # the bound. Diffing the whole catalog base to head shows exactly those edits and nothing else.
+    # the bound. Rolled again for the truthful owner-question work (PR1, owner 1D/2A): the
+    # escalate description and its nine field descriptions were replaced (the card is written
+    # for a reader outside the room, names the source of the fork, and the question has no
+    # quiz-specific length cap); schema shape, types, defaults and required keys are unchanged,
+    # and the entry's literal moved beside its validator in core_artifacts (byte-identical
+    # serialization). Rolled again for TZ-2 B1 (zero-option questions) and owner V13: the
+    # escalate description offers 0-6 alternatives (none for an open question answered in the
+    # human's own words), states that a shared wait ends on any incoming message and that a
+    # plain-text clarification ends the turn while a waited question keeps it alive; the
+    # `options` description says optional 0-6 and `options` leaves the required keys. Rolled
+    # again for TZ-1 V10: forward_to_worker also writes into a queued task's mailbox, so its
+    # description and `task_id` description say "running or queued" and when each reads it.
+    # Presence peer mail expands only forward_to_worker's description; the
+    # catalog comparison preserves every parameter and handler owner. Rolled again
+    # for same-tree mail: the forward_to_worker description names its peer addressees
+    # as any other task in the caller's tree (parent, sibling, any task sharing the
+    # root) and says Presence observation gaps are disclosed inside the tree too.
     assert hashlib.sha256(schema_bytes).hexdigest() == (
-        "7195a7459f276f4bdf8758864b079218f518ae446613cc8351967692f31472cd"
+        "25ab2df2f9cc9c65e4971b7d4e2a5d1013041933aa070849639a01c9a4398e83"
     )
     assert {
         entry.name: (entry.handler.__module__, entry.handler.__name__)

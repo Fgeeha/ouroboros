@@ -1023,7 +1023,7 @@ test('an untouched deep self-review placeholder is omitted from the save; an edi
         { route: { kind: 'api_chat', target_id: '' } });
     assert.match(deepReviewMetaNotes(blanked).join(' '), /Model id required — an empty model id is refused at save/);
     assert.match(deepReviewMetaNotes(untouched).join(' '), /Not saved as a row yet — shown from OUROBOROS_MODEL_DEEP_SELF_REVIEW/);
-    assert.match(deepReviewMetaNotes(untouched).join(' '), /an untouched row is not written/);
+    assert.match(deepReviewMetaNotes(untouched).join(' '), /stored when edited or when the default panel is first saved/);
     assert.deepEqual(deepReviewMetaNotes(edited), []);
     assert.deepEqual(deepReviewMetaNotes({ ...blanked, subagent_id: 'deep' }), []);
     assert.deepEqual(deepReviewMetaNotes({ ...blanked, route: { kind: ROUTE_KIND_SESSION, target_id: 'codex' } }), []);
@@ -1216,4 +1216,20 @@ test('an owner-disabled roster row leaves the picker but a saved reference to it
     assert.match(described, /refused at save rather than rerouted/);
     assert.match(described, /turn the row back on/);
     assert.doesNotMatch(describeSubagentReference('deep', roster), /switched off/);
+});
+
+
+test('referenced captions follow row effort overrides while compound routes stay immutable', () => {
+    const roster = [
+        { subagent_id: 'ordinary', effort: 'high', route: { kind: ROUTE_KIND_SESSION, target_id: 'codex=gpt-model' } },
+        { subagent_id: 'compound', effort: 'xhigh', route: { kind: ROUTE_KIND_SESSION, target_id: 'cursor=cursor-grok-xhigh' } },
+    ];
+    assert.match(describeSubagentReference('ordinary', roster, { effort: 'low' }), /preferred effort low/);
+    assert.doesNotMatch(describeSubagentReference('ordinary', roster, { effort: 'low' }), /effort high/);
+    assert.match(describeSubagentReference('ordinary', roster), /preferred effort high/);
+    const compound = describeSubagentReference('compound', roster, { effort: 'low' });
+    assert.match(compound, /cursor-grok-xhigh/);
+    assert.match(compound, /preferred effort xhigh/);
+    assert.doesNotMatch(compound, /effort low/);
+    assert.equal(roster[1].route.target_id, 'cursor=cursor-grok-xhigh');
 });

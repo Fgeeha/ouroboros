@@ -192,6 +192,13 @@ GIT_OPS_FAMILY_PATHS = frozenset(
 
 RELEASE_INVARIANT_PATHS = frozenset({
     ".github/workflows/ci.yml",
+    # The provider-canary job `release-preflight` requires keeps its body in a
+    # reusable workflow and its branch-push trigger in a wrapper — both outside
+    # the protected ci.yml, neither moving any of the risk — so every inventory
+    # that protects the parent must cover them (label parity — same rule as
+    # the G1 block below).
+    ".github/workflows/provider-canary.yml",
+    ".github/workflows/provider-canary-push.yml",
     "Ouroboros.spec",
     "build.sh",
     "build_linux.sh",

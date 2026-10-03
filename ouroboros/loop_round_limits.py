@@ -135,7 +135,7 @@ def _drain_incoming_messages(
             break
 
     if drive_root is not None and task_id:
-        from ouroboros.owner_mailbox import CONTEXT_ONLY_TASK_PROVENANCES, KIND_FINALIZE_NOW, KIND_HURRY, KIND_OWNER_TEXT, KIND_QUIZ_ANSWER, KIND_TASK_MESSAGE, acknowledge_transcript_entry, deliver_quiz_answer, deliver_task_message, drain_owner_entries
+        from ouroboros.owner_mailbox import CONTEXT_ONLY_TASK_PROVENANCES, KIND_FINALIZE_NOW, KIND_HURRY, KIND_OWNER_PAUSE, KIND_OWNER_TEXT, KIND_QUIZ_ANSWER, KIND_TASK_MESSAGE, acknowledge_transcript_entry, deliver_quiz_answer, deliver_task_message, drain_owner_entries
 
         if owner_ctx:
             owner_ctx._loop_mailbox_seen_ids = _owner_msg_seen
@@ -144,6 +144,11 @@ def _drain_incoming_messages(
             kind = entry.get("kind") or KIND_OWNER_TEXT
             if kind == KIND_FINALIZE_NOW:
                 handle_finalize_now_entry(entry, owner_ctx, drive_root, task_id, controls)
+                continue
+            if kind == KIND_OWNER_PAUSE:
+                # ACK receipt of this wake signal, not settlement of the Pause.
+                # The launch boundary still reads the durable root fence.
+                acknowledge_transcript_entry(drive_root, task_id, entry, wake_id="owner_pause_wake")
                 continue
             if kind == KIND_HURRY:
                 # HQ1 no-chat contract (§19.7.2 item 6): a typed hurry
@@ -197,10 +202,21 @@ def _drain_incoming_messages(
                 )
                 acknowledge_transcript_entry(drive_root, task_id, entry)
                 continue
+            # A LATE quiz answer: the owner's row and this entry's text are the
+            # owner's own words; the model reads (and the owner corpus keeps) the
+            # FULL card frame rebuilt from the stored block on the canonical root.
+            model_msg = dmsg
+            if entry.get("late_answer") is not None:
+                from ouroboros.owner_quiz import late_answer_model_text
+
+                model_msg = late_answer_model_text(
+                    str(getattr(owner_ctx, "budget_drive_root", "") or "") or drive_root,
+                    entry.get("late_answer"), dmsg,
+                )
             _loop()._record_owner_directive(
                 owner_ctx,
                 source="owner_mailbox",
-                content=dmsg,
+                content=model_msg,
                 msg_id=str(entry.get("msg_id") or ""),
             )
             _stamp_owner_delivery(
@@ -213,7 +229,7 @@ def _drain_incoming_messages(
             from ouroboros.client_surface import noted_owner_text
 
             _loop()._append_or_merge_user_message(
-                messages, _loop()._owner_marked_content(noted_owner_text(owner_ctx, entry, dmsg)),
+                messages, _loop()._owner_marked_content(noted_owner_text(owner_ctx, entry, model_msg)),
                 slot=owner_ctx,
             )
             acknowledge_transcript_entry(drive_root, task_id, entry)
@@ -479,7 +495,12 @@ def _handle_forced_finalization(ctx: _RoundLimitContext, reason: str) -> Tuple[s
         return _handle_owner_stop_finalization(ctx, str(reason))
     if reason_lines and reason_lines[0].strip() == REASON_OWNER_STOPPED_DIRECT_TURN:
         return _handle_direct_turn_hard_stop(ctx)
-    fallback = f"⚠️ Task reached {reason or 'deadline'}; finalization grace produced no answer."
+    from ouroboros.project_dialogue import TASK_CAUSE_PHRASES
+
+    # The host fallback speaks the rail's owner sentence; an unknown rail stays raw.
+    rail = (reason_lines[0].strip() if reason_lines else "") or "deadline"
+    cause = TASK_CAUSE_PHRASES.get(rail, f"Task reached {rail}")
+    fallback = f"⚠️ {cause}; finalization grace produced no answer."
     prompt = (
         f"[FINALIZE_NOW] The supervisor opened a finalization grace window (reason: {reason or 'deadline'}). "
         "The task will be stopped shortly. Produce your best final answer NOW from the verified "
@@ -634,7 +655,48 @@ def _handle_model_wait_control(
     # catches a hold's interruption raised outside the model call, must not
     # hand the same error back here.
     error.control_rails_seen = True
-    if reason not in {"cancelled", "finalize_requested", "deadline", "execution_deadline", "absolute_ceiling"}:
+    if reason == "owner_launch_authority_unavailable":
+        # Only the positively unsent handoff waits; sent effects never retry.
+        # Reuse this task's live stack and control/deadline checks, no scheduler.
+        from ouroboros.owner_pause import OwnerPauseRefused, launch_admission
+        from ouroboros.usage_accounting import current_usage_scope
+        from ouroboros.llm_attempt import require_physical_dispatch_window
+        while True:
+            try:
+                require_physical_dispatch_window()
+                with launch_admission(current_usage_scope()):
+                    pass
+                return None
+            except OwnerPauseRefused as exc:
+                if str(exc) == reason:
+                    import time
+                    from ouroboros.budget_pause import _HOLD_POLL_SEC
+
+                    time.sleep(_HOLD_POLL_SEC)
+                    continue
+                error = ModelWaitInterrupted(str(exc), role=error.model_role, cause=error)
+            except Exception as exc:
+                from ouroboros.model_wait import propagate_model_control
+
+                # Physical pre-send controls carry no model_role. Rejoin the
+                # same typed contract as the model-call boundary, retaining the
+                # no-dispatch cause instead of leaking it or masking Stop.
+                try:
+                    propagate_model_control(exc, role=error.model_role)
+                except ModelWaitInterrupted as interrupted:
+                    error = interrupted
+                else:
+                    raise
+            reason = error.control_reason
+            break
+    if reason == "owner_pause":
+        # Raised only BEFORE request bytes (a pre-dispatch wait or the send's
+        # launch handoff): nothing is in flight, the loop pauses exactly here.
+        from ouroboros.budget_pause import enter_owner_pause
+
+        enter_owner_pause(ctx)
+        return None
+    if reason not in {"cancelled", "finalize_requested", "deadline", "execution_deadline", "absolute_ceiling", "accounting_wait_expired"}:
         raise error
     owner = current_model_wait()
     root = ctx.status_drive_root or ctx.drive_root
@@ -686,11 +748,15 @@ def _handle_model_wait_control(
             return _maybe_early_finalize(ctx, ctx.tools, controls, transport_episode=transport_episode)
     reason_code = (REASON_OWNER_REQUESTED_FINALIZATION
                    if first_line == REASON_OWNER_REQUESTED_FINALIZATION else
+                   "accounting_wait_expired" if reason == "accounting_wait_expired" else
                    "deadline_local" if reason == "deadline" else "finalization_grace")
     trace = ctx.llm_trace if isinstance(ctx.llm_trace, dict) else {}
     _loop()._finalize_forced_services(ctx, trace)
-    ctx.accumulated_usage.update(execution_status="failed", reason_code=reason_code)
+    ctx.accumulated_usage.update(execution_status=("infra_failed" if reason == "accounting_wait_expired" else "failed"),
+                                 reason_code=reason_code)
     fallback = _loop()._last_assistant_text(ctx.messages) or (
+        "⚠️ Accounting access did not recover within this turn’s wait window; no further model call was made."
+        if reason == "accounting_wait_expired" else
         "⚠️ The model wait ended on the task's stop or deadline; no further model call was made."
     )
     result = _loop()._forced_fallback_result(
@@ -774,6 +840,12 @@ def _maybe_early_finalize(
     if reason in {"absolute_ceiling", "execution_deadline"}:
         return _handle_model_wait_control(limit_ctx, ModelWaitInterrupted(reason),
                                           transport_episode=transport_episode)
+    # The owner's Pause (a Stop above still wins): the root's durable fence, not
+    # the wake control, decides; entering the exact pause buys no model round.
+    from ouroboros.budget_pause import enter_cold_sleep, enter_owner_pause
+
+    enter_owner_pause(limit_ctx)
+    enter_cold_sleep(limit_ctx)  # the model's own cold sleep armed in the last tool batch
     # An active episode owns the deadline sliver: its last free redial +
     # no-resend terminal replace the paid deadline_local finalize call.
     if transport_episode is None:

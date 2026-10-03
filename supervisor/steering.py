@@ -53,6 +53,36 @@ def _task_issued(evt: Dict[str, Any]) -> bool:
     return str(_issuer(evt).get("kind") or "") == "task"
 
 
+def _presence_target_refused(ctx: Any, evt: Dict[str, Any], task: Dict[str, Any]) -> bool:
+    """A Presence sender's live target must be independent work of its own binding.
+
+    The sender is Presence by the host's stamp on the event or, failing that, by
+    its own live queue row (a delegated descendant's inherited binding authority),
+    so the fence never rests on one producer remembering to stamp the event; a
+    malformed stamp or carrier narrows to nothing. Whose work the target is follows
+    the read/cancel precedence: its canonical record decides, and the live row
+    stands in only for a record without Presence provenance.
+    """
+    from ouroboros.dialogue_provenance import (
+        presence_metadata_binding, presence_related_work, presence_target_record,
+    )
+
+    if "presence_binding_id" in evt:
+        stamp = evt.get("presence_binding_id")
+        binding = stamp.strip() if isinstance(stamp, str) else ""
+    else:
+        running = getattr(ctx, "RUNNING", None)
+        meta = running.get(str(_issuer(evt).get("task_id") or "")) if isinstance(running, dict) else None
+        row = meta.get("task") if isinstance(meta, dict) else None
+        binding = presence_metadata_binding(row.get("metadata")) if isinstance(row, dict) else None
+        if binding is None and isinstance(row, dict) and isinstance(row.get("task_contract"), dict):
+            binding = "" if "capability_ceiling" in row["task_contract"] else None
+    if binding is None:
+        return False
+    target = str(evt.get("target_task_id") or task.get("id") or "").strip()
+    return not presence_related_work(binding, presence_target_record(ctx.DRIVE_ROOT, target, queue_row=task))
+
+
 def _refuse_steering_while_cancelling(
     ctx: Any,
     evt: Dict[str, Any],
@@ -151,6 +181,10 @@ def _owner_lane_allows(ctx: Any, task: Dict[str, Any], target: str, chat_id: int
     Project room, and -- from the Main lane, which sees the global manifest --
     every root. The lane is the host registry's answer for the issuing chat, so
     a Swarm root (no routing contract) and a picker click read the same rule."""
+    from ouroboros.server_routing_context import _main_lane_chat
+
+    if _main_lane_chat(chat_id):
+        return True  # Main, including the bound external owner, needs no registry read.
     try:
         if int(task.get("chat_id") or 0) == chat_id:
             return True
@@ -160,11 +194,11 @@ def _owner_lane_allows(ctx: Any, task: Dict[str, Any], target: str, chat_id: int
     # but belong to a project thread — match via the durable binding.
     try:
         from ouroboros.projects_registry import project_chat_for_task
-        from ouroboros.server_routing_context import _project_id_for_registered_chat
+        from ouroboros.server_routing_context import _reserved_project_for_chat
 
         if int(project_chat_for_task(ctx.DRIVE_ROOT, target) or 0) == chat_id:
             return True
-        return not _project_id_for_registered_chat(ctx, chat_id)
+        return not _reserved_project_for_chat(ctx, chat_id)
     except Exception:
         return False
 
@@ -250,6 +284,8 @@ def _handle_steer_task(evt: Dict[str, Any], ctx: Any) -> None:
         refusal = "target_unknown"
     elif str(task.get("delegation_role") or "") == "subagent":
         refusal = "subagent_target"
+    elif task_issued and _presence_target_refused(ctx, evt, task):
+        refusal = "presence_work_not_related"
     elif not task_issued and not _owner_lane_allows(ctx, task, target, chat_id):
         refusal = "chat_mismatch"
     else:
@@ -346,6 +382,16 @@ def _handle_steer_task(evt: Dict[str, Any], ctx: Any) -> None:
                     status="needs_manual_target", reason="target_finished",
                 )
                 return
+            # The worker can remain RUNNING solely for post-task work after
+            # its solve loop and last mailbox drain. Never promise a delivery
+            # to an actor whose own result is already terminal.
+            from ouroboros.task_results import load_task_result
+            from ouroboros.task_status import SETTLED_STATUSES
+
+            if (load_task_result(drive, target) or {}).get("status") in SETTLED_STATUSES:
+                _steer_receipt(ctx, evt, target, target_label=target_label,
+                               status="needs_manual_target", reason="target_finished")
+                return
             fence_root = str(task.get("root_task_id") or target)
             active_fence = ACCEPTANCE_FENCES.get(fence_root)
             if isinstance(active_fence, dict) and str(active_fence.get("status") or "") == "sealed":
@@ -373,6 +419,7 @@ def _handle_steer_task(evt: Dict[str, Any], ctx: Any) -> None:
             if not write_task_message(
                 drive, message, target, source_task_id=issuer_task_id,
                 provenance=PROVENANCE_INDEPENDENT_TASK, msg_id=msg_id,
+                sender_origin=evt.get("sender_origin") if isinstance(evt.get("sender_origin"), dict) else None,
             ):
                 raise OSError("task mailbox append was not durable")
             delivered = True

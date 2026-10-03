@@ -13,20 +13,28 @@ from ouroboros.tools.registry import ToolContext, ToolEntry
 PRESENCE_OUTCOMES = ("message", "silent", "tool_delivered", "deferred")
 
 
-def _finish_presence(ctx: ToolContext, outcome: str, message: str = "") -> str:
+def _finish_presence(ctx: ToolContext, outcome: str, message: str = "", action: str = "finish",
+                     rationale: str = "", answer_sha256: str | None = None) -> str:
     contract = getattr(ctx, "task_contract", {})
     if not isinstance(contract, dict) or not isinstance(contract.get("capability_ceiling"), dict):
         return _publish_tool_result(ctx, ToolResult(status="unavailable", code="CAPABILITY_UNAVAILABLE", text=("ERROR: PRESENCE_COMPLETION_UNAVAILABLE: this is not a host-admitted presence turn.")))
     selected = str(outcome or "").strip()
     if selected not in PRESENCE_OUTCOMES:
         return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=("ERROR: PRESENCE_OUTCOME_INVALID: choose message, silent, tool_delivered, or deferred.")))
+    from ouroboros.tools.control_runtime import stage_completion_request
+    reply_later = not message and answer_sha256 is None and selected in {"message", "deferred"}
+    result = stage_completion_request(ctx, {"action": action, "rationale": rationale,
+        **({"answer_sha256": answer_sha256} if answer_sha256 is not None else {"answer": message})},
+        source="presence_finish", allow_empty=selected in {"silent", "tool_delivered"}, reply_later=reply_later)
+    if not getattr(ctx, "_completion_request", None) or getattr(ctx, "_completion_conflict", False):
+        return result
     ctx._presence_completion = {
         "outcome": selected,
         "message": str(message or "").strip(),
     }
     ctx._presence_completion_accepted = False
     ctx._presence_completion_owner_revision = len(getattr(ctx, "_owner_directives", []) or [])
-    return f"PRESENCE_COMPLETION_RECORDED: {selected}. The host will apply the normal finalization checks after this tool batch."
+    return result
 
 
 def _configure_presence(ctx: ToolContext, action: str, **params: Any) -> str:
@@ -300,9 +308,10 @@ def _initiate_presence(
 
 
 def _cancel_presence_work(ctx: ToolContext, work_ref: str, reason: str = "") -> str:
-    """Cancel only work correlated to this exact presence binding/conversation."""
+    """Cancel work started from this presence binding (any of its conversations) or this turn's own tree."""
 
-    from ouroboros.task_results import load_task_result, validate_task_id
+    from ouroboros.presence_authority import presence_caller_binding, presence_work_refusal
+    from ouroboros.task_results import validate_task_id
     from ouroboros.tool_access import canonical_data_root
     from ouroboros.tools.join_ledger import _cancel_task
 
@@ -310,21 +319,11 @@ def _cancel_presence_work(ctx: ToolContext, work_ref: str, reason: str = "") -> 
         task_id = validate_task_id(work_ref)
     except ValueError as exc:
         return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(f"ERROR: PRESENCE_WORK_REF_INVALID: {exc}")))
-    current_meta = getattr(ctx, "task_metadata", {})
-    current = current_meta.get("presence") if isinstance(current_meta, dict) else None
-    stored = load_task_result(canonical_data_root(ctx), task_id) or {}
-    target_meta = stored.get("metadata") if isinstance(stored.get("metadata"), dict) else {}
-    target = target_meta.get("presence") if isinstance(target_meta.get("presence"), dict) else None
-    if not isinstance(current, dict) or not isinstance(target, dict):
-        return _publish_tool_result(ctx, ToolResult(status="blocked", code="ACCESS_BLOCKED", text=("ERROR: PRESENCE_WORK_NOT_CORRELATED")))
-    current_event = current.get("event") if isinstance(current.get("event"), dict) else {}
-    target_event = target.get("event") if isinstance(target.get("event"), dict) else {}
-    if (
-        str(current.get("binding_id") or "") != str(target.get("binding_id") or "")
-        or str(current_event.get("conversation_key") or "")
-        != str(target_event.get("conversation_key") or "")
-    ):
-        return _publish_tool_result(ctx, ToolResult(status="blocked", code="ACCESS_BLOCKED", text=("ERROR: PRESENCE_WORK_NOT_CORRELATED")))
+    refusal = presence_work_refusal(ctx, task_id, drive_root=canonical_data_root(ctx), same_tree=True)
+    # A speaker, or a root acting only for its binding: the binding authority decides, not speaker metadata.
+    if refusal or presence_caller_binding(ctx) is None:
+        return _publish_tool_result(ctx, ToolResult(status="blocked", code="ACCESS_BLOCKED", text=(
+            "ERROR: PRESENCE_WORK_NOT_CORRELATED: " + (refusal.split(": ", 1)[-1] or "this is not a presence task."))))
     return _cancel_task(ctx, task_id, reason)
 
 
@@ -336,7 +335,7 @@ def get_tools() -> List[ToolEntry]:
                 "name": "presence_finish",
                 "description": (
                     "Finish the current external presence turn with a typed delivery outcome. "
-                    "Call after the useful work is done. Choose message to return "
+                    "Choose finish after useful work, or stop with a rationale when work remains. Choose message to return "
                     "a conversational reply, silent when no reply is appropriate, tool_delivered "
                     "when an allowed tool already delivered the result, or deferred after long "
                     "work was successfully promoted. With nonblank message text, or silent/tool_delivered, "
@@ -347,9 +346,12 @@ def get_tools() -> List[ToolEntry]:
                     "type": "object",
                     "properties": {
                         "outcome": {"type": "string", "enum": list(PRESENCE_OUTCOMES)},
+                        "action": {"type": "string", "enum": ["finish", "stop"], "default": "finish"},
+                        "rationale": {"type": "string", "description": "For stop, what remains unfinished. Delivery outcome is independent."},
+                        "answer_sha256": {"type": "string", "description": "Select an offered complete answer instead of message or reply-later."},
                         "message": {
                             "type": "string",
-                            "description": "Reply text for message, or an immediate acknowledgement for deferred. Nonblank text enables immediate finalization; omitting it leaves the reply to a subsequent model round.",
+                            "description": "Reply text for message, or an immediate acknowledgement for deferred. Nonblank text or answer_sha256 enables immediate finalization. Omitting both explicitly reserves the next ordinary model reply, subject to normal budget and controls; it is not yet an authored no-spend stop. Use selected bytes or silent/tool_delivered to stop without another reply.",
                         },
                     },
                     "required": ["outcome"],
@@ -440,9 +442,10 @@ def get_tools() -> List[ToolEntry]:
             schema={
                 "name": "presence_cancel_work",
                 "description": (
-                    "Request cancellation of long work previously deferred from this exact "
-                    "presence binding and conversation. The opaque work_ref is correlation, "
-                    "not general task authority."
+                    "Request cancellation of independent work started from this presence "
+                    "binding, in this or another of its conversations (or of this turn's own "
+                    "children). The result is a request receipt, not proof the work stopped; "
+                    "work of another binding or the owner's own tasks is refused."
                 ),
                 "parameters": {
                     "type": "object",

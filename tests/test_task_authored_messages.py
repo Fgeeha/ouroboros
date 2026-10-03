@@ -464,7 +464,7 @@ def test_forward_to_worker_reaches_a_host_listed_root_on_its_own_drive(tmp_path)
     [row] = drain_owner_entries(root_drive, "root-x")
     assert (row["provenance"], row["source_task_id"], row["text"]) == ("independent_task", "sender", "the shared schema changed")
     assert "TASK_FORBIDDEN" in forbidden and "nor an active independent root" in forbidden
-    assert "TASK_FORBIDDEN" in relayed and "independent root" in relayed
+    assert "TASK_FORBIDDEN" in relayed and "independent recipient" in relayed
     assert drain_owner_entries(tmp_path, "stranger") == []
 
 
@@ -525,6 +525,11 @@ def test_the_roster_note_includes_direct_roots_but_skips_subagents_and_discloses
         "incomplete": True,
     })
     assert "…and 5 more not shown." in rendered and "roster incomplete" in rendered
+    assert 'owner direct turn sends owner steering' in rendered
+    assert 'Project room (Main may address any listed root)' in rendered
+    assert 'a task speaks as itself' in rendered
+    assert "Presence's existing authority restrictions still apply" in rendered
+    assert 'never as owner text' not in rendered
 
 
 @pytest.mark.parametrize("origin", [{}, {"initiator": "consciousness"}], ids=["owner", "consciousness"])

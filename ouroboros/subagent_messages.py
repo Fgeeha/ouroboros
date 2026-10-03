@@ -1,8 +1,13 @@
-"""Compact, durable identity for owner-visible subagent messages."""
+"""Compact, durable identity for owner-visible subagent and task-card messages."""
 
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, Mapping
+
+# One delegated-activity record on the progress carrier, serialized. The producer's own
+# preview bounds keep an ordinary record far below it (``delegate_activity``).
+_ACTIVITY_MAX_CHARS = 64_000
 
 
 SUBAGENT_MESSAGE_FIELDS: tuple[str, ...] = (
@@ -19,6 +24,23 @@ SUBAGENT_MESSAGE_FIELDS: tuple[str, ...] = (
     "model",
     "executor_route",
 )
+
+# The host's two named placements of a task-keyed row inside its task's card.
+CARD_ROW_PLACEMENTS: tuple[str, ...] = ("timeline", "reviews")
+
+
+def is_task_card_message(meta: Mapping[str, Any] | None) -> bool:
+    """Whether a delivered row belongs inside a task card, not the conversation feed.
+
+    Both are declared facts, never a reading of the text: the host's placement
+    (``card_row``) and a child task's own lineage (``delegation_role`` — the
+    child speaks to its parent, whose card shows it). They hold whether or not a
+    page has that card loaded, so neither is a new conversation message for the
+    Project unread revision (DESIGN "Project unread dot").
+    """
+    source = meta if isinstance(meta, Mapping) else {}
+    return (source.get("card_row") in CARD_ROW_PLACEMENTS
+            or str(source.get("delegation_role") or "").strip().lower() == "subagent")
 
 
 def executor_observation_meta(
@@ -47,6 +69,32 @@ def executor_observation_meta(
     if isinstance(value.get("model"), str) and value["model"] and value.get("model_source") in ("requested", "observed"):
         observation.update(model=value["model"], model_source=value["model_source"])
     return observation
+
+
+def delegated_activity_meta(value: Any, *, task_id: str) -> Dict[str, Any]:
+    """Copy one delegated-activity record (``delegate_activity``) bound to its task's frame.
+
+    The same check at Agent emission, supervisor delivery and history replay. A record for
+    another task, without its exact run and seq range, with an unknown part or source kind,
+    or beyond the carrier bound is dropped whole; the frame text keeps the plain rendering.
+    The executor's words stay host progress: never narration, never execution evidence.
+    """
+    if not isinstance(value, Mapping) or not task_id or value.get("task_id") != task_id or value.get("v") != 1:
+        return {}
+    after, through, parts = value.get("after_seq"), value.get("through_seq"), value.get("parts")
+    source = value.get("source") if isinstance(value.get("source"), Mapping) else {}
+    if (not isinstance(value.get("run_id"), str) or not value["run_id"] or type(after) is not int
+            or type(through) is not int or not 0 <= after < through or not isinstance(parts, list)
+            or source.get("kind") not in ("run_events", "timeline_window")):
+        return {}
+    if any(not isinstance(part, Mapping) or part.get("kind") not in ("message", "thinking", "problem")
+           or not isinstance(part.get("text"), str) for part in parts):
+        return {}
+    try:
+        raw = json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return {}
+    return json.loads(raw) if len(raw) <= _ACTIVITY_MAX_CHARS else {}
 
 
 def initiator_meta(record: Mapping[str, Any] | None) -> Dict[str, Any]:

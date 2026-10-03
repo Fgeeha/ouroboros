@@ -188,7 +188,7 @@ def summarize_source(
     call: LightCall, text: str, spans: List[Tuple[int, int, str]],
     draft_prompt: Callable[[str, str], str], correct_prompt: Callable[[str, str, str], str],
     *, input_limit: Optional[Dict[str, Any]] = None,
-    on_refusal: Optional[Callable[[Dict[str, Any]], None]] = None,
+    on_refusal: Optional[Callable[[Dict[str, Any]], None]] = None, unit: str = "",
 ) -> Tuple[str, Dict[str, Any]]:
     """Draft and then correct one exact source, splitting only to fit its Light route.
 
@@ -203,7 +203,15 @@ def summarize_source(
     are released only from the CORRECTED response: the draft's trailing block
     travels into the correction, where cumulative revisions use its own note
     reads alongside the episode rather than inheriting the draft's read credit.
+
+    Inside a root late phase (owner D10) the whole ``unit``'s confirmed draft
+    survives a correction an owner Pause stopped; the resumed stage offers it
+    once to the correction, which checks it against the CURRENT source — the
+    draft is useful source, never a frozen request or a second paid draft.
     """
+    from ouroboros.post_task_checkpoint import current_late_phase_run
+
+    late = current_late_phase_run() if unit else None
     pending, summaries, usages = [(0, len(text))], [], []
     entries: List[Dict[str, Any]] = []
     from ouroboros.consolidator import _merge_consolidation_usage
@@ -230,18 +238,29 @@ def summarize_source(
             return False
         midpoint = start + len(halves[0])
         pending.extend([(midpoint, end), (start, midpoint)])
+        # The refusal is answered by its halves, each accounted by its own row; the
+        # attempt stays in the usage history, never read as an unresolved failure.
+        failure["resolution"] = "split"
         return True
 
     while pending:
         start, end = pending.pop()
         part, note = text[start:end], source_continuation_note(spans, start, end)
-        draft, usage, _draft_knowledge = call(draft_prompt(part, note), "Room summary", fixed_prompt=draft_prompt("", note),
-                                             input_limit=input_limit, call_type="memory_consolidation")
-        usages.append(usage)
+        whole = late is not None and (start, end) == (0, len(text))
+        draft, usage = (late.drafts.pop(unit, "") if whole else ""), {}
+        if not draft:
+            draft, usage, _draft_knowledge = call(draft_prompt(part, note), "Room summary", fixed_prompt=draft_prompt("", note),
+                                                 input_limit=input_limit, call_type="memory_consolidation")
+            usages.append(usage)
         if draft.strip():
-            corrected, usage, knowledge = call(
-                correct_prompt(draft, part, note), "Room correction", fixed_prompt=correct_prompt(draft, "", note),
-                input_limit=input_limit, call_type="memory_correction")
+            try:
+                corrected, usage, knowledge = call(
+                    correct_prompt(draft, part, note), "Room correction", fixed_prompt=correct_prompt(draft, "", note),
+                    input_limit=input_limit, call_type="memory_correction")
+            except BaseException:
+                if whole:  # a stopped correction keeps its confirmed draft for the resumed stage
+                    late.drafts[unit] = draft
+                raise
             usages.append(usage)
             if corrected.strip():
                 # A part's nominations are the corrected response's, released
@@ -259,7 +278,13 @@ def summarize_source(
                 corrected, raw = _extract_trailing_json(corrected, "KNOWLEDGE_ENTRIES_JSON:")
                 kept = [e for e in (raw if isinstance(raw, list) else []) if isinstance(e, dict)
                         and (str(e.get("topic") or ""), str(e.get("scope") or "")) in draft_topics]
-                entries.extend(knowledge.bind_entries(kept) if knowledge is not None and kept else [])
+                # Provenance is per nomination: the route that answered THIS part's
+                # correction wrote these entries, whatever route the block's other
+                # rooms or parts ran on (a wait may rebind between parts).
+                from ouroboros.knowledge import observed_route_stamp
+                route = observed_route_stamp(usage)
+                entries.extend({**entry, "_nomination_route": route}
+                               for entry in (knowledge.bind_entries(kept) if knowledge is not None and kept else []))
                 summaries.append(corrected.strip())
                 continue
         failure = usage["_consolidation_errors"][-1]
@@ -296,8 +321,21 @@ def summarize_block(
     entries: List[Dict[str, Any]] = []
 
     def finish(block: Optional[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
-        return block, {**_merge_consolidation_usage(*usages), "_consolidation_retry": input_limit,
-                       **({"_knowledge_entries": entries} if entries else {})}
+        usage = {**_merge_consolidation_usage(*usages), "_consolidation_retry": input_limit,
+                 **({"_knowledge_entries": entries} if entries else {})}
+        # One coverage fact per logical chunk: the WHOLE chunk is the unit a
+        # failure withholds, so its source counts every room, attempted or not.
+        usage["_coverage"] = [*usage.get("_coverage", []), {
+            "unit": "block", "status": "accepted" if block is not None else "withheld", "rooms": len(rooms),
+            "messages": sum(len(room.entries) for room in rooms),
+            "source_chars": sum(len(room.text) for room in rooms),
+            "output_chars": len(block["content"]) if block is not None else 0,
+            # Refusals answered by queueing halves, counted when queued: the
+            # halves' own outcome is this chunk's status, so an attempt is no recovery.
+            "split_attempts": sum(1 for error in usage.get("_consolidation_errors") or []
+                                  if isinstance(error, dict) and error.get("resolution") == "split"),
+        }]
+        return block, usage
 
     for room in rooms:
         def draft(part: str, note: str, room: RoomSource = room) -> str:
@@ -310,8 +348,8 @@ def summarize_block(
                                      identity_text=identity_text, continuation_note=note,
                                      knowledge_instruction=knowledge_instruction)
 
-        content, usage = summarize_source(call, room.text, room.spans, draft, correct,
-                                          input_limit=input_limit, on_refusal=on_refusal)
+        content, usage = summarize_source(call, room.text, room.spans, draft, correct, input_limit=input_limit,
+                                          on_refusal=on_refusal, unit=f"{first_ts}|{last_ts}|{room.room_id}")
         usages.append(usage)
         input_limit = usage["_consolidation_retry"]
         entries.extend(usage.get("_knowledge_entries") or [])
@@ -361,6 +399,16 @@ def compress_blocks_to_era(
     """
     from ouroboros.consolidator import _merge_consolidation_usage
 
+    def done(era: Optional[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+        # Produced is not adopted: the caller keeps the blocks unless the era is shorter.
+        usage = _merge_consolidation_usage(*usages)
+        usage["_coverage"] = [*usage.get("_coverage", []), {
+            "unit": "era", "status": "produced" if era is not None else "withheld", "blocks": len(blocks),
+            "messages": sum(int(b.get("message_count") or 0) for b in blocks),
+            "source_chars": sum(len(b.get("content", "")) for b in blocks),
+            "output_chars": len(era["content"]) if era is not None else 0}]
+        return era, usage
+
     start_date, end_date = era_dates(blocks)
     groups: Dict[str, Dict[str, Any]] = {}
     for block in blocks:
@@ -381,7 +429,7 @@ def compress_blocks_to_era(
                                           call_type="era_compression")
         usages.append(usage)
         if not content.strip():
-            return None, _merge_consolidation_usage(*usages)
+            return done(None)
         corrected, usage, _knowledge = call(
             correction_prompt(content, combined, room_label=group["label"], scope=scope, identity_text=identity_text),
             "Era correction", fixed_prompt=correction_prompt(content, "", room_label=group["label"], scope=scope,
@@ -389,18 +437,50 @@ def compress_blocks_to_era(
             call_type="era_correction")
         usages.append(usage)
         if not corrected.strip():
-            return None, _merge_consolidation_usage(*usages)
+            return done(None)
         rooms.append({"room_id": room_id, "label": group["label"], "message_count": group["message_count"],
                       "content": corrected.strip()})
     era_range = f"{start_date} to {end_date}"
-    return ({"range": era_range, "message_count": sum(int(b.get("message_count") or 0) for b in blocks),
-             "content": render_sections(f"### Era: {era_range}", rooms), "rooms": rooms},
-            _merge_consolidation_usage(*usages))
+    return done({"range": era_range, "message_count": sum(int(b.get("message_count") or 0) for b in blocks),
+                 "content": render_sections(f"### Era: {era_range}", rooms), "rooms": rooms})
+
+
+def consolidation_coverage(facts: Any) -> Dict[str, Any]:
+    """What one consolidation run covered, from its per-unit facts; every ratio names its denominator.
+
+    ``accepted`` chunks passed draft and correction (publication is the
+    separate ``blocks_written``); a ``withheld`` chunk stays behind the cursor
+    for the next cycle, and chunks after it were not attempted this run.
+    ``split_attempts`` counts refusals answered by queueing a part's halves,
+    whatever those halves then did; whether the chunk came through is its
+    status. An era ``produced`` is kept only when ``shorter``.
+    """
+    rows = [row for row in (facts or []) if isinstance(row, dict)]
+
+    def total(unit: str, status: str = "") -> Dict[str, int]:
+        chosen = [row for row in rows if row.get("unit") == unit and (not status or row.get("status") == status)]
+        keys = ("messages", "rooms", "source_chars", "output_chars") if unit == "block" else (
+            "blocks", "messages", "source_chars", "output_chars")
+        return {"count": len(chosen), **{key: sum(int(row.get(key) or 0) for row in chosen) for key in keys}}
+
+    accepted = total("block", "accepted")
+    eras = [row for row in rows if row.get("unit") == "era"]
+    return {
+        "unit": "chat chunk attempted this run",
+        "attempted": total("block"), "accepted": accepted, "withheld": total("block", "withheld"),
+        "split_attempts": sum(int(row.get("split_attempts") or 0) for row in rows if row.get("unit") == "block"),
+        "accepted_output_to_source": {
+            "ratio": round(accepted["output_chars"] / accepted["source_chars"], 4) if accepted["source_chars"] else None,
+            "numerator": "output chars of accepted chunks", "denominator": "source chars of accepted chunks"},
+        "eras": {**total("era"), "produced": sum(1 for row in eras if row.get("status") == "produced"),
+                 "shorter": sum(1 for row in eras if row.get("status") == "produced"
+                                and int(row.get("output_chars") or 0) < int(row.get("source_chars") or 0))},
+    }
 
 
 __all__ = [
     "LEGACY_ROOM_ID", "LEGACY_ROOM_LABEL", "FIDELITY_RULES", "RoomSource",
     "partition_entries", "block_range", "room_draft_prompt", "correction_prompt", "era_room_prompt",
     "split_source_text", "summarize_source", "summarize_block", "render_sections", "room_sections",
-    "era_dates", "compress_blocks_to_era",
+    "era_dates", "compress_blocks_to_era", "consolidation_coverage",
 ]

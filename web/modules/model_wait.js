@@ -26,13 +26,16 @@ export function modelWaitRoleLabel(role = '') {
     return String(role || 'Model');
 }
 
+/** Host wait reasons: `unavailable` is an engine-dated pool refusal, neither quota nor sign-in. */
+export const MODEL_WAIT_REASONS = ['quota', 'auth', 'auth_quota', 'unavailable'];
+
 /** A late snapshot cannot rewind a row or reopen a resolved wait episode. */
 export function mergeModelWaits(previous = {}, incoming = {}) {
     const result = { ...previous };
     for (const [id, row] of Object.entries(incoming || {})) {
         if (!row || row.wait_id !== id || !Number.isInteger(row.revision) || row.revision < 1
             || !Number.isInteger(row.task_attempt) || row.task_attempt < 1
-            || !['waiting', 'resolved'].includes(row.state) || !['quota', 'auth', 'auth_quota'].includes(row.reason)) continue;
+            || !['waiting', 'resolved'].includes(row.state) || !MODEL_WAIT_REASONS.includes(row.reason)) continue;
         const prior = result[id];
         if (prior && (prior.revision > row.revision || prior.state === 'resolved')) continue;
         if (prior?.revision === row.revision) {
@@ -50,10 +53,12 @@ export function mergeModelWaits(previous = {}, incoming = {}) {
 }
 
 export function activeModelWaits(waits = {}, finished = false, currentAttempt = 0) {
-    if (finished) return [];
     const rows = Object.values(waits);
     const attempt = currentAttempt || Math.max(0, ...rows.map((row) => row.task_attempt));
-    return rows.filter((row) => row.state === 'waiting' && row.task_attempt === attempt);
+    return rows.filter((row) => row.state === 'waiting' && row.task_attempt === attempt
+        && (!finished || (row.review_operation?.owner_id
+            && row.review_operation.owner_id === row.model_wait_owner_id
+            && row.review_operation.retry_key && row.review_operation.slot_id)));
 }
 
 export function modelWaitAction(taskId, row, action, fields, requestId) {
@@ -128,25 +133,31 @@ export function createModelWaitController({ getRecord, onDomWrite = (fn) => fn()
         const node = view.node;
         const pending = view.sending || isPending(row);
         const mixed = row.reason === 'auth_quota';
+        const pool = row.reason === 'unavailable';
         const quota = row.reason === 'quota' || mixed;
+        const observesAccess = row.availability_observation !== 'unavailable';
+        const timed = (quota || pool) && observesAccess;
         node.querySelector('[data-wait-role]').textContent = modelWaitRoleLabel(row.role);
-        node.querySelector('[data-wait-reason]').textContent = mixed ? 'Waiting for access'
-            : row.reason === 'auth' ? 'Sign-in required' : 'Waiting for quota';
+        node.querySelector('[data-wait-reason]').textContent = !observesAccess ? 'Waiting for provider access' : mixed ? 'Waiting for access'
+            : pool ? 'Waiting for an account' : row.reason === 'auth' ? 'Sign-in required' : 'Waiting for quota';
         const model = parseModelSource(row.model).model || row.model;
-        node.querySelector('[data-wait-model]').textContent = `${model || 'Model'} · ${row.credential_profile_id ? `Account: ${row.credential_profile_id}` : 'Auto rotation'}`;
+        node.querySelector('[data-wait-model]').textContent = `${model || 'Model'} · ${!observesAccess ? 'Configured API access' : row.credential_profile_id ? `Account: ${row.credential_profile_id}` : 'Auto rotation'}`;
         const reset = row.reset_at ? new Date(row.reset_at) : null;
-        node.querySelector('[data-wait-reset]').textContent = (mixed
-            ? 'Some accounts need sign-in; others are waiting for quota. ' : '') + (quota
-            ? (reset && Number.isFinite(reset.getTime()) ? `Quota resets ${reset.toLocaleString()}.` : 'Quota reset time is not known.') : '');
+        const known = reset && Number.isFinite(reset.getTime());
+        node.querySelector('[data-wait-reset]').textContent = !observesAccess
+            ? 'Automatic access checks are unavailable. Retry after access is restored, choose another model, or stop.' : (mixed
+            ? 'Some accounts need sign-in; others are waiting for quota. ' : '') + (pool
+            ? `No account can serve this model now. ${known ? `The engine reported a reset at ${reset.toLocaleString()}; availability is unconfirmed.` : 'The reset time is not known.'}`
+            : quota ? (known ? `Quota resets ${reset.toLocaleString()}.` : 'Quota reset time is not known.') : '');
         const automatic = node.querySelector('[data-wait-auto]');
-        automatic.parentElement.hidden = !quota;
-        node.querySelector('[data-wait-auto-label]').textContent = mixed
+        automatic.parentElement.hidden = !timed;
+        node.querySelector('[data-wait-auto-label]').textContent = mixed || pool
             ? 'Continue automatically when access is restored' : 'Continue automatically when quota resets';
         const requested = view.sending ? view.lastRequest : row.pending_action;
         automatic.checked = pending && requested?.action === 'auto_continue'
             ? requested.auto_continue : row.auto_continue !== false;
         const auth = node.querySelector('[data-wait-login]');
-        auth.hidden = row.reason !== 'auth';
+        auth.hidden = row.reason !== 'auth' || !observesAccess;
         node.querySelector('[data-wait-settings]').textContent = mixed ? 'Accounts' : 'Settings';
         node.querySelector('[data-wait-notice]').textContent = view.error
             || (view.sending ? 'Sending your choice…' : isPending(row)
@@ -165,25 +176,26 @@ export function createModelWaitController({ getRecord, onDomWrite = (fn) => fn()
         if (taskOnlyLocal) persist.checked = false;
         node.querySelector('[data-wait-scope]').textContent = taskOnlyLocal
             ? 'Local applies to all fallbacks in Settings. This change is task-only; edit Models for a permanent change.'
-            : 'This role changes until the task ends.';
+            : row.review_operation ? 'This role changes for this review operation.' : 'This role changes until the task ends.';
     }
 
     function paint(taskId) {
         if (destroyed) return false;
         const task = tasks.get(taskId);
         if (!task) return false;
-        const active = activeModelWaits(task.waits, task.finished, task.attempt);
+        const record = getRecord(taskId, false);
+        const active = activeModelWaits(task.waits, task.finished || record?.finished, task.attempt);
         if (!active.length) { clearViews(task); syncPhase(taskId, false); return true; }
-        const record = getRecord(taskId);
-        if (!record?.root || record.finished) { clearViews(task); return false; }
-        if (task.host?.parentElement !== record.root) {
+        const card = record || getRecord(taskId);
+        if (!card?.root) { clearViews(task); return false; }
+        if (task.host?.parentElement !== card.root) {
             if (!task.host) {
                 task.host = getDoc().createElement('section');
                 task.host.className = 'model-waits';
                 task.host.setAttribute('aria-label', 'Subscription access');
                 task.host.innerHTML = '<div data-wait-rows></div><div class="model-wait-footnote" data-wait-slot></div>';
             }
-            record.timelineEl.before(task.host);
+            card.timelineEl.before(task.host);
             const focused = task.focused;
             task.focused = null;
             if (focused) requestAnimationFrame(() => {
@@ -219,7 +231,6 @@ export function createModelWaitController({ getRecord, onDomWrite = (fn) => fn()
             ...Object.values(next).map((row) => row.task_attempt));
         const attemptChanged = nextAttempt > task.attempt;
         if (attemptChanged) { task.attempt = nextAttempt; task.finished = false; }
-        if (task.finished) return false;
         if (!attemptChanged && task.host?.isConnected && Object.keys(next).every((id) => next[id] === task.waits[id])) return false;
         task.waits = next;
         return onDomWrite(() => paint(taskId));
@@ -347,8 +358,9 @@ export function createModelWaitController({ getRecord, onDomWrite = (fn) => fn()
             const attempt = Number.isInteger(value?.task_attempt) ? value.task_attempt : 0;
             if (attempt && attempt < (tasks.get(taskId)?.attempt || 0)) return false;
             if (taskId && taskDoneIsTerminal(value)) {
-                if (value?.model_waits || isModelWaitReference(value)) taskEntry(taskId);
-                this.finish(taskId); return false;
+                const changed = adopt(taskId, value?.model_waits || (isModelWaitReference(value) && value.wait_id
+                    ? { [value.wait_id]: value } : {}), attempt);
+                this.finish(taskId); return changed;
             }
             if (value?.model_waits) return adopt(taskId, value.model_waits, attempt);
             if (isModelWaitReference(value) && value.wait_id) return adopt(taskId, { [value.wait_id]: value }, attempt);

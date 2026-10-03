@@ -94,6 +94,38 @@ def test_runtime_section_includes_light_runtime_mode_rule(tmp_path, monkeypatch)
     assert "runtime_data/uploads" in payload["runtime_mode_rule"]
 
 
+@pytest.mark.parametrize("trigger", ["once", "cron"])
+def test_runtime_keeps_the_admitted_occurrences_due_time_after_schedule_advances(tmp_path, trigger):
+    env = _make_health_env(tmp_path)
+    due = "2026-09-29T00:30:00+00:00"
+    claimed = "2026-09-30T03:00:00+00:00"
+    (tmp_path / "state" / "scheduled_tasks.json").write_text(json.dumps({"tasks": [{
+        "id": "follow-up", "enabled": trigger == "cron", "name": "Review results",
+        "trigger": {"type": trigger, "run_at": due, "expr": "30 0 * * *"},
+        "next_run_at": "2026-10-01T00:30:00+00:00",
+    }]}), encoding="utf-8")
+    task = {"id": "late-run", "type": "task", "metadata": {"schedule_occurrence": {
+        "schedule_id": "follow-up", "token": "occurrence-token", "due_at": due, "claimed_at": claimed,
+    }}}
+    runtime = json.loads(build_runtime_section(env, task).split("\n\n", 1)[1])
+    assert runtime["task"]["schedule_occurrence"] == {
+        "schedule_id": "follow-up", "due_at": due, "claimed_at": claimed,
+    }
+    if trigger == "once":
+        assert "scheduled_tasks" not in runtime  # consumed one-shot no longer appears in the digest
+    else:
+        assert runtime["scheduled_tasks"]["active"][0]["next_run_at"] != due
+
+
+def test_runtime_does_not_invent_a_due_time_for_legacy_or_ordinary_work(tmp_path):
+    env = _make_health_env(tmp_path)
+    task = {"id": "legacy", "metadata": {"schedule_occurrence": {"schedule_id": "old", "token": "t"}}}
+    legacy = json.loads(build_runtime_section(env, task).split("\n\n", 1)[1])
+    assert legacy["task"]["schedule_occurrence"] == {"schedule_id": "old", "due_at": None, "claimed_at": None}
+    ordinary = json.loads(build_runtime_section(env, {"id": "ordinary"}).split("\n\n", 1)[1])
+    assert "schedule_occurrence" not in ordinary["task"]
+
+
 def test_runtime_section_includes_filesystem_affordances_with_ctx(tmp_path, monkeypatch):
     from ouroboros.tools.registry import ToolContext
 
@@ -107,7 +139,7 @@ def test_runtime_section_includes_filesystem_affordances_with_ctx(tmp_path, monk
 
     assert fs["profile"] == "self_modification"
     assert "runtime_data" in fs["searchable_roots"]
-    assert "task_drive" not in fs["searchable_roots"]
+    assert "task_drive" in fs["searchable_roots"]  # read⇒search closure (TZ-1 E)
     assert "task_drive" in fs["allowed_shell_cwd_roots"]
     assert "status" in fs["git_readonly_subcommands"]
     assert "active_workspace" in fs["light_gated_roots"]
@@ -547,3 +579,40 @@ def test_delegation_fact_failure_never_drops_capability_digest(tmp_path, monkeyp
     # The surrounding digest survives intact.
     assert "allow_mutative_subagents" in capabilities
     assert "write_surfaces" in capabilities
+
+
+def test_runtime_names_its_capture_instant_and_how_this_run_learns_the_time(tmp_path):
+    """#1320: the runtime block is captured once; it says so instead of calling itself "now"."""
+    env = _make_health_env(tmp_path)
+    main = json.loads(build_runtime_section(env, {"id": "t1", "type": "task"}, captured_at="2027-01-15T12:00:00+00:00")
+                      .split("\n\n", 1)[1])
+    assert "utc_now" not in main and main["context_captured_at"] == "2027-01-15T12:00:00+00:00"
+    assert "not the current time" in main["clock_note"] and "host clock line" in main["clock_note"]
+    child = json.loads(build_runtime_section(env, {"id": "t2", "type": "task", "delegation_role": "subagent"})
+                       .split("\n\n", 1)[1])
+    assert "does not advance during this run" in child["clock_note"] and child["context_captured_at"]
+
+
+def test_captured_recent_and_drive_sections_carry_one_capture_label(tmp_path, monkeypatch):
+    """Recent*/Drive state are labelled with the core's single capture instant, below their headings,
+    and are not refreshed: two projections of one core carry byte-identical labels."""
+    from ouroboros import context as context_module
+    from ouroboros.context import build_llm_messages
+    from tests.test_cache_optimization import _make_env_and_memory
+
+    monkeypatch.setattr(context_module, "utc_now_iso", lambda: "2027-01-15T12:00:00+00:00")
+    env, memory = _make_env_and_memory(tmp_path)
+    logs = memory.drive_root / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    (logs / "chat.jsonl").write_text(json.dumps({
+        "ts": "2027-01-15T11:00:00+00:00", "direction": "in", "chat_id": 1, "text": "hello"}) + "\n",
+        encoding="utf-8")
+    messages, _info = build_llm_messages(env=env, memory=memory, task={
+        "id": "t-labels", "type": "task", "text": "hi", "_is_direct_chat": True, "chat_id": 1, "metadata": {}})
+    dynamic = messages[0]["content"][2]["text"]
+    label = "_Snapshot captured at 2027-01-15T12:00:00+00:00 when this context was built; not refreshed during this run._"
+    assert "## Drive state\n" + label in dynamic and "## Recent chat coverage\n" + label in dynamic
+    assert '"context_captured_at": "2027-01-15T12:00:00+00:00"' in dynamic
+    headings = [line for line in dynamic.splitlines() if line.startswith(("## Recent ", "## Drive state"))]
+    assert headings and all(dynamic.split(heading + "\n", 1)[1].startswith(label) for heading in headings)
+    assert "## Runtime context\n" + label not in dynamic  # labels are for the captured snapshots only

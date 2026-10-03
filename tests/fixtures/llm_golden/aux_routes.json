@@ -781,6 +781,19 @@
             "prompt_tokens_details": {
               "cached_tokens": 40
             },
+            "effort": {
+              "requested": "medium",
+              "sent": {
+                "extra_body.reasoning": {
+                  "effort": "medium",
+                  "exclude": false
+                }
+              },
+              "sent_state": "explicit",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            },
             "response_finish_reason": "stop",
             "cached_tokens": 40,
             "provider": "openrouter",
@@ -789,6 +802,11 @@
             "request_wire": {
               "requested_effort": "medium",
               "applied_effort": "medium",
+              "original_requested_effort": "medium",
+              "requested_effort_source": "provider_projection",
+              "applied_effort_source": "sent_candidate",
+              "reported_effort": null,
+              "reported_effort_source": null,
               "requested_tool_dialect": "none",
               "applied_tool_dialect": "none",
               "reason_code": "requested_wire_form",

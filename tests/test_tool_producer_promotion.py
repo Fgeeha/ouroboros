@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from ouroboros.artifacts import read_actor_source_bytes
-from ouroboros.headless import copy_child_task_result, prepare_task_drive, prune_headless_task_drives
+from ouroboros.headless import copy_child_task_result, prepare_task_drive, prune_headless_task_drives, retry_child_task_refs
 from ouroboros.loop_tool_execution import process_tool_results
 from ouroboros.observability import persist_call, read_blob_ref
 from ouroboros.task_results import STATUS_COMPLETED, write_task_result
@@ -48,13 +48,14 @@ def test_clean_source_in_model_request_survives_child_copyback_and_pruning(tmp_p
     write_task_result(child, task_id, STATUS_COMPLETED, result="done", artifact_status="ready",
                       trace_refs={"llm_call_refs": [{"request_ref": request["manifest_ref"]}]})
     copied = copy_child_task_result(parent, {"id": task_id, "drive_root": str(child)})
+    copied = retry_child_task_refs(parent, child, task_id)
     assert copied is not None and copied["child_ref_promotion"]["status"] == "complete"
     request_ref = copied["trace_refs"]["llm_call_refs"][0]["request_ref"]
     manifest = json.loads(Path(request_ref["path"]).read_text(encoding="utf-8"))
     promoted = read_blob_ref(parent, manifest["full_payload_ref"])["messages"][0]["content"]
     assert warning in promoted
     assert _marker_ref(promoted, "PRODUCER_RESULT_SOURCE_JSON=") == source
-    prune_headless_task_drives(parent, retention_days=0, now=4_000_000_000.0)
+    prune_headless_task_drives(parent, retention_days=0, now=4_000_000_000.0, live=lambda _task: False)
     assert not child.exists()
     assert read_actor_source_bytes(parent, task_id, source) == payload.encode("utf-8")
     canonical_ctx = ToolContext(repo_dir=repo, drive_root=parent, task_id=task_id)

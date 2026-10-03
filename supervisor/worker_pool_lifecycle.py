@@ -17,7 +17,6 @@ not pool state — nothing rebinds it — so the parent imports it back directly
 from __future__ import annotations
 
 import logging
-from supervisor.worker_process import _current_custody_session_id, worker_main
 import json
 import os
 import pathlib
@@ -62,16 +61,43 @@ def _serialized_worker_lifecycle(fn):
     return wrapped
 
 
+def _recorded_cancel_fields(task_id: str, *, stop_source: str = "", reason: str = "") -> dict:
+    """Keep the recorded intent's cause; only an absent intent permits a door fallback.
+
+    An unreadable authority supplies neither a recorded cause nor proof of absence.
+    """
+    try:
+        from ouroboros.cancel_intents import active_intent
+        from supervisor.cancel_publication import _intent_outcome_fields
+
+        intent = active_intent(_pool().DRIVE_ROOT, task_id, strict=True)
+        if intent:
+            return _intent_outcome_fields(intent)
+        return {"cancel_origin": {"source": stop_source, "reason": reason}} if stop_source else {}
+    except Exception:
+        log.warning("Stop cause of %s is unreadable; none recorded", task_id, exc_info=True)
+        return {}
+
+
 def _write_failure_result(
     task_id: str,
     reason: str = "Worker process crashed (crash storm). Task was not completed.",
     status: str = "",
+    stop_source: str = "",
 ) -> str:
     """Write failure result for a crashed/orphaned task.
 
     Returns the FINAL persisted status: if the task already reached a terminal
     state, the monotonic guard preserves it and that existing status is returned
     (so the UI event matches disk); otherwise the written failure status.
+
+    ``stop_source`` is the typed cause a known stop door passes (the owner's
+    Restart, a graceful server shutdown). It lands as ``cancel_origin`` — the
+    field a settled cancel intent records — and never outranks an earlier
+    stop: an active intent for the task is the cause as recorded (an owner
+    Stop stays a Stop), only a task no intent names takes the door's own
+    cause, and an unreadable intent store records none. A cancelled result
+    without a door source still retains its recorded intent (including Panic).
     """
     if not task_id:
         return ""
@@ -89,6 +115,8 @@ def _write_failure_result(
         # Reconstruct from durable llm_usage so an abnormally-finalized task does
         # not record zero cost/rounds (understating per-task + campaign metrics).
         f_cost_fields = _pool().reconstruct_task_cost(str(task_id), fields=True)
+        cause = (_recorded_cancel_fields(task_id, stop_source=stop_source, reason=reason)
+                 if stop_source or final_status == STATUS_CANCELLED else {})
         stored = write_task_result(
             _pool().DRIVE_ROOT,
             task_id,
@@ -103,6 +131,7 @@ def _write_failure_result(
                 review_trigger="worker_terminal",
             ),
             **f_cost_fields,
+            **cause,
         )
         persisted_status = str((stored or {}).get("status") or "").strip()
         if (
@@ -390,7 +419,7 @@ def _release_booting_slot(
     })
 
 
-def kill_worker_tree(pid: int, *, keep_services: bool = False) -> None:
+def kill_worker_tree(pid: int, *, keep_services: bool = False, panic_process=None):
     """The ONE worker process-tree kill, for every teardown and backstop.
 
     A worker's tree is not the worker's property: the installation's daemon
@@ -402,7 +431,14 @@ def kill_worker_tree(pid: int, *, keep_services: bool = False) -> None:
     ends those services with the generation, so the pool paths leave it off.
     The platform helper applies the same retained-subtree contract on every OS.
     """
-    from ouroboros.platform_layer import kill_pid_tree
+    from ouroboros.platform_layer import kill_pid_tree, request_process_tree_kill
+    if panic_process is not None:
+        # Explicit Panic has already requested installation-owned daemon stops.
+        # The supplied multiprocessing handle proves ownership without reading
+        # custody under the pool/queue locks. Ordinary teardown is unchanged.
+        if panic_process.pid != pid:
+            raise ValueError("Panic worker identity mismatch")
+        return request_process_tree_kill(panic_process)
     from supervisor import queue as _q
 
     spared = _q._retained_daemon_pids()
@@ -494,13 +530,17 @@ def _record_worker_pids() -> None:
 
         for w in _pool().WORKERS.values():
             if w.proc.pid:
-                record_process(
+                was_alive = w.proc.is_alive()
+                record = record_process(
                     _pool().DRIVE_ROOT,
                     pid=int(w.proc.pid),
                     cmd=f"ouroboros-worker-{w.wid}",
                     purpose=f"worker:{w.wid}",
                     scope="session",
                 )
+                if was_alive and w.proc.is_alive() and not getattr(w, "process_birth", ""):
+                    fingerprint = record["fingerprint"]
+                    w.process_birth = fingerprint.get("start_time_boot") or fingerprint.get("start_time") or ""
     except Exception:
         log.debug("Failed to ledger worker pids", exc_info=True)
 
@@ -649,6 +689,8 @@ def retire_worker(wid: int, slot: Any) -> bool:
         if _pool().WORKERS.get(wid) is not slot or slot.proc.is_alive():
             return False
         _pool().WORKERS.pop(wid)
+    from supervisor.worker_process import close_worker_stop_channel
+    close_worker_stop_channel(slot.proc)
     try:
         slot.in_q.close()
         slot.in_q.cancel_join_thread()
@@ -663,18 +705,13 @@ def _spawn_worker_slot(wid: int, old: Any = None, *, ready_attempt: int = 1) -> 
     ctx = _pool()._get_ctx()
     in_q = ctx.Queue()
     events_cursor, spawned_at = events_log_cursor(), time.time()
-    proc = ctx.Process(target=worker_main,
-                       args=(wid, in_q, _pool().get_event_q(), str(_pool().REPO_DIR), str(_pool().DRIVE_ROOT),
-                             _current_custody_session_id()))
-    proc.daemon = True
+    from supervisor.worker_process import close_worker_stop_channel, spawn_worker_process
+
     try:
-        proc.start()
+        proc = spawn_worker_process(ctx, wid, in_q, _pool().get_event_q(), _pool().REPO_DIR, _pool().DRIVE_ROOT)
     except Exception:
-        try:
-            in_q.close()
-            in_q.cancel_join_thread()
-        except Exception:
-            pass
+        in_q.close()
+        in_q.cancel_join_thread()
         raise
     installed = False
     with _queue_lock:
@@ -690,6 +727,7 @@ def _spawn_worker_slot(wid: int, old: Any = None, *, ready_attempt: int = 1) -> 
                 proc.terminate()
             proc.join(timeout=2)
         finally:
+            close_worker_stop_channel(proc)
             try:
                 in_q.close()
                 in_q.cancel_join_thread()
@@ -698,6 +736,8 @@ def _spawn_worker_slot(wid: int, old: Any = None, *, ready_attempt: int = 1) -> 
         return False
     # Close the crashed worker's old queue now that nothing can route to it,
     # otherwise its file descriptors / semaphores leak on every respawn.
+    if old is not None:
+        close_worker_stop_channel(old.proc)
     if old is not None and getattr(old, "in_q", None) is not None:
         try:
             old.in_q.close()

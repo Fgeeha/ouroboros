@@ -23,6 +23,7 @@ def test_update_state_is_exported_and_atomic(tmp_path):
     from supervisor import state
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     (tmp_path / "state").mkdir(parents=True, exist_ok=True)
     (tmp_path / "locks").mkdir(parents=True, exist_ok=True)
 

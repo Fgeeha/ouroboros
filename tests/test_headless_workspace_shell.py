@@ -7,6 +7,7 @@ git, and the preflight inference of binaries from manifests.
 """
 from __future__ import annotations
 
+import os
 import pathlib
 import sys
 
@@ -63,12 +64,21 @@ def test_workspace_context_routes_project_files_and_keeps_system_tools_reachable
 
 
 @pytest.mark.serial
-def test_workspace_run_shell_cwd_allows_scratch_and_explicit_system(tmp_path, monkeypatch):
+def test_workspace_run_shell_cwd_allows_scratch_and_explicit_system(tmp_path, tmp_path_factory, monkeypatch):
     """External-workspace tasks may run from host scratch (a sibling checkout, a
     /tmp tree) and explicitly select the system repo; generic runtime data stays
     off-limits and system-repo mutation remains independently governed."""
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
     monkeypatch.setenv("OUROBOROS_SAFETY_MODE", "off")
+    # The argv below launches the bare `python` from the launch PATH (argv is never
+    # rewritten), which a host shipping only `python3` (stock macOS) lacks. Put the
+    # running interpreter there under that name, outside the repo root.
+    executable = pathlib.Path(sys.executable)
+    python_dir = executable.parent
+    if os.name != "nt" and executable.name != "python":
+        python_dir = tmp_path_factory.mktemp("bare-python")
+        (python_dir / "python").symlink_to(executable)
+    monkeypatch.setenv("PATH", str(python_dir) + os.pathsep + os.environ.get("PATH", ""))
     # Pin $HOME outside tmp_path so the host-scratch cwd allowance holds on Windows
     # CI too (where pytest's tmp dir lives UNDER home and the data-parent-under-home
     # protection would otherwise block the sibling scratch cwd). See the same fixture

@@ -237,6 +237,21 @@ def build_anti_thrashing_rules_section(
     return "\n".join(lines)
 
 
+# The author's duty toward open review findings (docs/CHECKLISTS.md "Before
+# retrying after review findings"): the outcome is owed, the procedure is the
+# author's (BIBLE P13).
+REVIEW_REPAIR_JUDGMENT = (
+    "Consider the open findings together against the evidence and the accepted goal. "
+    "Repair what the requirement still needs, or replace or remove a means that is "
+    "yours to change, with evidence that the requirement still holds. An owner- or "
+    "parent-fixed requirement or method stays binding. A changed means does not make "
+    "a true historical finding false. Rebut unsupported findings or their current "
+    "applicability with reasons, preserving the record and anything unresolved. "
+    "How to inspect, group, order and explain that work, and whether to "
+    "seek more feedback first, is your judgment for this case."
+)
+
+
 def build_self_verification_template(
     findings: list,
     *,
@@ -244,7 +259,11 @@ def build_self_verification_template(
     tool_name: str = "commit_reviewed",
     context_noun: str = "diff",
 ) -> str:
-    """Return retry self-verification text, with circuit-breaker hint at attempt 3+."""
+    """Return the retry note from round 2: the open findings and the author's
+    outcome duties, without a prescribed procedure, fix-count STOP or escalating
+    prescription. It also renders beside findings that have no aggregate
+    verdict (a skill review that missed quorum keeps its partial FAILs), so it
+    names the recorded review state and defers paid/free retry to the gate."""
     if attempt_idx < 2:
         return ""
     finding_lines = "\n".join(
@@ -253,34 +272,24 @@ def build_self_verification_template(
     )
     if not finding_lines:
         finding_lines = "  (no findings captured — check review output above)"
-    self_verify = (
-        f"\n\n⚠️ Self-verification required before next {tool_name}:\n"
-        "For EACH finding listed above, explicitly state:\n"
-        "  Finding: [item name]\n"
-        "  Status: addressed / rebutted / pending\n"
-        "  Evidence: [file:line or symbol or test name]\n"
-        "  Note: [one sentence]\n\n"
-        "After the first blocked review, stop patching one finding at a time.\n"
-        f"Re-read the full {context_noun}, group obligations by root cause, rewrite the plan, then continue.\n\n"
-        f"Do NOT call {tool_name} until this table is filled in your response.\n"
+    return (
+        f"\n\nBefore the next {tool_name}:\n"
+        "The recorded review state and the individual findings below stand; your "
+        "response does not rewrite them or the configured enforcement.\n"
+        f"{REVIEW_REPAIR_JUDGMENT}\n"
+        f"Whether the next {tool_name} is replayed or refused for free, rejoins "
+        "unresolved review work, or pays for a new review follows the gate's "
+        "recorded replay eligibility, custody, budget and cycle limit, not this "
+        f"note. An eligible recorded verdict on an unchanged {context_noun} under "
+        "the same review contract is not re-reviewed without a genuinely new "
+        "review_rebuttal; an infrastructure outcome such as a missed reviewer "
+        f"quorum neither replays nor lapses a verdict, so an unchanged {context_noun} "
+        "without an eligible verdict may be reviewed again.\n"
+        "If attempts stop converging, reconsider the approach "
+        f"(for example split the {context_noun}, plan_task, or escalate) rather "
+        "than repeat it.\n"
         f"Open findings:\n{finding_lines}"
     )
-    if attempt_idx < 3:
-        return self_verify
-    circuit_breaker = (
-        f"\n\nCircuit-breaker hint (attempt {attempt_idx}+):\n"
-        f"Before calling {tool_name} again, pause and answer honestly:\n"
-        "- Am I patching one finding at a time, or did I re-read ALL findings together?\n"
-        "  (BIBLE P2: if the same class recurs with different wording, the fix is at\n"
-        "  the wrong level — do not keep patching instances.)\n"
-        "- Is my commit message growing each attempt? Long prose creates claim surface\n"
-        "  that reviewers then fact-check. Shrink to ONE subject line.\n"
-        "- Would `plan_task` surface the missing touchpoints cheaper than another\n"
-        "  blocked retry? Use it now if yes.\n"
-        "- If the same critical persists after two concrete fixes, STOP retrying:\n"
-        f"  split the {context_noun} or use `send_user_message` to escalate."
-    )
-    return self_verify + circuit_breaker
 
 
 _OBLIGATION_SUFFIX_RE = re.compile(r"\s*\(obligation\s+([a-z0-9][a-z0-9_-]*)\)\s*$", re.IGNORECASE)

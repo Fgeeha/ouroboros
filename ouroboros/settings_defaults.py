@@ -71,10 +71,15 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     "GIGACHAT_BASE_URL": "https://api.giga.chat/v1",
     "GIGACHAT_VERIFY_SSL_CERTS": "true",
     "GIGACHAT_PROFANITY_CHECK": "",
+    # PEM file with CA certificates ADDED to the default trust bundle for every
+    # first-party provider call (net_transport.extra_ca_bundle); "" = defaults only.
+    "OUROBOROS_EXTRA_CA_BUNDLE": "",
     "ANTHROPIC_API_KEY": "",
     "MINIMAX_API_KEY": "",
     "MINIMAX_REGION": "",
     "DEEPSEEK_API_KEY": "",
+    "ZAI_API_KEY": "",
+    "ZAI_PLAN": "",
     "OUROBOROS_NETWORK_PASSWORD": "",
     "OUROBOROS_SERVER_HOST": "127.0.0.1",
     "OUROBOROS_HOST_SERVICE_PORT": 8767,
@@ -97,7 +102,9 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     # unlike the worker lanes. (Renamed from the singular MODEL_FALLBACK.)
     "OUROBOROS_MODEL_FALLBACKS": OPENROUTER_DEFAULTS["fallback"],
     "OUROBOROS_SERVED_MODEL_REDOS": 2,  # redos of a round another model answered (`llm_substitution.py`)
-    "OUROBOROS_MODEL_DEEP_SELF_REVIEW": OPENROUTER_DEFAULTS["deep_self_review"],
+    # Empty preserves an unauthored default through settings merges/projection.
+    # The getter chooses the reachable default; existing nonempty choices stay pinned.
+    "OUROBOROS_MODEL_DEEP_SELF_REVIEW": "",
     "OUROBOROS_MAX_WORKERS": 10, "OUROBOROS_PRESENCE_MAX_ACTIVE": 2,
     "OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT": 6,
     "OUROBOROS_MAX_SUBAGENT_DEPTH": 3,

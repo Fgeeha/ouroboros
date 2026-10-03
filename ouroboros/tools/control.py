@@ -140,8 +140,9 @@ _SCHEDULE_SUBAGENT_DESCRIPTION = (
     "returns findings (it cannot write local state, commit, enable tools, or run "
     "shell/review/runtime/skills). Set write_surface to spawn a MUTATIVE (acting) child that "
     "writes on the selected surface. You remain the sole committer of the live Ouroboros body. "
-    "self_worktree is an isolated git worktree of THIS repo: apply its workspace.patch with "
-    "integrate_subagent_patch for parallel self-modification / best-of-N. Native children on "
+    "workspace_root selects the starting folder; omission inherits it. self_worktree copies "
+    "that Git source's current eligible files, including uncommitted work: return its patch "
+    "through integrate_subagent_patch for parallel changes / best-of-N. Native children on "
     "external_workspace write directly to the SHARED external project directory (write_root or "
     "the parent workspace); integrate_subagent_patch verifies the files already there without reapplying. "
     "genesis (a from-scratch new project — game/site/app/new Ouroboros — auto-provisioned as a fresh "
@@ -162,20 +163,14 @@ _SCHEDULE_SUBAGENT_DESCRIPTION = (
     "is allowed within configured depth/cap limits — use delegation_intent / may_mutate / "
     "may_fan_out to tell a child to recurse further, so a 'maximum subagents / grandchildren' "
     "request propagates structurally instead of collapsing into one flat layer. "
-    "BURST + ABSORB: when several children are INDEPENDENT, emit them in ONE batch (parallel "
-    "schedule_subagent calls in the same round) so they run concurrently, then absorb with "
-    "wait_tasks(any_terminal) — handling whichever finishes first — instead of scheduling and "
-    "blocking on them one at a time with serial wait_task calls — on cache-write-priced "
+    "BURST + ABSORB: independent children scheduled in the same round run concurrently; absorb "
+    "them with wait_tasks(any_terminal), which returns whichever finishes first. On cache-write-priced "
     "routes each sibling launched before the first sibling's first response pays its own full "
     "prefix write, so burst buys latency and spacing buys cash; your call. "
-    "INDEPENDENT VERIFIER: to check a finished deliverable without builder bias, spawn a "
-    "read-only child with memory_mode=empty whose objective carries ONLY the deliverable "
-    "location + the task's acceptance criteria (NOT your own probes/assumptions) and have it "
-    "verify through the task's own interface. "
     "EXCHANGE OF ADDRESSED TURNS: to make children participants whose position is not "
     "their whole participation, state the rules in objective/constraints (what is interim, "
-    "whom to address, what ends participation); a native child reaches you or a sibling with "
-    "forward_to_worker and waits with await_messages, and its final answer ends its "
+    "whom to address, what ends participation); a native child reaches you, a sibling or any "
+    "task in its tree with forward_to_worker and waits with await_messages, and its final answer ends its "
     "participation; a session (delegate_start) continues in the SAME session through "
     "delegate_answer when it can ask mid-run, else a later turn is a NEW run. Always retrieve "
     "the handoff with get_task_result, wait_task, or wait_tasks before relying on its results."
@@ -185,6 +180,18 @@ _SCHEDULE_SUBAGENT_DESCRIPTION = (
 def get_tools() -> List[ToolEntry]:
     from ouroboros.config import EFFORT_SCALE
     return [
+        ToolEntry("finish_task", {"name": "finish_task",
+            "description": "Select the complete answer and request completion of your current task. "
+                "Use finish after considering the observed work, or stop with a rationale naming unfinished work. "
+                "Select exactly one of answer or a host-offered answer_sha256. This grants no success, cancels no children, and retains all configured review and owner controls.",
+            "parameters": {"type": "object", "properties": {
+                "action": {"type": "string", "enum": ["finish", "stop"]}, "answer": {"type": "string", "description": "The complete answer, including a short correction."},
+                "answer_sha256": {"type": "string", "description": "Exact offered retained or whole held response hash."},
+                "rationale": {"type": "string", "description": "For stop, what remains unfinished."}, "acceptance_subject": {"type": "object", "properties": {"owner_source_sha256": {"type": "string"},
+                    "effective_criteria": {"type": "string"}, "material_tool_indices": {"type": "array", "items": {"type": "integer"}},
+                }, "required": ["owner_source_sha256"]},
+                "pending_review": {"type": "string", "enum": ["wait", "finish"], "default": "wait"},
+            }, "required": ["action"]}}, _finish_task),
         ToolEntry("set_tool_timeout", {
             "name": "set_tool_timeout",
             "description": "Update the global tool timeout in settings.json and apply it immediately without restart.",
@@ -289,7 +296,8 @@ def get_tools() -> List[ToolEntry]:
                 "owner's steering text; from a task it is written as a message from THIS task (never "
                 "owner text, no file attachments), and the result says written, not read. The task picks "
                 "it up at its next step. If no running task clearly fits, use promote_chat_to_task "
-                "(new work) or answer inline — never steer a task you are unsure about."
+                "(new work) or answer inline — never steer a task you are unsure about. "
+                "A Presence-bound turn can steer only work in its own binding; the host checks it."
             ),
             "parameters": {"type": "object", "properties": {
                 "task_id": {"type": "string", "description": "Id of the running task to steer (from current_chat.running_tasks)."},
@@ -356,6 +364,12 @@ def get_tools() -> List[ToolEntry]:
             "parameters": {"type": "object", "properties": {
                 "text": {"type": "string", "description": "Message text"},
                 "reason": {"type": "string", "description": "Why you're reaching out (logged, not sent)"},
+                "destination": {"type": "string", "enum": ["current", "main"], "default": "current",
+                                "description": "'current' (default): this conversation's room. 'main': the "
+                                               "owner's main chat, for a brief plain-text notice that belongs "
+                                               "there while this work lives in an owner-visible Project room. "
+                                               "It never appears in the Project thread and is not this task's "
+                                               "answer. Delegated, Presence and agent-to-agent work cannot use it."},
             }, "required": ["text"]},
         }, _send_user_message),
         ToolEntry("update_identity", {
@@ -382,23 +396,41 @@ def get_tools() -> List[ToolEntry]:
         }, _toggle_evolution),
         ToolEntry("toggle_consciousness", {
             "name": "toggle_consciousness",
-            "description": "Control background consciousness: 'start', 'stop', or 'status'.",
+            "description": ("Control background consciousness: 'start' or 'stop' (the owner is told), or "
+                            "'status' (answered to you only: the persisted state with its source, never posted to "
+                            "the owner's chat)."),
             "parameters": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": ["start", "stop", "status"], "description": "Action to perform"},
             }, "required": ["action"]},
         }, _toggle_consciousness),
         ToolEntry("set_next_wakeup", {
-            "name": "set_next_wakeup", "description": "Choose the consciousness wake-up interval in seconds: how long after a wake-up ends the next one starts (clamped into the owner's OUROBOROS_BG_WAKEUP_MIN/MAX bounds; a wake-up calling this sets its own next one; a pending wake-up keeps its time; stored for later when consciousness is off).", "parameters": {"type": "object", "properties": {"seconds": {"type": "integer", "description": "Seconds from the end of a wake-up to the next one"}}, "required": ["seconds"]},
+            "name": "set_next_wakeup", "description": (
+                "Choose the consciousness wake-up interval in seconds: how long after a wake-up ends the next one "
+                "starts, clamped into the owner's OUROBOROS_BG_WAKEUP_MIN/MAX. A wake-up calling this sets its own "
+                "next one; a wake-up already pending keeps its time; with consciousness off it is stored for later. "
+                "The alarm still adjusts it: a failed wake-up doubles the interval (up to MAX), a pending event "
+                "brings the next wake-up forward, a skipped one retries after MIN (an exhausted allowance waits for "
+                "its reset), and no wake-up starts sooner than MIN after the last wake-up, boot or skip."),
+            "parameters": {"type": "object", "properties": {"seconds": {"type": "integer", "description": "Seconds from the end of a wake-up to the next one"}}, "required": ["seconds"]},
         }, _set_next_wakeup),
         ToolEntry("switch_model", {
             "name": "switch_model",
             "description": "Switch to a different LLM model or reasoning effort level. "
                            "Use when you need more power (complex code, deep reasoning) "
-                           "or want to save budget (simple tasks). Takes effect on next round.",
+                           "or want to save budget (simple tasks). Takes effect on next round. "
+                           "After the host moved this turn to a configured fallback, primary='return' "
+                           "or 'wait' goes back to the turn's primary route.",
             "parameters": {"type": "object", "properties": {
                 "model": {"type": "string", "description": "Model name (e.g. anthropic/claude-sonnet-4). Leave empty to keep current."},
                 "effort": {"type": "string", "enum": list(EFFORT_SCALE),
                            "description": "Reasoning effort level (adapted down per route when a model tops out lower). Leave empty to keep current."},
+                "primary": {"type": "string", "enum": ["return", "wait"],
+                            "description": ("Omit to keep the current route. Return to this turn's primary route: its model, role and account policy "
+                                            "(Auto stays Auto) plus the owner's wait-card choice; effort stays. 'return': "
+                                            "if the primary refuses, configured routes are tried again. 'wait': if it "
+                                            "refuses or is unreachable, wait for it where this turn may wait instead of "
+                                            "paid alternatives. The next real request tests it; no timer or probe does. "
+                                            "Not with model.")},
             }, "required": []},
         }, _switch_model),
         ToolEntry("get_task_result", {
@@ -413,19 +445,21 @@ def get_tools() -> List[ToolEntry]:
                                               "description": "Read the full stored completion observations for this task, including returns omitted from the summary. Omit bounds for source length/hash, then request explicit character ranges."},
                 "include_focus_source": {"type": "boolean", "default": False, "description": "Read the exact bytes this task's focus source_ref answered when the focus was authored (the retained_source of an [INDEPENDENT_ROOTS] row); same bounds contract as include_completion_source."},
                 "focus_source_sha256": {"type": "string", "default": "", "description": "With include_focus_source: select the retained source by the sha256 the roster row quoted, so a later focus of the same author cannot substitute its evidence."},
+                "review_source_sha256": {"type": "string", "default": "", "description": "Root turns: read only the exact acceptance-review source named by a late-evidence digest, pinned to the physical task_id even after a retry. Works across forked/empty drives. Without a range returns complete_chars/hash; then use source_start_char/source_end_char to read exact text. Does not include authority."},
                 "source_start_char": {"type": "integer", "description": "Inclusive character offset for the requested canonical source range."},
                 "source_end_char": {"type": "integer", "description": "Exclusive character offset for the requested canonical source range. A range outside the source returns no text: the answer names complete_chars and the range received, and is an argument error."},
+                "presence_scope": {"type": "string", "enum": ["own_binding"], "description": "Presence tasks only: read just independent work started from this Presence binding (any of its conversations) or this task's own tree."},
             }},
         }, _get_task_result),
         ToolEntry("wait_task", {
             "name": "wait_task",
-            "description": "Wait for ONE subtask to reach a terminal status and return its effective result. May return EARLY (before terminal) if the child raises a tree_note blocker/question/interface_contract/review_requested/delegation_constraint beacon — the result then carries a [CHILD_BEACONS] block so you can steer, review, or override it. An unread message in your own mailbox also returns early so the ordinary loop can deliver and acknowledge it; the child keeps running. With SEVERAL children in flight, prefer wait_tasks(any_terminal) to absorb whichever finishes first rather than blocking serially on one id at a time.",
+            "description": "Wait for ONE subtask to reach a terminal status and return its effective result: the full single-child handoff once it settled (or when your known_result_sha256 no longer matches); a return BEFORE it settled carries the compact wait_tasks projection plus delegated_runs (its open delegated runs with dated observation facts, no liveness verdict). May return EARLY (before terminal) if the child raises a tree_note blocker/question/interface_contract/review_requested/delegation_constraint beacon — the result then carries a [CHILD_BEACONS] block so you can steer, review, or override it. An unread message in your own mailbox also returns early so the ordinary loop can deliver and acknowledge it; the child keeps running. With SEVERAL children in flight, prefer wait_tasks(any_terminal) to absorb whichever finishes first rather than blocking serially on one id at a time.",
             "parameters": {"type": "object", "required": ["task_id"], "properties": {
                 "task_id": {"type": "string", "description": "Task ID to check"},
                 "known_result_sha256": {"type": "string", "description": "Optional child_result_sha256 already obtained for this task. An exact match returns unchanged without repeating result/trace; current facts remain. Omit to return full text. This does not change when the wait ends."},
                 "timeout_sec": {"type": "integer", "default": 180, "description":
                                 "Maximum seconds to wait (default 180); a larger value is clamped to "
-                                f"{_WAIT_TASK_CLAMP_SEC}. Size the window to the child's expected life."},
+                                f"{_WAIT_TASK_CLAMP_SEC}, and a deadline narrows it (named in the result). Size the window to the child's expected life."},
             }},
         }, _wait_for_task, timeout_sec=7200),
         ToolEntry("wait_tasks", {
@@ -437,10 +471,10 @@ def get_tools() -> List[ToolEntry]:
                 "timeout_sec": {"type": "integer", "default": 600, "description":
                                 "Maximum seconds to wait (default 600); a larger value is clamped to "
                                 f"{_WAIT_TASKS_CLAMP_SEC}. Size the window to the children's expected life; "
-                                "an expired wait returns the still-live ids and this ceiling."},
+                                "an expired wait returns the still-live ids and this ceiling; a deadline narrows it (window_bound)."},
                 "mode": {"type": "string", "enum": ["all_terminal", "any_terminal"], "default": "all_terminal"},
             }},
-        }, _wait_for_tasks, timeout_sec=7200),
+        }, _wait_for_tasks, timeout_sec=_WAIT_TASKS_CLAMP_SEC + NESTED_SETTLEMENT_MARGIN_SEC),
         await_messages_entry(),
     ]
 
@@ -476,6 +510,7 @@ from ouroboros.tools.control_runtime import (  # noqa: E402, F401 -- intentional
     _promote_to_stable,
     _request_deep_self_review,
     _request_restart,
+    _finish_task,
     _send_user_message,
     _set_next_wakeup,
     _set_tool_timeout,
@@ -518,6 +553,7 @@ from ouroboros.tools.control_scheduling import (  # noqa: E402, F401 -- intentio
     maybe_emit_delegated_run_fanout,
 )
 from ouroboros.tools.control_task_results import (  # noqa: E402, F401 -- intentional public re-exports
+    NESTED_SETTLEMENT_MARGIN_SEC,
     _UNMINTED_WAIT_GRACE_SEC,
     _WAIT_TASK_CLAMP_SEC,
     _WAIT_TASKS_CLAMP_SEC,

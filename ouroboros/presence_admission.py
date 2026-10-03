@@ -100,11 +100,15 @@ def _required_selection_ready(root: Path, profile: Any, resolution: Any) -> None
                 and is_extension_live(target.provider, root)
             )
         elif isinstance(target, PresenceToolTarget):
-            from ouroboros.mcp_client import ensure_configured_from_settings, get_manager
+            from ouroboros.mcp_client import canonical_server_id, ensure_configured_from_settings, get_manager
 
             ensure_configured_from_settings(refresh=False)
             tool = get_manager().get_tool(target.name)
-            ready = bool(tool and str(tool.get("server_id") or "") == target.provider)
+            server = str(tool.get("server_id") or "") if tool else ""
+            # The same wire tool on the one server its stored provider names —
+            # exactly, or through the fixed-point id a pre-#1328 grant stored
+            # unconverged. An ambiguous id serves no tools, so it never matches.
+            ready = bool(server) and server in {target.provider, canonical_server_id(target.provider)}
         elif isinstance(target, PresenceScriptTarget):
             script_skill = find_skill(root, target.skill)
             scripts = {

@@ -334,6 +334,37 @@ def _maybe_inject_cost_budget_milestone(
     return True
 
 
+def _own_round_cost_sentence(ctx: Any, cost: float) -> tuple[str, str]:
+    """The reminder's money sentence from COST EVIDENCE first: a positive priced
+    delta (provider-reported or estimated cost of the nanny's own rounds) is
+    metered money; no price is an unknown cash cost, never zero. The latest round's
+    route is named only as context, and a fallback clause appears only when a
+    fallback chain is actually configured (a paid round is no proof the next is)."""
+    usage = getattr(ctx, "_accumulated_usage", None)
+    meta = usage.get("_last_llm_call_meta") if isinstance(usage, dict) else None
+    meta = meta if isinstance(meta, dict) else {}
+    model = str(meta.get("resolved_model") or meta.get("model") or "")
+    route = " / ".join(item for item in (str(meta.get("provider") or ""), model) if item)
+    if cost > 0:
+        cost_class, sentence = "priced", (
+            "Your own rounds here reported a price, so that spend is metered money")
+    else:
+        cost_class, sentence = "unpriced", (
+            "No provider price reached this task for your own rounds here: an unknown "
+            "cash cost, not a zero one")
+    sentence += f" (latest round: {route})." if route else "."
+    try:
+        from ouroboros.model_slots import get_fallback_models
+
+        fallbacks = get_fallback_models(str(meta.get("model") or ""))
+    except Exception:
+        fallbacks = []
+    if fallbacks:
+        sentence += (f" If this route stops serving, the configured fallback ({', '.join(fallbacks[:3])}) "
+                     "may take over, and a fallback round may be metered.")
+    return cost_class, sentence
+
+
 def _maybe_inject_nanny_economics_reminder(
     round_idx: int,
     messages: List[Dict[str, Any]],
@@ -378,13 +409,13 @@ def _maybe_inject_nanny_economics_reminder(
     # BR1-3: never an unconditional "$0" claim — the owner's wording law is
     # typed cost classes: known-zero only on a settled $0 spend, never "free"
     # unqualified (estimated/undisclosed spend is never zero).
+    cost_class, cost_sentence = _own_round_cost_sentence(ctx, cost)
     reminder = (
         "[NANNY ECONOMICS REMINDER]\n"
         f"You are a harness-dispatched NANNY and you have spent {_nanny_burn_phrase(rounds, cost)} "
         f"{since_phrase}. A subscription-lane delegated run has known-zero "
         "marginal cost only when its settled spend reports $0 (estimated or "
-        "undisclosed spend is never zero); every round you think yourself is "
-        "metered API money.\n"
+        f"undisclosed spend is never zero). {cost_sentence}\n"
         "This is a reminder, not a stop. Consider: delegate the remaining work "
         "(delegate_start / delegate_wait — follow-up work and fixes are delegated too), "
         "and keep your own rounds for judgment: acceptance, integration, honest "
@@ -400,6 +431,7 @@ def _maybe_inject_nanny_economics_reminder(
         "round": round_idx,
         "metered_rounds_since_delegate_activity": rounds,
         "metered_cost_since_delegate_activity_usd": round(cost, 4),
+        "own_round_cost_class": cost_class,
     })
     return True
 
@@ -664,8 +696,8 @@ def _maybe_inject_finalization_nudges(
                 or llm_trace.get("authoring_handover_incomplete"))
     if isinstance(handover, dict):
         baseline = int(handover.get("tool_calls_at_handover") or 0)
-        current = len(llm_trace.get("tool_calls") or [])
-        if current > baseline:
+        from ouroboros.tool_capabilities import substantive_tool_calls
+        if substantive_tool_calls((llm_trace.get("tool_calls") or [])[baseline:]):
             handover["status"] = "recovered"
             incomplete = llm_trace.pop("authoring_handover_incomplete", None)
             if isinstance(incomplete, dict):
@@ -835,6 +867,8 @@ def _maybe_inject_finalization_nudges(
         emit_progress("Verify-before-done nudge injected before final response.")
         llm_trace["reasoning_notes"].append("Verify-before-done nudge injected before final response.")
         return True
+    from ouroboros.tool_capabilities import substantive_tool_calls
+    work_calls = substantive_tool_calls(llm_trace.get("tool_calls"))
     # A3 one-shot no-op nudge: a declared deliverable but no tool calls,
     # reviewable effects or FINAL ANSWER marker this turn (family of the M2
     # expected_output_ungrounded flag). Own latch after the verify nudge; never
@@ -842,7 +876,7 @@ def _maybe_inject_finalization_nudges(
     if (
         not getattr(tools._ctx, "_noop_attempt_nudged", False)
         and str(_contract_expected_output(tools._ctx)).strip()
-        and not (llm_trace.get("tool_calls") or [])
+        and not work_calls
         and not turn_has_reviewable_effects(llm_trace)
         and not extract_final_answer(content or "")
     ):
@@ -872,7 +906,7 @@ def _maybe_inject_finalization_nudges(
         and _answer_protocol_active(tools._ctx)  # v6.60.0: marker nudge is protocol-gated
         and content and content.strip()
         and not extract_final_answer(content or "")
-        and ((llm_trace.get("tool_calls") or []) or turn_has_reviewable_effects(llm_trace))
+        and (work_calls or turn_has_reviewable_effects(llm_trace))
     ):
         tools._ctx._final_marker_nudged = True
         return _inject(

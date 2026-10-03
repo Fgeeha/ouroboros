@@ -152,6 +152,9 @@ def _presence_tool_allowed(ctx: Any, name: str) -> bool:
     )
 
     ceiling = presence_ceiling_from_context(ctx)
+    if name == "finish_task":
+        from ouroboros.dialogue_provenance import is_presence_task
+        return ceiling is None or not is_presence_task({"metadata": getattr(ctx, "task_metadata", {})})
     if name in {"presence_finish", "presence_cancel_work"}:
         return ceiling is not None
     return ceiling is None or presence_ceiling_allows_tool(ceiling, name)
@@ -191,6 +194,13 @@ def _presence_bound_args(ctx: Any, name: str, args: Any) -> tuple[dict[str, Any]
                 "⚠️ PRESENCE_CAPABILITY_BLOCKED: "
                 f"{name!r} is outside this presence task's positive capability ceiling."
             )
+        if ceiling is not None and name == "forward_to_worker":
+            # A selected forward keeps its own tree and reaches only this binding's work.
+            from ouroboros.presence_authority import presence_work_refusal
+
+            refusal = presence_work_refusal(ctx, str(bound.get("task_id") or ""), same_tree=True)
+            if refusal:
+                return {}, refusal
         return bound, ""
     except Exception as exc:
         return {}, f"⚠️ PRESENCE_ARGUMENT_BINDING_BLOCKED: {exc}"
@@ -300,7 +310,7 @@ class ToolRegistry:
         self._handler_overrides: Dict[str, Callable] = {}
 
     _FROZEN_TOOL_MODULES = [
-        "browser", "ci", "claude_advisory_review", "compact_context", "control",
+        "browser", "claude_advisory_review", "compact_context", "control",
         "core", "delegate", "edit_ops", "evolution_stats", "followup", "git", "git_pr", "git_rollback", "github",
         "health", "join_ledger", "knowledge", "media", "memory_tools", "plan_review", "project_journal", "presence",
         "recent_tasks",
@@ -470,6 +480,9 @@ class ToolRegistry:
 
     def _schema_for_entry(self, entry: ToolEntry) -> Dict[str, Any]:
         schema = entry.schema
+        if entry.name == "finish_task" and (self._is_local_readonly_subagent() or self._is_acting_subagent()):
+            schema = copy.deepcopy(schema)
+            schema["parameters"]["properties"].pop("pending_review", None)
         if self._is_local_readonly_subagent():
             if entry.name == "verify_and_record" and self._readonly_tool_allowed(entry.name):
                 # The read-only actor is allowed to mint exactly one kind of
@@ -498,9 +511,9 @@ class ToolRegistry:
             elif entry.name in {"browse_page", "browser_action"}:
                 schema = copy.deepcopy(entry.schema)
                 if entry.name == "browse_page":
-                    schema["description"] = "Open an HTTP(S) URL (external, or localhost on non-Ouroboros ports) or a file:// path under your workspace in a headless browser. Returns page content as text, html, markdown, or screenshot (base64 PNG) — use it with analyze_screenshot to visually verify your own built apps. The Ouroboros API ports, private/link-local IPs, and other URL schemes are blocked for subagents. Use viewport to test mobile layouts (e.g. '375x812')."
+                    schema["description"] = "Open an HTTP(S) URL (external, or localhost on non-Ouroboros ports) or a parent-readable file:// path in a headless browser. Returns page content as text, html, markdown, or screenshot (base64 PNG) — use it with analyze_screenshot to visually verify your own built apps. The Ouroboros API ports, private/link-local IPs, and other URL schemes are blocked for subagents. Use viewport to test mobile layouts (e.g. '375x812')."
                 if entry.name == "browser_action":
-                    schema["description"] = "Perform action on the current browser page (external HTTP(S), localhost on non-Ouroboros ports, or a file:// page under your workspace). Actions: click (selector), fill (selector + value), select (selector + value), screenshot (base64 PNG), scroll (value: up/down/top/bottom). JavaScript evaluate is unavailable to local-readonly subagents."
+                    schema["description"] = "Perform action on the current browser page (external HTTP(S), localhost on non-Ouroboros ports, or a parent-readable file:// page). Actions: click (selector), fill (selector + value), select (selector + value), screenshot (base64 PNG), scroll (value: up/down/top/bottom). JavaScript evaluate is unavailable to local-readonly subagents."
                     props = schema.get("parameters", {}).get("properties", {})
                     action_schema = props.get("action", {})
                     if isinstance((action_enum := action_schema.get("enum")), list):
@@ -546,15 +559,14 @@ class ToolRegistry:
 
     def _schema_with_matrix_roots(self, entry: ToolEntry) -> Dict[str, Any]:
         """A copy of the schema whose ``root`` enum is what the matrix grants this
-        profile for the tool's operation; query_code stays repo-only by contract."""
+        profile for the tool's operation; tool-specific root enums remain intact."""
         schema = copy.deepcopy(entry.schema)
         root_schema = schema.get("parameters", {}).get("properties", {}).get("root", {})
         operation = _target_binding_operation(entry.name, {})
         if isinstance(root_schema.get("enum"), list) and operation:
             root_schema["enum"] = [root for root in root_schema["enum"]
                 if decide_tool_access(profile=active_tool_profile(self._ctx), root=root,
-                                      operation=operation).allow
-                and (entry.name != "query_code" or root in {"active_workspace", "system_repo"})]
+                                      operation=operation).allow]
         return schema
 
     def _schemas_for_entry(self, entry: ToolEntry) -> List[Dict[str, Any]]:
@@ -644,7 +656,7 @@ class ToolRegistry:
         from ouroboros.mcp_client import ensure_configured_from_settings as _mcp_ensure_configured, get_manager as _mcp_get_manager
 
         if refresh:
-            _mcp_ensure_configured(refresh=True)
+            _mcp_ensure_configured(refresh=True, authority=self._ctx)
         manager = _mcp_get_manager()
         grants = self._acting_tool_grants() if self._is_acting_subagent() else None
         rows = [tool for tool in manager.list_tools_for_registry()
@@ -1007,9 +1019,11 @@ class ToolRegistry:
         resolved_binding: Any,
         interpreter_resolution: Any,
         worktree_before: Any,
+        handoff: Optional[Dict[str, Any]] = None,
     ) -> tuple[str | None, Any]:
         """Run one builtin handler under the scoped attestation."""
         from ouroboros.process_interpreters import interpreter_attestation
+        from ouroboros.owner_pause import OwnerPauseRefused, run_tool_handler
 
         observed_skill = None
         missing = object()
@@ -1048,7 +1062,7 @@ class ToolRegistry:
                         if refusal:
                             return refusal, None
                         observed_skill = (state_root, constraint)
-                    result = entry.handler(self._ctx, **handler_args)
+                    result = run_tool_handler(self._ctx, entry.handler, self._ctx, **handler_args)
                     published = _published_tool_result(
                         self._ctx,
                         tool_result_sentinel,
@@ -1060,6 +1074,8 @@ class ToolRegistry:
                     ):
                         return None, published
                     return None, result
+                except OwnerPauseRefused:
+                    raise
                 except TypeError as e:
                     return f"⚠️ TOOL_ERROR ({name}): {e}", None
                 except Exception as e:
@@ -1088,6 +1104,27 @@ class ToolRegistry:
                 self._invalidate_advisory_if_worktree_changed(name, worktree_before)
 
     def _execute_legacy_text(self, name: str, args: Dict[str, Any]) -> str | ToolResult:
+        from ouroboros.owner_pause import OwnerPauseRefused, tool_handoff
+
+        try:
+            with tool_handoff(self._ctx, str(name or "")) as handoff:
+                result = self._execute_admitted_text(name, args, handoff)
+                typed = result if isinstance(result, ToolResult) else LegacyTextResultAdapter.from_text(name, result)
+                # Host unwind/transport owners settle local execution. Business
+                # status and tool-authored metadata cannot create or negate a join.
+                handoff["settled"] = (handoff.get("settled") is True
+                    or handoff.get("local_extension_returned") is True
+                    or handoff.get("mcp_call_returned") is True)
+                return typed
+        except OwnerPauseRefused as exc:
+            from ouroboros.tools.tool_result import launch_refusal_result
+
+            return launch_refusal_result(str(exc))
+
+    def _execute_admitted_text(self, name: str, args: Dict[str, Any],
+                               handoff: Optional[Dict[str, Any]] = None) -> str | ToolResult:
+        if handoff is not None:
+            handoff["not_started"] = True
         name = str(name or "").strip()
         args, presence_arg_error = _presence_bound_args(self._ctx, name, args)
         if presence_arg_error:
@@ -1097,6 +1134,9 @@ class ToolRegistry:
         local_readonly_subagent = self._is_local_readonly_subagent()
         acting_subagent = self._is_acting_subagent()
         acting_self_worktree = acting_subagent and str(getattr(task_constraint, "surface", "") or "") == "self_worktree"
+        from ouroboros.workspace_copies import is_system_copy
+
+        acting_system_worktree = acting_self_worktree and is_system_copy(self._ctx)
         acting_protected_grant = acting_subagent and bool(getattr(task_constraint, "protected_paths_grant", False))
         acting_tool_grants = self._acting_tool_grants() if acting_subagent else set()
         entry = self._entries.get(name)
@@ -1162,6 +1202,8 @@ class ToolRegistry:
                 redirect = tool_resolution._light_binding_failure_result(name, args)
                 if redirect is not None:
                     return redirect
+                if name == "delegate_start":
+                    return tool_resolution.delegate_payload_binding_refusal(self._ctx, exc)
                 operation = tool_resolution._target_binding_operation(name, args)
                 if operation in {"shell", "service"}:
                     return shell_cwd_block_message(
@@ -1170,9 +1212,9 @@ class ToolRegistry:
                     name, str(args.get("root") or "active_workspace"), exc)
         # Asked three times below (light start_service, protected writes, the
         # light repo tripwire snapshot) and always with the same answer: an
-        # acting child's own worktree counts as the system repo.
+        # isolated child counts as the body only when its admitted source does.
         targets_system_repo = (
-            _binding_set_targets_system_repo(self._ctx, resolved_binding) or acting_self_worktree
+            _binding_set_targets_system_repo(self._ctx, resolved_binding) or acting_system_worktree
         )
         if not _presence_binding_allowed(self._ctx, resolved_binding):
             return (
@@ -1202,10 +1244,13 @@ class ToolRegistry:
         from ouroboros.consciousness_authority import effective_runtime_mode as _effective_runtime_mode
         _runtime_mode = _effective_runtime_mode(_runtime_mode, getattr(self._ctx, "task_metadata", None))
         if is_mcp:  # the exact catalog lookup precedes the paid safety check
-            return self._mcp_name_miss(name) or extension_dispatch._dispatch_mcp_tool_result(self._ctx, name, args)
+            miss = self._mcp_name_miss(name)
+            if miss is not None:
+                return miss
+            return extension_dispatch._dispatch_mcp_tool_result(self._ctx, name, args)
         if entry is None:
             if ext_tool and callable(ext_tool.get("handler")):
-                return extension_dispatch._dispatch_extension_tool_result(self._ctx, name, ext_tool, args)
+                return extension_dispatch._dispatch_extension_tool_result(self._ctx, name, ext_tool, args, handoff=handoff)
             return self._name_miss_result(name, extension_unavailable=extension_unavailable)
         args, interpreter_resolution, interpreter_block = tool_resolution._resolve_python_predispatch(
             self, name, args, _runtime_mode, effective_constraint, resolved_binding,
@@ -1230,11 +1275,11 @@ class ToolRegistry:
             # resolves user_files to the whole host, so a repository path
             # reached under THAT root is still Ouroboros self-modification.
             light_targets_system = (
-                _binding_set_is_light_restricted(self._ctx, resolved_binding) or acting_self_worktree
+                _binding_set_is_light_restricted(self._ctx, resolved_binding) or acting_system_worktree
                 or _user_files_binding_reaches_repo(self._ctx, resolved_binding)
             )
         else:
-            light_targets_system = not workspace_mode or acting_self_worktree
+            light_targets_system = not workspace_mode or acting_system_worktree
         if (
             _runtime_mode == "light"
             and name in _REPO_MUTATION_TOOLS
@@ -1269,7 +1314,7 @@ class ToolRegistry:
             if resolved_binding is not None:
                 protected_target = targets_system_repo
             else:
-                protected_target = (not workspace_mode or acting_self_worktree) and (
+                protected_target = (not workspace_mode or acting_system_worktree) and (
                     root_name in {"active_workspace", "system_repo"}
                 )
             protected_matches = (
@@ -1337,7 +1382,7 @@ class ToolRegistry:
                     effective_constraint=effective_constraint, resolved_binding=resolved_binding,
                 )
             early_error, result = self._invoke_builtin_handler(
-                name, entry, args, resolved_binding, interpreter_resolution, worktree_before,
+                name, entry, args, resolved_binding, interpreter_resolution, worktree_before, handoff,
             )
         if name in _PROCESS_COMMAND_TOOLS:
             # Tripwires run on the TOOL_ERROR path too: two early_error returns
@@ -1398,6 +1443,7 @@ class ToolRegistry:
                 pathlib.Path(self._ctx.drive_root),
                 mutation_root=pathlib.Path(self._ctx.repo_dir),
                 source_tool=tool_name,
+                mutating_task_id=str(getattr(self._ctx, "task_id", "") or ""),
             )
         except Exception:
             logging.getLogger(__name__).debug(

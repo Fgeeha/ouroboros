@@ -14,7 +14,7 @@ upgraded with a recorded reason + lineage gate) live here too.
 
 from __future__ import annotations
 
-from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
+from ouroboros.tools.tool_result import ToolResult, _publish_tool_result, completed_local_read
 
 import hashlib
 import json
@@ -24,6 +24,7 @@ from typing import Any, Dict
 
 from ouroboros.task_results import validate_task_id
 from ouroboros.task_status import load_effective_task_result, observe_cancellation_target
+from ouroboros.tool_access_paths import canonical_data_root as _status_drive_root
 from ouroboros.task_tree_ledger import (
     CHILD_RESULT_DISPOSITIONS,
     CHILD_RESULT_DISPOSITION_TYPE,
@@ -389,11 +390,6 @@ def _record_child_decision_beacon(ctx: ToolContext, task_id: str, text: str) -> 
         log.debug("Failed to record child decision beacon for %s", task_id, exc_info=True)
 
 
-def _status_drive_root(ctx: ToolContext) -> Path:
-    metadata = getattr(ctx, "task_metadata", {}) if isinstance(getattr(ctx, "task_metadata", {}), dict) else {}
-    return Path(str(metadata.get("budget_drive_root") or getattr(ctx, "budget_drive_root", "") or ctx.drive_root))
-
-
 def _is_own_child(ctx: ToolContext, status_drive_root: Path, tid: str, *, root_tree: bool = False) -> bool:
     """True if ``tid`` is a DIRECT child of the CURRENT task (D#7 safety): a parent
     decision may only describe the caller's OWN children, never an unrelated parent's
@@ -455,6 +451,7 @@ def _clip(text: object, limit: int, *, tail: bool = False) -> str:
     return f"{s[:limit]}…(+{omitted} more chars omitted)"
 
 
+@completed_local_read
 def _peek_task(ctx: ToolContext, task_id: str, view: str = "summary") -> str:
     """Read a child's CURRENT status + latest coordination beacons + result tail (D#7 — the
     parent's 'see intermediate findings' right). A PURE READ: it changes no state. The
@@ -649,12 +646,19 @@ def _resume_child_task(ctx: ToolContext, task_id: str, reason: str = "") -> str:
     )
 
 
-def _cancel_task(ctx: ToolContext, task_id: str, reason: str = "") -> str:
+def _cancel_task(ctx: ToolContext, task_id: str, reason: str = "", stop_action_id: str = "") -> str:
+    from supervisor.followup_policy import StopActionConflict
     try:
         tid = validate_task_id(task_id)
+        if not isinstance(stop_action_id, str) or len(stop_action_id) > 200:
+            raise ValueError("stop_action_id must be a string of at most 200 characters")
     except ValueError as exc:
         return f"⚠️ TOOL_ARG_ERROR (cancel_task): {exc}"
-    reason_text = _clip(" ".join(str(reason or "").split()), 500)
+    # The whole stated cause is the record: it rides the intent into custody,
+    # the settled ``cancel_origin`` and the receipt. The tree-ledger note and
+    # this reply only preview it, and ``_clip`` marks what they leave out.
+    reason_text = " ".join(str(reason or "").split())
+    reason_preview = _clip(reason_text, 500)
     status_drive_root = _status_drive_root(ctx)
     # Only stamp the join-ledger parent_decision (+ post to the tree ledger) when the
     # target is THIS task's own child — a cancel must not rewrite an unrelated task's
@@ -670,6 +674,23 @@ def _cancel_task(ctx: ToolContext, task_id: str, reason: str = "") -> str:
 
     if not own and (_is_delegated_task(ctx) or is_observe_origin(getattr(ctx, "task_metadata", {}))):
         return _publish_tool_result(ctx, ToolResult(status="blocked", code="ACCESS_BLOCKED", text=(f"⚠️ cancel_task: {tid} is not a child of this task — a delegated task may only cancel its own children, and a consciousness wake at the Observe level is held to the same rule.")))
+    from ouroboros.presence_authority import presence_caller_binding, presence_work_refusal
+
+    if not own and presence_caller_binding(ctx) is not None:
+        # A Presence caller stops only its own binding's work or its own tree, and
+        # a redirected retry is judged at its effective target too — before any intent.
+        from ouroboros.cancel_intents import _validated_single_cancel_target
+
+        refusal = presence_work_refusal(ctx, tid, drive_root=status_drive_root, same_tree=True)
+        if not refusal:
+            try:
+                effective = _validated_single_cancel_target(status_drive_root, tid)
+            except Exception:
+                effective = tid
+            if effective != tid:
+                refusal = presence_work_refusal(ctx, effective, drive_root=status_drive_root, same_tree=True)
+        if refusal:
+            return _publish_tool_result(ctx, ToolResult(status="blocked", code="ACCESS_BLOCKED", text=refusal))
     # Durable cancel intent — the ONE ingress (phase A, owner batch-4 1=A). The
     # canonical status never carries intent: the supervisor's cancellation
     # custody claims this intent, tears the task down, and settles the terminal
@@ -711,7 +732,12 @@ def _cancel_task(ctx: ToolContext, task_id: str, reason: str = "") -> str:
             requested_by=str(getattr(ctx, "task_id", "") or "") if own else "",
             allow_settled_target=live_ownership,
             observation=observation,
+            stop_action_id=stop_action_id,
         )
+    except StopActionConflict as exc:
+        return _publish_tool_result(ctx, ToolResult(status="blocked", code="STOP_ACTION_CONFLICT",
+            text=f"⚠️ STOP_ACTION_CONFLICT: {exc}; nothing was changed.",
+            meta={"operation_outcome": "completed_no_effect"}))
     except CancelIntentProjectionCorrupt:
         # GR4-8: a corrupt projection is not a transient — "retry" cannot
         # succeed until the file is repaired. The malformed file was preserved
@@ -746,7 +772,7 @@ def _cancel_task(ctx: ToolContext, task_id: str, reason: str = "") -> str:
     if own:
         _record_child_decision_beacon(
             ctx, tid,
-            f"requested cancellation of child {tid}" + (f": {reason_text}" if reason_text else ""),
+            f"requested cancellation of child {tid}" + (f": {reason_preview}" if reason_preview else ""),
         )
     # Emit live so the supervisor processes the cancellation within one loop tick;
     # the durable intent survives a lost event (the supervisor watchdog re-feeds it).
@@ -761,9 +787,10 @@ def _cancel_task(ctx: ToolContext, task_id: str, reason: str = "") -> str:
         "ts": utc_now_iso(),
     })
     note = " (live)" if emitted == "live" else " (deferred to round end)"
-    already = " (already requested earlier — idempotent)" if intent.get("already_requested") else ""
+    already = (" (same Stop action replayed)" if intent.get("stop_action_replayed") else
+               " (existing cancellation custody retained)" if intent.get("already_requested") else "")
     return (
-        f"Cancel requested: {tid}{(' — ' + reason_text) if reason_text else ''}{note}{already}. "
+        f"Cancel requested: {tid}{(' — ' + reason_preview) if reason_preview else ''}{note}{already}. "
         "cancel_state=pending until the supervisor confirms teardown; a child that "
         "already finished keeps its completed result (use discard_child_result to drop it)." + observed_note
     )
@@ -800,6 +827,7 @@ def get_tools() -> list[ToolEntry]:
             "parameters": {"type": "object", "properties": {
                 "task_id": {"type": "string"},
                 "reason": {"type": "string", "default": "", "description": "Why you are stopping it (recorded for the tree + review)."},
+                "stop_action_id": {"type": "string", "maxLength": 200, "description": "Stable ID for this Stop action: reuse after an uncertain response; use a new ID for a later intended Stop. Omission preserves legacy behavior without exact-retry deduplication."},
             }, "required": ["task_id"]},
         }, _cancel_task),
         ToolEntry("peek_task", {

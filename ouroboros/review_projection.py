@@ -151,7 +151,7 @@ def _review_actor_projection(actor: Any, surface: str) -> Dict[str, Any]:
     reason = reason or error or ("Reviewer response was malformed or absent." if not valid else "")
     if awaiting:
         reason = _AWAITING_REASON
-    model = str(usage.get("resolved_model") or row.get("model") or "")
+    model = str(usage.get("resolved_model", row.get("model")) or "")
     provider = str(usage.get("provider") or row.get("provider") or "")
     if not provider:
         provider = _sub().provider_for_model(model) if model else "unknown"
@@ -366,14 +366,17 @@ def compact_review_projection(review_runs: Any) -> Dict[str, Any]:
                 if key in raw_run:
                     panel[key] = copy.deepcopy(raw_run[key])
             # A panel that settled after its task ended carries the host's own
-            # sentence about it; the card prints those bytes verbatim, so the
-            # projection copies them under the same disclosed bound every other
-            # owner-facing review artifact uses.
+            # sentence about it; the card and the owner's row print those bytes
+            # verbatim, so the projection copies them under the same disclosed
+            # bound every other owner-facing review artifact uses, a cut said in
+            # words. The raw run keeps every byte, so a STORED applied record is
+            # named as the home of the rest (many reviewers can pass the bound).
             if isinstance(raw_run.get("late_settlement"), dict):
-                from ouroboros.utils import truncate_review_artifact
+                from ouroboros.acceptance_settlement import owner_bounded_text
 
                 late = copy.deepcopy(raw_run["late_settlement"])
-                late["note"] = truncate_review_artifact(str(late.get("note") or ""), 2000)
+                late["note"] = owner_bounded_text(str(late.get("note") or ""), 2000,
+                                                  in_record=panel["applied_source_status"] == "available")
                 panel["late_settlement"] = late
         for key in (
             "candidate_hash", "evidence_revision", "fence_hash", "binding_hash",
@@ -396,15 +399,120 @@ def _applied_source_unchanged(run: Dict[str, Any], raw: bytes) -> bool:
     return isinstance(ref, dict) and str(ref.get("sha256") or "") == hashlib.sha256(raw).hexdigest()
 
 
+def _actor_pending(actor: Dict[str, Any]) -> bool:
+    return (actor.get("transport_status") == AWAITING_PROJECTION
+            or actor.get("operation_state") in {"pending_dispatch", "in_flight"})
+
+
+def _producer_fact(actor: Dict[str, Any]) -> tuple:
+    """What one settled producer said, by identity and stored response, never by prose."""
+    ref = actor.get("response_ref") if isinstance(actor.get("response_ref"), dict) else {}
+    return (actor.get("operation_state"), actor.get("transport_status"), actor.get("parse_status"),
+            actor.get("semantic_verdict"), ref.get("sha256") or ref.get("call_id") or "")
+
+
+def _panel_merge(stored: Dict[str, Any], incoming: Dict[str, Any]) -> str:
+    """``advance``, ``same``, ``stored`` or ``conflict`` for one panel, compared slot by slot.
+
+    A slot advances (stored pending, incoming settled), regresses (the reverse)
+    or must carry the same producer facts. A snapshot that only advances wins;
+    one that only regresses is stale; a different operation, roster, subject
+    binding or settled fact — or a snapshot that advances one slot while
+    regressing another — is a conflict: neither projection can speak for both,
+    so the stored panel stays and the publisher is told.
+    """
+    for key in ("binding_hash", "candidate_hash"):
+        if stored.get(key) and incoming.get(key) and stored[key] != incoming[key]:
+            return "conflict"
+
+    def by_slot(panel: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+        return {str(actor.get("slot_id") or ""): actor for actor in panel.get("actors") or [] if isinstance(actor, dict)}
+
+    before, after = by_slot(stored), by_slot(incoming)
+    if set(before) != set(after):
+        return "conflict"
+    advances = regressions = 0
+    for slot_id, old in before.items():
+        new = after[slot_id]
+        if old.get("operation_id") and new.get("operation_id") and old["operation_id"] != new["operation_id"]:
+            return "conflict"
+        old_pending, new_pending = _actor_pending(old), _actor_pending(new)
+        if old_pending and not new_pending:
+            advances += 1
+        elif new_pending and not old_pending:
+            regressions += 1
+        elif not old_pending and _producer_fact(old) != _producer_fact(new):
+            return "conflict"
+    if advances and regressions:
+        return "conflict"
+    return "stored" if regressions else "advance" if advances else "same"
+
+
+def _keep_newer_producer_facts(existing: Any, incoming: Dict[str, Any]) -> tuple:
+    """Merge one incoming snapshot into the CANONICAL stored panels, slot by slot.
+
+    Another process (a late collector, the maintenance pass) may have published
+    a settled verdict or a late fact for the same panel. A stale snapshot keeps
+    the stored panel; a conflicting one is rejected rather than overwriting a
+    settled verdict; the first published late settlement keeps its bytes and
+    ``settled_at``; supersession only grows. Only a genuine advance is ordered
+    after the stored panel (its revision is raised past it); an unchanged
+    snapshot keeps its own revision, so a delayed older one never wins the
+    read-side merge. Returns ``(projection, rejected)``.
+    """
+    if not isinstance(existing, dict):
+        return incoming, []
+
+    def key(row: Dict[str, Any]) -> tuple:
+        return (str(row.get("surface") or ""), str(row.get("task_attempt") or ""), str(row.get("panel_id") or ""),
+                row.get("panel_index"))
+
+    stored = {key(row): row for row in existing.get("panels") or [] if isinstance(row, dict) and row.get("panel_id")}
+    panels, rejected, stamp = [], [], incoming.get("publication_revision") or 0
+    for row in incoming.get("panels") or []:
+        prior = stored.get(key(row)) if isinstance(row, dict) and row.get("panel_id") else None
+        if isinstance(prior, dict):
+            superseded = bool(prior.get("superseded") or row.get("superseded"))
+            decision = _panel_merge(prior, row)
+            if decision == "conflict":
+                rejected.append(str(row.get("panel_id") or ""))
+            if decision in {"stored", "conflict"}:
+                # The stored panel stands (the read-side union keeps it); this
+                # snapshot only adds a supersession it knows of.
+                if superseded and not prior.get("superseded"):
+                    panels.append({**copy.deepcopy(prior), "superseded": True})
+                continue
+            row = {**row, "superseded": superseded}
+            if isinstance(prior.get("late_settlement"), dict):
+                row["late_settlement"] = copy.deepcopy(prior["late_settlement"])
+            if decision == "advance" and type(prior.get("publication_revision")) is int:
+                row["publication_revision"] = max(int(row.get("publication_revision") or 0),
+                                                  prior["publication_revision"] + 1)
+                stamp = max(stamp, row["publication_revision"])
+        panels.append(row)
+    return {**incoming, "panels": panels, "publication_revision": stamp}, rejected
+
+
 def publish_acceptance_checkpoint(
     ctx: Any, llm_trace: Dict[str, Any], *, task_id: str = "",
-    drive_root: Any = None, chat_id: Any = None,
-) -> None:
+    drive_root: Any = None, chat_id: Any = None, partial_trace: bool = False,
+) -> Dict[str, Any]:
     """Save the complete applied host record before publishing its read model.
 
     This does not grant review authority or alter task lifecycle. Source bytes
     use the existing immutable artifact store; publication_revision only orders
-    concurrent snapshots of a panel within the existing task attempt.
+    snapshots of a panel. Under the result lock each panel is compared slot by
+    slot with the CANONICAL stored one (``_keep_newer_producer_facts``): only a
+    genuine producer advance is ordered past it, so neither a delayed older
+    snapshot nor a publication from another process (a late collector, the
+    maintenance pass) can overwrite a newer verdict. ``partial_trace`` (a trace
+    rebuilt from the published source) keeps the stored incident.
+
+    Returns what the canonical record now holds, read back from the locked
+    write itself: ``status`` (``published``, ``unavailable`` or ``skipped``),
+    the allocated ``revision``, the panel ids ``rejected`` as conflicting with
+    stored producer facts, and the stored ``projection``. A caller that must not
+    claim success unless its panel landed checks the returned projection.
     """
     from pathlib import Path
 
@@ -430,7 +538,7 @@ def publish_acceptance_checkpoint(
     # like every other published section before it leaves for an owner surface.
     incident = _sub().redact_projection(incident_projection(current_incident(llm_trace))).value
     if (not runs and not incident) or not task_id or not root:
-        return
+        return {"status": "skipped", "revision": 0, "rejected": [], "projection": {}}
     revision = int(llm_trace.get("_acceptance_publication_revision") or 0) + 1
     llm_trace["_acceptance_publication_revision"] = revision
     snapshots = copy.deepcopy(llm_trace.get("review_runs") or [])
@@ -488,16 +596,46 @@ def publish_acceptance_checkpoint(
         projection["task_attempt"] = attempt
     if incident:
         projection["acceptance_incident"] = incident
+    published: Dict[str, Any] = {}
+
+    def project(current: Dict[str, Any], fields: Dict[str, Any]) -> Dict[str, Any]:
+        existing = current.get("review_projection") if isinstance(current.get("review_projection"), dict) else None
+        incoming = copy.deepcopy(projection)
+        if partial_trace and isinstance(existing, dict) and "acceptance_incident" in existing:
+            incoming["acceptance_incident"] = copy.deepcopy(existing["acceptance_incident"])
+        incoming, rejected = _keep_newer_producer_facts(existing, incoming)
+        published.update(revision=incoming["publication_revision"], rejected=rejected,
+                         bumped={str(row.get("panel_id") or ""): row["publication_revision"]
+                                 for row in incoming.get("panels") or []
+                                 if isinstance(row, dict) and type(row.get("publication_revision")) is int
+                                 and row["publication_revision"] > revision})
+        return {"review_projection": merge_review_projection(existing, incoming),
+                "status": current.get("status") or fields["status"]}
+
     try:
-        result = write_task_result(
-            root, task_id, "running", review_projection=projection,
-            strict_existing_dict=True,
-            _field_projector=lambda current, fields: {**fields, "status": current.get("status") or "running"},
-        )
-        state = result.get("review_projection") or {}
+        result = write_task_result(root, task_id, "running", strict_existing_dict=True, _field_projector=project)
+    except (OSError, ValueError, TimeoutError) as exc:
+        logging.getLogger(__name__).warning("Applied acceptance projection unavailable", exc_info=True)
+        return {"status": "unavailable", "revision": 0, "rejected": [], "projection": {},
+                "error": f"{type(exc).__name__}: {exc}"}
+    allocated = published.get("revision", revision)
+    if published.get("rejected"):
+        logging.getLogger(__name__).warning("Acceptance panels %s conflict with stored producer facts; kept stored",
+                                            published["rejected"])
+    for run in llm_trace.get("review_runs") or []:
+        # An advance ordered past another process's stored panel carries that order on.
+        if isinstance(run, dict) and str(run.get("panel_id") or "") in (published.get("bumped") or {}) \
+                and run.get("publication_revision") == revision:
+            run["publication_revision"] = published["bumped"][str(run["panel_id"])]
+    llm_trace["_acceptance_publication_revision"] = max(
+        int(llm_trace.get("_acceptance_publication_revision") or 0), allocated)
+    state = result.get("review_projection") if isinstance(result.get("review_projection"), dict) else {}
+    try:
         _emit_review_reference(ctx, task_id, state, surface="task_acceptance", state_root=Path(root), chat_id=chat_id)
     except (OSError, ValueError, TimeoutError):
-        logging.getLogger(__name__).warning("Applied acceptance projection unavailable", exc_info=True)
+        logging.getLogger(__name__).warning("Acceptance review reference unavailable", exc_info=True)
+    return {"status": "published" if "revision" in published else "unavailable", "revision": allocated,
+            "rejected": list(published.get("rejected") or []), "projection": copy.deepcopy(state)}
 
 
 def acceptance_decision_projection(acceptance_decision: Dict[str, Any], subject_hash: str = "") -> Dict[str, Any]:
@@ -580,6 +718,24 @@ def merge_review_projection(previous: Any, incoming: Any) -> Any:
     """
     if not isinstance(previous, dict) or not isinstance(incoming, dict):
         return incoming
+    # A stale child snapshot cannot revoke the outbox's accepted duty. This
+    # receipt union is independent of reviewer authority and panel ordering,
+    # including legacy unstamped projections; one delivery id never migrates
+    # to another panel through a merge.
+    notices = {}
+    for source in (previous, incoming):
+        for delivery_id, receipt in (source.get("late_notice_receipts") or {}).items():
+            if not isinstance(receipt, dict):
+                continue
+            prior = notices.get(delivery_id)
+            def rank_notice(value):
+                revision = value.get("publication_revision")
+                return (value.get("custody") == "terminal_outbox", revision if type(revision) is int else 0)
+            if prior and (prior.get("panel_id") != receipt.get("panel_id") or rank_notice(prior) >= rank_notice(receipt)):
+                continue
+            notices[delivery_id] = copy.deepcopy(receipt)
+    if notices:
+        incoming = {**incoming, "late_notice_receipts": notices}
     old_rows, new_rows = previous.get("panels"), incoming.get("panels")
     if not isinstance(old_rows, list) or not isinstance(new_rows, list):
         return incoming

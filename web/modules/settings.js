@@ -19,6 +19,7 @@ import {
 } from './subagents_settings.js';
 import { initHarnessAccounts } from './harness_accounts.js';
 import { openConfirmDialog } from './confirm_dialog.js';
+import { confirmAndSendRestart } from './chat_activity.js';
 import { PROVIDER_TEST_INPUTS, SECRET_KEYS, bindSecretInputs, bindSettingsTabs, renderSettingsPage } from './settings_ui.js';
 import { showToast } from './toast.js';
 import { escapeHtmlAttr as escapeHtml, formatDualVersion } from './utils.js';
@@ -39,6 +40,7 @@ const INPUT_FIELDS = [
     ['s-openai-base-url', 'OPENAI_BASE_URL'], ['s-openai-compatible-base-url', 'OPENAI_COMPATIBLE_BASE_URL'], ['s-cloudru-base-url', 'CLOUDRU_FOUNDATION_MODELS_BASE_URL'],
     ['s-gigachat-scope', 'GIGACHAT_SCOPE'], ['s-gigachat-user', 'GIGACHAT_USER'], ['s-gigachat-base-url', 'GIGACHAT_BASE_URL'], ['s-gigachat-verify-ssl', 'GIGACHAT_VERIFY_SSL_CERTS'],
     ['s-minimax-region', 'MINIMAX_REGION'],
+    ['s-zai-plan', 'ZAI_PLAN'],
     ['s-server-host', 'OUROBOROS_SERVER_HOST', '127.0.0.1'],
     // 6.1: OUROBOROS_REVIEW_MODELS / OUROBOROS_SCOPE_REVIEW_MODELS are no
     // longer authored here — the Review lanes section composes the ONE
@@ -47,6 +49,7 @@ const INPUT_FIELDS = [
     // deep self-review row lives in Review lanes; the key is the backend's
     // invisible migration source for that row.
     ['s-skills-repo-path', 'OUROBOROS_SKILLS_REPO_PATH'],
+    ['s-extra-ca-bundle', 'OUROBOROS_EXTRA_CA_BUNDLE'],
     ['s-clawhub-registry-url', 'OUROBOROS_CLAWHUB_REGISTRY_URL'], ['s-websearch-model', 'OUROBOROS_WEBSEARCH_MODEL'], ['s-gh-repo', 'GITHUB_REPO'],
     ['s-local-source', 'LOCAL_MODEL_SOURCE'], ['s-local-filename', 'LOCAL_MODEL_FILENAME'], ['s-local-chat-format', 'LOCAL_MODEL_CHAT_FORMAT'],
     ['s-subagent-worktree-root', 'OUROBOROS_SUBAGENT_WORKTREE_ROOT'], ['s-subagent-projects-root', 'OUROBOROS_SUBAGENT_PROJECTS_ROOT'],
@@ -86,6 +89,13 @@ function setupModelSlots() {
 
 function byId(id) {
     return document.getElementById(id);
+}
+
+// A stored 0 is a value, not an absence: `fallback && !value` rendered a saved
+// 0 (e.g. OUROBOROS_CONSCIOUSNESS_DAILY_USD) as its fallback, and the next save
+// of ANY tab wrote the fallback back. Only a missing value takes the fallback.
+export function storedOrFallback(value, fallback) {
+    return fallback && (value === undefined || value === null || value === '') ? fallback : value;
 }
 
 function applyInputValue(id, value) {
@@ -402,12 +412,13 @@ function collectSecretValue(id, body) {
  * Exported for dependency-free node tests.
  */
 export function moreProvidersCredentialConfigured({
-    cloudruKey = '', minimaxKey = '', deepseekKey = '', gigachatCredentials = '', gigachatUser = '', gigachatPassword = '',
+    cloudruKey = '', minimaxKey = '', deepseekKey = '', zaiKey = '', gigachatCredentials = '', gigachatUser = '', gigachatPassword = '',
 } = {}) {
     const has = (v) => Boolean(String(v ?? '').trim());
     return has(cloudruKey)
         || has(minimaxKey)
         || has(deepseekKey)
+        || has(zaiKey)
         || has(gigachatCredentials)
         || (has(gigachatUser) && has(gigachatPassword));
 }
@@ -429,21 +440,11 @@ export function providerTestResultIsCurrent({
 }
 
 // Decision 16=A (#285): the settings "Restart now" action reuses the existing
-// owner command contract — the same WS `/restart` the chat header sends. The
-// whole confirm-and-send flow lives here (node-tested, panic-flow precedent):
-// the click handler only injects real deps. queue:false keeps a disconnected
-// page from silently queueing a destructive command for a later reconnect.
-export async function confirmAndSendRestart({ openConfirmDialog: confirmDialog, ws: socket }) {
-    const confirmed = await confirmDialog({
-        title: 'Restart agent',
-        body: 'All running and queued tasks stop, then the agent process restarts.\nSaved settings apply after the restart.',
-        confirmLabel: 'Restart',
-        danger: true,
-    });
-    if (!confirmed) return 'cancelled';
-    const result = socket?.send?.({ type: 'command', cmd: '/restart' }, { queue: false });
-    return result?.status === 'sent' ? 'sent' : 'not_connected';
-}
+// owner command contract — the same WS `/restart` the chat header sends, through
+// the ONE shared confirmation both Restart buttons use (owner quiz 285597). The
+// whole confirm-and-send flow lives in chat_activity.js (node-tested, beside the
+// Panic flow); this page re-exports it and its click handler only injects deps.
+export { confirmAndSendRestart };
 
 export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     const page = document.createElement('div');
@@ -671,7 +672,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         });
         page.querySelectorAll('[data-provider-test-status]').forEach((el) => setInlineStatus(el, '', 'muted'));
         applySecretInputs(page, s);
-        INPUT_FIELDS.forEach(([id, key, fallback = '']) => applyInputValue(id, fallback && !s[key] ? fallback : s[key]));
+        INPUT_FIELDS.forEach(([id, key, fallback = '']) => applyInputValue(id, storedOrFallback(s[key], fallback)));
         VALUE_FIELDS.forEach(([id, key, fallback]) => { byId(id).value = s[key] || fallback; });
         modelRoles.load(s, { ...setupContract, modelSlots: setupModelSlots().map((slot) => ({
             ...slot, inputId: slot.settingsInputId,
@@ -680,7 +681,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         // Owner-facing mutative-subagents control shows the EFFECTIVE state when it
         // is binary-representable: an explicit value, or unset in advanced/pro
         // (every acting surface on = "On"). Unset in LIGHT mode is surface-aware
-        // (external_workspace/genesis stay on, self_worktree off — see
+        // (external work, including isolated project copies, stays on; own-body copies off — see
         // config.get_allow_mutative_subagents), so neither Off nor On is truthful
         // there: it displays as "Auto". Picking Auto saves the empty value
         // (collectBody maps any non-on/off segment to ''), so the mode default
@@ -761,6 +762,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             cloudruKey: value('s-cloudru-key'),
             minimaxKey: value('s-minimax-key'),
             deepseekKey: value('s-deepseek-key'),
+            zaiKey: value('s-zai-key'),
             gigachatCredentials: value('s-gigachat-credentials'),
             gigachatUser: value('s-gigachat-user'),
             gigachatPassword: value('s-gigachat-password'),

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
+from ouroboros.tools.tool_result import ToolResult, _publish_tool_result, completed_local_read, publish_no_effect
 
+import copy
+import json
 import logging
 import os
 import pathlib
@@ -16,7 +18,6 @@ from ouroboros.artifacts import artifact_store_path_block_reason, copy_file_to_t
 from ouroboros.project_facts import filter_out_project_store as _filter_out_project_store  # noqa: F401
 from ouroboros.project_facts import project_store_access_block as _project_store_access_block
 from ouroboros.protected_artifacts import block_reason_for_path
-from ouroboros.secret_masking import mask_secret_bytes
 from ouroboros.tools.registry import ToolContext, ToolEntry, active_repo_dir_for  # noqa: F401
 from ouroboros.tool_access import (
     ResolvedResourceBinding,
@@ -46,12 +47,11 @@ from ouroboros.contracts.skill_payload_policy import (
     is_skill_create_typo,
     resolve_skill_payload_target,
 )
+from ouroboros.tools.core_secret_paths import is_restricted_subagent_profile  # noqa: F401
 from ouroboros.tools.core_file_tools import (  # noqa: F401
     _ListingFailure,
     _MEMORY_AT_DRIVE_MEMORY,
-    _raw_owner_secret_access_allowed,
     _SKILL_OWNER_STATE_FILENAMES,
-    _SUBAGENT_SECRET_FILE_NAMES,
     _access_or_block,
     _annotate_reread,
     _coerce_line_window,
@@ -59,18 +59,11 @@ from ouroboros.tools.core_file_tools import (  # noqa: F401
     _data_list,
     _data_read,
     _direct_resource_binding,
-    _filter_subagent_secret_listing,
-    _filter_subagent_secret_repo_listing,
     _is_cognitive_data_path,
     _is_skill_owner_state_target,
-    _is_subagent_secret_data_path,
-    _is_subagent_secret_repo_path,
-    _is_subagent_secret_repo_target,
-    make_subagent_secret_target_check,
     _list_dir,
     _list_files,
     _list_user_files_dir,
-    _local_readonly_resource_block,
     _normalize_data_read_path,
     _profile_roots_hint,
     _read_file,
@@ -78,7 +71,7 @@ from ouroboros.tools.core_file_tools import (  # noqa: F401
     _repo_list,
     _repo_read,
     _root_display_path,
-    is_restricted_subagent_profile,
+    _runtime_data_read_check,
 )
 from ouroboros.tools.core_artifacts import (  # noqa: F401
     _MAX_DOCUMENT_FILE_BYTES,
@@ -94,6 +87,7 @@ from ouroboros.tools.core_artifacts import (  # noqa: F401
     QuizValidationError,
     _MAX_LINK_ACTIONS,
     _MAX_QUIZ_OPTIONS,
+    ESCALATE_TOOL_SCHEMA,
     _escalate,
     _send_links,
     validate_link_actions,
@@ -206,15 +200,16 @@ def _str_match_replace(
     """Shared exact, byte-level, single-occurrence replacement for both str-replace
     editors — the repo editor (``git._str_replace_editor``) and the data-plane editor
     (``_edit_text``) — so they give IDENTICAL match feedback (deferral 4). Returns
-    ``(new_text, None)`` on a unique match, else ``(None, error_message)`` with the
-    count==0 file preview / count>1 positional hints. ``error_tag`` is the caller's
-    error prefix (e.g. ``STR_REPLACE_ERROR`` / ``EDIT_TEXT_ERROR``)."""
+    ``(new_text, None)`` on a unique match, else ``(None, error_message)``: a miss
+    carries the bounded edit-miss locator (plus the whole file when it is small),
+    duplicates name positions. ``error_tag`` is the caller's error prefix (e.g.
+    ``STR_REPLACE_ERROR`` / ``EDIT_TEXT_ERROR``)."""
     count = text.count(old_str)
     if count == 0:
-        preview = text[:2000]
+        from ouroboros.tools.edit_ops import locate_edit_miss, whole_file_preview
         return None, (
             f"⚠️ {error_tag}: old_str not found in {display_path}.\n"
-            f"File preview (first 2000 chars):\n{preview}"
+            f"{locate_edit_miss(text, old_str)}{whole_file_preview(text)}"
         )
     if count > 1:
         positions = []
@@ -551,7 +546,7 @@ def _write_file(
 ) -> str:
     normalized, block = _access_or_block(ctx, root, "write")
     if block:
-        return block
+        return publish_no_effect(ctx, block, tool_name="write_file")
     try:
         if _resolved_binding is None and files:
             bindings: ResolvedResourceBinding | tuple[ResolvedResourceBinding, ...] = tuple(
@@ -723,7 +718,7 @@ def _edit_text(
     cyber = mode_has_unrestricted_agency(get_runtime_mode())
     normalized, block = _access_or_block(ctx, root, "edit")
     if block:
-        return block
+        return publish_no_effect(ctx, block, tool_name="edit_text")
     try:
         binding = _direct_resource_binding(
             ctx, _resolved_binding, root=normalized, operation="edit", path=path,
@@ -731,7 +726,7 @@ def _edit_text(
         )
     except Exception as exc:
         prefix = "SKILL_PAYLOAD_ARG_ERROR" if normalized == "skill_payload" else "EDIT_TEXT_ERROR"
-        return f"⚠️ {prefix}: {exc}"
+        return publish_no_effect(ctx, f"⚠️ {prefix}: {exc}", tool_name="edit_text")
     reason = block_reason_for_path(ctx, binding.target_path, "write", binding)
     protected_block = (
         f"⚠️ EDIT_TEXT_BLOCKED: protected artifact path blocked: {reason}" if reason else ""
@@ -797,15 +792,20 @@ def _edit_text(
             block_reason = artifact_store_path_block_reason(target, base_path=binding.base_path)
             if block_reason:
                 return f"⚠️ EDIT_TEXT_BLOCKED: artifact_store path blocked: {block_reason}"
-        text = target.read_text(encoding="utf-8")
+        try:
+            text = target.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return publish_no_effect(ctx, f"⚠️ EDIT_TEXT_ERROR: file not found: {_root_display_path(normalized, path)}", tool_name="edit_text")
+        except OSError as exc:
+            return publish_no_effect(ctx, f"⚠️ EDIT_TEXT_ERROR: {type(exc).__name__}: {exc}", tool_name="edit_text")
         new_text, match_error = _str_match_replace(
             text, old_str, new_str, _root_display_path(normalized, path), "EDIT_TEXT_ERROR"
         )
         if match_error:
-            return match_error
+            return publish_no_effect(ctx, match_error, tool_name="edit_text")
         # Exact replace and full overwrite share the intentional-shrink contract.
         if (shrink := _check_data_shrink_guard(target, new_text, force)):
-            return shrink
+            return publish_no_effect(ctx, shrink, tool_name="edit_text")
         constraint = normalize_task_constraint(getattr(ctx, "task_constraint", None))
         repair = selected_payload and constraint and constraint.has_selected_skill
         if repair:
@@ -863,6 +863,7 @@ from ouroboros.code_search_rg import (  # noqa: E402
 )
 
 
+@completed_local_read
 def _code_search(ctx: ToolContext, query: str, path: str = ".",
                  regex: bool = False, max_results: int = 200,
                  include: str = "", root: str = "active_workspace",
@@ -883,7 +884,7 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
         return f"⚠️ USER_FILES_PATH_BLOCKED: {exc}"
     except Exception as exc:
         return f"⚠️ SEARCH_ERROR: {type(exc).__name__}: {exc}"
-    if normalized == "runtime_data" and (b := _project_store_access_block(_normalize_data_read_path(ctx, path))):
+    if normalized == "runtime_data" and (b := _project_store_access_block(binding.target_path.relative_to(binding.base_path).as_posix())):
         return b
 
     max_results = min(max(1, max_results), _MAX_SEARCH_RESULTS)
@@ -901,6 +902,9 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
             search_root.relative_to(root_path.resolve(strict=False))
         except ValueError:
             return f"⚠️ SEARCH_ERROR: path escapes root: {display_search_path}"
+    runtime_check = _runtime_data_read_check(ctx, root=binding.root)
+    if runtime_block := runtime_check(search_root):
+        return runtime_block
     protected_root_block = block_reason_for_path(
         ctx, search_root, "static_introspection", binding
     )
@@ -911,14 +915,6 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
     )
     if protected_root_read_block and search_root.is_file():
         return protected_root_read_block
-    subagent_readonly = is_restricted_subagent_profile(ctx)
-    secret_check = None
-    if subagent_readonly:
-        secret_repo = root_path if normalized in {"active_workspace", "system_repo"} else active_repo_dir_for(ctx)
-        secret_check = make_subagent_secret_target_check(secret_repo, ctx=ctx)
-        block_msg = _local_readonly_resource_block(ctx, normalized, search_root, root_path, action="SEARCH", secret_check=secret_check)
-        if block_msg:
-            return block_msg
     root_resolved = root_path.resolve(strict=False)
     _rt_search_root = str(root_resolved) if normalized == "runtime_data" else ""
     # Filter receipt (D3, capinv-447): every file present under the search root
@@ -941,36 +937,16 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
         # runtime_data per-project store is reachable only via scoped knowledge tools.
         if normalized == "runtime_data" and rel_parts and str(rel_parts[0]).casefold() == "projects":
             return _drop("project_store_scoped")
-        if subagent_readonly and _local_readonly_resource_block(ctx, normalized, fp, root_path, action="SEARCH", secret_check=secret_check):
-            return _drop("restricted_subagent")
         if normalized == "user_files" and user_files_path_block_reason(ctx, fp, operation="search"):
             return _drop("user_files_policy")
+        if runtime_check(fp):
+            return _drop("runtime_data_policy")
         if block_reason_for_path(ctx, fp, "read_bytes", binding):
             return _drop("protected_artifact")
         skip = _search_skip_reason(fp)
         if skip:
             return _drop(skip)
         return True
-
-    def _mask_user_files_matches(result_text: str) -> str:
-        # Same egress seam as _read_file (#447 В23): a search over the owner's
-        # home surfaces file CONTENT in the match lines, so bytes in a
-        # recognized credential format or a PEM block are masked here too, on
-        # BOTH the rg path and the Python fallback; secrets in unrecognized
-        # formats are not detected. Names/paths stay; masked values become ***.
-        if normalized != "user_files" and not subagent_readonly:
-            return result_text
-        if normalized == "user_files" and _raw_owner_secret_access_allowed(ctx):
-            return result_text
-        masked_text, masked = mask_secret_bytes(result_text)
-        if masked:
-            masked_text += (
-                f"\n⚠️ SECRET_BYTES_MASKED: {masked} span(s) in these matches matched "
-                "a recognized credential format or a PEM block and were replaced with "
-                "***; secrets in unrecognized formats are not detected. Reference the "
-                "masked ones by location, not value."
-            )
-        return masked_text
 
     # Validate a regex query UP FRONT so the invalid-regex contract holds for BOTH the
     # ripgrep path and the Python fallback. ripgrep accepts some malformed patterns
@@ -996,11 +972,11 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
                 search_root, query, regex=bool(regex), include=include,
                 max_results=max_results, path_allowed=_path_allowed_for_rg,
             )
-            return _mask_user_files_matches(format_search_result(
+            return format_search_result(
                 display_path=display_search_path, root_name=normalized,
                 root_path=root_path, query=query, regex=bool(regex),
                 max_results=max_results, result=rg_result, dropped=search_drops,
-            ))
+            )
     except (FileNotFoundError, RuntimeError, subprocess.SubprocessError, OSError) as e:
         # Degrade to the policy-aware Python scanner for rg absent/failed/timeout
         # AND OSError (wrong-arch/non-executable bundled rg -> 'Exec format
@@ -1058,26 +1034,17 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
                 else:
                     kept_dirs.append(d)
             dirnames[:] = kept_dirs
-        if subagent_readonly:
-            kept_dirs = []
-            for d in dirnames:
-                if _local_readonly_resource_block(ctx, normalized, pathlib.Path(dirpath) / d, root_path, action="SEARCH", secret_check=secret_check):
-                    _drop("restricted_subagent")
-                else:
-                    kept_dirs.append(d)
-            dirnames[:] = kept_dirs
-
         for fname in sorted(filenames):
             fp = pathlib.Path(dirpath) / fname
 
             if not matches_include(fname, include):
                 continue
 
-            if subagent_readonly and _local_readonly_resource_block(ctx, normalized, fp, root_path, action="SEARCH", secret_check=secret_check):
-                _drop("restricted_subagent")
-                continue
             if normalized == "user_files" and user_files_path_block_reason(ctx, fp, operation="search"):
                 _drop("user_files_policy")
+                continue
+            if runtime_check(fp):
+                _drop("runtime_data_policy")
                 continue
             if block_reason_for_path(ctx, fp, "read_bytes", binding):
                 _drop("protected_artifact")
@@ -1127,27 +1094,19 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
         "may be incomplete; narrow the path or glob, or raise OUROBOROS_SEARCH_CODE_WALL_SEC."
         if deadline_hit else ""
     )
-    # Typed disclosure, not invisibility (capinv-447): a restricted subagent is
-    # TOLD how many secret/control files its search could not see, mirroring the
-    # listing filters' hidden-entries marker.
     protected_omitted = search_drops.get("protected_artifact", 0)
-    restricted_omitted = search_drops.get("restricted_subagent", 0)
-    restricted_note = (
-        f" {restricted_omitted} secret/control file(s) omitted from this subagent's search."
-        if restricted_omitted else ""
-    )
     # Filter receipt for the remaining ordinary exclusions (D3): oversized,
     # symlinks, excluded names, unreadable, policy-scoped — never silent.
     from ouroboros.code_search_rg import format_dropped_files_note
 
     other_dropped_note = format_dropped_files_note({
         key: count for key, count in search_drops.items()
-        if key not in ("protected_artifact", "restricted_subagent")
+        if key != "protected_artifact"
     })
     if not matches:
         suffix = f" {protected_omitted} protected artifact file(s) omitted." if protected_omitted else ""
         cap_note = f" Scan stopped after {_MAX_SEARCH_FILES_SCANNED} files — narrow the path or glob." if files_capped else ""
-        return f"No matches found for {'regex' if regex else 'literal'} `{query}` in {display_search_path} ({files_searched} files searched).{suffix}{restricted_note}{other_dropped_note}{cap_note}{deadline_note}"
+        return f"No matches found for {'regex' if regex else 'literal'} `{query}` in {display_search_path} ({files_searched} files searched).{suffix}{other_dropped_note}{cap_note}{deadline_note}"
 
     header = f"Found {len(matches)} match{'es' if len(matches) != 1 else ''} in {display_search_path} ({files_searched} files searched)"
     if files_capped:
@@ -1158,29 +1117,27 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
         header += " — stopped at the time budget (results may be incomplete)"
     if protected_omitted:
         header += f" — {protected_omitted} protected artifact file(s) omitted"
-    if restricted_omitted:
-        header += f" — {restricted_omitted} secret/control file(s) omitted from this subagent's search"
     if other_dropped_note:
         header += " —" + other_dropped_note.rstrip(".")
-    return _mask_user_files_matches(header + "\n\n" + "\n".join(matches))
+    return header + "\n\n" + "\n".join(matches)
 
 
 def _forward_to_worker(
     ctx: ToolContext, task_id: str, message: str, relayed_from_task_id: str = "",
 ) -> str:
-    """Write a task-tree message into a running task's mailbox: one writer for a
-    descendant (an ancestor's or relayed sibling's message), for the caller's
-    own parent or sibling (a peer contribution, never authority), and for any
-    active independent root the host lists (a message from an independent task,
-    owner 6C). Never owner text; WRITTEN, not read -- the recipient drains it
-    later, from its recorded drive or the canonical root, never the sender's."""
+    """Write task context to the recipient's mailbox, never owner text.
+    Descendants receive ancestor/relayed context; contributions inside one tree
+    (parent, sibling, any task sharing the root) retain their relation. Listed
+    roots and inline Presence receive independent task context. Receipts prove
+    persistence, not a read, in the recipient's drive."""
     from ouroboros.owner_mailbox import (
-        PROVENANCE_INDEPENDENT_TASK, PROVENANCE_PEER_TASK, TASK_MESSAGE_MAX_CHARS, write_task_message,
+        PEER_RELATION_LABELS, PROVENANCE_INDEPENDENT_TASK, PROVENANCE_PEER_TASK, TASK_MESSAGE_MAX_CHARS,
+        write_task_message,
     )
     from ouroboros.peer_roster import (
-        durable_descendant_of, host_listed_independent_root, peer_contribution_admission,
+        durable_descendant_of, independent_message_target, peer_contribution_admission,
     )
-    from ouroboros.task_results import STATUS_RUNNING, validate_task_id
+    from ouroboros.task_results import STATUS_RUNNING, STATUS_SCHEDULED, validate_task_id
     from ouroboros.task_status import FINAL_STATUSES, load_effective_task_result
 
     try:
@@ -1200,8 +1157,8 @@ def _forward_to_worker(
         return _publish_tool_result(ctx, ToolResult(status="unavailable", code="LEGACY_UNAVAILABLE", text=(f"⚠️ TASK_NOT_FOUND: task {tid} is not registered.")))
     if status in FINAL_STATUSES:
         return _publish_tool_result(ctx, ToolResult(status="blocked", code="LEGACY_BLOCKED", text=(f"⚠️ TASK_NOT_ACTIVE: task {tid} is already {status}.")))
-    if status != STATUS_RUNNING:
-        return _publish_tool_result(ctx, ToolResult(status="blocked", code="LEGACY_BLOCKED", text=(f"⚠️ TASK_NOT_ACTIVE: task {tid} is {status or 'unknown'}, not running.")))
+    if status not in (STATUS_RUNNING, STATUS_SCHEDULED):
+        return _publish_tool_result(ctx, ToolResult(status="blocked", code="LEGACY_BLOCKED", text=(f"⚠️ TASK_NOT_ACTIVE: task {tid} is {status or 'unknown'}, neither running nor queued.")))
     # AR2-6: no NEW steering writes while a cancellation is pending. The
     # effective status honestly stays ``running`` (cancel_state=pending rides
     # beside it), so the checks above pass — consult the same predicate the
@@ -1226,9 +1183,10 @@ def _forward_to_worker(
     relation = ""
     listed_root = None
     if not durable_descendant_of(status_drive_root, tid, data, current_task_id):
-        # A peer inside the tree (the caller's parent or sibling) before the host
-        # roster; its typed admission (relay refused, cancel state read strictly)
-        # lives beside the roster's other addressability rules in peer_roster.
+        # A peer inside the tree (the caller's parent, a sibling, or any task sharing
+        # its root) before the host roster; its typed admission (relay refused, cancel
+        # state read strictly) lives beside the roster's other addressability rules
+        # in peer_roster.
         relation, refusal = peer_contribution_admission(
             status_drive_root, current_task_id, metadata, tid, data, relayed_from=relayed_from)
         if refusal is not None:
@@ -1236,12 +1194,13 @@ def _forward_to_worker(
         if relation:
             provenance = PROVENANCE_PEER_TASK
         else:
-            listed_root = host_listed_independent_root(status_drive_root, tid)
+            listed_root = independent_message_target(status_drive_root, tid, data)
             if listed_root is None:
-                return (f"⚠️ TASK_FORBIDDEN: task {tid} is neither a descendant, the parent nor a sibling "
-                        "of the current task, nor an active independent root the host lists.")
+                return (f"⚠️ TASK_FORBIDDEN: task {tid} is neither a descendant of the current task, nor a task "
+                        "in its tree (the parent nor a sibling nor any task sharing its root), nor an active "
+                        "independent root the host lists or an inline Presence mailbox.")
             if relayed_from:
-                return f"⚠️ TASK_FORBIDDEN: a relayed message reaches only your own descendants; task {tid} is an independent root."
+                return f"⚠️ TASK_FORBIDDEN: a relayed message reaches only your own descendants; task {tid} is an independent recipient."
             provenance = PROVENANCE_INDEPENDENT_TASK
     if relayed_from:
         try:
@@ -1275,10 +1234,43 @@ def _forward_to_worker(
     )
     if not written:
         return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ERROR", text=(f"⚠️ TASK_MESSAGE_UNWRITTEN: message to task {tid} was not persisted.")))
+    from ouroboros.owner_mailbox import MAIL_QUEUED, MAIL_RETAINED_UNREAD, mail_write_receipt, mailbox_drain_ended
+
+    try:
+        drain_ended = mailbox_drain_ended(mailbox_drive, tid)
+    except Exception:
+        drain_ended = False
+    receipt = mail_write_receipt(status, drain_ended=drain_ended)["receipt"]
+    if receipt == MAIL_RETAINED_UNREAD:
+        return (f"Message forwarded to task {tid}: written to its mailbox ({MAIL_RETAINED_UNREAD}); task {tid}'s "
+                "own drain has already ended, so no checkpoint will read it: its result keeps it as unread mail. "
+                "Files cannot be attached to messages between tasks.")
+    if listed_root is not None and listed_root.get("target_kind") == "inline_presence":
+        observation = json.dumps(listed_root["execution_observation"], ensure_ascii=False, sort_keys=True)
+        return (f"Message forwarded to task {tid}: written to its mailbox as a message from this task "
+                "(independent_task, never owner text). This proves persistence, not that its model read it; "
+                "if the turn continues, its checkpoint can read it. "
+                f"execution_observation={observation}. Files cannot be attached to messages between tasks.")
+    # A Presence root reached from inside its own tree keeps the shared execution
+    # observation on the receipt (persistence proof, not a read), as the roster path gives it.
+    presence = data.get("execution_observation") if provenance == PROVENANCE_PEER_TASK else None
+    observed = (f" execution_observation={json.dumps(presence, ensure_ascii=False, sort_keys=True)}."
+                if isinstance(presence, dict) and presence.get("kind") == "presence" else "")
+    as_peer = PEER_RELATION_LABELS.get(relation, {}).get("receipt") or relation
+    if receipt == MAIL_QUEUED:
+        as_from = (f" as a message from a peer task ({as_peer}; never owner text or an ancestor's steering)"
+                   if provenance == PROVENANCE_PEER_TASK else " as a message from this task (never owner text)"
+                   if listed_root is not None else "")
+        return (f"Message forwarded to task {tid}: written to its mailbox{as_from} ({MAIL_QUEUED}); task {tid} has not "
+                "started, so nothing has read it: it reads it when it starts, and if it ends unstarted its result keeps "
+                f"it as unread mail.{observed} Files cannot be attached to messages between tasks.")
     if provenance == PROVENANCE_PEER_TASK:
+        # A Presence turn may already be over: persistence is proven, a read is not.
+        read_note = ("This proves persistence, not that its model read it; if the turn continues, "
+                     "its checkpoint can read it." if observed else "it reads it at its next checkpoint.")
         return (f"Message forwarded to task {tid}: written to its mailbox as a message from a peer task "
-                f"(your {relation}; never owner text or an ancestor's steering); it reads it at its next "
-                "checkpoint. Files cannot be attached to messages between tasks.")
+                f"({as_peer}; never owner text or an ancestor's steering){'.' if observed else ';'} "
+                f"{read_note}{observed} Files cannot be attached to messages between tasks.")
     if listed_root is not None:
         return (f"Message forwarded to task {tid}: written to its mailbox as a message from this task "
                 "(never owner text); it reads it at its next checkpoint. Files cannot be attached to messages between tasks.")
@@ -1445,51 +1437,26 @@ def get_tools() -> List[ToolEntry]:
                 "include": {"type": "string", "default": "", "description": "Basename glob, including brace alternatives (e.g. '*.py', '*.{js,css}'); applies on every backend"},
             }, "required": ["query"]},
         }, _code_search),
-        ToolEntry("escalate", {
-            "name": "escalate",
-            "description": (
-                "Escalate a decision up the responsibility chain instead of guessing. "
-                "List 2-6 real options, mark your recommendation with recommended=true on that option, "
-                "and let each option's detail name what it gains and what it costs. "
-                "A root task asks the OWNER (a typed quiz card with option buttons); "
-                "a subagent asks its PARENT task (a typed mailbox frame the parent "
-                "answers with forward_to_worker or escalates higher, verbatim). "
-                "By default name your recommended option as the assumption and keep working: "
-                "the card stays answerable, and a late answer still arrives. "
-                "Set wait_for_answer=true (a live root, ordinary conversation included) when the next step "
-                "is irreversible or costly to redo, or the choice is the owner's to make "
-                "(spending, publishing, deleting); your judgment decides. The task then waits after the "
-                "current tool batch without model calls; waiting questions in one batch share one wait, "
-                "which ends on the first incoming message."
-            ),
-            "parameters": {"type": "object", "properties": {
-                "question": {"type": "string", "description": "The decision being escalated (markdown renders in chat)"},
-                "options": {"type": "array", "items": {"type": "object", "properties": {
-                    "label": {"type": "string", "description": "Short option label (button text, max 120)"},
-                    "detail": {"type": "string", "description": "Optional one-line consequence of this option (max 500)"},
-                    "recommended": {"type": "boolean", "description": "True on the ONE option you recommend"},
-                }, "required": ["label"]}, "description": "2-6 mutually exclusive options"},
-                "stake": {"type": "string", "description": "What depends on this decision (optional, max 500)"},
-                "assumption": {"type": "string", "description": "For optional clarification, the assumption you continue under (max 500); may be empty for required waiting."},
-                "wait_for_answer": {"type": "boolean", "default": False, "description": "Live roots: wait for addressed owner input before another model round."},
-                "max_wait_minutes": {"type": "integer", "description": "Optional bound for wait_for_answer: resume with a system notice after N minutes if no answer arrives (the card stays open)."},
-            }, "required": ["question", "options"]},
-        }, _escalate),
+        # A fresh copy per catalog, as the inline literals are.
+        ToolEntry("escalate", copy.deepcopy(ESCALATE_TOOL_SCHEMA), _escalate),
         ToolEntry("forward_to_worker", {
             "name": "forward_to_worker",
             "description": (
-                "Write an addressed task-tree message into a running task's mailbox: a child "
-                "or descendant of yours (delivered as the ancestor's message), your own parent "
-                "or a sibling (delivered as a message from a peer task naming the relation — "
-                "a contribution it weighs, never steering; relay is refused there), or any active "
-                "independent root the host lists (delivered as a message from an independent "
-                "task). It is never labelled owner dialogue, files cannot be attached, the body "
+                "Write an addressed task-tree message into a running or queued task's mailbox: a child "
+                "or descendant of yours (delivered as the ancestor's message), any other task in your "
+                "tree — your parent, a sibling, or any task sharing your root (delivered as a message "
+                "from a peer task naming the relation — a contribution it weighs, never steering; relay "
+                "is refused there), or any active independent root the host lists or a source-bound "
+                "inline Presence turn (a message from an independent task). Presence observation gaps "
+                "are disclosed, also when the Presence root is in your own tree; a write never "
+                "proves a read. It is never labelled owner dialogue, files cannot be attached, the body "
                 "is limited to 8000 chars (longer is refused, never truncated), and the "
-                "result says the message was written, not read: the task drains it at its next "
-                "checkpoint. To wait for a reply without spending model rounds, call await_messages."
+                "result says written, not read: a running task drains it at its next checkpoint, a queued "
+                "one when it starts, and a task that ends without reading it keeps it as unread mail in its "
+                "result. To wait for a reply without spending model rounds, call await_messages."
             ),
             "parameters": {"type": "object", "properties": {
-                "task_id": {"type": "string", "description": "ID of the running task to forward to"},
+                "task_id": {"type": "string", "description": "ID of the running or queued task to forward to"},
                 "message": {"type": "string", "description": "Message text to forward (at most 8000 chars)"},
                 "relayed_from_task_id": {"type": "string", "description":
                     "Optional sibling/descendant task whose output this ancestor relays. "

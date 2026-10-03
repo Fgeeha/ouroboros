@@ -136,6 +136,16 @@ const PROVIDER_CARDS = [
         note: 'Pick DeepSeek as the source in Models or Agents, then choose deepseek-v4-pro or deepseek-v4-flash.',
     },
     {
+        id: 'zai', title: 'Z.ai (GLM)', icon: '', hint: 'Direct OpenAI-compatible runtime', advanced: true,
+        fields: [
+            { id: 's-zai-key', settingKey: 'ZAI_API_KEY', label: 'API Key', placeholder: 'sk-...' },
+            { id: 's-zai-plan', label: 'Plan', placeholder: 'payg or coding' },
+        ],
+        testProvider: 'zai',
+        testInputs: { 's-zai-key': 'ZAI_API_KEY', 's-zai-plan': 'ZAI_PLAN' },
+        note: 'Pick Z.ai as the source in Models or Agents, then choose glm-5.3 or glm-5.3-flash. Coding Plan subscribers: set Plan to <code>coding</code>; the default <code>payg</code> is pay-as-you-go, and a Coding Plan key tested there reports No credits.',
+    },
+    {
         id: 'gigachat', title: 'GigaChat', icon: '/static/providers/gigachat.svg', hint: 'Sber GigaChat via the gigachat library', advanced: true,
         fields: [
             { id: 's-gigachat-credentials', settingKey: 'GIGACHAT_CREDENTIALS', label: 'Authorization Key', placeholder: 'Base64 client_id:secret (OAuth)' },
@@ -230,6 +240,7 @@ export const SECRET_KEYS = [
     ['ANTHROPIC_API_KEY', 'Anthropic API Key', 'sk-ant-...'],
     ['MINIMAX_API_KEY', 'MiniMax API Key', 'MiniMax key'],
     ['DEEPSEEK_API_KEY', 'DeepSeek API Key', 'sk-...'],
+    ['ZAI_API_KEY', 'Z.ai API Key (GLM)', 'Z.ai key'],
     ['GITHUB_TOKEN', 'GitHub Token', 'ghp_...'],
     ['OUROBOROS_NETWORK_PASSWORD', 'Network Password', 'Required for LAN/Docker binds'],
 ];
@@ -399,7 +410,7 @@ export function renderSettingsPage() {
                 <section class="settings-panel" data-settings-panel="behavior">
                     <div class="form-section">
                         <h3>Reasoning Effort</h3>
-                        <div class="settings-section-copy">Controls how deeply the model thinks per task type. Higher effort = slower but more thorough.</div>
+                        <div class="settings-section-copy">Preferred reasoning effort per task type. Unsupported levels adapt to the route; native mappings, required minimums or provider defaults may apply. Requested, sent and reported effort are recorded in Logs.</div>
                         <div class="settings-effort-grid">
                             ${EFFORT_FIELDS.map(([id, label, defaultValue]) => effortField({ id, label, defaultValue })).join('')}
                         </div>
@@ -846,6 +857,18 @@ export function renderSettingsPage() {
                     </div>
 
                     <div class="form-section">
+                        <h3>Extra CA Certificates</h3>
+                        <div class="settings-section-copy">Only for a network whose TLS certificates the default bundle does not trust: a TLS-inspecting proxy, or an endpoint behind a national CA such as GigaChat's. Ouroboros adds the file to its defaults for every provider call; everything else keeps working.</div>
+                        <div class="form-row">
+                            <div class="form-field ui-field">
+                                <label for="s-extra-ca-bundle">Extra CA bundle (PEM)</label>
+                                <input id="s-extra-ca-bundle" placeholder="/path/to/extra-ca.pem" class="ui-control" name="s-extra-ca-bundle" type="text" aria-describedby="s-extra-ca-bundle-help">
+                                <div class="settings-inline-note ui-field-help" id="s-extra-ca-bundle-help">Absolute or <code>~</code>-prefixed path to a PEM file on the machine that runs Ouroboros (its own filesystem, not the device showing this page). Leave empty unless a provider fails with a certificate error.</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="form-section">
                         <h3>Local Model Runtime</h3>
                         <div class="settings-section-copy">Only fill this in when you want Ouroboros to start and route to a GGUF model on this machine.</div>
                         <div class="form-grid two">
@@ -896,7 +919,7 @@ export function renderSettingsPage() {
                              Agents → Delegation (D-10): they bound the agents,
                              not the process pool. Max Workers stays: it is
                              runtime worker processes, not an agent setting. -->
-                        <div class="settings-section-copy">Workers control parallel task capacity. Task liveness is governed automatically by progress, deadlines, the idle rail and the reaper; the per-task round and lifetime limits are optional — a positive number, or <code>unlimited</code> for none (the fresh-install default). Budget limits control runtime cost thresholds. How many subagents a task may run, and how deep they may nest, live in <code>Agents</code>.</div>
+                        <div class="settings-section-copy">Workers control parallel task capacity. Task liveness is governed automatically by progress, deadlines, the idle rail and the reaper; the per-task round and lifetime limits are optional — a positive number, or <code>unlimited</code> for none (the fresh-install default). A settings file from an earlier release that never set them keeps the finite limits it ran under until you change them here; startup names the values once. Budget limits control runtime cost thresholds. How many subagents a task may run, and how deep they may nest, live in <code>Agents</code>.</div>
                         <div class="form-grid two">
                             <div class="form-field ui-field">
                                 <label for="s-workers">Max Workers</label>

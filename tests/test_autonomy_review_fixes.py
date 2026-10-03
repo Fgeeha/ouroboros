@@ -52,26 +52,28 @@ def test_project_followup_consumes_only_a_permanent_refusal(tmp_path, monkeypatc
     project = create_project(root, "project-a", name="Project A")
     ctx = ToolContext(repo_dir=tmp_path, drive_root=root, task_id="source-task",
                       project_id=project["id"], current_chat_id=project["chat_id"])
+    ctx.task_metadata = {"resource_intent": {"kind": "room_default", "project_id": project["id"]}}
     assert _handle_schedule_followup(ctx, run_at="2000-01-01T00:00:00Z",
-                                     objective="Continue in the same project").startswith("FOLLOWUP_SCHEDULED")
+                                     objective="Continue in the same project", relation="independent").startswith("FOLLOWUP_SCHEDULED")
     begin_project_deletion(root, project["id"])
     if lifecycle == "tombstoned":
         complete_project_deletion(root, project["id"])
+    monkeypatch.setattr("ouroboros.config.get_bg_wakeup_min_sec", lambda: 0)  # a wait ends at once here
     queue.check_scheduled_tasks()
     first = queue.list_scheduled_tasks(root)["tasks"][0]
-    failed = load_task_result(root, first["last_task_id"])
-    assert failed["status"] == "failed" and failed["reason_code"] == "project_routing_fence"
     queue.check_scheduled_tasks()
     second = queue.list_scheduled_tasks(root)["tasks"][0]
     assert queue.PENDING == []
+    # #1315: neither a permanent nor a transient refusal mints a failed root.
+    assert not list((root / "task_results").glob("*.json"))
+    assert not second.get("failure_count")
     if lifecycle == "tombstoned":
-        assert second["last_task_id"] == first["last_task_id"]
-        assert second["enabled"] is False and second["completed_at"]
-        assert len(list((root / "task_results").glob("*.json"))) == 1
-        assert second["failure_count"] == 1 and "project_routing_fence" in second["last_error"]
+        assert second["enabled"] is False and second["completed_at"]  # the obligation is consumed, loudly
+        assert "deleted" in second["last_error"] and "occurrence" not in second
     else:
-        assert second["last_task_id"] != first["last_task_id"]
         assert second["enabled"] is True and not second.get("completed_at")
+        assert second["hold"]["reason"] == "project_routing_fence"
+        assert second["occurrence"]["task_id"] == first["occurrence"]["task_id"]  # one occurrence, retried
 
 
 class ReachedExec(BaseException):
@@ -192,18 +194,18 @@ def test_pre_loop_checkpoint_failure_reports_unknown_counts_without_reading_corr
     assert stored["owner_wait"]["source_ref"] == case.wait["source_ref"]
 
 
-def test_unknown_exception_summary_does_not_invent_zero_rounds_or_buy_a_model_call(tmp_path, monkeypatch):
-    from ouroboros.post_task_synthesis import _run_task_summary
+def test_unknown_exception_facts_row_does_not_invent_zero_rounds_or_buy_a_model_call(tmp_path, monkeypatch):
+    from ouroboros.post_task_synthesis import _record_task_facts
 
     rows = []
-    monkeypatch.setattr("ouroboros.project_dialogue.append_authored_task_summary",
-                        lambda _root, _result_root, row, **_: rows.append(row))
+    monkeypatch.setattr("ouroboros.project_dialogue.append_canonical_task_summary",
+                        lambda _root, row: rows.append(row))
     monkeypatch.setattr("ouroboros.llm_observability.chat_observed", lambda *_a, **_kw: pytest.fail("no new paid summary"))
-    _run_task_summary(SimpleNamespace(drive_root=tmp_path), None, {"id": "unknown", "text": "Recover work"},
-                      {"loop_evidence_unavailable": True},
-                      {"loop_evidence_unavailable": True, "tool_calls": []}, tmp_path / "logs")
+    _record_task_facts(SimpleNamespace(drive_root=tmp_path), {"id": "unknown", "text": "Recover work"},
+                       {"loop_evidence_unavailable": True},
+                       {"loop_evidence_unavailable": True, "tool_calls": []}, tmp_path / "logs")
     assert rows[0]["tool_calls"] is None and rows[0]["rounds"] is None
-    assert "round count unknown" in rows[0]["text"]
+    assert rows[0]["summary_kind"] == "host_task_facts" and rows[0]["text"] == ""
 
 
 def test_failed_exception_attachment_keeps_the_original_error_and_unknown_projection(tmp_path):

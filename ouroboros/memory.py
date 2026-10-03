@@ -440,8 +440,25 @@ class Memory:
             return []
 
     @staticmethod
+    def era_host_note(block: Dict[str, Any]) -> str:
+        """Host-authored framing for an era block: what it is, and its known coverage."""
+        return (
+            "Host note: compression of older dialogue blocks; an interpretation, not a grant "
+            f"or a standing rule. Range: {block.get('range') or 'unknown'}; "
+            f"source messages: {block.get('message_count') or 'unknown'}."
+        )
+
+    @staticmethod
     def format_blocks_as_markdown(blocks: List[Dict[str, Any]]) -> str:
-        return "\n\n".join(b.get("content", "") for b in blocks)
+        """Render dialogue blocks for the task context (``context.py`` is the only caller).
+
+        An era block gets the host note on its own line first; other blocks are unchanged.
+        """
+        return "\n\n".join(
+            Memory.era_host_note(b) + "\n" + str(b.get("content", ""))
+            if b.get("type") == "era" else b.get("content", "")
+            for b in blocks
+        )
 
     def load_identity(self) -> str:
         path = self.identity_path()
@@ -882,7 +899,8 @@ class Memory:
         self, log_name: str, task_id: str, want: int,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """The newest ``want`` rows of ONE task (or of the log when ``task_id`` is
-        empty) through the bounded rotation-aware reader (razzant/ouroboros#131).
+        empty) through the bounded rotation-aware reader (razzant/ouroboros#131);
+        for ``tools.jsonl`` the rows of the newest ``want`` logical calls (#1316).
 
         The window is a doubling byte tail of the live file plus at most the
         three newest archives, so a busy neighbour cannot push this task's own
@@ -892,11 +910,19 @@ class Memory:
         section discloses it; ``read_file`` on the log pages the rest).
         """
         from ouroboros.jsonl_tail import read_rotated_jsonl_entries
+        from ouroboros.tool_call_log import counts_as_call, logical_calls
 
         wanted = str(task_id or "").strip()
+        calls_log = log_name == "tools.jsonl"
+
+        def matches(entry: Dict[str, Any]) -> bool:
+            return not wanted or str(entry.get("task_id", "")).strip() == wanted
 
         def counts(entry: Dict[str, Any]) -> bool:
-            return not wanted or str(entry.get("task_id", "")).strip() == wanted
+            # tools.jsonl quota is LOGICAL calls (#1316). The window is sized by starts and
+            # legacy rows (a lower bound: an orphan settlement only widens the read); the
+            # shown/matched counts below are exact logical calls over the rows read.
+            return matches(entry) and (not calls_log or counts_as_call(entry))
 
         stem = log_name[:-len(".jsonl")] if log_name.endswith(".jsonl") else log_name
         coverage: Dict[str, Any] = {"task_id": wanted, "source": f"logs/{log_name}"}
@@ -908,8 +934,21 @@ class Memory:
         except Exception:
             log.warning("Failed to read recent %s rows", log_name, exc_info=True)
             return [], {**coverage, "shown": 0, "matched": 0, "quota_met": False, "gaps": ["read_failed"]}
-        shown = [row for row in rows if counts(row)][-max(1, int(want)):]
-        coverage.update({"shown": len(shown), "quota_met": int(coverage.get("matched") or 0) >= int(want)})
+        matching = [row for row in rows if matches(row)]
+        if not calls_log:
+            shown = matching[-max(1, int(want)):]
+            coverage["shown"] = len(shown)
+        else:
+            # ONE unit for both counts: each call once (a start with its later rows, an
+            # orphan settlement or wait end, a legacy row), all rows of the newest `want`.
+            calls = logical_calls(matching)
+            kept = calls[-max(1, int(want)):]
+            ids = {call["invocation_id"] for call in kept if call.get("invocation_id")}
+            legacy = {id(call["settled"]) for call in kept if call["state"] == "legacy"}
+            shown = [row for row in matching if str(row.get("invocation_id") or "") in ids or id(row) in legacy]
+            coverage.update({"shown": len(kept), "matched": len(calls), "unit": "calls",
+                             "archives_bounded": bool(coverage.get("archives_bounded")) and len(calls) < int(want)})
+        coverage["quota_met"] = int(coverage.get("matched") or 0) >= int(want)
         return shown, coverage
 
     def read_jsonl_tail_after_offset(
@@ -1046,8 +1085,9 @@ class Memory:
                     f"task drive logs/{log_name}" + (
                         " (worker rows; host-side rows such as waits stay in the canonical log)"
                         if log_name == "events.jsonl" else ""))
-            if note(len(entries)):
-                coverage["rendered"] = note(len(entries))
+            shown = int(coverage.get("shown") or 0)  # tools: logical calls, never rows (#1316)
+            if note(shown):
+                coverage["rendered"] = note(shown)
             summary = formatter(entries)
             if summary or coverage.get("gaps") or coverage.get("archives_bounded"):
                 sections.append(f"{header} ({coverage_line(coverage)})" + (f"\n\n{summary}" if summary else ""))
@@ -1062,12 +1102,18 @@ class Memory:
         )
 
     def summarize_tools(self, entries: List[Dict[str, Any]]) -> str:
+        """One line per LOGICAL call (#1316): a start with no later row is an
+        unknown outcome, a caller whose wait ended is not a failed handler."""
+        from ouroboros.tool_call_log import logical_calls
+
         if not entries:
             return ""
+        calls = logical_calls(entries)
         lines = []
-        for e in entries[-10:]:
-            tool = e.get("tool") or e.get("tool_name") or "?"
-            args = e.get("args", {})
+        for call in calls[-10:]:
+            e = call.get("settled") or call.get("wait_ended") or call.get("started") or {}
+            tool = call.get("tool") or e.get("tool_name") or "?"
+            args = call.get("args") if isinstance(call.get("args"), dict) else {}
             hints = []
             for key in ("path", "dir", "commit_message", "query"):
                 if key in args:
@@ -1075,12 +1121,25 @@ class Memory:
             if "cmd" in args:
                 hints.append(f"cmd={short(str(args['cmd']), 80)}")
             hint_str = ", ".join(hints) if hints else ""
-            status = "✓" if ("result_preview" in e and not str(e.get("result_preview", "")).lstrip().startswith("⚠️")) else "·"
-            lines.append(f"{status} {tool} {hint_str}".strip())
+            settled = call.get("settled")
+            status, note = "?", ""
+            if settled is None:
+                note = (" (wait ended; no result recorded)" if "wait_ended" in call else
+                        " (started; no outcome recorded)")
+            elif isinstance(settled.get("is_error"), bool):
+                status = "·" if settled["is_error"] else "✓"
+            elif settled.get("status"):
+                if settled["status"] == "ok":
+                    status = "✓"
+                elif settled["status"] in {"error", "host_error", "blocked", "timeout", "unavailable"}:
+                    status = "·"
+            elif "result_preview" in settled:  # Only untyped legacy settlements infer from text.
+                status = "·" if str(settled["result_preview"]).lstrip().startswith("⚠️") else "✓"
+            lines.append(f"{status} {tool} {hint_str}".strip() + note)
 
         _REVIEW_MARKERS = ("REVIEW_BLOCKED", "TESTS_FAILED", "REVIEW_MAX_ITERATIONS", "COMMIT_BLOCKED")
         seen_failures: set = set()
-        for e in entries[-20:]:
+        for e in [call["settled"] for call in calls[-20:] if call.get("settled")]:
             result = str(e.get("result_preview", ""))
             if any(marker in result for marker in _REVIEW_MARKERS):
                 sig = (e.get("tool", ""), result[:80])

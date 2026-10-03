@@ -1,4 +1,8 @@
-"""Bounded, rotation-aware tail reads of one JSONL log — the ONE reader for them.
+"""Rotation-aware JSONL reads: captured byte ranges and bounded filtered tails.
+
+``JsonlChainSnapshot`` shares physical capture/read/segment ownership between
+history pagination and wake observations, whose parsing and selection policies
+remain separate. The filtered-tail reader below serves context and endpoints.
 
 Moved here from ``gateway/_helpers.py`` (v6.90.x P2) so that context assembly
 (``memory.py``, razzant/ouroboros#131) can use the same window-doubling
@@ -27,10 +31,50 @@ import os
 import pathlib
 from typing import Any, Callable, Iterable, Optional
 
-from ouroboros.utils import iter_jsonl_objects
+from ouroboros.utils import JsonlChainUnreadable, iter_jsonl_objects, jsonl_chain_handles
 
 TAIL_WINDOW_START_BYTES = 512 * 1024
 ARCHIVE_BACKFILL_MAX = 3
+
+
+class JsonlChainSnapshot:
+    """One captured byte horizon shared by history pages and wake observations.
+
+    Reads reopen through the rotation-aware handle owner and never cross the
+    captured horizon. No descriptor survives a read. Callers own row parsing,
+    unfinished-line handling, gaps and the boundary they accept; this reader
+    imposes neither a tail quota nor a timestamp policy.
+    """
+
+    def __init__(self, path: pathlib.Path, *, upper: Optional[int] = None):
+        self.path, self.snapshot = path, {}
+        with jsonl_chain_handles(path, strict=True, start_offset=0, snapshot=self.snapshot):
+            pass
+        self.entries, self.ends = self.snapshot["entries"], self.snapshot["ends"]
+        self.upper = self.snapshot["total"] if upper is None else upper
+        if not 0 <= self.upper <= self.snapshot["total"]:
+            raise JsonlChainUnreadable("source is shorter than its captured boundary")
+
+    def _read(self, start: int, end: int) -> bytes:
+        from bisect import bisect_left
+
+        if not 0 <= start <= end <= self.upper:
+            raise JsonlChainUnreadable("read is outside the captured boundary")
+        parts = []
+        while start < end:
+            with jsonl_chain_handles(self.path, strict=True, start_offset=start, snapshot=self.snapshot) as handles:
+                if not handles:
+                    raise JsonlChainUnreadable("source ended before its captured boundary")
+                size = min(end, self.ends[bisect_left(self.ends, start + 1)]) - start
+                data = handles[0][1].read(size)
+                if len(data) != size:
+                    raise JsonlChainUnreadable("source read ended before its captured boundary")
+            parts.append(data)
+            start += size
+        return b"".join(parts)
+
+    def segment(self, index: int) -> tuple[int, int]:
+        return (self.ends[index - 1] if index else 0), min(self.ends[index], self.upper)
 
 
 def archive_segments(archive_dir: pathlib.Path, archive_prefix: str, gaps: Optional[set] = None) -> list:
@@ -187,14 +231,15 @@ def coverage_line(coverage: dict) -> str:
     live_size, live_window = int(coverage.get("live_size") or 0), int(coverage.get("live_window") or 0)
     unread = "live_size" not in coverage
     whole = live_window >= live_size and not coverage.get("archives_bounded") and not unread
+    unit = str(coverage.get("unit") or "rows")  # tools.jsonl counts logical calls (#1316)
     if shown and matched > shown:
-        rows = f"newest {shown} of {matched} matching rows in the window"
+        rows = f"newest {shown} of {matched} matching {unit} in the window"
     elif shown and whole:
-        rows = f"all {shown} matching rows"
+        rows = f"all {shown} matching {unit}"
     elif shown:
-        rows = f"newest {shown} matching rows in the window"
+        rows = f"newest {shown} matching {unit} in the window"
     else:
-        rows = "no matching rows"
+        rows = f"no matching {unit}"
     if unread:
         window = "unread"
     elif live_window >= live_size:

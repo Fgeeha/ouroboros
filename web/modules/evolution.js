@@ -117,12 +117,13 @@ export function initEvolution({ ws, state, mount }) {
 
     function pillTone(status) {
         if (['running', 'queued', 'idle_ready', 'thinking', 'sleeping'].includes(status)) return 'online';
-        if (['waiting_for_idle', 'waiting_for_owner_chat', 'waiting_for_first_conversation', 'waiting_for_restart_verify', 'paused', 'starting'].includes(status)) return 'starting';
+        if (['waiting_for_idle', 'waiting_for_owner_chat', 'waiting_for_first_conversation', 'waiting_for_restart_verify', 'paused', 'starting', 'state_unknown', 'unknown'].includes(status)) return 'starting';
         if (['budget_blocked', 'budget_stopped', 'paused_failures', 'error_backoff', 'allowance_exhausted', 'allowance_unknown', 'wake_failed', 'wake_rejected'].includes(status)) return 'error';
         return 'offline';
     }
 
     function shortStatusLabel(status, fallback = 'off') {
+        if (status === 'state_unknown' || status === 'unknown') return 'unknown';  // a null control is never "off"
         if (status === 'thinking') return 'thinking';
         if (status === 'sleeping') return 'sleeping';
         if (status === 'waiting_for_first_conversation') return 'needs owner';
@@ -151,8 +152,10 @@ export function initEvolution({ ws, state, mount }) {
         const evolution = runtime.evolution_state || {};
         const campaign = evolution.campaign || {};
         const consciousness = runtime.bg_consciousness_state || {};
-        const evolutionStatus = evolution.status || (runtime.evolution_enabled ? 'idle_ready' : 'disabled');
-        const consciousnessStatus = consciousness.status || (runtime.bg_consciousness_enabled ? 'sleeping' : 'disabled');
+        const evolutionStatus = evolution.status || (runtime.evolution_enabled === null ? 'state_unknown'
+            : runtime.evolution_enabled ? 'idle_ready' : 'disabled');
+        const consciousnessStatus = consciousness.status || (runtime.bg_consciousness_enabled === null ? 'unknown'
+            : runtime.bg_consciousness_enabled ? 'sleeping' : 'disabled');
 
         evolutionPill.className = `evo-runtime-pill ${pillTone(evolutionStatus)}`;
         evolutionPill.textContent = `Evolution ${shortStatusLabel(evolutionStatus, 'off')}`;

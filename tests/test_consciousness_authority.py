@@ -581,10 +581,13 @@ def test_request_file_and_pending_apply_carry_the_origin(tmp_path, monkeypatch):
     monkeypatch.setattr("supervisor.evolution_lifecycle.evolution_block_reason", lambda: "")
     monkeypatch.setattr("supervisor.evolution_lifecycle.start_evolution_campaign",
                         lambda objective, source="", **kw: calls.append((objective, source, kw)) or {"id": "c1"})
-    monkeypatch.setattr("supervisor.state.load_state", lambda: {"owner_chat_id": 7})
+    monkeypatch.setattr("supervisor.state.load_state", lambda: {
+        "owner_chat_id": 7, "evolution_owner_stopped": False,
+        "evolution_mode_enabled": False,
+    })
 
     def _update_state(mutator):
-        live: dict = {}
+        live = {"evolution_owner_stopped": False, "evolution_mode_enabled": False}
         mutator(live)
         return live
 
@@ -607,6 +610,7 @@ def test_agent_tool_enable_is_refused_while_the_owner_stop_stands(tmp_path, monk
     from supervisor import evolution_lifecycle as el
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     state.update_state(lambda live: live.update(owner_chat_id=7, evolution_owner_stopped=True))
     started: list = []
     monkeypatch.setattr(el, "evolution_block_reason", lambda: "")
@@ -626,6 +630,7 @@ def test_agent_tool_enable_without_an_owner_stop_starts_a_campaign_with_the_orig
     from supervisor import evolution_lifecycle as el
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     state.update_state(lambda live: live.update(owner_chat_id=7, evolution_owner_stopped=False))
     started: list = []
     monkeypatch.setattr(el, "evolution_block_reason", lambda: "")
@@ -649,6 +654,7 @@ def test_a_stop_the_agent_placed_itself_stays_undoable_by_the_agent(tmp_path, mo
     from supervisor import evolution_lifecycle as el
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     # What the agent's own toggle_evolution(False) leaves behind (the disable path itself needs
     # the live supervisor; its state write is pinned in test_evolution_stop_and_cost).
     state.update_state(lambda live: live.update(owner_chat_id=7, evolution_owner_stopped=True,
@@ -677,11 +683,10 @@ def test_observe_does_without_the_work_starting_review_verb():
     # The GitHub write verbs change the world beyond the repository (PLAN §5.4: Observe keeps the reads only).
     for verb in ("create_github_issue", "comment_on_issue", "comment_on_pr", "close_github_issue"):
         assert verb in ca.OBSERVE_DISABLED and verb not in ca.ACT_DISABLED, verb
-    for verb in ("list_github_prs", "get_github_pr", "list_github_issues", "get_github_issue"):
+    for verb in ("list_github_prs", "get_github_pr", "get_github_checks", "list_github_issues", "get_github_issue"):
         assert verb not in ca.OBSERVE_DISABLED, verb
-    # The two built-in execution verbs (astra scope round 5): a skill's script, a push + CI run.
-    for verb in ("skill_exec", "run_ci_tests"):
-        assert verb in ca.OBSERVE_DISABLED and verb not in ca.ACT_DISABLED, verb
+    # The built-in execution verb (astra scope round 5): a skill's script.
+    assert "skill_exec" in ca.OBSERVE_DISABLED and "skill_exec" not in ca.ACT_DISABLED
 
 
 def test_deep_review_request_carries_the_origin_to_the_one_door(tmp_path, monkeypatch):
@@ -701,6 +706,7 @@ def test_deep_review_request_carries_the_origin_to_the_one_door(tmp_path, monkey
     assert "initiator" not in owner.pending_events[0]
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     queue.init(tmp_path)
     pending: list = []
     queue.init_queue_refs(pending, {}, {"value": 0})
@@ -732,6 +738,7 @@ def test_the_allowance_is_read_before_the_queue_lock(tmp_path, monkeypatch):
     from supervisor import queue, state
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     queue.init(tmp_path)
     pending: list = []
     queue.init_queue_refs(pending, {}, {"value": 0})
@@ -768,6 +775,7 @@ def test_campaign_keeps_the_origin_and_its_cycle_tasks_inherit_it(tmp_path, monk
     from supervisor import evolution_lifecycle, queue, state
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     queue.init(tmp_path)
     pending: list = []
     queue.init_queue_refs(pending, {}, {"value": 0})
@@ -819,6 +827,7 @@ def test_a_transient_refusal_never_pauses_the_campaign(tmp_path, monkeypatch):
     from supervisor import evolution_lifecycle, queue, state
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     queue.init(tmp_path)
     pending: list = []
     queue.init_queue_refs(pending, {}, {"value": 0})
@@ -844,6 +853,7 @@ def test_the_owners_start_adopts_a_paused_consciousness_campaign(tmp_path):
     from supervisor import evolution_lifecycle, queue, state
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     queue.init(tmp_path)
     origin = {"initiator": "consciousness", "usage_category": "consciousness_task", "consciousness_autonomy": "full"}
     campaign = evolution_lifecycle.start_evolution_campaign("Improve", source="agent_tool", origin=origin)
@@ -864,6 +874,7 @@ def test_owner_campaign_carries_no_origin(tmp_path):
     from supervisor import evolution_lifecycle, queue, state
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     queue.init(tmp_path)
     campaign = evolution_lifecycle.start_evolution_campaign("Improve", source="owner_chat")
     assert "initiator" not in campaign

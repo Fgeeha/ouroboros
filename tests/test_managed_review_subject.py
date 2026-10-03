@@ -24,6 +24,13 @@ from ouroboros.tools.review_subject import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _packet_default_panel(monkeypatch):
+    """This module pins the PACKET assembly of the default panel; the shipped
+    default triad reads the work itself since #1334, so pin packet explicitly."""
+    monkeypatch.setattr("ouroboros.reviewer_slot_config.DEFAULT_TRIAD_DELIVERY", "")
+
+
 def _git(repo, *args):
     return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
 
@@ -922,9 +929,10 @@ def test_guidance_open_debt_by_enforcement():
     assert "will be blocked" not in advisory
     assert "recorded durably" in advisory
     assert "commit_reviewed is available" in advisory
-    # The regroup methodology survives in BOTH branches (it is advice, not a lie).
+    # Both branches state the same outcome duty; the procedure is the author's.
     for msg in (blocking, advisory):
-        assert "group obligations by root cause" in msg.lower()
+        assert adv.REVIEW_REPAIR_JUDGMENT in msg
+        assert "group obligations by root cause" not in msg.lower()
 
 
 def test_skipped_guidance_is_managed_aware():

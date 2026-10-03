@@ -1,6 +1,6 @@
 # Core Governance Artifacts
 
-The **core governance artifacts** — `BIBLE.md`, `docs/ARCHITECTURE.md`, `docs/DEVELOPMENT.md` — are the constitutional, architectural and procedural ground truth. This chapter owns their delivery registry, structural plan tiering, exact premises, earned compaction and disclosed model-only truncation. Availability may be full inline text or complete on-demand sources with visible navigation; a missing source never becomes a claim of full context.
+The **core governance artifacts** — `BIBLE.md`, `docs/ARCHITECTURE.md`, `docs/DEVELOPMENT.md` — ground constitution, architecture and procedure. This chapter owns delivery, structural plan tiering, exact premises, earned compaction and disclosed model-only truncation. Full availability means inline text or complete navigable sources; absence never proves full context.
 
 ### Invariant: Full availability in reasoning flows
 
@@ -21,20 +21,11 @@ sections within that same share. This keeps shared rules consistent without
 letting reference books crowd out the change. A pointer gives a packet row
 no tools or evidence it did not receive.
 
-Plan review tiers its intention pack by ONE structural fact — whether a declared `affected_paths` target resolves under the Ouroboros
-system repository, never prose or a plan-kind taxonomy, which keeps
-classification un-gameable. Tiering is not omission: the subject is an
-INTENTION before any work exists, and nothing is silently omitted (P1). Only a
-REQUIRED governance pack that cannot be assembled stops the review, as a typed
-assembly failure (`PlanPacketError`); evidence the policy cannot attach is a
-named absence the panel still judges with (`[reviewer-requested]` omission row,
-head cut `truncated_to_<N>`), and a re-asked locator stays `need_evidence`
-(`need_evidence_repeat`) without new request memory or paid cycles.
-Classification, packet composition, bounds and wave/replay mechanics: ARCHITECTURE §6 "Plan
-construction and review", `ouroboros/tools/plan_packet.py`, `plan_spec.py`.
+Plan governance tiering uses only declared `affected_paths` resolving under the system repository, never prose or plan-kind taxonomy. The subject is an intention; tiering permits no silent omission. Unassemblable required governance raises typed `PlanPacketError`; unattached evidence remains a named absence (`[reviewer-requested]`, head cut `truncated_to_<N>`). Repeated locators stay `need_evidence`/`need_evidence_repeat` without new memory or paid cycles. Classification, bounds and wave/replay owners: ARCHITECTURE §6 "Plan construction and review", `ouroboros/tools/plan_packet.py`, `plan_spec.py`.
 
-Exact-wave custody is fail-closed: the evidence continuation uses a fresh
-full-packet dispatch only when no exact artifact reference exists; an unreadable
+Exact-wave custody is fail-closed: each packet slot continues its recorded
+transcript; the panel goes out fresh only when no exact artifact reference exists
+or the roster changed, each packet slot disclosing its cause; an unreadable
 referenced artifact returns `plan_review_exact_artifact_unavailable` and never
 mints replacement authority.
 
@@ -52,6 +43,8 @@ The context-delivery registry:
 | Skill review (`skill_review.py`) | full inline (`api_chat`) / mandatory full source-root read (`agent_session`) | same two classes | same two classes |
 | Plan review (`tools/plan_review.py`) | full for a SELF-MODIFICATION plan; otherwise a runtime heading-derived navigation map, never a copy | full for a self-modification plan (`api_chat` inline, `agent_session` mandatory full read); otherwise book navigation + a resolvable pointer | not resident: a named on-demand pointer; a reviewer needing it returns `need_evidence` with an exact `::lines=A-B` range |
 | Deep self-review (`deep_self_review.py`) | full inline through shared tier 1 on native and session deliveries, without a duplicate-read demand; the seven-file memory whitelist stays byte-exact inline with per-entry dispositions | Tier 3: book navigation and chapters on demand | Tier 2 within this row’s transcript-bound share; deep keeps its own report criteria and CHECKLISTS navigation (ARCHITECTURE §6 "Deep self-review") |
+
+A scheduled child's `input_sources="declared"` (API model or configured session) selects assignment/common sources; governance delivery and ordinary shared children stay unchanged. Qualify actual physical sends and source receipts, not disk `memory_mode=empty`. Tools/mail may broaden inputs; first position and exchange remain author decisions. Mechanism/limits: ARCHITECTURE §6 "Selected first-input sources".
 
 Scope's change-relative source manifest (`tools/scope_required_sources.py`)
 names touched protected runtime, frozen contracts and prompts, their declared
@@ -80,10 +73,14 @@ self-modification, never attachable evidence (`denied_path`).
 Specs, findings and closure: ARCHITECTURE §6 "Plan construction and review".
 Accept, reject or defer findings. Disposition-only
 `plan_task(review_disposition={review_fingerprint, items:[{finding_id, decision, rationale}]})`
-closes `need_evidence` at $0, one item per required finding.
-Duplicate, conflicting, unknown, stale, incomplete, mixed or vacuous calls
+closes `need_evidence` at $0, one item per required finding; under advisory a
+reasoned reject also closes a below-quorum blocking finding.
+Answers merge by `finding_id` across calls: a later answer supersedes only its
+own id, and two entries for one id in ONE call stay contradictory and open.
+Duplicate, conflicting, unknown, stale, incomplete or vacuous calls
 return typed argument errors before recording; `plan_review._handle_plan_task` ignores
-default-empty optional fields. Do not replay plans for dispositions.
+default-empty optional fields. An envelope sent with items records them first,
+then reviews.
 
 Only explicit `review_disposition.author_action`, author disposition and critic
 fingerprint select corrected goal/plan/spec. Exact `current_attempt.author_subject`
@@ -120,8 +117,10 @@ post-consolidation reader or the acceptance directive ledger that task
 acceptance keeps (`review_evidence._accept_owner_directives`). JSONL records
 and chat line selectors split on physical LF only, never on valid Unicode
 inside a message. Each consumer redacts at its boundary and discloses missing
-source or ranges; a replay or earned paid retry of the same author request
-keeps its recorded snapshot, disclosing later messages as unreviewed. Follow
+source or ranges; a replay or an addressed re-ask of the same author request
+keeps its recorded snapshot (complete and uncapped; the inline view is the
+conversation only, with a pointer naming exact omitted line ranges),
+disclosing later messages as unreviewed. Follow
 ARCHITECTURE's per-delivery context/source contract for delivery, coverage and sizing. Enforcement:
 `test_packet_uses_full_dialogue_and_keeps_acceptance_directives`,
 `tests/test_plan_dialogue_review_regressions.py`, the acceptance ledger tests
@@ -129,13 +128,19 @@ in `tests/test_loop_misc.py`.
 
 ### Invariant: Compaction must earn its rewrite
 
-Helper compaction is deficit-driven: checkpoint the exact actor-visible source
-before summarizing, then publish only completely covered, bound units with
-provenance and a strictly smaller ContextFit size (same image proxy/density).
-Only typed summarizer overflow may split sources; capsules retain the original
-provenance union. No-positive-reclaim and route+round rules belong to ARCHITECTURE
-§6 "Context fitting, retry, and compaction"; the materializer adds no threshold,
-timer, route or retry policy.
+Helper compaction is deficit-triggered and low-water-sized: a positive deficit
+against the binding boundary (the smaller known of owner target and route
+capacity) requests at most one pass per route+round, sized deficit plus
+ceil(boundary / `context_budget.RECLAIM_LOW_WATER_DIVISOR`) — a structural
+constant pinned by `tests/test_context_budget_ssot.py`, not a setting — so the pass lands
+below the boundary rather than at it; requested margin and achieved headroom are
+separate checkpoint facts, never conflated. The materializer then checkpoints the
+exact actor-visible source before summarizing and publishes only completely
+covered, bound units with provenance and a strictly smaller ContextFit size (same
+image proxy/density). Only typed summarizer overflow may split sources; capsules
+retain the original provenance union. Trigger, sizing and route+round rules
+belong to ARCHITECTURE §6 "Context fitting, retry, and compaction"; the
+materializer adds no threshold, timer, route or retry policy.
 
 Authored views reuse that custody but follow the actor's note/source selection,
 so need not shrink. Preserve complete units, owner/new tail and schema residency;

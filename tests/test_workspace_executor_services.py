@@ -23,7 +23,7 @@ import pytest
 
 from ouroboros.tools.registry import ToolContext, ToolRegistry
 
-from tests._workspace_executor_shared import _init_repo
+from tests._workspace_executor_shared import _init_repo, fake_docker_cli
 
 
 @pytest.mark.parametrize("executor_kind", [None, "local"])
@@ -139,7 +139,7 @@ def test_docker_service_only_forwards_selected_env_names(tmp_path, monkeypatch):
         calls.append((cmd, kwargs))
         return subprocess.CompletedProcess(cmd, 0, stdout="123\n" if "nohup" in cmd[-1] else "running\n", stderr="")
 
-    monkeypatch.setattr(executor.subprocess, "run", run)
+    fake_docker_cli(monkeypatch, run)
     payload = executor.start_service(ctx, name="selected", cmd=["server"], host_cwd=workspace,
         cwd_root="active_workspace", readiness={"timeout_sec": 0}, outputs=[], before_outputs={},
         env=selected, env_overlay={"PATH": "/host-only/node", "HOST_ONLY": "never-forward"})

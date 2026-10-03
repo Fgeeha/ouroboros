@@ -29,6 +29,7 @@ def test_ui_preferences_round_trip_and_normalization(tmp_path):
             "sidebar_width": 0,
             "project_panel_width": 0,
             "project_seen_revision": {},
+            "welcome": {"mode": "default", "text": ""},
         }
 
         create_project(tmp_path, "racer", name="Racer")
@@ -132,6 +133,92 @@ def test_ui_preferences_round_trip_and_normalization(tmp_path):
         assert client.post("/api/ui/preferences", json={"language": "de"}).status_code == 400
         assert client.post("/api/ui/preferences", json={"language": None}).status_code == 400
         assert client.post("/api/ui/preferences", json={"language": "en"}).json()["language"] == "en"
+
+
+def test_empty_chat_welcome_preference_round_trip_and_refusals(tmp_path):
+    from starlette.testclient import TestClient
+
+    app = Starlette(routes=collect_routes(data_dir=tmp_path))
+    app.state.drive_root = tmp_path
+    with TestClient(app) as client:
+        assert client.get("/api/ui/preferences").json()["welcome"] == {"mode": "default", "text": ""}
+        custom = {"mode": "custom", "text": "Привет <b>мир</b>\nagain"}
+        response = client.post("/api/ui/preferences", json={"welcome": custom})
+        assert response.status_code == 200
+        assert response.json()["welcome"] == custom
+        assert client.get("/api/ui/preferences").json()["welcome"] == custom
+        for invalid in ({"mode": "custom", "text": "  "}, {"mode": "custom", "text": "x" * 501},
+                        {"mode": "other", "text": "x"}, {"mode": "custom"}, None):
+            assert client.post("/api/ui/preferences", json={"welcome": invalid}).status_code == 400
+            assert client.get("/api/ui/preferences").json()["welcome"] == custom
+        hidden = {"mode": "hidden", "text": custom["text"]}
+        assert client.post("/api/ui/preferences", json={"welcome": hidden}).json()["welcome"] == hidden
+        assert client.post("/api/ui/preferences", json={"widget_order": ["skill:x"]}).json()["welcome"] == hidden
+        default = {"mode": "default", "text": custom["text"]}
+        assert client.post("/api/ui/preferences", json={"welcome": default}).json()["welcome"] == default
+
+
+def test_hand_edited_welcome_is_read_without_disturbing_other_keys(tmp_path):
+    """`welcome` has no Settings control: the owner edits the file (docs/DESIGN.md)."""
+    from starlette.testclient import TestClient
+
+    app = Starlette(routes=collect_routes(data_dir=tmp_path))
+    app.state.drive_root = tmp_path
+    path = tmp_path / "state" / "ui_preferences.json"
+    path.parent.mkdir(parents=True)
+    with TestClient(app) as client:
+        for welcome in ({"mode": "hidden", "text": ""}, {"mode": "custom", "text": "Доброе утро"},
+                        {"mode": "default", "text": ""}):
+            path.write_text(json.dumps({"sidebar_width": 300, "welcome": welcome}), encoding="utf-8")
+            prefs = client.get("/api/ui/preferences").json()
+            assert prefs["welcome"] == welcome and prefs["sidebar_width"] == 300
+        # A value the POST contract refuses reads as the default instead of resetting every
+        # other key, and cannot block their writes; the next write stores the default.
+        for invalid in ({"mode": "Hidden", "text": ""}, {"mode": "custom", "text": " "},
+                        {"mode": "custom", "text": "x" * 501}, {"mode": "custom"},
+                        {"mode": "hidden", "text": "", "extra": 1}, "hidden", None):
+            path.write_text(json.dumps({"sidebar_width": 300, "welcome": invalid}), encoding="utf-8")
+            prefs = client.get("/api/ui/preferences").json()
+            assert prefs["welcome"] == {"mode": "default", "text": ""} and prefs["sidebar_width"] == 300
+        response = client.post("/api/ui/preferences", json={"nested_subagents_expanded": True})
+        assert response.status_code == 200 and response.json()["sidebar_width"] == 300
+        stored = json.loads(path.read_text(encoding="utf-8"))
+        assert stored["welcome"] == {"mode": "default", "text": ""} and stored["nested_subagents_expanded"] is True
+
+
+def test_welcome_text_with_a_lone_surrogate_is_refused_and_read_as_default(tmp_path):
+    """JSON's "\\ud800" escape parses to a str UTF-8 cannot encode; it never reaches a response or the file."""
+    from starlette.testclient import TestClient
+
+    app = Starlette(routes=collect_routes(data_dir=tmp_path))
+    app.state.drive_root = tmp_path
+    path = tmp_path / "state" / "ui_preferences.json"
+    path.parent.mkdir(parents=True)
+    lone = {"mode": "custom", "text": "Hello \ud800 there"}
+    # json.dumps escapes non-ASCII, so the file carries the astral emoji as a "🌅" pair.
+    normal = {"mode": "custom", "text": "Доброе утро 🌅 中文"}
+    with TestClient(app) as client:
+        path.write_text(json.dumps({"sidebar_width": 300, "welcome": normal}), encoding="utf-8")
+        assert client.get("/api/ui/preferences").json()["welcome"] == normal
+        response = client.post("/api/ui/preferences", json={"welcome": normal})
+        assert response.status_code == 200 and response.json()["welcome"] == normal
+        stored = path.read_bytes()
+        response = client.post("/api/ui/preferences", content=json.dumps({"welcome": lone}),
+                               headers={"Content-Type": "application/json"})
+        assert response.status_code == 400
+        assert response.json()["error"] == "welcome text must be valid Unicode"
+        assert path.read_bytes() == stored
+        # A hand edit carrying one reads as the default without costing the other keys,
+        # and an unrelated write succeeds and stores the default.
+        path.write_text(json.dumps({"sidebar_width": 300, "welcome": lone}), encoding="utf-8")
+        prefs = client.get("/api/ui/preferences").json()
+        assert prefs["welcome"] == {"mode": "default", "text": ""} and prefs["sidebar_width"] == 300
+        response = client.post("/api/ui/preferences", json={"nested_subagents_expanded": True})
+        assert response.status_code == 200, response.text
+        assert response.json()["sidebar_width"] == 300
+        stored = json.loads(path.read_text(encoding="utf-8"))
+        assert stored["welcome"] == {"mode": "default", "text": ""}
+        assert stored["sidebar_width"] == 300 and stored["nested_subagents_expanded"] is True
 
 
 def test_ui_preferences_concurrent_paint_acks_are_monotonic(tmp_path):

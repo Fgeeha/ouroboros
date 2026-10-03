@@ -59,16 +59,27 @@ def test_ceiling_compiles_exact_tools_scripts_resources_and_digest():
     )
 
     # The profile selected chat_history and one script; the cognitive baseline
-    # (own memory, no new authority) is compiled in beside them.
+    # (own memory, no new authority) and the own-work baseline (this binding's
+    # readers, host-bound to its scope, and steer_task) are compiled in beside them.
     assert [grant.name for grant in ceiling.tool_grants] == [
         "chat_history",
+        "get_task_result",
         "knowledge_list",
         "knowledge_read",
         "knowledge_write",
+        "recent_tasks",
         "skill_exec",
+        "steer_task",
         "update_identity",
         "update_scratchpad",
     ]
+    scoped = {grant.name: [(item.argument_path, item.static_value) for item in grant.bindings]
+              for grant in ceiling.tool_grants if grant.name in {"get_task_result", "recent_tasks", "steer_task"}}
+    assert scoped == {
+        "get_task_result": [(("presence_scope",), "own_binding")],
+        "recent_tasks": [(("presence_scope",), "own_binding")],
+        "steer_task": [],
+    }
     script = next(grant for grant in ceiling.tool_grants if grant.name == "skill_exec")
     assert [(item.argument_path, item.static_value) for item in script.bindings] == [
         (("skill",), "calendar"),
@@ -226,13 +237,17 @@ def test_registry_filters_schema_dispatch_and_resolved_targets(tmp_path):
 
     names = {schema["function"]["name"] for schema in registry.schemas()}
     assert names == {
+        "finish_task",  # ceiling-only work has no speaker metadata; local completion grants no resource
         "presence_finish",
         "presence_cancel_work",
         "read_file",
         "chat_history",
+        "get_task_result",
         "knowledge_list",
         "knowledge_read",
         "knowledge_write",
+        "recent_tasks",
+        "steer_task",
         "update_identity",
         "update_scratchpad",
     }

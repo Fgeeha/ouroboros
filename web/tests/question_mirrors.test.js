@@ -194,6 +194,29 @@ test('own words answer from Main; a failed attempt stays answerable and a lost r
     } finally { fx.restore(); }
 }));
 
+test('Enter answers from the Main copy through its Send; focus stays, then goes to the composer', () => withTimers(async () => {
+    let composer = 0;
+    const fx = mainFixture({ focusAfterRemoval: () => { composer += 1; } });
+    try {
+        fx.add(WAITING);
+        const [card] = fx.cards();
+        const field = card.querySelector('.chat-quiz-comment');
+        field.focus();
+        field.value = 'Neither —\nask legal first.';
+        field.listeners.get('input')();
+        const enter = { key: 'Enter', preventDefault() { enter.defaultPrevented = true; } };
+        field.listeners.get('keydown')(enter);
+        await turn();
+        const sent = JSON.parse(fx.calls[0].init.body);
+        assert.deepEqual([enter.defaultPrevented, fx.calls.length, sent.decision_id, sent.comment, 'option_index' in sent],
+            [true, 1, 'quiz:t-1:qz-1', 'Neither —\nask legal first.', false]);
+        assert.equal(text(card, 'chat-quiz-answer'), "Owner's answer: Neither —\nask legal first.");
+        assert.equal(document.activeElement, card.querySelector('.chat-quiz-question'), 'focus stays in the settled copy');
+        mock.timers.tick(SETTLE_MS);
+        assert.deepEqual([fx.column.children.length, composer], [0, 1]);
+    } finally { fx.restore(); }
+}));
+
 test('an unknown source keeps what is known; otherwise the copy is a safe record with its way to the Project', () => {
     const fx = mainFixture();
     try {

@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import httpx
+from ouroboros.effort_evidence import validated_effort_resolution
 
 from ouroboros.config import (
     CLAUDEXOR_MIN_VERSION,
@@ -162,12 +163,26 @@ def run_failure_cause(failure: Any) -> str:
     """What the engine REPORTED about a failed run (``failure.safeMessage``), whitespace-
     collapsed, secret-redacted and strictly bounded; "" when it reported nothing. An OPAQUE
     fact: stored and displayed, never parsed or branched on (BIBLE P5) — presence is the
-    only test a caller may make."""
+    only test a caller may make; a person's quote separates the host's own cut from the
+    engine's words through ``reported_cause_words``."""
     from ouroboros.utils import sanitize_tool_result_for_log, truncate_within_limit
 
     words = (failure if isinstance(failure, dict) else {}).get("safeMessage")
     return truncate_within_limit(
         sanitize_tool_result_for_log(" ".join(str(words or "").split())), REPORTED_CAUSE_CHARS)
+
+
+def reported_cause_words(cause: Any) -> tuple[str, bool]:
+    """``(words, shortened)`` of a stored ``run_failure_cause``: the engine's words
+    without the bound's own omission marker (``truncate_within_limit``), and whether
+    that bound cut them. The words were whitespace-collapsed before the bound, so a
+    newline can only open the host's marker; the engine's words are never read."""
+    text = str(cause or "")
+    words, marker, length = text.rpartition(
+        f"\n⚠️ OMISSION NOTE: truncated at {REPORTED_CAUSE_CHARS} chars; original length ")
+    if marker and "\n" not in words and length.isdigit() and int(length) > len(text) == REPORTED_CAUSE_CHARS:
+        return words, True
+    return text, False
 
 
 def run_failure_error(run_id: str, run_state: str, failure: Any) -> ClaudexorUnavailable:
@@ -358,6 +373,31 @@ def model_failure_evidence_supported(operations: list[dict]) -> bool:
                                      name="captureFailureEvidence", value="true")
 
 
+# The engine's typed live-message outcomes (``LiveMessageOutcome``): the two
+# positive boundaries plus the four typed non-deliveries. Mirrored 1:1 by
+# ``delegate_message``; the host adds only its own ``not_found`` vocabulary.
+LIVE_MESSAGE_OUTCOMES = frozenset({
+    "delivered", "accepted", "rejected", "not_active", "unsupported", "delivery_unknown",
+})
+# The catalog spelling of the live-message route (Express-style template, the
+# same shape as ``/v2/runs/:id/control`` and the interaction-answer row).
+RUN_MESSAGE_OPERATION = ("POST", "/v2/runs/:id/messages")
+
+
+def run_message_supported(operations: list[dict]) -> bool:
+    """Does this engine's own route catalog list ``POST /v2/runs/:id/messages``?
+
+    Presence is negotiated structurally, like every other route here: an engine
+    older than the live-message release answers a route 404, which the verb must
+    never reach (a 404 is otherwise the daemon's "no such run").
+    """
+    method, path = RUN_MESSAGE_OPERATION
+    return any(
+        operation.get("method") == method and operation.get("path") == path
+        for operation in operations if isinstance(operation, dict)
+    )
+
+
 class ClaudexorGateway:
     """Thin typed client over the Claudexor ``/v2`` control API."""
 
@@ -529,9 +569,42 @@ class ClaudexorGateway:
         self._engine_build_sha = str(engine.get("sha") or "")
         return body
 
-    def agent_capabilities(self) -> Dict[str, Any]:
-        body = self._request("GET", "/v2/agent-capabilities")
+    def agent_capabilities(self, *, timeout_sec: Optional[float] = None) -> Dict[str, Any]:
+        body = self._request("GET", "/v2/agent-capabilities",
+                             **({"timeout_sec": timeout_sec} if timeout_sec is not None else {}))
         return body if isinstance(body, dict) else {}
+
+    def ask_input_limits(self) -> Dict[str, Dict[str, Any]]:
+        """Declared native text limits with the engine's ordinary ASK framing.
+
+        This catalog projection covers initial attempts, including thread turns.
+        Missing/unknown units or framing remain unknown, never a model window.
+        """
+        limits: Dict[str, Dict[str, Any]] = {}
+        for row in self.agent_capabilities().get("harnesses") or []:
+            if not isinstance(row, dict) or not row.get("id"):
+                continue
+            for value in row.get("inputLimits") or []:
+                if not isinstance(value, dict):
+                    continue
+                framing = value.get("askPromptBudget")
+                if (value.get("scope") != "turn_text" or value.get("unit") != "unicode_scalars"
+                        or not isinstance(framing, dict)
+                        or framing.get("shape") != "ordinary_initial_attempt"):
+                    continue
+                bound, overhead = value.get("limit"), framing.get("engineOverheadMax")
+                if (type(bound) is not int or bound <= 0 or type(overhead) is not int or overhead < 0
+                        or not isinstance(value.get("source"), str) or not value["source"]
+                        or not isinstance(value.get("verified_against"), str) or not value["verified_against"]):
+                    continue
+                candidate = {**value, "askPromptBudget": dict(framing),
+                             "prompt_budget": max(0, bound - overhead),
+                             "engine_version": self.engine_version,
+                             "engine_build_sha": self.engine_build_sha}
+                route_id = str(row["id"])
+                if route_id not in limits or candidate["prompt_budget"] < limits[route_id]["prompt_budget"]:
+                    limits[route_id] = candidate
+        return limits
 
     # Model operations use the same private control transport, not Agent runs
     # or the redacted/size-capped artifact surface. Callers own all admission,
@@ -627,10 +700,14 @@ class ClaudexorGateway:
         return ref
 
     def create_model_operation(self, request_ref: Dict[str, Any], *,
-                               idempotency_key: str, capture_failure_evidence: bool = False) -> Dict[str, Any]:
+                               idempotency_key: str, capture_failure_evidence: bool = False,
+                               capture_effort_evidence: bool = False) -> Dict[str, Any]:
         """Create or rejoin exactly one caller-identified generation; never mint a retry key."""
         key = _model_idempotency_key(idempotency_key)
-        path = "/v2/model-operations" + ("?captureFailureEvidence=true" if capture_failure_evidence else "")
+        query = "&".join(f"{name}=true" for name, enabled in (
+            ("captureFailureEvidence", capture_failure_evidence),
+            ("captureEffortEvidence", capture_effort_evidence)) if enabled)
+        path = "/v2/model-operations" + (f"?{query}" if query else "")
         return _model_operation(self._request(
             "POST", path, json_body={"request": _model_payload_ref(request_ref)},
             headers={"Idempotency-Key": key},
@@ -648,14 +725,10 @@ class ClaudexorGateway:
     def get_model_result(self, operation_id: str, *, expected_ref: Dict[str, Any],
                          timeout_sec: Optional[float] = None,
                          raw_bytes: bool = False) -> Dict[str, Any] | bytes:
-        """Read and verify the complete result, without ACK, redaction or artifact caps.
-
-        The expected reference comes from this operation's ready custody record.
-        Failure preserves that handle: only another read of the same operation is
-        appropriate here, never a new generation. The caller acknowledges after
-        it has retained the returned result under its own custody contract.
-        ``raw_bytes`` retains the exact verified JSON encoding for that custody;
-        it never skips the size, digest, UTF-8 or object validation below.
+        """Verify the complete result against ready custody; no ACK, redaction or caps.
+        Failure preserves the handle: re-read this operation, never regenerate.
+        The caller ACKs after retaining the result under its own custody contract.
+        ``raw_bytes`` keeps exact JSON encoding; size, digest, UTF-8 and object checks apply.
         """
         from urllib.parse import quote
 
@@ -700,7 +773,8 @@ class ClaudexorGateway:
         The agent-capability catalog is a derived projection that deliberately
         drops the manifest's transport flags (``json_schema_output``,
         ``interactive``); this is the surface that still carries them, so
-        transport-capability questions are asked here, not of the catalog.
+        these transport questions are asked here. The catalog's explicit
+        ``inputLimits`` projection separately includes engine ASK framing.
         """
         body = self._request("GET", "/v2/harnesses")
         rows = body.get("harnesses") if isinstance(body, dict) else None
@@ -869,6 +943,10 @@ class ClaudexorGateway:
         body = self._request("GET", f"/v2/runs/{run_id}", timeout_sec=timeout_sec)
         return body if isinstance(body, dict) else {}
 
+    def open_run_events(self, run_id: str, after_seq: int, timeout_sec: float) -> Any:
+        """``GET /v2/runs/:id/events`` resumed after ``after_seq``: an open SSE stream (``gateways.claudexor_run_events`` reads it)."""
+        return self._client.stream("GET", f"/v2/runs/{run_id}/events", headers={"Last-Event-ID": str(int(after_seq))}, timeout=httpx.Timeout(timeout_sec, connect=min(_CONNECT_TIMEOUT_SEC, timeout_sec)))
+
     def get_run_artifact(self, run_id: str, path: str) -> bytes:
         """GET /v2/runs/:id/artifacts/<path> — the FULL artifact body, raw bytes.
 
@@ -998,6 +1076,63 @@ class ClaudexorGateway:
         raise ClaudexorUnavailable(
             "malformed_response",
             f"interaction answer returned no typed status (HTTP {response.status_code})",
+        )
+
+    def send_run_message(self, run_id: str, text: str, *, idempotency_key: str,
+                         expected_attempt_id: str = "",
+                         timeout_sec: Optional[float] = None) -> Dict[str, Any]:
+        """POST /v2/runs/:id/messages — one live message into a running run.
+
+        ``idempotency_key`` is REQUIRED and is the caller's message identity: the
+        engine serves the route through its idempotent-delivery store, so a replay
+        under the same key returns the stored receipt instead of delivering twice
+        (``delegate_message`` mints it as ``message_id`` and hands it back).
+        ``expected_attempt_id`` pins the live attempt when a caller holds one.
+
+        Like ``answer_interaction`` this is transport, not translation, and it never
+        goes through ``_request`` (which raises on every status >= 400): any body
+        carrying a typed ``outcome`` (``LIVE_MESSAGE_OUTCOMES``) is returned as the
+        ANSWER it is, whatever the HTTP status. What raises ``ClaudexorUnavailable``:
+        transport failures (``daemon_unreachable``), and every refusal without a
+        typed outcome — the daemon's 404 ``no such run``, the 409 idempotency
+        problems (``idempotency_conflict`` / ``delivery_in_progress`` /
+        ``delivery_interrupted``), 400 (malformed, secret, too long), 501 (no
+        service), 5xx — each typed through ``_problem`` with its status code, so the
+        verb classifies by code AND status. A 2xx without a typed outcome is
+        ``malformed_response``.
+        """
+        from urllib.parse import quote
+
+        path = f"/v2/runs/{quote(str(run_id), safe='')}/messages"
+        payload: Dict[str, Any] = {"text": str(text)}
+        if expected_attempt_id:
+            payload["expectedAttemptId"] = str(expected_attempt_id)
+        bound: Dict[str, Any] = {}
+        if timeout_sec is not None:
+            bounded = max(0.000001, float(timeout_sec))
+            bound = {"timeout": httpx.Timeout(bounded, connect=min(_CONNECT_TIMEOUT_SEC, bounded))}
+        try:
+            response = self._client.request(
+                "POST", path, json=payload,
+                headers={"Idempotency-Key": str(idempotency_key)}, **bound)
+        except httpx.HTTPError as exc:
+            raise ClaudexorUnavailable(
+                "daemon_unreachable",
+                f"Claudexor daemon unreachable: {type(exc).__name__}: {exc}",
+            ) from exc
+        body: Any = None
+        if response.content:
+            try:
+                body = response.json()
+            except ValueError:
+                body = None
+        if isinstance(body, dict) and str(body.get("outcome") or "") in LIVE_MESSAGE_OUTCOMES:
+            return body
+        if response.status_code >= 400:
+            raise self._problem(response)
+        raise ClaudexorUnavailable(
+            "malformed_response",
+            f"run message returned no typed outcome (HTTP {response.status_code})",
         )
 
     def cancel_run(self, run_id: str, *, reason: str = "") -> Dict[str, Any]:
@@ -1133,7 +1268,7 @@ class ClaudexorGateway:
             raise ValueError(f"unknown setup job op: {op!r}")
         return body if isinstance(body, dict) else {}
 
-    def operations(self) -> List[Dict[str, Any]]:
+    def operations(self, *, timeout_sec: Optional[float] = None) -> List[Dict[str, Any]]:
         """GET /v2/operations — the engine's own implemented-route catalog.
 
         The handshake advertises this path (``operationsPath``); the catalog is
@@ -1141,7 +1276,7 @@ class ClaudexorGateway:
         on version folklore (verified live: ``{protocolMajor, operations:[{id,
         method, path, ...}]}``).
         """
-        body = self._request("GET", "/v2/operations")
+        body = self._request("GET", "/v2/operations", timeout_sec=timeout_sec)
         ops = body.get("operations") if isinstance(body, dict) else None
         return [row for row in (ops or []) if isinstance(row, dict)]
 
@@ -1355,8 +1490,8 @@ def attempt_containment(run_dir: str) -> List[AttemptContainment]:
     return applied
 
 
-def final_attempt_facts(detail: Dict[str, Any], run_id: str) -> Dict[str, str]:
-    """Read the final attempt's route facts from engine-owned telemetry.
+def final_attempt_facts(detail: Dict[str, Any], run_id: str) -> Dict[str, Any]:
+    """Read the final attempt's route and effort facts from engine-owned telemetry.
 
     The summary's model and harnesses echo the request; its route/authRoute
     projections may borrow facts from earlier attempts. Only the unique row
@@ -1385,13 +1520,16 @@ def final_attempt_facts(detail: Dict[str, Any], run_id: str) -> Dict[str, str]:
     if len(matching) != 1:
         return {}
     row = matching[0]
-    return {
+    facts = {
         target: row.get(source) if isinstance(row.get(source), str) else ""
         for target, source in (
             ("attempt_id", "attempt_id"), ("harness_id", "harness_id"),
             ("model", "observed_model"), ("profile_id", "profile_id"),
         )
     }
+    if "effort_resolution" in row:
+        facts["effort_resolution"] = validated_effort_resolution(row["effort_resolution"])
+    return facts
 
 
 __all__ = [

@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import pathlib
+import stat
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
@@ -327,16 +328,13 @@ def _iter_payload_files(
     manifest_scripts: Optional[List[Dict[str, Any]]] = None,
     include_control_files: bool = False,
 ) -> List[pathlib.Path]:
-    """Return files hashed for review freshness.
+    """List regular runtime payload files, excluding cache trees and symlink escapes.
 
-    The hash covers every regular runtime-reachable file under ``skill_dir``
-    except metadata/cache paths, lifecycle control files
-    (``HASH_EXEMPT_CONTROL_FILENAMES``), and symlink escapes. Manifest entry
-    points are re-added only when confined, keeping executable and reviewed
-    surfaces aligned. ``include_control_files=True`` reproduces the legacy
-    pre-v6.31 hash (control files included) for one-shot state migration.
-    Sensitive-looking filenames refuse ordinary loading; Cyber includes them
-    in the same byte hash and review pack rather than silently omitting them.
+    Confined manifest entries are re-added even under excluded directories,
+    keeping executable entry points inside the reviewed surface.
+    Native lifecycle markers are omitted unless ``include_control_files`` requests
+    their legacy pre-v6.31 hash. Sensitive filenames refuse ordinary loading;
+    Cyber includes them in the byte hash and review pack.
     """
     out: List[pathlib.Path] = []
     seen: set[pathlib.Path] = set()
@@ -356,15 +354,13 @@ def _iter_payload_files(
         resolved = (skill_dir / rel).resolve()
         try:
             resolved.relative_to(resolved_root)
-        except ValueError:
+            # is_file() hides ELOOP; an unreadable declared entry cannot be omitted from its hash.
+            if stat.S_ISREG(resolved.stat().st_mode):
+                _add(resolved)
+        except (ValueError, FileNotFoundError, NotADirectoryError):
             return
-        if resolved.is_file():
-            _add(resolved)
 
-    # Broad walk: everything runtime-reachable, minus metadata/cache names.
-    # Every candidate is resolved back under skill_dir so symlinks cannot leak
-    # outside files into reviewer prompts. Sensitive-path policy is shared with
-    # repo review.
+    # Confinement and the shared sensitive-path policy still cover every candidate.
     from ouroboros.tools.review_helpers import (
         _SENSITIVE_EXTENSIONS,
         _SENSITIVE_NAMES,
@@ -384,15 +380,21 @@ def _iter_payload_files(
         return False
 
     if resolved_root.is_dir():
-        for path in sorted(resolved_root.rglob("*")):
+        paths = []
+        pending = [resolved_root]
+        while pending:
+            directory = pending.pop()
+            for path in directory.glob("*"):
+                if path.name in _SKILL_DIR_CACHE_NAMES:
+                    continue
+                if path.is_dir() and not path.is_symlink():
+                    pending.append(path)
+                else:
+                    paths.append(path)
+        for path in sorted(paths):
             if not path.is_file():
                 continue
-            try:
-                rel_parts = path.relative_to(resolved_root).parts
-            except ValueError:
-                continue
-            if any(part in _SKILL_DIR_CACHE_NAMES for part in rel_parts):
-                continue
+            rel_parts = path.relative_to(resolved_root).parts
             # Only the TOP-LEVEL lifecycle marker of a NATIVE-bucket payload is
             # hash-exempt (the launcher writes it there; P3: everywhere else a
             # file by that name is ordinary runtime-reachable payload and stays

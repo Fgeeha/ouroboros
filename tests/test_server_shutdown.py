@@ -20,16 +20,22 @@ def _stop_restart_watcher(server):
     server._restart_requested.clear()
 
 
-def test_lifespan_shutdown_kills_executor_foreground_before_services():
-    import inspect
+@pytest.mark.parametrize("wait", [True, False])
+def test_lifespan_shutdown_kills_executor_foreground_before_services(monkeypatch, tmp_path, wait):
     import server
 
-    source = inspect.getsource(server.lifespan)
-
-    shell_idx = source.index("kill_all_tracked_subprocesses()")
-    foreground_idx = source.index("kill_all_foreground(lifespan_drive_root)")
-    service_idx = source.index("kill_all_services(lifespan_drive_root)")
-    assert shell_idx < foreground_idx < service_idx
+    order = []
+    def shell_failure():
+        order.append("shell")
+        raise OSError("shell custody unavailable")
+    monkeypatch.setattr("ouroboros.tools.shell.kill_all_tracked_subprocesses", shell_failure)
+    monkeypatch.setattr("ouroboros.workspace_executor.kill_all_foreground",
+                        lambda root, **kw: order.append(("foreground", root, kw)))
+    monkeypatch.setattr("ouroboros.tools.services.kill_all_services",
+                        lambda root, **kw: order.append(("services", root, kw)))
+    server._stop_owned_local_processes(tmp_path, wait=wait)
+    assert order == ["shell", ("foreground", tmp_path, {"wait": wait}),
+                     ("services", tmp_path, {"wait": wait})]
 
 
 def test_shutdown_task_cleanup_args_never_reports_crash_storm():
@@ -303,15 +309,22 @@ def test_supervisor_startup_restores_queue_before_worker_reset():
 
 
 def test_update_finalizer_waits_for_real_supervisor_outcome(monkeypatch):
+    """The waiter blocks on the init OUTCOME latch, never on readiness: a failed
+    init is an outcome that must not hang the boot, and it must not have to
+    fake readiness to unblock this waiter (the API would paint Online)."""
     import server
 
     calls = []
-    ready = SimpleNamespace(wait=lambda: calls.append("wait"))
-    monkeypatch.setattr(server, "_supervisor_ready", ready)
+    outcome = SimpleNamespace(wait=lambda: calls.append("wait"))
+    monkeypatch.setattr(server, "_supervisor_init_done", outcome)
+    monkeypatch.setattr(server, "_supervisor_ready", threading.Event())  # never set here
     monkeypatch.setattr(server, "_supervisor_error", None)
 
     assert server._wait_for_supervisor_update_finalize() is True
     assert calls == ["wait"]
+    monkeypatch.setattr(server, "_supervisor_error", "Supervisor init failed: boom")
+    assert server._wait_for_supervisor_update_finalize() is False
+    assert calls == ["wait", "wait"]
 
 
 def test_boot_update_check_notifies_the_live_ui():
@@ -516,37 +529,47 @@ def test_panic_stop_kills_services_without_log_finalization(monkeypatch, tmp_pat
     class ExitCalled(RuntimeError):
         pass
 
-    monkeypatch.setattr("ouroboros.tools.shell.kill_all_tracked_subprocesses", lambda: None)
+    monkeypatch.setattr("ouroboros.startup_historical_audit.audit.stop", lambda: None)
+    monkeypatch.setattr("ouroboros.tools.shell.kill_all_tracked_subprocesses", lambda **kw: None)
     monkeypatch.setattr("ouroboros.workspace_executor.kill_all_foreground", lambda *a, **k: foreground_calls.append((a, k)))
     monkeypatch.setattr("ouroboros.tools.services.kill_all_services", lambda *a, **k: service_calls.append((a, k)))
-    monkeypatch.setattr("ouroboros.local_model.get_manager", lambda: SimpleNamespace(stop_server=lambda: None))
-    monkeypatch.setattr("supervisor.state.load_state", lambda: {})
-    monkeypatch.setattr("supervisor.state.save_state", lambda _state: None)
-    monkeypatch.setattr("supervisor.evolution_lifecycle.complete_evolution_campaign", lambda *a, **k: {})
-    monkeypatch.setattr("ouroboros.post_task_evolution.drop_pending_request", lambda *a, **k: None)
-    monkeypatch.setattr("ouroboros.extension_companion.panic_kill_all", lambda: None)
-    monkeypatch.setattr("multiprocessing.active_children", lambda: [])
+    monkeypatch.setattr("ouroboros.local_model.get_manager", lambda **kw: SimpleNamespace(
+        panic_stop=lambda **kw: [], stop_server=lambda: None))
+    monkeypatch.setattr("ouroboros.claudexor_daemon.get_owned_daemon", lambda **kw: SimpleNamespace(
+        panic_stop=lambda **kw: [], stop_outcome=lambda: None))
+    monkeypatch.setattr(server_control, "_persist_panic_controls", lambda _data: None)
+    monkeypatch.setattr("ouroboros.extension_companion.panic_kill_all", lambda **kw: None)
+    monkeypatch.setattr("multiprocessing.active_children", lambda: [SimpleNamespace(pid=4321)])
+    native_calls = []
+    monkeypatch.setattr("supervisor.worker_pool_lifecycle.kill_worker_tree",
+                        lambda pid, panic_process=None: native_calls.append(pid) or {"requested": True})
     monkeypatch.setattr("ouroboros.platform_layer.kill_process_on_port", lambda _port: None)
     monkeypatch.setattr("ouroboros.gateway.host_service.host_service_port", lambda: 8767)
     monkeypatch.setattr(server_control.os, "_exit", lambda code: (_ for _ in ()).throw(ExitCalled(code)))
 
+    before = set(threading.enumerate())
     try:
-        server_control.execute_panic_stop(
+        with pytest.raises(ExitCalled):
+            server_control.execute_panic_stop(
             consciousness=SimpleNamespace(stop=lambda: None),
             kill_workers_fn=lambda **kw: worker_calls.append(kw),
             data_dir=tmp_path,
             panic_exit_code=120,
             log=SimpleNamespace(critical=lambda *a, **k: None),
-        )
-    except ExitCalled:
-        pass
+            )
+    finally:
+        for thread in set(threading.enumerate()) - before:
+            if thread.name.startswith("panic-"):
+                thread.join(timeout=5)
+                assert not thread.is_alive()
 
-    assert foreground_calls == [((tmp_path,), {"wait": False})]
-    assert service_calls == [((tmp_path,), {"wait": False})]
-    assert worker_calls == [{
-        "force": True, "archive_service_logs": False,
-        "reconcile_delegate_custody": False,
-    }]
+    assert native_calls == [4321]  # physical process request before settlement
+    assert any(k.get("request_only") for _, k in foreground_calls)
+    assert any(k.get("wait") is False for _, k in foreground_calls)
+    assert any(k.get("request_only") for _, k in service_calls)
+    assert any(k.get("wait") is False for _, k in service_calls)
+    assert worker_calls == []  # no root-first cooperative callback dependency
+    assert (tmp_path / "state/panic_stop.flag").read_text(encoding="utf-8") == "panic"
 
 
 # ---------------------------------------------------- shutdown-aware supervisor loop
@@ -661,6 +684,9 @@ def _supervisor_harness(monkeypatch, tmp_path, steps):
     monkeypatch.setattr(server, "ensure_legacy_imported", noop)
     monkeypatch.setattr(server, "_bootstrap_supervisor_repo", lambda _s: (True, "ok"))
     monkeypatch.setattr(server, "_runtime_branch_defaults", lambda: ("dev", "stable"))
+    # Startup notices have their own real delivery/state consumer tests. This
+    # harness records supervisor crash alerts and stubs other boot side effects.
+    monkeypatch.setattr("ouroboros.upgrade_notices.startup_upgrade_notices", noop)
     for name in (
         "_resume_interrupted_project_deletions", "_startup_prune_sweeps", "_startup_custody_sweep",
         "_startup_worktree_prune", "_prune_delegated_snapshots", "_periodic_supervisor_maintenance",
@@ -682,7 +708,7 @@ def _supervisor_harness(monkeypatch, tmp_path, steps):
     monkeypatch.setattr(events_mod, "make_server_log_sink", lambda *_a, **_k: None)
     monkeypatch.setattr(events_mod, "dispatch_event", noop)
     monkeypatch.setattr(state_mod, "init", noop)
-    monkeypatch.setattr(state_mod, "init_state", noop)
+    monkeypatch.setattr(state_mod, "init_state", lambda **_k: state_mod.StateRead("current", "primary", {}))
     monkeypatch.setattr(state_mod, "load_state", lambda: {"owner_chat_id": 7})
     for name in ("save_state", "update_state", "append_jsonl", "update_budget_from_usage",
                  "rotate_jsonl_log_if_needed"):
@@ -698,7 +724,6 @@ def _supervisor_harness(monkeypatch, tmp_path, steps):
         monkeypatch.setattr(workers_mod, name, noop)
     monkeypatch.setattr(workers_mod, "get_event_q", lambda: queue_mod.Queue())
     monkeypatch.setattr("ouroboros.delegate_recovery.pre_adopt_planned_handoffs", noop)
-    monkeypatch.setattr("ouroboros.observability.prune_observability_blobs", lambda _root: {})
     monkeypatch.setattr("ouroboros.tools.services.prune_service_logs", lambda _root: {})
     monkeypatch.setattr("ouroboros.consciousness.BackgroundConsciousness", _Consciousness)
     return rec
@@ -844,7 +869,7 @@ def test_terminal_custody_precedes_every_best_effort_wait_in_the_teardown():
     append_idx = teardown.index('"server_shutdown"')
     extension_idx = teardown.index("extension_reconcile_task.cancel()")
     host_idx = teardown.index("host_service_listener.close()")
-    sweeps_idx = teardown.index("kill_all_tracked_subprocesses()")
+    sweeps_idx = teardown.index("_stop_owned_local_processes(lifespan_drive_root)")
     assert stop_idx < join_idx < kill_idx < extension_idx < host_idx < sweeps_idx
     assert kill_idx < append_idx < extension_idx
 

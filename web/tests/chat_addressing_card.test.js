@@ -85,7 +85,8 @@ const final = { task_id: TASK, role: 'assistant', content: 'The task is schedule
     outcome_axes: { execution: { status: 'ok' } }, reason_code: 'final_message',
     accounted_upper_bound_usd: 0.75, cost_final: true, cost_accounting_status: 'available' };
 // The host stamps every frame of an addressing call with the action it represents.
-const stamped = (tool, row = {}) => ({ tool, routing_action: tool, ...row });
+const stamped = (tool, row = {}) => ({ tool, routing_action: tool,
+    invocation_id: row.tool_call_id || `host-${tool}`, ...row });
 
 for (const [room, chatId, destination, visible] of [
     ['Main', 1, 42, true], ['destination Project', 42, 42, false],
@@ -398,4 +399,74 @@ test('a complete host snapshot owns the counts and the tool names; later frames 
     const after = toolEvidenceView(record.toolFold);
     assert.deepEqual([after.headline, after.phase], ['4 tool calls · 1 error', 'warn'],
         'the host settled the turn; a straggling frame does not reopen it');
+});
+
+for (const [room, chatId] of [['Main', 1], ['Project', 42]]) {
+    for (const tool of ['finish_task', 'presence_finish', 'task_acceptance_review']) {
+        test(`${room}: successful host-stamped ${tool} is a completion receipt live, on reload and reconnect`, async () => {
+            const counts = { tool_calls: 1, tool_errors: 0, routing_tool_calls: 0,
+                completion_tool_calls: 1, tool_call_counts: { [tool]: 1 } };
+            const answer = { ...final, chat_id: chatId, ...counts };
+            const history = [answer, { ...answer, role: 'system', system_type: 'task_summary', text: '' }];
+            const f = fixture(history, chatId);
+            try {
+                const stamp = { tool, invocation_id: 'finish-1', completion_control: true };
+                f.log({ type: 'tool_call_started', ...stamp });
+                assert.equal(f.card(), null, 'a local completion request starts no work card');
+                f.log({ type: 'tool_call_finished', ...stamp, is_error: false });
+                f.emit('chat', answer);
+                f.log({ type: 'task_metrics_event', ...counts });
+                assert.equal(f.card(), null);
+                assert.ok(f.answerVisible(), 'the complete authored answer remains visible');
+                await f.instance.refreshHistory({ revision: 1 });
+                await f.instance.refreshHistory({ revision: 2 });
+                assert.equal(f.card(), null, 'history/reconnect retain the receipt-only classification');
+            } finally { f.close(); }
+            const cold = fixture(history, chatId);
+            try {
+                await cold.instance.refreshHistory({ revision: 1 });
+                assert.equal(cold.card(), null, 'aggregate-only cold replay mints no card');
+                assert.ok(cold.answerVisible());
+            } finally { cold.close(); }
+        });
+    }
+}
+
+test('completion errors stay visible, while an unmarked tool name alone conveys no receipt authority', () => {
+    for (const completion_control of [true, undefined]) {
+        const f = fixture();
+        try {
+            f.log({ type: 'tool_call_started', tool: 'finish_task', invocation_id: 'finish-1', completion_control });
+            assert.equal(Boolean(f.card()), completion_control !== true);
+            f.log({ type: 'tool_call_finished', tool: 'finish_task', invocation_id: 'finish-1', completion_control,
+                is_error: true, error: 'The selected answer is unavailable.' });
+            f.log({ type: 'task_metrics_event', tool_calls: 1, tool_errors: 1, completion_tool_calls: 0 });
+            assert.ok(f.card());
+            assert.match(f.meta(), /1 error/);
+            assert.ok(f.rows().some(row => /One of the steps failed/.test(row.innerHTML)));
+        } finally { f.close(); }
+    }
+});
+
+test('routing plus completion receipts keep actual counts, and work remains visible beside them', () => {
+    const record = {};
+    let view = noteToolHostMetrics(record, { calls: 2, errors: 0, routing: 1, completion: 1 });
+    assert.equal(view.receipt, true);
+    assert.equal(view.headline, '2 tool calls');
+    view = noteToolHostMetrics(record, { calls: 2 });
+    assert.equal(view.receipt, true, 'a partial snapshot retains both receipt totals');
+    view = noteToolHostMetrics(record, { calls: 3, errors: 0, routing: 1, completion: 1 });
+    assert.equal(view.receipt, false, 'the third call is real work');
+});
+
+test('successful completion settlement classifies an earlier unmarked start and a reordered start cannot undo it', () => {
+    const record = {};
+    noteToolCall(record, { key: 'finish', fact: 'started', status: 'calling', tool: 'finish_task', receipt: false });
+    assert.equal(toolEvidenceView(record.toolFold).receipt, false);
+    noteToolCall(record, { key: 'finish', fact: 'settled', status: 'ok', tool: 'finish_task', receipt: true });
+    assert.equal(toolEvidenceView(record.toolFold).receipt, true);
+    noteToolCall(record, { key: 'finish', fact: 'started', status: 'calling', tool: 'finish_task', receipt: false });
+    assert.equal(toolEvidenceView(record.toolFold).receipt, true);
+    const view = noteToolHostMetrics(record, { calls: 1, errors: 0, routing: 0 });
+    assert.equal(view.receipt, true, 'an absent completion aggregate cannot erase complete observed receipt facts');
 });

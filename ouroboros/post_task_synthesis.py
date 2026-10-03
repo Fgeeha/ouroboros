@@ -2,7 +2,7 @@
 
 The LLM-heavy best-effort memory work the post-task orchestrator
 (``agent_task_pipeline._run_post_task_processing_async``) dispatches after a
-task ends: the tool-trace summary, the episodic task summary, chat/scratchpad
+task ends: the tool-trace summary, the free host facts row, chat/scratchpad
 consolidation, the execution reflection with its child-task evidence, the
 durable improvement backlog and reflection memory actions, plus the shared
 pre-synthesis usage snapshot and the compact review projection those prompts
@@ -16,12 +16,12 @@ import logging
 import pathlib
 
 from dataclasses import replace
-from typing import Any, Dict
+from typing import Any, Callable, Dict
 from ouroboros.dialogue_provenance import presence_provenance_fields
 from ouroboros.llm_claudexor import propagate_model_error
 from ouroboros.outcomes import normalize_outcome_axes
 from ouroboros.subagent_messages import initiator_meta
-from ouroboros.synthesis_cost_text import _summary_row_cost_fields, _synthesis_cost_text, _synthesis_cost_usd, _synthesis_usage_snapshot_text
+from ouroboros.synthesis_cost_text import _summary_row_cost_fields, _synthesis_cost_usd, _synthesis_usage_snapshot_text
 from ouroboros.task_finalization import sealed_final_prompt_section
 from ouroboros.tool_capabilities import routing_action_for_tool
 from ouroboros.utils import append_jsonl, truncate_review_artifact as _truncate_with_notice, utc_now_iso
@@ -56,6 +56,8 @@ def task_tool_metrics(llm_trace: dict) -> dict:
         # a client list of tool names.
         "routing_tool_calls": None if unavailable else sum(
             1 for call in calls if isinstance(call, dict) and routing_action_for_tool(call.get("tool"))),
+        "completion_tool_calls": None if unavailable else sum(
+            1 for call in calls if isinstance(call, dict) and call.get("completion_control") is True and not call.get("is_error")),
         "tool_call_counts": None,
     }
     if unavailable or llm_trace.get("recovered_post_task_synthesis") or not isinstance(llm_trace.get("tool_calls"), list):
@@ -273,26 +275,26 @@ def _update_improvement_backlog(
     env: Any,
     reflection_entry: Dict[str, Any] | None,
 ) -> int:
-    """Persist LLM-nominated follow-up improvements into the durable backlog."""
-    try:
-        from ouroboros.improvement_backlog import append_backlog_items
+    """Persist LLM-nominated follow-up improvements into the durable backlog.
 
-        candidates = list((reflection_entry or {}).get("backlog_candidates") or [])
-        if not candidates:
-            return 0
-        added = append_backlog_items(env.drive_root, candidates)
-        try:
-            from ouroboros.improvement_backlog import groom_backlog
+    Returns the number appended; 0 is a genuine no-op (nothing nominated), never a
+    swallowed failure. An append or grooming failure raises to the promotion stage,
+    which isolates an ordinary one and stops later paid work on an interruption.
+    """
+    from ouroboros.improvement_backlog import append_backlog_items, groom_backlog
+    from ouroboros.post_task_checkpoint import current_late_phase_run
 
-            groom_backlog(env.drive_root)  # size-triggered; no-op while small
-        except Exception as error:
-            propagate_model_error(error)
-            log.debug("Backlog grooming failed", exc_info=True)
-        return added
-    except Exception as error:
-        propagate_model_error(error)
-        log.debug("Improvement backlog update failed", exc_info=True)
+    candidates = list((reflection_entry or {}).get("backlog_candidates") or [])
+    if not candidates:
         return 0
+    late, appended = current_late_phase_run(), f"backlog_appended:{env.drive_root}"
+    added = 0
+    if late is None or not late.marked(appended):  # a resumed Pause never counts a recurrence twice
+        added = append_backlog_items(env.drive_root, candidates)
+        if late is not None:
+            late.mark(appended)
+    groom_backlog(env.drive_root)  # size-triggered; no-op while small
+    return added
 
 
 def _apply_reflection_memory_actions(
@@ -502,109 +504,114 @@ def _compact_review_projection(llm_trace: Dict[str, Any]) -> Dict[str, Any]:
         return {"panels": []}
 
 
-def _run_task_summary(env, llm, task, usage, llm_trace, drive_logs, review_evidence=None,
-                      sealed_final=None):
-    """Generate a detailed task summary and inject it into chat.jsonl."""
+def _record_task_facts(env: Any, task: Dict[str, Any], usage: Dict[str, Any],
+                       llm_trace: Dict[str, Any], drive_logs: pathlib.Path) -> None:
+    """Append the task's free host facts row to chat.jsonl: no model call, no prose.
+
+    The owner removed the paid task narrative (TZ-2 decision 2=A). This row keeps
+    the facts its readers take from a ``task_summary`` row when the result file is
+    gone: the direct-turn fact, origin label, typed routing action, tool metrics,
+    rounds, cost and review projection. Its kind is ``host_task_facts``, never
+    ``authored_root_summary``, and it persists no continuation narrative, so a
+    Main continuation sees the typed ``continuation_narrative_unavailable`` gap.
+    Text stays empty: existing Project and result references own navigation.
+    """
+    task_id = str(task.get("id") or "unknown")
     try:
-        from ouroboros.project_dialogue import append_authored_task_summary, completion_status_label, outcome_phase
-        from ouroboros.projects_registry import project_thread_note_for_task
-        from ouroboros.consolidator import _consolidation_route
-        from ouroboros.settings_scales import resolve_effort
-        task_id = str(task.get("id") or "unknown")
+        from ouroboros.project_dialogue import append_canonical_task_summary, completion_status_label, outcome_phase
+        from ouroboros.task_finalization import artifact_store_roots, rescued_files_fact
+
         canonical_root = pathlib.Path(task.get("budget_drive_root") or drive_logs.parent)
-        summary_id = f"task-narrative:{task_id}"
-        tool_metrics = task_tool_metrics(llm_trace)
-        n_tool_calls = tool_metrics["tool_calls"]
-        rounds = None if usage.get("loop_evidence_unavailable") else int(usage.get("rounds") or 0)
-        round_text = "round count unknown" if rounds is None else f"{rounds}r"
-        cost_text = _synthesis_cost_text(usage)
-        outcome_axes = normalize_outcome_axes(usage)
-        reason_code = str(usage.get("reason_code") or "")
-        review_projection = _compact_review_projection(llm_trace)
-        presence_fields = presence_provenance_fields(task)
         result_root = pathlib.Path(getattr(env, "drive_root", canonical_root))
         stored_result = _atp().load_task_result(result_root, task_id) or {}
-        result_ref = {"kind": "task_result", "task_id": task_id, "reader": "get_task_result"}
+        review_projection = _compact_review_projection(llm_trace)
+        # TZ-2 C2: how many files the task rescued into its store(s) — positive, zero or
+        # unknown — by stat alone; the fact discloses that no hash was computed. A split
+        # non-Project root synthesizes on the canonical drive (parent env and task): its
+        # actor store is then the row's recorded ``child_drive_root``, else this drive.
+        canonical = result_root.resolve(strict=False) == canonical_root.resolve(strict=False)
+        files_rescued = rescued_files_fact(task_id, artifact_store_roots(
+            canonical_root, task_id, task=task, child_root=None if canonical else result_root))
+        append_canonical_task_summary(canonical_root, {
+            "ts": utc_now_iso(), "direction": "system", "type": "task_summary",
+            "summary_kind": "host_task_facts", "summary_id": f"task-facts:{task_id}",
+            "task_id": task_id, "parent_task_id": str(task.get("parent_task_id") or ""), "root_task_id": str(task.get("root_task_id") or task_id),
+            "project_id": str(task.get("project_id") or ""), "chat_id": int(task.get("chat_id") or 0), "delegation_role": str(task.get("delegation_role") or ""), "role": str(task.get("role") or ""),
+            "status": str(stored_result.get("status") or "completed"), "outcome": completion_status_label(stored_result, usage), "outcome_phase": outcome_phase(stored_result, usage),
+            "outcome_final": False, "outcome_authority": "pre_finalization_host_facts",
+            # The chat block reads its chrome, the addressing fact and the
+            # origin label from this row when the task result has been pruned.
+            "_is_direct_chat": bool(task.get("_is_direct_chat")), **initiator_meta(task),
+            **({"typed_routing_action": str(usage["typed_routing_action"])} if usage.get("typed_routing_action") else {}),
+            "text": "", **task_tool_metrics(llm_trace),
+            "rounds": None if usage.get("loop_evidence_unavailable") else int(usage.get("rounds") or 0),
+            "outcome_axes": normalize_outcome_axes(usage), "reason_code": str(usage.get("reason_code") or ""),
+            "result_ref": {"kind": "task_result", "task_id": task_id, "reader": "get_task_result"},
+            "files_rescued": files_rescued,
+            **_summary_row_cost_fields(usage), **presence_provenance_fields(task),
+            **({"review_projection": review_projection} if review_projection.get("panels") else {}),
+        })
+    except Exception:
+        log.warning("Task facts row was not recorded for %s (non-critical)", task_id, exc_info=True)
 
-        def _append_summary(value: str) -> None:
-            row = {
-                "ts": utc_now_iso(), "direction": "system", "type": "task_summary",
-                "summary_kind": "authored_root_summary", "summary_id": summary_id,
-                "task_id": task_id, "parent_task_id": str(task.get("parent_task_id") or ""), "root_task_id": str(task.get("root_task_id") or task_id),
-                "project_id": str(task.get("project_id") or ""), "chat_id": int(task.get("chat_id") or 0), "delegation_role": str(task.get("delegation_role") or ""), "role": str(task.get("role") or ""),
-                "status": str(stored_result.get("status") or "completed"), "outcome": completion_status_label(stored_result, usage), "outcome_phase": outcome_phase(stored_result, usage),
-                "outcome_final": False, "outcome_authority": "pre_finalization_narrative_context",
-                # The chat block reads its chrome, the addressing fact and the
-                # origin label from this row when the task result has been pruned.
-                "_is_direct_chat": bool(task.get("_is_direct_chat")), **initiator_meta(task),
-                **({"typed_routing_action": str(usage["typed_routing_action"])} if usage.get("typed_routing_action") else {}),
-                "text": value, **tool_metrics, "rounds": rounds, "outcome_axes": outcome_axes, "reason_code": reason_code,
-                "result_ref": result_ref, "source_coverage": {"task_result": result_ref}, **_summary_row_cost_fields(usage), **presence_fields,
-                **({"review_projection": review_projection} if review_projection.get("panels") else {}),
-            }
-            append_authored_task_summary(
-                canonical_root, result_root, row, status=str(stored_result.get("status") or ""),
-            )
-        # Skip LLM summary for trivial tasks.
-        if n_tool_calls in (None, 0) and (rounds is None or rounds <= 1):
-            goal = _truncate_with_notice(task.get("text", ""), 200)
-            summary_text = (
-                f"Task {task_id} ({task.get('type', 'user')}): "
-                f"{goal}. {round_text}, {cost_text}." + project_thread_note_for_task(task)
-            )
-            _append_summary(summary_text)
-            return
 
-        summary_model, summary_use_local = _consolidation_route()
-        goal = _truncate_with_notice(task.get("text", ""), 500)
-        trace = build_trace_summary(llm_trace)
-        try:
-            from ouroboros.review_evidence import format_review_evidence_for_prompt
-            review_section = format_review_evidence_for_prompt(review_evidence or {}, max_chars=8000, acceptance_panels=review_projection.get("panels"))
-        except Exception:
-            review_section = "(review evidence unavailable)"
-        from ouroboros.reflection import task_inputs_prompt_section
+POST_TASK_INTERRUPT_KINDS = frozenset({"budget_exhausted", "provider_outcome_unknown"})
 
-        prompt = _TASK_SUMMARY_PROMPT.format(
-            task_id=task_id, goal=goal or "(no goal text)",
-            task_type=task.get("type", "user"), rounds="unknown" if rounds is None else rounds,
-            cost_text=cost_text,
-            usage_snapshot=_synthesis_usage_snapshot_text(usage),
-            sealed_final=sealed_final_prompt_section(sealed_final),
-            task_inputs=task_inputs_prompt_section(review_evidence),
-            trace_summary=trace,
-            review_evidence=review_section,
-        )
-        try:
-            from ouroboros.llm_observability import chat_observed
 
-            msg, _usage = chat_observed(llm, drive_root=canonical_root, task_id=task_id,
-                                   call_type="task_summary", messages=[{"role": "user", "content": prompt}],
-                                   model=summary_model,
-                                   model_role="light",
-                                   reasoning_effort=resolve_effort("task"),  # the owner's Task / Chat level: one SSOT, no literal
-                                   max_tokens=16384,
-                                   use_local=summary_use_local)
-            summary_text = (msg.get("content") or "").strip()
-            if _usage.get("cost"):
-                try:
-                    from supervisor.state import update_budget_from_usage
-                    update_budget_from_usage(_usage)
-                except Exception:
-                    pass
-        except Exception as exc:
-            propagate_model_error(exc)
-            log.warning("Task summary LLM call failed, using fallback", exc_info=True)
-            summary_text = (
-                f"Task {task_id} ({task.get('type', 'user')}): "
-                f"{_truncate_with_notice(goal, 200)}. {round_text}, {cost_text}."
-            )
-        if summary_text:
-            summary_text += project_thread_note_for_task(task)
-            _append_summary(summary_text)
-    except Exception as exc:
-        propagate_model_error(exc)
-        log.debug("Task summary generation failed (non-critical)", exc_info=True)
+def propagate_paid_interruption(error: BaseException) -> None:
+    """Re-raise what must stop later paid post-work; return for an ordinary failure.
+
+    ``propagate_model_error`` carries the control and typed unknown-provider facts;
+    the wallet's ``BudgetExceeded`` and an unresolved attempt on ANY provider's
+    exception chain — the consolidator's own classifier, never a broadened global
+    one — are the others (TZ-2 C3). A stage adapter that only logged them let the
+    coordinator run the next paid stage and write ``completed``. Anything else
+    returns, so the caller isolates the failure to its own stage.
+    """
+    propagate_model_error(error)
+    from ouroboros.transport_custody import outcome_unknown_on_chain
+    from ouroboros.usage_accounting import BudgetExceeded
+
+    if isinstance(error, BudgetExceeded) or outcome_unknown_on_chain(error):
+        raise error
+
+
+def post_task_interruption(control: BaseException) -> str:
+    """The closed stop-reason word for a control that ended paid post-work.
+
+    A model wait carries its ``control_reason``; a typed provider fact keeps its
+    code; an unknown outcome (a dispatched attempt without a terminal provider
+    fact) is always ``provider_outcome_unknown`` — the transport's own
+    ``model_outcome_unknown`` spelling never reaches the checkpoint.
+    """
+    reason = str(getattr(control, "control_reason", "") or "")
+    if reason:
+        return reason
+    code = str(getattr(control, "code", "") or "")
+    from ouroboros.transport_custody import outcome_unknown_on_chain
+
+    if not code or code == "model_outcome_unknown" or outcome_unknown_on_chain(control):
+        return "provider_outcome_unknown"
+    return code
+
+
+def _post_task_paid_interruption(errors: Any) -> str:
+    """The stage's typed outcome from returned error facts: '' when clean.
+
+    Memory consolidation returns errors to keep completed chunks. Only this
+    stage adapter interprets those existing facts: a budget or unknown-provider
+    kind wins and stops later paid post-work; any other kind names the last
+    UNRESOLVED ordinary failure, so a stage that lost a chunk reads ``degraded``
+    like a stage that raised (TZ-2 C3: unfinished stages are never ``completed``).
+    The history keeps every attempt; a refusal its producer answered (a split whose
+    halves carry their own rows, ``resolution``) is not an unfinished stage.
+    """
+    rows = [row for row in (errors if isinstance(errors, list) else []) if isinstance(row, dict)]
+    for row in rows:
+        if row.get("kind") in POST_TASK_INTERRUPT_KINDS:
+            return str(row["kind"])
+    unresolved = [row for row in rows if not row.get("resolution")]
+    return str((unresolved[-1].get("kind") or "stage_error")) if unresolved else ""
 
 
 def _run_chat_consolidation(env, memory, llm, task, drive_logs):
@@ -651,10 +658,15 @@ def _run_chat_consolidation(env, memory, llm, task, drive_logs):
                 # LAST error any attempt recorded (recovered splits keep theirs), which
                 # is weaker than "the run failed" and is reported under that honest name.
                 errors = u.get("_consolidation_errors") or []
+                from ouroboros.room_consolidation import consolidation_coverage
+
+                # Coverage is measured from the run's own per-unit facts (no new
+                # ledger); cost stays None when any call's spend is unknown.
                 append_jsonl(_logs / "events.jsonl", {"ts": utc_now_iso(),
                     "type": "chat_block_consolidation", "task_id": _id,
                     "blocks_written": u.get("_blocks_written"),
                     "last_error_kind": (errors[-1] or {}).get("kind") if errors else None,
+                    "coverage": consolidation_coverage(u.get("_coverage")),
                     "cost_usd": (
                         round(float(u["cost"]), 6)
                         if u.get("cost") is not None
@@ -663,9 +675,11 @@ def _run_chat_consolidation(env, memory, llm, task, drive_logs):
                 if u.get("cost") or u.get("prompt_tokens"):
                     from supervisor.state import update_budget_from_usage
                     update_budget_from_usage(u)
+                return _post_task_paid_interruption(errors)
     except Exception as error:
-        propagate_model_error(error)
+        propagate_paid_interruption(error)
         log.warning("Chat block consolidation setup failed", exc_info=True)
+        return "stage_setup_failed"  # an ordinary failure isolated to this stage, never `completed`
 
 
 def _run_scratchpad_consolidation(env: Any, memory: Any, llm: Any) -> None:
@@ -696,93 +710,277 @@ def _run_scratchpad_consolidation(env: Any, memory: Any, llm: Any) -> None:
             if u and (u.get("cost") or u.get("prompt_tokens")):
                 from supervisor.state import update_budget_from_usage
                 update_budget_from_usage(u)
+            return _post_task_paid_interruption(u.get("_consolidation_errors") if isinstance(u, dict) else [])
     except Exception as error:
-        propagate_model_error(error)
+        propagate_paid_interruption(error)
         log.debug("Scratchpad consolidation setup failed", exc_info=True)
+        return "stage_setup_failed"
 
 
 def _run_reflection(env: Any, llm: Any, task: Dict[str, Any],
                     usage: Dict[str, Any], llm_trace: Dict[str, Any],
                     review_evidence: Dict[str, Any],
-                    sealed_final: Dict[str, Any] | None = None) -> Dict[str, Any] | None:
-    """Run execution reflection synchronously (process memory, Bible P1)."""
-    try:
-        from ouroboros.reflection import (
-            should_generate_reflection, generate_reflection, append_reflection_routed,
-        )
-        synthesis_cost = _synthesis_cost_usd(usage)
-        # The one walk happens BEFORE the decision, because a root whose only
-        # failures are its children cannot be recognized without it: children do
-        # not reflect, so their classes have to reach this gate to be learned
-        # from at all. Still one walk, and its rows serve the prompt below.
-        child_evidence, child_rows = _child_task_evidence(env, task)
-        child_classes = _child_failure_classes(child_rows)
-        if should_generate_reflection(
-            llm_trace,
-            task=task,
-            rounds=int(usage.get("rounds", 0)),
-            cost_usd=synthesis_cost,
+                    sealed_final: Dict[str, Any] | None = None,
+                    publish: Callable[[Dict[str, Any]], Any] | None = None) -> Dict[str, Any] | None:
+    """Run execution reflection synchronously (process memory, Bible P1).
+
+    Returns the entry, or None only when there is nothing to reflect on; a
+    failure raises to the post-task stage coordinator, which degrades the
+    checkpoint and still runs the later stages (TZ-2 C3). ``publish`` receives
+    the completed entry before its nested paid Pattern Register write, so an
+    interruption there still leaves the coordinator its free memory actions.
+    """
+    from ouroboros.reflection import (
+        should_generate_reflection, generate_reflection, append_reflection_routed,
+    )
+    synthesis_cost = _synthesis_cost_usd(usage)
+    # The one walk happens BEFORE the decision, because a root whose only
+    # failures are its children cannot be recognized without it: children do
+    # not reflect, so their classes have to reach this gate to be learned
+    # from at all. Still one walk, and its rows serve the prompt below.
+    child_evidence, child_rows = _child_task_evidence(env, task)
+    child_classes = _child_failure_classes(child_rows)
+    if should_generate_reflection(
+        llm_trace,
+        task=task,
+        rounds=int(usage.get("rounds", 0)),
+        cost_usd=synthesis_cost,
+        child_failure_classes=child_classes,
+    ):
+        trace_summary = build_trace_summary(llm_trace, all_calls=True)
+        reflection_usage = dict(usage)
+        # Reflection's legacy durable cost_usd field now records this
+        # same subtree snapshot instead of silently reverting to own cost.
+        reflection_usage["cost"] = synthesis_cost
+        from ouroboros.tools.registry import ToolContext
+        knowledge_context = ToolContext(
+            repo_dir=getattr(env, "repo_dir", env.drive_root),
+            drive_root=pathlib.Path(task.get("budget_drive_root") or env.drive_root),
+            project_id=str(task.get("project_id") or ""),
+            task_id=str(task.get("id") or ""))
+        entry = generate_reflection(
+            task, llm_trace, trace_summary,
+            llm, reflection_usage,
+            review_evidence=review_evidence,
+            child_evidence=child_evidence,
+            usage_snapshot_text=_synthesis_usage_snapshot_text(usage),
+            sealed_final_text=sealed_final_prompt_section(sealed_final),
             child_failure_classes=child_classes,
-        ):
-            trace_summary = build_trace_summary(llm_trace, all_calls=True)
-            try:
-                reflection_usage = dict(usage)
-                # Reflection's legacy durable cost_usd field now records this
-                # same subtree snapshot instead of silently reverting to own cost.
-                reflection_usage["cost"] = synthesis_cost
-                from ouroboros.tools.registry import ToolContext
-                knowledge_context = ToolContext(
-                    repo_dir=getattr(env, "repo_dir", env.drive_root),
-                    drive_root=pathlib.Path(task.get("budget_drive_root") or env.drive_root),
-                    project_id=str(task.get("project_id") or ""),
-                    task_id=str(task.get("id") or ""))
-                entry = generate_reflection(
-                    task, llm_trace, trace_summary,
-                    llm, reflection_usage,
-                    review_evidence=review_evidence,
-                    child_evidence=child_evidence,
-                    usage_snapshot_text=_synthesis_usage_snapshot_text(usage),
-                    sealed_final_text=sealed_final_prompt_section(sealed_final),
-                    child_failure_classes=child_classes,
-                    knowledge_context=knowledge_context,
-                )
-                entry = {**entry, **presence_provenance_fields(task)}
-                append_reflection_routed(env, task, entry)
-                return entry
-            except Exception as error:
-                propagate_model_error(error)
-                log.warning("Execution reflection failed (non-critical)", exc_info=True)
-    except Exception as error:
-        propagate_model_error(error)
-        log.debug("Execution reflection setup failed", exc_info=True)
+            knowledge_context=knowledge_context,
+        )
+        entry = {**entry, **presence_provenance_fields(task)}
+        if publish is not None:
+            publish(entry)
+        append_reflection_routed(env, task, entry)
+        return entry
     return None
 
 
-_TASK_SUMMARY_PROMPT = """\
-Summarize this completed task for Ouroboros's episodic memory.
-Be specific about: what was tried, what worked, what failed, key decisions made.
-Include file names, tool names, error messages when relevant.
-Treat tool statuses and exit/signal facts as authoritative. Agent notes are supplementary only.
-Never claim a tool succeeded when the trace shows non-zero exit, timeout, install_error, or any error status.
-If structured review evidence contains critical/advisory findings or open obligations,
-mention them individually with severity, item/tag identity, and whether they blocked
-the commit, remained open, or were resolved.
-If the task was trivial (0 tool calls and ≤1 round), keep it to 1-2 sentences and DO NOT add meta-reflection.
-If the task was non-trivial, end with a short meta-reflection section:
-- What friction, errors, or weak assumptions slowed the work?
-- What should Ouroboros change in its own process or prompts to avoid repeating that class of mistake?
-Keep the meta-reflection concrete and operational, not narrative.
-End with a task-scoped trace pointer: task_id={task_id}, task-events reader
-(CLI: ouroboros tasks watch {task_id} --jsonl). Do not guess flat log-file paths;
-the existing task reader merges this task's retained local, project and archived events.
-## Task
-Initial text: {goal}
-Type: {task_type}
-Rounds: {rounds}, Cost: {cost_text}
+# --- owner D10: the root late phase as a saved Pause (post_task_checkpoint.py) ---
 
-{usage_snapshot}{sealed_final}{task_inputs}## Execution trace
-{trace_summary}
+def late_phase_step(name: str, run_step: Callable[[], Any]) -> Any:
+    """Run one completed-once step of a stage; a resumed Pause skips a finished one."""
+    from ouroboros.post_task_checkpoint import current_late_phase_run
 
-## Structured review evidence
-{review_evidence}
-"""
+    late = current_late_phase_run()
+    if late is not None and late.marked(name):
+        return None
+    outcome = run_step()
+    if late is not None:
+        late.mark(name)
+    return outcome
+
+
+def reflection_callback_spec(callback: Any) -> Dict[str, Any] | None:
+    """The one durable shape of the split Project root's global reflection callback."""
+    import functools
+
+    if (isinstance(callback, functools.partial) and callback.func is _atp()._run_global_backlog_promotion_only
+            and len(callback.args) == 2):
+        parent_env, parent_task = callback.args
+        return {"drive_root": str(parent_env.drive_root), "repo_dir": str(parent_env.repo_dir),
+                "task": json.loads(json.dumps(parent_task, ensure_ascii=False, default=str))}
+    return None
+
+
+def _late_env(drive_root: Any, repo_dir: Any):
+    from types import SimpleNamespace
+
+    root = pathlib.Path(drive_root)
+    return SimpleNamespace(repo_dir=pathlib.Path(repo_dir), drive_root=root, drive_path=lambda rel, _r=root: _r / rel)
+
+
+def park_late_phase(env: Any, task: Dict[str, Any], stage: str, remaining: list, completed: list,
+                    *, inputs: tuple, state: Dict[str, Any], late: Any) -> bool:
+    """Save the interrupted remainder of a root late phase as the owner's Pause.
+
+    ``inputs`` are the coordinator's frozen synthesis inputs (usage, usage
+    snapshot, trace, review evidence, sealed final, drive logs, reflection
+    callback); ``late`` is what the phase already holds (completed steps, a
+    stopped correction's draft); the original money scope rides along. One
+    actor-source payload carries them; the checkpoint stays open ``paused``.
+    False means nothing was saved: the caller keeps its honest ``degraded``.
+    """
+    import dataclasses
+    import uuid
+
+    from ouroboros.artifacts import store_actor_source_bytes
+    from ouroboros.owner_pause import read_fence
+    from ouroboros.post_task_checkpoint import (
+        post_task_synthesis_is_paused,
+        root_checkpoint_roots,
+        set_root_post_task_checkpoint,
+    )
+    from ouroboros.usage_accounting import current_usage_scope
+
+    roots = root_checkpoint_roots(env, task)
+    task_id = str(task.get("id") or task.get("task_id") or "")
+    if late is None or not roots or not task_id or not stage:
+        return False
+    usage, usage_snapshot, trace, review_evidence, sealed_final, drive_logs, callback = inputs
+    scope = current_usage_scope()
+    try:
+        pause_id = uuid.uuid4().hex
+        payload = {"schema": "ouroboros.late_phase_pause.v1", "task_id": task_id, "stage": stage,
+                   "completed_stages": list(completed), "remaining_stages": list(remaining),
+                   "marks": sorted(late.marks), "drafts": dict(late.drafts), "task": task,
+                   "env": {"drive_root": str(env.drive_root), "repo_dir": str(getattr(env, "repo_dir", "") or "")},
+                   "money_scope": dataclasses.asdict(scope) if scope is not None else None,
+                   "usage": usage, "usage_snapshot": usage_snapshot, "trace": trace,
+                   "review_evidence": review_evidence, "sealed_final": sealed_final, "drive_logs": str(drive_logs),
+                   "reflection_callback": reflection_callback_spec(callback), **state}
+        ref = store_actor_source_bytes(roots[0], task_id, category="context_checkpoints",
+                                       source_id="late-phase-pause-" + pause_id, extension="json",
+                                       data=json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8"))
+        record = {"pause_id": pause_id, "fence_id": str(read_fence(roots[0], task_id).get("fence_id") or ""),
+                  "paused_at": utc_now_iso(), "stage": stage, "completed_stages": list(completed),
+                  "remaining_stages": list(remaining), "payload_ref": ref}
+        stored = set_root_post_task_checkpoint(env, task, "paused", pause=record)
+    except Exception:
+        log.warning("Late-phase pause of %s was not saved", task_id, exc_info=True)
+        return False
+    saved = post_task_synthesis_is_paused(((stored or {}).get("root_phase_checkpoint") or {}).get("post_task_synthesis"))
+    if saved:
+        append_jsonl(roots[0] / "logs" / "events.jsonl", {
+            "ts": utc_now_iso(), "type": "late_phase_paused", "task_id": task_id, "stage": stage,
+            "remaining_stages": list(remaining), "kept_drafts": len(late.drafts)})
+    return saved
+
+
+def finish_published_reflection(env: Any, task: Dict[str, Any], entry: Dict[str, Any]) -> Dict[str, Any]:
+    """A reflection published before its Pause: only the nested paid Pattern Register write remains."""
+    from ouroboros.reflection import _update_pattern_register
+
+    _update_pattern_register(pathlib.Path(str(task.get("budget_drive_root") or "").strip() or str(env.drive_root)), entry)
+    return entry
+
+
+def revoke_late_phase_grant(drive_root: Any, task_id: str, *, reason: str) -> Dict[str, Any] | None:
+    """Return an unconsumed Resume grant to its pause (Restart, a newer Pause, a failed start)."""
+    from ouroboros.post_task_checkpoint import update_late_phase_pause
+
+    def revoke(record: Dict[str, Any]) -> Dict[str, Any] | None:
+        grant = record.get("grant") if isinstance(record.get("grant"), dict) else {}
+        if not grant or grant.get("consumed_at") or grant.get("revoked_at"):
+            return None
+        return {**record, "grant": {**grant, "revoked_at": utc_now_iso(), "revoke_reason": str(reason)}}
+
+    return update_late_phase_pause(drive_root, task_id, revoke)
+
+
+def resume_paused_late_phase(drive_root: Any, repo_dir: Any, task_id: str) -> bool:
+    """Consume one granted Resume and continue the saved remainder (detached).
+
+    The exact fence the Pause saved is reopened first, as for a loop Resume (a
+    failure consumes nothing and the caller revokes the grant); the grant is
+    then consumed exactly once under the result lock, and a newer owner Pause
+    or a Stop that landed first wins with nothing run. The remainder runs under
+    the saved original money scope and re-reads its CURRENT memory inputs;
+    completed stages, steps and effects do not repeat.
+    """
+    from contextlib import nullcontext
+
+    from ouroboros.artifacts import read_actor_source_bytes
+    from ouroboros.owner_pause import reopen_for_resume
+    from ouroboros.post_task_checkpoint import late_phase_pause_record, update_late_phase_pause
+    from ouroboros.task_results import load_task_result
+    from ouroboros.usage_accounting import UsageScope, usage_scope
+
+    root = pathlib.Path(drive_root).resolve(strict=False)
+    record = late_phase_pause_record(load_task_result(root, task_id, strict=True) or {})
+    grant = record.get("grant") if isinstance(record.get("grant"), dict) else {}
+    if not grant.get("grant_id") or grant.get("consumed_at") or grant.get("revoked_at"):
+        return False
+    try:
+        payload = json.loads(read_actor_source_bytes(root, task_id, record["payload_ref"]))
+    except Exception:
+        log.warning("Saved late phase of %s is unreadable; its pause is kept", task_id, exc_info=True)
+        revoke_late_phase_grant(root, task_id, reason="pause_source_unreadable")
+        return False
+    now = utc_now_iso()
+
+    def consume(current: Dict[str, Any]) -> Dict[str, Any] | None:
+        live = current.get("grant") if isinstance(current.get("grant"), dict) else {}
+        if (current.get("pause_id") != record.get("pause_id") or live.get("grant_id") != grant["grant_id"]
+                or live.get("consumed_at") or live.get("revoked_at") or current.get("stopped_at")):
+            return None
+        return {**current, "grant": {**live, "consumed_at": now}, "resumed_at": now}
+
+    try:
+        if grant.get("fence_id"):
+            # The loop Resume's rule: a newer Pause minted over this grant keeps
+            # its fence, and the remainder parks again at its first paid send.
+            reopen_for_resume(root, task_id, task_id, fence_id=str(grant["fence_id"]), grant_id=grant["grant_id"])
+    except Exception:
+        log.warning("Late-phase Resume of %s lost its fence; the pause is kept", task_id, exc_info=True)
+        return False
+    if update_late_phase_pause(root, task_id, consume) is None:
+        return False
+    env = _late_env(payload["env"]["drive_root"], payload["env"]["repo_dir"] or repo_dir)
+    spec = payload.get("reflection_callback")
+    callback = None
+    if isinstance(spec, dict):
+        import functools
+
+        callback = functools.partial(_atp()._run_global_backlog_promotion_only,
+                                     _late_env(spec["drive_root"], spec["repo_dir"]), spec["task"])
+    money = payload.get("money_scope")
+    scope = UsageScope(**{key: value for key, value in money.items()
+                          if key in UsageScope.__dataclass_fields__}) if isinstance(money, dict) else None
+    append_jsonl(root / "logs" / "events.jsonl", {"ts": now, "type": "late_phase_resumed", "task_id": task_id,
+                                                  "stage": record.get("stage"), "grant_id": grant["grant_id"]})
+    with usage_scope(scope) if scope is not None else nullcontext():
+        _atp()._run_post_task_processing_async(
+            env, payload["task"], payload["usage"], payload["trace"], payload["review_evidence"],
+            pathlib.Path(payload["drive_logs"]), blocking=False, on_reflection=callback,
+            sealed_final=payload.get("sealed_final"), resume=payload)
+    return True
+
+
+def stop_paused_late_phase(drive_root: Any, task_id: str) -> bool:
+    """The owner's Stop of a saved remainder: degraded ``owner_stopped``, answer kept.
+
+    Applies only while the phase is still paused and no Resume consumed its
+    grant; otherwise the live phase's own stage gate owns the Stop.
+    """
+    from ouroboros.post_task_checkpoint import set_root_post_task_checkpoint, update_late_phase_pause
+    from ouroboros.task_results import load_task_result
+
+    root = pathlib.Path(drive_root).resolve(strict=False)
+    now = utc_now_iso()
+
+    def stop(record: Dict[str, Any]) -> Dict[str, Any] | None:
+        grant = record.get("grant") if isinstance(record.get("grant"), dict) else {}
+        if grant.get("consumed_at"):
+            return None
+        revoked = {**grant, "revoked_at": now, "revoke_reason": "owner_stopped"} if grant and not grant.get("revoked_at") else grant
+        return {**record, "stopped_at": now, **({"grant": revoked} if grant else {})}
+
+    stopped = update_late_phase_pause(root, task_id, stop)
+    if stopped is None:
+        return False
+    row = load_task_result(root, task_id, strict=True) or {}
+    skipped = ",".join(stopped.get("remaining_stages") or [stopped.get("stage") or ""])
+    set_root_post_task_checkpoint(_late_env(root, root.parent), {**row, "id": task_id, "budget_drive_root": str(root)},
+                                  "degraded", stop_reason=f"owner_stopped:skipped={skipped}")
+    return True

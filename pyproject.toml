@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ouroboros"
-version = "7.4.11"
+version = "7.5.1"
 description = "Self-creating AI agent with constitution, background consciousness, and persistent identity"
 readme = "README.md"
 license = {text = "MIT"}
@@ -32,7 +32,7 @@ dependencies = [
     # Runtime self-update and install paths execute ``sys.executable -m pip``.
     # uv-created source/tool environments do not seed pip unless it is declared.
     "pip",
-    "httpx",
+    "httpx[socks]>=0.28",  # SOCKS transport plus socks5h URL support (HTTPX 0.28+).
     # Native process command/tree observations for shared-daemon custody on Windows.
     "psutil>=7.2; sys_platform == 'win32'",
     # Runtime custom-tool calls are validated against the exact projected schema.
@@ -117,7 +117,7 @@ markers = [
     "portable_detail: portable/build artifact detail checks; excluded from default local runs",
     "serial: real subprocess / real port / mutable module-global test — run in a serial pass, excluded from the `-n auto` parallel pass via `-m 'not serial'` (see .github/workflows/ci.yml AND the hermetic commit gate ouroboros/preflight_runner.py, which runs the same two-pass split)",
     "skill_smoke: real-network OuroborosHub official-skill install + review-flow smoke; excluded from default local runs, opt in via `pytest -m skill_smoke` (canonical lane description: docs/DEVELOPMENT.md 'Pytest marker lanes')",
-    "size_ratchet: repository size gates against the live repo (manifest exactness, shrink-only pairwise transition, MAX_TOTAL_FUNCTIONS) — a BLOCKING lane only in official-repository CI; excluded from default local runs, which surface the same validator findings as warnings (canonical lane description: docs/DEVELOPMENT.md 'Pytest marker lanes')",
+    "size_ratchet: per-module line/UTF-8 byte and per-function length gates against the live repo (manifest exactness, shrink-only pairwise transition) — a BLOCKING lane only in official-repository CI; excluded from default local runs, which surface the same validator findings as warnings (canonical lane description: docs/DEVELOPMENT.md 'Pytest marker lanes')",
 ]
 
 [tool.setuptools]

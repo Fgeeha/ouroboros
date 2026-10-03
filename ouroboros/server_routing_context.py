@@ -64,6 +64,14 @@ def _addressable_root_tasks(ctx: Any, chat_id: Optional[int] = None) -> list:
             return
         if chat_id is not None and not _task_belongs_to_chat(ctx, tid, task_obj, int(chat_id or 0)):
             return
+        # RUNNING can mean only paid post-work remains. A terminal result
+        # cannot drain a new owner/peer message; don't suggest it as steerable.
+        from ouroboros.task_results import load_task_result
+        from ouroboros.task_status import SETTLED_STATUSES
+        from supervisor.queue import _task_drive_for_task
+
+        if (load_task_result(_task_drive_for_task(task_obj, tid), tid) or {}).get("status") in SETTLED_STATUSES:
+            return
         objective = str(
             task_obj.get("objective") or task_obj.get("description") or task_obj.get("text") or ""
         ).strip()
@@ -535,6 +543,14 @@ def _decision_turn_metadata(ctx: Any, chat_id: int, client_message_id: str, task
         # review wave, because the deciding turn was never told a receipt already
         # existed. The choice stays with the model - no host ban on a second root.
         routing_contract["message_routing_receipt"] = receipt
+        acts = _message_routing_acts(ctx, client_message_id)
+        if len(acts) > 1:
+            # The latest row hides earlier acts on the same message (a promote, then
+            # a steer): each act keeps its own receipt, read, never inferred.
+            routing_contract["message_routing_acts"] = acts
+            routing_contract["message_routing_acts_note"] = (
+                "Recorded routing acts already taken for THIS owner message, oldest first. "
+                "Facts, not a ban: another act stays your choice.")
     md["routing_contract"] = routing_contract
     return md
 
@@ -569,8 +585,10 @@ def _message_routing_receipt(ctx: Any, client_message_id: str) -> Dict[str, Any]
     except Exception:
         log.debug("message routing receipt lookup failed", exc_info=True)
         return {}
-    if not row:
-        return {}
+    return _receipt_fields(row) if row else {}
+
+
+def _receipt_fields(row: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "action": str(row.get("action") or ""),
         "target": str(row.get("target") or ""),
@@ -579,6 +597,25 @@ def _message_routing_receipt(ctx: Any, client_message_id: str) -> Dict[str, Any]
         "ts": str(row.get("ts") or ""),
         "project_id": str(row.get("project_id") or ""),
     }
+
+
+def _message_routing_acts(ctx: Any, client_message_id: str) -> list:
+    """Every routing act recorded for THIS owner message (latest row per act), oldest first.
+
+    The routing rail already keeps one receipt per (message, routing token); this
+    only reads it. Acts keyed to a synthetic ``agent-steer:*`` id or to another
+    task's id carry no link to this message and stay unlisted (a producer gap).
+    """
+    try:
+        from ouroboros.project_dialogue import _ANNOTATIONS_NAME, _latest_annotations_by_token
+
+        rows = [row for (message_id, _token), row in _latest_annotations_by_token(
+            pathlib.Path(ctx.DRIVE_ROOT) / "logs" / _ANNOTATIONS_NAME).items()
+            if message_id == str(client_message_id)]
+    except Exception:
+        log.debug("message routing acts lookup failed", exc_info=True)
+        return []
+    return [_receipt_fields(row) for row in sorted(rows, key=lambda row: str(row.get("ts") or ""))]
 
 
 def _scoped_task_metadata(project_id: str, task_metadata: Any) -> Any:
@@ -633,17 +670,33 @@ def _project_id_for_registered_chat(ctx: Any, chat_id: int) -> str:
     return ""
 
 
-def _reserved_project_for_chat(ctx: Any, chat_id: int) -> Dict[str, Any]:
-    try:
-        from ouroboros.projects_registry import list_reserved_projects
+def _main_lane_chat(chat_id: int) -> bool:
+    """Host-attested absence of a Project room, answered without the registry.
 
-        cid = int(chat_id or 0)
-        for project in list_reserved_projects(ctx.DRIVE_ROOT):
-            try:
-                if int(project.get("chat_id") or 0) == cid:
-                    return dict(project)
-            except (TypeError, ValueError):
-                continue
+    Ids below the Project floor are Main, hidden or A2A. A transport id shares
+    the numeric range, so only the positively bound external owner slot (written
+    by that transport's own slash command) proves its chat is the owner's Main;
+    any other id at or above the floor still needs the strict registry read.
+    """
+    from ouroboros.contracts.chat_id_policy import is_project_chat_id
+
+    cid = int(chat_id or 0)
+    if not is_project_chat_id(cid):
+        return True
+    try:
+        from supervisor.state import control_value, load_state
+
+        known, bound = control_value(load_state(), "owner_external_chat_id")
     except Exception:
-        log.debug("Reserved Project chat lookup failed", exc_info=True)
-    return {}
+        return False  # an unreadable binding proves nothing
+    return known and type(bound) is int and bound == cid
+
+
+def _reserved_project_for_chat(ctx: Any, chat_id: int) -> Dict[str, Any]:
+    """Execution routing requires positive absence, not an unavailable display lens."""
+    from ouroboros.project_admission import reserved_project_for_chat
+
+    cid = int(chat_id or 0)
+    if _main_lane_chat(cid):
+        return {}  # Host-attested: this chat cannot belong to a Project room.
+    return reserved_project_for_chat(ctx.DRIVE_ROOT, cid)

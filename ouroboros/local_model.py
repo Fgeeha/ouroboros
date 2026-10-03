@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import threading
@@ -19,6 +20,8 @@ from ouroboros.platform_layer import (
 log = logging.getLogger(__name__)
 
 _LOCAL_MODEL_DEFAULT_PORT = 8766
+# start_server appends this pair last, so a model path cannot supply it.
+_SERVING_CONTEXT_ARGV_RE = re.compile(r"\s--n_ctx[ =](\d+)$")
 
 
 def local_model_settings(values: dict) -> dict:
@@ -70,8 +73,10 @@ _manager: Optional[LocalModelManager] = None
 _manager_lock = threading.Lock()
 
 
-def get_manager() -> LocalModelManager:
+def get_manager(*, create: bool = True) -> Optional[LocalModelManager]:
     global _manager
+    if _manager is not None or not create:
+        return _manager
     with _manager_lock:
         if _manager is None:
             _manager = LocalModelManager()
@@ -105,6 +110,7 @@ class LocalModelManager:
         # Cancellation flag — set in stop_server() so _run_install() can abort
         # even before _install_proc is assigned, closing the panic-window race.
         self._install_cancelled = threading.Event()
+        self._panic_requested = False
 
     def get_status(self) -> str:
         if self._proc is not None and self._proc.poll() is not None:
@@ -182,6 +188,8 @@ class LocalModelManager:
                 log.info("Runtime install already in progress")
                 return
             # stop_server may have cancelled a previous lifecycle.
+            if self._panic_requested:
+                raise RuntimeError("Local runtime install cancelled by Panic")
             self._install_cancelled.clear()
             self._runtime_status = "installing"
             self._runtime_install_log = ""
@@ -439,6 +447,8 @@ class LocalModelManager:
     ) -> None:
         """Start the server; rechecks runtime as a safety net before Popen."""
         with self._lock:
+            if self._panic_requested:
+                raise RuntimeError("Local model startup cancelled by Panic")
             if self._proc is not None and self._proc.poll() is None:
                 raise RuntimeError("Local model server is already running")
 
@@ -506,6 +516,8 @@ class LocalModelManager:
                 )
                 _popen_kwargs.update(subprocess_new_group_kwargs())
                 self._proc = subprocess.Popen(cmd, **_with_hidden_subprocess(_popen_kwargs))
+                if self._panic_requested:
+                    self.panic_stop(request_only=True)
                 try:
                     from ouroboros.config import DATA_DIR
                     from ouroboros.process_custody import record_process
@@ -607,6 +619,18 @@ class LocalModelManager:
         self._error = f"Server failed to become healthy within {timeout}s"
         log.error(self._error)
 
+    def panic_stop(self, *, request_only: bool = False) -> list:
+        """Signal our captured children before manager locks or cleanup waits."""
+        from ouroboros.platform_layer import request_process_tree_kill
+
+        self._panic_requested = True
+        self._install_cancelled.set()
+        requests = [request_process_tree_kill(proc) for proc in (self._proc, self._install_proc)
+                    if proc is not None]
+        if not request_only:
+            self.stop_server()
+        return requests
+
     def stop_server(self) -> None:
         """Stop the local model server subprocess and any ongoing install."""
         # Abort install even before _install_proc exists.
@@ -664,12 +688,9 @@ class LocalModelManager:
         """Query local server health and loaded-model info."""
         import requests
 
-        from ouroboros.utils import in_worker_process
-
         url = f"http://127.0.0.1:{self._port}/v1/models"
         with requests.Session() as session:
-            if in_worker_process():
-                session.trust_env = False  # fork-safe + localhost never needs a proxy
+            session.trust_env = False  # Owned loopback never needs proxy discovery, in any process.
             resp = session.get(url, timeout=5)
         resp.raise_for_status()
         data = resp.json()
@@ -691,6 +712,10 @@ class LocalModelManager:
 
     def serving_context_evidence(self) -> Dict[str, Any]:
         """The live owned server's configured window, distinct from training metadata."""
+        from ouroboros.utils import in_worker_process
+
+        if in_worker_process():  # A forked worker's inherited _proc is not its child.
+            return self._published_serving_evidence()
         process = self._proc
         capacity = int(getattr(self, "_serving_context_length", 0) or 0)
         known = bool(process is not None and process.poll() is None and self._status == "ready" and capacity > 0)
@@ -698,13 +723,46 @@ class LocalModelManager:
                 "source": "owned_server_arguments" if known else "serving_window_unobserved",
                 "process_id": process.pid if known else None}
 
+    def _published_serving_evidence(self) -> Dict[str, Any]:
+        """A worker's view of the server its server process owns.
+
+        Workers never own the server. The owner publishes the ready instance's
+        service binding; it counts only while that exact process (pid and
+        platform-specific fingerprint) is live on this worker's loopback port,
+        and its window is that process's own ``--n_ctx`` argument.
+        """
+        unknown = {"context_window": None, "confirmed": False,
+                   "source": "serving_window_unobserved", "process_id": None}
+        try:
+            from ouroboros.config import DATA_DIR
+            from ouroboros.platform_layer import process_command
+            from ouroboros.server_process import read_service_bindings, service_binding_is_live
+
+            binding = read_service_bindings(pathlib.Path(DATA_DIR)).get("local_model") or {}
+            # The endpoint this worker's LLMClient._get_local_client dispatches to.
+            port = int(os.environ.get("LOCAL_MODEL_PORT", _LOCAL_MODEL_DEFAULT_PORT))
+            if (binding.get("host"), binding.get("port")) != ("127.0.0.1", port):
+                return unknown
+            # Read argv before the identity check: a pid that still matches its
+            # recorded birth afterwards already belonged to that process here.
+            match = _SERVING_CONTEXT_ARGV_RE.search(process_command(int(binding["pid"])))
+            window = int(match.group(1)) if match else 0
+            if window <= 0 or not service_binding_is_live(binding):
+                return unknown
+        except Exception:
+            return unknown
+        return {"context_window": window, "confirmed": True, "source": "published_server_arguments",
+                "process_id": int(binding["pid"]), "port": port}
+
     def measure_prepared_input(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Bounded read-only I/O to the same owned server; it never generates tokens."""
         from ouroboros.local_model_server import input_fingerprint
 
         evidence = self.serving_context_evidence()
         unknown = {"supported": False, "input_is_exact": False, "reason": "measurement_unavailable"}
-        if not evidence["confirmed"] or not getattr(self, "_measurement_route", False):
+        # A published instance was launched by start_server, which always serves this route.
+        published = evidence.get("source") == "published_server_arguments"
+        if not evidence["confirmed"] or not (published or getattr(self, "_measurement_route", False)):
             return unknown
         expected_pid = evidence["process_id"]
         try:
@@ -712,7 +770,8 @@ class LocalModelManager:
 
             with requests.Session() as session:
                 session.trust_env = False  # Owned loopback must not use an external proxy.
-                response = session.post(f"http://127.0.0.1:{self._port}/extras/measure_chat",
+                port = evidence["port"] if published else self._port
+                response = session.post(f"http://127.0.0.1:{port}/extras/measure_chat",
                                         json=payload, timeout=5.0)
                 response.raise_for_status()
                 measured = response.json()
@@ -727,14 +786,12 @@ class LocalModelManager:
             return {**unknown, "reason": f"measurement_unavailable:{type(error).__name__}"}
 
     def get_context_length(self) -> int:
-        """Return cached context length, querying the server if needed."""
-        if self._context_length > 0:
-            return self._context_length
+        """Metadata (launch value while loading), or 0; not serving capacity or health."""
         try:
-            info = self.health_check()
-            self._context_length = info.get("context_length", 4096)
+            self._context_length = max(0, int(
+                self._context_length or self.health_check().get("context_length") or 0))
         except Exception:
-            self._context_length = 4096
+            self._context_length = 0
         return self._context_length
 
     def test_tool_calling(self) -> Dict[str, Any]:
@@ -776,6 +833,7 @@ class LocalModelManager:
                 task_id="system:capability_probe",
                 root_task_id="system:capability_probe",
                 category="capability_probe",
+                non_task_operation=True,
                 source="capability_probe.local_model",
             )):
                 return _send()

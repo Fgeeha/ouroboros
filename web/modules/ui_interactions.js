@@ -62,6 +62,31 @@ export function bindDialogFocus(dialog, {
 }
 
 /**
+ * A message field's Enter presses its own Send button (DESIGN "Controls and
+ * editable choices"), so that button's validation, disabled and pending state
+ * decide what is sent. Shift+Enter keeps the native line break; Ctrl/Cmd/Alt
+ * with Enter send like Enter. An Enter that commits an IME composition never
+ * sends: WebKit ends the composition before that keydown and marks it only
+ * with keyCode 229. A held key sends once. The touch keyboard labels the key
+ * Send. The listener lives on the field; dispose only if the field outlives it.
+ */
+export function bindEnterSubmit(field, button) {
+    const hint = field.enterKeyHint;
+    field.enterKeyHint = 'send';
+    const onKey = (event) => {
+        if (event.key !== 'Enter' || event.shiftKey || event.defaultPrevented || event.isComposing
+            || event.keyCode === 229 || !field.isConnected || field.disabled || field.readOnly) return;
+        event.preventDefault();
+        if (!event.repeat && button.isConnected && !button.disabled) button.click();
+    };
+    field.addEventListener('keydown', onKey);
+    return () => {
+        field.removeEventListener('keydown', onKey);
+        field.enterKeyHint = hint;
+    };
+}
+
+/**
  * Geometry only for a mounted, fixed-position popup. The owner provides CSS
  * consuming --ui-popup-{top,left,max-height,max-width,anchor-width}, including
  * overflow and bounded sizing, and portals outside any clipping ancestor.

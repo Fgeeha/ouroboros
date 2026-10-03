@@ -145,14 +145,17 @@ def test_stale_child_read_and_copyback_keep_newest_canonical_panel(tmp_path):
 @pytest.mark.parametrize("superseded", [False, True])
 def test_promoted_refs_do_not_shadow_next_publication_or_regress_on_child_replay(tmp_path, monkeypatch, superseded):
     from ouroboros import observability
-    from ouroboros.headless import copy_child_task_result, prepare_task_drive
+    from ouroboros.headless import copy_child_task_result, prepare_task_drive, retry_child_task_refs
 
     parent = tmp_path / "canonical"
     child = prepare_task_drive(parent, "applied", "empty")
     ctx = _context(child)
     ctx.budget_drive_root = parent
     run = _run()
-    run["request"]["evidence"] = {"receipt": observability.write_blob(child, {"result": "first"})}
+    call = observability.persist_call(child, task_id='applied', call_id='first', call_type='tool_call',
+                                      payload={'tool': 'run_command', 'result': 'first'})
+    run["request"]["evidence"] = {'tool_trajectory_source_ref': artifacts.persist_tool_trajectory_source(
+        child, 'applied', [{'tool': 'run_command', 'trace_ref': call}])}
     trace = {"review_runs": [run]}
     review_projection.publish_acceptance_checkpoint(ctx, trace)
     first = copy.deepcopy(load_task_result(parent, "applied")["review_projection"])
@@ -160,11 +163,15 @@ def test_promoted_refs_do_not_shadow_next_publication_or_regress_on_child_replay
     write_task_result(child, "applied", "completed", review_projection=first)
     task = {"id": "applied", "drive_root": str(child)}
     copied = copy_child_task_result(parent, task)
-    assert copied["review_projection"]["panels"][0]["applied_source_ref"] != first_ref
+    copied = retry_child_task_refs(parent, child, "applied")
+    assert copied["review_projection"]["panels"][0]["applied_source_ref"] == first_ref
     assert copied["review_projection"]["panels"][0]["publication_revision"] == 1
     assert trace["_acceptance_publication_revision"] == 1
 
-    run["request"]["evidence"] = {"receipt": observability.write_blob(parent, {"result": "new publication"})}
+    call = observability.persist_call(parent, task_id='applied', call_id='new', call_type='tool_call',
+                                      payload={'tool': 'run_command', 'result': 'new publication'})
+    run["request"]["evidence"] = {'tool_trajectory_source_ref': artifacts.persist_tool_trajectory_source(
+        parent, 'applied', [{'tool': 'run_command', 'trace_ref': call}])}
     run["superseded_by_revision"] = superseded
     run["aggregate_signal"] = "FAIL"
     review_projection.publish_acceptance_checkpoint(ctx, trace)
@@ -185,6 +192,7 @@ def test_promoted_refs_do_not_shadow_next_publication_or_regress_on_child_replay
         stale["panels"][0].update(publication_revision=revision, applied_source_ref=missing)
         write_task_result(child, "applied", "completed", review_projection=stale)
         copied = copy_child_task_result(parent, task)
+        copied = retry_child_task_refs(parent, child, "applied")
         assert copied["review_projection"] == current
         assert copied["child_ref_promotion"]["status"] == "complete"
         assert copied["child_ref_promotion"]["pending_refs"] == []

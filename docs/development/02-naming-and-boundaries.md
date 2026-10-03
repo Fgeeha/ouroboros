@@ -54,8 +54,8 @@ of core" step in `.github/workflows/ci.yml`); the rest is review-only.
   refuse owner input or output on a SUFFIX or WORD inside a file name; dotenv
   spellings are the one surviving tail rule. Owner locations are a physical list
   (`credential_shapes.owner_credential_locations`), so an unlisted store keeps
-  ordinary access; `make_subagent_secret_target_check` is prepared once per call
-  and never retained; `pem_capture_refusal` keeps effective Cyber's finding
+  ordinary access. Helpers inherit the parent's reads without file-name filters
+  or content masking; `pem_capture_refusal` keeps effective Cyber's finding
   advisory with the requested bytes while ordinary modes keep the exclusion; the
   SSH config exception permits no key writes under `.ssh`.
 - An unlaunchable sole cmd element gets an actionable argv/shell hint, never
@@ -87,47 +87,53 @@ Never freeze the model's reasoning, dialogue representation or collaboration
 strategy to make one incident testable — SYSTEM accretion trains around that
 incident, bloats the resident prefix and forks the authority.
 
+Whether, when and how often to tell the owner, retry, wait or substitute is the
+prompt's and model's judgment; a threshold, timer or counter standing in for it
+is the if-else selection BIBLE P5 forbids, whoever proposes it, while numbers
+still bound physical, safety, budget, transport and evidence expiry. A missing
+channel is a capability gap: `send_user_message(destination="main")` gives a
+registered Project root or host-attested owner-origin root a Main voice, never
+hidden, A2A, Presence or delegated work; no chat number, even Main's, is owner proof.
+
 `prompts/SYSTEM.md` is tier-0 for every Main/task profile in both context modes
-and competes with the task for context; the safety supervisor is the one caller
-with a prompt of its own, and Background Consciousness uses SYSTEM.md like any
-other turn, with `prompts/CONSCIOUSNESS.md` as the USER message a wake-up
-receives, never a second system prompt. It carries identity and tone, the
-decision loop, cross-tool policy, prohibitions and safety invariants stated once,
-and the memory contract — whose resident rule is that a note's authored summary
-is its resident face in the knowledge index and an absent carrier renders as a
-visible gap, never as silence. It never carries how a tool works: parameters,
-recipes, typed outcomes and "when to choose it" belong to the `get_tools()`
-schema every profile receives in full each round (delegated, repair, credential
-and contract filters narrow it), so a prompt sentence about a schema is a
-drifting second copy and a new tool needs NO SYSTEM.md mention. Runtime facts are
-assembled ONCE per task attempt, so the Health Invariants block states custody
-obligations as of task start and never refreshes mid-task — a deliberate
-frozen-ContextCore / prompt-cache choice (ARCHITECTURE §6 "Context fitting, retry, and
-compaction"). Check the schema and runtime block before adding a prompt sentence,
-and before removing one. Keep SYSTEM's load-bearing floor rules in its preamble,
-because local-model overflow compaction keeps only the text before a block's
-first `## ` heading (`ouroboros/llm_local.py`); that splitter also leaves BIBLE's
-principle bodies as compaction markers, a disclosed defect (issue #1018), never
-an intended reduction of the constitution (BIBLE P1). Every prompt change reports
-its before/after byte size in the commit or PR.
+and competes with the task for context; only the safety supervisor has its own
+prompt, and a consciousness wake-up gets SYSTEM.md plus
+`prompts/CONSCIOUSNESS.md` as its USER message, never a second system prompt. It
+carries identity and tone, the decision loop, cross-tool policy, prohibitions and
+safety invariants stated once, and the memory contract's resident rule: a note's
+authored summary is its resident face in the knowledge index, and an absent
+carrier renders as a visible gap, never silence. It never carries how a tool
+works: parameters, recipes, typed outcomes and "when to choose it" belong to the
+`get_tools()` schema every profile receives in full each round (delegated,
+repair, credential and contract filters narrow it), so a prompt sentence about a
+schema is a drifting second copy and a new tool needs NO SYSTEM.md mention.
+Runtime facts are assembled ONCE per task attempt, so the Health Invariants block
+states custody obligations as of task start and never refreshes mid-task — a
+deliberate frozen-ContextCore / prompt-cache choice. Check the schema and runtime
+block before adding or removing a prompt sentence. Keep SYSTEM's load-bearing
+floor rules in its preamble, all that local-model overflow compaction keeps
+(ARCHITECTURE §6 "Context fitting, retry, and compaction" owns that compactor,
+its disclosed BIBLE defect and the frozen core). Every prompt change reports its
+before/after byte size in the commit or PR.
 
 Recoverable tool failures are evidence for the next LLM turn, not triggers for a
 host-authored recovery workflow: return a typed, redacted result naming the
-failed stage, the completed external effects and an actionable repair hint, and
+failed stage, completed external effects and an actionable repair hint, and
 let the LLM decide. Host code owns deterministic integrity, authority boundaries
 and truthful receipts only — no task-specific auto-retry, fallback, cleanup,
-resume or terminal-flow state machines. Explicitly naming a documented default is
-never a different request: an argument whose value is what omitting it already
-means — `directory_strategy="direct"` with no `scope_paths` on a shape that cannot
-serve the argument, or `workspace_root` naming the Ouroboros repository itself —
-takes the omitted path, disclosed in the result; only a value that genuinely asks
-for something is refused there, typed, at the earliest layer holding the authority
-to judge it, with the repair named. Models fill every key of a tool schema, so an
+resume or terminal-flow state machines. Naming a documented default is never a
+different request: a value meaning what omission means —
+`directory_strategy="direct"` with no `scope_paths` on a shape that cannot serve
+it, or `workspace_root` naming the Ouroboros repository — takes the omitted path,
+disclosed in the result; only a value genuinely asking for something is refused,
+typed, at the earliest layer with authority to judge it, repair named. Models may
+fill optional keys (OpenAI's Responses API tries strict mode if unset; the
+OpenRouter lane sends `strict:false`), so an
 optional argument's empty or mode-irrelevant form (`max_wait_minutes` on a quiz that
 does not wait, `0` with `""`, a range end past a knowledge note, a zone beside an
 offset-carrying instant) is that same omitted path, and a refusal that only restates its rule is
 retried unchanged: it names the field, the value received and the repair in ONE
-reply (house helpers for both sentences: `tools/arg_feedback`).
+reply (house helpers for both: `tools/arg_feedback`).
 
 A producer that knows its call failed publishes that fact typed
 (`tool_result._publish_tool_result`, or a first-line `⚠️ IDENTIFIER` the legacy
@@ -142,8 +148,8 @@ acknowledged on the `supervision_wake_id` that result publishes, never on the
 tool's name (ARCHITECTURE §6 "Delegated subagents").
 
 Enforcement: CHECKLISTS item 13(b) scores the prompt-edit discipline; the
-recoverable-failure boundary is review-only; `tests/test_typed_tool_refusals.py`
-is the shrink-only source lint over returned literals in `ouroboros/tools/`,
+owner-judgment and recoverable-failure boundaries are review-only;
+`tests/test_typed_tool_refusals.py` is the shrink-only source lint over returned literals in `ouroboros/tools/`,
 flagging identifier-less heads (and, growth-only, interpolated `⚠️ {code}` heads,
 which the adapter types only by luck of the runtime value), and its per-file
 allowlist IS that residual's disclosure. A same-file swap is invisible to the count; a marker-shaped refusal
@@ -177,12 +183,12 @@ under a chapter's H1 IS its compact Low/Nano view: re-read and correct it
 whenever the chapter changes.
 
 Track assets with a continuing purpose for the product, contributors, verification,
-legal requirements or evidence for public claims, beyond the work that introduced them. Plans, review packets, run receipts
-and campaign bookkeeping belong in the external work area or durable task evidence,
-not the tracked source tree; a test preserving their presence or wording does not
-give them a permanent product role. Retire temporary campaign tooling when its
-purpose ends. Keep current behavior and its rationale in their existing owners;
-future-work lists and campaign backlog stay outside the tracked product tree.
+legal requirements or evidence for public claims, beyond the work that introduced them. Plans, future-work lists,
+campaign backlog and bookkeeping, review packets and run receipts belong in the
+external work area or durable task evidence, not the tracked source tree; a test
+preserving their presence or wording does not give them a permanent product role.
+Retire temporary campaign tooling when its purpose ends; current behavior and its
+rationale stay in their existing owners.
 Generated snapshots with real product, verification or publication consumers remain
 valid; optional reports use stdout or an explicit output destination. Existing
 review enforces this contract, without automatic deletion or filename matching.
@@ -214,8 +220,12 @@ in `tests/test_docs_sync.py`, which enforces only the case-sensitive matches in
 `DOC_RESIDUE_PATTERNS`, outside language-tagged fences and its declared skipped
 subsections ("Mutable external-fact inventory" and this one); the untagged
 module-tree fence in ARCHITECTURE §1 IS scanned, an owner decision. Each chapter
-also carries a byte budget in the official-CI `size_ratchet` lane, raised only
-in the diff that needs it, with a reason; local surfaces never block on it.
+also carries a byte budget in the official-CI `size_ratchet` lane: a base number
+plus its grant files under `tests/reference_book_grants/`. A change that grows a
+chapter adds one grant file holding that change's net growth and the reason,
+never an edit to a shared number; a compression pass folds the grants into the
+base. Local surfaces never block on the budget; a malformed grant file fails
+every default lane.
 Equivalent historical prose stays review-only under CHECKLISTS item 7.
 
 ### Generality and emergence (P13)
@@ -257,8 +267,8 @@ same owner message — a promoted root, a mid-run scope call, the timeout retry
 replacing a dead attempt — INHERITS the origin's project binding
 (`projects_registry.project_id_for_origin`) instead of re-deriving membership
 from its own id, because a message is one convertible unit, not one per task id.
-A timeout retry binds at RETRY ADMISSION, inside the admitting transaction and
-only once cancellation can no longer win the boundary (ARCHITECTURE §6 "Project binding by task
+A timeout retry binds at RETRY ADMISSION, inside its admission transaction, once
+cancellation can no longer win (ARCHITECTURE §6 "Project binding by task
 and by origin"; `tests/test_retry_project_binding.py`).
 
 One named exception: a verification RECEIPT with no ingress point reconciles by
@@ -307,11 +317,9 @@ correct: `tool_capabilities.OBSERVE_WORLD_MUTATION_TOOLS`, compiled by
 `ouroboros/consciousness_authority.py`, names the verbs that START work or CHANGE
 the world, so a new READ tool reaches Observe by default, pinned against the
 catalog's own `mutates_worktree` marker. That module owns a level's two
-consequences — `disabled_tools` and the per-task `runtime_mode_cap`, the stricter
-of install mode and cap binding even on an advanced/pro/cyber_pro install — and
-for a consciousness-origin task `disabled_tools` binds at DISPATCH ONLY, so the
-wake keeps an owner turn's cached prefix while every other contract keeps both
-enforcement halves (ARCHITECTURE §6 "Background consciousness and Evolution").
+consequences, `disabled_tools` (DISPATCH ONLY for a consciousness-origin task,
+both enforcement halves elsewhere) and the per-task `runtime_mode_cap`
+(ARCHITECTURE §6 "Background consciousness and Evolution").
 
 ### Task-authored messages are never owner text
 
@@ -333,9 +341,9 @@ ARCHITECTURE §6 "Owner routing verbs").
 
 ### The owner corpus archives inputs; the owner door's stamp is the only authority
 
-The first user turn of every run is recorded in the owner corpus so that acceptance,
-Safety and the post-task synthesis read the same physical archive, but its label states
-only what the host knows: `initial_user` when owner routing stamped the run
+A task-authored objective copies only its retained owner corpus, never the draft itself.
+Other runs record their first user turn for acceptance, Safety and reflection, labelled by
+what the host knows: `initial_user` when owner routing stamped the run
 (`metadata.origin_message_ref` or `origin_suppressed`, which a promoted root inherits by
 value), `initial_text` otherwise — a Presence event, a wake, a schedule, a follow-up, a
 child's work order, an unmarked context. `dialogue_provenance.run_origin` mints that fact
@@ -377,7 +385,8 @@ rows — review-only maintenance.
 | Location | Fact | Mutability | Current authority | Live/probe option | Risk | Recommendation |
 |----------|------|------------|-------------------|-------------------|------|----------------|
 | `ouroboros/provider_models.py::_VISION_MODEL_PREFIXES` / `_VISION_OVERLAY` | Which model families accept native image input | High as model families and route capabilities change | Conservative shipped prefixes, overridden by parsed OpenRouter `/models` `architecture.input_modalities` for exact model ids | Exact provider metadata when available; otherwise a bounded image-input capability probe | A stale positive sends unsupported image blocks; a stale negative needlessly captions them | Keep the conservative fallback and exact-model overlay; consider broader provider metadata only in a separately reviewed migration |
-| `ouroboros/llm.py::supports_message_cache_control` | Which families support message cache controls | Medium/high as provider routing contracts change | Explicit family rules backed by provider behavior and dated live probes | Provider documentation plus a bounded cache-control send | A false positive can invalidate a request; a false negative loses the prompt cache | Retain the small explicit rules and re-probe when provider behavior changes; do not generalize by model-name resemblance |
+| `ouroboros/llm_attempt.py::supports_message_cache_control` | Which families support message cache controls | Medium/high as provider routing contracts change | Explicit family rules backed by provider behavior and dated live probes | Provider documentation plus a bounded cache-control send | A false positive can invalidate a request; a false negative loses the prompt cache | Retain the small explicit rules and re-probe when provider behavior changes; do not generalize by model-name resemblance |
+| `ouroboros/llm_attempt.py::openai_family_model` | OpenAI's public API (measured 2026-09-25, `openai/gpt-6-sol` via OpenRouter and direct) reuses a prompt cache only for the whole leading system section plus tool schemas as one unit or for an exact earlier prompt as a prefix, and the routing key partitions the cache | Provider dependent | Dated probe recorded beside the predicate | Re-send one declared 3-block prompt under a shared key from two conversations and read `cached_tokens` | A stale positive projects a family that caches by token prefix (harmless but pointless); a stale negative pays cold prefixes on every new conversation | Re-probe before widening the family; never match by substring such as `gpt` |
 | `ouroboros/reasoning_artifacts.py::SIGNED_PORTABLE` and its sealed classifier | Which families' SEALED reasoning artifacts (signed, encrypted, redacted, unrecognized) survive a same-model cross-provider replay; readable artifacts are portable by shape for every family | High; an upstream can bind a reasoning artifact to its endpoint without a routing-contract change | A short vouched family roster plus a shape-first classifier that fails closed on artifacts it cannot read | A same-model cross-provider replay probe of the exact family | A false positive 400s the replayed turn (the reactive strip-and-retry is the net); a false negative pins a portable transcript to one endpoint and forfeits same-model failover | Extend the roster only by a fresh cross-provider replay probe of the exact family, never by model-name resemblance; `openai/` was removed on 2026-07 field evidence despite an earlier passing probe |
 | `ouroboros/provider_models.py::_ANTHROPIC_MODEL_ALIASES` / `migrate_model_value` | Direct-provider id spelling compatibility | Medium as providers rename ids and prefixes | Shipped compatibility mapping and current direct-provider id contract | Exact provider catalog/documentation can confirm a current id, but cannot establish whether a saved spelling was intentional | Removing an alias breaks upgrades; guessing aliases can silently reroute | Keep explicit compatibility aliases until a separately documented retirement window closes |
 | `ouroboros/server_runtime.py::_RETIRED_MODEL_DEFAULT_REPLACEMENTS` and scope prior/legacy defaults | Which formerly shipped defaults are upgraded automatically | Release-dependent | Release history plus current `SETTINGS_DEFAULTS`; only known former defaults are migrated | A live catalog can show availability, but cannot infer user intent or whether a saved value was a default | Over-broad migration overwrites an explicit owner choice | Keep release-scoped exact replacements and regression tests; review retirement separately |
@@ -385,6 +394,7 @@ rows — review-only maintenance.
 | `ouroboros/reviewer_slot_config.py::_ACCEPTANCE_API_PANEL_MEASURED` | Historical API-panel comparison: approximately 12 s / $0.07 per model row per task (median of the 2026-09-01 OSWorld traces); 75 s / $0.82 for a three-row panel on ProgramBench | Workload and route dependent | The named measurement constant used by the one-time delivery disclosure | Repeat the same workload with recorded model, route and usage | An old comparison can be mistaken for a current tariff or a subscription-cost estimate | Keep the date and workload visible; current usage owns money, and session delivery spends subscription time |
 | `ouroboros/llm_claudexor.py::cache_key_for_model` | The 2026-09-17 measurement found Codex prefix reuse across conversations requires one `prompt_cache_key` + `session_id`, while per-conversation turn states remain valid under that shared session | Provider dependent | Dated measurement beside the key derivation | Re-measure cache reads and turn state across two conversations | A stale positive pays cold prefixes or breaks turn state | Re-measure before changing the key scope |
 | `ouroboros/llm_openai_compatible.py` DeepSeek send projection | The 2026-09-03 probe found thinking accepts only `auto`/`none` tool choice; required/named calls returned 400 on both probed v4 models | Provider dependent | Dated probe recorded beside the send projection and its transport tests | Re-probe the exact endpoint/model when that dialect changes | Removing the projection too early breaks forced calls; keeping it after a provider change may suppress supported thinking | Revalidate the wire contract before changing the projection; keep its effect disclosed |
+| `ouroboros/provider_models.py::ZAI_REASONING_EFFORT_ALIASES` (Z.ai send projection) | The 2026-09-21 contributor probe (PR #1207, Coding Plan key, glm-5.3): only `low`/`high`/`max` are accepted, an absent tier is served at max, thinking cannot be disabled (400 code 1210), and forced tool_choice works with thinking on; GLM-5.2 accepts the wider scale | Provider dependent | Dated probe recorded beside the projection and its tests | Re-probe the exact endpoint/model when Z.ai changes the enum or a GLM release changes semantics | Dropping the projection bills every call at max; a stale one rejects tiers the provider would accept | Revalidate the wire contract before changing the projection; keep its effect disclosed |
 
 ### Provider Independence
 
@@ -393,13 +403,13 @@ scope policy, safety, and context/memory flows; core capability must not acquire
 a hidden OpenRouter or second-provider dependency. (CHECKLISTS item 2(h) and
 ARCHITECTURE both point here; this is the SSOT sentence.)
 
-Tool-schema changes are provider-contract changes: every shipped built-in schema
-must pass general JSON Schema and the known cross-provider subset over the
-complete registry, trusted integration CI sends that registry in one bounded tool
-canary per supported provider family/API surface in the transport Main uses, and
-pull-request CI stays secretless. Malformed native arguments and invalid schemas
-stay red, diagnostics limited to structural facts, hashes and parse position;
-never add a prose parser, provider hop or unbounded retry to make that contract
+Tool-schema changes are provider-contract changes: validate the full shipped
+registry against JSON Schema and the cross-provider subset, then run the trusted
+bounded canaries through Main's transports; PR jobs stay secretless. Malformed
+arguments and invalid schemas stay red. Console diagnostics contain structural
+facts, hashes and parse positions; selected CI artifacts add safe synthetic
+arguments/attempt evidence, excluding credentials and private native data.
+Never add a prose parser, provider hop or unbounded retry to make the contract
 green (ARCHITECTURE §8 "CI topology").
 
 Adding or changing a provider updates one coherent route contract:
@@ -435,9 +445,9 @@ slug, not an official OpenAI model id, so a direct OpenAI Chat slot uses the pla
 Sol id (the slug in Chat Completions is a guaranteed 404) — a compatibility
 constraint, not a mutable capability table; direct OpenAI tool conversations stay
 on Chat Completions and a model-name prefix is never admission authority;
-DeepSeek is the second effort-carrying route, its `reasoning_effort` keyed on the
-provider id rather than a name prefix or capability field, so a hand-built target
-cannot silently drop it; direct Anthropic is the deliberate exception to a purely
+DeepSeek and Z.ai carry `reasoning_effort` through provider-specific projections
+keyed on the provider id rather than a name prefix or capability field, so a
+hand-built target cannot silently drop it; direct Anthropic is the deliberate exception to a purely
 reconstructed provider transcript, and no effort-to-`budget_tokens` policy is
 synthesized (ARCHITECTURE §6 "Context fitting, retry, and compaction", ARCHITECTURE §7 "LLM output token
 budgets"). A provider-specific optional feature may be unavailable elsewhere, but

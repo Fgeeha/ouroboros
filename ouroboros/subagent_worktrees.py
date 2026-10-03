@@ -1,9 +1,9 @@
 """Lifecycle for acting-subagent ``self_worktree`` checkouts.
 
-Acting (mutative) subagents that modify the Ouroboros body itself run inside an
-isolated ``git worktree`` checked out from the parent's base commit, under a root
-that lives OUTSIDE ``repo/`` and ``data/``. The child writes only there and
-returns a ``workspace.patch``; the parent integrates and is the sole committer.
+Acting subagents use an isolated ``git worktree`` of the selected Git source's
+current eligible files, under a root OUTSIDE ``repo/`` and ``data/``. Source
+identity distinguishes Ouroboros-body copies from external project copies.
+The child returns its delta; the parent integrates and owns final delivery.
 
 git has no automatic worktree garbage collection, so we keep a durable JSON
 registry (``data/state/subagent_worktrees.json``) and prune orphans on startup.
@@ -263,6 +263,7 @@ def _git(repo_dir: Path, *args: str, check: bool = True,
         cwd=str(repo_dir),
         capture_output=True,
         text=True,
+        encoding="utf-8",
         check=check,
         env=env,
     )
@@ -361,6 +362,12 @@ class WorktreeHandle:
     repo_dir: str
     created_at: float
     parent_task_id: str = ""
+    file_baseline: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    untracked_baseline: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    source_is_system_repo: bool = True
+    target_head: str = ""
+    source_index_clean: bool = False
+    git_dir: str = ""
 
 
 def provision_worktree(
@@ -371,69 +378,25 @@ def provision_worktree(
     parent_task_id: str = "",
     worktree_root: Optional[Any] = None,
     data_dir: Optional[Any] = None,
+    source_is_system_repo: bool = True,
 ) -> WorktreeHandle:
-    """Create an isolated worktree branched from ``base_sha`` (default HEAD).
+    """Give a child the source's current eligible tree, under task-owned GC.
 
-    The returned branch is a delta base for the child; the child's patch is a
-    diff against ``base_sha`` so the parent can integrate it deliberately.
+    The branch pins the synthetic current-tree baseline, not just source HEAD.
+    Unlike delegated execution snapshots, this checkout belongs to the child
+    task and is removed by worktree retention, never by delegated-run custody.
     """
-    repo_dir = Path(repo_dir).resolve()
-    root = _resolve_root(worktree_root)
-    _assert_root_isolated(root, repo_dir, _data_dir(data_dir))
-    safe_task = _safe_name(task_id)
-    wt_path = (root / safe_task).resolve()
-    branch = f"{_BRANCH_PREFIX}{safe_task}"
-    # A stale checkout left by a crashed run is plain files: deleted OUTSIDE the
-    # lock (#1241); its admin dir and branch are replaced under it.
-    if _deletable(wt_path, root) and wt_path.exists():
-        _force_rmtree(wt_path)
-    with _ops_lock(root, op="worktree", task_id=str(task_id or ""), target=str(repo_dir)):
-        if base_sha:
-            _git(repo_dir, "rev-parse", "--verify", f"{base_sha}^{{commit}}")
-            base_sha = _git(repo_dir, "rev-parse", base_sha).stdout.strip()
-        else:
-            base_sha = _git(repo_dir, "rev-parse", "HEAD").stdout.strip()
-        _git_quiet(repo_dir, "worktree", "prune")
-        _git_quiet(repo_dir, "branch", "-D", branch)
-        wt_path.parent.mkdir(parents=True, exist_ok=True)
-        # Admin dir + branch under the lock; the checkout itself is populated below.
-        _git(repo_dir, "worktree", "add", "--no-checkout", "--force", "-b", branch, str(wt_path), base_sha)
-        handle = WorktreeHandle(
-            task_id=str(task_id),
-            path=str(wt_path),
-            branch=branch,
-            base_sha=base_sha,
-            repo_dir=str(repo_dir),
-            created_at=time.time(),
-            parent_task_id=str(parent_task_id or ""),
-        )
-        try:
-            entries = [
-                e for e in _load_registry(data_dir, strict=True, op="provision_worktree")
-                if e.get("path") != str(wt_path)
-            ]
-            entries.append(asdict(handle))
-            _save_registry(entries, data_dir)
-        except Exception:
-            # Registration is INSIDE the cleanup scope, mirroring the snapshot
-            # branches below: a worktree nothing registered is invisible to
-            # disposal and retention, so a corrupt registry (strict load) or a
-            # failed write would otherwise strand the checkout AND its branch
-            # on every retry, without bound.
-            _remove_paths(repo_dir, wt_path, branch, allowed_root=root)
-            raise
-    try:
-        # Populate OUTSIDE the lock: what `worktree add` runs internally (no
-        # submodule recursion; the body's post-checkout hook no longer fires at
-        # provision — a narrowing, named in ARCHITECTURE §6).
-        _git(wt_path, "reset", "--hard", "--quiet", "--no-recurse-submodules")
-    except Exception:
-        try:
-            remove_worktree(path=str(wt_path), worktree_root=root, data_dir=data_dir)
-        except Exception:
-            log.warning("Failed to discard acting worktree %s after a populate failure", wt_path, exc_info=True)
-        raise
-    return handle
+    target = Path(repo_dir).resolve()
+    if base_sha:
+        expected = _git(target, "rev-parse", "--verify", f"{base_sha}^{{commit}}").stdout.strip()
+        if _git(target, "rev-parse", "HEAD").stdout.strip() != expected:
+            raise ValueError("isolated child source HEAD differs from the requested base_sha")
+    return _provision_git_copy(
+        target_root=target, task_id=task_id, snapshot_id=f"task_{_safe_name(task_id)}",
+        worktree_root=worktree_root, data_dir=data_dir,
+        task_copy=True, parent_task_id=parent_task_id,
+        source_is_system_repo=source_is_system_repo,
+    )
 
 
 def provision_genesis_project(
@@ -453,26 +416,34 @@ def provision_genesis_project(
     child builds the whole project here and returns a ``workspace.patch`` that is
     a diff from the empty initial commit (``base_sha``).
 
-    ``dir_name`` names the genesis directory meaningfully (e.g. the project name)
-    instead of the raw task id, so sibling builders share a recognizable project
-    root; the handle's binding identity stays ``task_id`` (I, v6.39).
+    ``dir_name`` names the genesis directory meaningfully (e.g. the project name,
+    readable Unicode via ``project_folder_basename``) instead of the raw task id, so
+    sibling builders share a recognizable project root; the handle's binding
+    identity stays ``task_id`` (I, v6.39). Existing folders are never renamed.
     """
+    from ouroboros.project_facts import project_folder_basename
+
     repo_dir = Path(repo_dir).resolve()
     root = Path(projects_root) if projects_root else Path(get_subagent_projects_root())
     root = root.expanduser().resolve()
     _assert_root_isolated(root, repo_dir, _data_dir(data_dir))
-    safe_task = _safe_name(dir_name or task_id)
+    safe_task = project_folder_basename(dir_name) or _safe_name(task_id)
     with _ops_lock(root, op="genesis", task_id=str(task_id or "")):
-        proj = (root / safe_task).resolve()
-        # Genesis projects are durable: never clobber an existing one -> unique name. Since
-        # dir_name can repeat across projects (a shared display name), count up under the
-        # ops lock until a free path is found — a single timestamp suffix could still
-        # collide on a same-name re-provision within the same second (FileExistsError).
+        # Genesis projects are durable: never clobber an existing entry. The candidate is
+        # created EXCLUSIVELY before anything resolves it, so an existing directory, a
+        # case/normalization alias, or a (dangling) symlink all count as taken -> "_N".
+        root.mkdir(parents=True, exist_ok=True)
         _suffix = 0
-        while proj.exists():
-            _suffix += 1
-            proj = (root / f"{safe_task}_{_suffix}").resolve()
-        proj.mkdir(parents=True, exist_ok=False)
+        while True:
+            proj = root / (f"{safe_task}_{_suffix}" if _suffix else safe_task)
+            try:
+                os.mkdir(proj)
+                break
+            except FileExistsError:
+                _suffix += 1
+        if proj.resolve().parent != root:
+            raise RuntimeError(f"genesis project escaped its root: {proj}")
+        proj = proj.resolve()
         try:
             _git(proj, "init")
             # A fresh repo may have no commit identity; set a local one for the seed
@@ -556,6 +527,7 @@ class ExecutionSnapshotHandle:
     # Wall-clock seconds the provision took; a disclosure on the start receipt and
     # the baseline manifest (a heavy tree is visible the moment it is snapshotted).
     provisioning_sec: float = 0.0
+    git_dir: str = ""  # Stable shared Git metadata survives deletion of a source worktree.
 
 
 def _git_env_index(index_path: Path) -> Dict[str, str]:
@@ -577,13 +549,27 @@ def _git_env(repo_dir: Path, *args: str, env: Dict[str, str],
 
 
 def provision_execution_snapshot(
+    *, target_root: Any, task_id: Any, snapshot_id: str,
+    worktree_root: Optional[Any] = None, data_dir: Optional[Any] = None,
+) -> ExecutionSnapshotHandle:
+    """Provision a run-owned current-tree snapshot; custody owns its lifetime."""
+    return _provision_git_copy(
+        target_root=target_root, task_id=task_id, snapshot_id=snapshot_id,
+        worktree_root=worktree_root, data_dir=data_dir,
+    )
+
+
+def _provision_git_copy(
     *,
     target_root: Any,
     task_id: Any,
     snapshot_id: str,
     worktree_root: Optional[Any] = None,
     data_dir: Optional[Any] = None,
-) -> ExecutionSnapshotHandle:
+    task_copy: bool = False,
+    parent_task_id: str = "",
+    source_is_system_repo: bool = True,
+) -> ExecutionSnapshotHandle | WorktreeHandle:
     """Snapshot ``target_root``'s REAL current tree into a private execution root.
 
     Baseline construction never touches the target's own index, HEAD or working
@@ -615,8 +601,6 @@ def provision_execution_snapshot(
         raise ValueError(f"delegated execution snapshot target {target} is not a git working tree")
     root = _resolve_root(worktree_root)
     data_root = _data_dir(data_dir)
-    if _is_within(root, target) or _is_within(target, root):
-        raise ValueError(f"subagent worktree root {root} overlaps the snapshot target {target}")
     if _is_within(root, data_root) or _is_within(data_root, root):
         raise ValueError(f"subagent worktree root {root} overlaps runtime data {data_root}")
     snap = str(snapshot_id or "").strip()
@@ -625,8 +609,13 @@ def provision_execution_snapshot(
     safe_snap = _safe_name(snap)
     task = str(task_id or "")
     started = time.monotonic()
-    wt_path = (root / f"dlg_{_safe_name(task_id)}_{safe_snap[:16]}").resolve()
-    baseline_ref = f"{_BASELINE_REF_PREFIX}{safe_snap}"
+    name = _safe_name(task_id) if task_copy else f"dlg_{_safe_name(task_id)}_{safe_snap[:16]}"
+    wt_path = (root / name).resolve()
+    _assert_root_isolated(wt_path, target, data_root)
+    branch = f"{_BRANCH_PREFIX}{_safe_name(task_id)}" if task_copy else ""
+    baseline_ref = f"refs/heads/{branch}" if task_copy else f"{_BASELINE_REF_PREFIX}{safe_snap}"
+    common = Path(_git(target, "rev-parse", "--git-common-dir").stdout.strip())
+    git_dir = str((common if common.is_absolute() else target / common).resolve())
     # A malformed registry refuses HERE, before the tree is hashed (strict read).
     _load_registry(data_dir, strict=True, op="provision_execution_snapshot")
     root.mkdir(parents=True, exist_ok=True)
@@ -657,6 +646,16 @@ def provision_execution_snapshot(
             p for p in _git_env(target, "ls-files", "-z", env=real_env)
             .stdout.decode("utf-8", errors="surrogateescape").split("\0") if p
         ]
+        if target_head:
+            # A staged removal is absent from the real index but still in the
+            # HEAD-seeded scratch index. Remove it there before eligible inputs
+            # are staged; a recreated excluded file must not be hashed either.
+            removed = _git_env(target, "diff", "--cached", "--no-renames", "--diff-filter=D",
+                               "--name-only", "-z", target_head, "--", env=real_env).stdout
+            if removed:
+                _git_env(target, "update-index", "--force-remove", "-z", "--stdin", env=env, input_bytes=removed)
+        source_index_clean = bool(target_head and _git_env(
+            target, "diff-index", "--cached", "--quiet", target_head, "--", env=real_env, check=False).returncode == 0)
         untracked_raw = _git_env(
             target, "ls-files", "-z", "--others", "--exclude-standard",
             env=real_env,
@@ -714,6 +713,8 @@ def provision_execution_snapshot(
                  "GIT_AUTHOR_NAME": "Ouroboros", "GIT_AUTHOR_EMAIL": "ouroboros@localhost",
                  "GIT_COMMITTER_NAME": "Ouroboros", "GIT_COMMITTER_EMAIL": "ouroboros@localhost"},
         ).stdout.decode("utf-8").strip()
+        if task_copy and target_head and tree_sha == _git(target, "rev-parse", f"{target_head}^{{tree}}").stdout.strip():
+            baseline_sha = target_head
     finally:
         try:
             index_path.unlink()
@@ -724,8 +725,25 @@ def provision_execution_snapshot(
         baseline_ref=baseline_ref, baseline_sha=baseline_sha, baseline_tree=tree_sha,
         manifest_digest=manifest_digest, target_head=target_head, created_at=time.time(),
         entry_count=entry_count, excluded_untracked=tuple(excluded),
-        untracked_baseline=untracked_baseline, capture_warnings=tuple(capture_warnings))
+        untracked_baseline=untracked_baseline, capture_warnings=tuple(capture_warnings), git_dir=git_dir)
     registered = False  # nothing to discard until the row exists (a busy first section is a plain refusal)
+    def record_copy(handle, exclusions):
+        if not task_copy:
+            _register_snapshot(handle, exclusions, data_dir)
+            return handle
+        owned = WorktreeHandle(
+            task_id=task, path=str(wt_path), branch=branch, base_sha=baseline_sha,
+            repo_dir=str(target), created_at=handle.created_at, parent_task_id=parent_task_id,
+            file_baseline=handle.file_baseline, untracked_baseline=handle.untracked_baseline,
+            source_is_system_repo=source_is_system_repo, target_head=target_head,
+            source_index_clean=source_index_clean, git_dir=git_dir,
+        )
+        entries = [e for e in _load_registry(data_dir, strict=True, op="provision_worktree")
+                   if e.get("path") != str(wt_path)]
+        entries.append(asdict(owned))
+        _save_registry(entries, data_dir)
+        return owned
+
     try:
         with _ops_lock(root, op="provision", task_id=task, target=str(target)):
             # Row FIRST, then the pin, then the admin dir: a crash after any of these
@@ -734,12 +752,15 @@ def provision_execution_snapshot(
             # The provisional row is LIGHT (no per-file maps): the GC needs only
             # path, ref and snapshot id, and the maps are O(files) to serialize.
             _git_quiet(target, "worktree", "prune")
-            _register_snapshot(ExecutionSnapshotHandle(**{**fields, "untracked_baseline": {},
-                                                        "excluded_untracked": ()}), [], data_dir)
+            record_copy(ExecutionSnapshotHandle(**{**fields, "untracked_baseline": {},
+                                                    "excluded_untracked": ()}), [])
             registered = True
             _git(target, "update-ref", baseline_ref, baseline_sha)
             wt_path.parent.mkdir(parents=True, exist_ok=True)
-            _git(target, "worktree", "add", "--detach", "--no-checkout", str(wt_path), baseline_sha)
+            if task_copy:
+                _git(target, "worktree", "add", "--no-checkout", "--force", str(wt_path), branch)
+            else:
+                _git(target, "worktree", "add", "--detach", "--no-checkout", str(wt_path), baseline_sha)
         # Populate outside the lock: the same reset git's own `worktree add` runs
         # (no submodule recursion) — minus the target's post-checkout hook.
         _git(wt_path, "reset", "--hard", "--quiet", "--no-recurse-submodules")
@@ -784,11 +805,18 @@ def provision_execution_snapshot(
             **fields, "manifest_digest": manifest_digest, "entry_count": entry_count,
             "file_baseline": file_baseline, "provisioning_sec": round(time.monotonic() - started, 3)})
         with _ops_lock(root, op="provision", task_id=task, target=str(target)):
-            _register_snapshot(handle, excluded, data_dir)
+            handle = record_copy(handle, excluded)
     except Exception as exc:
         if registered:
-            _discard_snapshot_checkout(target, wt_path, baseline_ref, snap, root=root, data_dir=data_dir, task_id=task,
-                                       lock_wait_sec=5.0 if isinstance(exc, WorktreeOpsLockBusy) else None)
+            if task_copy:
+                try:
+                    remove_worktree(path=str(wt_path), worktree_root=root, data_dir=data_dir,
+                                    lock_wait_sec=5.0 if isinstance(exc, WorktreeOpsLockBusy) else None)
+                except Exception:
+                    log.warning("Failed to discard task copy %s after provisioning failure", task, exc_info=True)
+            else:
+                _discard_snapshot_checkout(Path(git_dir), wt_path, baseline_ref, snap, root=root, data_dir=data_dir, task_id=task,
+                                           lock_wait_sec=5.0 if isinstance(exc, WorktreeOpsLockBusy) else None)
         raise
     return handle
 
@@ -1127,7 +1155,7 @@ def remove_execution_snapshot(
             # A standalone payload snapshot (R1 §10.4) keeps its .git INSIDE the
             # directory just deleted; a Git snapshot also owns an admin dir and a
             # baseline pin in the TARGET repository.
-            target = Path(str(entry.get("target_root") or "."))
+            target = Path(str(entry.get("git_dir") or entry.get("target_root") or "."))
             _git_quiet(target, "worktree", "prune")
             ref = str(entry.get("baseline_ref") or "")
             if ref.startswith(_BASELINE_REF_PREFIX):
@@ -1173,12 +1201,15 @@ def remove_worktree(
     path: str = "",
     worktree_root: Optional[Any] = None,
     data_dir: Optional[Any] = None,
+    lock_wait_sec: Optional[float] = None,
 ) -> bool:
     """Tear down a worktree by task_id or path; unregister it. Returns success."""
     want_path = str(Path(path).resolve()) if path else ""
     entries = _load_registry(data_dir, strict=True, op="remove_worktree")
     match: Optional[Dict[str, Any]] = None
     for entry in entries:
+        if entry.get("kind") == _KIND_DELEGATED_EXEC:
+            continue
         if task_id and entry.get("task_id") == str(task_id):
             match = entry
             break
@@ -1197,8 +1228,8 @@ def remove_worktree(
     wt_path = Path(match.get("path") or "")
     if _deletable(wt_path, root) and wt_path.exists():
         _force_rmtree(wt_path)  # the checkout's files go first, OUTSIDE the lock (#1241)
-    with _ops_lock(root, op="remove_worktree", task_id=str(task_id or "")):
-        _remove_paths(Path(match.get("repo_dir") or "."), wt_path, match.get("branch") or "", allowed_root=root)
+    with _ops_lock(root, op="remove_worktree", task_id=str(task_id or ""), timeout_sec=lock_wait_sec):
+        _remove_paths(Path(match.get("git_dir") or match.get("repo_dir") or "."), wt_path, match.get("branch") or "", allowed_root=root)
         survivors = [
             e for e in _load_registry(data_dir, strict=True, op="remove_worktree")
             if e.get("path") != match.get("path")
@@ -1233,7 +1264,7 @@ def prune_orphans(
                 # and their baseline ref needs deleting, which this loop cannot do.
                 kept.append(entry)
                 continue
-            repo_dir = str(entry.get("repo_dir") or "")
+            repo_dir = str(entry.get("git_dir") or entry.get("repo_dir") or "")
             wt_path = str(entry.get("path") or "")
             created = float(entry.get("created_at") or 0)
             if repo_dir:

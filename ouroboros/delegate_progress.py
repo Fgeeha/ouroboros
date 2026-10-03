@@ -18,7 +18,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from ouroboros.config import DELEGATE_WAIT_CEILING_SEC
 from ouroboros.utils import truncate_review_artifact
@@ -68,7 +68,9 @@ def _bounded(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for row in rows[-_TIMELINE_TAIL:]:
         item = {"type": _label(row.get("type")), "title": _label(row.get("title")),
                 "severity": _label(row.get("severity"))}
-        for key in ("attemptId", "harnessId"):
+        # ``messageId``/``outcome`` ride the engine's ``message.*`` rows: the
+        # receipts a recovered nanny reconciles a delegate_message against (A26).
+        for key in ("attemptId", "harnessId", "messageId", "outcome"):
             if isinstance(row.get(key), str) and row[key]:
                 item[key] = _label(row[key])
         if row.get("textKind") in _TEXT_KINDS and isinstance(row.get("detail"), str):
@@ -601,7 +603,9 @@ def executor_observation(
 
 
 def emit(ctx: Any, run_id: str, advance: _Advance, *,
-         detail: Optional[Dict[str, Any]] = None, entry: Any = None) -> None:
+         detail: Optional[Dict[str, Any]] = None, entry: Any = None,
+         gateway: Any = None, after_seq: Optional[int] = None, drain_sec: Optional[float] = None,
+         read_remaining: Optional[Callable[[], float]] = None) -> None:
     """Push one advance to the LIVE progress surface, from inside the wait.
 
     `ctx.emit_progress_fn` is immediate (it puts the frame straight on the event queue),
@@ -610,16 +614,49 @@ def emit(ctx: Any, run_id: str, advance: _Advance, *,
     exists to avoid. The frame is also what stamps the supervisor's `last_progress_at`,
     which a silently blocking wait would otherwise starve. A broken progress channel
     must never abort a wait that is holding a live overpowered run.
+
+    The wait passes its transport and the batch's lower cursor (``after_seq``) for a run
+    it owns; each frame then carries one typed ``delegated_activity`` record read from the
+    run's own journal (``delegate_activity.observations``) and its speech-first text, and
+    the record's range counts as shown only once its frame was handed over. A terminal
+    run passes ``drain_sec`` to drain the journal's tail; ``read_remaining`` bounds all new
+    catalog/stream reads by the wait's remaining operation allowance.
+    Without them, the plain ``live_line`` keeps the historical one-argument contract.
     """
     fn = getattr(ctx, "emit_progress_fn", None)
     if not callable(fn):
         return
     try:
         observation = executor_observation(ctx, run_id, advance, detail, entry) if detail is not None else {}
-        metadata = {"executor_observation": observation} if observation else {}
-        fn(live_line(run_id, advance), **metadata)
+        metadata: Dict[str, Any] = {"executor_observation": observation} if observation else {}
+        if (gateway is not None and after_seq is not None and getattr(entry, "run_id", None) == run_id
+                and getattr(entry, "task_id", None) == getattr(ctx, "task_id", None)):
+            from ouroboros import delegate_activity
+            from ouroboros.gateways.claudexor import SHORT_POLL_TIMEOUT_SEC
+
+            for activity, commit in delegate_activity.observations(
+                    ctx, gateway, run_id, advance, after_seq=after_seq, read_sec=SHORT_POLL_TIMEOUT_SEC,
+                    drain_sec=drain_sec, read_remaining=read_remaining):
+                fn(delegate_activity.progress_text(activity), **metadata, delegated_activity=activity)
+                commit()
+            return
+        if after_seq is None or advance.seq > after_seq:
+            fn(live_line(run_id, advance), **metadata)
     except Exception:
         log.debug("delegated progress emit failed", exc_info=True)
+
+
+def paused_note(pending_interactions: Optional[List[Dict[str, Any]]]) -> str:
+    """The note of a run PAUSED on its own question(s): never "stuck" (owner 7=A /
+    F13). Shared by the per-window payload and the supervising wake, which keeps it
+    when it drops the per-tick keep-watching/cancel note."""
+    return ("The run is alive and PAUSED on the question(s) it already asked "
+            "(waiting_on_user; see pending_interactions). Decide: answer with "
+            "delegate_answer, escalate an above-authority question with the "
+            "escalate verb (parent-first; the reply reaches your mailbox on a "
+            "later round), or "
+            f"keep waiting (call again) — {waiting_expiry_clause(pending_interactions)}. "
+            "Do not cancel a run merely because it asked a question.")
 
 
 def window_payload(
@@ -671,14 +708,7 @@ def window_payload(
         # generic delegate_cancel hint invited cancelling a run that is simply
         # waiting to be answered. The waiting state gets its own note.
         payload["note"] = (
-            ("The run is alive and PAUSED on the question(s) it already asked "
-             "(waiting_on_user; see pending_interactions). Decide: answer with "
-             "delegate_answer, escalate an above-authority question with the "
-             "escalate verb (parent-first; the reply reaches your mailbox on a "
-             "later round), or "
-             f"keep waiting (call again) — {waiting_expiry_clause(pending_interactions)}. "
-             "Do not cancel a run merely because it asked a question.")
-            if waiting_on_user else
+            paused_note(pending_interactions) if waiting_on_user else
             ("The run is alive but silent. Decide: keep waiting (call again), "
              "or delegate_cancel if it is stuck."))
         _fitted_pending(payload, list(pending_interactions or []), budget)

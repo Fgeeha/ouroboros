@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from starlette.requests import Request
-from starlette.responses import FileResponse, JSONResponse, Response
+from starlette.responses import JSONResponse
 
 from ouroboros.gateway._helpers import coerce_int, json_error, json_exception, request_drive_root, request_json_or, request_repo_dir, run_sync_to_completion, stage_initial_task_attachments
 from ouroboros.gateway.cost_breakdown import _task_cost_breakdown_view  # noqa: F401
@@ -35,7 +35,13 @@ from ouroboros.gateway.task_events import (  # noqa: F401
 # Re-exported hurry ingress (same module-size split as task_events): route
 # wiring and tests address gateway.tasks.api_task_hurry.
 from ouroboros.gateway.task_hurry import api_task_hurry  # noqa: F401
+from ouroboros.gateway.task_pause import api_task_pause, owner_tree_control_routes  # noqa: F401 -- same split as hurry
 from ouroboros.gateway.task_decision import api_decision_answer  # noqa: F401
+from ouroboros.gateway.task_archive import (
+    chat_media_identity, directory_archives, plain_segments, serve_directory_archive, serve_task_file,
+    task_artifact_location, recorded_identity, serve_task_source,
+)
+from ouroboros.task_custody import task_artifact_stores
 from ouroboros.headless import (
     ARTIFACTS_DIR,
     ARTIFACT_STATUS_FAILED,
@@ -100,6 +106,7 @@ _RESERVED_METADATA_KEYS = frozenset({
     "budget_drive_root",
     "task_constraint",
     "task_contract",
+    "input_sources",
     "allowed_resources",
     "deadline_at",
     "executor_ref",
@@ -118,21 +125,31 @@ def _cleanup_api_admission_attempt(
     admission_token: str,
     child_drive: Optional[pathlib.Path] = None,
 ) -> None:
-    """Release one token and remove only its pre-admission task-local state."""
-    from supervisor.queue import release_task_admission
+    """Clean a known pre-enqueue failure while its reservation excludes rivals."""
+    from supervisor import queue
 
-    release_task_admission(task_id, admission_token)
-    if child_drive is not None:
+    with queue._queue_lock:
+        if (queue.ADMISSION_RESERVATIONS.get(task_id) != admission_token
+                or task_id in queue.RUNNING or any(row.get("id") == task_id for row in queue.PENDING)):
+            return
         try:
-            from ouroboros.headless import remove_subagent_task_drive
-
-            remove_subagent_task_drive(drive_root, task_id)
+            if load_task_result(drive_root, task_id, strict=True) is not None:
+                return
         except Exception:
-            log.warning("Failed to clean child drive for rejected task %s", task_id, exc_info=True)
+            return  # unreadable identity is not proof of our preparation ownership
+    # Keep the reservation through cleanup, but not Q through drive preparation.
+    # Even a raising prepare_task_drive may have created a partial owned drive.
+    from ouroboros.headless import remove_subagent_task_drive
+    try:
+        remove_subagent_task_drive(drive_root, task_id, live=queue.task_settlement_liveness,
+                                   guard=queue.task_settlement_interlock, admission_rollback=True)
+    except Exception:
+        log.warning("Failed to clean child drive for rejected task %s", task_id, exc_info=True)
     try:
         shutil.rmtree(task_artifacts_dir(drive_root, task_id, create=False), ignore_errors=True)
     except Exception:
         log.warning("Failed to clean admission artifacts for task %s", task_id, exc_info=True)
+    queue.release_task_admission(task_id, admission_token)
 
 
 def _external_subagent_label(body: Dict[str, Any], metadata: Dict[str, Any]) -> bool:
@@ -200,6 +217,10 @@ def _admission_rejection_response(
     if not (isinstance(admitted, dict) and admitted.get("_admission_blocked")):
         return None
     reason_code = str(admitted.get("_admission_blocked") or "admission_fence")
+    if reason_code.startswith("project_routing_fence"):
+        from ouroboros.project_dialogue import routing_refusal_cause
+
+        detail = routing_refusal_cause("promote_chat_to_task", "failed", reason_code) + "."
     if reason_code == "invalid_task_depth":
         detail, status_code = str(admitted.get("_admission_detail") or "Task was not scheduled: depth must be a non-negative integer."), 400
     if reason_code == "task_id_lookup_failed":
@@ -212,7 +233,7 @@ def _admission_rejection_response(
             },
             status_code=409,
         )
-    if reason_code in {"duplicate_task_id", "admission_reservation_lost"}:
+    if reason_code in {"duplicate_task_id", "admission_reservation_lost", "admission_reservation_owned"}:
         return JSONResponse(
             {
                 "error": "Task id is already owned by another admission attempt.",
@@ -224,25 +245,32 @@ def _admission_rejection_response(
         )
     admission = {
         "reason_code": reason_code,
+        "detail": str(admitted.get("_admission_detail") or ""),
         "project_id": str(admitted.get("_project_id") or project_id),
         "project_lifecycle": str(admitted.get("_project_lifecycle") or ""),
         "acceptance_fence_token": str(admitted.get("_acceptance_fence_token") or ""),
         "acceptance_fence_status": str(admitted.get("_acceptance_fence_status") or ""),
     }
-    write_task_result(
+    from supervisor.task_admission import persist_never_admitted_refusal
+
+    write_refusal = persist_never_admitted_refusal if admitted.get("_admission_never_admitted") else write_task_result
+    write_refusal(
         drive_root,
         task_id,
-        STATUS_FAILED,
+        **({"admission_token": str(admitted.get("_admission_owner_token") or "")}
+           if admitted.get("_admission_never_admitted") else {"status": STATUS_FAILED}),
         reason_code=reason_code,
         admission=admission,
+        **({"admission_outcome": "never_admitted"} if admitted.get("_admission_never_admitted") else {}),
         artifact_status=ARTIFACT_STATUS_FAILED if workspace_root else "",
         result=detail,
         accounted_upper_bound_usd=0.0,
     )
     if child_drive is not None:
         from ouroboros.headless import remove_subagent_task_drive
-
-        removed = remove_subagent_task_drive(drive_root, task_id)
+        from supervisor.queue import task_settlement_interlock, task_settlement_liveness
+        removed = remove_subagent_task_drive(drive_root, task_id, live=task_settlement_liveness,
+                                             guard=task_settlement_interlock, admission_rollback=True)
         write_task_result(
             drive_root,
             task_id,
@@ -278,23 +306,24 @@ def _enqueue_api_task_durably(
     with queue._queue_lock:
         admitted = queue.enqueue_task(task)
         if isinstance(admitted, dict) and admitted.get("_admission_blocked"):
+            admitted.update(_admission_never_admitted=True, _admission_owner_token=admission_token)
             return admitted
-        if queue.persist_queue_snapshot(reason="api_task_create") is not True:
-            queue.PENDING[:] = [
-                row for row in queue.PENDING
-                if not (
-                    isinstance(row, dict)
-                    and str(row.get("id") or "") == task_id
-                    and str(row.get("_admission_owner_token") or "") == admission_token
-                )
-            ]
-            queue.persist_queue_snapshot(reason="api_task_create_rollback")
-            return {
-                **task,
-                "_admission_blocked": "queue_snapshot_persist_failed",
-                "_admission_status_code": 503,
-            }
-        write_task_result(drive_root, task_id, STATUS_SCHEDULED, **result_fields)
+        try:
+            if queue.persist_queue_snapshot(reason="api_task_create") is not True:
+                raise RuntimeError("Queue snapshot persistence was not confirmed")
+            write_task_result(drive_root, task_id, STATUS_SCHEDULED, **result_fields)
+            stored = load_task_result(drive_root, task_id, strict=True) or {}
+            if stored.get("api_admission") != result_fields["api_admission"]:
+                raise RuntimeError("The exact API admission receipt was not persisted")
+        except Exception as exc:
+            # An observer may raise AFTER atomic replacement. Read the exact
+            # token; unknown persistence retains the queue row and its resources.
+            try:
+                stored = load_task_result(drive_root, task_id, strict=True) or {}
+            except Exception:
+                stored = {}
+            if stored.get("api_admission") != result_fields["api_admission"]:
+                return {**admitted, "_admission_uncertain": str(exc)}
         queue.release_task_admission(task_id, admission_token)
         return admitted
 
@@ -316,7 +345,7 @@ def _complete_api_task_admission(
     artifacts: List[Dict[str, Any]],
     metadata: Dict[str, Any],
 ) -> JSONResponse:
-    """Publish one API admission or roll back only its token-owned queue row."""
+    """Publish one API admission; retain custody when persistence is unknown."""
     result_fields = {
         **({"created_at": task["created_at"]} if task.get("created_at") else {}),
         **{key: task.get(key) for key in (
@@ -325,6 +354,7 @@ def _complete_api_task_admission(
             "task_contract", "workspace_root",
         )},
         "project_id": project_id,
+        **{k: v for k, v in task.items() if k == "_project_admission"},
         "description": description,
         "allowed_resources": allowed_resources,
         "deadline_at": deadline_at,
@@ -336,6 +366,7 @@ def _complete_api_task_admission(
         "artifact_status": ARTIFACT_STATUS_PENDING if workspace_root else "",
         "metadata": metadata,
         **{key: task[key] for key in ("attachment_manifest", "attachment_manifest_ref") if key in task},
+        "api_admission": {"token": admission_token, "status": "accepted"},
         "result": "Task accepted and durably scheduled.",
     }
     try:
@@ -346,10 +377,10 @@ def _complete_api_task_admission(
             admission_token=admission_token,
             result_fields=result_fields,
         )
-        snapshot_failed = (
-            str(admitted.get("_admission_blocked") or "")
-            == "queue_snapshot_persist_failed"
-        )
+        if admitted.get("_admission_uncertain"):
+            return JSONResponse({"task_id": task_id, "status": "unconfirmed",
+                                 "error": "Task admission persistence is unconfirmed; its resources were retained.",
+                                 "detail": admitted["_admission_uncertain"]}, status_code=503)
         rejection = _admission_rejection_response(
             admitted,
             drive_root=drive_root,
@@ -357,52 +388,15 @@ def _complete_api_task_admission(
             project_id=project_id,
             workspace_root=workspace_root,
             child_drive=child_drive,
-            status_code=503 if snapshot_failed else 409,
-            detail=(
-                "Task was not scheduled because its durable queue snapshot could not be written."
-                if snapshot_failed
-                else "Task was not scheduled because its admission fence is closed."
-            ),
         )
         if rejection is not None:
             return rejection
     except Exception as exc:
-        try:
-            from supervisor import queue as supervisor_queue
-
-            with supervisor_queue._queue_lock:
-                supervisor_queue.PENDING[:] = [
-                    row for row in supervisor_queue.PENDING
-                    if not (
-                        isinstance(row, dict)
-                        and str(row.get("id") or "") == task_id
-                        and str(row.get("_admission_owner_token") or "")
-                        == admission_token
-                    )
-                ]
-            supervisor_queue.persist_queue_snapshot(
-                reason="api_task_create_failed_rollback"
-            )
-        except Exception:
-            log.warning(
-                "Failed to roll back API task %s after admission error",
-                task_id,
-                exc_info=True,
-            )
-        write_task_result(
-            drive_root,
-            task_id,
-            "failed",
-            **{
-                **result_fields,
-                "artifact_status": ARTIFACT_STATUS_FAILED if workspace_root else "",
-                "result": f"Failed to enqueue task: {exc}",
-            },
-        )
-        _cleanup_api_admission_attempt(
-            drive_root, task_id, admission_token, child_drive
-        )
-        return json_exception(exc, 503)
+        # The queue may already have been observed or persisted. No broad
+        # rollback can prove non-execution here, and unreadable is not refusal.
+        log.warning("API task admission settlement is unconfirmed for %s", task_id, exc_info=True)
+        return JSONResponse({"task_id": task_id, "status": "unconfirmed",
+                             "error": f"Task admission settlement is unconfirmed: {exc}"}, status_code=503)
     _broadcast_task_named(task_id, str(task.get("suggested_name") or ""))
     return JSONResponse({
         "ok": True,
@@ -458,6 +452,37 @@ async def api_tasks_create(request: Request) -> JSONResponse:
     return await run_sync_to_completion(_create_task_from_body, request, body)
 
 
+def _api_executor_metadata(body: dict, raw_metadata: dict, workspace_root: Optional[pathlib.Path],
+                           repo_dir: pathlib.Path, drive_root: pathlib.Path) -> dict:
+    """Validate executor scope before reservation or preparation effects."""
+    if "executor_ref" in raw_metadata or "workspace_executor" in raw_metadata:
+        raise ValueError("metadata.executor_ref/workspace_executor is reserved; pass executor_ref as a top-level task field")
+    if "executor_ref" not in body:
+        return {}
+    raw = body["executor_ref"]
+    if not isinstance(raw, dict) or not raw:
+        raise ValueError("executor_ref must be a JSON object")
+    if workspace_root is None:
+        raise ValueError("executor_ref requires an external workspace_root")
+    executor = normalize_executor_ref(raw)
+    if executor is None:
+        return {}
+    for mapping in executor.mappings:
+        for protected_root, label in ((repo_dir, "Ouroboros system repo"), (drive_root, "Ouroboros data drive")):
+            if paths_overlap_casefold(mapping.host_path, protected_root):
+                raise ValueError(f"executor_ref mapping must not overlap the {label}")
+    if not any(path_is_relative_to(workspace_root, mapping.host_path) for mapping in executor.mappings):
+        raise ValueError("executor_ref mappings must cover workspace_root")
+    return {"executor_ref": {
+        "type": executor.kind, "id": executor.executor_id, "network": executor.network,
+        "workspace_host_path": str(executor.mappings[0].host_path),
+        "workspace_backend_path": executor.mappings[0].backend_path,
+        "container_name": executor.container_name,
+        "path_mappings": [{"host_path": str(mapping.host_path), "backend_path": mapping.backend_path}
+                          for mapping in executor.mappings],
+    }}
+
+
 def _create_task_from_body(request: Request, body: Any) -> JSONResponse:
     """Settle the existing reservation, staging and durable admission as one unit."""
     if not isinstance(body, dict):
@@ -497,24 +522,22 @@ def _create_task_from_body(request: Request, body: Any) -> JSONResponse:
         return json_error("memory_mode must be one of forked, empty, shared", 400)
     if workspace_root and memory_mode == "shared":
         return json_error("memory_mode=shared is not allowed for external workspaces; use forked or empty", 400)
-    from ouroboros.project_facts import explicit_project_id_ok, resolve_project_id as _resolve_pid
+    from ouroboros.project_facts import explicit_project_id_ok
+    from ouroboros.projects_registry import project_scope_admission
 
     raw_project_id = str(body.get("project_id") or "")
-    # Validate the UNSTRIPPED value so leading/trailing whitespace (which would
-    # collapse two inputs into one store) is rejected, not silently normalized.
+    # Reject unsanitized ids: normalization would alias different memory stores.
     if raw_project_id and not explicit_project_id_ok(raw_project_id):
-        # Fail closed: an explicit project_id must already be filesystem-clean.
-        # Reject (rather than silently normalize/empty -> canonical), so two
-        # inputs never collapse to one store and isolation is never defeated.
-        return json_error(
-            "project_id must be filesystem-safe (alphanumeric/_/-/., no spaces or slashes)", 400)
-    _task_project_id = _resolve_pid({"project_id": raw_project_id, "workspace_root": str(workspace_root or "")})
-    # D5 (Option A): keep the RECORDED memory_mode exactly as requested — shared/forked/
-    # empty semantics are unchanged. Isolation for a project-scoped `shared` task comes
-    # from MATERIALIZING an isolated child drive (data-root isolation), NOT from mutating
-    # the recorded mode. The worker uses task['drive_root'] (the child), and a pure
-    # --project-id task never shows the memory_mode line, so the recorded mode stays
-    # purely informational while post-task writes still land on the isolated child.
+        return json_error("project_id must be filesystem-safe (alphanumeric/_/-/., no spaces or slashes)", 400)
+    try:
+        project_basis = project_scope_admission(
+            drive_root, project_id=raw_project_id, workspace_root=str(workspace_root or ""))
+    except (OSError, ValueError, RuntimeError) as exc:
+        return json_error(f"Project state could not be checked: {exc}", 409,
+                          reason_code="project_routing_fence_lookup_failed")
+    _task_project_id = project_basis["project_id"]
+    # Keep requested memory_mode; project-scoped shared memory runs on a forked
+    # child data root, so post-task writes stay isolated even without a workspace.
     effective_drive_mode = "forked" if (_task_project_id and memory_mode == "shared") else memory_mode
     task_type = str(body.get("type") or "task")
     if task_type in {"evolution", "review", "deep_self_review"}:
@@ -526,7 +549,8 @@ def _create_task_from_body(request: Request, body: Any) -> JSONResponse:
     if workspace_root and task_type != "task":
         return json_error("external workspace tasks must use type='task'", 400)
     try:
-        chat_id = ingress_chat_id(body.get("chat_id"), drive_root, _task_project_id, source=body.get("source"))
+        chat_id = ingress_chat_id(body.get("chat_id"), drive_root, _task_project_id,
+                                  source=body.get("source"), project_basis=project_basis)
         depth = parse_task_depth(body.get("depth"), default=0)
     except ProjectThreadConflict as exc:
         return json_error(str(exc), 400)
@@ -539,6 +563,10 @@ def _create_task_from_body(request: Request, body: Any) -> JSONResponse:
         )
 
     raw_metadata = dict(body.get("metadata") or {}) if isinstance(body.get("metadata"), dict) else {}
+    if "input_sources" in raw_metadata:
+        return json_error(
+            "metadata.input_sources is reserved; source selection is only supported by schedule_subagent",
+            400, reason_code="input_source_selection_unsupported")
     if _external_subagent_label(body, raw_metadata):
         return json_error("delegation_role=subagent is only allowed through the internal schedule_subagent tool", 400)
     if str(body.get("parent_task_id") or "").strip() or str(body.get("root_task_id") or "").strip():
@@ -554,37 +582,10 @@ def _create_task_from_body(request: Request, body: Any) -> JSONResponse:
     )
     if policy_error:
         return json_error(policy_error, 400)
-    if "executor_ref" in raw_metadata or "workspace_executor" in raw_metadata:
-        return json_error("metadata.executor_ref/workspace_executor is reserved; pass executor_ref as a top-level task field", 400)
-    if "executor_ref" in body:
-        raw_executor_ref = body.get("executor_ref")
-        if not isinstance(raw_executor_ref, dict) or not raw_executor_ref:
-            return json_error("executor_ref must be a JSON object", 400)
-        if workspace_root is None:
-            return json_error("executor_ref requires an external workspace_root", 400)
-        try:
-            normalized_executor = normalize_executor_ref(raw_executor_ref)
-        except ValueError as exc:
-            return json_error(str(exc), 400)
-        if normalized_executor is not None:
-            for mapping in normalized_executor.mappings:
-                for protected_root, label in ((repo_dir, "Ouroboros system repo"), (drive_root, "Ouroboros data drive")):
-                    if paths_overlap_casefold(mapping.host_path, protected_root):
-                        return json_error(f"executor_ref mapping must not overlap the {label}", 400)
-            if not any(path_is_relative_to(workspace_root, mapping.host_path) for mapping in normalized_executor.mappings):
-                return json_error("executor_ref mappings must cover workspace_root", 400)
-            metadata["executor_ref"] = {
-                "type": normalized_executor.kind,
-                "id": normalized_executor.executor_id,
-                "network": normalized_executor.network,
-                "workspace_host_path": str(normalized_executor.mappings[0].host_path),
-                "workspace_backend_path": normalized_executor.mappings[0].backend_path,
-                "container_name": normalized_executor.container_name,
-                "path_mappings": [
-                    {"host_path": str(mapping.host_path), "backend_path": mapping.backend_path}
-                    for mapping in normalized_executor.mappings
-                ],
-            }
+    try:
+        metadata.update(_api_executor_metadata(body, raw_metadata, workspace_root, repo_dir, drive_root))
+    except ValueError as exc:
+        return json_error(str(exc), 400)
     try:
         deadline_at = _normalize_deadline_at(body.get("deadline_at") or raw_metadata.get("deadline_at") or "")
     except ValueError as exc:
@@ -630,11 +631,15 @@ def _create_task_from_body(request: Request, body: Any) -> JSONResponse:
     # task['drive_root'] set at the end of this handler). The returned manifest renders
     # READY read_file(root='artifact_store', ...) lines and feeds native image blocks.
     effective_drive = child_drive or drive_root
-    attachment_manifest, attachment_error = stage_initial_task_attachments(
-        effective_drive, task_id, _normalize_attachments(body.get("attachments")),
-        # Partial staging is the DEFAULT (В25c); explicit false = atomic admission.
-        allow_partial=body.get("allow_partial_attachments") is not False,
-    )
+    try:
+        attachment_manifest, attachment_error = stage_initial_task_attachments(
+            effective_drive, task_id, _normalize_attachments(body.get("attachments")),
+            # Partial staging is the DEFAULT (В25c); explicit false = atomic admission.
+            allow_partial=body.get("allow_partial_attachments") is not False,
+        )
+    except Exception as exc:
+        _cleanup_api_admission_attempt(drive_root, task_id, admission_token, child_drive)
+        return json_exception(exc, 503)
     if attachment_error is not None:
         _cleanup_api_admission_attempt(drive_root, task_id, admission_token, child_drive)
         return attachment_error
@@ -651,6 +656,8 @@ def _create_task_from_body(request: Request, body: Any) -> JSONResponse:
     metadata.setdefault("task_id", task_id)
     metadata.setdefault("parent_task_id", "")
     metadata.setdefault("root_task_id", task_id)
+    metadata["resource_intent"] = ({"kind": "explicit_resource", "root": str(workspace_root)} if workspace_root  # #1315
+                                   else {"kind": "explicit_none", "project_id": _task_project_id} if _task_project_id else {"kind": "system_repo"})
     artifacts: List[Dict[str, Any]] = []
     workspace_preflight_summary: Dict[str, Any] = {}
     if workspace_root:
@@ -711,6 +718,7 @@ def _create_task_from_body(request: Request, body: Any) -> JSONResponse:
         "workspace_mode": workspace_mode,
         "memory_mode": memory_mode,
         "project_id": _task_project_id,
+        **({"_project_admission": project_basis} if _task_project_id else {}),
         "metadata": metadata,
         # v6.52.0 (P1): the STAGED manifest (root/relpath/mime/is_image), not raw
         # host paths — relpaths resolve against task['drive_root'] at read time.
@@ -729,12 +737,9 @@ def _create_task_from_body(request: Request, body: Any) -> JSONResponse:
     try:
         task = attach_task_contract(task)
     except Exception as exc:
-        _cleanup_api_admission_attempt(
-            drive_root, task_id, admission_token, child_drive
-        )
+        _cleanup_api_admission_attempt(drive_root, task_id, admission_token, child_drive)
         return json_exception(exc, 503)
     if child_drive is not None:
-        task["drive_root"] = str(child_drive)
         task["child_drive_root"] = str(child_drive)
         task["budget_drive_root"] = str(drive_root)
         metadata["child_drive_root"] = str(child_drive)
@@ -902,7 +907,7 @@ async def api_task_get(request: Request) -> JSONResponse:
 
 
 def _task_get_response(request: Request) -> JSONResponse:
-    """Materialize the complete detail and ledger projection off the HTTP loop."""
+    """Project the complete detail and ledger view off the HTTP loop (a pure read)."""
     try:
         task_id = validate_task_id(request.path_params.get("task_id"))
     except ValueError as exc:
@@ -918,6 +923,11 @@ def _task_get_response(request: Request) -> JSONResponse:
             pass
         return json_error("task result is unavailable", 503)
     payload = public_task_result(data)
+    from ouroboros.owner_continue import continuation_offer  # Batch4: a Continue, or its accepted successor
+    payload["continuation_offer"] = continuation_offer(data, task_id)
+    if isinstance(payload.get("artifacts"), list):  # what ``?archive=<dir>`` would stream now, per top-level dir
+        payload["artifact_archives"] = directory_archives(task_artifact_stores(drive_root, task_id),
+                                                          payload["artifacts"], anchor=drive_root)
     breakdown_view = _task_cost_breakdown_view(drive_root, data)
     if breakdown_view is not None:
         payload["cost_breakdown"] = breakdown_view
@@ -925,6 +935,10 @@ def _task_get_response(request: Request) -> JSONResponse:
 
 
 def api_task_artifact(request: Request):
+    """Serve one task file read-only from its canonical or OWN child store (``task_archive``): a bare
+    name selects only a top-level file (several nested matches: 409 ``artifact_name_ambiguous`` naming
+    their ``relpaths``), ``?relpath=a/b/{name}`` is exact, ``?archive=<dir>`` with ``{name}`` =
+    ``<basename>.zip`` streams a recorded directory; bytes leave only through ``serve_task_file``."""
     try:
         task_id = validate_task_id(request.path_params.get("task_id"))
     except ValueError as exc:
@@ -932,45 +946,47 @@ def api_task_artifact(request: Request):
     name = str(request.path_params.get("name") or "").strip()
     if not name or "/" in name or "\\" in name or name in {".", ".."} or ".." in pathlib.PurePosixPath(name).parts:
         return json_error("artifact name must be a simple filename", 400)
+    source, relpath = request.query_params.get("source"), request.query_params.get("relpath")
+    if relpath is not None and (source or plain_segments(relpath)[-1:] != [name]):
+        return json_error("relpath must be store-relative plain segments ending in the name, without source",
+                          400, reason_code="artifact_relpath_invalid", task_id=task_id, artifact=name)
     drive_root = request_drive_root(request)
-    path = artifact_store.resolve_chat_media_path(drive_root, task_id, name)
-    if path is None:
-        registered = artifact_store.registered_task_artifact(drive_root, task_id, name)
-        source = request.query_params.get("source")
-        # Registered immutable bytes need one identity check below, not a
-        # materialization/hash of the whole result before that same check.
-        result = (load_effective_task_result(drive_root, task_id) or {}
-                  if source or not registered or not registered.get("immutable") else {})
-        if not result and not registered:
-            return json_error("task not found", 404)
-        if source:
-            try:
-                return Response(artifact_store.read_task_result_source_bytes(drive_root, result, name, source), media_type="application/json")
-            except (OSError, ValueError, RuntimeError):
-                return json_error("task source is unavailable or does not match its recorded identity", 404)
-        artifact = registered if registered and registered.get("immutable") else next(
-            (row for row in result.get("artifacts") or []
-             if isinstance(row, dict)
-             and str(row.get("name") or pathlib.Path(str(row.get("path") or "")).name) == name),
-            None) or registered
-        if artifact is None:
-            return json_error("artifact not found", 404, task_id=task_id, artifact=name)
-        base = task_artifacts_dir(drive_root, task_id).resolve(strict=False)
-        path = pathlib.Path(str(artifact.get("path") or "")).resolve(strict=False)
-        if path.name != name:
+    if (archive := request.query_params.get("archive")) is not None:
+        return serve_directory_archive(drive_root, task_id, name, archive,
+                                       other_selectors=source is not None or relpath is not None)
+    stores = task_artifact_stores(drive_root, task_id)
+    path = None if relpath is not None else artifact_store.resolve_chat_media_path(drive_root, task_id, name)
+    if path is not None:  # content-addressed chat media: the canonical store, bytes that hash to the name
+        media = task_artifact_location(stores[:1], path)
+        return (serve_task_file(drive_root, stores[0], media[2], name, chat_media_identity(name), task_id=task_id)
+                if media else json_error("artifact not found", 404, task_id=task_id, artifact=name))
+    registered = artifact_store.registered_task_artifact(drive_root, task_id, name) if relpath in (None, name) else None
+    # A registered immutable top-level file needs one identity check, not a result projection.
+    fast = bool(not source and registered and registered.get("immutable")
+                and (at := task_artifact_location(stores, registered.get("path"))) and at[2] == name)
+    result = {} if fast else (load_effective_task_result(drive_root, task_id) or {})
+    if not result and not registered:
+        return json_error("task not found", 404)
+    if source:
+        return serve_task_source(drive_root, stores, result, task_id, name, source)
+    rows = [] if fast else [row for row in result.get("artifacts") or [] if isinstance(row, dict) and (
+        relpath is not None or str(row.get("name") or pathlib.Path(str(row.get("path") or "")).name) == name)]
+    located = [(at, order, row) for order, row in enumerate(rows + ([registered] if registered else []))
+               if (at := task_artifact_location(stores, row.get("path")))]
+    matches = [item for item in located if item[0][2] == (relpath or name)]
+    nested = sorted({item[0][2] for item in located if "/" in item[0][2]})
+    if relpath is None and not matches and len(nested) > 1:
+        return json_error("artifact name matches several nested files; select one with ?relpath=", 409,
+                          reason_code="artifact_name_ambiguous", task_id=task_id, artifact=name, relpaths=nested)
+    if not matches:
+        if relpath is None and any(at[2].rsplit("/", 1)[-1] != name for at, _order, _row in located):
             return json_error("artifact metadata path does not match requested name", 500)
-        try:
-            path.relative_to(base)
-        except ValueError:
+        if (rows or registered) and not located and relpath is None:
             return json_error("artifact path is outside task artifact directory", 500)
-        if not path.is_file():
-            return json_error("artifact file is missing", 404, task_id=task_id, artifact=name)
-        if artifact.get("immutable"):
-            try:
-                artifact_store.stream_artifact_file(path, expected=artifact)
-            except OSError:
-                return json_error("captured artifact failed byte verification", 404)
-    return FileResponse(path)
+        return json_error("artifact not found", 404, task_id=task_id, artifact=name)
+    (index, _path, relative), _order, artifact = min(matches, key=lambda item: (item[0][0], item[1]))
+    return serve_task_file(drive_root, stores[index], relative, name, recorded_identity(artifact), task_id=task_id,
+                           mutable=not artifact.get("immutable"))
 
 
 def _record_cascade_incident(task_id: str, kind: str, detail: str = "") -> None:
@@ -1051,7 +1067,7 @@ def _run_cascade_cancel(task_id: str) -> bool:
 _NO_BODY = object()
 
 
-async def _graceful_stop_acknowledgement(task_id: str, *, cascade: bool) -> JSONResponse:
+async def _graceful_stop_acknowledgement(task_id: str, *, cascade: bool, stop_action_id: str = "") -> JSONResponse:
     """S3 graceful ingress: durable finalize intent + IMMEDIATE pending ack.
 
     The socket is NOT held for the (up to) 120-second episode (§12.2 item 2):
@@ -1061,6 +1077,7 @@ async def _graceful_stop_acknowledgement(task_id: str, *, cascade: bool) -> JSON
     Stop-now stays available throughout and HARDENS the same intent.
     """
     import threading
+    from supervisor.followup_policy import StopActionConflict
 
     from supervisor.queue import (
         DRIVE_ROOT as _drive_root,
@@ -1086,10 +1103,13 @@ async def _graceful_stop_acknowledgement(task_id: str, *, cascade: bool) -> JSON
             reason="owner requested finalize-then-stop",
             source="http_graceful", requested_by="owner",
             observation=observation,
+            stop_action_id=stop_action_id,
             requested_stop_policy=STOP_POLICY_FINALIZE,
             allow_settled_target=bool(cascade or live_own),
             **({"scope": SCOPE_CASCADE} if cascade else {}),
         ))
+    except StopActionConflict as exc:
+        return json_error(str(exc), 409, task_id=task_id, reason_code="stop_action_conflict")
     except CancelIntentProjectionCorrupt:
         return json_error(
             "the cancel-intent projection is corrupt; nothing was requested",
@@ -1131,14 +1151,9 @@ async def api_task_cancel(request: Request) -> JSONResponse:
         task_id = validate_task_id(request.path_params.get("task_id"))
     except ValueError as exc:
         return json_error(str(exc), 400)
-    # Optional JSON body {"cascade": true} (v6.82): cancel the task AND its
-    # atomically-snapshotted live subtree, answering only once that teardown has
-    # finished. An absent/empty body keeps today's single-task behavior
-    # byte-identical for headless callers (the CLI posts {}).
-    # An ABSENT body keeps the legacy single-task path; a body that is PRESENT but
-    # unparseable (or not a JSON object) is a client error. Collapsing the two would
-    # answer a malformed cascade request by quietly cancelling only the root and
-    # leaving its descendants running.
+    # Optional cascade cancels the snapshotted live subtree before hard reply.
+    # Absent/empty body keeps legacy single-task behavior. Present malformed or
+    # non-object JSON must refuse, never silently narrow a cascade to its root.
     raw_body = (await request.body()) or b""
     if raw_body.strip():
         body = await request_json_or(request, _NO_BODY)
@@ -1165,41 +1180,28 @@ async def api_task_cancel(request: Request) -> JSONResponse:
             "stop_policy must be 'immediate' or 'finalize_then_cancel'",
             400, task_id=task_id,
         )
+    action_id = body.get("stop_action_id", "")
+    if not isinstance(action_id, str) or len(action_id) > 200:
+        return json_error("stop_action_id must be a string of at most 200 characters", 400, task_id=task_id)
     if stop_policy_value == "finalize_then_cancel":
         # Graceful ingress: immediate typed pending acknowledgement; the
         # synchronous teardown contract below stays hard/legacy-only.
-        return await _graceful_stop_acknowledgement(task_id, cascade=cascade)
+        return await _graceful_stop_acknowledgement(task_id, cascade=cascade, stop_action_id=action_id)
 
     intent_target = {"task_id": task_id, "scope": ""}
 
     def _record_http_intent(
         source: str, *, cascade_scope: bool = False, allow_settled: bool = False,
     ) -> bool:
-        """ALL cancel ingress goes through the durable intent (owner batch-4 1=A):
-        the intent survives a lost event/crash mid-teardown and the supervisor
-        watchdog re-feeds it into custody. FAIL-CLOSED (AR2-1, mirroring the
-        agent tool lane): a cancel whose durable intent could not be recorded is
-        REFUSED — teardown without the intent would recreate exactly the
-        unfenced, unreplayable cancel the redesign removes.
+        """Persist the watchdog fence before teardown; failure refuses ingress.
 
-        The cascade endpoint mints with ``scope=cascade`` AT THE INGRESS
-        (GR2-1a): a crash before the supervisor's own scope stamp would
-        otherwise leave a single-scope intent that a watchdog replay runs as a
-        single cancel, settling the root while its descendants keep running.
-        It also mints over an ALREADY-SETTLED root (GR2-1b): a settled root
-        with live descendants still needs the durable cascade coordination
-        intent — it is the watchdog's replay trigger for the descendants and
-        settles only when the cascade's no-live postcondition passes.
-
-        ``allow_settled`` (GR6-1) is the single lane's LIVE-OWNERSHIP fact: a
-        settled RESULT with a live worker (post-task cognition still spending)
-        must still mint, or the ingress no-ops while the worker burns —
-        ``already_settled`` is terminal only when no live ownership remains.
-
-        Returns "" on success, or a typed refusal kind: "projection_corrupt"
-        (GR4-8 — the projection FILE is malformed; a retry cannot succeed
-        until it is repaired) vs "write_failed" (transient — retry)."""
+        Cascade ingress records widen-only scope and allows settled roots with
+        live descendants. Single ingress supplies allow_settled from live physical
+        ownership, since stored completion can precede worker exit. Return an
+        empty string on success or a typed write/corruption/action-conflict refusal.
+        """
         try:
+            from supervisor.followup_policy import StopActionConflict
             from supervisor.queue import DRIVE_ROOT as _drive_root
 
             from ouroboros.cancel_intents import (
@@ -1215,6 +1217,7 @@ async def api_task_cancel(request: Request) -> JSONResponse:
         try:
             intent = request_cancel(
                 _drive_root, task_id, source=source,
+                stop_action_id=action_id,
                 observation=observe_cancellation_target(_drive_root, task_id, request_origin={"kind": "http_client", "source": source}),
                 **({"scope": SCOPE_CASCADE} if cascade_scope else {}),
                 allow_settled_target=bool(cascade_scope or allow_settled),
@@ -1227,6 +1230,8 @@ async def api_task_cancel(request: Request) -> JSONResponse:
             intent_target["task_id"] = str(intent.get("task_id") or task_id)
             intent_target["scope"] = str(intent.get("scope") or "")
             return ""
+        except StopActionConflict:
+            return "stop_action_conflict"
         except CancelIntentProjectionCorrupt:
             log.error("HTTP cancel refused for %s: intent projection corrupt", task_id)
             return "projection_corrupt"
@@ -1236,6 +1241,9 @@ async def api_task_cancel(request: Request) -> JSONResponse:
             return "write_failed"
 
     def _intent_write_refused(kind: str) -> JSONResponse:
+        if kind == "stop_action_conflict":
+            return json_error("stop_action_id reused with a different action", 409,
+                              task_id=task_id, reason_code=kind)
         if kind == "projection_corrupt":
             # GR4-8: honest wording — "retry" cannot succeed while the file is
             # malformed. The corrupt state/cancel_intents.json was PRESERVED
@@ -1401,6 +1409,7 @@ async def api_task_resume(request: Request) -> JSONResponse:
         # fresh custody at grant (#1196, owner Q8): a delegated run not proven
         # terminal keeps the task paused; a marker/attempt drift is typed too
         "external_runs_unsettled", "pause_attempt_mismatch",
+        "owner_pause_effects_unsettled", "owner_pause_custody_unreadable", "selection_authority_changed",
     } else 404
     return json_error(error, status, task_id=task_id, **({"action": result["action"]} if result.get("action") else {}))
 
@@ -1531,7 +1540,13 @@ def _render_attachment_lines(attachments: Any) -> str:
 def _queue_snapshot(drive_root: pathlib.Path) -> Dict[str, Any]:
     path = pathlib.Path(drive_root) / "state" / "queue_snapshot.json"
     try:
-        return read_json_dict(path) or {}
+        from ouroboros.project_admission import project_hold_fact
+        snapshot = read_json_dict(path) or {}
+        for row in [*snapshot.get("pending", []), *snapshot.get("running", [])]:
+            task = row.get("task")
+            if isinstance(task, dict):
+                task["project_admission_hold"] = project_hold_fact(task)
+        return snapshot
     except Exception:
         return {}
 
@@ -1567,7 +1582,7 @@ __all__ = [
     "api_task_artifact",
     "api_task_cancel",
     "api_decision_answer",
-    "api_task_hurry",
+    "api_task_hurry", "api_task_pause", "owner_tree_control_routes",
     "api_task_resume",
     "api_task_events",
     "api_task_get",

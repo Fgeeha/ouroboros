@@ -162,7 +162,7 @@ def test_root_re_resume_rebinds_fence_lifted_sibling_holds_to_the_live_grant(tmp
     monkeypatch.setattr(state, "budget_remaining", lambda _st, **_k: 5.0)
     root, _row = _parked(tmp_path, monkeypatch, task_id="root-3", scope="root")
     sibling = {"id": "sib-3", "type": "task", "chat_id": 0, "root_task_id": "root-3",
-               "parent_task_id": "root-3", "_attempt": 1}
+               "parent_task_id": "root-3", "_attempt": 1, "admitted_dispatch": "none"}
     workers.PENDING.append(sibling)
     first = queue.resume_budget_paused_task("root-3")
     assert first["ok"] is True and first["held_siblings"] == ["sib-3"]
@@ -328,7 +328,7 @@ def test_acceptance_fence_at_restore_holds_a_saved_pause_instead_of_cancelling(t
 
 def _fenced_member(workers, task_id, root_task_id):
     member = {"id": task_id, "type": "task", "chat_id": 0, "root_task_id": root_task_id,
-              "parent_task_id": root_task_id, "_attempt": 1}
+              "parent_task_id": root_task_id, "_attempt": 1, "admitted_dispatch": "none"}
     workers.PENDING.append(member)
     return member
 
@@ -410,6 +410,7 @@ def test_root_resume_holds_a_fence_bound_child_marker_instead_of_stranding_it(tm
     root, _row = _parked(tmp_path, monkeypatch, task_id="root-f3", scope="root")
     fence = queue.BUDGET_ROOT_FENCES["root-f3"]
     child = _fenced_member(workers, "child-f3", "root-f3")
+    child.pop("admitted_dispatch")  # historical positive pause survives conversion to a hold
     child["_budget_pause"] = {"status": "paused_before_dispatch", "scope": "root",
                               "root_task_id": "root-f3", "fence_id": fence["fence_id"],
                               "replay_safe": True, "physical_calls": 0, "auto_resume": False}

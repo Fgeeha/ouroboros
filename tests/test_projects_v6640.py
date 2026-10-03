@@ -411,7 +411,7 @@ def test_project_sidebar_and_menu_static_contracts():
     assert "project_seen_revision" in app
     assert "acknowledgeProjectAfterPaint" in app
     assert "inst.refreshHistory?.({ revision })" in app
-    assert "paint?.painted" in app
+    assert "paint?.read" in app  # painted AND at the newest messages (DESIGN "Project unread dot")
     assert "await markProjectViewed(project.id, revision)" in app
     assert "async function markProjectViewed" in app
     assert "await fetchJson('/api/ui/preferences'" in app
@@ -524,7 +524,8 @@ def test_project_lifecycle_rows_render_design_system_action_static_contract():
     )
     # chat.js only delegates; the lifecycle-row module puts the one Project reference
     # (web/modules/project_reference.js) into the shared action composition.
-    assert "if (PROJECT_ROW_TYPES.has(systemType)) decorateProjectRow(bubble, { role, projectId, projectName });" in chat
+    assert "if (PROJECT_ROW_TYPES.has(systemType)) decorateProjectRow(bubble, { role, projectId, projectName," in chat
+    assert "terminalTime: opts.terminalTime, addedAt: ts, completion: systemType === 'project_completion_summary'" in chat
     render = (root / "web" / "modules" / "project_answer.js").read_text(encoding="utf-8")
     assert "createSystemMessageActions(projectReference(" in render
     assert "row.className = 'system-message-actions'" in helpers
@@ -716,17 +717,18 @@ def test_web_frames_keep_reference_order_and_one_authored_reply():
 
     root = Path(__file__).resolve().parents[1]
     chat = (root / "web" / "modules" / "chat.js").read_text(encoding="utf-8")
-    reference = chat[chat.index("function handleCardReference"):chat.index("function createLiveCardRecord")]
+    reference = chat[chat.index("function admitCardMetadata"):chat.index("function createLiveCardRecord")]
+    assert reference.index("noteToolMetrics(row.task_id, row,") < reference.index("isModelWaitReference(row)")
     assert reference.index("isModelWaitReference(row)") < reference.index("reviewReferenceFromRow(row)")
     logs = chat[chat.index("function updateLiveCardFromLogEvent"):chat.index("function addMessage")]
-    assert logs.index("handleCardReference(evt)") < logs.index("const taskId = getLogTaskGroupId(evt)")
-    # Tool accounting (the telemetry closure's one surviving job) also runs
-    # after the reference seam.
-    assert logs.index("handleCardReference(evt)") < logs.index("noteToolMetrics(taskId, evt, rawTs)")
+    assert logs.index("admitCardMetadata(evt)") < logs.index("const taskId = getLogTaskGroupId(evt)")
+    # Ordinary telemetry accounting follows metadata admission; reference-carried
+    # evidence is admitted inside that seam before any presentation-only return.
+    assert logs.index("admitCardMetadata(evt)") < logs.index("noteToolMetrics(taskId, evt, rawTs)")
     history = chat[chat.index("function applyHistoryMessages"):chat.index("async function syncHistory")]
-    assert history.index("handleCardReference(msg)") < history.index("updateLiveCardFromProgressMessage(msg,")
+    assert history.index("admitCardMetadata(msg)") < history.index("updateLiveCardFromProgressMessage(msg,")
     fanout = chat[chat.index("onWs('chat'"):chat.index("onWs('message_annotation'")]
-    assert fanout.index("handleCardReference(msg)") < fanout.index("updateLiveCardFromProgressMessage(msg,")
+    assert fanout.index("admitCardMetadata(msg)") < fanout.index("updateLiveCardFromProgressMessage(msg,")
     assert "showTaskIncidentToast(msg);" in fanout
     assistant_fanout = fanout[fanout.index("const explicitTaskId"):]
     assert assistant_fanout.count("addMessage(msg.content, msg.role") == 1
@@ -735,4 +737,8 @@ def test_web_frames_keep_reference_order_and_one_authored_reply():
     # (typing frames are receipts and never register liveness or controls).
     assert "updateLiveCardFromProgressMessage(msg, { grantCancelAuthority: true })" in fanout
     updater = chat[chat.index("function updateLiveCardFromProgressMessage"):chat.index("function updateLiveCardFromLogEvent")]
-    assert "grantCancelAuthority && msg?.cancelable === true && msg?.task_id" in updater
+    assert "const taskId = msg?.task_id || '';" in updater
+    guard = updater.index("if (!taskId) return false;")
+    grant = updater.index("if (grantCancelAuthority && msg.cancelable === true) {")
+    # The grant keeps the earlier replayed tool-evidence change instead of overwriting it.
+    assert guard < grant < updater.index("changed = markTaskCancelable(String(taskId)) || changed;")

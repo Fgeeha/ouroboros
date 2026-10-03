@@ -15,6 +15,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict
 
+from ouroboros.dialogue_provenance import presence_root_carrier
 from ouroboros.tools.control_events import (
     _PROMOTE_CONFIRM_TIMEOUT_SEC,
     _emit_and_wait_for_routing,
@@ -22,6 +23,7 @@ from ouroboros.tools.control_events import (
 )
 from ouroboros.tool_access_paths import canonical_data_root
 from ouroboros.tools.registry import ToolContext
+from ouroboros.tools.tool_result import completed_local_read
 from ouroboros.utils import append_jsonl, utc_now_iso
 
 log = logging.getLogger(__name__)
@@ -59,6 +61,24 @@ def _attach_origin_from_metadata(ctx: ToolContext, evt: Dict[str, Any]) -> None:
             evt["source_text"] = text
     elif metadata.get("origin_suppressed"):
         evt["origin_suppressed"] = True
+
+
+def _attach_drafted_objective(ctx: ToolContext, evt: Dict[str, Any]) -> None:
+    """Keep the routed objective's author separate from the ingress owner corpus."""
+    evt["objective_author"] = {"kind": "task", "task_id": str(getattr(ctx, "task_id", "") or "")}
+    owner_rows = [dict(row) for row in (getattr(ctx, "_owner_directives", None) or [])
+                  if isinstance(row, dict) and row.get("source") in {
+                      "owner_mailbox", "owner_quiz_answer", "origin_message", "owner_corpus", "direct_incoming"}]
+    if evt.get("source_text") and not any(row.get("source") == "origin_message" for row in owner_rows):
+        owner_rows.insert(0, {"source": "origin_message", "content": evt["source_text"]})
+    elif not evt.get("source_text"):
+        # A suppressed (never-logged) origin carries no text; the owner's words
+        # then live only in this run's first row, and ONLY under the host's
+        # owner-ingress stamp (``initial_user``) — an unstamped first turn
+        # (``initial_text``) is never laundered into owner authority.
+        owner_rows[:0] = [dict(row) for row in (getattr(ctx, "_owner_directives", None) or [])
+                          if isinstance(row, dict) and row.get("source") == "initial_user"]
+    evt["owner_corpus"] = owner_rows
 
 
 def _durable_project_of_request(ctx: ToolContext) -> str:
@@ -367,6 +387,7 @@ def _promote_chat_to_task(
     requested_root = str(workspace_root or "").strip()
     workspace_sentinel = str(workspace or "").strip().lower()
     repo_root_note = ""
+    intent_system_repo = False
     if requested_root:
         # Q4=A: naming the Ouroboros repository ITSELF names the documented
         # default (no separate workspace — the ordinary self-modification task),
@@ -390,6 +411,7 @@ def _promote_chat_to_task(
             same_root = False
         if same_root:
             requested_root, workspace_sentinel = "", WORKSPACE_NONE
+            intent_system_repo = True  # the CHOICE survives the sentinel (#1315)
             repo_root_note = (
                 " (workspace_root named the Ouroboros repository itself; started as an "
                 "ordinary task over it — no separate workspace)"
@@ -400,8 +422,8 @@ def _promote_chat_to_task(
     if disabled_reason:
         response = (
             f"⚠️ PROMOTE_REJECTED: task {tid} was not scheduled "
-            f"(worker_pool_unavailable: {disabled_reason}). No project/workspace "
-            "admission side effects were started."
+            f"(worker_pool_unavailable: {disabled_reason}){_cause_words('worker_pool_unavailable')}. "
+            "No project/workspace admission side effects were started."
         )
         return _finish_swarm_handoff(
             ctx,
@@ -427,6 +449,7 @@ def _promote_chat_to_task(
         # default (a folder-less task in a folder-ful project stays possible).
         "workspace": workspace_sentinel,
         "chat_id": current_chat_id,
+        **({"resource_intent": {"kind": "system_repo"}} if intent_system_repo else {}),
         "client_message_id": str(
             ((getattr(ctx, "task_metadata", {}) or {}).get("client_message_id") or "")
             if isinstance(getattr(ctx, "task_metadata", {}), dict) else ""
@@ -438,18 +461,17 @@ def _promote_chat_to_task(
         "ts": utc_now_iso(),
     }
     metadata = getattr(ctx, "task_metadata", {})
-    presence = metadata.get("presence") if isinstance(metadata, dict) else None
-    if isinstance(presence, dict) and presence:
-        # A public conversation may promote long work, but it cannot choose a
-        # new Project/workspace/source authority. The immutable positive ceiling
-        # and exact return destination follow the promoted root by value.
+    presence_carrier = presence_root_carrier(metadata, task_contract=getattr(ctx, "task_contract", None))
+    if presence_carrier:
+        # A public conversation cannot choose a new Project/workspace/source authority; the immutable
+        # ceiling and return destination (a descendant's root: its binding only) follow it by value.
         evt.update({
             "project_id": "",
             "project_name": "",
             "workspace_root": "",
             "workspace": "",
             "source": "",
-            "presence": dict(presence),
+            **presence_carrier,
             "task_contract": dict(getattr(ctx, "task_contract", {}) or {}),
         })
         repo_root_note = ""  # Presence runs in its admitted folder, never over the repo
@@ -461,6 +483,7 @@ def _promote_chat_to_task(
 
     evt.update(consciousness_origin_metadata(metadata))
     _attach_origin_from_metadata(ctx, evt)
+    _attach_drafted_objective(ctx, evt)
     predecessor_error = _attach_predecessor_authority_from_metadata(
         ctx, evt, predecessor_task_id,
     )
@@ -501,7 +524,7 @@ def _promote_chat_to_task(
             shown_reason = f"{shown_reason}: {detail}" if shown_reason else detail
         response = (
             f"⚠️ PROMOTE_REJECTED: task {tid} was not scheduled"
-            f"{f' ({shown_reason})' if shown_reason else ''}. "
+            f"{f' ({shown_reason})' if shown_reason else ''}{_cause_words(reason)}. "
             "Do not report this task as created."
         )
         return _finish_swarm_handoff(
@@ -582,6 +605,7 @@ def _second_project_note(ctx: ToolContext, already_bound: str, effective_pid: st
     )
 
 
+@completed_local_read
 def _list_projects(ctx: ToolContext, limit: int = 50) -> str:
     """Enumerate the owner's projects (id, name, recency) so the one mind can
     decide whether a main-chat message belongs to an existing project. The registry
@@ -647,7 +671,10 @@ def _route_to_project(
     predecessor_facts = dict(predecessor_event.pop("predecessor_facts", None) or {})
     requested_pid = str(project_id or "").strip()
     pid = sanitize_project_id(requested_pid) if requested_pid and explicit_project_id_ok(requested_pid) else ""
-    proj = get_project(canonical_data_root(ctx), pid) if pid else None
+    try:
+        proj = get_project(canonical_data_root(ctx), pid, strict=True) if pid else None
+    except (OSError, ValueError) as exc:
+        return "⚠️ AUTHORITY_SOURCE_UNAVAILABLE (route_to_project): " + str(exc)
     failure = (
         "target_unspecified" if not requested_pid
         else "invalid_project_id" if not pid
@@ -658,7 +685,7 @@ def _route_to_project(
         # the typed refusal in its own result, and no ack travels to a chat under
         # an empty message id. `list_projects` names the ids it may route to.
         return (
-            f"⚠️ ROUTE_REJECTED ({failure}): no route was dispatched. A task-authored route "
+            f"⚠️ ROUTE_REJECTED ({failure}): no route was dispatched{_cause_words(failure)}. A task-authored route "
             "needs an existing project id (see list_projects); the manual-target picker is "
             "an owner surface and is not offered to a task."
         )
@@ -716,11 +743,11 @@ def _route_to_project(
             )
             options_text = json.dumps(durable_options, ensure_ascii=False, default=str)
             return (
-                f"⚠️ NEEDS_MANUAL_TARGET ({failure}, {mode}): no route was dispatched. "
+                f"⚠️ NEEDS_MANUAL_TARGET ({failure}, {mode}): no route was dispatched{_cause_words(failure)}. "
                 f"Host-validated options: {options_text}"
             )
         return (
-            f"⚠️ ROUTING_UNCONFIRMED ({failure}, {mode}): no route was dispatched and "
+            f"⚠️ ROUTING_UNCONFIRMED ({failure}, {mode}): no route was dispatched{_cause_words(failure)}, and "
             "delivery of the manual target options was not confirmed."
         )
     tid = uuid.uuid4().hex[:16]
@@ -750,6 +777,7 @@ def _route_to_project(
 
     evt.update(consciousness_origin_metadata(metadata))
     _attach_origin_from_metadata(ctx, evt)
+    _attach_drafted_objective(ctx, evt)
     evt.update(predecessor_event)
     _attach_client_surface(ctx, evt)
     # Owner 3=A holds on this verb too: a route starts a NEW root exactly like a
@@ -773,7 +801,7 @@ def _route_to_project(
     if status in {"rejected", "needs_manual_target"}:
         response = (
             f"⚠️ ROUTE_REJECTED: task {tid} was not routed to project '{name}' "
-            f"({reason_text}{(': ' + detail) if detail else ''})."
+            f"({reason_text}{(': ' + detail) if detail else ''}){_cause_words(reason_text)}."
         )
         return _finish_swarm_handoff(
             ctx, evt, response, status="rejected", reason=reason_text,
@@ -943,19 +971,32 @@ def _steer_task(ctx: ToolContext, task_id: str, message: str) -> str:
     return _steer_refusal_text(target, mode, receipt)
 
 
+def _cause_words(code: str) -> str:
+    """``": <words>"`` for a refusal code the host cause table explains, else "".
+
+    The machine prefix and the code stay exactly where readers parse them; the
+    words come from the ONE table the owner's receipts read
+    (``project_dialogue.ROUTING_REFUSAL_CAUSES``), so the mind reads the same
+    fact the owner does. A code without a row stays bare -- never a near-miss.
+    """
+    from ouroboros.project_dialogue import ROUTING_REFUSAL_CAUSES
+
+    phrase = ROUTING_REFUSAL_CAUSES.get(str(code or "").strip(), "")
+    return f": {phrase}" if phrase else ""
+
+
 def _steer_refusal_text(target: str, mode: str, receipt: Dict[str, Any]) -> str:
     """The typed refusal/unconfirmed sentence for one steer receipt."""
     status = str(receipt.get("status") or "unconfirmed")
     if status in {"rejected", "needs_manual_target"}:
-        return (
-            f"⚠️ STEER_REJECTED: task {target} was not steered "
-            f"({str(receipt.get('reason') or 'target_not_steerable')})."
-        )
+        reason = str(receipt.get("reason") or "target_not_steerable")
+        return f"⚠️ STEER_REJECTED: task {target} was not steered ({reason}){_cause_words(reason)}."
     # Only "no receipt exists yet" reaches here: a settled refusal is returned
     # above with its reason, so UNCONFIRMED never disguises a known rejection.
+    reason = str(receipt.get("reason") or "confirmation_timeout")
     return (
         f"⚠️ STEER_UNCONFIRMED: mailbox delivery to task {target} was not durably confirmed "
-        f"({mode}, {str(receipt.get('reason') or 'confirmation_timeout')}). "
+        f"({mode}, {reason}){_cause_words(reason)}. "
         "Do not report the message as delivered."
     )
 
@@ -972,6 +1013,7 @@ def _send_task_message(
     No origin-bytes substitution, attachments or owner client surface.
     The result says WRITTEN: the target reads it at its next checkpoint.
     """
+    from ouroboros.dialogue_provenance import presence_caller_binding, presence_sender_origin
     from ouroboros.project_dialogue import AGENT_RECEIPT_ID_PREFIX
 
     routing_token = uuid.uuid4().hex
@@ -987,6 +1029,8 @@ def _send_task_message(
         "issuer": dict(issuer),
         "ts": utc_now_iso(),
     }
+    if (binding := presence_caller_binding(ctx)) is not None:  # admitted only to this binding's own work (owner Q2)
+        evt.update(presence_binding_id=binding, sender_origin=presence_sender_origin(ctx))
     mode, receipt = _emit_and_wait_for_routing(ctx, evt)
     if str(receipt.get("status") or "") == "delivered":
         return (

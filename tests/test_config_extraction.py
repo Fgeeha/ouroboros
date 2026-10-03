@@ -23,6 +23,9 @@ _LEAVES = (settings_defaults, settings_scales, model_slots, review_model_routes,
 # New subscription capabilities belong to the same leaves, but did not exist on
 # the historical extraction's facade and need not add compatibility re-exports.
 _ADDED_OWNERS = {
+    # Compatible-only review routing belongs to the existing model-route leaf.
+    "compatible_only_review_model": review_model_routes,
+    "_compatible_only_models": review_model_routes,
     "WORKER_READY_CEILING_SEC": runtime_limits,
     # The supervisor loop's bounded events pass and the budget-projection retry interval.
     "SUPERVISOR_EVENT_BATCH_MAX_EVENTS": runtime_limits,
@@ -52,6 +55,7 @@ _ADDED_OWNERS = {
     "normalize_model_role_options": model_slots,
     "model_role_option": model_slots,
     "task_model_binding": model_slots,
+    "route_binding": model_slots,
     "apply_model_role_override": model_slots,
     "CLAUDEXOR_MODEL_POLL_INTERVAL_SEC": runtime_limits,
     "CLAUDEXOR_OPERATOR_STOP_TIMEOUT_SEC": runtime_limits,
@@ -318,5 +322,6 @@ def test_settings_extraction_size_bounds_have_meaningful_headroom():
     }
     assert counts["ouroboros.config"] <= 1000
     assert all(count <= 1000 for count in counts.values())
-    assert counts["ouroboros.settings_defaults"] <= 500
+    # 500 -> 520: the Z.ai direct provider adds its key and plan rows to the leaf (PR #1207).
+    assert counts["ouroboros.settings_defaults"] <= 520
     assert (PACKAGE / "config.py").is_file()

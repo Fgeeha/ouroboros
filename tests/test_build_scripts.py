@@ -544,84 +544,60 @@ class TestDockerignore:
 
 
 class TestDockerfile:
-    """Dockerfile must install Playwright Chromium/WebKit binaries so browser tools work
-    out of the box in the container without additional setup."""
+    """One self-contained Dockerfile ships Chromium/WebKit for the locked Playwright.
 
-    def test_playwright_install_chromium_present(self):
+    The pins below are the contract the tag-only ``docker-ui-smoke`` and
+    ``docker-portable-test`` lanes rely on: browsers land in the shared
+    ``/ms-playwright`` the runtime honors as-is, they are downloaded ABOVE the
+    lock copy (every release rewrites ``pyproject.toml``/``uv.lock``), and CI
+    exercises the image's own browsers instead of re-downloading them.
+    """
+
+    def test_build_is_self_contained(self):
+        """``docker build -t ouroboros-web .`` must not depend on a locally built base tag."""
         src = _read("Dockerfile")
-        assert "playwright install chromium webkit" in src, (
-            "Dockerfile must call 'playwright install chromium webkit' to bundle the browsers"
+        assert "FROM python:3.10-slim" in src
+        assert "FROM ${" not in src, "the image must not start from an unpublished local tag"
+
+    def test_playwright_pin_matches_lock(self):
+        src = _read("Dockerfile")
+        match = re.search(r'\[\[package\]\]\nname = "playwright"\nversion = "([^"]+)"', _read("uv.lock"))
+        assert match is not None, "uv.lock must lock playwright"
+        assert f"PLAYWRIGHT_VERSION={match.group(1)}" in src, (
+            "Dockerfile must pin the browser installer to the locked Playwright version"
         )
 
-    def test_playwright_browsers_path_zero_set(self):
+    def test_shared_browser_path_is_the_image_environment(self):
         src = _read("Dockerfile")
-        assert "PLAYWRIGHT_BROWSERS_PATH=0" in src, (
-            "Dockerfile must set PLAYWRIGHT_BROWSERS_PATH=0 so Chromium installs "
-            "inside the pip package tree (not into a user cache that won't survive "
-            "image layer boundaries)"
+        assert "PLAYWRIGHT_BROWSERS_PATH=/ms-playwright" in src
+        assert "PLAYWRIGHT_BROWSERS_PATH=0" not in src, (
+            "browsers must not live in the package tree: the dependency layer is rebuilt on every release"
         )
 
-    def test_playwright_install_deps_present(self):
-        """Dockerfile must use 'playwright install-deps chromium webkit' (the authoritative
-        Playwright dependency resolver) rather than a hand-curated apt library list.
-        This ensures all runtime native libs required by Chromium/WebKit are present."""
-        src = _read("Dockerfile")
-        assert "playwright install-deps chromium webkit" in src, (
-            "Dockerfile must call 'playwright install-deps chromium webkit' to install all "
-            "native system libraries required by Chromium/WebKit via Playwright's authoritative "
-            "dependency resolver"
-        )
-
-    def test_install_deps_before_install_chromium(self):
-        """Native system dependencies must be installed BEFORE the Chromium binary
-        is downloaded, so the binary can find its runtime libraries on first launch."""
+    def test_browsers_install_before_the_lock_copy(self):
         src = _read("Dockerfile")
         deps_pos = src.find("playwright install-deps chromium webkit")
-        src.find("playwright install chromium webkit")
-        # binary_pos must not match the install-deps line itself
-        # find the standalone 'playwright install chromium webkit' (not install-deps)
-        import re as _re
-        binary_match = _re.search(r"(?<!install-deps )playwright install chromium webkit", src)
-        assert deps_pos != -1, "playwright install-deps chromium webkit not found in Dockerfile"
-        assert binary_match is not None, "standalone playwright install chromium webkit not found in Dockerfile"
-        assert deps_pos < binary_match.start(), (
-            "playwright install-deps must appear BEFORE playwright install chromium webkit in Dockerfile"
+        install_pos = src.find("playwright install chromium webkit")
+        lock_pos = src.find("COPY pyproject.toml uv.lock")
+        assert deps_pos != -1 and install_pos != -1 and lock_pos != -1
+        assert deps_pos < install_pos < lock_pos, (
+            "install-deps, then the browser download, then the lock copy — otherwise a release "
+            f"bump re-downloads the browsers (deps {deps_pos}, install {install_pos}, lock {lock_pos})"
         )
 
-    def test_uv_sync_before_playwright_install_deps(self):
-        """uv sync must appear BEFORE playwright install-deps chromium webkit — the
-        playwright Python package must be importable when install-deps runs."""
-        src = _read("Dockerfile")
-        sync_pos = src.find("uv sync")
-        deps_pos = src.find("playwright install-deps chromium webkit")
-        assert sync_pos != -1, "uv sync step not found in Dockerfile"
-        assert deps_pos != -1, "playwright install-deps chromium webkit not found in Dockerfile"
-        assert sync_pos < deps_pos, (
-            "uv sync must appear BEFORE playwright install-deps chromium webkit in Dockerfile "
-            f"(sync at char {sync_pos}, install-deps at {deps_pos})"
+    def test_no_runtime_uv_project_environment(self):
+        """A baked ``UV_PROJECT_ENVIRONMENT`` makes an agent's ``uv sync`` in a task
+        workspace rewrite Ouroboros's own venv."""
+        assert "UV_PROJECT_ENVIRONMENT" not in _read("Dockerfile")
+
+    def test_ci_docker_lanes_use_the_shipped_browsers(self):
+        """The release-gate container commands must not redirect Playwright away from the image."""
+        ci = _read(".github/workflows/ci.yml")
+        assert "docker build -t ouroboros-web:test ." in ci
+        assert "PLAYWRIGHT_BROWSERS_PATH=0" not in ci, (
+            "a PLAYWRIGHT_BROWSERS_PATH=0 prefix hides /ms-playwright and makes the lane download at test time"
         )
-
-    def test_uv_sync_before_all_playwright_invocations(self):
-        """uv sync must appear BEFORE every ``python3 -m playwright ...`` invocation
-        in the Dockerfile — both ``install-deps`` and ``install chromium webkit``.
-        If *any* playwright invocation precedes dependency sync, ModuleNotFoundError occurs."""
-        src = _read("Dockerfile")
-        sync_pos = src.find("uv sync")
-        assert sync_pos != -1, "uv sync step not found in Dockerfile"
-
-        import re as _re
-        playwright_invocations = [
-            m.start() for m in _re.finditer(r"python3 -m playwright", src)
-        ]
-        assert playwright_invocations, "No 'python3 -m playwright' invocations found in Dockerfile"
-
-        earliest_playwright = min(playwright_invocations)
-        assert sync_pos < earliest_playwright, (
-            "uv sync must appear BEFORE the earliest 'python3 -m playwright' invocation "
-            f"in the Dockerfile (sync at char {sync_pos}, earliest playwright at {earliest_playwright}). "
-            f"Found {len(playwright_invocations)} playwright invocation(s) at positions: "
-            f"{playwright_invocations}"
-        )
+        assert "playwright install --only-shell" not in ci, "the portable lane measures the shipped image"
 
 
 @pytest.mark.parametrize(
@@ -1175,7 +1151,7 @@ def test_ci_setup_aware_failure_collection_guards_each_independent_lane():
     for job_name in ("quick-test", "full-test", "marker-guards", "docker-ui-smoke", "system-e2e-mock", "android-test"):
         steps = jobs[job_name]["steps"]
         assert any("!cancelled()" in str(step.get("if", "")) for step in steps if "run" in step), job_name
-    ui = {step.get("name"): step for step in _ui_browser_jobs()["ui-smoke"]["steps"]}
+    ui = {step.get("name"): step for step in _ui_browser_jobs()["ui-shard"]["steps"]}
     host = ui["Run complete host UI lane with collection and availability guards"]
     assert "github.event_name" not in host["if"]
     assert "--require-ui-browser" in host["run"]
@@ -1218,10 +1194,10 @@ def test_ci_failure_collection_guards_every_independent_step_and_rerun_uploads()
         "system-e2e-mock": ["Run the keyless system E2E scenario lane (real isolated servers)", "Run the cancellation E-suite mock lane"],
         "android-test": ["Run Android source and release contract tests", "Compile and verify explicitly test-signed Android host"],
     }
-    expected["ui-smoke"] = ["Install UI smoke Chromium and WebKit",
+    expected["ui-shard"] = ["Install UI smoke Chromium and WebKit",
                            "Run complete host UI lane with collection and availability guards",
                            "Run browser tools Chromium/WebKit smoke"]
-    jobs = {**jobs, "ui-smoke": _ui_browser_jobs()["ui-smoke"]}
+    jobs = {**jobs, "ui-shard": _ui_browser_jobs()["ui-shard"]}
     for job, names in expected.items():
         steps = {step.get("name"): step for step in jobs[job]["steps"]}
         for name in names:
@@ -1245,32 +1221,28 @@ def test_ci_step_outcome_references_resolve_to_prior_step_ids():
 
 
 
-def test_ci_branch_filters_include_packaging_assets():
-    workflow = _ci_workflow()
-
-    assert "- 'packaging/**'" in workflow
-    assert "- 'devtools/**'" in workflow
-
-
-def test_only_the_browser_push_workflow_drops_the_path_filter():
+def test_neither_the_code_workflow_nor_the_browser_push_workflow_filters_pushes_by_path():
     import yaml
 
-    # The shared workflow keeps ci.yml's filter for every other job; the browser
-    # lane alone must also see a Makefile-, spec- or requirements-only push.
-    ci_push = yaml.safe_load(_ci_workflow()).get("on", None)
-    ci_push = (ci_push or yaml.safe_load(_ci_workflow())[True])["push"]
-    assert ci_push["paths"] and "Makefile" not in str(ci_push["paths"])
+    # A path list decides whether a LANDED commit is tested at all: packaging/, devtools/,
+    # prompts/, skills/, the Makefile, the spec and the requirements are read by tests and
+    # builds, so both push entries must see a push that touches only those.
+    ci = yaml.safe_load(_ci_workflow())
+    ci_push = ci.get("on", ci.get(True))["push"]
+    assert ci_push == {"branches": ["main", "ouroboros", "ouroboros-stable"], "tags": ["v*"]}
 
     push = yaml.safe_load((_REPO_PATH / ".github/workflows/ui-browser-push.yml").read_text(encoding="utf-8"))
     trigger = push.get("on", push.get(True))
-    assert list(trigger) == ["push"], "the push lane adds no schedule and no new cron"
+    assert list(trigger) == ["push", "workflow_dispatch"], "the UI-only entry adds no schedule or paid lane"
+    assert trigger["workflow_dispatch"]["inputs"]["diagnostic"]["options"] == ["full", "viewport", "inflight"]
     assert trigger["push"]["branches"] == ["ouroboros"]
-    assert "paths" not in trigger["push"] and "paths-ignore" not in trigger["push"]
+    for label, entry in (("ci.yml", ci_push), ("ui-browser-push.yml", trigger["push"])):
+        assert "paths" not in entry and "paths-ignore" not in entry, label
     assert push["jobs"]["ui-smoke"]["uses"] == "./.github/workflows/ui-browser.yml"
 
     shared = yaml.safe_load((_REPO_PATH / ".github/workflows/ui-browser.yml").read_text(encoding="utf-8"))
     assert list(shared.get("on", shared.get(True))) == ["workflow_call"]
-    assert "secrets" not in str(shared["jobs"]["ui-smoke"])
+    assert "secrets" not in str(shared["jobs"])
 
 
 def test_ci_release_prerelease_flag_uses_preflight_output():
