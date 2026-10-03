@@ -11,6 +11,16 @@ from starlette.testclient import TestClient
 from ouroboros import i18n_memory as memory
 from ouroboros.gateway.host_service import create_host_service_app
 from tests.test_host_service_api import FakeBridge, _seed_token
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _own_settings_file(tmp_path, monkeypatch):
+    """The language writer goes through the owner settings writer, which writes `config.SETTINGS_PATH`:
+    point it at this test's root so no test leaves a settings.json in the session-wide data root."""
+    import ouroboros.config as cfg
+
+    monkeypatch.setattr(cfg, "SETTINGS_PATH", tmp_path / "settings.json")
 
 
 def _client(tmp_path: pathlib.Path, permissions=("inject_chat",)) -> TestClient:

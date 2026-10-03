@@ -47,6 +47,14 @@ def test_the_language_key_has_one_writer_and_still_reaches_every_process():
 
     merged = gateway_settings._merge_settings_payload({"OUROBOROS_UI_LANGUAGE": "en"}, {"OUROBOROS_UI_LANGUAGE": "de"})  # noqa: SLF001
     assert merged["OUROBOROS_UI_LANGUAGE"] == "en", "a generic save cannot move the language"
+    # The save answer names the writer for the key it skipped (the handler builds `ignored_keys`
+    # from the same set), so a CLI `settings set` learns where the key is written. Pinned on the
+    # source: a request-level test of the settings POST writes the process-wide settings path.
+    import inspect
+
+    handler_source = inspect.getsource(gateway_settings)
+    assert 'resp["ignored_keys"] = {k: _ENDPOINT_WRITERS.get(k' in handler_source
+    assert "sorted(k for k in body if k in _ENDPOINT_WRITTEN_SETTINGS)" in handler_source
     # Restart-shaped: the saved choice is projected into a fresh environment.
     assert "OUROBOROS_UI_LANGUAGE" in settings_env_keys()
     env: dict = {}

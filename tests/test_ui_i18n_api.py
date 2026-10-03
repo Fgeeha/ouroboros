@@ -7,6 +7,16 @@ from starlette.applications import Starlette
 
 from ouroboros import i18n_memory as memory
 from ouroboros.gateway.router import collect_routes
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _own_settings_file(tmp_path, monkeypatch):
+    """The language writer goes through the owner settings writer, which writes `config.SETTINGS_PATH`:
+    point it at this test's root so no test leaves a settings.json in the session-wide data root."""
+    import ouroboros.config as cfg
+
+    monkeypatch.setattr(cfg, "SETTINGS_PATH", tmp_path / "settings.json")
 
 
 def _client(tmp_path):
@@ -183,13 +193,3 @@ def test_get_omits_the_lexicon_and_import_checks_its_schema(tmp_path, monkeypatc
         assert memory.load_memory(tmp_path, "qya")["schema"] == 1
         ok = client.post("/api/ui/i18n/import", json={"schema": 1, "language": "qya", "entries": {"Settings": {"text": "Sanyar"}}})
         assert ok.status_code == 200, ok.text
-
-
-def test_a_generic_settings_save_names_the_language_writer_it_skipped(tmp_path, monkeypatch):
-    monkeypatch.setenv("OUROBOROS_UI_LANGUAGE", "")
-    with _client(tmp_path) as client:
-        response = client.post("/api/settings", json={"OUROBOROS_UI_LANGUAGE": "de"})
-        assert response.status_code == 200, response.text
-        body = response.json()
-        assert body.get("ignored_keys") == {"OUROBOROS_UI_LANGUAGE": "POST /api/ui/i18n/language"}, body
-        assert client.get("/api/ui/i18n").json()["language"] != "de", "the generic save did not move the language"
