@@ -58,6 +58,7 @@ Every `/api/files/*` operation resolves its requested path and refuses the opera
 | POST | `/api/onboarding/subagents/preview` | `gateway.onboarding.api_onboarding_subagents_preview` |
 | GET | `/api/settings` | `gateway.settings.api_settings_get` |
 | POST | `/api/settings` | `gateway.settings.api_settings_post` |
+| POST | `/api/settings/secret` | `gateway.settings_secrets.api_settings_secret` |
 | GET | `/api/reviewer-slots` | `gateway.settings.api_reviewer_slots` |
 | GET | `/api/claudexor/status` | `gateway.claudexor_accounts.api_claudexor_status` |
 | POST | `/api/claudexor/quota/refresh` | `gateway.claudexor_quota.api_claudexor_quota_refresh` |
