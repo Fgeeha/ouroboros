@@ -1129,10 +1129,10 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         });
     }
 
-    // Blocks outside the server draft (theme, notifications, Windows startup) live on the Appearance
-    // tab but never enter the /api/settings payload, so their controls must not
-    // make the server draft dirty — otherwise toggling one would ask the owner
-    // to discard "unsaved settings" that do not exist.
+    // Blocks outside the server draft (theme, notifications on Appearance; host
+    // sign-in startup on Behavior) never enter the /api/settings payload, so their
+    // controls must not make the server draft dirty — otherwise toggling one would
+    // ask the owner to discard "unsaved settings" that do not exist.
     const onServerSettingEdited = (event) => {
         if (event?.target?.closest?.('[data-notify-settings], [data-autostart-settings]')) return;
         onSettingsEdited();
