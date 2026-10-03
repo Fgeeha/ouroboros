@@ -860,10 +860,10 @@ waits for the owner's grant and posts it:
 The host writes one System row (`system_type: "skill_notice"`) in the owner's
 chat: the signature line `Notice · <your skill name>`, stamped by the host, then
 your sentence verbatim. Like any System row it stays in history, the Telegram
-skill mirrors it (in `telegram_only` mode too), a running client with
-notifications on rings it under "Messages Ouroboros sends you while it works,
-its reminders, and skill notices" (titled `Notice from <skill>`, the sentence
-only with message text on), and
+skill mirrors it (in `telegram_only` mode too, to the pinned Chat ID), a running
+client with notifications on rings it under "Messages Ouroboros sends you while it
+works, its reminders, and skill notices" (titled `Notice from <skill>`, the
+sentence only with message text on), and
 Ouroboros reads it on its next turn as `📋 [skill_notice]`, so it
 knows what you told the owner. No model turn starts.
 

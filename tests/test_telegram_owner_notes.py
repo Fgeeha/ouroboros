@@ -81,3 +81,27 @@ def test_notes_and_skill_notices_reach_the_pinned_chat(tmp_path, monkeypatch, mo
         assert forwarded == [note["text"], notice["text"]], "the mode's filter still holds for everything else"
     else:
         assert forwarded == [note["text"], notice["text"], "Restarting.", "Hello"]
+
+
+def test_the_settings_say_telegram_only_also_carries_reminders_and_skill_notices(tmp_path, monkeypatch):
+    """The mode's explanation and its option name the exception the mirror makes above."""
+    plugin = _load_plugin()
+    monkeypatch.setattr(plugin, "register_miniapp", lambda _api: None)  # its own runtime, not this text
+    sections = []
+
+    class _Registrar(_Api):
+        def __getattr__(self, _name):  # every other registration is irrelevant here
+            return lambda *_args, **_kwargs: None
+
+        def register_settings_section(self, _section_id, title, schema):
+            sections.append(schema)
+
+    plugin.register(_Registrar(tmp_path))
+    [schema] = sections
+    explanation = " ".join(c.get("text", "") for c in schema["components"] if c.get("type") == "markdown")
+    fields = [f for c in schema["components"] if c.get("type") == "form" for f in c.get("fields", [])]
+    [mode] = [field for field in fields if field.get("name") == "TELEGRAM_MIRROR_MODE"]
+    option = {row["value"]: row["label"] for row in mode["options"]}["telegram_only"]
+    told = explanation[explanation.index("*Telegram only*"):].split("\n", 1)[0]
+    for words in (told, option):
+        assert "Telegram" in words and "reminders" in words and "skill notices" in words, words
