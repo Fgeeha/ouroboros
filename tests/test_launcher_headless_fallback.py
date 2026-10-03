@@ -8,6 +8,8 @@ test_launcher_sync.py / test_packaged_runtime_and_lifecycle.py which import
 """
 
 import json
+from pathlib import Path
+import shlex
 import sys
 import types
 
@@ -46,6 +48,10 @@ def test_external_ui_reopen_attaches_without_browser(external_launcher, monkeypa
     ("owner", "panic", True),
     ("automatic", "owner_restart_no_resume", True),
     ("automatic", None, True),
+    ("systemd", "panic", False),
+    ("systemd", "owner_restart_no_resume", True),
+    ("systemd", None, True),
+    ("desktop", "panic", True),
 ])
 def test_native_boot_preserves_panic_but_owner_can_start(
     external_launcher, monkeypatch, intent, marker, launches,
@@ -54,7 +60,7 @@ def test_native_boot_preserves_panic_but_owner_can_start(
     flag = launcher.DATA_DIR / "state" / "panic_stop.flag"
     if marker is not None:
         flag.parent.mkdir()
-        flag.write_text(marker)
+        flag.write_text(marker, encoding="utf-8")
     observed = []
 
     class ReachedBootstrap(Exception):
@@ -66,11 +72,19 @@ def test_native_boot_preserves_panic_but_owner_can_start(
 
     monkeypatch.setattr(launcher, "check_git", lambda: True)
     monkeypatch.setattr(launcher, "bootstrap_repo", bootstrap)
+    if intent == "systemd":
+        unit = (Path(__file__).resolve().parents[1] / "packaging" / "systemd"
+                / "ouroboros.service").read_text(encoding="utf-8")
+        command = next(line.removeprefix("ExecStart=") for line in unit.splitlines()
+                       if line.startswith("ExecStart="))
+        argv = shlex.split(command)[1:]
+    else:
+        argv = [] if intent == "desktop" else ["--launch-intent", intent]
     if launches:
         with pytest.raises(ReachedBootstrap):
-            launcher.main(["--no-ui", "--launch-intent", intent])
+            launcher.main(["--no-ui", *argv])
     else:
-        launcher.main(["--no-ui", "--launch-intent", intent])
+        launcher.main(["--no-ui", *argv])
     assert bool(observed) == launches
     if marker is not None:
         assert flag.read_text(encoding="utf-8") == marker
