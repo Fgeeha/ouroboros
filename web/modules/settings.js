@@ -29,6 +29,7 @@ import { createModelRolesEditor, modelRoleMap } from './model_roles.js';
 import { PROCESSING_PREFERENCE_KEY, MODEL_PROCESSING_PREFERENCES_KEY } from './route_editor_primitives.js';
 import { collectSafeFieldValues, normalizeTone, renderSafeField, setInlineStatus, revealNewRow } from './ui_helpers.js';
 import { extensionActionStatus } from './extension_status_text.js';
+import { resetSecretReveals } from './settings_secrets.js';
 
 let markSettingsDirty = () => {};
 const BASE_SECRET_KEYS = new Set(SECRET_KEYS.map(([key]) => key));
@@ -166,6 +167,7 @@ function readInt(id, fallback) {
 }
 
 function resetSecretClearFlags(root) {
+    resetSecretReveals(root);
     root.querySelectorAll('.secret-input').forEach((input) => {
         delete input.dataset.forceClear;
         input.type = 'password';
@@ -203,6 +205,7 @@ function customSecretRow(key = '', value = '') {
         row.querySelector(`label[for="${id}"]`).textContent = `Value for ${event.target.value.trim() || `custom key ${ordinal}`}`;
     });
     row.querySelector('[data-custom-secret-remove]')?.addEventListener('click', () => {
+        resetSecretReveals(row);
         if (row.dataset.originalKey) { row.dataset.removeCustomSecret = '1'; row.hidden = true; }
         else row.remove();
         markSettingsDirty();
@@ -213,6 +216,7 @@ function customSecretRow(key = '', value = '') {
 function renderCustomSecrets(root, settings) {
     const host = root.querySelector('#custom-secrets-list');
     if (!host) return;
+    resetSecretReveals(host);
     host.innerHTML = '';
     const keys = Array.isArray(settings?._meta?.custom_secret_keys) ? settings._meta.custom_secret_keys : [];
     keys.forEach((key) => host.appendChild(customSecretRow(key, settings[key] || '')));
@@ -222,6 +226,7 @@ function renderCustomSecrets(root, settings) {
 function renderRequestedSkillSecrets(root, skills, settings) {
     const host = root.querySelector('#skill-requested-secrets');
     if (!host) return;
+    resetSecretReveals(host);
     const keys = [];
     (Array.isArray(skills) ? skills : []).forEach((skill) => {
         (skill?.grants?.requested_keys || []).forEach((key) => {
@@ -457,7 +462,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             page.activateSettingsTab(tabName);
         }
     };
-    const disposeSettingsTabs = bindSettingsTabs(page, { state });
+    const disposeSettingsTabs = bindSettingsTabs(page, { state, onActivate: () => resetSecretReveals(page) });
     bindSecretInputs(page);
     bindEffortSegments(page);
     // Appearance is client-local and injected after boot; never a server setting.
@@ -790,6 +795,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     }
 
     async function loadSettings() {
+        resetSecretReveals(page);
         const sequence = ++loadSequence;
         const restartSequence = ++restartReadSequence;
         const revision = draftRevision;
@@ -1114,9 +1120,9 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         setBeforePageLeave(async ({ from }) => {
             if (from !== 'settings') return true;
             if (settingsSaving) return false;
-            if (!settingsDirty) return true;
+            if (!settingsDirty) { resetSecretReveals(page); return true; }
             const leave = await confirmDiscardSettings('leave Settings');
-            if (leave) discardUnsavedSettingsDraft();
+            if (leave) { resetSecretReveals(page); discardUnsavedSettingsDraft(); }
             return leave;
         });
     }
@@ -1187,6 +1193,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     window.addEventListener('beforeunload', beforeUnload);
     document.addEventListener('settings-model-catalog:updated', onModelCatalog);
     window.addEventListener('pagehide', (event) => {
+        resetSecretReveals(page);
         if (event.persisted) return;
         disposeSettingsTabs();
         window.removeEventListener('beforeunload', beforeUnload);
