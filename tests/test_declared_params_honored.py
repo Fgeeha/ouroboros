@@ -273,7 +273,9 @@ def test_published_item_schemas_are_derived_from_the_one_declaration():
         # Whole-property equality, not just the key set: a type or description that
         # drifts from the declaration is the same silent-divergence class.
         assert item_shape["properties"] == declared, tool_name
-        assert item_shape["additionalProperties"] is False, tool_name
+        # Extras must reach value-aware feedback: schema-level refusal would
+        # reject harmless repeats before the tool could accept and disclose them.
+        assert item_shape.get("additionalProperties") is not False, tool_name
         assert tuple(allowed) == tuple(declared), tool_name
         assert item_shape["required"] == list(required), tool_name
         assert set(required) <= set(allowed), tool_name
@@ -314,7 +316,7 @@ def test_non_dict_batch_item_refuses_the_whole_call_on_every_root(tmp_path):
             "not-an-object",
         ], root=root)
         assert "TOOL_ARG_ERROR" in out, (root, out)
-        assert "file 2: not an object" in out, (root, out)
+        assert "file 2='not-an-object': not an object" in out, (root, out)
         assert "OK: wrote" not in out and "✅" not in out, (root, out)
     # The clean sibling never landed on the two roots whose base path is known here.
     assert not (ctx.repo_dir / "kept.txt").exists()
@@ -338,11 +340,13 @@ def test_declared_batch_items_keep_write_and_append_on_every_root(tmp_path, monk
         selectors = {"bucket": "external", "skill_name": "alpha"}
     for mode, contents in [("overwrite", ("hello ", "first ")), ("append", ("мир", "second"))]:
         result = _write_file(ctx, files=[
-            {"path": "a.txt", "content": contents[0]},
+            {"path": "a.txt", "content": contents[0], "root": root, "mode": mode},
             {"path": "b.txt", "content": contents[1]},
         ], root=root, mode=mode, **selectors)
         assert "TOOL_ARG_ERROR" not in result and "PARTIAL_FAILURE" not in result, result
         assert result.startswith(("✅", "OK: wrote")), result
+        assert f"file 1.root={root!r} ignored" in result
+        assert f"file 1.mode={mode!r} ignored" in result
     assert "hello мир" in _read_file(ctx, "a.txt", root=root, **selectors)
     assert "first second" in _read_file(ctx, "b.txt", root=root, **selectors)
 
@@ -353,11 +357,40 @@ def test_declared_edit_batch_items_keep_count_and_sequential_edits(tmp_path):
     target = ctx.repo_dir / "edit.txt"
     target.write_text("alpha alpha\n", encoding="utf-8")
     result = _edit_batch(ctx, edits=[
-        {"path": "edit.txt", "old_str": "alpha", "new_str": "beta", "count": 2},
+        {"path": "edit.txt", "old_str": "alpha", "new_str": "beta", "count": 2,
+         "root": "active_workspace", "optional": None},
         {"path": "edit.txt", "old_str": "beta beta", "new_str": "done"},
     ])
     assert result.startswith("✅ edit_batch applied 2 edit(s)"), result
     assert target.read_text(encoding="utf-8") == "done\n"
+    assert "edit 1.root='active_workspace' ignored" in result
+    assert "edit 1.optional=None ignored" in result
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("tool", ["write_file", "edit_batch"])
+def test_batch_feedback_reports_every_problem_once_before_any_effect(tmp_path, monkeypatch, tool):
+    ctx = _ctx(tmp_path)
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "cyber_pro")
+    registry = ToolRegistry(repo_dir=ctx.repo_dir, drive_root=ctx.drive_root)
+    registry.set_context(ctx)
+    target = ctx.repo_dir / "batch.txt"
+    target.write_text("before\n", encoding="utf-8")
+    item = ({"path": "batch.txt", "content": "after\n"} if tool == "write_file"
+            else {"path": "batch.txt", "old_str": "before", "new_str": "after"})
+    key = "files" if tool == "write_file" else "edits"
+    result = registry.execute_result(tool, {key: [item, {**item, "root": "task_drive"}, 42,
+                                                 {**item, "unread_option": "requested"}]})
+    assert result.status == "error" and result.code == "TOOL_ARG_ERROR", result
+    assert result.text.count("TOOL_ARG_ERROR") == 1
+    for fragment in ("2.root='task_drive'", "3=42", "4.unread_option='requested'",
+                     "separate call", "remove unread_option", "Nothing was written"):
+        assert fragment in result.text
+    assert target.read_text(encoding="utf-8") == "before\n"
+    result = registry.execute_result(tool, {key: [{**item, "root": "active_workspace", "extra": ""}]})
+    assert result.status == "ok", result
+    assert "ignored" in result.text
+    assert target.read_text(encoding="utf-8") == "after\n"
 
 
 @pytest.mark.serial
@@ -379,3 +412,18 @@ def test_write_file_registry_refuses_json_string_batch_once_and_keeps_list_valid
     result = registry.execute_result("write_file", {"root": "runtime_data", "files": files})
     assert result.status == "ok", result.text
     assert (ctx.drive_root / "batch.txt").read_text(encoding="utf-8") == files[0]["content"]
+
+
+@pytest.mark.serial
+def test_harmless_item_note_preserves_inner_write_refusal(tmp_path, monkeypatch):
+    ctx = _ctx(tmp_path)
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "cyber_pro")
+    registry = ToolRegistry(repo_dir=ctx.repo_dir, drive_root=ctx.drive_root)
+    registry.set_context(ctx)
+    result = registry.execute_result("write_file", {"files": [{
+        "path": "bad.py", "content": "def broken(:", "root": "active_workspace",
+    }]})
+    assert result.status == "blocked" and result.code == "LEGACY_BLOCKED", result
+    assert result.meta["operation_outcome"] == "completed_no_effect"
+    assert "WRITE_BLOCKED_SYNTAX" in result.text and "ignored" in result.text
+    assert not (ctx.repo_dir / "bad.py").exists()

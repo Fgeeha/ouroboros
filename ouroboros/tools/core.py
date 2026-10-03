@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from ouroboros.tools.tool_result import ToolResult, _publish_tool_result, completed_local_read, publish_no_effect
 
+from ouroboros.tools.arg_feedback import payload_item_feedback, with_argument_notes
+
 import copy
 import json
 import logging
@@ -532,6 +534,12 @@ def _join_write_results(results: List[str]) -> str:
     return rendered
 
 
+# Consumed item fields own both schema and pre-write validation. Extras remain
+# schema-permitted: their value determines omission versus a typed refusal.
+_WRITE_FILE_ITEM_PROPERTIES = {"path": {"type": "string"}, "content": {"type": "string"}}
+_WRITE_FILE_ITEM_KEYS = tuple(_WRITE_FILE_ITEM_PROPERTIES)
+
+
 def _write_file(
     ctx: ToolContext,
     path: str = "",
@@ -547,6 +555,15 @@ def _write_file(
     normalized, block = _access_or_block(ctx, root, "write")
     if block:
         return publish_no_effect(ctx, block, tool_name="write_file")
+    notes = []
+    if files is not None:
+        refusal, notes = payload_item_feedback(
+            ctx, files, _WRITE_FILE_ITEM_PROPERTIES, item_label="file",
+            options={"root": normalized, "mode": mode, "force": force,
+                     "bucket": bucket, "skill_name": skill_name},
+        )
+        if refusal:
+            return refusal
     try:
         if _resolved_binding is None and files:
             bindings: ResolvedResourceBinding | tuple[ResolvedResourceBinding, ...] = tuple(
@@ -554,7 +571,7 @@ def _write_file(
                     ctx, None, root=normalized, operation="write",
                     path=str(item.get("path") or ""), bucket=bucket, skill_name=skill_name,
                 )
-                for item in files if isinstance(item, dict)
+                for item in files
             )
         else:
             bindings = _direct_resource_binding(
@@ -575,43 +592,19 @@ def _write_file(
     if normalized in {"active_workspace", "system_repo"}:
         from ouroboros.tools.git import _repo_write
 
-        return _repo_write(
+        result = _repo_write(
             ctx, path=path, content=content, files=files or [], mode=mode, force=force,
             display_root=normalized, _resolved_binding=bindings,
         )
-    if normalized == "runtime_data":
+        return with_argument_notes(ctx, result, notes)
+    if normalized in {"runtime_data", "skill_payload"}:
         if files:
             results = []
             binding_iter = iter(binding_items)
             for item in files:
-                if not isinstance(item, dict):
-                    continue
+                rel = str(item.get("path") or "")
+                body = str(item.get("content") or "")
                 item_binding = next(binding_iter, None)
-                if item_binding is None:
-                    results.append("⚠️ TOOL_ARG_ERROR: files must contain {path, content} objects.")
-                    continue
-                results.append(_data_write(
-                    ctx,
-                    str(item.get("path") or ""),
-                    str(item.get("content") or ""),
-                    mode=mode,
-                    display_root=normalized,
-                    force=force,
-                    _resolved_binding=item_binding,
-                ))
-            return _join_write_results(results)
-        return _data_write(
-            ctx, path=path, content=content, mode=mode, display_root=normalized,
-            force=force, _resolved_binding=binding_items[0],
-        )
-    if normalized == "skill_payload":
-        if files:
-            results = []
-            binding_iter = iter(binding_items)
-            for item in files:
-                rel = str(item.get("path") or "") if isinstance(item, dict) else ""
-                body = str(item.get("content") or "") if isinstance(item, dict) else ""
-                item_binding = next(binding_iter, None) if isinstance(item, dict) else None
                 if item_binding is None:
                     results.append("⚠️ TOOL_ARG_ERROR: files must contain {path, content} objects.")
                     continue
@@ -626,7 +619,7 @@ def _write_file(
                     force=force,
                     _resolved_binding=item_binding,
                 ))
-            return _join_write_results(results)
+            return with_argument_notes(ctx, _join_write_results(results), notes)
         return _data_write(
             ctx, path=path, content=content, mode=mode, bucket=bucket,
             skill_name=skill_name, display_root=normalized, force=force,
@@ -637,8 +630,6 @@ def _write_file(
             results = []
             binding_iter = iter(binding_items)
             for item in files:
-                if not isinstance(item, dict):
-                    continue
                 rel_path = str(item.get("path") or "")
                 item_binding = next(binding_iter, None)
                 if item_binding is None:
@@ -673,7 +664,7 @@ def _write_file(
                     if record:
                         result += f"\nARTIFACT_OUTPUTS: registered user file -> artifact_store:{record.get('name')}"
                 results.append(result)
-            return _join_write_results(results)
+            return with_argument_notes(ctx, _join_write_results(results), notes)
         target = binding_items[0].target_path
         if normalized == "artifact_store":
             block_reason = artifact_store_path_block_reason(
@@ -1320,9 +1311,9 @@ def get_tools() -> List[ToolEntry]:
             "parameters": {"type": "object", "properties": {
                 "path": {"type": "string"},
                 "content": {"type": "string"},
-                "files": {"type": "array", "items": {"type": "object", "properties": {
-                    "path": {"type": "string"}, "content": {"type": "string"},
-                }, "required": ["path", "content"]}},
+                "files": {"type": "array", "items": {"type": "object",
+                    "properties": {k: dict(v) for k, v in _WRITE_FILE_ITEM_PROPERTIES.items()},
+                    "required": list(_WRITE_FILE_ITEM_KEYS)}},
                 "root": {"type": "string", "enum": ["active_workspace", "system_repo", "runtime_data", "task_drive", "skill_payload", "artifact_store", "user_files"], "default": "active_workspace"},
                 "mode": {"type": "string", "enum": ["overwrite", "append"], "default": "overwrite"},
                 "force": {"type": "boolean", "default": False, "description": "Bypass the shrink guard for an intentional full rewrite on any root where it applies (active_workspace via the repo guard; runtime_data/task_drive/skill_payload/artifact_store/user_files via the data-plane guard)."},

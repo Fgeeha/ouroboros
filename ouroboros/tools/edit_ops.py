@@ -57,6 +57,7 @@ import textwrap
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+from ouroboros.tools.arg_feedback import payload_item_feedback, with_argument_notes
 from ouroboros.config import get_runtime_mode
 from ouroboros.runtime_mode_policy import (
     core_patch_notice,
@@ -93,48 +94,6 @@ _EDIT_BATCH_ITEM_PROPERTIES: Dict[str, Dict[str, Any]] = {
 }
 _EDIT_BATCH_ITEM_KEYS: Tuple[str, ...] = tuple(_EDIT_BATCH_ITEM_PROPERTIES)
 _EDIT_BATCH_ITEM_REQUIRED: Tuple[str, ...] = ("path", "old_str", "new_str")
-
-
-def payload_item_key_refusal(
-    items: Any,
-    allowed: Tuple[str, ...],
-    *,
-    item_label: str,
-) -> str:
-    """Refuse a payload item this tool cannot honor exactly as declared.
-
-    These tools take their targets INSIDE the payload but bind every item to the
-    ONE top-level ``root``, so an item key outside the declared vocabulary is not
-    a harmless extra: a dropped per-item ``root`` silently redirects the write to
-    a different resource root while the call reports success. The declared item
-    shape is therefore CLOSED in both directions — an undeclared key, and an item
-    that is not an object at all, refuse the whole call before anything is
-    written, so a caller's stated target can never be ignored and a malformed
-    item can never vanish while its siblings report success.
-
-    Returns the typed refusal, or "" when every item is clean.
-    """
-    if not isinstance(items, list):
-        return f"⚠️ TOOL_ARG_ERROR: {item_label} payload must be an array of objects."
-    offenders: List[str] = []
-    for idx, item in enumerate(items, 1):
-        if not isinstance(item, dict):
-            offenders.append(f"{item_label} {idx}: not an object")
-            continue
-        extra = sorted(str(key) for key in item if str(key) not in allowed)
-        if extra:
-            offenders.append(
-                f"{item_label} {idx} ({item.get('path') or '?'}): unread key(s) {', '.join(extra)}"
-            )
-    if not offenders:
-        return ""
-    return (
-        "⚠️ TOOL_ARG_ERROR: payload item(s) this tool cannot honor as declared — "
-        + "; ".join(offenders)
-        + f". A {item_label} declares only: {', '.join(allowed)}, and every item is bound "
-        "to the ONE top-level root. Nothing was written: fix the item(s), or make "
-        "one call per target root."
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -850,7 +809,9 @@ def _edit_batch(
 ) -> str:
     if not edits or not isinstance(edits, list):
         return "⚠️ EDIT_BATCH_ERROR: edits must be a non-empty array."
-    item_refusal = payload_item_key_refusal(edits, _EDIT_BATCH_ITEM_KEYS, item_label="edit")
+    item_refusal, notes = payload_item_feedback(
+        ctx, edits, _EDIT_BATCH_ITEM_PROPERTIES, item_label="edit", options={"root": root},
+    )
     if item_refusal:
         return item_refusal
     contents: Dict[str, str] = {}
@@ -866,9 +827,6 @@ def _edit_batch(
     mutation_binding: ResolvedResourceBinding | None = None
     located = 0  # misses diagnosed so far (bounded per call)
     for idx, edit in enumerate(edits, 1):
-        if not isinstance(edit, dict):
-            errors.append(f"edit {idx}: must be an object")
-            continue
         item_binding = next(binding_iter, None)
         path = str(edit.get("path", "") or "")
         old_str = edit.get("old_str", "")
@@ -943,11 +901,11 @@ def _edit_batch(
             )
         changed.append(rel)
     footer = _finish_mutation(ctx, changed, "edit_batch", mutation_binding)
-    return (
+    return with_argument_notes(ctx, (
         f"✅ edit_batch applied {len(applied)} edit(s) across {len(changed)} file(s):\n"
         + "\n".join("  " + a for a in applied)
         + f"\n{footer}"
-    )
+    ), notes)
 
 
 # ---------------------------------------------------------------------------
@@ -1050,7 +1008,7 @@ def get_tools() -> List[ToolEntry]:
                 "use count>1 for identical repeated edits instead of many edit_text calls."
             ),
             "parameters": {"type": "object", "properties": {
-                "edits": {"type": "array", "items": {"type": "object", "additionalProperties": False,
+                "edits": {"type": "array", "items": {"type": "object",
                     "properties": {k: dict(v) for k, v in _EDIT_BATCH_ITEM_PROPERTIES.items()},
                     "required": list(_EDIT_BATCH_ITEM_REQUIRED)}},
                 "root": {"type": "string", "enum": ["active_workspace", "system_repo"], "default": "active_workspace"},
