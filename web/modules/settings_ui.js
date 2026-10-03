@@ -780,7 +780,7 @@ export function renderSettingsPage() {
                             </label>
                             <label class="local-toggle ui-field ui-field-inline">
                                 <input type="checkbox" class="ui-checkbox" data-notify-pref="important">
-                                Messages Ouroboros sends you while it works
+                                Messages Ouroboros sends you while it works, its reminders, and skill notices
                             </label>
                             <label class="local-toggle ui-field ui-field-inline">
                                 <input type="checkbox" class="ui-checkbox" data-notify-pref="main_reply">
