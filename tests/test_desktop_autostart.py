@@ -1,10 +1,13 @@
 """Sign-in contract across packaged hosts; OS commands never reach the real host."""
 from __future__ import annotations
 
+import configparser
 import json
 import logging
 from pathlib import Path
 import plistlib
+import re
+import shlex
 from types import SimpleNamespace
 
 import pytest
@@ -69,6 +72,15 @@ def host(tmp_path, monkeypatch):
     return package, state
 
 
+def _exec_argv(path: Path) -> list[str]:
+    """Exec= as a sign-in session runs it: Desktop Entry string unescaping, then argument quoting."""
+    parser = configparser.ConfigParser(interpolation=None)
+    parser.read_string(path.read_text(encoding="utf-8"))
+    escapes = {"s": " ", "n": "\n", "t": "\t", "r": "\r", "\\": "\\"}
+    value = re.sub(r"\\(.)", lambda m: escapes.get(m.group(1), m.group(0)), parser["Desktop Entry"]["Exec"])
+    return [arg.replace("%%", "%") for arg in shlex.split(value)]
+
+
 def test_macos_writes_one_launchagent_and_respects_os_override(host, tmp_path):
     package, os_state = host
     exe = package("darwin")
@@ -101,12 +113,14 @@ def test_linux_portable_registers_only_its_stable_target(host, tmp_path, appimag
     assert startup.autostart_status()["state"] == "off"
     assert startup.autostart_status(True)["state"] == "on"
     text = path.read_text(encoding="utf-8")
-    assert text == f'[Desktop Entry]\nType=Application\nName=Ouroboros\nExec="{exe}" --launch-intent automatic\nTerminal=false\n'
+    command = startup._desktop_command(exe)  # escaped: a raw Windows path never equals the written line
+    assert text == f"[Desktop Entry]\nType=Application\nName=Ouroboros\nExec={command}\nTerminal=false\n"
+    assert _exec_argv(path) == [str(exe), "--launch-intent", "automatic"]
     assert os_state.calls == [] and not (tmp_path / "Library").exists()
     path.write_text(text + "Hidden=true\n", encoding="utf-8")
     assert startup.autostart_status()["state"] == "disabled_by_os"
     assert startup.autostart_status(True)["state"] == "on"
-    foreign = text.replace(str(exe), "/other/Ouroboros")
+    foreign = text.replace(command, '"/other/Ouroboros" --launch-intent automatic')
     path.write_text(foreign + "Hidden=true\n", encoding="utf-8")
     assert startup.autostart_status()["state"] == "off"  # a hidden entry starts no copy at all
     path.write_text(foreign, encoding="utf-8")
