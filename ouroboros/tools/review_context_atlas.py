@@ -8,7 +8,9 @@ them. Bodies are never rendered here; the reviewer opens any path in full with
 
 Two parts, both deterministic and both derived from the same per-file facts:
 
-* the COVERAGE INDEX — one ``disposition<TAB>path`` row for every tracked path,
+* the COVERAGE INDEX — one row for every tracked path: a bare ``path`` for the
+  ordinary ``indexed`` class (the overwhelming majority, so the constant label is
+  not repeated a thousand times), ``disposition<TAB>path`` for every other class,
   with the policy-excluded classes (tests, non-agent-logic directories, binary
   media, vendored/minified files) collapsed to one
   ``disposition<TAB>directory/ (N files)`` row per directory, so the whole tree
@@ -437,7 +439,10 @@ def _render_index_text(
             collapsed[(facts.disposition, "" if parent == "." else parent)] += 1
         else:
             detailed.append((facts.disposition, rel))
-    index_lines = [f"{disposition}\t{rel}" for disposition, rel in sorted(detailed)]
+    # The default class is the whole point of the map, so it is the bare path;
+    # only a non-default class spends a label on its row.
+    index_lines = [rel if disposition == "indexed" else f"{disposition}\t{rel}"
+                   for disposition, rel in sorted(detailed)]
     index_lines += [
         f"{disposition}\t{directory}/ ({count} files)"
         for (disposition, directory), count in sorted(collapsed.items())
@@ -452,7 +457,8 @@ def _render_index_text(
         "",
         "### Coverage index",
         "",
-        f"All {len(facts_by_path):,} tracked path(s) as `disposition<TAB>path`. "
+        f"All {len(facts_by_path):,} tracked path(s), one row each: a bare path is "
+        "`indexed` (readable in full); every other class is `disposition<TAB>path`. "
         "The policy-excluded classes (excluded_test, excluded_dir, binary_media, "
         "vendored_minified) are collapsed to one `disposition<TAB>directory/ (N "
         "files)` row per directory; a touched path and a listed importer always "
