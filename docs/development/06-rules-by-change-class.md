@@ -1025,6 +1025,9 @@ and what enforces each.
   unknown; unrelated passes erase no failure. Deliver content and recover the same
   snapshot. `OWNER_DELIVERY_TOOL_NAMES` counts sends, never global skill state.
   `host_task_facts` is free; paid reflection/Pattern Register use `chat_observed` custody.
+  Plan-review facts reach the reflection as ONE bounded slice with a source pointer
+  (`plan_review_facts.py`), never a score; a panel that settles after the task ended
+  appends one bounded reflection row through `append_reflection_routed`.
 - Promoted tasks carry their host-minted root id and role on the queue payload.
   RUNNING writes preserve the actual `_task_started_ts` as `started_at` and an existing
   `queued_at`; terminal `ts` stays its own field; missing historical start facts stay
