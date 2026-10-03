@@ -362,6 +362,10 @@ def _target_chat(settings: Dict[str, Any], event: Dict[str, Any]) -> int:
         transport = event.get("transport") if isinstance(event.get("transport"), dict) else {}
         if transport.get("kind") == "telegram":
             return chat_id
+        # ...and the owner's notes and skill notices: System rows written for the
+        # owner, which an owner who left the web should still get on the phone.
+        if event.get("role") == "system" and event.get("system_type") in {"reminder", "skill_notice"}:
+            return chat_id
         return 0
     # No pinned chat configured — only forward events that originate from
     # a Telegram transport conversation so local UI events are never leaked.

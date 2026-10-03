@@ -457,10 +457,7 @@
  * @property {Object=} transport
  * @property {string=} system_type
  * @property {"timeline"|"reviews"=} card_row
- *   A host-stamped placement fact for a task-keyed System row: "timeline" = a
- *   timeline item of the task's card, "reviews" = the card's Reviews group
- *   carries the fact (the row is still attached to the card); absent = an
- *   ordinary row.
+ *   A host-stamped placement fact for a task-keyed System row: "timeline" = a timeline item of the task's card, "reviews" = the card's Reviews group carries the fact (the row is still attached to the card); absent = an ordinary row.
  * @property {string=} card_row_id  // the row's stable identity across live delivery, outbox replay and history
  * @property {number=} card_row_revision  // canonical source order, independent of delivery timestamp
  * @property {Object=} late_evidence

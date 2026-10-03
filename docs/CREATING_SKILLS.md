@@ -595,7 +595,7 @@ calls and runtime behaviours:
 | `subscribe_event` | The skill may subscribe to manifest-declared host event topics such as `chat.outbound` or `skill.lifecycle`. Chat topics require owner permission grants; `skill.lifecycle` does not. |
 | `inject_chat` | The skill may request Host Service chat injection after an explicit owner permission grant: `POST /chat/inject` carries text, an inline image, or `attachments` (`[{path, name?, mime?}]` — regular files under the skill's own state root, at most 25 per message, which the host copies without the former 50 MiB upload cap into the shared `data/uploads` chat-upload store and stages for the task; a file-only message needs no text). The same grant lets the skill relay the owner's decision-card answer through `POST /chat/decision` (`{request_id, decision_id, option_index?, comment?}`, the `POST /api/decisions` contract). A message that carries a `client_message_id` becomes an addressable operation: the host answers with its `operation_ref` (`<chat_id>:<client_message_id>`) on 202, 200 and 504; a repeated delivery of the same message rejoins it instead of enqueueing again (a different message under a reused id is refused with 409); `GET /chat/operations/{operation_ref}` reports the skill's own accepted message (`pending`, `running` with its task or turn, the durable answer, a terminal task status, or `lost` after a host restart); and `POST /chat/cancel` (`{operation_ref, reason?}`) runs the existing cancellation owner on work that message started, answering `cancelled`, `already_terminal`, `unresolved` or `cancel_unsupported` — never a cancellation that did not happen. |
 | `presence` | A reviewed transport skill may submit authenticated non-owner conversation events to the Host Service Presence boundary and poll only their correlated late work. Requires an explicit content-hash-bound owner grant. |
-| `notify_owner` | The skill may hand the owner one system notification through `POST /notify` after an explicit owner permission grant (see "System notifications for the owner" below): a bounded plain sentence that becomes a banner in a running web client and, when the Telegram skill's toggle is on, one line on the phone — never a chat row, never a model turn. Strictly weaker than `inject_chat`; a skill that only reminds does not ask to wake the agent. |
+| `notify_owner` | The skill may tell the owner one thing through `POST /notify` after an explicit owner permission grant (see "Telling the owner something" below): one bounded plain sentence the host shows in the owner's chat as a System row signed with the skill's name. It wakes no model; narrower than `inject_chat`. |
 
 A missing permission causes the matching `register_*` call to raise
 `ExtensionRegistrationError`, surfaced as a skill load error in the
@@ -847,78 +847,37 @@ permission grant. Skills that perform multi-step external work should still
 print a concise success/failure marker or write structured state under
 `OUROBOROS_SKILL_STATE_DIR` so the agent can decide whether to fix or report.
 
-## System notifications for the owner (`POST /notify`)
+## Telling the owner something (`POST /notify`)
 
-A skill that must reach the owner with a finished sentence — a calendar's
-"meeting in 15 minutes", a long external job that ended — does not wake the
-agent and does not write to the chat. It declares `notify_owner`, waits for the
-owner's grant, checks `notify_version` on `GET /identity` (absent on an older
-host: degrade to your own widget), and posts one plain sentence:
+A skill that must reach the owner with a finished sentence (a calendar's
+"meeting in 15 minutes", an external job that ended) declares `notify_owner`,
+waits for the owner's grant and posts it:
 
 ```json
-{"text": "⏰ 14:45 · Meeting with Ivan (in 15 min)", "key": "cal:evt_123:2026-09-25T14:45"}
+{"text": "⏰ 14:45 · Meeting with Ivan (in 15 min)"}
 ```
 
-The host answers `200 {ok, ts, chat_id}` once one `owner_notification` row is
-in `logs/events.jsonl`: that row is the live banner in a running web client
-(category "Reminders and notices from skills and Ouroboros", titled "Reminder
-from <skill>", the sentence shown only when the owner turned message text on),
-the `owner.notification` topic for transport skills (Telegram mirrors it to the
-pinned chat when its notices toggle is on), and nothing else — no chat row, no
-model turn, no history the mind can read (a deferred reminder's sentence does
-sit in the schedule table, where Ouroboros can list and cancel it at the owner's
-word). `text` is at most 1000 characters,
-plain; `key` (at most 128) identifies a deferred reminder for update or
-cancellation. An immediate `/notify` call is **not** server-idempotent: after a
-lost response its outcome is unknown, and repeating the same key may deliver a
-second web/Telegram notice. Do not retry an ambiguous immediate response
-blindly. `403` is a missing grant, `429` the 60-per-minute lane, `503` an unconfirmed append or schedule write (inspect the returned status;
-`outcome_unknown` is not a safe retry), `409` a
-keyed row that belongs to another skill. A cancel whose delete landed but whose
-audit outcome was lost answers `200 {ok: false, cancelled: true, status: "changed_audit_incomplete"}` —
-the row is gone, do not retry.
+The host writes one System row (`system_type: "skill_notice"`) in the owner's
+chat: the signature line `Notice · <your skill name>`, stamped by the host, then
+your sentence verbatim. Like any System row it stays in history, the Telegram
+skill mirrors it (in `telegram_only` mode too), a running client with
+notifications on rings it under "Messages Ouroboros sends you while it works"
+(titled `Notice from <skill>`, the sentence only with message text on), and
+Ouroboros reads it on its next turn as `📋 [skill_notice]`, so it
+knows what you told the owner. No model turn starts.
 
-A deferred reminder adds `"at": "<ISO 8601 instant with UTC offset>"` (once) or `"cron":
-"<5-field>"` plus optional `"timezone"`. An offsetless `at` is refused
-whether or not `timezone` is provided; put the offset in `at`. For a recurring
-local-time cron, provide an IANA timezone explicitly: the blank-zone fallback
-uses the server's zone, which on Windows or a Docker host without a discoverable
-IANA zone may be a fixed current UTC offset and drift at daylight-saving changes.
-Success answers
-`200 {ok, scheduled: true, id, next_run_at}` (`ok: false` there means the row is
-stored but its audit outcome could not be recorded — no retry needed). The host
-stores a `kind: "notify"` row in the one schedule table (visible under Activity
-→ Scheduled, where the owner can disable or delete it) and the supervisor tick
-fires it at its instant without a model — a reminder whose instant passed while
-Ouroboros was off fires on the next tick, like any one-shot. The table consumes
-the occurrence before the outbound append: a crash can lose one alert, but
-cannot replay it automatically. Inspect the row and events before re-arming.
-If the supervisor is not running, `POST /notify` refuses a new or moved deferred row
-with `503 {ok:false, scheduled:false, status:"scheduler_unavailable"}` before
-writing it. An immediate notice still appends and reaches a connected browser
-through the server log sink without a model; cancellation of an existing row
-remains available. Previously stored rows can still wait if the supervisor
-later stops. No model call is needed at firing time, but the existing scheduler
-requires a running supervisor; no independent notification scheduler is started.
-On a configured boot, the supervisor starts after extension subscribers load;
-a failed extension load or an absent browser client still cannot guarantee a
-Telegram push or a desktop banner. Browser banners are live-only, not replayed
-when a tab reconnects. With a `key`
-the row is yours to move: the same key posted again replaces its time and
-text (a one-shot that already fired needs a new `at` — the same instant answers
-`400 consumed_not_rearmed`); `{"key": ..., "cancel": true}` removes it (`404` when there is no such
-row of yours). Without a key each post is a new fire-and-forget row. A
-disabled or removed skill's rows — or a skill whose `notify_owner` grant was
-revoked — stay silent until it is enabled and granted again, and an
-owner who **disables** one of your rows — on the Activity page, or by
-asking Ouroboros — keeps it off: the same key posted again answers `{"scheduled": false, "status":
-"suppressed"}` and your cancel `{"cancelled": false, "status": "suppressed"}`
-until the owner restores or deletes the row. **Delete removes the row immediately**;
-a later post with the same key may schedule it again. A reminder that already
-fired is a receipt: the owner's Delete removes it at once; your cancel cannot
-remove a row the owner disabled. Every scheduled post rewrites the
-one schedule table under its lock, so keep the armed set small — the next
-occurrences, keyed, not a year of one-shots.
+`text` is required, plain, at most 400 characters. `200 {ok, ts, chat_id}`: the
+row is written. `400`: not one plain sentence. `403`: no live grant (a disabled
+skill, a stale review or a revoked grant included); nothing is written. `429`:
+the 60-per-minute lane. `503 {status: "not_confirmed"}`: the row is not
+confirmed, so check the chat before posting again (a notice is not
+server-idempotent); a host without a configured model provider has no chat
+writer yet and answers it too. `GET /identity` advertises `notify_version: 1`; on
+an older host it is absent, so degrade to your own widget. Timing is yours: post
+at the moment you chose (a calendar keeps its own clock).
+
+Prefer `inject_chat` when the event needs Ouroboros to think or act (it starts a
+turn); `notify_owner` is for facts the owner should simply see.
 
 ## Iterative skill development
 

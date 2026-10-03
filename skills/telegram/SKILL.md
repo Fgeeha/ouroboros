@@ -1,7 +1,7 @@
 ---
 name: telegram
 description: Owner-only Telegram text bridge and Mini App gateway for the existing Ouroboros interface.
-version: 1.2.9
+version: 1.2.10
 type: extension
 entry: plugin.py
 plugin_api: "2.0"
@@ -67,6 +67,10 @@ Version 1.2.9 routes every Telegram API call through the optional skill-local
 `TELEGRAM_PROXY` setting, including polling, sends, downloads, notifications,
 and the companion's menu button lifecycle. The Settings form masks the proxy
 and never reads its stored credentials back into the browser.
+
+Version 1.2.10 also forwards the owner's notes and skill notices (`reminder` and
+`skill_notice` System rows, written for the owner) to the pinned chat when the
+mirror mode is `telegram_only`; mode `all` already mirrored them.
 
 The Mini App exposes the unchanged Ouroboros SPA through the established
 owner-authenticated sidecar and a pinned Cloudflare Quick Tunnel. It is enabled
