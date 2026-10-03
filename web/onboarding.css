@@ -791,6 +791,11 @@ textarea::placeholder {
   gap: var(--space-2);
 }
 .wizard-footer [hidden] { display: none; }
+/* The Language block is the Settings control (settings_language.js) mounted here; the wizard loads neither
+   style.css nor settings.css, so the three layout rules that block relies on there are stated for it. */
+.wizard-content [data-i18n-settings] [hidden] { display: none; }
+.wizard-content [data-i18n-settings] .settings-effort-card { display: flex; flex-direction: column; gap: var(--space-2); }
+.wizard-content [data-i18n-settings] .settings-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
 .wizard-content .settings-section-copy {
   font-size: var(--type-body);
   color: var(--text-meta);

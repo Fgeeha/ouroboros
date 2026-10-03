@@ -5,9 +5,10 @@
 // browser. The memory arrives as a gateway payload here: no dictionary lives in the repo.
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import {
     applyPayload, createTranslator, currentPayload, englishTag, entryText, flushMisses, fmt, fmtInto,
-    lookupString, missKeyFor, pendingMisses, pluralSelectMap, setLanguage, setMissTransport, tr, translateString, tx,
+    localeDirection, lookupString, missKeyFor, pendingMisses, pluralSelectMap, setLanguage, setMissTransport, tr, translateString, tx,
     CODE_PREFIX, EXCLUDE_SELECTOR, SCOPE_SEPARATOR, SKIP_ROOTS, USER_CONTENT,
 } from '../modules/i18n.js';
 
@@ -684,4 +685,51 @@ test('a string that is already a translation in the memory is never reported as 
     createTranslator().applyTo(root);
     assert.deepEqual(pendingMisses(), ['Files'], 'the Russian label is not queued as a new English key');
     applyPayload(RU);
+});
+
+test('the read behind the first socket open brings an update that landed before the subscription existed', async () => {
+    const { markBootRead, pendingBootRead, refreshDictionary, dictionaryRevision } = await import('../modules/i18n.js');
+    const { apiClient } = await import('../modules/api_client.js');
+    const savedFetch = globalThis.fetch;
+    let served = { ...RU, revision: 1, entries: { Working: { text: 'Работает (черновик)' } } };
+    const reads = [];
+    globalThis.fetch = async (url) => { reads.push(String(url)); const body = served; return { ok: true, status: 200, json: async () => body }; };
+    try {
+        // app.js at boot: the first answer paints, and the boot read settles only once it is applied.
+        await markBootRead(apiClient.uiI18n().then((i18n) => setLanguage(i18n.language, i18n).then(() => i18n)));
+        assert.equal(currentPayload().revision, 1, 'a control mounted behind the boot read finds its payload applied');
+        // The generator finishes: its frame goes out before this page's socket has subscribed.
+        served = { ...RU, revision: 2, entries: { Working: { text: 'Работает' } } };
+        // app.js on every socket open, the first included.
+        await pendingBootRead().then(refreshDictionary);
+        assert.equal(dictionaryRevision(), 2);
+        assert.equal(tx('Working'), 'Работает');
+        assert.deepEqual(reads, ['/api/ui/i18n', '/api/ui/i18n'], 'the boot read and the read behind the subscription');
+        // The socket may open first: the read behind it still lands after the boot answer, never before it.
+        served = { ...RU, revision: 3, entries: { Working: { text: 'Работает!' } } };
+        let answerBoot;
+        const slowBoot = new Promise((resolve) => { answerBoot = resolve; });
+        markBootRead(slowBoot.then((i18n) => setLanguage(i18n.language, i18n).then(() => i18n)));
+        const behind = pendingBootRead().then(refreshDictionary);
+        answerBoot({ ...RU, revision: 2, entries: { Working: { text: 'Работает' } } });   // the older answer arrives late
+        await behind;
+        assert.equal(dictionaryRevision(), 3, 'the older boot answer did not land over the newer read');
+    } finally {
+        globalThis.fetch = savedFetch;
+        markBootRead(null);
+        applyPayload(RU);
+    }
+    const source = readFileSync(new URL('../app.js', import.meta.url), 'utf8');
+    const open = source.slice(source.indexOf("ws.on('open', () => {"), source.indexOf("ws.on('close', () => {"));
+    assert.match(open, /pendingBootRead\(\)\.then\(refreshDictionary\);/, 'app.js re-reads on every open, behind the boot read');
+    assert.match(source, /\.then\(\(i18n\) => setLanguage\(i18n\.language, i18n\)\.then\(\(\) => i18n\)\)/, 'and its boot read settles after the payload is applied');
+});
+
+test('the direction seam has no opinion on a language whose script the engine does not know', () => {
+    for (const tag of ['art-x-vael', 'zz', 'not a tag', '']) assert.equal(localeDirection(tag), '', tag);
+    const known = (tag) => { try { const locale = new Intl.Locale(tag); return Boolean(locale.maximize().script) && Boolean(locale.getTextInfo?.() || locale.textInfo); } catch { return false; } };
+    if (known('ar')) assert.equal(localeDirection('ar'), 'rtl');
+    if (known('de')) assert.equal(localeDirection('de'), 'ltr');
+    // Northern Luri: Arabic script, and no plural data in the engines that ship its script.
+    if (known('lrc')) assert.equal(localeDirection('lrc'), 'rtl', 'the script decides, not the plural data');
 });

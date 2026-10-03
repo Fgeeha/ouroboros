@@ -544,7 +544,10 @@ def test_project_lifecycle_rows_render_design_system_action_static_contract():
     chrome = chat[chat.index("function syncBlockChrome(record) {"):chat.index("function syncCancelRunButton(record) {")]
     assert "btn.className = 'btn btn-xs btn-default';" in chrome
     assert "btn.dataset.turnIntoProject = '1';" in chrome
-    assert "btn.textContent = 'Turn into project';" in chrome
+    assert "btn.textContent = liveCardLabel.turnIntoProject();" in chrome
+    # The words sit with the other live-card labels and are read through the interface-language seam.
+    chip = (root / "web" / "modules" / "task_phase_chip.js").read_text(encoding="utf-8")
+    assert "turnIntoProject: () => tr('task.card.turn_into_project', 'Turn into project')," in chip
     # One owner intent, one control: the converted card (chat.js), the bound-task
     # footer (app.js) and every row that points at a Project get it from the door,
     # which alone knows its classes and words.

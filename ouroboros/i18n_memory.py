@@ -302,7 +302,8 @@ def _validate_text(key: str, value: Any, allowed: Optional[set], source: Optiona
     if len(value) > MAX_VALUE_CHARS:
         raise MemoryFormatError(f"entry {key!r} value is too long")
     if markup_tokens(value) - (markup_tokens(source) if source is not None else set()):
-        raise MemoryFormatError(f"entry {key!r} value carries markup")
+        hint = "" if source is not None else " (a code entry whose English has angle-bracket text states it as `source`)"
+        raise MemoryFormatError(f"entry {key!r} value carries markup{hint}")
     if source is not None and brace_tokens(value) - brace_tokens(source):
         raise MemoryFormatError(f"entry {key!r} value carries a {{...}} field the source lacks")
     if not inline_slots_balanced(value):

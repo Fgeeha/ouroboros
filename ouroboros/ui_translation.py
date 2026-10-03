@@ -503,6 +503,8 @@ class _Worker:
         self.drive_root: Optional[pathlib.Path] = None
         self.client_factory: Optional[Callable[[], Any]] = None
         self.status: Dict[str, Any] = {"state": "idle", "error": "", "updated_at": "", "applied": 0, "language": ""}
+        self.batch_keys: Dict[str, int] = {}  # per language: the batch size the route's output bound allowed
+        self.halt: Optional[threading.Event] = None  # the host's teardown event: no batch starts once it is set
 
     def schedule(self, drive_root: pathlib.Path) -> None:
         with self.lock:
@@ -516,8 +518,11 @@ class _Worker:
     def _set(self, state: str, error: str = "") -> None:
         self.status.update(state=state, error=error[:200], updated_at=utc_now_iso())
 
+    def _stopping(self) -> bool:
+        return self.stop.is_set() or (self.halt is not None and self.halt.is_set())
+
     def _run(self) -> None:
-        while not self.stop.is_set():
+        while not self._stopping():
             if not self.wake.wait(timeout=0.5):
                 with self.lock:
                     if not self.wake.is_set():
@@ -536,13 +541,18 @@ class _Worker:
         client = self.client_factory() if self.client_factory else None
         self.status["language"] = tag
         self._set("running")
-        while not self.stop.is_set() and memory.current_language() == tag:
+        while not self._stopping() and memory.current_language() == tag:
             pending = memory.pending_count(root, tag)
             if not pending:
                 self._set("idle")
                 return
-            facts = translate_batch(root, tag, client=client, limit=BATCH_KEYS)
+            facts = translate_batch(root, tag, client=client, limit=self.batch_keys.get(tag, BATCH_KEYS))
             self.status["applied"] = int(self.status.get("applied") or 0) + int(facts["applied"])
+            if facts["error"] == "output_truncated" and int(facts["taken"]) > 1:
+                # The answer did not fit this route's output bound: the queue is asked again in half
+                # the batch, and the smaller size is kept for this language in this process.
+                self.batch_keys[tag] = int(facts["taken"]) // 2
+                continue
             if facts["error"] in ("language_needs_model",):
                 self._set("no_model", facts["error"])
                 return
@@ -585,15 +595,18 @@ def on_language_event(event: str, drive_root: pathlib.Path, tag: str) -> None:
     _WORKER.schedule(pathlib.Path(drive_root))
 
 
-def start_background(drive_root: pathlib.Path) -> None:
+def start_background(drive_root: pathlib.Path, halt: Optional[threading.Event] = None) -> None:
     """Server boot (fail-soft, no model call): register the gateway hook, remember the data
     root so a table registered later can queue itself, and re-check the chosen language —
-    catalog codes the memory lacks or whose English moved, misses left in the queue."""
+    catalog codes the memory lacks or whose English moved, misses left in the queue. ``halt``
+    is the host's own teardown event (the server lifespan's): once set, the worker starts no
+    further batch, so a shutdown or restart never buys one it cannot keep."""
     try:
         from ouroboros.gateway.ui_i18n import register_language_hook
 
         register_language_hook(on_language_event)
         _WORKER.drive_root = pathlib.Path(drive_root)
+        _WORKER.halt = halt
         tag = memory.current_language()
         if not tag or is_english(tag):
             return
@@ -605,7 +618,8 @@ def start_background(drive_root: pathlib.Path) -> None:
 
 
 def stop_background(timeout: float = 2.0) -> None:
-    """Lifespan teardown (fail-soft): stop the worker thread."""
+    """Stop the worker thread and wait for it (fail-soft): tests and an embedding host. The
+    server lifespan does not wait — it hands ``start_background`` its teardown event."""
     try:
         _WORKER.stop.set()
         _WORKER.wake.set()

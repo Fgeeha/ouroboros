@@ -339,9 +339,111 @@ test('the summary step stages the language and applies it only after the complet
     // The other verified-success path — a save that timed out and was then confirmed by the
     // readiness probe — applies the staged language too, and the re-mounted control gets the draft back.
     const recovered = source.indexOf('if (status === 204) {');
-    assert.ok(recovered > 0 && source.indexOf('await applyStagedLanguage();', recovered) < source.indexOf('announceCompletion(', recovered));
+    assert.ok(recovered > 0 && source.indexOf('if (!(await applyStagedLanguage())) {', recovered) < source.indexOf('announceCompletion(', recovered));
     assert.match(source, /bindLanguageSettings\(root, \{ staged: state\.languageChoice, stage:/);
     // A completion whose settings landed but whose later step failed (`saved: true`) applies it as well;
     // a refusal that wrote nothing (`saved: false`) must not — that would be the write before completion again.
     assert.match(source, /if \(notice\.saved\) await applyStagedLanguage\(\);/);
+});
+
+test('a staged language whose writer is still busy keeps the wizard open; the next check applies it and proceeds', async () => {
+    // The completion timed out (503, `saved: null`) and the readiness probe then says it landed, while the
+    // finishing save still holds the settings document: the language writer answers 503. The staged choice
+    // must not be dropped with the page — the wizard stays, and the next "Check status" applies it.
+    const staged = {
+        ...BOOTSTRAP,
+        stepOrder: ['summary', ...BOOTSTRAP.stepOrder.filter((step) => step !== 'summary')],
+        initialState: { ...BOOTSTRAP.initialState, openrouterKey: 'sk-or-v1-abcdefghijklmnop', languageChoice: 'en' },
+    };
+    const requests = [];
+    const languageAnswers = [
+        { ok: false, status: 503, body: { ok: false, error: 'another settings save is still running', code: 'settings_document_busy' } },
+        { ok: true, status: 200, body: { language: '', english: true, chosen: true, entries: {}, revision: 0, languages: [] } },
+    ];
+    const fetch = async (url, init = {}) => {
+        const call = `${init.method || 'GET'} ${String(url)}`;
+        if (call !== 'GET /api/ui/i18n') requests.push(call);
+        if (String(url) === '/api/onboarding/complete') {
+            return { ok: false, status: 503, text: async () => '', json: async () => ({ error: 'still running', code: 'settings_save_timeout', saved: null }) };
+        }
+        if (String(url) === '/api/onboarding') return { ok: true, status: 204, text: async () => '', json: async () => { throw new Error('no body'); } };
+        if (String(url) === '/api/ui/i18n/language') {
+            const answer = languageAnswers.shift();
+            return { ok: answer.ok, status: answer.status, text: async () => '', json: async () => answer.body };
+        }
+        return { ok: true, status: 200, json: async () => ({}), text: async () => '' };
+    };
+    const replaced = [];
+    const location = {
+        origin: 'http://127.0.0.1:8765', href: 'http://127.0.0.1:8765/onboarding', search: '', hash: '', pathname: '/onboarding',
+        replace: (href) => replaced.push(href),
+    };
+    const settle = async () => { for (let i = 0; i < 20; i += 1) await new Promise((resolve) => setImmediate(resolve)); };
+    const warn = console.warn;
+    console.warn = () => {};
+    try {
+        await withWizard(staged, 'save=timeout-language-busy', async ({ doc }) => {
+            doc.getElementById('next-btn').fire('click');   // "Start Ouroboros" → 503, outcome unknown
+            await settle();
+            assert.deepEqual(requests, ['POST /api/onboarding/complete'], 'nothing is written for the language before the save is known to have landed');
+            doc.getElementById('check-save-btn').fire('click');
+            await settle();
+            assert.deepEqual(requests.slice(1), ['GET /api/onboarding', 'POST /api/ui/i18n/language']);
+            assert.equal(replaced.length, 0, 'the wizard does not leave with the choice unapplied');
+            const html = doc.getElementById('root').innerHTML;
+            assert.match(html, /Setup is saved\. The interface language is still being applied/);
+            assert.match(html, /id="check-save-btn"/, 'the same action retries');
+            doc.getElementById('check-save-btn').fire('click');
+            await settle();
+            assert.deepEqual(requests.slice(3), ['GET /api/onboarding', 'POST /api/ui/i18n/language']);
+            assert.deepEqual(replaced, ['/'], 'applied: the wizard proceeds as it does on a receipt');
+        }, { fetch, location });
+    } finally {
+        console.warn = warn;
+    }
+});
+
+test('a staged language the gateway refuses for good does not hold the finished setup', async () => {
+    // A failure a retry cannot fix (here: the gateway cannot work out the typed name) is logged and the
+    // completed setup proceeds; the owner picks the language in Settings → Appearance, which says why.
+    const staged = {
+        ...BOOTSTRAP,
+        stepOrder: ['summary', ...BOOTSTRAP.stepOrder.filter((step) => step !== 'summary')],
+        initialState: { ...BOOTSTRAP.initialState, openrouterKey: 'sk-or-v1-abcdefghijklmnop', languageChoice: 'Quenya' },
+    };
+    const requests = [];
+    const fetch = async (url, init = {}) => {
+        const call = `${init.method || 'GET'} ${String(url)}`;
+        if (call !== 'GET /api/ui/i18n') requests.push(call);
+        if (String(url) === '/api/onboarding/complete') {
+            return { ok: false, status: 503, text: async () => '', json: async () => ({ error: 'still running', code: 'settings_save_timeout', saved: null }) };
+        }
+        if (String(url) === '/api/onboarding') return { ok: true, status: 204, text: async () => '', json: async () => { throw new Error('no body'); } };
+        if (String(url) === '/api/ui/i18n/language') {
+            return { ok: false, status: 400, text: async () => '', json: async () => ({ ok: false, saved: false, code: 'language_needs_model', error: 'no credentialed model' }) };
+        }
+        return { ok: true, status: 200, json: async () => ({}), text: async () => '' };
+    };
+    const replaced = [];
+    const location = {
+        origin: 'http://127.0.0.1:8765', href: 'http://127.0.0.1:8765/onboarding', search: '', hash: '', pathname: '/onboarding',
+        replace: (href) => replaced.push(href),
+    };
+    const settle = async () => { for (let i = 0; i < 20; i += 1) await new Promise((resolve) => setImmediate(resolve)); };
+    const warn = console.warn;
+    const warned = [];
+    console.warn = (...args) => { warned.push(String(args[0])); };
+    try {
+        await withWizard(staged, 'save=timeout-language-refused', async ({ doc }) => {
+            doc.getElementById('next-btn').fire('click');
+            await settle();
+            doc.getElementById('check-save-btn').fire('click');
+            await settle();
+            assert.deepEqual(requests, ['POST /api/onboarding/complete', 'GET /api/onboarding', 'POST /api/ui/i18n/language']);
+            assert.deepEqual(replaced, ['/']);
+            assert.ok(warned.some((line) => line.includes('language not applied yet')));
+        }, { fetch, location });
+    } finally {
+        console.warn = warn;
+    }
 });

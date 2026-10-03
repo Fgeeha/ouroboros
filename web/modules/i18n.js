@@ -18,7 +18,7 @@
  *   place the table is read, so the chat transcript is never walked and model prose is
  *   never touched; the code survives an upstream reword of the English.
  * - **Composed strings** (`3 notes`, `New task in {name}`) go through `fmt(key, params,
- *   template)` at the producer, with `Intl.PluralRules` choosing the plural form.
+ *   template)` at the producer; the memory's stored plural map chooses the form, then `Intl.PluralRules`.
  *
  * Excluded from the overlay by construction: every chat transcript (model prose and the
  * host rows, which translate through `tr` instead), logs, code, inputs, owner-supplied
@@ -106,6 +106,8 @@ export function currentPayload() { return state.payload; }
 export function localeDirection(tag) {
     try {
         const locale = new Intl.Locale(String(tag || ''));
+        // No likely script: an invented or unknown language, for which Intl would only guess `ltr`.
+        if (!locale.maximize().script) return '';
         const info = typeof locale.getTextInfo === 'function' ? locale.getTextInfo() : locale.textInfo;
         return info && (info.direction === 'rtl' || info.direction === 'ltr') ? info.direction : '';
     } catch { return ''; }

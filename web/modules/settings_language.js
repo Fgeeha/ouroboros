@@ -10,14 +10,15 @@
 // no model is configured, and the note says so).
 import { apiClient } from './api_client.js';
 import { showToast } from './toast.js';
-import { applyPayload, currentLanguage, currentPayload, engineKnowsLocale, englishTag, fmt, isEnglish, localeDirection, pendingBootRead, pluralSelectMap, setLanguage, tr } from './i18n.js';
+import { applyPayload, currentLanguage, currentPayload, englishTag, fmt, isEnglish, localeDirection, pendingBootRead, pluralSelectMap, setLanguage, tr } from './i18n.js';
 
 export const OTHER_VALUE = '__other__';
 export const ENGLISH_VALUE = 'en';
 
 /**
  * The Language control's markup (Settings → Appearance, and the end of onboarding). One block,
- * bound by `bindLanguageSettings`; `onboarding` swaps the lead copy for the first-run wording.
+ * bound by `bindLanguageSettings`; `onboarding` swaps the lead copy for the first-run wording and
+ * leaves out Export and Regenerate, which act on a language the install does not have yet.
  */
 export function languageBlockHtml({ onboarding = false } = {}) {
     const lead = onboarding
@@ -52,9 +53,9 @@ export function languageBlockHtml({ onboarding = false } = {}) {
                 <div class="settings-inline-note" data-i18n-status data-i18n-skip role="status" aria-live="polite"></div>
                 <div class="settings-toolbar">
                     <button type="button" class="btn btn-default btn-sm" data-i18n-import>Import JSON…</button>
-                    <input type="file" accept="application/json,.json" data-i18n-import-file hidden>
+                    <input type="file" accept="application/json,.json" data-i18n-import-file hidden>${onboarding ? '' : `
                     <button type="button" class="btn btn-default btn-sm" data-i18n-export>Export</button>
-                    <button type="button" class="btn btn-default btn-sm" data-i18n-regenerate>Regenerate</button>
+                    <button type="button" class="btn btn-default btn-sm" data-i18n-regenerate>Regenerate</button>`}
                 </div>
             </div>
         </div>`;
@@ -139,8 +140,9 @@ export function describeStatus(payload) {
 /**
  * Save a language choice through the one writer: a tag goes with this engine's plural rules,
  * display name and text direction; a name or a description is resolved by the gateway and then
- * completed with the plural map when the engine knows the resolved tag. Returns the payload the
- * gateway answered. Shared by the Settings control and the first-run wizard's completion.
+ * completed with the plural map when the engine knows the resolved tag. The page is painted from
+ * the payload the gateway answered, which is returned. Shared by the Settings control and the
+ * first-run wizard's completion.
  */
 export async function saveLanguageChoice(value, client = apiClient) {
     const body = { language: value };
@@ -153,9 +155,9 @@ export async function saveLanguageChoice(value, client = apiClient) {
         }
         const label = displayName(tag, '');
         if (label) body.label = label;
-        // Only an engine that knows the tag has an opinion on its direction: for an invented
-        // language Intl guesses `ltr` and would overwrite what the model decided.
-        const direction = engineKnowsLocale(tag) ? localeDirection(tag) : '';
+        // Only an engine that knows the tag's script has an opinion on its direction: for an
+        // invented language Intl guesses `ltr` and would overwrite what the model decided.
+        const direction = localeDirection(tag);
         if (direction) body.profile = { direction };
     }
     let payload = await client.saveUiLanguage(body);
@@ -171,6 +173,7 @@ export async function saveLanguageChoice(value, client = apiClient) {
             });
         }
     }
+    applyPayload(payload);
     return payload;
 }
 
@@ -283,7 +286,6 @@ export function bindLanguageSettings(page, {
         setNote('');
         try {
             payload = await saveLanguageChoice(value, client);
-            applyPayload(payload);
             render();
             if (otherInput) otherInput.value = '';
         } catch (error) {

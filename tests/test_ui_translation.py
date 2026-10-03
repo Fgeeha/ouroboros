@@ -546,3 +546,91 @@ def test_an_answer_with_a_brace_field_the_source_lacks_is_refused_per_key_not_pe
     assert doc["entries"]["code:tg.menu_test2.hello"]["text"] == "Привет", "a valid peer is written"
     pending = dict(memory.take_pending(tmp_path, "ru", 10))
     assert pending["code:tg.menu_test2.lang_changed"]["attempts"] == 1, "the bad answer costs its key one attempt"
+
+
+class _Narrow:
+    """A route whose output bound fits ``fits`` strings a call: a larger batch comes back cut."""
+
+    def __init__(self, fits):
+        self.fits = fits
+        self.sizes = []
+
+    def chat(self, **kwargs):
+        rows = json.loads(kwargs["messages"][1]["content"].split("\n", 1)[1])
+        self.sizes.append(len(rows))
+        if len(rows) > self.fits:
+            return {"content": "{\"translations\": [{\"id\": 0, \"te"}, {"response_finish_reason": "length"}
+        answers = [{"id": row["id"], "text": "RU " + row["text"]} for row in rows]
+        return {"content": json.dumps({"translations": answers})}, {"response_finish_reason": "stop"}
+
+
+def _drain_with(light, tmp_path, client):
+    light.setenv("OUROBOROS_UI_LANGUAGE", "ru")
+    light.setattr(gen, "_broadcast", lambda frame: None)
+    worker = gen._Worker()
+    light.setattr(gen, "_WORKER", worker)
+    worker.client_factory = lambda: client
+    worker._drain(tmp_path, "ru")
+    return worker
+
+
+def test_an_answer_cut_by_the_output_bound_is_asked_again_in_half_the_batch(tmp_path, light):
+    _ru(tmp_path)
+    memory.record_missing(tmp_path, "ru", [{"key": f"Label {i}", "context": {}} for i in range(8)])
+    client = _Narrow(fits=2)
+    worker = _drain_with(light, tmp_path, client)
+    assert client.sizes == [8, 4, 2, 2, 2, 2], "halved until the answer fits, then kept at that size"
+    entries = memory.load_memory(tmp_path, "ru")["entries"]
+    assert {key: row["text"] for key, row in entries.items()} == {f"Label {i}": f"RU Label {i}" for i in range(8)}
+    assert worker.status["state"] == "idle" and worker.status["applied"] == 8 and worker.batch_keys == {"ru": 2}
+    assert memory.load_memory(tmp_path, "ru")["refused"] == {}
+    # A later wake starts from the size the route allowed, not from the full batch again.
+    memory.record_missing(tmp_path, "ru", [{"key": f"More {i}", "context": {}} for i in range(3)])
+    client.sizes.clear()
+    worker._drain(tmp_path, "ru")
+    assert client.sizes == [2, 1]
+
+
+def test_a_route_that_fits_the_batch_keeps_the_full_batch(tmp_path, light):
+    _ru(tmp_path)
+    memory.record_missing(tmp_path, "ru", [{"key": f"Label {i}", "context": {}} for i in range(8)])
+    client = _Narrow(fits=100)
+    worker = _drain_with(light, tmp_path, client)
+    assert client.sizes == [8] and worker.batch_keys == {} and worker.status["state"] == "idle"
+
+
+def test_a_single_string_the_output_bound_cannot_hold_pauses_the_generator(tmp_path, light):
+    _ru(tmp_path)
+    memory.record_missing(tmp_path, "ru", [{"key": "Settings", "context": {}}])
+    client = _Narrow(fits=0)
+    worker = _drain_with(light, tmp_path, client)
+    assert client.sizes == [1], "one string cannot be halved: no second call is bought"
+    assert worker.status["state"] == "failed" and worker.status["error"] == "output_truncated"
+    pending = dict(memory.take_pending(tmp_path, "ru", 10))
+    assert set(pending) == {"Settings"} and not pending["Settings"].get("attempts")
+
+
+def test_the_hosts_teardown_event_stops_new_batches_and_a_clear_event_lets_them_run(tmp_path, light):
+    light.setenv("OUROBOROS_UI_LANGUAGE", "ru")
+    light.setattr(gen, "_broadcast", lambda frame: None)
+    light.setattr(gen, "enqueue_catalog", lambda root, tag: 0)   # this test is about the queue, not the catalog
+    _ru(tmp_path)
+    memory.record_missing(tmp_path, "ru", [{"key": f"Label {i}", "context": {}} for i in range(4)])
+    client = _Narrow(fits=100)
+    gen.set_client_factory(lambda: client)
+
+    def boot(event):
+        gen.start_background(tmp_path, halt=event)   # the server lifespan hands over its own stop event
+        thread = gen._WORKER.thread
+        if thread is not None:
+            thread.join(timeout=5)
+
+    teardown = threading.Event()
+    teardown.set()
+    boot(teardown)                                   # a host that is already tearing down
+    assert client.sizes == [] and memory.pending_count(tmp_path, "ru") == 4, "no batch starts; the queue keeps the work"
+    gen._WORKER._drain(tmp_path, "ru")               # nor does a drain that was already running
+    assert client.sizes == []
+    teardown.clear()                                 # the next lifespan clears its event and boots again
+    boot(teardown)
+    assert client.sizes == [4] and memory.pending_count(tmp_path, "ru") == 0

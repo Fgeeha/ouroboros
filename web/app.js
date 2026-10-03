@@ -29,7 +29,7 @@ import { initUpdateStatus } from './modules/update_status.js';
 import { initDashboard } from './modules/dashboard.js';
 import { hydrateNavIcons } from './modules/page_icons.js';
 
-import { fmt, markBootRead, refreshDictionary, setLanguage, storedLanguage, tr } from './modules/i18n.js';
+import { fmt, markBootRead, pendingBootRead, refreshDictionary, setLanguage, storedLanguage, tr } from './modules/i18n.js';
 import { initOnboardingOverlay } from './modules/onboarding_overlay.js';
 import { installAltMenuSuppression, installDesktopShellLinkInterceptor } from './modules/ui_helpers.js';
 import { nameProjectReference, projectReference } from './modules/project_reference.js';
@@ -901,16 +901,16 @@ apiFetch('/api/ui/preferences', { cache: 'no-store' })
 // clients learn about a change from the frames below; the settings save path broadcasts
 // nothing, so these are the only cross-client signals.
 markBootRead(apiClient.uiI18n()
-    .then((i18n) => { setLanguage(i18n.language, i18n); return i18n; })
-    .catch(() => { setLanguage(storedLanguage()); return null; }));
+    .then((i18n) => setLanguage(i18n.language, i18n).then(() => i18n))
+    .catch(() => setLanguage(storedLanguage()).then(() => null)));
 ws.on('ui_language_changed', () => { refreshDictionary(); });
 ws.on('ui_i18n_updated', () => { refreshDictionary(); });
 
-ws.on('open', ({ previouslyConnected } = {}) => {
+ws.on('open', () => {
     activitySocketDisconnected = false;
     stateSnapshots.fail(stateSnapshots.begin());
     refreshProjectsNav(true); // the in-flight read predates the socket: one coalesced post-open read
-    if (previouslyConnected) refreshDictionary(); // a real reconnect: frames were missed while offline (the first open follows the boot read)
+    pendingBootRead().then(refreshDictionary); // every open, the first too: a frame sent before this subscription was missed (behind the boot read, whose older answer must not land last)
 });
 ws.on('close', () => {
     activitySocketDisconnected = true;

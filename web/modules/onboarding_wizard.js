@@ -1389,19 +1389,15 @@ import { accountRowFacts } from './harness_accounts.js';
     }
 
     async function checkSaveStatus() {
-        // Completion answered 503 `settings_save_timeout`: its body kept running
-        // in the server past the shared writer bound, so whether the bytes
-        // landed is UNKNOWN (`saved: null`) and a retry would be a second write.
-        // Re-read the readiness probe the overlay itself gates on — 204 means a
-        // startup-ready provider is on disk, i.e. the transaction landed — and
-        // proceed exactly as a completion receipt would; otherwise stay open.
+        // Completion answered 503 `settings_save_timeout`: its body kept running in the server past the shared writer
+        // bound, so whether the bytes landed is UNKNOWN (`saved: null`) and a retry would be a second write. Re-read the
+        // readiness probe the overlay itself gates on — 204 means a startup-ready provider is on disk, i.e. the
+        // transaction landed — and proceed exactly as a completion receipt would; otherwise stay open.
         state.error = '';
         render();
         let status = 0;
         try {
-            const response = await fetch('/api/onboarding', {
-                method: 'GET', headers: { Accept: 'application/json' },
-            });
+            const response = await fetch('/api/onboarding', { method: 'GET', headers: { Accept: 'application/json' } });
             status = response.status;
         } catch (error) {
             state.error = `Could not check the save status: ${String(error?.message || error)}. Try again in a moment.`;
@@ -1409,8 +1405,12 @@ import { accountRowFacts } from './harness_accounts.js';
             return;
         }
         if (status === 204) {
+            // The transaction landed. Its staged language needs the settings lock the finishing save may still hold: while that writer answers busy, stay with the draft so the next check applies it.
+            if (!(await applyStagedLanguage())) {
+                state.error = 'Setup is saved. The interface language is still being applied — check again in a moment.';
+                return render();
+            }
             state.saveUnknown = false;
-            await applyStagedLanguage();   // the transaction landed: the same post-completion step as a receipt
             await agentsStep?.disposeForCompletion();
             agentsStep = null;
             // The receipt's `restart_required` never arrived: the boot-pinned
@@ -1422,8 +1422,7 @@ import { accountRowFacts } from './harness_accounts.js';
             });
             return;
         }
-        state.error = 'Setup is not complete yet — the save may still be running in the '
-            + 'server. Check again in a moment; if it never completes, finish setup again.';
+        state.error = 'Setup is not complete yet — the save may still be running in the server. Check again in a moment; if it never completes, finish setup again.';
         render();
     }
 
@@ -1462,10 +1461,11 @@ import { accountRowFacts } from './harness_accounts.js';
 
     // The summary step's Language control stages its choice (a write before completion would create settings.json ahead of the
     // transaction and disqualify the fresh-install defaults); it goes through the one writer once the save is KNOWN to have landed.
+    // Answers false only when that writer was busy (HTTP 503: another save holds the settings document) — the one failure a retry fixes.
     async function applyStagedLanguage() {
         const choice = trim(state.languageChoice);
-        if (!choice) return;
-        try { await saveLanguageChoice(choice); state.languageChoice = ''; } catch (error) { console.warn('onboarding: language not applied yet; choose it in Settings → Appearance', error); }
+        if (!choice) return true;
+        try { await saveLanguageChoice(choice); state.languageChoice = ''; return true; } catch (error) { console.warn('onboarding: language not applied yet; choose it in Settings → Appearance', error); return error?.status !== 503; }
     }
 
     async function saveWizardPayload(payload) {

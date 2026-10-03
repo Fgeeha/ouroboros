@@ -201,7 +201,7 @@ def test_migration_moves_the_retired_bridge_language_to_the_install_once(plugin,
     assert i18n.migration_target({"TELEGRAM_LANGUAGE": "ru", "TELEGRAM_LANGUAGE_MIGRATED": "ru"}) is None
 
     settings_path.write_text(json.dumps({"TELEGRAM_CHAT_ID": "42", "TELEGRAM_LANGUAGE": "ru"}), encoding="utf-8")
-    lang = asyncio.run(plugin._migrate_bridge_language(api, json.loads(settings_path.read_text()), ""))
+    lang = asyncio.run(plugin._migrate_bridge_language(api, json.loads(settings_path.read_text(encoding="utf-8")), ""))
     assert lang == "ru" and posts == [("/ui/language", {"language": "ru"})]
     stored = json.loads(settings_path.read_text(encoding="utf-8"))
     assert stored["TELEGRAM_LANGUAGE_MIGRATED"] == "ru"

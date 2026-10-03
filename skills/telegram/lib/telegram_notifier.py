@@ -175,7 +175,7 @@ def _phase_word(phase: str, lang: str) -> str:
 
 
 # The two push lines this transport composes itself; everything else it relays is the
-# host's own sentence (``telegram_i18n.phrase``).
+# host's own sentence, sent as the host wrote it.
 _NOTIFY = Index("notify", {
     "task_finished": "{icon} Task {id} {word}{tail}",
     "budget": "⚠️ Budget: {pct}% (${spent} / ${total})",

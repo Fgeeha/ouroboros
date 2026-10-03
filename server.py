@@ -1424,7 +1424,7 @@ async def lifespan(app):
             _reload_extensions(lifespan_drive_root, _load_settings, repo_path=repo_path or None)
     except Exception:
         log.error("Extension reload_all at startup failed", exc_info=True)
-    if not pytest_default_real_data_dir: _start_ui_translation(lifespan_drive_root)  # after the skills registered their tables; fail-soft, no model call  # noqa: E701
+    if not pytest_default_real_data_dir: _start_ui_translation(lifespan_drive_root, _supervisor_stop)  # after the skills registered their tables; fail-soft, no model call; no batch starts once teardown began  # noqa: E701
     # Only now: the first tick may consume an overdue note; a bus subscriber attached later never sees it.
     if startup_provider_ready:
         _start_supervisor_if_needed(settings)

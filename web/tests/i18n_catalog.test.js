@@ -119,3 +119,14 @@ test('the raw cause table still works as the presenter lookup for callers outsid
     assert.deepEqual(acceptanceIncidentClauses({ acceptance_incident: { status: 'open' } }, 'final_message', table), ['A', '']);
     assert.deepEqual(acceptanceIncidentClauses({ acceptance_incident: { status: 'resolved' } }, 'author_stop', table), []);
 });
+
+test('a shortened cancel reason keeps the space before its preview note in every language', () => {
+    const origin = { source: 'agent_tool', reason: 'x'.repeat(200) };
+    applyPayload(EN);
+    const english = cancelCauseClauses(origin, { task_id: 't1' })[1];
+    assert.equal(english, 'x'.repeat(159) + '… (preview; the full reason is kept with the task)');
+    applyPayload({ ...RU, entries: { ...RU.entries, [CODE_PREFIX + 'cancel.reason_preview_note']: { text: '(начало; полная причина хранится в задаче)' } } });
+    const russian = cancelCauseClauses(origin, { task_id: 't1' })[1];
+    assert.equal(russian, 'x'.repeat(159) + '… (начало; полная причина хранится в задаче)');
+    applyPayload(EN);
+});

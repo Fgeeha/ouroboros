@@ -4,7 +4,8 @@
 // install-wide setting at once and never through the Settings draft.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { bindLanguageSettings, describeStatus, languageOptions, ENGLISH_VALUE, OTHER_VALUE } from '../modules/settings_language.js';
+import { readFileSync } from 'node:fs';
+import { bindLanguageSettings, describeStatus, languageBlockHtml, languageOptions, ENGLISH_VALUE, OTHER_VALUE } from '../modules/settings_language.js';
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -456,3 +457,60 @@ test('a re-mounted staging control shows the draft its caller still holds', () =
     assert.equal(p.otherInput.value, 'de');
     assert.equal(client.calls.filter(([name]) => name === 'saveUiLanguage').length, 0);
 }));
+
+test('a tag whose script the engine knows carries its direction even when the engine has no plural data for it', () => withDocument(async () => {
+    const { localeDirection } = await import('../modules/i18n.js');
+    const { saveLanguageChoice } = await import('../modules/settings_language.js');
+    const client = fakeClient(ENGLISH);
+    await saveLanguageChoice('lrc', client);   // Northern Luri: Arabic script, no CLDR plural rules
+    const body = client.calls.filter(([name]) => name === 'saveUiLanguage').at(-1)[1];
+    const expected = localeDirection('lrc');
+    if (expected) assert.deepEqual(body.profile, { direction: expected });
+    else assert.equal(body.profile, undefined);
+    let scriptKnown = false;
+    try { scriptKnown = Boolean(new Intl.Locale('lrc').maximize().script) && Boolean(new Intl.Locale('lrc').getTextInfo?.() || new Intl.Locale('lrc').textInfo); } catch { /* an engine without Intl.Locale */ }
+    if (scriptKnown) assert.deepEqual(body.profile, { direction: 'rtl' }, 'the right-to-left script is sent, not withheld for the missing plural data');
+}));
+
+test('saving a choice paints the page from the answer; a refused save leaves the page as it was', () => withDocument(async () => {
+    const { currentLanguage, currentPayload } = await import('../modules/i18n.js');
+    const { saveLanguageChoice } = await import('../modules/settings_language.js');
+    const client = fakeClient(ENGLISH);
+    const answered = await saveLanguageChoice('de', client);   // the first-run wizard's post-completion step
+    assert.equal(currentPayload(), answered);
+    assert.equal(currentLanguage(), 'de');
+    await assert.rejects(saveLanguageChoice('Quenya', client));
+    assert.equal(currentLanguage(), 'de', 'a refused save applies nothing');
+    // The wizard re-renders after a save that landed with a failed later step: the control it
+    // mounts again paints the language the page now has, without another read.
+    const p = page();
+    bindLanguageSettings(p.doc, { client, toast: () => {}, navigatorLanguages: [], stage: () => {}, staged: '' });
+    await settle();
+    assert.equal(p.select.value, 'de');
+    assert.notEqual(p.status.textContent, 'English, the source text; no language chosen yet.');
+    assert.equal(client.calls.filter(([name]) => name === 'uiI18n').length, 0);
+}));
+
+test('edits inside the language block never mark the Settings draft dirty', () => {
+    const source = readFileSync(new URL('../modules/settings.js', import.meta.url), 'utf8');
+    const handler = source.slice(source.indexOf('const onServerSettingEdited = (event) => {'), source.indexOf("page.addEventListener('input', onServerSettingEdited);"));
+    assert.match(handler, /closest\?\.\('\[data-i18n-settings\]'\)\) return;/, 'the language saves through its own endpoint');
+    assert.ok(handler.indexOf('[data-i18n-settings]') < handler.indexOf('onSettingsEdited();'), 'before the draft is touched');
+});
+
+test('the block mounted in the wizard offers Import only and hides what is hidden; Settings keeps Export and Regenerate', () => {
+    const settings = languageBlockHtml();
+    const wizard = languageBlockHtml({ onboarding: true });
+    for (const marker of ['data-i18n-select', 'data-i18n-other hidden', 'data-i18n-other-input', 'data-i18n-status', 'data-i18n-import', 'data-i18n-import-file hidden']) {
+        assert.ok(settings.includes(marker) && wizard.includes(marker), marker);
+    }
+    for (const marker of ['data-i18n-export', 'data-i18n-regenerate']) {
+        assert.ok(settings.includes(marker), `${marker} in Settings`);
+        assert.ok(!wizard.includes(marker), `${marker} acts on a language a first run does not have yet`);
+    }
+    // The wizard loads neither style.css (the global [hidden] rule) nor settings.css (the toolbar row):
+    // its own stylesheet states both for this block, or "Other language" shows before "Other…" is chosen.
+    const css = readFileSync(new URL('../onboarding.css', import.meta.url), 'utf8');
+    assert.match(css, /\.wizard-content \[data-i18n-settings\] \[hidden\] \{ display: none; \}/);
+    assert.match(css, /\.wizard-content \[data-i18n-settings\] \.settings-toolbar \{ display: flex;/);
+});

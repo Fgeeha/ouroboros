@@ -29,7 +29,7 @@ export const CANCEL_REASON_PREVIEW_NOTE = ' (preview; the full reason is kept wi
 function reasonPreview(value) {
     const whole = plainCauseText(value, 0);
     const shown = plainCauseText(value, CANCEL_REASON_MAX_CHARS);
-    return shown === whole ? shown : `${shown}${tr('cancel.reason_preview_note', CANCEL_REASON_PREVIEW_NOTE)}`;
+    return shown === whole ? shown : `${shown} ${tr('cancel.reason_preview_note', CANCEL_REASON_PREVIEW_NOTE.trim())}`;
 }
 
 export function cancelCauseClauses(origin, record = {}) {

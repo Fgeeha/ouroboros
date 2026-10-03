@@ -273,11 +273,12 @@ def test_markup_the_source_has_is_not_injected_markup():
     doc["entries"][key] = {"text": "MCP открывает инструменты как <1>mcp_<server>__<tool></1> после обновления.", "provenance": "generated"}
     assert memory.validate_memory(doc)["entries"][key]["text"].startswith("MCP открывает")
     doc["entries"][key] = {"text": "MCP <b>открывает</b> <1>mcp_<server>__<tool></1>.", "provenance": "generated"}
-    with pytest.raises(memory.MemoryFormatError, match="carries markup"):
+    with pytest.raises(memory.MemoryFormatError, match="carries markup") as refused:
         memory.validate_memory(doc)
+    assert "`source`" not in str(refused.value), "a text key is its own source: nothing to add to the pack"
     doc["entries"] = {"code:tg.menu.hello": {"text": "Привет <server>", "provenance": "generated"}}
-    with pytest.raises(memory.MemoryFormatError, match="carries markup"):
-        memory.validate_memory(doc)
+    with pytest.raises(memory.MemoryFormatError, match="carries markup .*states it as `source`"):
+        memory.validate_memory(doc)  # a code entry without its English: the refusal says what the pack lacks
 
 
 def test_brace_fields_the_source_lacks_are_refused_and_a_code_entry_is_judged_against_its_source(tmp_path):
