@@ -76,33 +76,96 @@ def test_facts_name_each_element_its_findings_answers_and_fate_in_the_selected_p
     assert by_id["decision_1"]["changed_in_selected_plan"] == "same"
     assert facts["questions"] == [{"finding_id": "s2:f2", "breaks": "claim_2",
                                    "question": "Who writes the notes?", "answer": "unanswered"}]
-    assert facts["unresolved_reviewers_at_task_end"] == {"count": 1, "slots": ["s2"]}
+    assert facts["reviewers_without_a_merged_answer"] == {"awaiting": 0, "unresolved": 1, "uncollected": 0, "slots": ["s2"]}
     assert facts["claims_source"] == "author_plan"
     assert facts["wave_ref"] == wave["wave_artifact"]
     assert facts["selected_plan"]["delta"]["removed"] == ["claim_2"] and facts["selected_plan"]["delta"]["changed"] == ["claim_1"]
-    assert facts["reviewed_plan"] == {"aggregate": "REVIEW_REQUIRED", "closed": False, "cycle": 1, "closure_notes": []}
+    assert "enforcement" not in facts["selected_plan"] and "paid" not in facts["waves"][0]
+    assert facts["reviewed_plan"] == {"aggregate": "REVIEW_REQUIRED", "closed": False, "cycle": 1,
+                                      "closure_notes": [], "closure_notes_total": 0}
     assert facts["unchanged_elements_without_findings"] == 1  # the goal
     assert "omitted" not in facts
-    # Facts, not judgement: nothing in the slice scores a reviewer or ranks a finding.
-    assert not {"score", "rank", "weight"} & set(json.dumps(facts))
+    # Facts, not judgement: no key anywhere in the slice scores a reviewer or ranks a finding.
+    assert not {"score", "rank", "weight"} & set(_keys(facts))
+
+
+def _keys(node):
+    if isinstance(node, dict):
+        for key, value in node.items():
+            yield key
+            yield from _keys(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _keys(value)
+
+
+def test_element_fates_follow_the_texts_not_the_positional_ids():
+    """Ids are positional: dropping the first claim moves the second into its slot. The
+    reviewed first claim is REMOVED (its text is gone), the second is RENUMBERED, an invariant
+    edited in place is CHANGED, a changed goal is CHANGED, and an element the selected plan
+    introduces is ADDED."""
+    critic = {"goal": "Ship the deck", "invariants": ["Keep the house voice", "No new fonts"],
+              "acceptance_claims": [{"id": "claim_1", "claim": "A"}, {"id": "claim_2", "claim": "B"}],
+              "decisions": [], "deferred": []}
+    selected = {"goal": "Ship the deck by Friday", "invariants": ["Use a new voice", "No new fonts"],
+                "acceptance_claims": [{"id": "claim_1", "claim": "B"}, {"id": "claim_2", "claim": "C"}],
+                "decisions": [], "deferred": []}
+    wave = _wave(spec=critic, findings=[{"finding_id": "s1:f1", "id": "f1", "slot": "s1", "model": "m",
+                                        "class": "blocking", "breaks": "invariant_1", "locator": "", "summary": "voice"}],
+                 dispositions=[{"finding_id": "s1:f1", "decision": "accept", "rationale": "rewritten"}])
+    author = {**_author_plan(), "spec": selected}
+
+    facts = facts_from_state({"waves": [wave]}, critic=wave, author_plan=author)
+
+    fates = {row["id"]: row["changed_in_selected_plan"] for row in facts["elements"]}
+    assert fates == {"claim_1": "removed", "claim_2": "renumbered→claim_1", "invariant_1": "changed",
+                     "goal": "changed", "claim_2_added": "added"} or fates == {
+        "claim_1": "removed", "claim_2": "renumbered→claim_1", "invariant_1": "changed", "goal": "changed"}
+    assert fates["claim_1"] == "removed" and fates["claim_2"] == "renumbered→claim_1"
+    assert fates["invariant_1"] == "changed" and fates["goal"] == "changed"
+    assert facts["unchanged_elements_without_findings"] == 1  # invariant_2 kept its text
+    assert facts["selected_plan"]["delta"]["goal_changed"] is True
+    assert facts["selected_plan"]["delta"]["renumbered"] == [{"from": "claim_2", "to": "claim_1"}]
+
+
+def test_two_answers_to_one_finding_in_one_call_are_reported_as_the_open_contradiction_they_are():
+    wave = _wave(dispositions=[{"finding_id": "s1:f1", "decision": "accept", "rationale": "yes"},
+                               {"finding_id": "s1:f1", "decision": "reject", "rationale": "no"}])
+
+    facts = facts_from_state({"waves": [wave]}, critic=wave)
+
+    [finding] = [f for e in facts["elements"] for f in e["findings"] if f["finding_id"] == "s1:f1"]
+    assert finding["disposition"].startswith("contradictory answers in one call (2: accept, reject)")
+    assert finding["disposition"].endswith("the finding stays open")
+
+
+def test_an_unreadable_author_plan_is_named_not_rendered_as_no_author_plan():
+    facts = facts_from_state({"waves": [_wave()]}, critic=_wave(), author_plan_unavailable="PLAN_AUTHOR_SOURCE_UNAVAILABLE: gone")
+    assert facts["selected_plan"] == {"unavailable": "PLAN_AUTHOR_SOURCE_UNAVAILABLE: gone"}
+    assert {row["changed_in_selected_plan"] for row in facts["elements"]} == {"n/a"}
 
 
 def test_no_recorded_wave_means_no_slice():
     assert facts_from_state({"waves": []}, critic=None) is None
 
 
-def test_the_slice_is_bounded_with_every_cut_named():
+@pytest.mark.parametrize("klass", ["note", "need_evidence"])
+def test_the_slice_is_bounded_with_every_cut_named(klass):
+    """Note summaries, elements AND author questions all bend to the one bound (the
+    heading included); each cut is counted."""
     claims = [{"id": f"claim_{i}", "claim": f"Claim number {i} " + "x" * 120} for i in range(1, 41)]
-    findings = [{"finding_id": f"s{j}:f{i}", "id": f"f{i}", "slot": f"s{j}", "model": "m", "class": "note",
-                 "breaks": f"claim_{i}", "locator": "", "summary": "note text " * 10}
-                for i in range(1, 41) for j in range(1, 33)]
+    findings = [{"finding_id": f"s{j}:f{i}", "id": f"f{i}", "slot": f"s{j}", "model": "m", "class": klass,
+                 "breaks": f"claim_{i}", "locator": "", "summary": "question or note text " * 8}
+                for i in range(1, 41) for j in range(1, 5)]
     wave = _wave(spec={"goal": "g", "acceptance_claims": claims, "decisions": [], "deferred": []},
                  findings=findings, dispositions=[])
 
     facts = facts_from_state({"waves": [wave]}, critic=wave)
 
-    assert len(render_plan_review_section(facts)) <= PLAN_REVIEW_REFLECTION_CHARS + 100
-    assert facts["omitted"]["note_findings_summaries"] > 0 or facts["omitted"]["elements"] > 0
+    assert len(render_plan_review_section(facts)) <= PLAN_REVIEW_REFLECTION_CHARS
+    assert sum(facts["omitted"][key] for key in ("note_findings_summaries", "elements", "questions")) > 0
+    if klass == "need_evidence":
+        assert facts["omitted"]["questions"] > 0
     assert facts["omitted"]["note"].startswith("whole rows omitted")
     assert facts["source_ref"] == {}
 
@@ -140,6 +203,33 @@ def test_an_unreadable_recorded_source_is_disclosed_never_silent(tmp_path, monke
     facts = plan_review_reflection_slice(tmp_path, "task-2")
 
     assert facts["unavailable"].endswith("artifact gone") and facts["source_ref"]["task_id"] == "task-2"
+
+
+def test_an_unreadable_author_plan_reaches_the_slice_as_a_named_fact(tmp_path, monkeypatch):
+    from ouroboros.tools import plan_review_artifacts as artifacts
+    from ouroboros.tools.plan_review_artifacts import PlanReviewSourceUnavailable
+
+    _patch_sources(monkeypatch, state={"waves": [_wave()]}, author=None)
+    monkeypatch.setattr(artifacts, "current_author_plan",
+                        lambda root, tid, st: (_ for _ in ()).throw(PlanReviewSourceUnavailable("PLAN_AUTHOR_SOURCE_UNAVAILABLE: gone")))
+
+    facts = plan_review_reflection_slice(tmp_path, "task-2b")
+
+    assert facts["selected_plan"] == {"unavailable": "PLAN_AUTHOR_SOURCE_UNAVAILABLE: gone"}
+    assert facts["elements"], "the reviewed wave's facts still come through"
+
+
+def test_the_wave_the_author_answered_is_never_substituted_when_it_is_missing(tmp_path, monkeypatch):
+    other = _wave(request_fingerprint="d" * 64, cycle_index=2,
+                  findings=[{"finding_id": "s:only2", "id": "only2", "slot": "s", "model": "m", "class": "note",
+                             "breaks": "claim_1", "locator": "", "summary": "ONLY_WAVE_2"}], dispositions=[])
+    author = {**_author_plan(), "review_fingerprint": "e" * 64}
+    _patch_sources(monkeypatch, state={"waves": [_wave(), other], "current_attempt": {"fingerprint": "c" * 64}}, author=author)
+
+    facts = plan_review_reflection_slice(tmp_path, "task-2c")
+
+    assert "unavailable" in facts and "not in the index" in facts["unavailable"]
+    assert "ONLY_WAVE_2" not in json.dumps(facts)
 
 
 def test_a_task_without_waves_or_without_an_id_has_no_slice(tmp_path, monkeypatch):
@@ -186,10 +276,10 @@ def test_the_reflection_prompt_carries_the_slice_exactly_when_the_task_recorded_
     assert "lens-survives" in captured["prompt"]
 
 
-def _late_result(tmp_path, task_id="late-1", retry_key="rk-1"):
+def _late_result(tmp_path, task_id="late-1", retry_key="rk-1", **fields):
     from ouroboros.task_results import write_task_result
 
-    write_task_result(tmp_path, task_id, "completed", text="Ship the deck", result="done", review_projection={
+    write_task_result(tmp_path, task_id, "completed", text="Ship the deck", result="done", **fields, review_projection={
         "panels": [{"panel_id": "panel_1", "late_settlement": {
             "note": "Reviewers later passed it.\nSecond line of the host's sentence.",
             "reviewed_subject": {"retry_key": retry_key, "panel_id": "panel_1"},
@@ -208,11 +298,39 @@ def test_the_late_settlement_row_is_bounded_sourced_and_closed_to_the_pattern_re
     assert entry["type"] == entry["task_type"] == LATE_SETTLEMENT_TASK_TYPE
     assert entry["supplement_id"] == "acceptance-late:rk-1" and entry["task_id"] == task_id
     assert entry["reflection"].startswith("Reviewers later passed it.")
+    assert entry["reflection"].splitlines()[1] == f"Source: get_task_result(task_id={task_id}), review_projection panel panel_1."
     assert "- a (model/a): PASS" in entry["reflection"]
-    assert entry["reflection"].rstrip().endswith("review_projection panel panel_1.")
     assert entry["source_ref"]["panel_id"] == "panel_1" and entry["goal"] == "Ship the deck"
     assert not _admits_pattern_register(entry)
     assert late_settlement_reflection_entry(tmp_path, task_id, "unknown-key") is None
+
+
+def test_the_late_row_passes_the_result_so_the_claims_source_sees_the_task_contract(tmp_path, monkeypatch):
+    seen = {}
+
+    def claims(ctx, contract, root, tid):
+        seen["contract"] = contract
+        return [], "ingress_contract", {}
+
+    _patch_sources(monkeypatch, state={"waves": [_wave()]}, author=None)
+    monkeypatch.setattr("ouroboros.review_evidence_sections._accept_effective_claims", claims)
+    task_id = _late_result(tmp_path, task_contract={"acceptance_claims": [{"id": "claim_1", "claim": "The deck has ten slides"}]})
+
+    entry = late_settlement_reflection_entry(tmp_path, task_id, "rk-1")
+
+    assert seen["contract"]["acceptance_claims"][0]["id"] == "claim_1"
+    assert "Plan review (ingress_contract claims; 3 of 3 elements)" in entry["reflection"]
+
+
+def test_a_failing_plan_fact_read_still_leaves_the_late_row_with_its_verdict(tmp_path, monkeypatch):
+    monkeypatch.setattr(facts_mod, "plan_review_reflection_slice",
+                        lambda root, tid, task=None: (_ for _ in ()).throw(ValueError("dialogue source torn")))
+    task_id = _late_result(tmp_path)
+
+    entry = late_settlement_reflection_entry(tmp_path, task_id, "rk-1")
+
+    assert entry["reflection"].startswith("Reviewers later passed it.")
+    assert "Plan-review facts unavailable: dialogue source torn" in entry["reflection"]
 
 
 def test_learning_from_a_late_settlement_appends_one_routed_row_and_never_raises(tmp_path, monkeypatch):
@@ -230,3 +348,48 @@ def test_learning_from_a_late_settlement_appends_one_routed_row_and_never_raises
     monkeypatch.setattr("ouroboros.reflection.append_reflection_routed",
                         lambda env, task, entry: (_ for _ in ()).throw(OSError("disk gone")))
     assert learn_from_late_settlement(tmp_path, result, "rk-1") is False
+
+
+def test_a_project_bound_late_row_lands_on_the_project_drive_with_a_canonical_pointer(tmp_path, monkeypatch):
+    import ouroboros.project_facts as pf
+    from ouroboros.task_results import load_task_result
+
+    monkeypatch.setattr(pf, "_project_store_root", lambda pid: tmp_path / "projects" / pid)
+    monkeypatch.setattr(facts_mod, "plan_review_reflection_slice", lambda root, tid, task=None: None)
+    canonical = tmp_path / "data"
+    task_id = _late_result(canonical, task_id="late-proj", project_id="slime", budget_drive_root=str(canonical))
+    result = load_task_result(canonical, task_id)
+
+    assert learn_from_late_settlement(canonical, result, "rk-1") is True
+
+    project_log = tmp_path / "projects" / "slime" / "logs" / "task_reflections.jsonl"
+    [row] = [json.loads(line) for line in project_log.read_text(encoding="utf-8").splitlines()]
+    assert row["type"] == LATE_SETTLEMENT_TASK_TYPE and row["task_id"] == "late-proj"
+    [pointer] = [json.loads(line) for line in (canonical / "logs" / "task_reflections.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert pointer["type"] == "project_reflection_pointer" and pointer["project_id"] == "slime"
+
+
+def test_every_path_that_announces_a_settlement_writes_the_row_and_a_replay_does_not(tmp_path, monkeypatch):
+    """Maintenance and recovery announce through enqueue_late_acceptance_settlement directly,
+    so the learning hook lives there: a NEW announcement writes one row, an already delivered
+    notice writes none."""
+    from types import SimpleNamespace
+
+    from ouroboros import acceptance_settlement as settlement
+    from ouroboros.task_results import load_task_result
+    from supervisor import terminal_delivery
+
+    monkeypatch.setattr(facts_mod, "plan_review_reflection_slice", lambda root, tid, task=None: None)
+    monkeypatch.setattr(terminal_delivery, "pending_deliveries", lambda root: [])
+    outcomes = iter([terminal_delivery.ENQUEUE_QUEUED, terminal_delivery.ENQUEUE_ALREADY_DELIVERED])
+    monkeypatch.setattr(terminal_delivery, "enqueue_terminal_delivery_outcome", lambda root, row, event_queue=None: next(outcomes))
+    task_id = _late_result(tmp_path, task_id="late-m")
+    result = load_task_result(tmp_path, task_id)
+    panel = result["review_projection"]["panels"][0]
+    ctx = SimpleNamespace(drive_root=tmp_path, budget_drive_root=str(tmp_path))
+
+    assert settlement.enqueue_late_acceptance_settlement(ctx, task_id, "rk-1", result, panel) == "announced"
+    assert settlement.enqueue_late_acceptance_settlement(ctx, task_id, "rk-1", result, panel) == "published"
+
+    rows = [json.loads(line) for line in (tmp_path / "logs" / "task_reflections.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert [row["supplement_id"] for row in rows] == ["acceptance-late:rk-1"]

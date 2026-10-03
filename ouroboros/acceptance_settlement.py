@@ -811,11 +811,9 @@ def attach_late_acceptance_settlement(usage_ctx: Any, request: Any, wave: Dict[s
     sees it; the next turn reads it in chat history, and one bounded reflection
     row carries the settled verdict to the learning log (plan_review_facts).
     """
-    retry_key = str(getattr(request, "retry_key", "") or "")
-    outcome = settle_acceptance_operation(usage_ctx, retry_key=retry_key, task_id=str(getattr(request, "task_id", "") or ""), result=result, wave=wave)
-    if outcome == "announced":  # one row per announced settlement; a replay announces nothing new
-        learn_from_late_settlement(_result_root(usage_ctx), result, retry_key)
-    return outcome == "announced"
+    return settle_acceptance_operation(
+        usage_ctx, retry_key=str(getattr(request, "retry_key", "") or ""),
+        task_id=str(getattr(request, "task_id", "") or ""), result=result, wave=wave) == "announced"
 
 
 def settle_acceptance_operation(usage_ctx: Any, *, retry_key: str, task_id: str, result: Dict[str, Any],
@@ -948,6 +946,8 @@ def enqueue_late_acceptance_settlement(usage_ctx: Any, task_id: str, retry_key: 
         historical_publication_retained(root, task_id, retry_key)
     with _LATE_LOCK:
         _LATE_UNPUBLISHED.discard((str(task_id), str(retry_key)))
+    if outcome == ENQUEUE_QUEUED:  # a NEW announcement, whichever path made it: one learning row, never on a replay
+        learn_from_late_settlement(root, result, retry_key)
     return "announced" if outcome == ENQUEUE_QUEUED else "published"
 
 

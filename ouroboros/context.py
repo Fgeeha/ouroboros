@@ -806,7 +806,7 @@ def build_memory_sections(memory: Memory, partition: str = "all", durable_dialog
     return sections
 
 
-def _format_recent_reflections(entries: List[Dict[str, Any]], limit: int = 10) -> str:
+def _format_recent_reflections(entries: List[Dict[str, Any]], limit: int = 20) -> str:
     if not entries:
         return ""
 
@@ -974,7 +974,7 @@ def build_recent_sections(
 
     # Read-back of the project's OWN full reflections (F5 wrote them to the
     # project drive; the canonical tail above carries only pointer rows). Same
-    # bounds as the canonical read: last 20 rows, 10 rendered.
+    # bounds as the canonical read: last 20 rows, all 20 rendered.
     _pid = str(project_id or "").strip()
     if _pid:
         try:
