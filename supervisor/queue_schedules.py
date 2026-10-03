@@ -305,9 +305,11 @@ def _schedule_projection_row(raw: Dict[str, Any]) -> Dict[str, Any]:
     row: Dict[str, Any] = {}
     # Keep only lifecycle facts useful to a model.  In particular, the durable
     # task template (including context/attachments) never crosses this seam.
+    # ``last_error`` says why a row did not do its job (a note whose chat write
+    # was not confirmed reads "consumed" otherwise); it is bounded like any text.
     projection_keys = (
         "id", "name", "enabled", "source", "skill", "trigger",
-        "created_at", "last_run_at", "last_task_id", "completed_at", "next_run_at",
+        "created_at", "last_run_at", "last_task_id", "last_error", "completed_at", "next_run_at",
     )
     for key in projection_keys:
         value = raw.get(key)

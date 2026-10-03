@@ -75,3 +75,18 @@ test('a note row is named by its own words and offers the same lifecycle', () =>
     assert.match(task, /<span class="activity-name">Reminder of task t1<\/span>/, 'a task row keeps its schedule name');
     assert.match(task, /data-note="">Delete</);
 });
+
+test('a row shows its stored error: a consumed note whose chat write was not confirmed says so', () => {
+    const note = {
+        id: 'followup-t1-abc123', name: 'Reminder of task t1', kind: 'notify', status: 'consumed', enabled: false,
+        relation: 'independent', trigger: { type: 'once', run_at: '2027-01-15T09:00:00Z' },
+        completed_at: '2027-01-15T09:00:05Z', notification: { text: 'Call mother' },
+    };
+    const failed = scheduleRowHtml({ ...note, last_error: 'delivery <not> confirmed' });
+    assert.match(failed, / · already fired · <span class="activity-tag">last error: delivery &lt;not&gt; confirmed<\/span>/);
+    assert.match(failed, /consumed once · history/, 'still history: no retry control appears');
+    assert.doesNotMatch(failed, /data-act="schedule-toggle"/);
+    for (const quiet of [note, { ...note, last_error: '' }]) {
+        assert.doesNotMatch(scheduleRowHtml(quiet), /last error/, 'a row with no stored error says none');
+    }
+});

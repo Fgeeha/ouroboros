@@ -108,6 +108,9 @@ export function scheduleRowHtml(s) {
     // A due occurrence that waits (capacity, a missing folder, an unknown fact) says why.
     const waiting = s.hold && s.hold.reason
         ? ` · <span class="activity-tag" title="${esc(s.hold.detail || '')}">waiting: ${esc(s.hold.reason)}</span>` : '';
+    // Why the row did not do its job, as stored (a note whose chat write was not
+    // confirmed is consumed and never retried, so this is the only place it says so).
+    const failed = s.last_error ? ` · <span class="activity-tag">last error: ${esc(s.last_error)}</span>` : '';
     const relation = String(s.relation || 'unknown');
     const hold = s.followup_hold || {};
     const work = s.billing_group || {};
@@ -122,7 +125,7 @@ export function scheduleRowHtml(s) {
     const pendingDetail = pendingDelete ? ` · deletion waits for ${relation === 'independent'
         ? 'its accepted run to start' : 'its task to finish'}` : '';
     const statusLabel = pendingDelete ? 'deletion pending' : status;
-    const sub = `${note ? 'reminder · ' : ''}${timing}${next && !consumed && !pendingDelete ? ` · next ${next}` : ''} · ${esc(statusLabel)}${pendingDetail} · ${esc(relation)}${binding}${s.deadline_at ? ` · deadline ${scheduleInstantHtml(s.deadline_at, { includeYear: true })}` : ''}${hold.reason ? ` · ${esc(explanations[hold.reason] || hold.reason)}` : ''}${s.followup_wait ? ` · ${esc(explanations[s.followup_wait] || s.followup_wait)}` : ''}${s.completed_at ? ' · already fired' : ''}${managed && s.skill ? ` · ${esc(s.skill)}` : ''}${waiting}`;
+    const sub = `${note ? 'reminder · ' : ''}${timing}${next && !consumed && !pendingDelete ? ` · next ${next}` : ''} · ${esc(statusLabel)}${pendingDetail} · ${esc(relation)}${binding}${s.deadline_at ? ` · deadline ${scheduleInstantHtml(s.deadline_at, { includeYear: true })}` : ''}${hold.reason ? ` · ${esc(explanations[hold.reason] || hold.reason)}` : ''}${s.followup_wait ? ` · ${esc(explanations[s.followup_wait] || s.followup_wait)}` : ''}${s.completed_at ? ' · already fired' : ''}${managed && s.skill ? ` · ${esc(s.skill)}` : ''}${waiting}${failed}`;
     // The exact hold release stays available wherever a hold exists, including on a
     // deleted row whose accepted task still needs it; it never re-enables the row.
     const holdControl = !hold.hold_id ? ''

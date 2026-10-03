@@ -150,6 +150,29 @@ def test_the_note_is_consumed_on_disk_before_it_is_shown_and_never_retried(host,
     assert _chat_rows(host.root) == []
 
 
+def test_an_unconfirmed_note_says_so_to_the_model_and_in_activity(host, monkeypatch):
+    """The stored delivery error is on both schedule surfaces: the model's bounded
+    ``manage_schedules`` list and the owner's Activity rows. Still never retried."""
+    from ouroboros.tools.followup import _manage_schedules
+    from supervisor import message_bus, queue_schedules
+
+    def unconfirmed(*_args, **_kwargs):
+        raise RuntimeError("canonical message acceptance could not be persisted")
+
+    _note(host.queue)
+    _note(host.queue, "note-2", trigger={"type": "once", "run_at": "2999-01-01T00:00:00+00:00"})
+    monkeypatch.setattr(message_bus, "send_with_budget", unconfirmed)
+    host.queue.check_scheduled_tasks()
+    ctx = types.SimpleNamespace(task_metadata={}, drive_root=host.root, budget_drive_root=host.root, task_id="t")
+    listed = {row["id"]: row for row in json.loads(_manage_schedules(ctx, action="list"))["tasks"]}
+    assert (listed["note-1"]["status"], listed["note-1"]["last_error"]) == ("consumed", "delivery not confirmed")
+    assert not listed["note-2"]["last_error"], "a row with no stored error says none"
+    activity = queue_schedules.schedule_activity_projection(host.queue.list_scheduled_tasks(host.root))["tasks"]
+    assert {row["id"]: row.get("last_error") for row in activity}["note-1"] == "delivery not confirmed"
+    long_error = {"id": "x", "trigger": {"type": "cron", "expr": "0 9 * * *"}, "last_error": "E" * 500}
+    assert len(queue_schedules.schedule_tool_projection({"tasks": [long_error]})["tasks"][0]["last_error"]) <= 96
+
+
 def test_a_failed_table_write_shows_nothing_and_the_note_stays_due(host, monkeypatch):
     from supervisor import queue_schedules
 
