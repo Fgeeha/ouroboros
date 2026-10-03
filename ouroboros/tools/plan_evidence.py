@@ -403,9 +403,13 @@ def evidence_manifest_hash(manifest: Mapping[str, Any]) -> str:
 
 
 def task_evidence_reader(root: pathlib.Path) -> Callable[[str], Optional[str]]:
-    """Task-result projection; the evidence resolver hashes, budgets and redacts it."""
+    """Task-result projection with the WHOLE result; the evidence resolver hashes,
+    budgets and redacts it. One bound: ``EVIDENCE_PER_ITEM_BYTES`` cuts the attached
+    head with the cut named (``truncated_to_N``) while sha256/bytes describe the full
+    projection, and a locator selector reads the original. An inner preview here would
+    hash the preview, so two results differing past it would share one identity and a
+    tail selector would read the omission marker instead of the result."""
     from ouroboros.task_results import load_task_result
-    from ouroboros.utils import truncate_review_artifact
     def _read(task_id: str) -> Optional[str]:
         try:
             record = load_task_result(root, task_id)
@@ -418,7 +422,7 @@ def task_evidence_reader(root: pathlib.Path) -> Callable[[str], Optional[str]]:
             "status": record.get("status"),
             "reason_code": record.get("reason_code"),
             "ts": record.get("ts"),
-            "result": truncate_review_artifact(str(record.get("result") or ""), limit=6_000),
+            "result": str(record.get("result") or ""),
         }
         if "terminal_host_notice" in record:
             projection["terminal_host_notice"] = str(record["terminal_host_notice"] or "")
