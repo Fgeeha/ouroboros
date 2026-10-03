@@ -103,21 +103,25 @@ def test_every_bridge_table_is_registered_with_the_generator(plugin):
         assert item["context"]["table"] == f"tg.{table}"
 
 
-def test_phrase_relays_a_host_sentence_translated_or_english_with_a_miss(plugin, tmp_path, monkeypatch):
+def test_relayed_host_sentences_are_sent_as_the_host_wrote_them_and_are_never_translation_keys(plugin, tmp_path, monkeypatch):
+    """A question's host facts and a task's reason line carry ids, times, the English task-control
+    words and sometimes the author's own rationale. The bridge relays them unchanged: translating
+    the flattened sentence would translate a control word or authored prose, and make every
+    question a unique key."""
+    import sys
+
     i18n = plugin.telegram_i18n
+    assert not hasattr(i18n, "phrase"), "no whole-sentence relay translation seam"
     root = tmp_path / "data"
-    woken = []
-    monkeypatch.setattr(i18n, "_wake_generator", lambda r, tag: woken.append(tag))
-    assert i18n.phrase("Ouroboros stopped with unfinished work.", "") == "Ouroboros stopped with unfinished work."
-    assert woken == []
     monkeypatch.setenv("OUROBOROS_UI_LANGUAGE", "ru")
-    _seed(root, "ru", {"Ouroboros stopped with unfinished work.": {"text": "Уроборос остановился с незавершённой работой."}})
-    assert i18n.phrase("Ouroboros stopped with unfinished work.") == "Уроборос остановился с незавершённой работой."
-    assert i18n.phrase("The reviewers did not reach a verdict.") == "The reviewers did not reach a verdict."
-    assert woken == ["ru"]
-    pending = dict(memory.take_pending(root, "ru", 10))
-    assert pending["The reviewers did not reach a verdict."]["context"] == {"role": "telegram"}
-    assert i18n.phrase("2026-10-03T10:00:00Z") == "2026-10-03T10:00:00Z" and memory.pending_count(root, "ru") == 0
+    _seed(root, "ru", {"Asked by task 3f2a9c8e, 12:00; seen 3 min ago.": {"text": "ПЕРЕВОД"}})
+    quiz = sys.modules["tg_i18n_test.lib.telegram_quiz"]
+    facts = "Asked by task 3f2a9c8e, 12:00; seen 3 min ago."
+    body = quiz.render_quiz_text("Ship it?", ["Yes", "No"], "", "", host_facts=facts, lang="ru")
+    assert facts in body and "ПЕРЕВОД" not in body
+    assert memory.pending_count(root, "ru") == 0 or facts not in dict(memory.take_pending(root, "ru", 50))
+    notifier_source = (Path(_ROOT / "lib" / "telegram_notifier.py")).read_text(encoding="utf-8")
+    assert 'msg += "\\n" + reason' in notifier_source, "the reason line is relayed as composed (Stop now / Wrap up stay English)"
 
 
 def test_language_keyboard_lists_english_the_memories_on_disk_and_marks_the_current_one(plugin, tmp_path, monkeypatch):

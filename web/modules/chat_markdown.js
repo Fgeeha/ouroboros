@@ -730,7 +730,7 @@ function markTableOverflow(wrap) {
     if (scrolls === wrap.hasAttribute('tabindex')) return;
     if (scrolls) {
         wrap.setAttribute('role', 'region');
-        wrap.setAttribute('aria-label', 'Scrollable table');
+        wrap.setAttribute('aria-label', tr('code.scrollable_table', 'Scrollable table'));
         wrap.tabIndex = 0;
     } else {
         wrap.removeAttribute('role');

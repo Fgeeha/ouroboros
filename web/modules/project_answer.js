@@ -8,6 +8,7 @@
  * the voice of a row never chooses how the UI points at its Project.
  */
 import { createSystemMessageActions } from './ui_helpers.js';
+import { tr } from './i18n.js';
 import { projectReference } from './project_reference.js';
 import { terminalTimeNote } from './utils.js';
 
@@ -74,7 +75,7 @@ export function syncSavedProjectContext(bubble, projected, originId = '') {
     if (prior) return false;
     const note = bubble.ownerDocument.createElement('div');
     note.className = 'msg-provenance saved-project-context';
-    note.textContent = 'Saved project context — original request retained here; surrounding history may still need loading.';
+    note.textContent = tr('project.saved_context_note', 'Saved project context — original request retained here; surrounding history may still need loading.');
     bubble.insertBefore(note, bubble.querySelector('.message')?.nextSibling || null);
     bubble.dataset.originProjected = '1';
     return true;

@@ -906,11 +906,11 @@ markBootRead(apiClient.uiI18n()
 ws.on('ui_language_changed', () => { refreshDictionary(); });
 ws.on('ui_i18n_updated', () => { refreshDictionary(); });
 
-ws.on('open', () => {
+ws.on('open', ({ previouslyConnected } = {}) => {
     activitySocketDisconnected = false;
     stateSnapshots.fail(stateSnapshots.begin());
     refreshProjectsNav(true); // the in-flight read predates the socket: one coalesced post-open read
-    refreshDictionary(); // frames missed while offline: the memory may have moved on
+    if (previouslyConnected) refreshDictionary(); // a real reconnect: frames were missed while offline (the first open follows the boot read)
 });
 ws.on('close', () => {
     activitySocketDisconnected = true;

@@ -725,7 +725,7 @@ export function createChatMedia({
             if (!existing.querySelector('.chat-group-title')) {
                 const title = document.createElement('div');
                 title.className = 'chat-group-title';
-                title.textContent = kind === 'photos' ? 'Multiple images' : 'Multiple files';
+                title.textContent = kind === 'photos' ? tr('media.multiple_images', 'Multiple images') : tr('media.multiple_files', 'Multiple files');
                 grid.before(title);
             }
             stampNodeTimestamp(existing, msg.ts || '', { anchor: true });
@@ -755,7 +755,7 @@ export function createChatMedia({
         button.type = 'button';
         button.className = 'chat-message-copy';
         button.innerHTML = COPY_ICON_SVG;
-        button.title = 'Copy';
+        button.title = tr('code.copy', 'Copy');
         button.setAttribute('aria-label', tr('media.copy_message', 'Copy message'));
         const writeFallback = () => {
             const area = document.createElement('textarea');
@@ -783,11 +783,11 @@ export function createChatMedia({
                 ok = false;
             }
             button.textContent = ok ? '✓' : '✗';
-            button.title = ok ? 'Message copied' : 'Copy failed';
+            button.title = ok ? tr('media.message_copied', 'Message copied') : tr('media.copy_failed', 'Copy failed');
             button.setAttribute('aria-label', ok ? tr('media.message_copied', 'Message copied') : tr('media.copy_failed', 'Copy failed'));
             later(() => {
                 button.innerHTML = COPY_ICON_SVG;
-                button.title = 'Copy';
+                button.title = tr('code.copy', 'Copy');
                 button.setAttribute('aria-label', tr('media.copy_message', 'Copy message'));
             }, 1500, button);
         });

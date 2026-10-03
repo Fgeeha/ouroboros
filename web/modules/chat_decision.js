@@ -882,7 +882,7 @@ export function createChatDecision({
             if (overflow && index >= ROUTING_TOP_OPTIONS) btn.hidden = true;
             const label = document.createElement('span');
             label.className = 'chat-quiz-option-label';
-            label.textContent = routingOptionLabel(option) || `Option ${index + 1}`;
+            label.textContent = routingOptionLabel(option) || fmt('Option {n}', { n: index + 1 });
             btn.append(label);
             btn.addEventListener('click', () => {
                 if (card.dataset.state !== 'open') return;
@@ -895,7 +895,7 @@ export function createChatDecision({
             const more = document.createElement('button');
             more.type = 'button';
             more.className = 'chat-quiz-more';
-            more.textContent = `Show all ${options.length}`;
+            more.textContent = fmt('Show all {n}', { n: options.length });
             more.addEventListener('click', () => onDomWrite(() => {
                 optionsBox.querySelectorAll('.chat-quiz-option')
                     .forEach((btn) => { btn.hidden = false; });

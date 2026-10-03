@@ -1,4 +1,27 @@
 import { taskPresentation } from './log_events.js';
+import { fmt, tr } from './i18n.js';
+
+// The live card's own words. Its root is one the overlay never enters (a transcript), so every
+// label is read through the translation seam here, at the producer.
+export const liveCardLabel = {
+    turnIntoProject: () => tr('task.card.turn_into_project', 'Turn into project'),
+    creatingProject: () => tr('task.card.creating_project', 'Creating project…'),
+};
+export function liveCardCountBits(notes, children) {
+    const bits = [];
+    if (notes >= 2) bits.push(fmt('{n} notes', { n: notes }));
+    if (children) bits.push(fmt(children === 1 ? '{n} child' : '{n} children', { n: children }));
+    return bits;
+}
+const CHIP = {
+    finalizing: () => tr('task.chip.finalizing', 'Finalizing…'),
+    cancelling: () => tr('task.chip.cancelling', 'Cancelling…'),
+    paused: () => tr('task.chip.paused', 'Paused'),
+    pausing: () => tr('task.chip.pausing', 'Pausing…'),
+    unconfirmed: () => tr('task.chip.activity_unconfirmed', 'Activity unconfirmed'),
+    waitingAccess: () => tr('task.chip.waiting_for_access', 'Waiting for access'),
+    working: () => tr('task.chip.working', 'Working'),
+};
 
 // Pure desired-chip projection. Terminal truth wins; while unfinished, an
 // owner stop/finalization hold stays sticky across ordinary progress frames.
@@ -14,7 +37,7 @@ export function desiredLiveCardPhase(record = {}, terminalPhase = 'done') {
     if (record.cancelPendingPolicy) {
         return {
             phase: 'working',
-            text: record.cancelPendingPolicy === 'finalize' ? 'Finalizing…' : 'Cancelling…',
+            text: record.cancelPendingPolicy === 'finalize' ? CHIP.finalizing() : CHIP.cancelling(),
             className: 'chat-live-phase working cancelling',
         };
     }
@@ -24,7 +47,8 @@ export function desiredLiveCardPhase(record = {}, terminalPhase = 'done') {
         // only "Finalizing…", so the failure had to be smuggled into the title.
         // D10: the owner's Pause of that late work is the same second fact.
         const observed = String(record.observedOutcome || '');
-        const late = { budget_paused: 'Paused', budget_pausing: 'Pausing…' }[record.parkedPhase] || 'Finalizing…';
+        const lateKind = { budget_paused: 'paused', budget_pausing: 'pausing' }[record.parkedPhase] || 'finalizing';
+        const late = CHIP[lateKind]();
         if (observed) {
             const presentation = taskPresentation(observed);
             return {
@@ -34,25 +58,25 @@ export function desiredLiveCardPhase(record = {}, terminalPhase = 'done') {
                 secondary: late,
             };
         }
-        if (late === 'Finalizing…') return {
+        if (lateKind === 'finalizing') return {
             phase: 'working',
-            text: 'Finalizing…',
+            text: late,
             className: 'chat-live-phase working finalizing',
         };
     }
     // Owner Batch4: a paused task (owner Pause, budget pause, Restart hold) is
     // not working, and neither is one still settling its Pause.
-    if (record.parkedPhase === 'unknown') return { phase: 'unknown', text: 'Activity unconfirmed', className: 'chat-live-phase warn' };
-    if (record.parkedPhase === 'budget_paused') return { phase: 'paused', text: 'Paused', className: 'chat-live-phase warn' };
+    if (record.parkedPhase === 'unknown') return { phase: 'unknown', text: CHIP.unconfirmed(), className: 'chat-live-phase warn' };
+    if (record.parkedPhase === 'budget_paused') return { phase: 'paused', text: CHIP.paused(), className: 'chat-live-phase warn' };
     if (record.parkedPhase === 'budget_pausing') return {
-        phase: 'working', text: 'Pausing…', className: 'chat-live-phase working waiting',
+        phase: 'working', text: CHIP.pausing(), className: 'chat-live-phase working waiting',
     };
     if (record.modelWaiting) return {
-        phase: 'working', text: 'Waiting for access', className: 'chat-live-phase working waiting',
+        phase: 'working', text: CHIP.waitingAccess(), className: 'chat-live-phase working waiting',
     };
     // A census Project/scope verification hold: an unfinished, static amber wait.
     if (record.projectHold) return { phase: 'working', text: record.projectHold, className: 'chat-live-phase warn' };
-    return { phase: 'working', text: 'Working', className: 'chat-live-phase working' };
+    return { phase: 'working', text: CHIP.working(), className: 'chat-live-phase working' };
 }
 
 /**

@@ -304,3 +304,18 @@ def test_text_keys_are_read_as_the_reader_sees_them(tmp_path, monkeypatch):
     memory.update_memory(tmp_path, "ru", lambda doc: (memory.apply_generated(doc, {"Open the file now": {"text": "Откройте файл"}}, model="t"), doc)[1], create=True)
     assert memory.tr("Open the  file\n   now", drive_root=tmp_path) == "Откройте файл", "a relayed sentence with source-layout whitespace finds its entry"
     assert memory.fmt("Open   the file now", drive_root=tmp_path) == "Откройте файл"
+
+
+def test_inline_slots_are_flat_and_may_be_reordered_but_never_nested_or_crossed():
+    assert memory.inline_slots_balanced("Use <1>127.0.0.1</1> or <2>0.0.0.0</2>.")
+    assert memory.inline_slots_balanced("<2>0.0.0.0</2> first, then <1>127.0.0.1</1>."), "sibling slots may change order"
+    assert not memory.inline_slots_balanced("Use <1>127.0.0.1 <2>0.0.0.0</2></1>."), "nested: the renderer would drop the inner element"
+    assert not memory.inline_slots_balanced("Use <1>127.0.0.1 <2>0.0.0.0</1></2>."), "crossing"
+    assert not memory.inline_slots_balanced("<1>a</1> and <1>b</1>")
+    key = "Use <1>127.0.0.1</1> or <2>0.0.0.0</2> for LAN."
+    doc = memory.new_memory("de")
+    doc["entries"][key] = {"text": "Nutze <1>127.0.0.1 <2>0.0.0.0</2></1> für LAN.", "provenance": "imported"}
+    with pytest.raises(memory.MemoryFormatError, match="unbalanced inline slot"):
+        memory.validate_memory(doc)
+    doc["entries"][key] = {"text": "Für LAN <2>0.0.0.0</2>, sonst <1>127.0.0.1</1>.", "provenance": "imported"}
+    assert memory.validate_memory(doc)["entries"][key]["text"].startswith("Für LAN")

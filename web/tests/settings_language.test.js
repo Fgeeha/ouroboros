@@ -444,3 +444,15 @@ test('the status line names refused strings, and an invented tag sends no engine
     assert.equal(body.profile, undefined, 'the engine has no opinion on an invented language\'s direction');
     assert.equal(body.plural_select, undefined);
 }));
+
+
+test('a re-mounted staging control shows the draft its caller still holds', () => withDocument(async () => {
+    const p = page();
+    const client = fakeClient(ENGLISH);
+    bindLanguageSettings(p.doc, { client, toast: () => {}, navigatorLanguages: [], stage: () => {}, staged: 'de' });
+    await settle();
+    assert.equal(p.status.textContent, 'Will be applied when setup finishes: de');
+    assert.equal(p.select.value, OTHER_VALUE);
+    assert.equal(p.otherInput.value, 'de');
+    assert.equal(client.calls.filter(([name]) => name === 'saveUiLanguage').length, 0);
+}));

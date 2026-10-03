@@ -154,7 +154,7 @@ export function syncContinueAction(record, detail, { read = fetchTaskDetail } = 
         renderSuccessor(button, view.successorId);
         return !existing;
     }
-    button.textContent = view.kind === 'retry' ? 'Retry Continue' : 'Continue';
+    button.textContent = view.kind === 'retry' ? tr('task.continue.retry', 'Retry Continue') : tr('task.continue.label', 'Continue');
     button.disabled = false;
     button.title = view.kind === 'retry' ? tr('task.continue.retry_title', 'Retry the same unconfirmed Continue action')
         : fmt('Start a new task that continues this interrupted one ({cause})', { cause: tx(view.cause || 'technical interruption') });

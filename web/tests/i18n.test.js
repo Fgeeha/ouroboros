@@ -643,3 +643,45 @@ test('re-applying the overlay to an unchanged inline composite writes nothing', 
     translator.restore(root);
     assert.equal(help.textContent, 'Type a code such as pt-BR or a name.');
 });
+
+
+test('an inline composite the app rewrote keeps the app\'s new content; the old stash is never put back', () => {
+    applyPayload({ ...RU, entries: { ...RU_ENTRIES, 'LAN URL: <1>http://192.168.1.10:8765</1>': { text: 'Адрес в сети: <1>http://192.168.1.10:8765</1>' } } });
+    const code = el('code', {}, 'pt-BR');
+    const help = el('div', { class: 'settings-inline-note' }, 'Type a code such as ', code, ' or a name.');
+    const root = el('div', {}, help);
+    const translator = createTranslator();
+    translator.applyTo(root);
+    assert.equal(help.textContent, 'Введите код, например pt-BR, или название.');
+    // The app replaces the sentence with another composite (a different inline element).
+    const link = el('a', {}, 'http://192.168.1.10:8765');
+    help.replaceChildren(doc.createTextNode('LAN URL: '), link);
+    translator.applyTo(root);
+    assert.equal(help.textContent, 'Адрес в сети: http://192.168.1.10:8765', 'the new sentence is translated');
+    assert.ok(help.childNodes.includes(link), 'with the app\'s own new element, not the stale one');
+    assert.ok(!help.childNodes.includes(code));
+    // And one with no translation stays exactly what the app wrote.
+    const other = el('a', {}, 'http://10.0.0.2:8765');
+    help.replaceChildren(doc.createTextNode('Open '), other, doc.createTextNode(' on this network.'));
+    translator.applyTo(root);
+    assert.equal(help.textContent, 'Open http://10.0.0.2:8765 on this network.');
+    assert.ok(help.childNodes.includes(other));
+    applyPayload(RU);
+});
+
+test('a stored plural map answers its exact entry before its period', () => {
+    applyPayload({ ...RU, language: 'art-x-vael', entries: { '{n} notes': { forms: { one: 'ONE {n}', other: 'OTHER {n}' } } }, plural_select: { map: { '0': 'other', '10': 'one' }, period: 10 } });
+    assert.equal(fmt('{n} notes', { n: 10 }), 'ONE 10', 'the exact entry, as Python selects');
+    assert.equal(fmt('{n} notes', { n: 20 }), 'OTHER 20', 'then the periodic one');
+    applyPayload(RU);
+});
+
+
+test('a string that is already a translation in the memory is never reported as a miss', () => {
+    applyPayload({ ...RU, entries: { ...RU_ENTRIES, 'code:task.chip.paused': { text: 'На паузе', provenance: 'generated', source: 'Paused' } } });
+    // A producer wrote its label through tr(); the node happens to sit where the overlay walks.
+    const root = el('div', {}, el('span', {}, tr('task.chip.paused', 'Paused')), el('span', {}, 'Files'));
+    createTranslator().applyTo(root);
+    assert.deepEqual(pendingMisses(), ['Files'], 'the Russian label is not queued as a new English key');
+    applyPayload(RU);
+});

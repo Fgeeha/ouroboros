@@ -13,8 +13,10 @@ Two kinds of keys live in ``entries``, because two kinds of owner-visible Englis
 * ``code:<table>.<key>`` — a host sentence minted by a closed code→sentence table
   (task headline words, cause sentences, question status, Telegram's own lines,
   notification titles). The code is stable across rewording, so an owner's or a
-  fork's pin survives an upstream English edit; ``source_hash`` detects the edit and
-  the status lists the entry as *stale* for review.
+  fork's pin survives an upstream English edit; for a code the Python catalog owns,
+  ``source_hash`` detects the edit and the status counts the entry as *stale* for
+  review (a code only the browser renders has no hash here: its pin keeps rendering
+  and is not counted).
 * the rendered English string itself (optionally ``\\x1f<dom scope>``) — scattered
   interface chrome translated by the browser overlay (``web/modules/i18n.js``). The
   key IS the English, so a reword is a new key and the old entry is orphaned; that is
@@ -132,12 +134,23 @@ def placeholders(text: object) -> set:
 
 
 def inline_slots_balanced(text: object) -> bool:
-    """Every numbered inline slot opens and closes exactly once (`<1>…</1>`)."""
-    opened: Dict[str, int] = {}
-    closed: Dict[str, int] = {}
+    """Numbered inline slots form the flat shape the renderer rebuilds: each ``<n>`` closes before
+    another opens and each number is used once — ``<2>…</2> … <1>…</1>`` in any order, never
+    nested or crossing (the overlay would drop the inner element)."""
+    seen: set = set()
+    current: Optional[str] = None
     for match in _SLOT_RE.finditer(str(text or "")):
-        (closed if match.group(1) else opened)[match.group(2)] = (closed if match.group(1) else opened).get(match.group(2), 0) + 1
-    return opened == closed and all(count == 1 for count in opened.values())
+        closing, number = bool(match.group(1)), match.group(2)
+        if closing:
+            if current != number:
+                return False
+            current = None
+        elif current is not None or number in seen:
+            return False
+        else:
+            seen.add(number)
+            current = number
+    return current is None
 
 
 def is_code_key(key: object) -> bool:

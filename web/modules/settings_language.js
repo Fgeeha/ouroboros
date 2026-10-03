@@ -177,10 +177,11 @@ export async function saveLanguageChoice(value, client = apiClient) {
 /**
  * Wire the `[data-i18n-settings]` block. Returns a disposer. `client`, `toast` and
  * `navigatorLanguages` are injectable for tests. With `stage`, a choice is not saved but handed
- * to that callback (the first-run wizard applies it after its completion transaction).
+ * to that callback (the first-run wizard applies it after its completion transaction); `staged`
+ * is the draft the caller already holds, shown again when the block is re-mounted.
  */
 export function bindLanguageSettings(page, {
-    client = apiClient, toast = showToast, stage = null,
+    client = apiClient, toast = showToast, stage = null, staged: initialStaged = '',
     navigatorLanguages = (typeof navigator !== 'undefined' && navigator.languages) || [],
     openUrl = (url) => { if (typeof window !== 'undefined') window.open(url, '_blank', 'noopener'); },
 } = {}) {
@@ -198,7 +199,7 @@ export function bindLanguageSettings(page, {
     const regenerateButton = root.querySelector('[data-i18n-regenerate]');
     let payload = null;
     let busy = false;
-    let staged = '';
+    let staged = typeof stage === 'function' ? String(initialStaged || '').trim() : '';   // the wizard's retained draft
     for (const el of [status, note]) if (el && el.dataset) el.dataset.i18nSkip = '';
 
     const setNote = (text) => { if (note) note.textContent = text || ''; };
@@ -253,8 +254,12 @@ export function bindLanguageSettings(page, {
     // follow — also on a page without the socket frames, such as the first-run wizard.
     async function reload() {
         try {
-            payload = await client.uiI18n();
-            applyPayload(payload);
+            const fresh = await client.uiI18n();
+            const held = currentPayload();
+            // A read that answers after a newer revision of the same language landed is not applied over it.
+            const older = held && fresh && held.language === fresh.language && Number(fresh.revision || 0) < Number(held.revision || 0);
+            if (!older) applyPayload(fresh);
+            payload = currentPayload() || fresh;
             render();
         } catch {
             setStatus('Language settings could not be loaded.');

@@ -1078,7 +1078,7 @@ import { accountRowFacts } from './harness_accounts.js';
         `;
         bindEvents();
         disposeLanguage?.();   // the Language block lives on the summary step only; its binder owns its listeners
-        disposeLanguage = state.currentStep === 'summary' && !state.completedRestartMode ? bindLanguageSettings(root, { stage: (value) => { state.languageChoice = value; } }) : null;
+        disposeLanguage = state.currentStep === 'summary' && !state.completedRestartMode ? bindLanguageSettings(root, { staged: state.languageChoice, stage: (value) => { state.languageChoice = value; } }) : null;
         renderLocalStatus();
     }
 
@@ -1410,6 +1410,7 @@ import { accountRowFacts } from './harness_accounts.js';
         }
         if (status === 204) {
             state.saveUnknown = false;
+            await applyStagedLanguage();   // the transaction landed: the same post-completion step as a receipt
             await agentsStep?.disposeForCompletion();
             agentsStep = null;
             // The receipt's `restart_required` never arrived: the boot-pinned
@@ -1459,14 +1460,12 @@ import { accountRowFacts } from './harness_accounts.js';
         return answer.receipt;
     }
 
-    // The summary step's Language control stages its choice (a write before completion would create
-    // settings.json ahead of the transaction and disqualify the fresh-install defaults and presets);
-    // it goes through the one language writer right after. One that cannot be applied yet leaves
-    // the install in English; Settings → Appearance offers the same control.
+    // The summary step's Language control stages its choice (a write before completion would create settings.json ahead of the
+    // transaction and disqualify the fresh-install defaults); it goes through the one writer once the save is KNOWN to have landed.
     async function applyStagedLanguage() {
         const choice = trim(state.languageChoice);
         if (!choice) return;
-        try { await saveLanguageChoice(choice); } catch (error) { console.warn('onboarding: language not applied yet; choose it in Settings → Appearance', error); }
+        try { await saveLanguageChoice(choice); state.languageChoice = ''; } catch (error) { console.warn('onboarding: language not applied yet; choose it in Settings → Appearance', error); }
     }
 
     async function saveWizardPayload(payload) {
@@ -1533,6 +1532,7 @@ import { accountRowFacts } from './harness_accounts.js';
             // wrote nothing, so the offered escape is honest: finish without the
             // agent defaults and keep everything editable in Settings.
             const notice = completionFailureNotice(error);
+            if (notice.saved) await applyStagedLanguage();   // the settings landed (a later step failed): the staged language goes with them
             state.saving = false;
             state.presetFailure = notice.canSkip ? { code: notice.code } : null;
             state.saveUnknown = Boolean(notice.saveUnknown);

@@ -330,10 +330,18 @@ test('the summary step stages the language and applies it only after the complet
     // completion is announced — a write before it would create settings.json ahead of the transaction.
     const fs = await import('node:fs/promises');
     const source = await fs.readFile(new URL('../modules/onboarding_wizard.js', import.meta.url), 'utf8');
-    assert.match(source, /bindLanguageSettings\(root, \{ stage: \(value\) => \{ state\.languageChoice = value; \} \}\)/);
+    assert.match(source, /stage: \(value\) => \{ state\.languageChoice = value; \} \}\)/);
     const complete = source.indexOf('const result = await completeOnboardingAtomically(payload);');
     const apply = source.indexOf('await applyStagedLanguage();', complete);
     const announce = source.indexOf('announceCompletion(result);', complete);
     assert.ok(complete > 0 && apply > complete && announce > apply, 'complete → apply the staged language → announce');
     assert.match(source, /await saveLanguageChoice\(choice\)/, 'the shared writer, not a second path');
+    // The other verified-success path — a save that timed out and was then confirmed by the
+    // readiness probe — applies the staged language too, and the re-mounted control gets the draft back.
+    const recovered = source.indexOf('if (status === 204) {');
+    assert.ok(recovered > 0 && source.indexOf('await applyStagedLanguage();', recovered) < source.indexOf('announceCompletion(', recovered));
+    assert.match(source, /bindLanguageSettings\(root, \{ staged: state\.languageChoice, stage:/);
+    // A completion whose settings landed but whose later step failed (`saved: true`) applies it as well;
+    // a refusal that wrote nothing (`saved: false`) must not — that would be the write before completion again.
+    assert.match(source, /if \(notice\.saved\) await applyStagedLanguage\(\);/);
 });

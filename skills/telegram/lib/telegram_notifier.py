@@ -265,10 +265,12 @@ async def _check_tasks_notify(
         msg = _NOTIFY[lang].format("task_finished", icon=icon, id=tid[:8], word=word, tail=tail)
         # The card's reason line, exactly as the host composed it for this task's
         # durable row — never a second sentence written here, and never a second
-        # rendering of the cause table; the memory may know the sentence's translation.
+        # rendering of the cause table. Relayed in English: the flattened sentence
+        # carries task-control words that stay English by decision and sometimes the
+        # author's own rationale, and a transport has no typed clauses to translate around.
         reason = str(e.get("reason_detail") or "").strip()
         if reason:
-            msg += "\n" + telegram_i18n.phrase(reason, lang)
+            msg += "\n" + reason
         send_outcome, exc = await _push_notification(api, chat_id, msg, trust_env=trust_env)
         if send_outcome == "transient":
             # Stop the batch on the first transient failure: every further

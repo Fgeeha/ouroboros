@@ -8,15 +8,17 @@ The skill ships no dictionary: a table registers its English rows with the trans
 generator (``ouroboros/ui_translation.py``) under ``code:tg.<table>.<key>``, and the
 light model fills the memory when a language is chosen.
 
-Three seams:
+Two seams:
 
 * ``Index`` / ``Texts`` — a table of English rows read by key in a language:
   ``TEXTS[lang]["btn_back"]``. The existing call sites keep their shape; only the source
   of truth moved from an ``en``/``ru`` pair to one English table plus the memory.
-* ``phrase(english, lang)`` — a sentence the host composed in English from its own closed
-  tables (a task's reason line) and this transport merely relays: translated when the
-  memory knows the exact sentence, otherwise sent as it is and queued as a miss.
 * ``language()`` — the install's tag (``""`` reads as English) and ``label(tag)``.
+
+A sentence the host composed and this transport merely relays (a task's reason line, a
+question's host facts) is sent as the host wrote it, in English: it carries ids, times,
+the task-control words that stay English by decision and sometimes the author's own
+rationale, and the bridge has no typed clauses to translate around.
 
 The bridge's former private ``TELEGRAM_LANGUAGE`` setting is migrated once
 (``migration_target``): an install that chose Russian in the bridge before the install-wide
@@ -165,23 +167,6 @@ def _report_miss(key: str, tag: str, context: Dict[str, Any]) -> None:
         log.debug("telegram i18n: miss not recorded", exc_info=True)
 
 
-def phrase(text: str, lang: Optional[str] = None) -> str:
-    """A host-composed English sentence this transport relays (a task's reason line).
-    Translated when the memory knows the exact sentence; otherwise sent in English and
-    queued for the generator, so the next card of the same kind reads translated."""
-    source = str(text or "").strip()
-    tag = normalize_language_tag(lang) if lang is not None else language()
-    if not source or english(tag):
-        return source
-    root = drive_root()
-    found = memory.tr(source, tag, None, drive_root=root)
-    if isinstance(found, str) and found:
-        return found
-    if not memory.looks_volatile(source):
-        _report_miss(source, tag, {"role": "telegram"})
-    return source
-
-
 def _wake_generator(root: pathlib.Path, tag: str) -> None:
     try:
         from ouroboros.ui_translation import on_language_event
@@ -209,5 +194,5 @@ LanguagePost = Callable[[Dict[str, Any]], Any]
 
 __all__ = [
     "CATALOG_PREFIX", "Index", "Texts", "configure", "drive_root", "language", "english", "label",
-    "known_languages", "phrase", "migration_target",
+    "known_languages", "migration_target",
 ]

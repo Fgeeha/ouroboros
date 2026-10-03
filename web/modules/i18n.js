@@ -76,6 +76,7 @@ export const USER_CONTENT = [
 const state = {
     language: '', english: true, revision: 0, entries: Object.create(null), scopes: [],
     plural: null, pluralMap: null, profile: null, stats: null, languages: [], payload: null,
+    values: new Set(),
 };
 // The SPA's boot read of the memory, so a control that mounts before it answers waits for it
 // instead of reading the gateway a second time.
@@ -147,8 +148,10 @@ function pluralCategory(n) {
     const stored = state.pluralMap;
     const value = Math.abs(n);
     if (stored && stored.map && typeof stored.map === 'object' && Number.isInteger(value)) {
+        // The exact entry first, then the periodic one — the order Python selects in.
         const period = Number(stored.period) || 0;
-        const picked = stored.map[String(period ? value % period : value)];
+        const exact = stored.map[String(value)];
+        const picked = typeof exact === 'string' ? exact : (period ? stored.map[String(value % period)] : undefined);
         if (typeof picked === 'string') return picked;
     }
     if (!state.plural) return 'other';
@@ -252,7 +255,7 @@ function looksVolatile(text) {
 function noteMiss(key, context = {}) {
     if (state.english || !key || reportedAtRevision.has(key) || misses.has(key)) return;
     const source = key.startsWith(CODE_PREFIX) ? key : key.split(SCOPE_SEPARATOR)[0];
-    if (!key.startsWith(CODE_PREFIX) && looksVolatile(source)) return;
+    if (!key.startsWith(CODE_PREFIX) && (looksVolatile(source) || state.values.has(keyText(source)))) return;  // already a translation
     misses.set(key, { key, context: { ...context, page: pageContext() } });
     reportedAtRevision.add(key);
     if (misses.size >= MISS_BATCH) flushMisses();
@@ -484,16 +487,18 @@ export function createTranslator({
         const doc = el.ownerDocument || (typeof document !== 'undefined' ? document : null);
         if (!doc || typeof doc.createTextNode !== 'function' || typeof el.replaceChildren !== 'function') return;
         const { key, slots } = inlineKey(el);
-        const stash = el.__ouroInline;
-        // Our own output still in place → the source is the stashed English; otherwise the app
-        // rewrote the composite and what stands now IS the source.
-        const ours = Boolean(stash && key === stash.out);
-        const source = ours ? stash.src : key;
+        const prior = el.__ouroInline;
+        // Our own output still in place → the source is the stashed English. Otherwise the app
+        // rewrote the composite: what stands now IS the source, and the stash (the nodes and slots
+        // of the sentence that was there before) is dropped — never put back over the app's update.
+        const stash = prior && key === prior.out ? prior : null;
+        if (prior && !stash) delete el.__ouroInline;
+        const source = stash ? stash.src : key;
         const { text: translated, found } = lookupString(source, el);
         // Idempotent: our output stands and the translation has not changed → not one DOM write
         // (a write here would wake the observer, which would bring the node back here, forever).
-        if (ours && translated === stash.text) return;
-        if (ours) restoreSlotTexts(stash.slots, stash.slotTexts);  // the slots' English back before any rebuild
+        if (stash && translated === stash.text) return;
+        if (stash) restoreSlotTexts(stash.slots, stash.slotTexts);  // the slots' English back before any rebuild
         if (translated === source) {
             if (stash) {
                 el.replaceChildren(...stash.nodes);
@@ -645,6 +650,13 @@ export function applyPayload(payload) {
     state.revision = Number(data.revision) || 0;
     state.entries = Object.assign(Object.create(null), data.entries && typeof data.entries === 'object' ? data.entries : {});
     state.scopes = collectScopes(state.entries);
+    // Every translated text the memory holds: a producer that already read its label through
+    // `tr` may sit where the overlay walks, and what it wrote is a translation, not a new key.
+    state.values = new Set();
+    for (const entry of Object.values(state.entries)) {
+        if (entry && typeof entry.text === 'string') state.values.add(keyText(entry.text));
+        else if (entry && entry.forms && typeof entry.forms === 'object') for (const form of Object.values(entry.forms)) if (typeof form === 'string') state.values.add(keyText(form));
+    }
     const stored = data.plural_select;
     state.pluralMap = !state.english && stored && typeof stored === 'object' && stored.map && typeof stored.map === 'object' ? stored : null;
     state.plural = state.english ? null : makePluralRules(state.language);
