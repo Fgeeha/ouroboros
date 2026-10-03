@@ -115,6 +115,7 @@ def _desktop_command(exe: Path) -> str:
 
 
 def _desktop_state(path: Path, exe: Path) -> str:
+    """This copy's XDG entry. A Hidden=true entry starts nothing, whoever wrote it."""
     parser = configparser.ConfigParser(interpolation=None)
     try:
         parser.read_string(path.read_text(encoding="utf-8"))
@@ -123,9 +124,10 @@ def _desktop_state(path: Path, exe: Path) -> str:
         return "off"
     except (configparser.Error, KeyError, UnicodeError):
         return "other_copy"
+    hidden = entry.get("Hidden", "false").lower() == "true"
     if entry.get("Exec") != _desktop_command(exe) or entry.get("Type") != "Application":
-        return "other_copy"
-    return "disabled_by_os" if entry.get("Hidden", "false").lower() == "true" else "on"
+        return "off" if hidden else "other_copy"
+    return "disabled_by_os" if hidden else "on"
 
 
 def _systemd_state() -> str:
@@ -156,8 +158,8 @@ def _linux(exe: Path, enabled: bool | None) -> str:
         else:
             path.unlink(missing_ok=True)
         unit_state = "off"
-    if native:
-        return "other_copy" if path.exists() else unit_state
+    if native:  # an entry that starts nothing (absent or hidden) leaves the unit's state standing
+        return unit_state if _desktop_state(path, exe) in ("off", "disabled_by_os") else "other_copy"
     return "other_copy" if unit_state == "on" else _desktop_state(path, exe)
 
 

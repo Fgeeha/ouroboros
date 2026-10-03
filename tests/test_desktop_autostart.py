@@ -106,7 +106,10 @@ def test_linux_portable_registers_only_its_stable_target(host, tmp_path, appimag
     path.write_text(text + "Hidden=true\n", encoding="utf-8")
     assert startup.autostart_status()["state"] == "disabled_by_os"
     assert startup.autostart_status(True)["state"] == "on"
-    path.write_text(text.replace(str(exe), "/other/Ouroboros"), encoding="utf-8")
+    foreign = text.replace(str(exe), "/other/Ouroboros")
+    path.write_text(foreign + "Hidden=true\n", encoding="utf-8")
+    assert startup.autostart_status()["state"] == "off"  # a hidden entry starts no copy at all
+    path.write_text(foreign, encoding="utf-8")
     assert startup.autostart_status()["state"] == "other_copy"
     assert startup.autostart_status(False)["state"] == "off"
     assert not path.exists()
@@ -127,6 +130,20 @@ def test_linux_native_uses_shipped_unit_and_replaces_xdg_registration(host, tmp_
     os_state.unit = "enabled"
     assert startup.autostart_status(False)["state"] == "off"
     assert ["systemctl", "--user", "disable", "ouroboros.service"] in os_state.calls
+
+
+def test_linux_native_unit_is_not_masked_by_a_hidden_leftover_entry(host, tmp_path):
+    package, os_state = host
+    package("linux", native=True)
+    path = tmp_path / ".config/autostart/ouroboros.desktop"
+    path.parent.mkdir(parents=True)
+    leftover = '[Desktop Entry]\nType=Application\nExec="/home/me/Ouroboros.AppImage" --launch-intent automatic\n'
+    path.write_text(leftover + "Hidden=true\n", encoding="utf-8")  # turned off in the desktop's startup settings
+    assert startup.autostart_status()["state"] == "off"
+    os_state.unit = "enabled"
+    assert startup.autostart_status()["state"] == "on"
+    path.write_text(leftover, encoding="utf-8")  # a live leftover still starts the other copy
+    assert startup.autostart_status()["state"] == "other_copy"
 
 
 def test_linux_portable_disables_existing_native_registration_before_writing(host, tmp_path):
