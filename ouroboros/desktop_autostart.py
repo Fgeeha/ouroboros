@@ -125,7 +125,8 @@ def _desktop_command(exe: Path) -> str:
 
 
 def _desktop_state(path: Path, exe: Path) -> str:
-    """This copy's XDG entry. A Hidden=true entry starts nothing, whoever wrote it."""
+    """This copy's XDG entry. An entry turned off starts nothing, whoever wrote it: XDG Hidden=true,
+    or X-GNOME-Autostart-enabled=false from the Startup Applications of GNOME-family sessions."""
     parser = configparser.ConfigParser(interpolation=None)
     try:
         parser.read_string(path.read_text(encoding="utf-8"))
@@ -134,10 +135,11 @@ def _desktop_state(path: Path, exe: Path) -> str:
         return "off"
     except (configparser.Error, KeyError, UnicodeError):
         return "other_copy"
-    hidden = entry.get("Hidden", "false").lower() == "true"
+    off = (entry.get("Hidden", "false").lower() == "true"
+           or entry.get("X-GNOME-Autostart-enabled", "true").lower() == "false")
     if entry.get("Exec") != _desktop_command(exe) or entry.get("Type") != "Application":
-        return "off" if hidden else "other_copy"
-    return "disabled_by_os" if hidden else "on"
+        return "off" if off else "other_copy"
+    return "disabled_by_os" if off else "on"
 
 
 def _systemd_state() -> str:
@@ -185,7 +187,7 @@ def _linux(exe: Path, enabled: bool | None) -> str:
         else:
             path.unlink(missing_ok=True)
         unit_state = "off"
-    if native:  # an entry that starts nothing (absent or hidden) leaves the unit's state standing
+    if native:  # an entry that starts nothing (absent or turned off) leaves the unit's state standing
         return unit_state if _desktop_state(path, exe) in ("off", "disabled_by_os") else "other_copy"
     return "other_copy" if unit_state == "on" else _desktop_state(path, exe)
 

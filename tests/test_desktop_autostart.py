@@ -149,6 +149,12 @@ def test_linux_portable_registers_only_its_stable_target(host, tmp_path, appimag
     path.write_text(text + "Hidden=true\n", encoding="utf-8")
     assert startup.autostart_status()["state"] == "disabled_by_os"
     assert startup.autostart_status(True)["state"] == "on"
+    path.write_text(text + "X-GNOME-Autostart-enabled=true\n", encoding="utf-8")
+    assert startup.autostart_status()["state"] == "on"
+    path.write_text(text + "X-GNOME-Autostart-enabled=false\n", encoding="utf-8")  # Cinnamon Startup Applications
+    assert startup.autostart_status()["state"] == "disabled_by_os"
+    assert startup.autostart_status(True)["state"] == "on"
+    assert "X-GNOME-Autostart-enabled" not in path.read_text(encoding="utf-8")
     foreign = text.replace(command, '"/other/Ouroboros" --launch-intent automatic')
     path.write_text(foreign + "Hidden=true\n", encoding="utf-8")
     assert startup.autostart_status()["state"] == "off"  # a hidden entry starts no copy at all
@@ -196,13 +202,14 @@ def test_linux_native_uses_shipped_unit_and_replaces_xdg_registration(host, tmp_
     assert ["systemctl", "--user", "disable", "ouroboros.service"] in os_state.calls
 
 
-def test_linux_native_unit_is_not_masked_by_a_hidden_leftover_entry(host, tmp_path):
+@pytest.mark.parametrize("turned_off", ["Hidden=true", "X-GNOME-Autostart-enabled=false"])
+def test_linux_native_unit_is_not_masked_by_a_turned_off_leftover_entry(host, tmp_path, turned_off):
     package, os_state = host
     package("linux", native=True)
     path = tmp_path / ".config/autostart/ouroboros.desktop"
     path.parent.mkdir(parents=True)
     leftover = '[Desktop Entry]\nType=Application\nExec="/home/me/Ouroboros.AppImage" --launch-intent automatic\n'
-    path.write_text(leftover + "Hidden=true\n", encoding="utf-8")  # turned off in the desktop's startup settings
+    path.write_text(leftover + turned_off + "\n", encoding="utf-8")  # turned off in the desktop's startup settings
     assert startup.autostart_status()["state"] == "off"
     os_state.unit = "enabled"
     assert startup.autostart_status()["state"] == "on"
