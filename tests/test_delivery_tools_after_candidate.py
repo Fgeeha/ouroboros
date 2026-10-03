@@ -3,6 +3,7 @@
 import json
 
 from tests.test_delivery_candidate import _run_loop
+from tests.test_completion_selection import finish
 
 
 def test_further_write_then_complete_replacement_remain_available(tmp_path, monkeypatch):
@@ -13,14 +14,14 @@ def test_further_write_then_complete_replacement_remain_available(tmp_path, monk
          {"content": None, "tool_calls": [{"id": "write-1", "type": "function", "function": {
              "name": "write_file", "arguments": json.dumps({"path": "effect.txt", "content": "verified result"}),
          }}]},
-         json.dumps({"delivery_control": "replace", "full_answer": replacement})],
+         finish(replacement)],
         acceptance_results=[True, False],
     )
     prompt = json.dumps(calls[1])
-    assert "may continue using tools" in prompt
-    assert "only to your final response with no tool calls" in prompt
-    assert (tmp_path / "effect.txt").read_text() == "verified result"
+    assert "Continue useful work" in prompt and "available completion tool" in prompt
+    assert "action=finish" in prompt and "action=stop" in prompt
+    assert (tmp_path / "effect.txt").read_text(encoding="utf-8") == "verified result"
     assert result == replacement
     assert trace["delivery_candidate"]["revision"] == 2
-    assert trace["delivery_candidate"]["finalization_control"] == "replace"
+    assert trace["delivery_candidate"]["finalization_control"] == "candidate"
     assert trace["delivery_candidate"]["degraded"] is False

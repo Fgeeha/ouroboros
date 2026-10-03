@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import time
 
 import pytest
+
+from tests.ui_failure_evidence import FailureEvidence
 
 _CAPTURE_TEST_SOCKET = """() => {
     const NativeWebSocket = window.WebSocket;
@@ -87,18 +90,27 @@ def _emit_ws_frame(page, frame):
 def run_chat_viewport_smoke(
     direct_server_with_data,
     browser_engine,
+    request,
 ):
     """Live card growth follows bottom or preserves the visible descendant."""
     pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
     from playwright.sync_api import Error as PlaywrightError
     from playwright.sync_api import sync_playwright
+    from tests.ci_evidence import output_dir
 
+    evidence_dir, nodeid = output_dir(request.config), request.node.nodeid
     url = direct_server_with_data["url"]
     data_dir = direct_server_with_data["data_dir"]
     logs_dir = data_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
     (logs_dir / "chat.jsonl").write_text("", encoding="utf-8")
     (logs_dir / "progress.jsonl").write_text("", encoding="utf-8")
+
+    evidence = None
+
+    def emit_frame(page, frame):
+        evidence.checkpoint("emit_ws_frame", frame=frame)
+        _emit_ws_frame(page, frame)
 
     def card_top(page, task_id):
         return page.locator(f'.chat-live-card[data-task-id="{task_id}"]').evaluate(
@@ -136,6 +148,61 @@ def run_chat_viewport_smoke(
         page.evaluate(_SETTLE_TWO_FRAMES)
         return result
 
+    def read_to_latest(page):
+        # Follow is reading intent: the reader's own wheel reaches the live edge.
+        # A scripted scroll (set_remaining) moves the view but decides nothing.
+        deadline = time.monotonic() + 30
+        evidence.checkpoint("read_to_latest:prepare")
+        box = page.locator("#chat-messages").bounding_box()
+        evidence.point = {"x": box["x"] + box["width"] / 2, "y": box["y"] + box["height"] / 2}
+        page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+        # A native wheel impulse can finish short of the edge. Keep reading,
+        # but never accept a settled gesture that made no progress toward it.
+        while True:
+            before = jump_state(page)
+            page.evaluate("""() => {
+                const feed = document.querySelector('#chat-messages');
+                const state = window.__viewportWheel = {seen: false, scrolls: 0, settled: false};
+                const wheel = () => { state.seen = true; };
+                const scroll = () => { state.scrolls++; state.settled = false; };
+                const end = () => {
+                    if (!state.seen || !state.scrolls) return;
+                    const count = state.scrolls;
+                    requestAnimationFrame(() => requestAnimationFrame(() => {
+                        if (count === state.scrolls) state.settled = true;
+                    }));
+                };
+                for (const [type, handler] of [['wheel', wheel], ['scroll', scroll], ['scrollend', end]])
+                    feed.addEventListener(type, handler, {passive: true});
+                state.dispose = () => {
+                    for (const [type, handler] of [['wheel', wheel], ['scroll', scroll], ['scrollend', end]])
+                        feed.removeEventListener(type, handler);
+                    delete window.__viewportWheel;
+                };
+            }""")
+            try:
+                # Even an already-bottom reader needs an actual gesture to follow.
+                page.mouse.wheel(0, before["remaining"] + 200)
+                evidence.checkpoint("read_to_latest:wait_for_live_edge", before=before)
+                remaining_ms = (deadline - time.monotonic()) * 1000
+                assert remaining_ms > 0, "reading did not reach the live edge within 30 seconds"
+                page.wait_for_function(
+                    "atEdge => window.__viewportWheel.seen && (atEdge || window.__viewportWheel.settled)",
+                    arg=before["remaining"] <= 1, timeout=remaining_ms,
+                )
+                after = jump_state(page)
+                assert before["remaining"] <= 1 or after["remaining"] < before["remaining"], (before, after)
+                if after["remaining"] <= 1:
+                    break
+            finally:
+                if evidence.output_dir is not None:
+                    evidence._attempt("wheel_state", lambda: evidence.details.update(viewport_wheel=page.evaluate(
+                        "() => { const s = window.__viewportWheel; return s ? {seen: s.seen, scrolls: s.scrolls, "
+                        "settled: s.settled, time_ms: performance.now()} : {state: 'unavailable'}; }")))
+                page.evaluate("() => window.__viewportWheel.dispose()")
+        page.evaluate(_SETTLE_TWO_FRAMES)
+        evidence.checkpoint("read_to_latest:complete")
+
     def jump_state(page):
         return page.evaluate(
             """() => {
@@ -157,7 +224,13 @@ def run_chat_viewport_smoke(
         )
 
     def begin_noop_read(page):
-        set_remaining(page, 0)
+        # Establish follow through the existing reader action for the no-op
+        # precondition, even when a concurrent restore already hid the button.
+        # Physical button and wheel interactions are exercised separately below.
+        page.locator("#chat-scroll-bottom").dispatch_event("click")
+        page.evaluate(_SETTLE_TWO_FRAMES)
+        state = jump_state(page)
+        assert state["remaining"] <= 1 and state["dotHidden"], state
         return set_remaining(page, 40)["scrollTop"]
 
     def assert_noop_read(page, before):
@@ -166,8 +239,9 @@ def run_chat_viewport_smoke(
         assert abs(state["remaining"] - 40) <= 2 and state["dotHidden"], state
 
     def assert_noop_frame(page, frame):
+        evidence.checkpoint("noop_frame:prepare", planned_frame=frame)
         before = begin_noop_read(page)
-        _emit_ws_frame(page, frame)
+        emit_frame(page, frame)
         assert_noop_read(page, before)
 
     def hold_first_route(routes):
@@ -206,7 +280,8 @@ def run_chat_viewport_smoke(
                     pytest.fail(f"required Playwright {browser_engine} browser is not installed: {exc}")
                 raise
             page = browser.new_page(viewport={"width": 1280, "height": 760})
-            try:
+            evidence = FailureEvidence(page, browser, evidence_dir, nodeid, browser_engine)
+            with evidence:
                 page.add_init_script(f"({_CAPTURE_TEST_SOCKET})()")
                 page.route("**/api/state", incomplete_activity_census)
                 page.goto(url, wait_until="domcontentloaded", timeout=30_000)
@@ -220,26 +295,23 @@ def run_chat_viewport_smoke(
                     "() => window.__testSockets?.some(socket => socket.readyState === WebSocket.OPEN)",
                     timeout=30_000,
                 )
-                page.wait_for_function(
-                    "() => document.querySelector('#chat-messages')?.innerText.includes('Ouroboros has awakened')",
-                    timeout=30_000,
-                )
+                page.wait_for_selector('#chat-messages[data-history-hydrated="true"]', timeout=30_000)
                 # Threshold assertions start after the page-show restore lease;
                 # WebKit otherwise applies its final scheduled pin mid-scenario.
                 page.evaluate(_SETTLE_RESTORE_FRAMES)
 
-                _emit_ws_frame(page, {
+                emit_frame(page, {
                     "type": "chat", "role": "assistant", "is_progress": True,
                     "chat_id": 1, "task_id": "vp-parent",
                     "content": "Parent begins", "ts": "2026-08-03T10:00:00+00:00",
                 })
-                _emit_ws_frame(page, {
+                emit_frame(page, {
                     "type": "chat", "role": "assistant", "is_progress": True,
                     "chat_id": 1, "task_id": "vp-review",
                     "content": "Review target begins", "ts": "2026-08-03T10:00:00.500000+00:00",
                 })
                 for idx in range(1, 5):
-                    _emit_ws_frame(page, {
+                    emit_frame(page, {
                         "type": "chat", "role": "assistant", "is_progress": True,
                         "chat_id": 1, "task_id": f"vp-child-{idx}",
                         "delegation_role": "subagent", "subagent_event": "scheduled",
@@ -249,14 +321,14 @@ def run_chat_viewport_smoke(
                         "ts": f"2026-08-03T10:00:0{idx}+00:00",
                     })
                 for idx in range(1, 11):
-                    _emit_ws_frame(page, {
+                    emit_frame(page, {
                         "type": "chat", "role": "assistant", "is_progress": True,
                         "chat_id": 1, "task_id": f"vp-follow-{idx}",
                         "content": (f"Following task {idx} " * 14),
                         "ts": f"2026-08-03T10:01:{idx:02d}+00:00",
                     })
                 page.wait_for_selector('.chat-live-card[data-task-id="vp-follow-10"]', timeout=30_000)
-                _emit_ws_frame(page, {
+                emit_frame(page, {
                     "type": "chat", "role": "user", "chat_id": 1,
                     "client_message_id": "vp-routing", "sender_session_id": "routing-test",
                     "content": "Route this existing message", "ts": "2026-08-03T10:00:00.250000+00:00",
@@ -271,10 +343,12 @@ def run_chat_viewport_smoke(
                 assert state["visible"] and state["dotHidden"], state
                 assert state["label"] == state["title"] == "Scroll to latest message", state
 
-                # The visible pre-mutation distance is the only live-follow truth.
+                # A following reader follows only from within the 48px zone:
+                # the visible pre-mutation distance decides.
+                read_to_latest(page)
                 for case, target in enumerate((0, 40)):
                     assert abs(set_remaining(page, target)["remaining"] - target) <= 2
-                    _emit_ws_frame(page, {
+                    emit_frame(page, {
                         "type": "chat", "role": "assistant", "is_progress": True,
                         "chat_id": 1, "task_id": f"vp-threshold-follow-{case}",
                         "content": f"Follow at {target}px " * 18,
@@ -288,7 +362,7 @@ def run_chat_viewport_smoke(
                     assert jump_state(page)["dotHidden"]
                     assert abs(set_remaining(page, target)["remaining"] - target) <= 2
                     anchor = visible_card_anchor(page)
-                    _emit_ws_frame(page, {
+                    emit_frame(page, {
                         "type": "chat", "role": "assistant", "is_progress": True,
                         "chat_id": 1, "task_id": f"vp-threshold-freeze-{case}",
                         "content": f"Freeze at {target}px " * 18,
@@ -312,9 +386,9 @@ def run_chat_viewport_smoke(
                     set_remaining(page, 0)
                     assert jump_state(page)["dotHidden"]
 
-                # `_savedStick` is deliberately stale here: scroll and delivery
+                # Follow intent is deliberately stale here: scroll and delivery
                 # happen in one JS turn, before a native scroll event can repair it.
-                set_remaining(page, 0)
+                read_to_latest(page)
                 stale = page.evaluate(
                     """frame => {
                         const messages = document.querySelector('#chat-messages');
@@ -351,7 +425,7 @@ def run_chat_viewport_smoke(
 
                 # Native keyboard activation uses the same explicit landing path.
                 set_remaining(page, 300)
-                _emit_ws_frame(page, {
+                emit_frame(page, {
                     "type": "chat", "role": "assistant", "is_progress": True,
                     "chat_id": 1, "task_id": "vp-keyboard-jump",
                     "content": "Keyboard jump target", "ts": "2026-08-03T10:02:21+00:00",
@@ -372,15 +446,15 @@ def run_chat_viewport_smoke(
                     "content": "Exactly once", "ts": "2026-08-03T10:02:22+00:00",
                 }
                 set_remaining(page, 300)
-                _emit_ws_frame(page, duplicate)
+                emit_frame(page, duplicate)
                 button.click()
                 page.evaluate(_SETTLE_TWO_FRAMES)
                 set_remaining(page, 300)
-                _emit_ws_frame(page, duplicate)
+                emit_frame(page, duplicate)
                 state = jump_state(page)
                 assert state["remaining"] > 48 and state["dotHidden"], state
                 before_direct = state["scrollTop"]
-                _emit_ws_frame(page, {
+                emit_frame(page, {
                     "type": "chat", "role": "assistant", "is_progress": True,
                     "chat_id": 1,
                     "task_id": "vp-direct-work", "content": "Ordinary direct work",
@@ -391,7 +465,7 @@ def run_chat_viewport_smoke(
                 state = jump_state(page)
                 assert not state["dotHidden"] and state["dotCount"] == 1, state
                 assert abs(state["scrollTop"] - before_direct) <= 6, state
-                _emit_ws_frame(page, {
+                emit_frame(page, {
                     "type": "chat", "role": "assistant", "is_progress": True, "chat_id": 1,
                     "task_id": "vp-direct-work", "content": "More ordinary direct work",
                 })
@@ -400,7 +474,12 @@ def run_chat_viewport_smoke(
                 # Browser visibility is a lifecycle seam. A hidden pinned
                 # reader re-follows; a hidden history reader keeps its saved
                 # numeric position and receives the coalesced activity bit.
-                set_remaining(page, 0)
+                # Following is the reader's intent, set by ↓ or their own
+                # gesture; a scripted scroll event alone decides neither.
+                button.click()
+                page.evaluate(_SETTLE_TWO_FRAMES)
+                state = jump_state(page)
+                assert state["remaining"] <= 6 and state["dotHidden"], state
                 page.evaluate(
                     """() => {
                         window.__testDocumentHidden = true;
@@ -411,7 +490,7 @@ def run_chat_viewport_smoke(
                         document.dispatchEvent(new Event('visibilitychange'));
                     }"""
                 )
-                _emit_ws_frame(page, {
+                emit_frame(page, {
                     "type": "chat", "role": "assistant", "is_progress": True,
                     "chat_id": 1, "task_id": "vp-hidden-pinned",
                     "content": "Hidden pinned update", "ts": "2026-08-03T10:02:24+00:00",
@@ -426,7 +505,16 @@ def run_chat_viewport_smoke(
                 state = jump_state(page)
                 assert state["remaining"] <= 6 and state["dotHidden"], state
 
-                set_remaining(page, 300)
+                box = page.locator("#chat-messages").bounding_box()
+                page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+                page.mouse.wheel(0, -300)
+                page.wait_for_function(
+                    """() => {
+                        const messages = document.querySelector('#chat-messages');
+                        return messages.scrollHeight - messages.scrollTop - messages.clientHeight >= 298;
+                    }"""
+                )
+                page.evaluate(_SETTLE_TWO_FRAMES)
                 hidden_top = page.locator("#chat-messages").evaluate("node => node.scrollTop")
                 page.evaluate(
                     """() => {
@@ -434,7 +522,7 @@ def run_chat_viewport_smoke(
                         document.dispatchEvent(new Event('visibilitychange'));
                     }"""
                 )
-                _emit_ws_frame(page, {
+                emit_frame(page, {
                     "type": "chat", "role": "assistant", "is_progress": True,
                     "chat_id": 1, "task_id": "vp-hidden-reader",
                     "content": "Hidden history update", "ts": "2026-08-03T10:02:25+00:00",
@@ -466,7 +554,7 @@ def run_chat_viewport_smoke(
                         for idx in range(10)
                     ],
                 }
-                _emit_ws_frame(page, routing_frame)
+                emit_frame(page, routing_frame)
                 routing_card = page.locator('.chat-routing-card[data-routing-token="vp-route-token"]')
                 routing_card.wait_for(state="attached", timeout=10_000)
                 assert abs(card_top(page, routing_anchor["id"]) - routing_anchor["top"]) <= 6
@@ -479,7 +567,7 @@ def run_chat_viewport_smoke(
                 page.evaluate(_SETTLE_TWO_FRAMES)
                 assert abs(card_top(page, routing_anchor["id"]) - routing_anchor["top"]) <= 6
                 assert jump_state(page)["dotHidden"]
-                _emit_ws_frame(page, {
+                emit_frame(page, {
                     "type": "message_annotation", "annotation_type": "routing_ack",
                     "chat_id": 1, "client_message_id": "vp-routing", "status": "delivered",
                     "action": "steer_task", "target": "vp-route-0", "target_label": "Route 0",
@@ -495,7 +583,7 @@ def run_chat_viewport_smoke(
                 # Same-value lifecycle frames must perform no connected DOM
                 # writes: WebKit can otherwise move the viewport on the write.
                 set_remaining(page, 0)
-                _emit_ws_frame(page, {
+                emit_frame(page, {
                     "type": "quiz", "chat_id": 1, "quiz_id": "vp-quiz",
                     "task_id": "vp-quiz-task", "question": "Keep reading?",
                     "state": "open", "options": [{"label": "Yes"}, {"label": "No"}],
@@ -505,14 +593,14 @@ def run_chat_viewport_smoke(
                     "type": "quiz_state", "quiz_id": "vp-quiz",
                     "task_id": "vp-quiz-task", "state": "answered", "answered_index": 0,
                 }
-                _emit_ws_frame(page, quiz_state)
+                emit_frame(page, quiz_state)
                 assert_noop_frame(page, quiz_state)
                 set_remaining(page, 300)
 
                 # Cleanup is the inverse no-op case: a duplicate final bubble
                 # still removes a pending routing annotation, so that real height
                 # change must preserve the reader and mark remote activity.
-                _emit_ws_frame(page, {
+                emit_frame(page, {
                     "type": "chat", "role": "user", "chat_id": 1,
                     "client_message_id": "vp-routing-cleanup", "sender_session_id": "routing-test",
                     "content": "Route cleanup target", "ts": "2026-08-03T10:00:00.300000+00:00",
@@ -522,8 +610,8 @@ def run_chat_viewport_smoke(
                     "task_id": "vp-routing-cleanup-final", "content": "Routing settled",
                     "ts": "2026-08-03T10:00:00.400000+00:00",
                 }
-                _emit_ws_frame(page, duplicate_final)
-                _emit_ws_frame(page, {
+                emit_frame(page, duplicate_final)
+                emit_frame(page, {
                     "type": "message_annotation", "annotation_type": "routing_ack",
                     "chat_id": 1, "client_message_id": "vp-routing-cleanup",
                     "status": "pending",
@@ -535,7 +623,7 @@ def run_chat_viewport_smoke(
                 page.evaluate(_SETTLE_TWO_FRAMES)
                 set_remaining(page, 300)
                 routing_anchor = visible_card_anchor(page)
-                _emit_ws_frame(page, duplicate_final)
+                emit_frame(page, duplicate_final)
                 assert abs(card_top(page, routing_anchor["id"]) - routing_anchor["top"]) <= 6
                 assert not jump_state(page)["dotHidden"]
                 assert page.locator(
@@ -572,14 +660,14 @@ def run_chat_viewport_smoke(
                     "type": "task_named", "task_id": "vp-parent",
                     "suggested_name": "A deliberately long generated project name " * 12,
                 }
-                _emit_ws_frame(page, parent_name)
+                emit_frame(page, parent_name)
                 child_after_name = page.locator(child_selector).evaluate("el => el.getBoundingClientRect().top")
                 parent_height_named = parent.evaluate("card => card.getBoundingClientRect().height")
                 assert parent_height_named > parent_height_before + 20
                 assert abs(child_after_name - child_before) <= 6
 
                 for idx in range(8):
-                    _emit_ws_frame(page, {
+                    emit_frame(page, {
                         "type": "chat", "role": "assistant", "is_progress": True,
                         "chat_id": 1, "task_id": "vp-parent",
                         "content": (f"Visible parent timeline update {idx} " * 10),
@@ -608,7 +696,7 @@ def run_chat_viewport_smoke(
                     "content": "Late child mounted above the reader",
                     "ts": "2026-08-03T10:04:00+00:00",
                 }
-                _emit_ws_frame(page, late_child_frame)
+                emit_frame(page, late_child_frame)
                 # Observe this mount's real height change before testing the
                 # viewport; elapsed animation frames alone do not establish it.
                 # A missing or zero-height child still fails.
@@ -642,7 +730,7 @@ def run_chat_viewport_smoke(
                     }]},
                 }
                 anchor_before = card_top(page, anchor_id)
-                _emit_ws_frame(page, enriched_child)
+                emit_frame(page, enriched_child)
                 assert page.locator(
                     '.chat-live-card[data-task-id="vp-late-child"] [data-live-review-summary]'
                 ).text_content() == "Reviews 1"
@@ -664,7 +752,7 @@ def run_chat_viewport_smoke(
                         "artifacts": {"status": "ready"},
                     },
                 }
-                _emit_ws_frame(page, parent_summary)
+                emit_frame(page, parent_summary)
                 assert parent.get_attribute("data-expanded") == "1"
                 # A terminal summary is legally shorter than live narration by a
                 # couple of wrapped lines; three --type-body line boxes
@@ -678,15 +766,15 @@ def run_chat_viewport_smoke(
 
                 # Internal metrics and a stable-key task_done may reconcile
                 # state, but their exact repeats cannot become scroll authors.
-                _emit_ws_frame(page, {"type": "log", "data": {
+                emit_frame(page, {"type": "log", "data": {
                     "chat_id": 1, "type": "task_started", "task_id": "vp-title-noop",
                 }})
                 terminal = {"type": "chat", "role": "assistant", "chat_id": 1,
                             "task_id": "vp-title-noop", "task_terminal_status": "completed",
                             "content": "Title terminal"}
-                _emit_ws_frame(page, terminal)
+                emit_frame(page, terminal)
                 assert_noop_frame(page, terminal)
-                _emit_ws_frame(page, {
+                emit_frame(page, {
                     "type": "chat", "role": "assistant", "is_progress": True,
                     "chat_id": 1, "task_id": "vp-log-noop", "content": "Log target",
                     "ts": "2026-08-03T10:05:01+00:00",
@@ -695,20 +783,20 @@ def run_chat_viewport_smoke(
                     "chat_id": 1, "type": "task_metrics_event", "task_id": "vp-log-noop",
                     "tool_calls": 1, "tool_errors": 0, "ts": "2026-08-03T10:05:02+00:00",
                 }}
-                _emit_ws_frame(page, metric)
+                emit_frame(page, metric)
                 assert_noop_frame(page, metric)
                 error_frame = {"type": "log", "data": {
                     "chat_id": 1, "type": "tool_timeout", "task_id": "vp-log-noop",
                     "tool": "browser", "error": "timed out",
                     "ts": "2026-08-03T10:05:02.500000+00:00",
                 }}
-                _emit_ws_frame(page, error_frame)
+                emit_frame(page, error_frame)
                 assert_noop_frame(page, error_frame)
                 task_done = {"type": "log", "data": {
                     "chat_id": 1, "type": "task_done", "task_id": "vp-log-noop",
                     "status": "completed", "ts": "2026-08-03T10:05:03+00:00",
                 }}
-                _emit_ws_frame(page, task_done)
+                emit_frame(page, task_done)
                 assert_noop_frame(page, task_done)
 
                 # A stable-key repeat can add only the newly-authorized Stop
@@ -720,7 +808,7 @@ def run_chat_viewport_smoke(
                     "content": "Authority target", "ts": "2026-08-03T10:05:03.500000+00:00",
                 }
                 set_remaining(page, 0)
-                _emit_ws_frame(page, cancel_authority)
+                emit_frame(page, cancel_authority)
                 assert page.locator(
                     '.chat-live-card[data-task-id="vp-cancel-authority"] [data-cancel-run]'
                 ).count() == 0
@@ -742,7 +830,7 @@ def run_chat_viewport_smoke(
                 )
                 set_remaining(page, 300)
                 authority_anchor = visible_card_anchor(page)
-                _emit_ws_frame(page, {**cancel_authority, "cancelable": True})
+                emit_frame(page, {**cancel_authority, "cancelable": True})
                 assert page.locator(
                     '.chat-live-card[data-task-id="vp-cancel-authority"] [data-cancel-run]'
                 ).count() == 1
@@ -760,11 +848,11 @@ def run_chat_viewport_smoke(
                 page.route(
                     "**/api/tasks/vp-cancel-noop/cancel",
                     lambda route: route.fulfill(status=202, content_type="application/json", body=json.dumps({
-                        "task_id": "vp-cancel-noop", "cancel_state": "pending",
+                        "ok": True, "task_id": "vp-cancel-noop", "cancel_state": "pending",
                         "stop_policy": "finalize_then_cancel",
                     })),
                 )
-                _emit_ws_frame(page, {
+                emit_frame(page, {
                     "type": "chat", "role": "assistant", "is_progress": True, "cancelable": True,
                     "chat_id": 1, "task_id": "vp-cancel-noop", "content": "Cancelable target",
                     "ts": "2026-08-03T10:05:04+00:00",
@@ -821,7 +909,7 @@ def run_chat_viewport_smoke(
                     "chat_id": 1, "task_id": "vp-review", "surface": "plan_review",
                     "state_revision": "a" * 64, "ts": "2026-08-03T10:05:10+00:00",
                 }
-                _emit_ws_frame(page, review_reference)
+                emit_frame(page, review_reference)
                 page.wait_for_function(
                     "() => document.querySelector('.chat-live-card[data-task-id=\"vp-review\"] "
                     "[data-live-review-summary]')?.textContent === 'Reviews 1'",
@@ -843,7 +931,7 @@ def run_chat_viewport_smoke(
                             scrollHeight: messages.scrollHeight};
                     }"""
                 )
-                _emit_ws_frame(page, review_reference)
+                emit_frame(page, review_reference)
                 duplicate_after = page.evaluate(
                     """() => {
                         const card = document.querySelector('.chat-live-card[data-task-id="vp-review"]');
@@ -866,7 +954,7 @@ def run_chat_viewport_smoke(
                     "state_revision": "b" * 64, "ts": "2026-08-03T10:05:11+00:00",
                 }
                 with page.expect_request("**/api/tasks/vp-review-race"):
-                    _emit_ws_frame(page, delayed_reference)
+                    emit_frame(page, delayed_reference)
                 for _ in range(100):
                     if held_review_routes:
                         break
@@ -915,7 +1003,7 @@ def run_chat_viewport_smoke(
                         };
                     }"""
                 )
-                _emit_ws_frame(page, {
+                emit_frame(page, {
                     "type": "chat", "role": "assistant", "chat_id": 1,
                     "markdown": True, "ts": "2026-08-03T10:00:30+00:00",
                     "content": "Late viewport diagram\n\n```mermaid\ngraph TD; A-->B\n```",
@@ -932,7 +1020,7 @@ def run_chat_viewport_smoke(
 
                 review_child = page.locator('.chat-live-card[data-task-id="vp-late-child"]')
                 review_before = review_child.evaluate("card => card.getBoundingClientRect().height")
-                _emit_ws_frame(page, {
+                emit_frame(page, {
                     "type": "chat", "role": "assistant", "is_progress": True,
                     "chat_id": 1, "task_id": "vp-late-child",
                     "delegation_role": "subagent", "subagent_event": "completed",
@@ -994,7 +1082,7 @@ def run_chat_viewport_smoke(
                     "content": "Delayed detail target", "ts": "2026-08-03T10:07:00+00:00",
                 }
                 set_remaining(page, 0)
-                _emit_ws_frame(page, detail_progress)
+                emit_frame(page, detail_progress)
                 held_missing_detail = []
                 page.route(
                     "**/api/tasks/vp-detail-noop",
@@ -1046,12 +1134,12 @@ def run_chat_viewport_smoke(
                     )
 
                 page.route("**/api/chat/history*", serve_history)
-                _emit_ws_frame(page, {
+                emit_frame(page, {
                     "type": "chat", "role": "assistant", "is_progress": True,
                     "chat_id": 1, "task_id": "vp-history-trigger",
                     "content": "History trigger", "ts": "2026-08-03T10:07:02+00:00",
                 })
-                _emit_ws_frame(page, {
+                emit_frame(page, {
                     "type": "chat", "role": "system", "system_type": "task_summary",
                     "chat_id": 1, "task_id": "vp-history-trigger", "content": "Done",
                     "ts": "2026-08-03T10:07:03+00:00",
@@ -1074,14 +1162,12 @@ def run_chat_viewport_smoke(
                 assert_noop_read(page, noop_top)
                 set_remaining(page, 300)
                 healing_anchor = visible_card_anchor(page)
-                _emit_ws_frame(page, {
+                emit_frame(page, {
                     "type": "chat", "role": "assistant", "is_progress": True,
                     "chat_id": 1, "task_id": "vp-threshold-freeze-0", "content": "Late ordinary work",
                 })
                 assert abs(card_top(page, healing_anchor["id"]) - healing_anchor["top"]) <= 6
                 assert page.locator('[data-task-id="vp-threshold-freeze-0"]').count() == 1 and not jump_state(page)["dotHidden"]
-            finally:
-                browser.close()
     except PlaywrightError as exc:
         if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
             pytest.fail(f"required Playwright {browser_engine} browser is not installed: {exc}")

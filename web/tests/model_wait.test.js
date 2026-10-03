@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { activeModelWaits, createModelWaitController, isModelWaitReference, mergeModelWaits, modelWaitAction, modelWaitRoleLabel } from '../modules/model_wait.js';
+import { activeModelWaits, createModelWaitController, isModelWaitReference, MODEL_WAIT_REASONS, mergeModelWaits, modelWaitAction, modelWaitRoleLabel } from '../modules/model_wait.js';
 import { desiredLiveCardPhase } from '../modules/task_phase_chip.js';
 import { computeDerivedChatStatus } from '../modules/chat_activity.js';
 
@@ -74,7 +74,13 @@ test('confirmed mixed access keeps an actionable replay row without inventing an
     const state = mergeModelWaits({}, { [mixed.wait_id]: mixed });
     assert.deepEqual(activeModelWaits(state), [mixed]);
     assert.equal(state[mixed.wait_id].credential_profile_id, '');
-    assert.deepEqual(mergeModelWaits({}, { [mixed.wait_id]: row({ reason: 'unavailable' }) }), {});
+    assert.deepEqual(mergeModelWaits({}, { [mixed.wait_id]: row({ reason: 'pool' }) }), {});
+});
+
+test('an engine-dated unavailable pool is its own actionable reason, not quota or sign-in', () => {
+    const pool = row({ reason: 'unavailable', credential_profile_id: '', reset_at: '2099-01-01T00:00:00Z' });
+    assert.deepEqual(activeModelWaits(mergeModelWaits({}, { [pool.wait_id]: pool })), [pool]);
+    assert.ok(MODEL_WAIT_REASONS.includes('unavailable') && !MODEL_WAIT_REASONS.includes('transport'));
 });
 
 test('switch payload binds the exact wait revision and defaults to temporary role change', () => {

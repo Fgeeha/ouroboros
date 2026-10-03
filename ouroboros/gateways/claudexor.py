@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import httpx
+from ouroboros.effort_evidence import validated_effort_resolution
 
 from ouroboros.config import (
     CLAUDEXOR_MIN_VERSION,
@@ -162,12 +163,26 @@ def run_failure_cause(failure: Any) -> str:
     """What the engine REPORTED about a failed run (``failure.safeMessage``), whitespace-
     collapsed, secret-redacted and strictly bounded; "" when it reported nothing. An OPAQUE
     fact: stored and displayed, never parsed or branched on (BIBLE P5) — presence is the
-    only test a caller may make."""
+    only test a caller may make; a person's quote separates the host's own cut from the
+    engine's words through ``reported_cause_words``."""
     from ouroboros.utils import sanitize_tool_result_for_log, truncate_within_limit
 
     words = (failure if isinstance(failure, dict) else {}).get("safeMessage")
     return truncate_within_limit(
         sanitize_tool_result_for_log(" ".join(str(words or "").split())), REPORTED_CAUSE_CHARS)
+
+
+def reported_cause_words(cause: Any) -> tuple[str, bool]:
+    """``(words, shortened)`` of a stored ``run_failure_cause``: the engine's words
+    without the bound's own omission marker (``truncate_within_limit``), and whether
+    that bound cut them. The words were whitespace-collapsed before the bound, so a
+    newline can only open the host's marker; the engine's words are never read."""
+    text = str(cause or "")
+    words, marker, length = text.rpartition(
+        f"\n⚠️ OMISSION NOTE: truncated at {REPORTED_CAUSE_CHARS} chars; original length ")
+    if marker and "\n" not in words and length.isdigit() and int(length) > len(text) == REPORTED_CAUSE_CHARS:
+        return words, True
+    return text, False
 
 
 def run_failure_error(run_id: str, run_state: str, failure: Any) -> ClaudexorUnavailable:
@@ -559,6 +574,38 @@ class ClaudexorGateway:
                              **({"timeout_sec": timeout_sec} if timeout_sec is not None else {}))
         return body if isinstance(body, dict) else {}
 
+    def ask_input_limits(self) -> Dict[str, Dict[str, Any]]:
+        """Declared native text limits with the engine's ordinary ASK framing.
+
+        This catalog projection covers initial attempts, including thread turns.
+        Missing/unknown units or framing remain unknown, never a model window.
+        """
+        limits: Dict[str, Dict[str, Any]] = {}
+        for row in self.agent_capabilities().get("harnesses") or []:
+            if not isinstance(row, dict) or not row.get("id"):
+                continue
+            for value in row.get("inputLimits") or []:
+                if not isinstance(value, dict):
+                    continue
+                framing = value.get("askPromptBudget")
+                if (value.get("scope") != "turn_text" or value.get("unit") != "unicode_scalars"
+                        or not isinstance(framing, dict)
+                        or framing.get("shape") != "ordinary_initial_attempt"):
+                    continue
+                bound, overhead = value.get("limit"), framing.get("engineOverheadMax")
+                if (type(bound) is not int or bound <= 0 or type(overhead) is not int or overhead < 0
+                        or not isinstance(value.get("source"), str) or not value["source"]
+                        or not isinstance(value.get("verified_against"), str) or not value["verified_against"]):
+                    continue
+                candidate = {**value, "askPromptBudget": dict(framing),
+                             "prompt_budget": max(0, bound - overhead),
+                             "engine_version": self.engine_version,
+                             "engine_build_sha": self.engine_build_sha}
+                route_id = str(row["id"])
+                if route_id not in limits or candidate["prompt_budget"] < limits[route_id]["prompt_budget"]:
+                    limits[route_id] = candidate
+        return limits
+
     # Model operations use the same private control transport, not Agent runs
     # or the redacted/size-capped artifact surface. Callers own all admission,
     # waiting, billing and explicit acknowledgement. The engine owns account
@@ -653,10 +700,14 @@ class ClaudexorGateway:
         return ref
 
     def create_model_operation(self, request_ref: Dict[str, Any], *,
-                               idempotency_key: str, capture_failure_evidence: bool = False) -> Dict[str, Any]:
+                               idempotency_key: str, capture_failure_evidence: bool = False,
+                               capture_effort_evidence: bool = False) -> Dict[str, Any]:
         """Create or rejoin exactly one caller-identified generation; never mint a retry key."""
         key = _model_idempotency_key(idempotency_key)
-        path = "/v2/model-operations" + ("?captureFailureEvidence=true" if capture_failure_evidence else "")
+        query = "&".join(f"{name}=true" for name, enabled in (
+            ("captureFailureEvidence", capture_failure_evidence),
+            ("captureEffortEvidence", capture_effort_evidence)) if enabled)
+        path = "/v2/model-operations" + (f"?{query}" if query else "")
         return _model_operation(self._request(
             "POST", path, json_body={"request": _model_payload_ref(request_ref)},
             headers={"Idempotency-Key": key},
@@ -674,14 +725,10 @@ class ClaudexorGateway:
     def get_model_result(self, operation_id: str, *, expected_ref: Dict[str, Any],
                          timeout_sec: Optional[float] = None,
                          raw_bytes: bool = False) -> Dict[str, Any] | bytes:
-        """Read and verify the complete result, without ACK, redaction or artifact caps.
-
-        The expected reference comes from this operation's ready custody record.
-        Failure preserves that handle: only another read of the same operation is
-        appropriate here, never a new generation. The caller acknowledges after
-        it has retained the returned result under its own custody contract.
-        ``raw_bytes`` retains the exact verified JSON encoding for that custody;
-        it never skips the size, digest, UTF-8 or object validation below.
+        """Verify the complete result against ready custody; no ACK, redaction or caps.
+        Failure preserves the handle: re-read this operation, never regenerate.
+        The caller ACKs after retaining the result under its own custody contract.
+        ``raw_bytes`` keeps exact JSON encoding; size, digest, UTF-8 and object checks apply.
         """
         from urllib.parse import quote
 
@@ -726,7 +773,8 @@ class ClaudexorGateway:
         The agent-capability catalog is a derived projection that deliberately
         drops the manifest's transport flags (``json_schema_output``,
         ``interactive``); this is the surface that still carries them, so
-        transport-capability questions are asked here, not of the catalog.
+        these transport questions are asked here. The catalog's explicit
+        ``inputLimits`` projection separately includes engine ASK framing.
         """
         body = self._request("GET", "/v2/harnesses")
         rows = body.get("harnesses") if isinstance(body, dict) else None
@@ -1442,8 +1490,8 @@ def attempt_containment(run_dir: str) -> List[AttemptContainment]:
     return applied
 
 
-def final_attempt_facts(detail: Dict[str, Any], run_id: str) -> Dict[str, str]:
-    """Read the final attempt's route facts from engine-owned telemetry.
+def final_attempt_facts(detail: Dict[str, Any], run_id: str) -> Dict[str, Any]:
+    """Read the final attempt's route and effort facts from engine-owned telemetry.
 
     The summary's model and harnesses echo the request; its route/authRoute
     projections may borrow facts from earlier attempts. Only the unique row
@@ -1472,13 +1520,16 @@ def final_attempt_facts(detail: Dict[str, Any], run_id: str) -> Dict[str, str]:
     if len(matching) != 1:
         return {}
     row = matching[0]
-    return {
+    facts = {
         target: row.get(source) if isinstance(row.get(source), str) else ""
         for target, source in (
             ("attempt_id", "attempt_id"), ("harness_id", "harness_id"),
             ("model", "observed_model"), ("profile_id", "profile_id"),
         )
     }
+    if "effort_resolution" in row:
+        facts["effort_resolution"] = validated_effort_resolution(row["effort_resolution"])
+    return facts
 
 
 __all__ = [

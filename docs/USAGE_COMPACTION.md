@@ -52,7 +52,7 @@ settlement or release the row is immutable again. Identical actual-receipt retri
 are no-op at the accounting writer; conflicting receipts cannot append. The full
 validator and incremental `LedgerResumeState.late_receipt_ids` preserve the same
 eligibility, so a warm read grants no extra transition and loses no owed receipt.
-Compaction preserves the whole eligible chain, not just its last row. Existing
+Compaction preserves the whole eligible chain, not just its last row, including a raw send's optional `local_answer_owner_pid`. Proven local consumer death can change writer classification; it never makes an unresolved monetary chain foldable. Existing
 baseline groups keep their recorded sums and weights; the archive is not migrated
 to invent individually correctable attempts.
 
@@ -90,9 +90,15 @@ whole history.
 
 ```
 key = (state, model, provider, category, source,
-       task_id, root_task_id, parent_task_id,
+       task_id, root_task_id, parent_task_id, billing_group_id,
+       has_group_limit, group_limit, group_limit_source, group_limit_revision,
        prompt_cache_ttl, cost_known, cost_final, pricing_known, bound_known)
 ```
+
+(`billing_group_id` keeps an owner Continue's whole-work group intact through
+the fold; a group row carries it only when non-empty. Cap presence, value,
+source and revision are preserved together, including an explicitly unbounded
+cap, so compaction cannot replace an original group cap with later configuration.)
 
 carrying: the key fields verbatim; `folded_attempt_count` (int ≥ 1);
 `cost_usd` / `reservation_upper_bound_usd` as **exact-decimal JSON strings**
@@ -241,6 +247,32 @@ The group key (§4) makes each group homogeneous in every branch predicate
 `_summary` evaluates per row (`cost is None`, `cost_final`,
 `pricing_known is False`, `bound is None`, state), so the per-group branch is
 exactly the per-row branch taken `weight` times with the sums pre-added.
+
+Original cap authority is separate from aggregate minima. `BindingIndex`
+keeps the earliest original root/group fields verbatim, including explicit
+unlimited `None`. Compaction stamps `binding_authority=carried` and puts
+`original_root_binding` / `original_group_binding` on the first aggregate for
+each identity. Exact `unbound` leaves that axis open to the first later original
+row. Missing, malformed or foreign modern carriage fixes UNKNOWN; a later cap
+or aggregate sort order cannot replace it.
+
+Older unstamped blocks may recover exact original fields through
+`usage_compaction.prepare_original_bindings`: the existing hash/size/transition
+and complete epoch/anchor validation, oldest source first. A newer UNKNOWN
+can inherit only a recovery proved for its own archived source. Unrecorded,
+pre-archive/imported or corrupt authority stays a gap, never current settings.
+Source/revision fields remain unchanged; the header's segment chain retains
+the original attempt evidence. Durable bindings and owner amendments remain
+separate authorities.
+
+Strict writer preparation recovers outside the money lock; generation/CAS and
+appended-suffix validation precede use. Its archive certificate shares the
+existing segment-cache lifetime and checks source fingerprints. Warm admission
+uses that view without parsing archives; source loss invalidates it. Display
+and raw-record reads do not initiate archive recovery. Compaction borrows only
+prepared authority, compares exact source/candidate bindings and money, and
+carries recovered values for cold reads. An unprepared explicit pass preserves
+UNKNOWN with its archive chain, allowing later off-lock recovery.
 
 ## 8. Concurrency, crash-safety, caches
 
@@ -840,7 +872,7 @@ tests/fixtures_usage_compaction.py)
 
 ## Writer continuity and qualification
 
-`usage_ledger.py` owns one cross-process lock for validation/reservation/transition/append/fsync; accounting imports it, never vice versa. Warm writers borrow one generation-bound `_usage_rows_memo` view: only unseen/appended rows and touched IDs/roots update validation (including late-receipt rights), final IDs and exact cash. Cold/replaced views parse a captured newline-aligned extent outside the lock, then prove file identity and cache generation and reconcile the suffix inside; replacement, including committed compaction, releases and reprepares. Strict projection, root refresh, review-wave, seal audit and custody maintenance readers reuse this SAME prepared source: they capture private immutable row references and a scalar generation under lock, then copy/render outside it. `read_usage_records(final_only=...)` supplies detached nested snapshots; full-record import remains atomic under its original lock. Seal manifest selection precedes the snapshot; maintenance retains sequence rechecks and review/late-owner policies. Display memo/render generations never retain mutable writer indexes or resume-state maps. Public full-record/resume readers retain snapshots. Cache publication follows durable append; append/fsync uncertainty invalidates it. Resume trusts the validated prefix without rereading it: within one inode, rows are only appended under the lock (locked quarantine truncates only a rejected tail), and history changes only by atomic replacement. Its new inode, like a shrink or a same-size rewrite with a new `mtime_ns`, forces preparation and full validation. A same-inode rewrite that grows the file (an editor saving in place, say) is outside this protocol: the warm view parses only the bytes past its offset, which may happen to be valid, so rewritten history can stay unseen until the next replacement or cold preparation. Rehashing history on each warm write would restore the per-append full-history cost this view removes. Full, incremental and cold preparation share `_decode_record`: UTF-8 JSON objects, with only real empty line separators ignored (whitespace-only or alternate-encoding records are invalid). Exceptional tail quarantine remains locked and loud; middle corruption fails closed. Display `allow_stale` never authorizes admission.
+`usage_ledger.py` owns one cross-process lock for validation/reservation/transition/append/fsync; accounting imports it, never vice versa. Warm writers borrow one generation-bound `_usage_rows_memo` view: only unseen/appended rows and touched IDs/roots/billing groups update validation (including late-receipt rights), final IDs and exact cash. Cold/replaced views parse a captured newline-aligned extent outside the lock, then prove file identity and cache generation and reconcile the suffix inside; replacement, including committed compaction, releases and reprepares. Strict projection, root refresh, review-wave, seal audit and custody maintenance readers reuse this SAME prepared source: they capture private immutable row references and a scalar generation under lock, then copy/render outside it. `read_usage_records(final_only=...)` supplies detached nested snapshots; full-record import remains atomic under its original lock. Seal manifest selection precedes the snapshot; maintenance retains sequence rechecks and review/late-owner policies. Display memo/render generations never retain mutable writer indexes or resume-state maps. Public full-record/resume readers retain snapshots. Cache publication follows durable append; append/fsync uncertainty invalidates it. Resume trusts the validated prefix without rereading it: within one inode, rows are only appended under the lock (locked quarantine truncates only a rejected tail), and history changes only by atomic replacement. Its new inode, like a shrink or a same-size rewrite with a new `mtime_ns`, forces preparation and full validation. A same-inode rewrite that grows the file (an editor saving in place, say) is outside this protocol: the warm view parses only the bytes past its offset, which may happen to be valid, so rewritten history can stay unseen until the next replacement or cold preparation. Rehashing history on each warm write would restore the per-append full-history cost this view removes. Full, incremental and cold preparation share `_decode_record`: UTF-8 JSON objects, with only real empty line separators ignored (whitespace-only or alternate-encoding records are invalid). Exceptional tail quarantine remains locked and loud; middle corruption fails closed. Display `allow_stale` never authorizes admission. Whole-work group keys share one pure legacy-root fallback rule in replay and the writer; root identities remain distinct. Compaction preserves the group cap source/revision and explicit unlimited `None`, checks group projection equality, and independently compares exact raw cash/bounds by root and group as well as globally.
 
 `_usage_money.py` shares reversible precision-60 Decimal cash contributions with full replay and compaction, trapping unintended rounding. Baseline strings/raw monetary number literals retain precision. `monetary_scope_key` defines root selection once for replay and the incremental index; absent/None/empty roots retain their existing meaning, and future metadata gains no invented authority. Admission keeps six-place half-even bucket rounding and the existing `1e-9` allowance; the historical float ordering artifact at exact `2.4675885` now consistently renders `2.467588`. Historical charges are not rewritten. Rich subscription/window/non-money projections retain full replay. The same writer view indexes fold eligibility using compactor policy and timestamps: baseline-only residue cannot repeatedly launch an unprofitable full pass, while eligible attempts still use the existing locked durable compaction.
 

@@ -215,29 +215,28 @@ def _scheduled_tasks_digest(env: Any, *, limit: int = 8) -> Optional[Dict[str, A
     except Exception:
         log.debug("Failed to read scheduled tasks for context digest", exc_info=True)
         return None
-    tasks = [
-        t for t in (data.get("tasks") or [])
-        if isinstance(t, dict) and t.get("enabled", True)
-    ]
+    from supervisor.followup_policy import observed_store
+    from supervisor.queue_schedules import schedule_lifecycle_status
+    root = pathlib.Path(env.drive_path("state/scheduled_tasks.json")).parent.parent
+    data = observed_store(root, data)
+    # A deleted row still finishing accepted work stays in view until it goes.
+    tasks = [t for t in data.get("tasks", []) if isinstance(t, dict) and (t.get("enabled", True)
+             or t.get("followup_hold") or t.get("followup_wait") or t.get("delete_requested_at"))]
     if not tasks:
         return None
-    digest: List[Dict[str, Any]] = []
+    out: Dict[str, Any] = {"active": [], "held": [], "waiting": []}
     for record in tasks[:limit]:
-        trigger = record.get("trigger") if isinstance(record.get("trigger"), dict) else {}
-        entry = {
-            "id": str(record.get("id") or ""),
-            "name": str(record.get("name") or ""),
-            "timezone": str(record.get("timezone") or "") or "local",
-            "next_run_at": str(record.get("next_run_at") or ""),
-        }
-        if str(trigger.get("type") or "cron") == "once":
-            # One-shot records (schedule_followup) have no cron cadence: project
-            # the fire instant instead of an empty-string cron.
-            entry["run_at"] = str(trigger.get("run_at") or "")
-        else:
-            entry["cron"] = str(trigger.get("expr") or record.get("cron") or "")
-        digest.append(entry)
-    out: Dict[str, Any] = {"active": digest}
+        trigger = record.get("trigger") or {}
+        status = schedule_lifecycle_status(record)
+        entry = {"id": record.get("id"), "name": record.get("name"), "status": status,
+                 "relation": record.get("relation"), "followup_hold": record.get("followup_hold"),
+                 "followup_wait": record.get("followup_wait"), "hold_persisted": record.get("hold_persisted"),
+                 "timezone": record.get("timezone") or "local", "next_run_at": record.get("next_run_at") or ""}
+        entry["run_at" if trigger.get("type") == "once" else "cron"] = trigger.get("run_at" if trigger.get("type") == "once" else "expr", "")
+        if status == "delete_pending":
+            out.setdefault("delete_pending", []).append(entry)
+            continue
+        out["held" if record.get("followup_hold") else "waiting" if record.get("followup_wait") else "active"].append(entry)
     if len(tasks) > limit:
         out["omitted_count"] = len(tasks) - limit
     return out
@@ -269,6 +268,7 @@ from ouroboros.context_runtime_facts import (  # noqa: E402,F401 — re-exported
     _queue_context_fact,
     _runtime_budget_info,
     task_execution_clock_fact,
+    task_schedule_fact,
 )
 
 
@@ -354,6 +354,7 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None, sc
             "budget_drive_root": task.get("budget_drive_root"),
             "deadline_at": task.get("deadline_at"),
             **task_execution_clock_fact(task, ctx),
+            **task_schedule_fact(task),
             "allowed_resources": task.get("allowed_resources"),
             "context": task.get("context"),
         },
@@ -400,11 +401,14 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None, sc
     try:
         from ouroboros.config import get_allow_mutative_subagents
         from ouroboros.contracts.task_constraint import VALID_WRITE_SURFACES
+        from ouroboros.workspace_copies import workspace_copy_source_is_system
 
+        copy_source_is_system = workspace_copy_source_is_system(ctx or env, str(task.get("workspace_root") or ""))
         runtime_data["capabilities"] = {
             "allow_mutative_subagents": bool(get_allow_mutative_subagents()),
             "mutative_subagent_surfaces": sorted(
-                s for s in VALID_WRITE_SURFACES if get_allow_mutative_subagents(s)
+                s for s in VALID_WRITE_SURFACES
+                if get_allow_mutative_subagents(s, source_is_system_repo=copy_source_is_system)
             ),
             "write_surfaces": sorted(VALID_WRITE_SURFACES),
             "web_search_backend": runtime_setting("OUROBOROS_WEBSEARCH_BACKEND", "auto"),
@@ -417,7 +421,8 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None, sc
                 "applies to every surface; when it is empty the runtime mode decides, "
                 "SURFACE-AWARE: advanced/pro/cyber_pro allow every surface, light allows "
                 "external_workspace/genesis — they build outside the Ouroboros runtime — "
-                "and keeps self_worktree off). mutative_subagent_surfaces lists what is "
+                "including isolated project copies; own-body self_worktree stays off). "
+                "mutative_subagent_surfaces lists what is "
                 "actually schedulable RIGHT NOW. Read THIS before declaring you cannot "
                 "spawn acting subagents."
             ),

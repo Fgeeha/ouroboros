@@ -8,9 +8,12 @@ import threading
 import time
 import types
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+
+from tests.test_swarm_host_admission import host  # noqa: F401
 
 
 pytestmark = pytest.mark.serial
@@ -633,41 +636,40 @@ def test_unpicklable_control_event_fails_before_feeder_thread(tmp_path):
         ctx.event_queue.cancel_join_thread()
 
 
-def test_snapshot_persistence_failure_rolls_back_pending(monkeypatch, tmp_path):
-    import supervisor.workers as workers
+def test_snapshot_persistence_failure_preserves_pending_and_inputs(host, monkeypatch, tmp_path):  # noqa: F811
+    from ouroboros.projects_registry import create_project
     from ouroboros.task_results import load_task_result
+    from supervisor import queue
     from supervisor.events import _handle_promote_chat_to_task
 
-    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
-    pending = []
-
-    def enqueue(task):
-        pending.append(dict(task))
-        return task
-
-    ctx = types.SimpleNamespace(
-        DRIVE_ROOT=tmp_path,
-        WORKERS={0: types.SimpleNamespace()},
-        PENDING=pending,
-        bridge=None,
-        enqueue_task=enqueue,
-        persist_queue_snapshot=lambda **_kwargs: False,
-        load_state=lambda: {"owner_chat_id": 1},
-        append_jsonl=lambda *_args, **_kwargs: None,
-    )
+    create_project(host.root, "target")
+    source = tmp_path / "input.txt"
+    source.write_text("retain this input after ambiguous admission", encoding="utf-8")
+    monkeypatch.setattr(host.ctx, "persist_queue_snapshot", lambda **_kwargs: False)
     outcome = _handle_promote_chat_to_task(
         {
             "type": "promote_chat_to_task",
             "task_id": "snapfail",
             "routing_token": "snapfail-token",
             "objective": "Build",
+            "project_id": "target",
+            "workspace": "none",
+            "chat_id": 1,
+            "attachment_uploads": [{"path": str(source)}],
         },
-        ctx,
+        host.ctx,
     )
-    assert outcome["reason"] == "queue_snapshot_persist_failed"
-    assert pending == []
-    stored = load_task_result(tmp_path, "snapfail")
-    assert stored["promotion_admission"]["status"] == "rejected"
+    assert (outcome["status"], outcome["task_id"], outcome["reason"], bool(outcome.get("never_admitted"))) == (
+        "unconfirmed", "snapfail", "queue_snapshot_persist_failed", False)
+    [admitted] = host.pending
+    assert (admitted["id"], admitted["root_task_id"], admitted["admitted_dispatch"]) == ("snapfail", "snapfail", "none")
+    assert "snapfail" not in queue.ADMISSION_RESERVATIONS
+    assert len(admitted["attachments"]) == 1
+    staged = Path(admitted["attachments"][0]["abs_path"])
+    assert staged != source and staged.read_bytes() == source.read_bytes()
+    assert source.read_text(encoding="utf-8") == "retain this input after ambiguous admission"
+    # No definite refusal receipt may be forged after the real queue accepted it.
+    assert load_task_result(host.root, "snapfail") is None
 
 
 def test_missing_snapshot_persister_fails_closed(monkeypatch, tmp_path):
@@ -844,7 +846,7 @@ def test_project_registry_lookup_failure_prevents_clone(monkeypatch, tmp_path):
     from ouroboros.promotion_source import resolve_promote_source
 
     monkeypatch.setattr(
-        "ouroboros.projects_registry.get_reserved_project",
+        "ouroboros.projects_registry.project_admission_view",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("registry unreadable")),
     )
     monkeypatch.setattr(
@@ -940,7 +942,7 @@ def test_source_resolution_runs_off_supervisor_loop_and_continues_once(
 
     seen_names = []
 
-    def slow_resolve(_ctx, _source, project_id, *, project_name=""):
+    def slow_resolve(_ctx, _source, project_id, *, project_name="", admission_basis_out=None):
         seen_names.append(project_name)
         started.set()
         assert release.wait(2)

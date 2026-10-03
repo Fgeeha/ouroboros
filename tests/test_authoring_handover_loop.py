@@ -22,6 +22,7 @@ from ouroboros.outcomes import derive_loop_outcome
 from ouroboros.owner_mailbox import KIND_FINALIZE_NOW, write_owner_message
 from ouroboros.tools.registry import ToolRegistry
 from tests.test_acceptance_async_loop import full_loop as full_loop_fixture
+from tests.test_completion_selection import finish
 
 full_loop = full_loop_fixture
 
@@ -78,6 +79,8 @@ def episode(tmp_path, monkeypatch):
     monkeypatch.setattr(loop, "call_llm_with_retry", scripted)
 
     def run(steps, *, task_id=TASK):
+        from ouroboros.task_results import write_task_result
+        write_task_result(tmp_path, task_id, "running", root_task_id=task_id, _attempt=1)
         state.steps = list(steps)
         state.task_id = task_id
         state.result = loop.run_llm_loop(
@@ -104,9 +107,9 @@ def _handover_notes(trace):
 
 @pytest.mark.parametrize("first_status", ["The worktree is clean.", "Finished successfully.", "Работа ещё продолжается."])
 def test_real_fallback_after_tool_result_requires_one_recovery(episode, first_status):
-    text, usage, trace = episode.run([_read(), None, _text(first_status), _text("No additional work done.")])
+    text, usage, trace = episode.run([_read(), None, _text(first_status), finish("No additional work done.")])
     assert [call["model"] for call in episode.calls] == [PRIMARY, PRIMARY, SUCCESSOR, SUCCESSOR]
-    assert len(trace["tool_calls"]) == 1
+    assert [row["tool"] for row in trace["tool_calls"]] == ["read_file", "finish_task"]
     assert trace["tool_calls"][0]["is_error"] is False
     assert any(row.get("role") == "tool" and "Verified predecessor evidence" in row.get("content", "")
                for row in episode.calls[2]["messages"])
@@ -121,10 +124,10 @@ def test_real_fallback_after_tool_result_requires_one_recovery(episode, first_st
 
 def test_recovery_tools_publish_fresh_final_without_json_only_instruction(episode):
     text, usage, trace = episode.run([
-        _read(), None, _text("WIP before recovery"), _read(), _text("Fresh verified report"),
+        _read(), None, _text("WIP before recovery"), _read(), finish("Fresh verified report"),
     ])
     assert text == "Fresh verified report"
-    assert len(trace["tool_calls"]) == 2
+    assert [row["tool"] for row in trace["tool_calls"]] == ["read_file", "read_file", "finish_task"]
     assert len(_handover_notes(trace)) == 1
     assert usage.get("reason_code") != "authoring_handover_incomplete"
     assert "authoring_handover_incomplete" not in trace
@@ -171,7 +174,7 @@ def test_model_wait_reprepare_preserves_original_author_and_tool_baseline(episod
 
     steps = [_read(), switch] if prior_tools else [switch]
     if target != PRIMARY and prior_tools:
-        steps.append(_text("Second successor response"))
+        steps.append(finish("Second successor response"))
     with model_wait.task_model_wait_scope(task={"id": TASK}, drive_root=episode.root,
                                          event_queue=None, worker_slot_held=False) as owner:
         owner.tool_context = episode.tools._ctx
@@ -224,7 +227,8 @@ def test_reused_tool_context_does_not_inherit_previous_handover(episode, prior_t
             write_owner_message(state.root, "deadline", TASK, kind=KIND_FINALIZE_NOW)
         return _text("First status")
 
-    episode.run([_read(), None, interim, _text("Still status")])
+    episode.run([_read(), None, interim,
+                 _text("Still status") if prior_terminal == "pending_at_finalize" else finish("Still status")])
     text, usage, trace = episode.run([_text("Unrelated new task")], task_id="later-task")
     assert text == "Unrelated new task"
     assert not trace.get("route_handovers")
@@ -232,21 +236,34 @@ def test_reused_tool_context_does_not_inherit_previous_handover(episode, prior_t
     assert usage.get("reason_code") != "authoring_handover_incomplete"
 
 
-def test_owner_followup_after_incomplete_can_resume_tools_and_heal_warning(episode):
+def test_owner_followup_after_incomplete_can_resume_tools_and_heal_warning(episode, monkeypatch):
     agent = SimpleNamespace(_owner_message_admission_lock=threading.Lock(),
                             _accepting_owner_messages=True, _busy=True, _current_task_id=TASK)
     episode.tools._ctx.owner_message_admission_lock = agent._owner_message_admission_lock
     episode.tools._ctx.owner_message_admission_agent = agent
 
-    def followup(state, _usage, _kwargs):
-        write_owner_message(state.root, "Read the evidence once more and finish.", TASK, msg_id="followup")
-        return _text("Still incomplete before follow-up")
+    acceptance = loop._run_task_acceptance_review_once
+    sent = []
+
+    def followup_at_seal(**kwargs):
+        if not sent and kwargs["llm_trace"].get("authoring_handover_incomplete"):
+            write_owner_message(episode.root, "Read the evidence once more and finish.", TASK, msg_id="followup")
+            sent.append(1)
+        return acceptance(**kwargs)
+
+    monkeypatch.setattr(loop, "_run_task_acceptance_review_once", followup_at_seal)
+
+    def informed_final(state, _usage, _kwargs):
+        source = state.tools._ctx._acceptance_observation["owner_source_sha256"]
+        assert source in str(state.calls[-1]["messages"])
+        return finish("Complete after follow-up", acceptance_subject={"owner_source_sha256": source})
 
     text, usage, trace = episode.run([
-        _read(), None, _text("Initial WIP"), followup, _read(), _text("Complete after follow-up"),
+        _read(), None, _text("Initial WIP"), finish("Still incomplete before follow-up"), _read(), informed_final,
     ])
     assert text == "Complete after follow-up"
-    assert len(trace["tool_calls"]) == 2
+    assert sent == [1]
+    assert [row["tool"] for row in trace["tool_calls"]] == ["read_file", "finish_task", "read_file", "finish_task"]
     assert len(_handover_notes(trace)) == 1
     assert any("Read the evidence once more" in str(row.get("content", ""))
                for row in episode.calls[-1]["messages"])
@@ -264,9 +281,9 @@ def test_second_toolless_handover_preserves_real_verification_nudge(episode):
     assert append_verification_receipt(episode.root, TASK, {
         "status": "fail", "kind": "run", "check": "existing project check", "returncode": 1,
     })
-    replacement = json.dumps({"delivery_control": "replace", "full_answer": "Final with disclosed failed check"})
+    replacement = finish("Final with disclosed failed check")
     text, usage, trace = episode.run([
-        _read(), None, _text("Initial WIP"), _text("Still incomplete"), _text(replacement),
+        _read(), None, _text("Initial WIP"), finish("Still incomplete"), replacement,
     ])
     assert text == "Final with disclosed failed check"
     assert len(_handover_notes(trace)) == 1
@@ -286,8 +303,8 @@ def test_second_toolless_handover_preserves_real_skill_readiness_nudge(episode):
     write = _tool("write_file", path="notes.txt", content="Authored skill notes",
                   root="skill_payload", bucket="external", skill_name="alpha")
     text, usage, trace = episode.run([
-        write, None, _text("Initial WIP"), _text("Still incomplete"),
-        _text("Skill is authored but still needs review and enablement."),
+        write, None, _text("Initial WIP"), finish("Still incomplete"),
+        finish("Skill is authored but still needs review and enablement."),
     ])
     assert text == "Skill is authored but still needs review and enablement."
     assert trace["tool_calls"][0]["is_error"] is False
@@ -300,7 +317,7 @@ def test_second_toolless_handover_preserves_real_skill_readiness_nudge(episode):
 
 def test_acceptance_improvement_after_incomplete_heals_warning(episode, full_loop, monkeypatch):
     from ouroboros.loop_nudges import _maybe_inject_finalization_nudges
-    from tests.test_acceptance_async_loop import keep
+    from tests.test_acceptance_async_loop import keep, select_completion
     from tests.test_loop_acceptance_gate import _order_acceptance_feedback
 
     f = full_loop
@@ -326,14 +343,14 @@ def test_acceptance_improvement_after_incomplete_heals_warning(episode, full_loo
             assert model == SUCCESSOR
             return _text("Initial WIP"), 0.0
         if f.model_step == 4:
-            return _text("Still incomplete"), 0.0
+            return select_completion(f, "Still incomplete"), 0.0
         if f.model_step == 5:
             assert f.review_requests and f.review_requests[0].subject == "Still incomplete"
             assert f.ctx._execution_trace["authoring_handover_incomplete"]["incomplete_observed"]
             f.reviewer_verdict = "PASS"
             return _read(), 0.0
         if f.model_step == 6:
-            return _text("Fresh report after acceptance feedback"), 0.0
+            return select_completion(f, "Fresh report after acceptance feedback"), 0.0
         assert f.model_step < 9, f.progress
         return keep(f), 0.0
 
@@ -341,7 +358,7 @@ def test_acceptance_improvement_after_incomplete_heals_warning(episode, full_loo
     text, usage, trace = f.run()
     assert text == "Fresh report after acceptance feedback"
     assert len(_handover_notes(trace)) == 1
-    assert len(trace["tool_calls"]) == 2
+    assert [row["tool"] for row in trace["tool_calls"] if not row.get("completion_control")] == ["read_file", "read_file"]
     assert trace["route_handovers"][0]["incomplete_observed"] is True
     assert trace["route_handovers"][0]["status"] == "recovered"
     assert "authoring_handover_incomplete" not in trace

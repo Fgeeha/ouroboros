@@ -286,13 +286,19 @@ def _loop_tree_accounting(
             refresh_root_accounting,
         )
 
+        from ouroboros.usage_admission import accounting_key
+
         scope = current_usage_scope()
         if scope is None or not scope.root_task_id:
             return None
+        key = accounting_key(scope)  # a Continue's successor paces on its whole-work GROUP
+        if scope.billing_group_id:
+            from ouroboros.usage_admission import task_money_snapshot
+            return task_money_snapshot(scope.drive_root, {"id": scope.task_id}, scope.root_task_id,
+                                       root_limit=scope.root_limit_usd)
         if refresh:
-            return refresh_root_accounting(scope.drive_root, scope.root_task_id,
-                                           max_age_sec=max_age_sec, strict=strict)
-        return last_root_accounting(scope.root_task_id)
+            return refresh_root_accounting(scope.drive_root, key, max_age_sec=max_age_sec, strict=strict)
+        return last_root_accounting(key)
     except Exception:
         log.debug("Tree accounting telemetry unavailable", exc_info=True)
         return None
@@ -842,3 +848,21 @@ def _prepare_post_tool_budget_context(
     limit_ctx.active_model = active_model
     limit_ctx.active_use_local = active_use_local
     limit_ctx.active_effort = active_effort
+
+
+def authored_completion_budget_exhausted(ctx: Any, budget_remaining: float | None, ceiling: Any) -> bool:
+    """Only actual money exhaustion owns a no-spend stop; prospective reserves do not."""
+    global_remaining = _wrapup_global_remaining() if not ctx.active_use_local else None
+    if ((budget_remaining is not None and budget_remaining <= 0)
+            or (global_remaining is not None and global_remaining <= 0)):
+        return True
+    cap = getattr(ceiling, "root_cap_usd", None)
+    if cap is None:
+        return False
+    tree = _loop()._loop_tree_accounting(refresh=True, max_age_sec=0.0)
+    deciding, basis = task_pacing.resolve_deciding_spend(tree_cost_usd=(tree or {}).get("accounted_usd"),
+        task_cost_usd=ctx.accumulated_usage.get("cost"), root_cap_usd=cap)
+    if deciding is not None and deciding >= cap:
+        ctx.accumulated_usage["cost_stop_spend_basis"] = basis
+        return True
+    return False

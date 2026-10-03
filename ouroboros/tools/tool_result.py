@@ -6,6 +6,7 @@ import json
 import re
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
+from functools import wraps
 from types import MappingProxyType
 from typing import Any, Literal, Mapping
 
@@ -351,6 +352,21 @@ TOOL_CODE_SPECS: Mapping[str, ToolCodeSpec] = MappingProxyType(
             "warning",
             "follow the refusal text",
         ),
+        # The owner paused the tree before this call's launch handoff
+        # (ouroboros/owner_pause.py): nothing ran — distinct from a timeout or an
+        # interrupted call whose execution is unknown.
+        "OWNER_LAUNCH_AUTHORITY_UNAVAILABLE": _code_spec(
+            "unavailable", "unavailable", "warning", "retry when launch authority is available",
+        ),
+        "STOP_ACTION_CONFLICT": _code_spec(
+            "blocked", "blocked", "warning", "retry the original Stop action unchanged",
+        ),
+        "OWNER_PAUSE_NOT_STARTED": _code_spec(
+            "blocked",
+            "blocked",
+            "info",
+            "issue the call again after the owner resumes the task",
+        ),
         "CAPABILITY_UNAVAILABLE": _code_spec(
             "unavailable",
             "unavailable",
@@ -500,6 +516,13 @@ class ToolResult:
 
     Producer text is captured only when the host adds annotations, before any
     composition. It is not bounded metadata and is never reconstructed from text.
+
+    Optional producer fact: ``meta.operation_outcome="completed_no_effect"``
+    describes a pre-effect refusal or completed read; ``completed`` describes
+    a foreground process exit, including nonzero. Neither metadata nor business
+    success grants custody settlement: the host observes handler unwind/join,
+    while independent process, receipt, model and delegated owners retain their
+    own unfinished work. Missing metadata does not keep a joined local call live.
     """
 
     status: ToolStatus
@@ -621,6 +644,67 @@ def _restore_tool_result_sidecar(token: Token) -> None:
     _TOOL_RESULT_STATE.reset(token)
 
 
+def publish_no_effect(ctx: Any, result: str | ToolResult, *, tool_name: str = "") -> str:
+    """Publish a producer-proven refusal before this invocation's first effect.
+
+    Call only at the validation boundary, never on a generic error/timeout path.
+    Preserve typed classification/text; this outcome fact grants no custody settlement.
+    """
+    prior = _published_tool_result(ctx, None)
+    typed = result if isinstance(result, ToolResult) else (
+        prior if isinstance(prior, ToolResult) and prior.text == result
+        else LegacyTextResultAdapter.from_text(tool_name, result))
+    return _publish_tool_result(ctx, _replace_tool_result(
+        typed, meta_updates={"operation_outcome": "completed_no_effect"}))
+
+
+def completed_local_read(handler):
+    """Publish completion from a synchronous first-party reader's returned body.
+
+    Only producers with no external work/effects to settle may use this. A
+    warning, refusal or partial read is still a completed read, not permission
+    to retry unknown work. Escaping exceptions publish no completion fact.
+    Preserve the text ABI and any existing typed result/annotations exactly.
+    """
+    @wraps(handler)
+    def read(ctx, *args, **kwargs):
+        sentinel = object()
+        token = _install_tool_result_sidecar(ctx, sentinel)
+        try:
+            result = handler(ctx, *args, **kwargs)
+            published = _published_tool_result(ctx, sentinel)
+        finally:
+            _restore_tool_result_sidecar(token)
+        typed = result if isinstance(result, ToolResult) else (
+            published if isinstance(published, ToolResult) and published.text == result
+            else LegacyTextResultAdapter.from_text(handler.__name__, result))
+        typed = _replace_tool_result(typed, meta_updates={"operation_outcome": "completed_no_effect"})
+        return typed if isinstance(result, ToolResult) else _publish_tool_result(ctx, typed)
+    return read
+
+
+def launch_refusal_result(reason: str, *, completed_no_effect: bool = False) -> ToolResult:
+    """An unsent operation; only its producer can attest completed preparation."""
+    from ouroboros.owner_pause import NOT_STARTED_TEXT
+
+    unavailable = reason == "owner_launch_authority_unavailable"
+    code = "OWNER_LAUNCH_AUTHORITY_UNAVAILABLE" if unavailable else "OWNER_PAUSE_NOT_STARTED"
+    if unavailable:
+        text = ("⚠️ OWNER_LAUNCH_AUTHORITY_UNAVAILABLE: NOT STARTED — launch authority is temporarily "
+                "unavailable. Nothing was submitted; retry when authority is available.")
+    elif reason in {"owner_pause_authority_unreadable", "model_sleep_authority_unreadable"}:
+        text = ("⚠️ OWNER_PAUSE_NOT_STARTED: NOT STARTED — pause/sleep authority could not be read. "
+                "Nothing was submitted; repair the authority before retrying.")
+    elif reason == "operation_already_returned":
+        text = "⚠️ OWNER_PAUSE_NOT_STARTED: NOT STARTED — this operation has ended; it cannot submit more work."
+    else:
+        text = NOT_STARTED_TEXT
+    return ToolResult(status="unavailable" if unavailable else "blocked", code=code,
+                      text=f"{text} ({reason})", meta={"owner_pause_not_started": True,
+                      "control_reason": reason, **({"operation_outcome": "completed_no_effect"}
+                                                   if completed_no_effect else {})})
+
+
 def _publish_process_result(
     ctx: Any,
     code: str,
@@ -632,7 +716,7 @@ def _publish_process_result(
     shell_regex_auto_corrected: bool = False,
     meta: Mapping[str, Any] | None = None,
 ) -> str:
-    """Publish trusted process facts through the transient string-bound sidecar."""
+    """Publish process facts; only the executor producer can certify completion."""
 
     facts = dict(meta or {})
     if exit_code is not None:
@@ -700,6 +784,9 @@ _EXACT_IDENTIFIER_CODES = MappingProxyType(
         "ROOT_REQUIRED_USER_FILES": "ROOT_REQUIRED_USER_FILES",
         "ROOT_REQUIRED_ACTIVE_WORKSPACE": "ROOT_REQUIRED_ACTIVE_WORKSPACE",
         "USER_FILES_PATH_BLOCKED": "USER_FILES_PATH_BLOCKED",
+        "OWNER_PAUSE_NOT_STARTED": "OWNER_PAUSE_NOT_STARTED",
+        "OWNER_LAUNCH_AUTHORITY_UNAVAILABLE": "OWNER_LAUNCH_AUTHORITY_UNAVAILABLE",
+        "STOP_ACTION_CONFLICT": "STOP_ACTION_CONFLICT",
         "COGNITIVE_TOOL_REQUIRED": "COGNITIVE_TOOL_REQUIRED",
         "RESOURCE_CONSTRAINT_BLOCKED": "RESOURCE_CONSTRAINT_BLOCKED",
         "RESOURCE_POLICY_BLOCKED": "RESOURCE_POLICY_BLOCKED",

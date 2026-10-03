@@ -162,16 +162,34 @@ def test_reviewer_wait_outlives_the_author_scope_and_closes_only_after_settlemen
     assert len(f.model.calls) == 2, "one refused attempt and one answer; collection bought nothing"
 
 
-def test_author_execution_scope_is_stripped_while_operation_clocks_bound_the_drain(env):
+def test_author_execution_scope_is_stripped_while_operation_clocks_bound_the_drain(env, monkeypatch):
     f = env
     timer = threading.Timer(0.4, f.model.ready.set)
-    with _parent(f) as parent:
-        # An author tool-call execution deadline far shorter than the reviewer's quota wait.
-        with model_wait.execution_deadline_scope(model_wait.monotonic_now() + 0.05):
+    timer_started = False
+    catalog = f.model.claudexor_model_catalog
+
+    def observe_wait(*args, **kwargs):
+        nonlocal timer_started
+        response = catalog(*args, **kwargs)
+        if not timer_started:
+            # Start the recovery window after quota_enter, not during panel setup.
+            assert response["models"] == []
             timer.start()
-            result = run_review_request(_request(drain=False), slots=[_slot()], drive_root=f.root,
-                                        usage_ctx=f.ctx, llm=f.model)
-        assert parent.paused_seconds() == 0.0, "the reviewer's quota wait is the operation's clock"
+            timer_started = True
+        return response
+
+    monkeypatch.setattr(f.model, "claudexor_model_catalog", observe_wait)
+    try:
+        with _parent(f) as parent:
+            # An author tool-call execution deadline far shorter than the reviewer's quota wait.
+            with model_wait.execution_deadline_scope(model_wait.monotonic_now() + 0.05):
+                result = run_review_request(_request(drain=False), slots=[_slot()], drive_root=f.root,
+                                            usage_ctx=f.ctx, llm=f.model)
+            assert parent.paused_seconds() == 0.0, "the reviewer's quota wait is the operation's clock"
+    finally:
+        timer.cancel()
+        if timer_started:
+            timer.join()
     actor = result.actors[0]
     assert actor["status"] == "ok" and actor["parsed"]["verdict"] == "PASS", actor
     events = [f.events.get_nowait() for _ in range(f.events.qsize())]

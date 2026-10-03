@@ -59,7 +59,7 @@ def test_original_calendar_window_uses_review_floor_without_author_reserve(
 
 
 def test_automatic_rechecks_window_after_original_writer_drains(late, tmp_path, monkeypatch):
-    from ouroboros import acceptance_late
+    from ouroboros import acceptance_late, review_source_closure
     from supervisor import queue as task_queue
     now = datetime.now(timezone.utc)
     clock = [now]
@@ -67,24 +67,38 @@ def test_automatic_rechecks_window_after_original_writer_drains(late, tmp_path, 
     f = delivered(tmp_path, monkeypatch, receipt='owed', deadline=(now + timedelta(seconds=201)).isoformat())
     monkeypatch.setattr(task_queue, 'RUNNING', {f.tid: {'task': f.task}})
     entered, release = threading.Event(), threading.Event()
-    sleep = acceptance_late.time.sleep
+    writer_live = acceptance_late._historical_writer_live
+    observations = []
+    preparations = []
+    retain_sources = review_source_closure.retain_review_request_sources
 
-    def drain(seconds):
-        if threading.current_thread() is not threading.main_thread() and seconds == 0.1:
+    def prepare_sources(*args, **kwargs):
+        preparations.append(True)
+        return retain_sources(*args, **kwargs)
+
+    def drain(*args, **kwargs):
+        live = writer_live(*args, **kwargs)
+        observations.append(live)
+        if live:
             entered.set()
             assert release.wait(5)
-        else:
-            sleep(seconds)
+            live = writer_live(*args, **kwargs)  # Observe the real writer after its drain.
+            observations.append(live)
+        return live
 
-    monkeypatch.setattr(acceptance_late.time, 'sleep', drain)
+    monkeypatch.setattr(acceptance_late, '_historical_writer_live', drain)
+    monkeypatch.setattr(review_source_closure, 'retain_review_request_sources', prepare_sources)
     try:
         chat._handle_send_message(f.event, _send_ctx(f.root, []))
         assert entered.wait(5) and not late.calls
         clock[0] += timedelta(seconds=2)
         task_queue.RUNNING.clear()
     finally:
+        task_queue.RUNNING.clear()
         release.set()
     row = _unpaid(f, late)
+    assert observations == [True, False]
+    assert not preparations, "expired post-drain window must refuse before preparing reviewer sources"
     pointer = next(iter(row['review_operations'].values()))
     assert pointer['preparation_outcome']['reason'] == 'review_skipped_deadline_reserve'
     assert not pointer.get('source_ref')  # no source preparation after the drain
@@ -138,6 +152,7 @@ def test_existing_paid_or_unknown_panel_collects_after_calendar_closes(late, tmp
 ])
 def test_worker_public_adapter_uses_venue_authority(late, tmp_path, monkeypatch, venue, evidence, buy):
     """Worker maps are empty even while the supervisor's original writer lives."""
+    import queue
     from supervisor import queue as task_queue, workers
     f = delivered(tmp_path, monkeypatch)
     before = copy.deepcopy(load_task_result(f.root, f.tid)['acceptance_debt'])
@@ -164,6 +179,7 @@ def test_worker_public_adapter_uses_venue_authority(late, tmp_path, monkeypatch,
         (f.root / 'state' / f'{name}.json').write_text(
             '{' if selected and evidence == 'invalid' else json.dumps(payload))
     ctx = _caller(f)
+    ctx.event_queue = queue.Queue()  # This consumer owns a live notification sink.
     source = _source(ctx)
     # A split worker reads the canonical authority, never its private data copy.
     ctx.drive_root = f.worker
@@ -172,6 +188,9 @@ def test_worker_public_adapter_uses_venue_authority(late, tmp_path, monkeypatch,
         until(lambda: len(late.calls) == 3)
         until(lambda: not review_operation._LIVE)
         assert result['status'] in {'pending', 'announced', 'published', 'settled'}, result
+        notices = [event for event in list(ctx.event_queue.queue)
+                   if event.get('system_type') == 'acceptance_late_settlement']
+        assert len(notices) == 1 and notices[0]['task_id'] == f.tid
     else:
         reason = 'control_authority_unavailable' if venue == 'pooled' and evidence == 'invalid' else 'historical_writer_still_live'
         assert result['reason'] == reason, result

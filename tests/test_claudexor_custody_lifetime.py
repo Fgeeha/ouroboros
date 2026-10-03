@@ -24,7 +24,12 @@ from ouroboros.platform_layer import pid_is_alive
 _POSIX = pytest.mark.skipif(os.name == "nt", reason="POSIX process groups; Windows Job Objects")
 
 _DAEMON = """
-import http.server, json
+import http.server, json, socketserver
+class LoopbackHTTPServer(http.server.HTTPServer):
+    def server_bind(self):
+        # Numeric loopback fixture: no hostname semantics, skip HTTPServer's reverse DNS.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *_args): pass
     def do_GET(self):
@@ -36,7 +41,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(200); self.end_headers()
         self.wfile.write(json.dumps({'compatible': True, 'protocolMajor': 3,
             'engine': {'version': '3.9.8', 'sha': 'a' * 40}}).encode())
-server = http.server.HTTPServer(('127.0.0.1', 0), Handler)
+server = LoopbackHTTPServer(('127.0.0.1', 0), Handler)
 print(server.server_port, flush=True)
 server.serve_forever()
 """
@@ -75,6 +80,26 @@ def _supervisor_rows(root: pathlib.Path, kind: str) -> list:
         return []
     rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
     return [row for row in rows if row.get("type") == kind]
+
+
+@pytest.mark.serial
+def test_daemon_fixture_serves_without_reverse_dns():
+    """The fixture daemon binds a numeric loopback address, so it must start and answer
+    while ``socket.getfqdn`` raises: that lookup costs about 35 s per bind on macOS CI."""
+    refuse = ("import socket\n"
+              "def _refuse(*_a): raise RuntimeError('fixture performed reverse DNS')\n"
+              "socket.getfqdn = _refuse\n")
+    proc = subprocess.Popen([sys.executable, "-u", "-c", refuse + _DAEMON],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        line = proc.stdout.readline()
+        assert line.strip().isdigit(), proc.communicate(timeout=5)
+        assert _echoes(int(line))
+    finally:
+        proc.kill()
+        proc.wait(timeout=5)
+        proc.stdout.close()
+        proc.stderr.close()
 
 
 @pytest.fixture

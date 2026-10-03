@@ -7,7 +7,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ouroboros.contracts.chat_id_policy import is_a2a_chat_id
 from ouroboros import room_consolidation
-from ouroboros.utils import append_jsonl, atomic_write_json, replace_atomic, utc_now_iso, read_text
+from ouroboros.utils import append_jsonl, atomic_write_json, replace_atomic, utc_now_iso, read_text, extract_trailing_json_object
 
 from ouroboros.platform_layer import (
     file_lock_exclusive as _lock_ex, file_lock_exclusive_nb as _lock_nb, file_unlock as _unlock,
@@ -292,15 +292,12 @@ def _run_block_consolidation(
         # a failed block write keeps the old cursor for retry and an interrupted
         # attempt never duplicates the marker.
         lost_sig = meta.get("chat_log_signature") or {}
-        lost_marker = (
-            f"{str(lost_sig.get('first_line_sha256') or 'unknown')[:16]}"
-            f":{int(meta.get('last_consolidated_offset', 0) or 0)}"
-        )
+        lost_marker = (f"{str(lost_sig.get('first_line_sha256') or 'unknown')[:16]}"
+                       f":{int(meta.get('last_consolidated_offset', 0) or 0)}")
         log.warning(
             "Chat consolidation cursor generation not found in archive chain; "
             "appending explicit gap block (last_offset=%d, live_entries=%d)",
-            int(meta.get("last_consolidated_offset", 0) or 0), _count_lines(source_path),
-        )
+            int(meta.get("last_consolidated_offset", 0) or 0), _count_lines(source_path))
         if not _append_gap_block(blocks_path, lost_marker):
             return None
         meta["last_consolidated_offset"] = 0
@@ -317,33 +314,29 @@ def _run_block_consolidation(
         return None
 
     total_usage: Dict[str, Any] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "cost": 0.0}
-    # A failed chunk withholds only itself (its earlier sibling chunks are
-    # complete units); the stale-error clear below must know whether THIS run
-    # recorded a failure it would otherwise erase.
+    # A failed chunk withholds only itself (earlier sibling chunks are complete units); the
+    # stale-error clear below must know whether THIS run recorded a failure it would erase.
     run_failed = False
     new_blocks: List[Dict[str, Any]] = []
     from ouroboros.dialogue_provenance import RoomLabelResolver
 
-    # The chat log may live in a forked/task drive while projects.json remains
-    # on the canonical data root.  Provenance must follow the registry root,
-    # never the incidental location of the source bytes.
+    # The chat log may live in a forked/task drive while projects.json remains on the canonical
+    # data root. Provenance follows the registry root, never where the source bytes happen to be.
     registry_root = room_registry_root
     if registry_root is None and knowledge_context is not None:
-        registry_root = (getattr(knowledge_context, "budget_drive_root", None)
-                         or getattr(knowledge_context, "drive_root", None))
+        registry_root = getattr(knowledge_context, "budget_drive_root", None) or getattr(knowledge_context, "drive_root", None)
     room_resolver = RoomLabelResolver(registry_root or source_path.parent.parent)
     chunks_to_process = (len(new_entries) + BLOCK_SIZE - 1) // BLOCK_SIZE if force_tail else len(new_entries) // BLOCK_SIZE
     processed = 0
     knowledge_instruction = (KNOWLEDGE_MAINTENANCE_PROMPT + "\nAfter the episodic summary, optionally add "
                              'a final line KNOWLEDGE_ENTRIES_JSON: [{"topic":"...","scope":"global","edits":[...]}] ("content" for a new topic).\n'
                              if knowledge_context is not None else "")
-    block = None
+    block = interrupted = None
 
     for i in range(chunks_to_process):
         chunk = new_entries[i * BLOCK_SIZE : (i + 1) * BLOCK_SIZE]
-        # The host partitions by the actual chat id BEFORE any model call: each
-        # room's episodic summary uses its own chronological bytes; cumulative
-        # knowledge can span rooms. Each section's identity is a host fact.
+        # The host partitions by the actual chat id BEFORE any model call: each room's episodic
+        # summary uses its own chronological bytes; knowledge can span rooms; identities are host facts.
         rooms = room_consolidation.partition_entries(chunk, room_resolver)
         first_ts = str(chunk[0].get("ts", "unknown"))
         last_ts = str(chunk[-1].get("ts", "unknown"))
@@ -357,12 +350,17 @@ def _run_block_consolidation(
             meta["consolidation_retry"] = {"source_sha256": source_hash, "input_limit": input_limit}
             atomic_write_json(meta_path, meta)
 
-        block, usage = room_consolidation.summarize_block(
-            _light_call(llm_client, knowledge_context, {}), rooms, first_ts=first_ts, last_ts=last_ts,
-            identity_text=identity_text, knowledge_instruction=knowledge_instruction,
-            input_limit=retry.get("input_limit") if retry.get("source_sha256") == source_hash else None,
-            on_refusal=remember_refusal,
-        )
+        try:
+            block, usage = room_consolidation.summarize_block(
+                _light_call(llm_client, knowledge_context, {}), rooms, first_ts=first_ts, last_ts=last_ts,
+                identity_text=identity_text, knowledge_instruction=knowledge_instruction,
+                input_limit=retry.get("input_limit") if retry.get("source_sha256") == source_hash else None,
+                on_refusal=remember_refusal)
+        except Exception as error:
+            if not new_blocks or getattr(error, "control_reason", "") != "owner_pause":
+                raise
+            interrupted = error
+            break
 
         total_usage = _merge_consolidation_usage(total_usage, usage)
         if (meta.get("consolidation_retry") or {}).get("source_sha256") == source_hash:
@@ -386,21 +384,20 @@ def _run_block_consolidation(
                if usage.get("_knowledge_entries") else {})})
         processed += len(chunk)
 
-    # Set after the last merge of this stretch: _merge_consolidation_usage forwards
-    # fixed keys only, so an earlier assignment would be dropped by the next merge.
-    # The transaction boundary is the logical chunk: every room section and its
-    # correction succeed before that chunk's block exists at all.  Earlier
-    # chunks of the same run are complete units and stay published, so a
-    # transient failure on chunk N never discards N-1 finished chunks (that
-    # would let a flaky route starve the cursor forever); the failed chunk is
-    # retried from its own offset next cycle.
+    # Set after the last merge of this stretch: _merge_consolidation_usage forwards fixed keys
+    # only, so an earlier assignment would be dropped by the next merge. The transaction
+    # boundary is the logical chunk: every room section and its correction succeed before
+    # that chunk's block exists. Earlier chunks of the same run are complete units and stay
+    # published, so a failure on chunk N never discards N-1 finished chunks (a flaky route
+    # would starve the cursor forever); the failed chunk retries from its own offset next
+    # cycle. An owner Pause raised mid-chunk or mid-era SAVES them first, then propagates and
+    # buys nothing more (no era); any other control still discards the unpublished run.
     total_usage["_blocks_written"] = len(new_blocks)
     if not new_blocks:
         atomic_write_json(meta_path, meta)
         return total_usage
 
-    # The route that nominated a block's entries is a history stamp for the
-    # writes below, never a persisted block field; receipts keep their pairs.
+    # A nominating route is a history stamp for the writes below, never a block field; receipts keep pairs.
     nomination_routes = {id(block): block.pop("_nomination_route", "unknown") for block in new_blocks}
     pending_knowledge = [(block, block.pop("knowledge_entries")) for block in new_blocks
                          if block.get("knowledge_entries")]
@@ -429,15 +426,13 @@ def _run_block_consolidation(
     existing_blocks = _load_blocks(blocks_path)
     all_blocks = existing_blocks + new_blocks
 
-    if len(all_blocks) > MAX_SUMMARY_BLOCKS and block is not None:
-        # Gap markers are DURABLE discontinuity facts (BIBLE P1) that keep their
-        # chronological positions, and an earlier era is a boundary too: an era
-        # compresses ONE CONTIGUOUS run of ordinary summary blocks, never a span
-        # bridging a discontinuity and never a summary of its own summary. The
-        # run is the OLDEST run of up to ERA_COMPRESS_COUNT summary blocks anywhere
-        # before the newest block — eras and gaps ahead of it are skipped, not a
-        # reason to stop compressing (a window of the first four blocks went blind
-        # once those four were eras).
+    if len(all_blocks) > MAX_SUMMARY_BLOCKS and block is not None and interrupted is None:
+        # Gap markers are DURABLE discontinuity facts (BIBLE P1) keeping their chronological
+        # positions, and an earlier era is a boundary too: an era compresses ONE CONTIGUOUS run
+        # of ordinary summary blocks, never bridging a discontinuity or summarizing a summary.
+        # The run is the OLDEST run of up to ERA_COMPRESS_COUNT summary blocks before the newest
+        # block; eras and gaps ahead of it are skipped, not a reason to stop compressing (a
+        # first-four window went blind once those four blocks were eras).
         run_start = next((i for i, b in enumerate(all_blocks[:-1]) if not _is_run_boundary(b)), None)
         era = None
         if run_start is not None:
@@ -445,8 +440,13 @@ def _run_block_consolidation(
             while (run_end < len(all_blocks) - 1 and run_end - run_start < ERA_COMPRESS_COUNT
                    and not _is_run_boundary(all_blocks[run_end])):
                 run_end += 1
-            era, era_usage = _era_for_run(all_blocks[run_start:run_end], meta, source_path.parent,
-                                          llm_client, identity_text, knowledge_context)
+            try:
+                era, era_usage = _era_for_run(all_blocks[run_start:run_end], meta, source_path.parent,
+                                              llm_client, identity_text, knowledge_context)
+            except Exception as error:
+                if getattr(error, "control_reason", "") != "owner_pause":
+                    raise
+                era, era_usage, interrupted = None, None, error
             if era_usage is not None:
                 total_usage = _merge_consolidation_usage(total_usage, era_usage)
         if era is not None:
@@ -466,14 +466,12 @@ def _run_block_consolidation(
             if any(not outcome["ok"] for outcome in block["knowledge_writes"]):
                 append_jsonl(pathlib.Path(knowledge_context.drive_root) / "memory" / "knowledge_history.jsonl", {
                     "ts": utc_now_iso(), "type": "dialogue_knowledge_writes_incomplete",
-                    "source_ref": block["knowledge_source_ref"], "outcomes": block["knowledge_writes"],
-                })
+                    "source_ref": block["knowledge_source_ref"], "outcomes": block["knowledge_writes"]})
         if pending_knowledge:
             _write_locked_json(blocks_path, all_blocks)
             from ouroboros.memory_nomination_receipts import settle
             settle(meta, pending_ids, published)
-            # Legacy batch-only receipts remain open: no positional evidence can
-            # prove which old entry a later successful nomination resolved.
+            # Legacy batch-only receipts stay open: no positional evidence proves which old entry resolved.
 
     _advance_cursor(meta, segments, segment_sigs, segment_entries, last_offset + processed)
     if not run_failed:  # An advance by a run that recorded no failure retires a stale error.
@@ -484,6 +482,8 @@ def _run_block_consolidation(
     log.info("Block consolidation: %d messages -> %d new blocks (total %d)",
              processed, len(new_blocks), len(all_blocks))
     total_usage["_blocks_written"] = len(new_blocks)
+    if interrupted is not None:
+        raise interrupted
     return total_usage
 
 
@@ -1472,7 +1472,12 @@ Respond with JSON only (no fences), after any useful knowledge reads:
         if raw.startswith("```"):
             raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
 
-        result = json.loads(raw)
+        try:
+            result = json.loads(raw)
+        except json.JSONDecodeError:
+            _, result, _ = extract_trailing_json_object(raw)
+            if result is None:
+                raise
 
         compressed_text = result.get("compressed_block", "")
         if not compressed_text or not compressed_text.strip():

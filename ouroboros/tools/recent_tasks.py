@@ -8,6 +8,7 @@ import pathlib
 from typing import Any, Dict, List
 
 from ouroboros.tools.registry import ToolContext, ToolEntry
+from ouroboros.tools.tool_result import completed_local_read
 from ouroboros.outcomes import normalize_outcome_axes
 from ouroboros.task_status import effective_task_result
 from ouroboros.dialogue_provenance import (
@@ -86,6 +87,8 @@ def _task_record(
         "total_rounds": data.get("total_rounds"),
         "result_preview": _preview(result),
     }
+    if isinstance(data.get("execution_observation"), dict):
+        record["execution_observation"] = dict(data["execution_observation"])
     if isinstance(data.get("task_contract"), dict):
         record["task_contract"] = data.get("task_contract")
     if isinstance(data.get("artifact_bundle"), dict):
@@ -278,6 +281,7 @@ def _recent_tasks_snapshot(
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+@completed_local_read
 def _handle_recent_tasks(
     ctx: ToolContext,
     limit: int = 5,
@@ -445,6 +449,7 @@ def _restricted_actor(ctx: ToolContext) -> bool:
             or is_presence_task({"metadata": metadata}) or presence_caller_binding(ctx) is not None)
 
 
+@completed_local_read
 def _handle_live_roots(ctx: ToolContext, limit: int = 20, offset: int = 0, snapshot: str = "", **_kwargs: Any) -> str:
     """Page the existing host live-root projection without scanning task results."""
     if _restricted_actor(ctx):

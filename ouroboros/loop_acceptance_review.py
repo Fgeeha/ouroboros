@@ -45,14 +45,14 @@ _ACCEPTANCE_REVIEW_CHECKLIST = (
     "the interface/surface the task itself names (not a weaker "
     "surrogate self-test), and "
     "whether the final response should be changed before release. "
-    "SCOPE CUTS (v6.60.0): did the agent knowingly narrow the task's scope "
+    "SCOPE CUTS (v6.60.0): did the agent knowingly narrow the task's requirements "
     "(dropped/limited requirements, simplified formats, skipped inputs)? "
     "A DISCLOSED, task-justified cut is honest best_effort; an unjustified "
     "or silent cut is a finding — name it with severity high and a concrete "
     "recommendation (under blocking enforcement it becomes an obligation). "
-    "Classify the deliverable tier (solved / best_effort / "
-    "blocked_with_evidence) and name the single highest-value change "
-    "that would move it one tier up. If the task asks for a specific "
+    "Replacing a means the author may change is not itself a scope cut when the requirement "
+    "stays verified; an owner- or parent-fixed method is not the author's to drop. "
+    "If the task asks for a specific "
     "value or short answer, check the FINAL ANSWER line matches the "
     "requested format exactly."
 )
@@ -158,7 +158,7 @@ def prepare_acceptance_observation(ctx: Any, trace: dict, incoming: Any, message
 
 def wait_for_acceptance_feedback(tools: Any, limit_ctx: Any, trace: dict,
                                  tool_schemas: list, seen: set) -> None:
-    """Park a pending answer with optional controls and a complete prose continuation."""
+    """Park paid criticism without losing the retained answer or explicit selection."""
     ctx = tools._ctx
     binding = getattr(ctx, "_task_acceptance_pending", "")
     if not binding:
@@ -200,19 +200,17 @@ def advance_explicit_acceptance(tools: Any, limit_ctx: Any, trace: dict,
             return
     tools._ctx._acceptance_review_only = True
     try:
-        # The tool's claim is a new complete nomination, not prose responding
-        # to an earlier keep/replace prompt. Readiness and review stay shared.
+        # The tool explicitly nominates complete bytes; readiness and review stay shared.
         _loop()._replace_delivery_candidate(tools, limit_ctx, trace, request.get("subject") or "", control="candidate")
         _loop()._no_tool_final_answer(request.get("subject") or "", limit_ctx, trace,
-                                      tools, incoming, seen, emit, review_only=True)
+                                      tools, incoming, seen, emit, review_only=True, explicit_candidate=True)
     finally:
         tools._ctx._acceptance_review_only = False
     if (getattr(tools._ctx, "_task_acceptance_pending", "")
             or getattr(tools._ctx, "_task_acceptance_reviewed", False)
             or not review_enforcement_blocks("blocking")):
         # Explicit submission retained a complete answer without delivering it.
-        # Teach the existing keep/replace reader that this is a control episode;
-        # otherwise the subject-observation's requested keep JSON becomes prose.
+        # Retained review nominations require an explicit completion selection.
         _loop()._arm_delivery_control(tools, limit_ctx, trace, control="acceptance_feedback")
 
 
@@ -647,9 +645,10 @@ def _finish_advisory_author(ctx: _TaskAcceptanceContext) -> bool:
     # advisory author_finish then read as Done over "not ready".
     if action != "stop":
         from ouroboros.loop_delivery import delivery_evidence_fingerprint
+        from ouroboros.tool_capabilities import completion_observation_calls
 
         if (not feedback or intent.get("review_binding_hash") != feedback.get("binding_hash")
-                or intent.get("tool_count") != len(ctx.llm_trace.get("tool_calls") or [])
+                or completion_observation_calls((ctx.llm_trace.get("tool_calls") or [])[int(intent.get("tool_count") or 0):])
                 or intent.get("owner_directives") != len(getattr(ctx.tools._ctx, "_owner_directives", []) or [])
                 or intent.get("evidence_fingerprint") != delivery_evidence_fingerprint(ctx.tools._ctx, ctx.llm_trace)):
             return False
@@ -667,7 +666,7 @@ def _finish_advisory_author(ctx: _TaskAcceptanceContext) -> bool:
     capacity = project_task_acceptance_review_capacity(ctx.tools._ctx, task_id=ctx.task_id) if action == "stop" else {}
     terminal_reason = (REASON_REVIEW_CYCLES_EXHAUSTED if action == "stop" and capacity.get("reason") == REASON_REVIEW_CYCLES_EXHAUSTED
                        else "author_stop" if action == "stop" else "author_finish")
-    ended = _loop()._end_task_acceptance_fence(ctx.tools._ctx, outcome="terminal")
+    ended = _loop()._end_task_acceptance_fence(ctx.tools._ctx, outcome="author_stop" if action == "stop" else "terminal")
     if ended.status == "refused":  # a gap is not a refusal: the final seal asks again and discloses
         _loop()._supersede_task_acceptance_for_owner_followup(ctx.tools._ctx, ctx.llm_trace)
         return True

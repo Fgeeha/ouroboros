@@ -144,7 +144,7 @@ REFRESH_SOURCE_LITERAL = "'refreshed to $%.2f'"
 REFRESHED_NOTICE_MARKER = "planning threshold refreshed to $"
 LITERAL_SOURCES = {
     FORCED_WRAPUP_MARKER: "ouroboros/loop_budget.py",
-    RESUME_NOTICE_MARKER: "ouroboros/budget_pause.py",
+    RESUME_NOTICE_MARKER.replace("budget pause", "{kind}"): "ouroboros/budget_pause.py",
     REFRESH_SOURCE_LITERAL: "ouroboros/budget_pause.py",
 }
 
@@ -184,6 +184,10 @@ def test_w8_literals_still_exist_in_the_tree():
     prompt head (must NEVER reach the stub after a pause) and the resume notice
     (MUST reach it on the resumed round). A literal that drifted upstream would
     make the first claim vacuously green and the second red by the wrong name."""
+    # Runtime scenarios keep the concrete budget notice; source selects the
+    # owner/budget wording through the existing f-string. Pin that choice too.
+    source = (REPO_ROOT / "ouroboros/budget_pause.py").read_text(encoding="utf-8")
+    assert 'kind = "owner Pause" if str(row.get("reason") or "") == REASON_OWNER else "budget pause"' in source
     for literal, relpath in LITERAL_SOURCES.items():
         source = (REPO_ROOT / relpath).read_text(encoding="utf-8")
         assert literal in source, f"{relpath} no longer carries {literal!r}"

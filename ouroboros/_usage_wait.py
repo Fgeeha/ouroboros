@@ -212,3 +212,85 @@ async def postresponse_off_loop(function, *args, retain_on_cancel):
         cancelled.response_retention_error = type(exc).__name__
         log.exception("Failed to retain cancelled paid response")
     raise cancelled
+
+
+def model_send(reservation, send):
+    """One physical sender owned until it returns; no wait under Pause's lock."""
+    from concurrent.futures import ThreadPoolExecutor
+    from ouroboros.owner_pause import submit_model
+
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="model-send") as executor:
+        future = submit_model(reservation, executor.submit, send)
+        return future.result()
+
+
+async def model_send_async(reservation, complete, *, retain_on_cancel):
+    """Join cancellation/settlement before the exact consumer may retire."""
+    from ouroboros import usage_accounting as ua
+    from ouroboros.owner_pause import submit_model
+
+    outcome = {}
+    async def invoke():
+        outcome["entered"] = True
+        try:
+            return await complete()
+        except BaseException as exc:
+            outcome["error"] = exc
+            return None  # Keep exception identity across an asyncio Task boundary.
+        finally:
+            outcome["capture"] = ua.last_physical_attempt_capture()
+
+    try:
+        future = submit_model(reservation, lambda run, fn: run(asyncio.create_task, fn()), invoke)
+    except BaseException as exc:
+        exc.model_sender_not_started = True
+        raise
+    try:
+        response = await asyncio.shield(future)
+        if "error" in outcome:
+            raise outcome["error"]
+        return response
+    except asyncio.CancelledError as cancelled:
+        future.cancel()
+        while not future.done():
+            try:
+                await asyncio.shield(future)
+            except BaseException:
+                if future.done():
+                    break
+        if not outcome.get("entered"):
+            cancelled.model_sender_cancelled_before_entry = True
+            raise cancelled
+        try:
+            response = future.result()
+            if "error" in outcome:
+                raise outcome["error"]
+        except BaseException:
+            # Task boundaries may synthesize a fresh CancelledError. Keep the
+            # caller's cancellation, carrying the exact joined paid outcome.
+            error = outcome["error"]
+            for field in ("response", "response_manifest_ref", "response_retention_error", "physical_attempt_capture"):
+                if hasattr(error, field):
+                    setattr(cancelled, field, getattr(error, field))
+            raise cancelled from error
+        capture = outcome.get("capture")
+        # Completion won the cancellation race; its value is still a paid answer.
+        cancelled.response, cancelled.physical_attempt_capture = response, capture
+        retention = asyncio.create_task(asyncio.to_thread(retain_on_cancel, response, capture))
+        while not retention.done():
+            try:
+                await asyncio.shield(retention)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        try:
+            cancelled.response_manifest_ref = retention.result()["manifest_ref"]
+        except Exception as exc:
+            cancelled.response_retention_error = type(exc).__name__
+            log.exception("Failed to retain cancelled paid response")
+        raise cancelled
+    finally:
+        capture = outcome.get("capture")
+        if capture is not None:
+            ua.adopt_physical_attempt_capture(capture)

@@ -6,7 +6,7 @@ real bundles in Chromium, with the mutating control endpoints stubbed at the
 is asserted against the LIVE chat DOM, not a unit model.
 
 Covered here (both owner surfaces):
-  * Chat live card: trigger label, the exact frozen three-action dropdown,
+  * Chat live card: trigger label, the exact frozen action dropdown (with Pause),
     dismiss-continues-the-run, "Hurry up" = local toast + stable request_id
     idempotent retry + ZERO new chat bubbles, "Wrap up" = "Finalizing…"
     card with the pending menu collapsed to "Stop now" only.
@@ -30,10 +30,12 @@ from tests.test_ui_smoke_playwright import (
 # below can request it (aliased import keeps ruff F811 clean).
 direct_server_with_data = _direct_server_with_data
 
-# The frozen owner wording (Q2/HQ1) — asserted verbatim, in order.
+# The frozen owner wording (Q2/HQ1) — asserted verbatim, in order — plus the
+# owner's whole-tree Pause (Batch4 5A) before the Stop escalation.
 EXPECTED_ACTIONS = [
     ("finalize", "Wrap up"),
     ("hurry", "Hurry up"),
+    ("pause", "Pause"),
     ("stop_now", "Stop now"),
 ]
 
@@ -148,8 +150,6 @@ def _assert_menu_geometry(metrics: dict, *, placement: str | None = None) -> Non
         assert rect["bottom"] <= metrics["trigger"]["top"] - 3, metrics
 
 
-@pytest.mark.ui_browser
-
 def _hold_live_root(data_dir, task_id: str, *, hold_seconds: float = 90.0) -> None:
     """Make ``task_id`` a GENUINELY running managed root for the test's duration: a queued
     row restored from the queue snapshot at boot, dispatched by the pool, and held inside
@@ -192,6 +192,7 @@ def _release_mock_model() -> None:
     fixtures_mock_llm.HOLD_RELEASE.set()
 
 
+@pytest.mark.ui_browser
 def test_s3_chat_card_dropdown_hurry_and_soft_stop(direct_server_with_data):
     """Chat surface: frozen dropdown, no-chat hurry with idempotent request_id
     retry, and the soft stop collapsing the pending menu to the escalation."""
@@ -509,7 +510,11 @@ def test_s3_chat_card_dropdown_hurry_and_soft_stop(direct_server_with_data):
                 )
                 calls = page.evaluate("() => window.__s3Calls")
                 assert calls[-1]["kind"] == "cancel"
-                assert calls[-1]["body"] == {"cascade": True, "stop_policy": "finalize_then_cancel"}
+                # One retryable Stop action: its id rides beside the exact policy.
+                body = dict(calls[-1]["body"])
+                action_id = body.pop("stop_action_id", "")
+                assert body == {"cascade": True, "stop_policy": "finalize_then_cancel"}
+                assert action_id.startswith("stop-") and len(action_id) <= 200, action_id
                 trigger.wait_for(state="attached", timeout=10_000)
                 page.wait_for_function(
                     "() => !document.querySelector('.chat-live-card[data-task-id=\"live-root\"]"

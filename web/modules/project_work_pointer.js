@@ -27,7 +27,7 @@ export function projectWorkLabel(target) {
     return `${target.finished ? 'Latest task' : 'Working'} · ${short}`;
 }
 
-export function bindProjectWorkPointer(host, { records, getWindow, onNavigate }) {
+export function bindProjectWorkPointer(host, { records, onNavigate }) {
     const doc = host.ownerDocument;
     const button = doc.createElement('button');
     button.type = 'button';
@@ -35,8 +35,6 @@ export function bindProjectWorkPointer(host, { records, getWindow, onNavigate })
     const label = doc.createElement('span');
     label.className = 'project-work-pointer-label';
     button.append(label);
-    const note = doc.createElement('span');
-    note.className = 'project-work-coverage';
     let target = null;
     let disposed = false;
     const navigate = () => {
@@ -52,13 +50,9 @@ export function bindProjectWorkPointer(host, { records, getWindow, onNavigate })
         // space; an absent card is not a claim that the Project has no work.
         button.hidden = !target;
         button.disabled = !target;
-        // A represented card is not a claim that all Project work/history is loaded.
-        const coverage = target && getWindow()?.complete !== true ? 'Loaded messages only' : '';
-        if (note.textContent !== coverage) note.textContent = coverage;
-        note.hidden = !coverage;
     }
     button.addEventListener('click', navigate);
-    host.prepend(button, note);
+    host.prepend(button);
     update();
     return {
         update,
@@ -66,7 +60,6 @@ export function bindProjectWorkPointer(host, { records, getWindow, onNavigate })
             disposed = true;
             button.removeEventListener('click', navigate);
             button.remove();
-            note.remove();
             target = null;
         },
     };

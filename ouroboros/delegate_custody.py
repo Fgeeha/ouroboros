@@ -842,9 +842,8 @@ def invocation_record(drive_root: Any, invocation_id: str, *,
 def record_start_requested(drive_root: Any, **payload: Any) -> bool:
     """Durably name the resources a start is about to bind, BEFORE the POST.
 
-    Returns whether the row LANDED; the caller must not POST when it did not —
-    a run whose request row never reached disk is live, mutating and unfindable
-    if the worker dies before ``record_started``.
+    Returns whether the row LANDED; without it the caller must not POST:
+    a worker crash before ``record_started`` would leave the run unfindable.
 
     The full replay envelope goes to raw CAS before its event reference. Use
     ``write_blob``, never a redacted ``persist_call`` projection: request values
@@ -861,7 +860,9 @@ def record_start_requested(drive_root: Any, **payload: Any) -> bool:
             return False
         payload = {key: value for key, value in payload.items() if key != "request"}
         payload.update(request_ref=ref, prompt_chars=len(str(body.get("prompt") or "")))
-    return emit(drive_root, START_REQUESTED, payload)
+    from ouroboros.owner_pause import admit_delegated_start
+
+    return admit_delegated_start(drive_root, payload)
 
 
 def record_started(drive_root: Any, custody: RunCustody,
@@ -1099,6 +1100,7 @@ def settle_run(drive_root: Any, gateway: Any, custody: RunCustody, detail: Dict[
                 # and the ledger writer decides what is usable.
                 input_token_usage=summary.get("inputTokenUsage"),
                 attempt_execution=detail.get("attemptExecution"),
+                effort_resolution=observed.get("effort_resolution"),
                 spend_usd=spend,
                 spend_estimated=estimated,
                 credential_profile_id=applied_profile,

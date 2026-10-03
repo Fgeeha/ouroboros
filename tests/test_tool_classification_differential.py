@@ -66,7 +66,6 @@ APPROVED_DELTAS: Mapping[str, Delta] = MappingProxyType({
     "CANCEL_INTENT_PROJECTION_CORRUPT": Delta(False, "ok", True, "error", "A.5", "a corrupted cancel projection is an error, not a success"),
     "CAPABILITY_UNAVAILABLE": Delta(True, "error", True, "unavailable", "A.18", "unavailability gets its own status name; the report bucket is unchanged"),
     "CHILD_RESULT_LINEAGE_FORBIDDEN": Delta(False, "ok", True, "blocked", "A.4", "a refused child-result lineage is a denial"),
-    "CI_UNAVAILABLE": Delta(True, "error", True, "unavailable", "A.18", "unavailability gets its own status name; the report bucket is unchanged"),
     "COGNITIVE_TOOL_REQUIRED": Delta(True, "cognitive_tool_required", False, "ok", "A.11", "owner batch #4: the cognitive redirect is a hint, the error flag is removed"),
     "EXECUTOR_UNAVAILABLE": Delta(True, "error", True, "unavailable", "A.18", "unavailability gets its own status name; the report bucket is unchanged"),
     # This tree's post-cutoff producers emit five more *_UNAVAILABLE identifiers
@@ -356,6 +355,11 @@ CURRENT_PRODUCER_CONTRACTS = {
     # Saved-setting selection uses the existing process access authority; its new
     # foreground refusal remains blocked through both text and native ACCESS_BLOCKED.
     "PROCESS_ENV_REFERENCE_BLOCKED": (True, "blocked"),
+    # Owner Batch4: a call the owner's Pause fenced before its launch handoff never
+    # ran; it is the substrate's answer, homed with the other runtime refusals.
+    "OWNER_PAUSE_NOT_STARTED": (True, "blocked"),
+    "OWNER_LAUNCH_AUTHORITY_UNAVAILABLE": (True, "unavailable"),
+    "STOP_ACTION_CONFLICT": (True, "blocked"),
     "SAFETY_ADVICE": (False, "ok"),
     "LIGHT_MODE_REPO_CHANGED": (False, "ok"),
     "BROWSER_ACTION_OUTCOME_UNKNOWN": (True, "error"),
@@ -379,6 +383,8 @@ CURRENT_PRODUCER_CONTRACTS = {
     "INTEGRATE_CAPPED_TREE": (True, "integration_blocked"),
     "INTEGRATE_DIRECTORY_SURFACE_MISMATCH": (True, "integration_blocked"),
     "INTEGRATE_FILE_OUTPUTS_UNAVAILABLE": (True, "integration_blocked"),
+    "INTEGRATE_APPLY_UNKNOWN": (True, "integration_blocked"),
+    "INTEGRATE_COPY_BINDING_MISMATCH": (True, "integration_blocked"),
     # The harvest puts every identifier first. A standalone capture failure
     # is an error; the actual successful-write suffix is pinned separately.
     "OUTPUT_CAPTURE_FAILED": (True, "error"),
@@ -396,6 +402,10 @@ CURRENT_PRODUCER_CONTRACTS = {
     "SCOPE_UNCONFIRMED": (True, "tool_reported_failure"),
     "TOOL_ERROR": (True, "error"),
     "native:TOOL_REPORTED_FAILURE:TOOL_ERROR": (True, "tool_reported_failure"),
+    # extension_dispatch's async runner that ended without a result is the first
+    # EXTENSION_ERROR producer with a literal first line, so the harvest now sees
+    # the pair. Its code answers as the shape:extension_handler_error row does (A.17).
+    "native:EXTENSION_ERROR:TOOL_ERROR": (True, "extension_error"),
     # Release admission split its one PREFLIGHT_BLOCKED text in two: a source it
     # could not read is unavailable evidence, not a candidate defect. The new
     # identifier reaches its text through the `code` variable, so it is declared
@@ -409,6 +419,10 @@ CURRENT_PRODUCER_CONTRACTS = {
     "MCP_CATALOG_UNAVAILABLE": (True, "unavailable"),
     "TASK_FORBIDDEN": (True, "blocked"),
     "native:LEGACY_BLOCKED:TASK_FORBIDDEN": (True, "blocked"),
+    # #1412: send_user_message(destination="main") refuses a caller with no Main
+    # voice (delegated, Presence, agent-to-agent) through native ACCESS_BLOCKED.
+    "MAIN_NOTICE_BLOCKED": (True, "blocked"),
+    "native:ACCESS_BLOCKED:MAIN_NOTICE_BLOCKED": (True, "blocked"),
 }
 
 

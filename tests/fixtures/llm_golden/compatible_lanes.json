@@ -172,6 +172,14 @@
           "usage": {
             "prompt_tokens": 200,
             "completion_tokens": 10,
+            "effort": {
+              "requested": "medium",
+              "sent": {},
+              "sent_state": "omitted",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            },
             "response_finish_reason": "stop",
             "provider": "openai-compatible",
             "resolved_model": "openai-compatible/glm-5",
@@ -348,6 +356,14 @@
           "usage": {
             "prompt_tokens": 200,
             "completion_tokens": 10,
+            "effort": {
+              "requested": "medium",
+              "sent": {},
+              "sent_state": "omitted",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            },
             "response_finish_reason": "stop",
             "provider": "cloudru",
             "resolved_model": "cloudru/GLM-5",
@@ -477,6 +493,14 @@
           "usage": {
             "prompt_tokens": 200,
             "completion_tokens": 10,
+            "effort": {
+              "requested": "medium",
+              "sent": {},
+              "sent_state": "omitted",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            },
             "response_finish_reason": "stop",
             "provider": "minimax",
             "resolved_model": "minimax/MiniMax-M2",
@@ -508,9 +532,12 @@
                   "content": "hello"
                 }
               ],
-              "max_tokens": 65536
+              "max_tokens": 65536,
+              "extra_body": {
+                "reasoning_split": true
+              }
             },
-            "payload_sha256": "65a41fc52448a9eb26a9d2ac2eea731381971b2bac0582a3003d4c14506de338"
+            "payload_sha256": "dadf31aade82adc876baab4d8f718f4cf9836c63ffdf067b05b5d8f0230d03a0"
           }
         ],
         "pricing_calls": [
@@ -533,8 +560,8 @@
             "source": "llm.chat",
             "model": "minimax/MiniMax-M2",
             "provider": "minimax",
-            "candidate_raw_sha256": "65a41fc52448a9eb26a9d2ac2eea731381971b2bac0582a3003d4c14506de338",
-            "candidate_raw_size_bytes": 139,
+            "candidate_raw_sha256": "dadf31aade82adc876baab4d8f718f4cf9836c63ffdf067b05b5d8f0230d03a0",
+            "candidate_raw_size_bytes": 177,
             "candidate_measurement_kind": "canonical_json_v1",
             "states": [
               "reserved",

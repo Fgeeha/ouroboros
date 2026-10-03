@@ -16,6 +16,12 @@ def data_root(tmp_path, monkeypatch):
     monkeypatch.setenv("OUROBOROS_SETTINGS_PATH", str(root / "settings.json"))
     monkeypatch.setenv("TOTAL_BUDGET", "100")
     (root / "state").mkdir(parents=True)
+    # These reviews spend as children of admitted roots, not standalone jobs.
+    from ouroboros.task_results import write_task_result
+    for task_id in ('root-review', 'root'):
+        write_task_result(root, task_id, 'running', billing_group={
+            'billing_group_id': task_id, 'billing_group_limit_usd': None,
+            'billing_group_limit_source': 'initial_task_admission', 'billing_group_limit_revision': 'fixture'})
     return root
 
 

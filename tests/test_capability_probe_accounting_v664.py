@@ -146,6 +146,10 @@ def test_local_model_capability_checks_are_accounted_and_inherit_task_scope(
     assert system_result["success"] is True
     assert len(provider_calls) == 2
 
+    from ouroboros.task_results import write_task_result
+    write_task_result(tmp_path, 'local-probe-root', 'running', billing_group={
+        'billing_group_id': 'local-probe-root', 'billing_group_limit_usd': 2.0,
+        'billing_group_limit_source': 'initial_task_admission', 'billing_group_limit_revision': 'fixture'})
     task_scope = UsageScope(
         drive_root=tmp_path,
         task_id="local-probe-task",

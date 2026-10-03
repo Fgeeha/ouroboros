@@ -111,7 +111,15 @@ def write_receipt(drive_root: Any, task_id: str, receipt: Dict[str, Any], *, cla
         keep = {r["receipt_id"] for r in disposable[-_RECEIPTS_CAP:]}
         rows = [r for r in rows if _must_observe(r) or r["receipt_id"] in keep]
         selected.update(updated)
-        return stamp_task_result_schema({**current, RECEIPTS_KEY: rows})
+        claims = dict(current.get("launch_handoffs") or {})
+        definite = effect_is_definite(updated)
+        if definite:
+            for operation_id in updated.get("launch_operation_ids") or []:
+                claim_row = claims.get(operation_id) or {}
+                if claim_row.get("tool") == "pr_merge" and claim_row.get("task_id") == task_id:
+                    claims.pop(operation_id, None)
+        return stamp_task_result_schema({**current, RECEIPTS_KEY: rows,
+            **({"launch_handoffs": claims} if "launch_handoffs" in current else {})})
 
     update_json_locked(task_result_path(drive_root, task_id), _mutate, strict_existing_dict=True)
     return selected
@@ -120,6 +128,8 @@ def write_receipt(drive_root: Any, task_id: str, receipt: Dict[str, Any], *, cla
 def _merge_facts(prior: Dict[str, Any], incoming: Dict[str, Any]) -> Dict[str, Any]:
     """Join observations under the receipt lock, retaining committed effect facts."""
     merged = {**prior, **incoming}
+    merged["launch_operation_ids"] = list(dict.fromkeys(
+        [*(prior.get("launch_operation_ids") or []), *(incoming.get("launch_operation_ids") or [])]))
     if prior.get("effect"):
         merged["effect"] = prior["effect"]  # exactly one merge invocation owns this receipt
     states = ("intent_recorded", "effect_attempted", "settled")
@@ -145,6 +155,13 @@ def _merge_facts(prior: Dict[str, Any], incoming: Dict[str, Any]) -> Dict[str, A
             outcome.pop("merge_tree_unavailable", None)
         merged["outcome"] = outcome
     return merged
+
+
+def effect_is_definite(receipt: Dict[str, Any]) -> bool:
+    """Positive merge/no-effect fact, independently of publication still owed."""
+    status = (receipt.get("outcome") or {}).get("status")
+    return status == "merged" or (status == "refused" and
+        (receipt.get("effect") or {}).get("failure") in {"cli_missing", "target", "pre_effect"})
 
 
 def _must_observe(receipt: Dict[str, Any]) -> bool:
@@ -337,7 +354,7 @@ def _outcome(pr: Optional[Dict[str, Any]], gh_api: Gh, *, own_effect_ok: bool, e
     return {"status": "unknown", "reason": f"pr_state_{state.lower() or 'unread'}_after_unconfirmed_effect"}
 
 
-def _publish(ctx: Any, gh: Gh, receipt: Dict[str, Any], drive_root: Any, task_id: str) -> Dict[str, Any]:
+def _publish(ctx: Any, gh: Gh, gh_api: Gh, receipt: Dict[str, Any], drive_root: Any, task_id: str) -> Dict[str, Any]:
     """PR body block (confirmed by readback) and the task-card row, each with its own gap."""
     block = public_block(receipt)
     body_status: Dict[str, Any] = {"status": "gap"}
@@ -345,15 +362,21 @@ def _publish(ctx: Any, gh: Gh, receipt: Dict[str, Any], drive_root: Any, task_id
     # is unnecessary when a lost reply already left the exact block in place.
     latest = _read_pr(gh, receipt["number"])
     res = None
-    if latest is not None and block not in str(latest.get("body") or ""):
-        res = gh(["pr", "edit", str(receipt["number"]), "--body-file", "-"], timeout=60,
-                 input_data=upsert_body(latest.get("body") or "", block))
+    target = _PR_URL_RE.fullmatch(str((receipt.get("repo") or {}).get("url") or ""))
+    if target is None or int(target.group(4)) != receipt["number"]:
+        target = None
+        body_status["reason"] = "target_unavailable"
+    if target is not None and latest is not None and block not in str(latest.get("body") or ""):
+        # REST edits only the body; gh pr edit also queries organization metadata.
+        res = gh_api(["api", f"repos/{target.group(2)}/{target.group(3)}/pulls/{receipt['number']}",
+                      "--hostname", target.group(1), "--method", "PATCH", "--input", "-"], timeout=60,
+                     input_data=json.dumps({"body": upsert_body(latest.get("body") or "", block)}))
     readback = _read_pr(gh, receipt["number"])
-    if readback is not None and block in str(readback.get("body") or ""):
+    if target is not None and readback is not None and block in str(readback.get("body") or ""):
         body_status = {"status": "published"}
     else:
-        body_status["reason"] = "readback_missing_block" if getattr(res, "ok", False) else str(
-            getattr(res, "failure", "") or "edit_failed")
+        body_status.setdefault("reason", "readback_missing_block" if getattr(res, "ok", False) else str(
+            getattr(res, "failure", "") or "edit_failed"))
     # The canonical receipt is the projection source. The existing outbox owns
     # terminal supplement delivery/replay, including after this worker exits.
     # A best-effort emitter returning None is never delivery evidence.
@@ -447,7 +470,7 @@ def _finish(ctx: Any, gh: Gh, gh_api: Gh, drive_root: Any, task_id: str,
             receipt = write_receipt(drive_root, task_id, receipt)
         while receipt["outcome"]["status"] in ("merged", "queued"):
             source = receipt
-            publication = _publish(ctx, gh, source, drive_root, task_id)
+            publication = _publish(ctx, gh, gh_api, source, drive_root, task_id)
             # Preserve observed publication facts even if their durable write fails.
             receipt = dict(source, publication=publication)
             receipt = write_receipt(drive_root, task_id, source, publication=publication)
@@ -464,6 +487,8 @@ def run_pr_merge(ctx: Any, gh: Gh, gh_api: Gh, *, drive_root: Any, task_id: str,
                  expected_head_sha: str, method: str, review: Dict[str, Any]) -> Dict[str, Any]:
     """Claim intent atomically; observe that operation on every subsequent call."""
     expected = _sha(expected_head_sha)
+    from ouroboros.owner_pause import current_tool_operation
+    operation_id = current_tool_operation(ctx, "pr_merge")
     if method not in METHODS or not expected or number <= 0:
         return {"refused": "arguments", "detail": f"method must be one of {METHODS}; expected_head_sha a hex SHA"}
     pr = _read_pr(gh, number)
@@ -483,6 +508,7 @@ def run_pr_merge(ctx: Any, gh: Gh, gh_api: Gh, *, drive_root: Any, task_id: str,
         receipt = {
             "schema": 1, "receipt_id": uuid.uuid4().hex, "created_at": utc_now_iso(), "state": "intent_recorded",
             "repo": repo, "number": int(number),
+            "launch_operation_ids": [operation_id] if operation_id else [],
             "requested": {"method": method, "expected_head_sha": expected}, "observed_before": observed,
             "review": {"declared": declared, "host_observed": host_observed,
                        "contributor_evidence": contributor_evidence(pr.get("body") or "", pr.get("comments") or [])},
@@ -504,6 +530,8 @@ def run_pr_merge(ctx: Any, gh: Gh, gh_api: Gh, *, drive_root: Any, task_id: str,
             outcome["attribution"] = (historical.get("attribution", "unproven")
                                       if historical.get("status") == "merged" else "unproven")
         recovered = dict(prior, outcome=outcome, observed_after=observed, state="settled")
+        recovered["launch_operation_ids"] = list(dict.fromkeys(
+            [*(prior.get("launch_operation_ids") or []), *([operation_id] if operation_id else [])]))
         return {**_finish(ctx, gh, gh_api, drive_root, task_id, recovered), "readback_only": True}
     res = gh(["pr", "merge", str(number), f"--{method}", "--match-head-commit", expected], timeout=120)
     receipt.update(state="effect_attempted", effect={

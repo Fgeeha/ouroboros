@@ -28,7 +28,9 @@ def test_single_element_is_not_split_or_wrapped(tmp_path, monkeypatch, raw):
     calls = []
     def missing(cmd, **kwargs):
         calls.append(cmd)
-        raise FileNotFoundError('executable not found')
+        error = FileNotFoundError('executable not found')
+        error.process_not_started = True  # matches the real Popen producer
+        raise error
     monkeypatch.setattr('ouroboros.tools.shell._tracked_subprocess_run', missing)
     result = _run_shell(_ctx(tmp_path), [raw])
     assert calls == [[raw]]

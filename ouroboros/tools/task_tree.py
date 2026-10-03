@@ -7,6 +7,7 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 from ouroboros.tools.registry import ToolContext, ToolEntry
+from ouroboros.tools.tool_result import completed_local_read
 
 
 def tree_root_id(ctx: ToolContext) -> str:
@@ -57,6 +58,7 @@ def _tree_note(
     )
 
 
+@completed_local_read
 def _tree_read(
     ctx: ToolContext,
     limit: int = 40,

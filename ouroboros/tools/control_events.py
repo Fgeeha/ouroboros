@@ -238,8 +238,12 @@ def _emit_and_wait_for_routing(
     evt: Dict[str, Any],
 ) -> tuple[str, Dict[str, Any]]:
     """Emit one routing event and return only its durable handler outcome."""
+    from ouroboros.tool_custody import record_control_handoff, forget_unemitted_control
+
+    record_control_handoff(evt)
     mode = _emit_control_event(ctx, evt)
     if mode == "serialization_failed":
+        forget_unemitted_control(evt)
         return mode, {
             "status": "rejected",
             "reason": "event_serialization_failed",

@@ -118,7 +118,7 @@ def collect_routes(
         api_task_artifact,
         api_task_cancel,
     api_decision_answer,
-    api_task_hurry,
+    api_task_hurry, owner_tree_control_routes,
         api_task_resume,
         api_task_events,
         api_task_get,
@@ -138,6 +138,7 @@ def collect_routes(
         api_settings_get,
         api_settings_post,
     )
+    from ouroboros.gateway.settings_secrets import api_settings_secret
     from ouroboros.gateway.presence_settings import api_owner_skill_presence_runtime
     from ouroboros.gateway.ws import ws_endpoint
     settings_handlers = settings_handlers or {}
@@ -211,13 +212,10 @@ def collect_routes(
             endpoint=api_onboarding_subagents_preview,
             methods=["POST"],
         ),
-        Route(
-            "/api/onboarding/complete",
-            endpoint=api_onboarding_complete,
-            methods=["POST"],
-        ),
+        Route("/api/onboarding/complete", endpoint=api_onboarding_complete, methods=["POST"]),
         Route("/api/settings", endpoint=settings_get, methods=["GET"]),
         Route("/api/settings", endpoint=settings_post, methods=["POST"]),
+        Route("/api/settings/secret", endpoint=api_settings_secret, methods=["POST"]),
         Route("/api/ui/preferences", endpoint=api_ui_preferences_get, methods=["GET"]),
         Route("/api/ui/preferences", endpoint=api_ui_preferences_post, methods=["POST"]),
         Route("/api/desktop/autostart", endpoint=api_desktop_autostart_get, methods=["GET"]),
@@ -241,6 +239,7 @@ def collect_routes(
         Route("/api/tasks/{task_id}/events", endpoint=api_task_events, methods=["GET", "POST"]),
         Route("/api/tasks/{task_id}/cancel", endpoint=api_task_cancel, methods=["POST"]),
         Route("/api/tasks/{task_id}/hurry", endpoint=api_task_hurry, methods=["POST"]),
+        *owner_tree_control_routes(),
         Route("/api/tasks/{task_id}/resume", endpoint=api_task_resume, methods=["POST"]),
     Route("/api/decisions", endpoint=api_decision_answer, methods=["POST"]),
         Route("/api/schedules", endpoint=api_schedules_list, methods=["GET"]),

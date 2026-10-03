@@ -41,6 +41,7 @@ _CANCEL_TERMINALIZED = frozenset({CANCEL_CANCELLED, CANCEL_ALREADY_SETTLED, CANC
 # tables must name the same sources, because one stored ``cancel_origin`` is
 # rendered by the task card AND by this host's durable terminal rows.
 CANCEL_SOURCE_PHRASES = {
+    "server_shutdown": "Server shutdown",
     "http_single": "Stopped from the app (Stop now)",
     "http_cascade": "Stopped from the app (Stop now)",
     "http_graceful": "Stopped from the app (Wrap up)",
@@ -707,6 +708,33 @@ def _finish_captured_chat_turn(
     _settle_intent(q, task_id, outcome=SETTLED_ALREADY,
                    detail=str(stored.get("status") or ""), intent=intent)
     return CANCEL_ALREADY_SETTLED if outcome == DIRECT_TURN_STOP_GONE else CANCEL_CANCELLED
+
+
+def stop_paused_late_phase_custody(q: Any, task_id: str, *, intent: Optional[Dict[str, Any]] = None) -> bool:
+    """The owner's Stop of an answered root's paused late phase (D10).
+
+    Saved post-task work degrades with ``owner_stopped`` and its skipped stages;
+    an unsent review records ``preparation_refused/owner_stopped``. The delivered
+    answer/status stay, and unused grants revoke. Live work keeps its own owner.
+    """
+    from ouroboros.post_task_synthesis import stop_paused_late_phase
+    from ouroboros.review_operation import stop_paused_acceptance_preparations
+    from supervisor.owner_pause_control import late_phase_settled
+    from supervisor.task_lifecycle import _settle_intent
+
+    try:
+        stopped_post = stop_paused_late_phase(q.DRIVE_ROOT, task_id)
+        stopped_review = stop_paused_acceptance_preparations(q.DRIVE_ROOT, task_id)
+        if not stopped_post and not stopped_review:
+            return False
+    except Exception:
+        log.warning("Stop of the saved late phase of %s was not recorded", task_id, exc_info=True)
+        return False
+    _settle_intent(q, task_id, outcome="cancelled", detail="late_phase_owner_stopped", intent=intent)
+    late_phase_settled(q.DRIVE_ROOT, task_id)
+    q.append_jsonl(q.DRIVE_ROOT / "logs" / "events.jsonl",
+                   {"ts": utc_now_iso(), "type": "late_phase_stopped", "task_id": task_id, "owner_visible": True})
+    return True
 
 
 def _finalize_cancel_intent_on_miss(

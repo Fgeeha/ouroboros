@@ -14,7 +14,7 @@ upgraded with a recorded reason + lineage gate) live here too.
 
 from __future__ import annotations
 
-from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
+from ouroboros.tools.tool_result import ToolResult, _publish_tool_result, completed_local_read
 
 import hashlib
 import json
@@ -451,6 +451,7 @@ def _clip(text: object, limit: int, *, tail: bool = False) -> str:
     return f"{s[:limit]}…(+{omitted} more chars omitted)"
 
 
+@completed_local_read
 def _peek_task(ctx: ToolContext, task_id: str, view: str = "summary") -> str:
     """Read a child's CURRENT status + latest coordination beacons + result tail (D#7 — the
     parent's 'see intermediate findings' right). A PURE READ: it changes no state. The
@@ -645,9 +646,12 @@ def _resume_child_task(ctx: ToolContext, task_id: str, reason: str = "") -> str:
     )
 
 
-def _cancel_task(ctx: ToolContext, task_id: str, reason: str = "") -> str:
+def _cancel_task(ctx: ToolContext, task_id: str, reason: str = "", stop_action_id: str = "") -> str:
+    from supervisor.followup_policy import StopActionConflict
     try:
         tid = validate_task_id(task_id)
+        if not isinstance(stop_action_id, str) or len(stop_action_id) > 200:
+            raise ValueError("stop_action_id must be a string of at most 200 characters")
     except ValueError as exc:
         return f"⚠️ TOOL_ARG_ERROR (cancel_task): {exc}"
     # The whole stated cause is the record: it rides the intent into custody,
@@ -728,7 +732,12 @@ def _cancel_task(ctx: ToolContext, task_id: str, reason: str = "") -> str:
             requested_by=str(getattr(ctx, "task_id", "") or "") if own else "",
             allow_settled_target=live_ownership,
             observation=observation,
+            stop_action_id=stop_action_id,
         )
+    except StopActionConflict as exc:
+        return _publish_tool_result(ctx, ToolResult(status="blocked", code="STOP_ACTION_CONFLICT",
+            text=f"⚠️ STOP_ACTION_CONFLICT: {exc}; nothing was changed.",
+            meta={"operation_outcome": "completed_no_effect"}))
     except CancelIntentProjectionCorrupt:
         # GR4-8: a corrupt projection is not a transient — "retry" cannot
         # succeed until the file is repaired. The malformed file was preserved
@@ -778,7 +787,8 @@ def _cancel_task(ctx: ToolContext, task_id: str, reason: str = "") -> str:
         "ts": utc_now_iso(),
     })
     note = " (live)" if emitted == "live" else " (deferred to round end)"
-    already = " (already requested earlier — idempotent)" if intent.get("already_requested") else ""
+    already = (" (same Stop action replayed)" if intent.get("stop_action_replayed") else
+               " (existing cancellation custody retained)" if intent.get("already_requested") else "")
     return (
         f"Cancel requested: {tid}{(' — ' + reason_preview) if reason_preview else ''}{note}{already}. "
         "cancel_state=pending until the supervisor confirms teardown; a child that "
@@ -817,6 +827,7 @@ def get_tools() -> list[ToolEntry]:
             "parameters": {"type": "object", "properties": {
                 "task_id": {"type": "string"},
                 "reason": {"type": "string", "default": "", "description": "Why you are stopping it (recorded for the tree + review)."},
+                "stop_action_id": {"type": "string", "maxLength": 200, "description": "Stable ID for this Stop action: reuse after an uncertain response; use a new ID for a later intended Stop. Omission preserves legacy behavior without exact-retry deduplication."},
             }, "required": ["task_id"]},
         }, _cancel_task),
         ToolEntry("peek_task", {

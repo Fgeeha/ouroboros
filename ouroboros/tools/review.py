@@ -194,15 +194,9 @@ def _handle_task_acceptance_review(
     )
     from ouroboros.task_results import resolve_task_lineage
 
-    # v6.51.0 idea-2: the child/off path builds the process-aware evidence packet
-    # (full contract + first-class verification_summary + host-collected redacted
-    # repo_diff + leak-safe artifacts + provenance tags) and dispatches its packet
-    # rows itself. The ROOT nomination (auto/required) never builds it: the host
-    # rebuilds the packet at its own fence, so the nomination records only the
-    # author's claims, stance and any explicit retry — which is what lets an
-    # informed finish/stop register even while that builder is broken (#1223).
-    # Agent evidence stays under `agent_supplied`; its `repo_diff` becomes
-    # `agent_supplied_repo_diff`. Only HOST structural facts own `repo_diff`.
+    # Child/off review-only calls build their packet; roots nominate to the host fence.
+    # Explicit author actions stage completion before either dispatch path, even if
+    # packet assembly is unavailable. Agent evidence never becomes host repo_diff.
     legacy_aliases = []
     if str(agent_disposition or "").strip():
         legacy_aliases.append("agent_disposition")
@@ -250,10 +244,7 @@ def _handle_task_acceptance_review(
         dict(evidence) if isinstance(evidence, dict)
         else ({} if evidence is None else {"raw_evidence": truncate_review_artifact(repr(evidence), limit=2000)})
     )
-    # Bind the cheap evidence revision to the agent's actual acceptance claim,
-    # goal, and checklist as well as its supporting references.  Otherwise two
-    # materially different claims over the same evidence dict would share a
-    # misleading revision even though the host panel must treat them separately.
+    # Bind claim, goal and checklist, not only the supporting references.
     agent_evidence["acceptance_request"] = {
         "claim": str(claim or ""),
         "goal": str(goal or ""),
@@ -345,6 +336,13 @@ def _handle_task_acceptance_review(
     )
     task_id = str(lineage["task_id"])
     is_root_task = bool(lineage["is_root_task"])
+    if agent_decision.get("explicit_finish"):
+        from ouroboros.tools.control_runtime import stage_completion_request
+        return stage_completion_request(ctx, {
+            "action": author_action or "finish", "answer": str(claim or ""),
+            "rationale": agent_rationale, "acceptance_subject": acceptance_subject,
+            "agent_decision": agent_decision,
+        }, source="task_acceptance_review")
     if get_task_review_mode() in {"auto", "required"} and is_root_task:
         # The ROOT nomination returns BEFORE any host evidence is built: the
         # host rebuilds host-attested evidence at the authoritative fence, and

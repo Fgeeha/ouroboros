@@ -89,15 +89,17 @@ export function createTask(payload) {
  * "immediate" (or absent) keeps today's hard cancel byte-identical.
  * Shared by the Chat live-card stop control and the Activity tab.
  * @param {string} taskId
- * @param {{cascade?: boolean, stopPolicy?: string}} [options]
+ * @param {{cascade?: boolean, stopPolicy?: string, stopActionId?: string}} [options]
  * @returns {Promise<import('./api_types.js').TaskCancelResponse>}
  */
-export function cancelTask(taskId, { cascade = false, stopPolicy = '' } = {}) {
+export function cancelTask(taskId, { cascade = false, stopPolicy = '', stopActionId = '' } = {}) {
     const url = `/api/tasks/${encodeURIComponent(taskId)}/cancel`;
     const policy = String(stopPolicy || '');
+    /** @type {import('./api_types.js').TaskCancelRequest} */
     const body = {
         ...(cascade ? { cascade: true } : {}),
         ...(policy && policy !== 'immediate' ? { stop_policy: policy } : {}),
+        ...(stopActionId ? { stop_action_id: stopActionId } : {}),
     };
     return Object.keys(body).length ? jsonPost(url, body) : fetchJson(url, { method: 'POST' });
 }
@@ -164,6 +166,40 @@ export function hurryTask(taskId, requestId) {
     return jsonPost(
         `/api/tasks/${encodeURIComponent(taskId)}/hurry`,
         { request_id: String(requestId || '') },
+        { rejectOkFalse: true },
+    );
+}
+
+/**
+ * Owner Pause of a whole task tree (Batch4): text-free like hurry — the body is
+ * ONLY the stable request_id (the same id on retry is idempotent). The answer
+ * arrives after the root's durable fence landed; its `state` is `requested`
+ * while members still settle, `paused` once saved, or `released` on replay
+ * after that action was resumed. A 202 `latch_pending` answer is accepted
+ * (the fence is durable) and the SAME id completes its queue latch. An
+ * intentional new Pause uses a fresh id.
+ * @param {string} taskId
+ * @param {string} requestId
+ */
+export function pauseTask(taskId, requestId) {
+    return jsonPost(
+        `/api/tasks/${encodeURIComponent(taskId)}/pause`,
+        { request_id: String(requestId || '') },
+        { rejectOkFalse: true },
+    );
+}
+
+/**
+ * Owner Continue of an interrupted root (Batch4): the body is ONLY the action
+ * nonce the caller keeps across retries and reloads, so the same press answers
+ * the same admission; a different nonce is a new press.
+ * @param {string} taskId
+ * @param {string} actionNonce
+ */
+export function continueTask(taskId, actionNonce) {
+    return jsonPost(
+        `/api/tasks/${encodeURIComponent(taskId)}/continue`,
+        { action_nonce: String(actionNonce || '') },
         { rejectOkFalse: true },
     );
 }
@@ -237,6 +273,8 @@ export const apiClient = {
     /** @returns {Promise<import('./api_types.js').StateResponse>} */
     state: () => fetchJson('/api/state', { cache: 'no-store' }),
     settings: () => fetchJson('/api/settings', { cache: 'no-store' }),
+    /** @param {{key: string}|{mcp_server_id: string}} selector @returns {Promise<{value: string}>} */
+    revealSettingsSecret: (selector) => jsonPost('/api/settings/secret', selector),
     /** @returns {Promise<import('./api_types.js').UiPreferencesResponse>} */
     uiPreferences: (init = {}) => fetchJson('/api/ui/preferences', { cache: 'no-store', ...init }),
     saveUiPreferences: (payload) => jsonPost('/api/ui/preferences', payload),

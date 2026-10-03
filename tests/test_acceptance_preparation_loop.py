@@ -265,7 +265,7 @@ def test_full_loop_nomination_to_informed_terminal_with_broken_fingerprint(full_
     from ouroboros import loop, loop_acceptance_review as review, loop_delivery as delivery
     from ouroboros.outcomes import derive_loop_outcome
     from ouroboros.project_dialogue import outcome_phase
-    from tests.test_acceptance_async_loop import ANSWER, call, keep
+    from tests.test_acceptance_async_loop import ANSWER, call
 
     f = full_loop
     monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", enforcement)
@@ -293,17 +293,16 @@ def test_full_loop_nomination_to_informed_terminal_with_broken_fingerprint(full_
             assert f.ctx._delivery_candidate.full_text == ANSWER
             monkeypatch.setattr(delivery, "delivery_evidence_fingerprint", broken_fingerprint)
             return {"content": "", "tool_calls": [call("task_acceptance_review", {
-                "claim": "This nomination must retain the earlier complete answer.",
+                "claim": ANSWER,
                 "agent_disposition": "partial", "author_action": action,
                 "rationale": "The available result has an unresolved local acceptance gap.",
                 "acceptance_subject": {"owner_source_sha256": f.ctx._acceptance_observation["owner_source_sha256"]},
             }, "informed-choice")]}, 0.0
-        assert f.model_step == 3, f.progress
-        return keep(f), 0.0
+        pytest.fail("the explicit author choice must not require another finish call")
 
     monkeypatch.setattr(loop, "call_llm_with_retry", main)
     result, usage, trace = f.run()
-    assert result == ANSWER and f.model_step == 3
+    assert result == ANSWER and f.model_step == 2
     assert builders == [1] and fingerprints == []
     assert f.review_sends == [] and f.waits == []
     assert trace["acceptance_decision"]["reason"] == "author_" + action
@@ -392,13 +391,13 @@ def test_full_ordinary_loop_first_answer_is_retained_when_the_fingerprint_is_bro
     regression breaks it only after the first answer was retained). The first plain
     answer is still retained over unknown evidence and published as such, the host
     pass accounts the failure as its local preparation incident without reaching the
-    builder, and the loop ends honestly: Advisory finishes with the caveat, Blocking
-    exposes the failure once and stops unfinished on the real unchanged repeat — no
+    builder, and the loop ends honestly after Main selects the retained answer:
+    Advisory keeps the caveat and Blocking stops unfinished — no
     reviewer, no second host attempt, no replay of the broken read."""
     from ouroboros import loop, loop_acceptance_review as review, loop_delivery as delivery
     from ouroboros.outcomes import derive_loop_outcome
     from ouroboros.project_dialogue import outcome_phase
-    from tests.test_acceptance_async_loop import ANSWER
+    from tests.test_acceptance_async_loop import ANSWER, keep
 
     f = full_loop
     monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", enforcement)
@@ -422,6 +421,7 @@ def test_full_ordinary_loop_first_answer_is_retained_when_the_fingerprint_is_bro
         if f.model_step == 2:
             assert "could not be assembled locally" in str(messages)
             assert f.ctx._delivery_candidate.full_text == ANSWER and f.ctx._delivery_candidate.revision == 1
+            return keep(f), 0.0
         else:
             assert f.model_step == 1, f.progress
         return {"content": ANSWER}, 0.0
@@ -481,13 +481,13 @@ def test_local_fingerprint_escape_remains_bound_to_informed_choice(tmp_path, mon
 
 @pytest.mark.parametrize("enforcement", ["advisory", "blocking"])
 @pytest.mark.parametrize("reaction_allowed", [False, True])
-def test_full_loop_auto_finish_after_preparation_failure_is_unfinished_in_blocking(
+def test_full_loop_selected_finish_after_preparation_failure_is_unfinished_in_blocking(
     full_loop, monkeypatch, enforcement, reaction_allowed,
 ):
     from ouroboros import loop, loop_acceptance_review as review
     from ouroboros.outcomes import derive_loop_outcome
     from ouroboros.project_dialogue import outcome_phase
-    from tests.test_acceptance_async_loop import ANSWER
+    from tests.test_acceptance_async_loop import ANSWER, keep
 
     f = full_loop
     monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", enforcement)
@@ -507,7 +507,7 @@ def test_full_loop_auto_finish_after_preparation_failure_is_unfinished_in_blocki
             return {"content": ANSWER}, 0.0
         assert reaction_allowed and f.model_step == 2
         assert "could not be assembled locally" in str(messages)
-        return {"content": ANSWER}, 0.0  # No control episode was armed; ordinary authored reaction.
+        return keep(f), 0.0  # Select the retained bytes without claiming review approval.
 
     monkeypatch.setattr(loop, "call_llm_with_retry", main)
     result, usage, trace = f.run()
@@ -699,17 +699,18 @@ def test_the_evidence_state_types_a_broken_read_as_unknown_without_moving_known_
     assert loop._delivery_evidence_state(registry, ctx, trace) == (2, "known-2")
 
 
-@pytest.mark.parametrize("path", ["arm", "post_tool", "control_keep", "stance"])
+@pytest.mark.parametrize("path", ["arm", "post_tool", "selection", "stance"])
 def test_every_retained_answer_path_survives_a_broken_read_and_claims_nothing(tmp_path, monkeypatch, path):
     """Retention was guarded, but arming a control round, the post-tool budget
-    context, a keep control and a stance merge still reached the broken read
+    context, an answer selection and a stance merge still reached the broken read
     unguarded AFTER the answer was retained. Each now types it unknown: the answer
-    stays, is published as unavailable (never current, never bound), keep is
-    refused for a KNOWN candidate until it is restated, and the restated answer is
-    retained over unknown evidence where keep is allowed without a verified subject."""
+    stays, is published as unavailable (never current, never bound), and explicit
+    selection preserves the same bytes over unknown evidence without borrowing
+    the old candidate's verified subject."""
     import ouroboros.loop as loop
     import ouroboros.loop_delivery as delivery_mod
     from ouroboros.loop_acceptance import merge_agent_acceptance_stance
+    from ouroboros.tools.control_runtime import _finish_task
 
     trace = {"tool_calls": [], "reasoning_notes": []}
     registry, ctx = _delivery_ctx(tmp_path, trace)
@@ -720,18 +721,21 @@ def test_every_retained_answer_path_survives_a_broken_read_and_claims_nothing(tm
     transcript = lambda: "\n".join(str(row.get("content") or "") for row in ctx.messages)  # noqa: E731
     if path == "arm":
         loop._arm_delivery_control(registry, ctx, trace)
-        assert "keep is NOT allowed" in transcript() and "can no longer be verified" in transcript()
+        assert candidate.content_sha256 in transcript() and "select complete answer bytes or this answer_sha256" in transcript()
         assert candidate.finalization_control == "awaiting_control"
     elif path == "post_tool":
         loop._prepare_post_tool_budget_context(registry, ctx, trace, "test-model", False, "medium")
         assert candidate.finalization_control == "effect_revision_required"
-        assert "keep is NOT allowed" in transcript()
-    elif path == "control_keep":
+        assert "select complete answer bytes or this answer_sha256" in transcript()
+    elif path == "selection":
         registry._ctx._delivery_control_required = True
         candidate.finalization_control = "awaiting_control"
-        state, text = loop._resolve_delivery_control('{"delivery_control":"keep"}', registry, ctx, trace)
-        assert (state, text) == ("retry", "") and candidate.finalization_control == "repair_requested"
-        assert "keep cannot bind changed evidence" in transcript()
+        registry._ctx._completion_observation = delivery_mod.completion_observation(registry._ctx, trace)
+        payload = json.loads(_finish_task(registry._ctx, action="finish", answer_sha256=candidate.content_sha256))
+        assert payload["status"] == "completion_requested"
+        assert delivery_mod.consume_completion_request(registry, ctx, trace)
+        assert registry._ctx._delivery_candidate.full_text == candidate.full_text
+        assert registry._ctx._completion_selected["observation"]["evidence_fingerprint"] == ""
     else:
         merge_agent_acceptance_stance(trace, {"explicit_finish": True, "author_action": "stop",
                                               "disposition": "partial", "rationale": "stopping"}, registry._ctx)
@@ -748,7 +752,7 @@ def test_every_retained_answer_path_survives_a_broken_read_and_claims_nothing(tm
     assert restated.acceptance_binding["authoritative"] is False
     assert loop._replace_delivery_candidate(registry, ctx, trace, "complete answer", control="candidate") is restated
     loop._arm_delivery_control(registry, ctx, trace)
-    assert "keep is allowed: it restates an answer retained over evidence the host could not read" in transcript()
+    assert restated.content_sha256 in transcript() and "action=stop with a rationale" in transcript()
     loop._prepare_post_tool_budget_context(registry, ctx, trace, "test-model", False, "medium")
     assert restated.finalization_control == "awaiting_control"   # unchanged unknown evidence arms nothing new
     assert trace["delivery_candidate"]["evidence_status"] == "unavailable_local_preparation"
@@ -778,8 +782,8 @@ def test_a_forced_exit_over_an_unreadable_fingerprint_preserves_the_answer_as_un
 
 
 @pytest.mark.parametrize("criteria", ["original requirements", "changed requirements"])
-def test_forced_keep_cannot_rebind_authoritative_approval_to_unknown(tmp_path, monkeypatch, criteria):
-    """An acknowledged subject on forced keep must not borrow the earlier PASS
+def test_forced_selection_cannot_rebind_authoritative_approval_to_unknown(tmp_path, monkeypatch, criteria):
+    """An acknowledged subject on forced selection must not borrow the earlier PASS
     when the fingerprint is unreadable, even with unchanged answer bytes."""
     from ouroboros import loop, loop_delivery as delivery
     from ouroboros.loop_forced_finalization import _resolve_forced_delivery_control
@@ -799,7 +803,7 @@ def test_forced_keep_cannot_rebind_authoritative_approval_to_unknown(tmp_path, m
     registry._ctx._delivery_control_required = True
     monkeypatch.setattr(acceptance, "acknowledge_acceptance_observation", lambda *_a, **_k: True)
     _raise_fingerprint(monkeypatch)
-    control = json.dumps({"delivery_control": "keep", "acceptance_subject": {
+    control = json.dumps({"action": "finish", "answer_sha256": candidate.content_sha256, "acceptance_subject": {
         "owner_source_sha256": "observed-owner", "effective_criteria": criteria}})
     text, reason, retained, replaced = _resolve_forced_delivery_control(registry._ctx, control, ctx=ctx, llm_trace=trace)
     assert text == "complete answer" and retained and not replaced and not reason

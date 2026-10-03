@@ -409,34 +409,44 @@ def test_the_root_nomination_never_runs_the_builder_and_records_the_stance(tmp_p
         raise RuntimeError("packet assembly failed")
 
     monkeypatch.setattr(re_mod, "build_task_acceptance_evidence", _explode)
+    ctx = _tool_ctx(tmp_path)
     payload = json.loads(_handle_task_acceptance_review(
-        _tool_ctx(tmp_path), claim="done", goal="g", agent_disposition="partial",
-        rationale="stopping honestly", author_action="stop",
+        ctx, claim="done", goal="g",
         evidence={"repo_diff": "the agent's own diff", "notes": "n"},
     ))
     assert calls == []                                              # the builder never ran
     assert payload["status"] == "deferred_to_host_acceptance" and payload["authoritative"] is False
-    assert payload["agent_decision"]["author_action"] == "stop"
-    assert payload["agent_decision"]["disposition"] == "partial"
-    assert "acceptance_retry" not in payload  # Retry and a terminal stance are mutually exclusive.
     supplied = payload["agent_supplied"]                            # the builder's own normalization
     assert supplied["agent_supplied_repo_diff"] == "the agent's own diff" and "repo_diff" not in supplied
     assert supplied["acceptance_request"]["claim"] == "done"
     assert len(payload["evidence_revision"]) == 64
+    completion = json.loads(_handle_task_acceptance_review(
+        ctx, claim="done", goal="g", agent_disposition="partial",
+        rationale="stopping honestly", author_action="stop",
+        evidence={"repo_diff": "the agent's own diff", "notes": "n"},
+    ))
+    assert calls == [] and completion["status"] == "completion_requested"
+    assert completion["completion_control"] is True and "acceptance_retry" not in completion
+    request = ctx._completion_request
+    assert request["answer"] == "done" and request["source"] == "task_acceptance_review"
+    assert request["agent_decision"]["author_action"] == "stop"
+    assert request["agent_decision"]["disposition"] == "partial"
 
 
 def test_action_only_nomination_does_not_invent_partial_stance(tmp_path, monkeypatch):
     from ouroboros.tools.review import _handle_task_acceptance_review
 
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "auto")
+    ctx = _tool_ctx(tmp_path)
     payload = json.loads(_handle_task_acceptance_review(
-        _tool_ctx(tmp_path), claim="saved result", goal="deliver result",
+        ctx, claim="saved result", goal="deliver result",
         rationale="Informed advisory finish with open critic notes", author_action="finish",
     ))
-    assert payload["status"] == "deferred_to_host_acceptance"
-    assert payload["agent_decision"]["disposition"] == ""
-    assert payload["agent_decision"]["author_action"] == "finish"
-    assert payload["agent_decision"]["explicit_finish"] is True
+    assert payload["status"] == "completion_requested"
+    decision = ctx._completion_request["agent_decision"]
+    assert decision["disposition"] == ""
+    assert decision["author_action"] == "finish"
+    assert decision["explicit_finish"] is True
 
 
 def test_the_child_path_still_builds_its_packet_and_a_broken_builder_still_raises(tmp_path, monkeypatch):

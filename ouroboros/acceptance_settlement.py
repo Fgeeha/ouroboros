@@ -72,7 +72,12 @@ ACCEPTANCE_SETTLEMENT_WAKE = (
 
 
 def _reviewer_lines(wave: Dict[str, Any]) -> List[str]:
-    """One line per roster slot: the reviewer's own verdict and note, or pending."""
+    """One line per roster slot: the reviewer's own verdict and note, or pending.
+
+    This is the MODEL mailbox's form (``acceptance_settlement_message``): slot
+    ids, the verdict tokens and the bounded note with its disclosed omission
+    marker. The owner's row is composed separately (``_owner_reviewer_lines``).
+    """
     slots = wave.get("slots") or {}
     verdicts = wave.get("verdicts") or {}
     lines: List[str] = []
@@ -81,6 +86,189 @@ def _reviewer_lines(wave: Dict[str, Any]) -> List[str]:
         verdict = str(row.get("verdict") or "") or str(status or "pending")
         note = str(row.get("note") or "")
         lines.append(f"- {slot_id}: {verdict}" + (f" — {note}" if note else ""))
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# The owner's reading of a settled reviewer (issue #1369). The record keeps the
+# tokens: ``reviewer_outputs`` carries slot id, operation and PASS/FAIL/DEGRADED,
+# the mailbox line keeps the bounded note with its omission marker, the applied
+# review JSON keeps every byte. The row a person reads names the reviewer by the
+# model that answered, says the verdict in words and discloses a shortening in
+# words (DESIGN §4: internal reason codes belong in details and diagnostics).
+# ---------------------------------------------------------------------------
+
+_OWNER_NOTE_LIMIT = 400
+# The verdict a reviewer actually settled with, in the owner's words. DEGRADED is
+# a reviewer's own deliberate non-verdict; it is neither a refusal nor an absence.
+_OWNER_VERDICT_WORDS = {"PASS": "passed it", "FAIL": "rejected it", "DEGRADED": "inconclusive"}
+# The slot states that carry no verdict: an answer still owed, a physical outcome
+# the host does not know, a request never sent, and a settled failure.
+_OWNER_AWAITED = "still awaited"
+_OWNER_UNKNOWN = "outcome unknown"
+_OWNER_NOT_SENT = "not sent"
+_OWNER_UNAVAILABLE = "unavailable"
+_OWNER_UNREADABLE = "answered, but no verdict could be read"
+_OWNER_SHORTENED = "… (shortened; the complete text is in the review record)"
+
+
+def _slot_row(rows: Any, slot_id: str) -> Dict[str, Any]:
+    """One slot's row of a run's ``actors`` or its ``slot_roster``, or {}."""
+    return next((row for row in rows or [] if isinstance(row, dict) and str(row.get("slot_id") or "") == slot_id), {})
+
+
+def _reviewer_identity(actor: Dict[str, Any], roster_row: Dict[str, Any]) -> Dict[str, str]:
+    """Which model this slot ran as: the positively observed one when the route
+    reported it, else the requested one (labelled as requested), else unknown.
+
+    Only an engine's final-attempt report (``usage.observed_attempt``) is an
+    observation. ``usage.resolved_model`` is not one: a direct API route writes
+    its own target there — what the host sent, not what answered."""
+    usage = actor.get("usage") if isinstance(actor.get("usage"), dict) else {}
+    attempt = usage.get("observed_attempt") if isinstance(usage.get("observed_attempt"), dict) else {}
+    observed = str(attempt.get("model") or "").strip()
+    requested = str(actor.get("model") or roster_row.get("model") or "").strip()
+    if observed:
+        label = observed
+    elif requested:
+        label = f"{requested} (requested)"
+    else:
+        label = "unknown reviewer"
+    return {"label": label, "model": observed, "requested_model": requested}
+
+
+def _owner_outcome(actor: Dict[str, Any], status: str, verdict: str) -> str:
+    """The reviewer's own settled outcome in the owner's words; tokens stay in the record.
+
+    Only an answer carries a verdict. PASS and FAIL are only ever parsed from one,
+    but DEGRADED is also the parser's word for NO text: ``_settled_slot_verdict``
+    gives it to a failed, refused or unknown slot, whose own state speaks instead.
+    """
+    parsed = actor.get("parsed")
+    if verdict in {"PASS", "FAIL"} or (verdict == "DEGRADED" and parsed is not None):
+        return _OWNER_VERDICT_WORDS[verdict]
+    # Text outside the contract is an unreadable answer, whatever custody state the
+    # row still carries: a row that holds an answer is judged by it.
+    if parsed is not None or str(actor.get("raw_text") or "").strip():
+        return _OWNER_UNREADABLE
+    state = str(actor.get("operation_state") or "")
+    if not status or state in {"pending_dispatch", "in_flight"}:
+        return _OWNER_AWAITED
+    if state == "custody_lost" or bool(actor.get("late_result_pending")):
+        return _OWNER_UNKNOWN
+    if status == "not_dispatched" or state == "not_dispatched":
+        return _OWNER_NOT_SENT
+    if status in {"ok", "empty"}:
+        return _OWNER_UNREADABLE  # the call returned, with no text to read
+    # The cause is the delegated engine's own ``failure.safeMessage`` (``run_failure_cause``),
+    # never the provider's or the reviewer's: the row names whose words they are. A cut made
+    # by the host's bound is said in words; its model-facing marker stays in the record.
+    from ouroboros.gateways.claudexor import reported_cause_words
+
+    words, shortened = reported_cause_words(actor.get("reported_cause"))
+    cause = " ".join(words.split())
+    quote = f'"{cause}…" (shortened)' if shortened else f'"{cause}"'
+    return f"{_OWNER_UNAVAILABLE} — the engine reported: {quote}" if cause else _OWNER_UNAVAILABLE
+
+
+def owner_bounded_text(text: str, limit: int, *, in_record: bool) -> str:
+    """The SSOT display bound (``truncate_review_artifact``: same limit, same
+    anti-waste floor) with its model-facing marker said in words for a person.
+    The marker is replaced only where the SSOT itself appended it — no reviewer
+    text is pattern-matched — and the words point at the review record that
+    holds the complete text only when ``in_record`` says it holds it."""
+    from ouroboros.utils import truncate_review_artifact
+
+    full = str(text or "")
+    bounded = truncate_review_artifact(full, limit=limit)
+    marker = f"\n⚠️ OMISSION NOTE: truncated at {limit} chars; original length {len(full)}"
+    if bounded == full or not bounded.endswith(marker):
+        return bounded
+    return bounded[: -len(marker)].rstrip() + (_OWNER_SHORTENED if in_record else "… (shortened)")
+
+
+def _owner_shortened(text: str, limit: int = _OWNER_NOTE_LIMIT) -> str:
+    """One reviewer's note on one line of the owner's row, bounded in words.
+
+    The note is composed before the panel's review record is stored, and that
+    store can fail, so the cut says only that it was shortened; the row's
+    record link, offered only for a stored record, is the pointer."""
+    return owner_bounded_text(" ".join(str(text or "").split()), limit, in_record=False)
+
+
+def _owner_note(actor: Dict[str, Any], verdict_row: Dict[str, Any]) -> str:
+    """The reviewer's own summary from its complete answer, shortened in words.
+
+    The mailbox note (``verdict_row['note']``) is already bounded with the
+    model-facing marker; a person's row re-reads the complete answer instead of
+    editing that marker, and falls back to the mailbox note only for a slot that
+    answered while the run holds no answer text, and only when that note carries
+    no marker of its own."""
+    from ouroboros.triad_review import parse_review_findings
+
+    parsed = actor.get("parsed")
+    findings: List[Any] = []
+    raw = str(actor.get("raw_text") or "")
+    if parsed is None and raw.strip():
+        try:
+            parsed, findings, _signal = parse_review_findings(raw)
+        except Exception:
+            log.debug("late acceptance note could not be parsed for the owner row", exc_info=True)
+            parsed, findings = None, []
+    elif isinstance(parsed, dict):
+        rows = parsed.get("findings")
+        findings = [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+    elif isinstance(parsed, list):
+        findings = [row for row in parsed if isinstance(row, dict)]
+    note = str(parsed.get("summary") or "") if isinstance(parsed, dict) else ""
+    note = note or next((str(row.get("recommendation") or row.get("item") or "")
+                         for row in findings if isinstance(row, dict)), "")
+    # A failure code or parse diagnostic stays in the task detail and Logs; the
+    # owner's line quotes only the reviewer's own words (or the engine's
+    # reported cause, already in the outcome), never the exception text. The
+    # mailbox note of a slot that never answered IS that text (its error, which
+    # ``_settled_slot_verdict`` keeps whitespace-normalised), so it never falls back.
+    answered = (str(actor.get("status") or "") in {"ok", "empty"}
+                or str(verdict_row.get("verdict") or "").upper() in {"PASS", "FAIL"})
+    if not note and answered and actor.get("parsed") is None and not raw.strip():
+        mailbox = str(verdict_row.get("note") or "")
+        note = "" if "⚠️ OMISSION NOTE" in mailbox else mailbox
+    return _owner_shortened(note)
+
+
+def _owner_reviewer_lines(run: Dict[str, Any], wave: Dict[str, Any]) -> List[str]:
+    """One line per roster slot for the owner: the model that answered, its
+    outcome in words and its own note. Two seats of the same model stay two
+    lines, distinguished by seat number, never merged.
+
+    Lines follow the run's recorded roster, as the review record lists it: a
+    released wave collects its slots from a set, so the wave's own order is
+    arbitrary and a seat number taken from it could name another reviewer."""
+    slots = wave.get("slots") or {}
+    verdicts = wave.get("verdicts") or {}
+    rank: Dict[str, int] = {}
+    for row in [*(run.get("slot_roster") or []), *(run.get("actors") or [])]:
+        if isinstance(row, dict):
+            rank.setdefault(str(row.get("slot_id") or ""), len(rank))
+    labels: List[str] = []
+    rows: List[tuple] = []
+    for slot_id, status in sorted(slots.items(), key=lambda item: rank.get(str(item[0]), len(rank))):
+        actor = _slot_row(run.get("actors"), str(slot_id))
+        verdict_row = verdicts.get(slot_id) if isinstance(verdicts.get(slot_id), dict) else {}
+        parsed = actor.get("parsed") if isinstance(actor.get("parsed"), dict) else {}
+        verdict = (str(verdict_row.get("verdict") or "")
+                   or str(actor.get("semantic_verdict") or actor.get("signal") or "")
+                   or str(parsed.get("verdict") or parsed.get("status") or "")).upper()
+        identity = _reviewer_identity(actor, _slot_row(run.get("slot_roster"), str(slot_id)))
+        labels.append(identity["label"])
+        rows.append((identity["label"], _owner_outcome(actor, str(status or ""), verdict),
+                     _owner_note(actor, verdict_row) if actor or verdict_row else ""))
+    lines: List[str] = []
+    seen: Dict[str, int] = {}
+    for label, outcome, note in rows:
+        seen[label] = seen.get(label, 0) + 1
+        seat = f" (seat {seen[label]})" if labels.count(label) > 1 else ""
+        lines.append(f"- {label}{seat}: {outcome}" + (f" — {note}" if note else ""))
     return lines
 
 
@@ -423,6 +611,8 @@ _VERSION_CLAUSES = {
 # closes as ``unpublished`` so the existing maintenance pass retries it.
 _LATE_UNPUBLISHED: set = set()
 _LATE_LOCK = threading.Lock()
+# Makes "is this notice already owed?" and its enqueue one step for every settler in this process.
+_LATE_NOTICE_LOCK = threading.Lock()
 
 
 def late_publication_owed(task_id: str, retry_key: str) -> bool:
@@ -432,13 +622,17 @@ def late_publication_owed(task_id: str, retry_key: str) -> bool:
 
 def _late_settlement_text(run: Dict[str, Any], wave: Dict[str, Any],
                           fact: Optional[Dict[str, Any]] = None) -> str:
-    """The owner row: which version, then the verdict, then the reviewers' own lines."""
+    """The owner row: which version, then the verdict, then the reviewers' own lines.
+
+    The reviewer lines are the owner's form (model, outcome in words, note
+    shortened in words); the model mailbox keeps its own ``_reviewer_lines``.
+    """
     signal = str(run.get("aggregate_signal") or "").upper()
     verdict = ({"PASS": "reviewers later passed it.", "FAIL": "reviewers later rejected it."}.get(signal)
                or _unsettled_clause(run))
     version = str((fact or {}).get("reviewed_revision") or "unknown")
     return "\n".join([f"{_VERSION_CLAUSES.get(version, _VERSION_CLAUSES['unknown'])}, {verdict}",
-                      *_reviewer_lines(wave)])
+                      *_owner_reviewer_lines(run, wave)])
 
 
 def emitted_answer_fact(root: Any, task_id: str) -> Dict[str, Any]:
@@ -493,6 +687,12 @@ def late_evidence_fact(run: Dict[str, Any], emitted: Dict[str, Any], *, settled_
             {"slot_id": str(actor.get("slot_id") or ""), "operation_id": str(actor.get("operation_id") or ""),
              "operation_state": str(actor.get("operation_state") or ""),
              "verdict": str(actor.get("semantic_verdict") or actor.get("signal") or "").upper(),
+             # The identity the owner row names (additive): the model the route
+             # reported, and the one the roster asked for; "" where unreported.
+             "model": _reviewer_identity(
+                 actor, _slot_row(run.get("slot_roster"), str(actor.get("slot_id") or "")))["model"],
+             "requested_model": _reviewer_identity(
+                 actor, _slot_row(run.get("slot_roster"), str(actor.get("slot_id") or "")))["requested_model"],
              "response_ref": dict(actor.get("response_ref") or {})}
             for actor in (run.get("actors") or []) if isinstance(actor, dict)],
     }
@@ -605,7 +805,8 @@ def attach_late_acceptance_settlement(usage_ctx: Any, request: Any, wave: Dict[s
     the task's own review projection through the existing locked writer, and
     announced ONCE in the task's room through the existing terminal-delivery
     outbox (durably owed, keyed by ``delivery_id``; a second settlement of the
-    same wave finds nothing left to reconcile and announces nothing). The owner
+    same wave, concurrent or later, finds that notice already owed or delivered
+    and queues no second live copy). The owner
     sees it; the next turn reads it in chat history. The acceptance twin of plan
     review's historical supplement (docs/architecture/06-agent-core.md).
     """
@@ -620,7 +821,7 @@ def settle_acceptance_operation(usage_ctx: Any, *, retry_key: str, task_id: str,
     """Collect one wave of a terminal task purely, publish it and announce it once.
 
     Returns ``announced`` (publication read back, row enqueued), ``published``
-    (read back; the row was already delivered),
+    (read back; the row was already owed or delivered),
     ``settled`` (nothing was pending), ``pending`` (still in flight),
     ``unpublished`` (the canonical record or durable notice custody did not
     take the settlement; retry duty remains), ``source_unreadable`` (a published source exists but cannot
@@ -695,7 +896,7 @@ def enqueue_late_acceptance_settlement(usage_ctx: Any, task_id: str, retry_key: 
                                       result: Dict[str, Any], panel: Dict[str, Any]) -> str:
     """Owe the already-published fact, also after an old controller lost its outbox write."""
     from supervisor.terminal_delivery import (
-        ENQUEUE_ALREADY_DELIVERED, ENQUEUE_QUEUED, enqueue_terminal_delivery_outcome,
+        ENQUEUE_ALREADY_DELIVERED, ENQUEUE_QUEUED, enqueue_terminal_delivery_outcome, pending_deliveries,
     )
 
     root = _result_root(usage_ctx)
@@ -714,20 +915,27 @@ def enqueue_late_acceptance_settlement(usage_ctx: Any, task_id: str, retry_key: 
         from ouroboros.task_finalization import review_source_reader
 
         evidence["read"] = review_source_reader(task_id, evidence["source_ref"])
-    # The operation outlives the execution drive; replay belongs to the same
-    # canonical root as its publication and the supervisor's delivery registry.
-    outcome = enqueue_terminal_delivery_outcome(root, {
-        "type": "send_message", "chat_id": int(chat_id or 0), "task_id": task_id,
-        "text": str(late.get("note") or ""),
-        "role": "system", "system_type": LATE_SETTLEMENT_SYSTEM_TYPE,
-        "delivery_id": f"acceptance-late:{retry_key}",
-        # The verdict belongs inside the task's card, in its Reviews group, and
-        # stays one row across live delivery, outbox replay and history. The
-        # evidence pointer is neutral: it grants no action and starts no turn.
-        "progress_meta": {"card_row": "reviews", "card_row_id": f"acceptance-late:{retry_key}",
-                          "late_evidence": evidence},
-    }, event_queue=getattr(usage_ctx, "event_queue", None))
-    if outcome not in {ENQUEUE_QUEUED, ENQUEUE_ALREADY_DELIVERED}:
+    delivery_id = f"acceptance-late:{retry_key}"
+    with _LATE_NOTICE_LOCK:
+        # Every settler of one wave ends here: the drain's own collection, the
+        # last slot's callback (whose mailbox duty mark can arrive after the
+        # drain already announced), maintenance, an owner rejoin. A notice the
+        # outbox already owes has custody and replay, so no second live copy.
+        owed = any(row.get("delivery_id") == delivery_id for row in pending_deliveries(root))
+        # The operation outlives the execution drive; replay belongs to the same
+        # canonical root as its publication and the supervisor's delivery registry.
+        outcome = "" if owed else enqueue_terminal_delivery_outcome(root, {
+            "type": "send_message", "chat_id": int(chat_id or 0), "task_id": task_id,
+            "text": str(late.get("note") or ""),
+            "role": "system", "system_type": LATE_SETTLEMENT_SYSTEM_TYPE,
+            "delivery_id": delivery_id,
+            # The verdict belongs inside the task's card, in its Reviews group, and
+            # stays one row across live delivery, outbox replay and history. The
+            # evidence pointer is neutral: it grants no action and starts no turn.
+            "progress_meta": {"card_row": "reviews", "card_row_id": delivery_id,
+                              "late_evidence": evidence},
+        }, event_queue=getattr(usage_ctx, "event_queue", None))
+    if not owed and outcome not in {ENQUEUE_QUEUED, ENQUEUE_ALREADY_DELIVERED}:
         # Publication survived, but a live queue alone is not durable custody.
         # The operation pointer carries this retry duty across controller exit.
         return _unpublished(task_id, retry_key, "unpublished")

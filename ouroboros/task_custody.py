@@ -77,17 +77,19 @@ from typing import Any, Callable, ContextManager, Dict, Iterator, List, Optional
 
 from ouroboros.task_results import load_task_result, validate_task_id, write_task_result
 from ouroboros.utils import utc_now_iso
+from ouroboros.owner_mailbox import _mailbox_path, _MAILBOX_DIR as _OWNER_MAILBOX_DIR
 
 log = logging.getLogger(__name__)
 
 HEADLESS_TASKS_DIR = pathlib.Path("state") / "headless_tasks"
 TASK_DRIVES_DIR = pathlib.Path("task_drives")
 _ARTIFACTS_DIR = pathlib.Path("task_results") / "artifacts"
-_MAILBOX_DIR = pathlib.Path("memory") / "owner_mailbox"
+_MAILBOX_DIR = pathlib.Path(_OWNER_MAILBOX_DIR)
 _STAGING_DIR = pathlib.Path("state") / "custody_staging"
 _TRASH_DIR = pathlib.Path("state") / "custody_trash"
 # The addressed words a sender is owed; controls (hurry, finalize_now, ...) are not mail.
 UNREAD_MAIL_KINDS = frozenset({"owner_text", "task_message", "quiz_answer"})
+OWNER_MAIL_KINDS = frozenset({"owner_text", "quiz_answer"})  # what the owner authored
 # A store's own bookkeeping and non-deliverable subtrees (inputs, media, sources).
 _STORE_BOOKKEEPING = frozenset({".artifact_manifest.json", ".artifact_manifest.json.lock",
                                 ".scratch_manifest.json", "verification_receipts.jsonl"})
@@ -223,10 +225,6 @@ def store_relpath(store: pathlib.Path, raw_path: Any) -> str:
 # ----------------------------------------------------------------- unread mail
 
 
-def _mailbox_path(drive_root: Any, task_id: str) -> pathlib.Path:
-    return pathlib.Path(drive_root) / _MAILBOX_DIR / f"{validate_task_id(task_id)}.jsonl"
-
-
 def _row_key(row: str) -> str:
     """A captured row's identity: its exact bytes (a ``msg_id`` proves nothing about them)."""
     return "sha:" + hashlib.sha256(row.encode("utf-8")).hexdigest()
@@ -248,7 +246,7 @@ def unread_mail_rows(drive_root: Any, task_id: str) -> Tuple[List[str], bool]:
     complete = bool(status.get("complete"))
     try:
         content = path.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeError):
         return [], False
     complete = complete and (not content or content.endswith("\n"))
     rows: List[str] = []
@@ -300,6 +298,54 @@ def merge_unread_mail(*values: Any) -> Optional[Dict[str, Any]]:
         return None
     custody = {"schema": 1, "total": len(rows), "rows": rows, "read_complete": complete, "captured_at": latest}
     return {**custody, "inputs": {key: inputs[key] for key in inputs if key in keys}} if inputs else custody
+
+
+def owner_mail_rows(drive_root: Any, task_id: str) -> Tuple[List[str], bool]:
+    """Exact OWNER-authored mailbox lines, read AND unread, and whether the read was
+    complete. Reads only. ``unread_mail_rows`` keeps what no attempt read; this keeps
+    what the owner said, since an acknowledged correction's last addressable copy is
+    the mailbox the settled cleanup unlinks (owner Batch4, Continue)."""
+    from ouroboros.owner_mailbox import mailbox_lines
+
+    path = _mailbox_path(drive_root, task_id)
+    if not path.exists():
+        return [], True
+    try:
+        content = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return [], False
+    complete = not content or content.endswith("\n")
+    rows: List[str] = []
+    for line in mailbox_lines(content):
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            complete = False
+            continue
+        if not isinstance(entry, dict):
+            complete = False
+        elif str(entry.get("kind") or "owner_text") in OWNER_MAIL_KINDS:
+            rows.append(line)
+    return rows, complete
+
+
+def capture_owner_mail(root: Any, task_id: str) -> Optional[Dict[str, Any]]:
+    """The terminal capture of a ROOT's owner rows (``owner_mailbox``): its own mailbox and
+    each own child drive's, in the ``unread_mailbox`` shape (exact rows, grow-only). Always a
+    capture, an empty one included — it proves the mailbox was read at the terminal, so a
+    later reader can tell "nothing was said" from "not captured". Never ACKs; never raises
+    (a failure is ``read_complete=False``, which a Continue refuses as a gap)."""
+    rows: List[str] = []
+    complete = True
+    try:
+        for drive in [pathlib.Path(root), *own_child_drives(root, task_id)]:
+            found, whole = owner_mail_rows(drive, task_id)
+            rows.extend(found)
+            complete = complete and whole
+    except Exception:
+        log.warning("Owner mail capture failed for %s", task_id, exc_info=True)
+        complete = False
+    return merge_unread_mail({"rows": rows, "read_complete": complete, "captured_at": utc_now_iso()})
 
 
 def unread_mail_held(custody: Any, rows: List[str]) -> bool:
@@ -379,11 +425,22 @@ def _mail_fields(current: Dict[str, Any], rows: List[str], inputs: Optional[Dict
     return {"unread_mailbox": merge_unread_mail(held, {**capture, "inputs": inputs or {}})}
 
 
+def _owner_mail_fields(current: Dict[str, Any], captured: Dict[str, Any]) -> Dict[str, Any]:
+    """Deletion requires complete current capture and exact canonical readback, ACKs included."""
+    if captured.get("read_complete") is not True:
+        raise _Retained("owner_mailbox_unreadable")
+    held = current.get("owner_mailbox") or {}
+    if held.get("read_complete") is True and unread_mail_held(held, captured["rows"]):
+        return {}
+    return {"owner_mailbox": merge_unread_mail(held, captured)}
+
+
 def settle_task_mailbox(canonical_root: Any, task_id: str, mailbox_root: Any, *, carry_inputs: bool = True,
                         stop: Optional[Callable[[], bool]] = None) -> bool:
     """Unlink one mailbox and its acks only once the task is settled with post-work and input
     copy closed (``owner_mailbox.settled_mailbox_cleanup_allowed``) and the canonical row
-    durably holds every unread row AND a verified canonical projection of every input-bearing
+    durably holds every owner row (acknowledged ones included), every unread row
+    AND a verified canonical projection of every input-bearing
     row's attachments (a drive's acknowledged inputs are carried through
     ``promote_owner_attachments`` first). Carrying or re-verifying inputs copies and hashes
     under the custody lock, so ``carry_inputs=False`` (the loop thread's task-done seam) keeps
@@ -430,11 +487,15 @@ def settle_task_mailbox(canonical_root: Any, task_id: str, mailbox_root: Any, *,
                     rows, complete = unread_mail_rows(mailbox_root, task_id)
                     if not complete:
                         raise _Retained("unread_mailbox_unreadable")
-                    if _mail_fields(current, rows, inputs):
-                        _write_custody_fields(canonical, task_id, current, lambda row: _mail_fields(row, rows, inputs),
+                    owner_capture = capture_owner_mail(canonical, task_id)
+                    def mail_fields(row):
+                        return {**_mail_fields(row, rows, inputs),
+                                **_owner_mail_fields(row, owner_capture)}
+                    if mail_fields(current):
+                        _write_custody_fields(canonical, task_id, current, mail_fields,
                                               closed=stop)
                         readback = load_task_result(canonical, task_id, strict=True) or {}
-                        if _mail_fields(readback, rows, inputs):
+                        if mail_fields(readback):
                             return False  # rows landed since the closure, or inputs are owed: the next call carries them
                     fence_publication()
                     mailbox.unlink()
@@ -976,6 +1037,8 @@ def _secure_occupant(canonical: pathlib.Path, drive: pathlib.Path, prepared: Dic
     rows, complete = unread_mail_rows(drive, task_id)
     if not complete:
         raise _Retained("unread_mailbox_unreadable")  # a torn mailbox stops before any file moves
+    owner_capture = capture_owner_mail(canonical, task_id)
+    _owner_mail_fields(current, owner_capture)  # refuse incomplete reads before publication
     prepared["receipts"] = _receipts_identity(drive, task_id)
     if prepared["receipts"] is not None and not publish_verification_receipt_union(canonical, task_id, drive):
         raise _Retained("verification_receipts_uncustodied")
@@ -987,6 +1050,7 @@ def _secure_occupant(canonical: pathlib.Path, drive: pathlib.Path, prepared: Dic
 
     def fields_for(row: Dict[str, Any]) -> Dict[str, Any]:
         return {**_custody_fields(row, source, published), **_mail_fields(row, rows, prepared["inputs"]),
+                **_owner_mail_fields(row, owner_capture),
                 **prepared["input_fields"]}
 
     _write_custody_fields(canonical, task_id, current, fields_for, basis=prepared["basis"], closed=closed)
@@ -994,7 +1058,7 @@ def _secure_occupant(canonical: pathlib.Path, drive: pathlib.Path, prepared: Dic
     if attempt_basis(readback) != prepared["basis"]:
         raise _Retained("canonical_changed")
     _verify_readback(readback, source, published)
-    if _mail_fields(readback, rows, prepared["inputs"]):
+    if _owner_mail_fields(readback, owner_capture) or _mail_fields(readback, rows, prepared["inputs"]):
         raise _Retained("unread_mailbox_uncustodied")
     if any(readback.get(key) != value for key, value in prepared["input_fields"].items()):
         raise _Retained("inputs_uncustodied")
@@ -1018,7 +1082,8 @@ def _recheck_occupant(canonical: pathlib.Path, drive: pathlib.Path, prepared: Di
         if rows or current.get("started_at") or load_task_result(drive, task_id, strict=True):
             raise _Retained("admission_rollback_evidence")
         return
-    if _mail_fields(current, rows, prepared["inputs"]):
+    if (_owner_mail_fields(current, capture_owner_mail(canonical, task_id))
+            or _mail_fields(current, rows, prepared["inputs"])):
         raise _Retained("unread_mailbox_uncustodied")  # late mail: the next pass unions and carries it
     if _receipts_identity(drive, task_id) != prepared["receipts"]:
         raise _Retained("verification_receipts_uncustodied")

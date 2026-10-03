@@ -1,5 +1,6 @@
 """Real builtin refusals keep producer facts through the string handler ABI."""
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -111,7 +112,12 @@ def test_presence_contract_refusal_and_valid_completion_remain_distinct():
     assert result.status == "unavailable"
     assert not hasattr(ctx, "_presence_completion")
     ctx.task_contract = {"capability_ceiling": {}}
-    assert _finish_presence(ctx, "message", "hello").startswith("PRESENCE_COMPLETION_RECORDED")
+    assert json.loads(_finish_presence(ctx, "message", "hello")) == {
+        "status": "completion_requested", "completion_control": True, "action": "finish",
+    }
+    assert ctx._completion_request["source"] == "presence_finish"
+    assert ctx._completion_request["answer"] == "hello"
+    assert ctx._presence_completion_accepted is False
     assert ctx._presence_completion == {"outcome": "message", "message": "hello"}
 
 
@@ -162,6 +168,9 @@ def _delegate_registry(tmp_path, monkeypatch, task_id="t-family"):
     monkeypatch.setattr(safety, "check_safety", lambda *_a, **_k: (True, ""))
     registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
     registry._ctx.task_id = task_id
+    from ouroboros.task_results import write_task_result
+
+    write_task_result(tmp_path, task_id, "running", root_task_id=task_id, task_attempt=1)
     registry._ctx.task_metadata = {"root_task_id": task_id, "parent_task_id": task_id}
     assert {"delegate_start", "delegate_wait", "delegate_cancel", "delegate_answer",
             "delegate_message"} <= set(registry._entries)

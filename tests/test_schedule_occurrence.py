@@ -11,12 +11,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from ouroboros.task_results import load_task_result
+from ouroboros.task_results import load_task_result, write_task_result
 
 
 @pytest.fixture
 def q(tmp_path, monkeypatch):
-    from supervisor import queue, queue_schedules, state
+    from supervisor import queue, queue_schedules, state, workers
 
     root = tmp_path / "data"  # project folders live beside, never inside, the data root
     root.mkdir()
@@ -25,7 +25,7 @@ def q(tmp_path, monkeypatch):
     queue.init(root)
     pending: list = []
     queue.init_queue_refs(pending, {}, {"value": 0})
-    monkeypatch.setattr(queue, "REPO_DIR", tmp_path / "repo", raising=False)
+    monkeypatch.setattr(workers, "REPO_DIR", tmp_path / "repo")
     (tmp_path / "repo").mkdir()
     monkeypatch.setattr(queue_schedules, "resync_skill_schedules", lambda *_a: {})
     monkeypatch.setattr("ouroboros.config.get_bg_wakeup_min_sec", lambda: 0)  # waits end at once here
@@ -43,7 +43,11 @@ def _row(q, schedule_id="s1", *, intent=None, cron=False, project_id="", chat_id
                                            **({"project_id": project_id} if project_id else {}), "metadata": meta},
               **({"next_run_at": "2000-01-01T00:00:00+00:00"} if cron else {})}
     q.queue.upsert_scheduled_task({**record, **{k: v for k, v in extra.items() if k != "continuation_of"}},
-                                  continuation_of=extra.get("continuation_of"))
+                                  continuation_of=extra.get("continuation_of"),
+                                  host_followup={"followup_relation": {"kind": "independent"},
+                                      "followup_origin": {"task_id": meta.get("origin_task_id", ""),
+                                                          "root_task_id": meta.get("origin_root_task_id")
+                                                          or meta.get("origin_task_id", "")}})
 
 
 def _rows(q):
@@ -72,8 +76,6 @@ def test_one_occurrence_one_receipt_with_the_room_address(q):
 
 def test_capacity_waits_on_the_row_without_phantom_roots(q, monkeypatch):
     from ouroboros import consciousness_allowance
-    from supervisor import schedule_occurrence
-
     monkeypatch.setenv("OUROBOROS_CONSCIOUSNESS_MAX_TASKS", "1")
     monkeypatch.setattr(consciousness_allowance, "allowance_window", lambda _root: {
         "status": "available", "limit_usd": 10.0, "accounted_usd": 0.0, "unknown_unmetered": 0, "resets_at": ""})
@@ -86,10 +88,8 @@ def test_capacity_waits_on_the_row_without_phantom_roots(q, monkeypatch):
     assert not list((q.root / "task_results").glob("*.json"))  # no failed root, ever
     held_task = row["occurrence"]["task_id"]
     token = row["occurrence"]["token"]
-    assert row["occurrence"]["admission"] == "refused"
-    # Reconstruct process-local queue/claim state. No old Python object proves
-    # this claim unrun; the persisted actual refusal must carry it across boot.
-    schedule_occurrence._FRESH_CLAIMS.clear()
+    assert row["occurrence"]["phase"] == "claimed"
+    # Reconstruct the live queue; the persisted claim carries recovery across boot.
     q.pending = []
     q.queue.init(q.root)
     q.queue.init_queue_refs(q.pending, {}, {"value": 0})
@@ -313,6 +313,13 @@ def test_dispatch_barrier_restore_and_settlement(q, monkeypatch):
     q.queue.check_scheduled_tasks()
     [task] = q.pending
     assert occurrences.restore_allowed(task) is True  # accepted, never dispatched: may be revived
+    stored = load_task_result(q.root, task["id"])
+    receipt = stored["schedule_admission"]
+    for frozen in ({"id": "another-task"}, None):
+        write_task_result(q.root, task["id"], "scheduled", schedule_admission={**receipt, "task": frozen})
+        assert occurrences.restore_allowed(task) is False
+        assert occurrences.record_dispatch_possible(task) is False
+    write_task_result(q.root, task["id"], "scheduled", schedule_admission=receipt)
     assert occurrences.record_dispatch_possible(task) is True
     receipt = load_task_result(q.root, task["id"])
     assert receipt["status"] == "running" and receipt["schedule_admission"]["dispatch"] == "possible"
@@ -447,7 +454,7 @@ def test_deleting_a_row_never_takes_back_an_accepted_occurrence(q, monkeypatch):
     task_id = _rows(q)["s1"]["occurrence"]["task_id"]
     outcome = q.queue.mutate_scheduled_task("delete", "s1", reason="owner", actor="owner")
     row = _rows(q)["s1"]
-    assert outcome["status"] == "deleted" and "owed" in outcome["detail"]
+    assert outcome["status"] == "delete_deferred" and "owed" in outcome["detail"]
     assert row["enabled"] is False and row["delete_requested_at"]
     monkeypatch.setattr(q.queue, "persist_queue_snapshot", lambda reason="": True)
     q.queue.check_scheduled_tasks()

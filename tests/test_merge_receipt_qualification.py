@@ -36,6 +36,50 @@ def registered_merge(world):
                    reviewed_head_sha=HEAD, reviewed_base_sha=BASE, review_task_ids=["review-1"])
 
 
+@pytest.mark.parametrize("hostname", ["github.com", "github.example.test"])
+def test_body_patch_uses_selected_repo_scoped_identity_without_org_access(world, monkeypatch, hostname):
+    """The real gh binding needs no GraphQL organization metadata to edit a body."""
+    selected_env = {"GH_TOKEN": "synthetic-repo-token-without-read-org"}
+    repo = f"{hostname}/chosen/repository"
+    world.gh.pr["url"] = f"https://{repo}/pull/7"
+    prefix, suffix = 'Résumé "quoted" \\ path.\r\n\n', '\n\nOwner footer.  \n'
+    note = "\nAdded during merge: @literal-file-name.\n"
+    world.gh.pr["body"] = prefix + "<!-- ouroboros:merge-receipt ab -->\nold\n<!-- /ouroboros:merge-receipt -->" + suffix
+    writes = []
+
+    def process(argv, **kw):
+        assert kw["env"] == selected_env  # every call retains the same selected identity
+        args = argv[1:]
+        if args[:1] == ["pr"]:
+            assert args[-2:] == ["--repo", repo]
+        if args[:1] == ["api"] and "PATCH" in args:
+            assert args == ["api", "repos/chosen/repository/pulls/7", "--hostname", hostname,
+                            "--method", "PATCH", "--input", "-"]
+            assert kw["timeout"] == 60
+            assert _receipts(world)[0]["outcome"]["status"] == "merged"
+            writes.append(json.loads(kw["input"]))
+        result = world.gh(args, world.ctx, input_data=kw.get("input"))
+        if args[:2] == ["pr", "merge"]:
+            world.gh.pr["body"] += note
+        return SimpleNamespace(returncode=result.exit_code, stdout=result.text if result.ok else "",
+                               stderr="" if result.ok else result.text)
+
+    monkeypatch.setattr(github, "_gh_run", REAL_GH)
+    monkeypatch.setattr(github.subprocess, "run", process)
+    monkeypatch.setattr(github, "_gh_env", lambda ctx: selected_env)
+    monkeypatch.setattr(github, "github_token_from_env_or_settings", lambda: selected_env["GH_TOKEN"])
+    handler = next(entry.handler for entry in github.get_tools() if entry.name == "pr_merge")
+    text = handler(world.ctx, number=7, expected_head_sha=HEAD, method="squash", repo=repo)
+    (receipt,) = _receipts(world)
+    assert receipt["publication"]["body"] == {"status": "published"}, text
+    expected = prefix + merge_receipts.public_block(receipt) + suffix + note
+    assert writes == [{"body": expected}] and world.gh.pr["body"] == expected
+    assert world.gh.pr["title"] == "demo"
+    assert receipt["publication"]["card"]["status"] == "owed"
+    assert not any(c[:2] == ["pr", "edit"] or c[:2] == ["api", "graphql"] or c[0] == "auth"
+                   for c in world.gh.calls)
+
+
 @pytest.mark.parametrize("failure", ["EOF", "HTTP 502: Bad Gateway (https://api.github.com/graphql)",
                                      "HTTP 409: Conflict (https://api.github.com/graphql)",
                                      PRE_EFFECT + "HTTP 503: lost reply", "timeout"])
@@ -148,7 +192,7 @@ def test_concurrent_publication_through_outbox_dedup_and_history(world, monkeypa
     gh = world.gh
 
     def delayed(args, *a, **kw):
-        if args[:2] == ["pr", "edit"] and "**queued**" in str(kw.get("input_data")):
+        if args[:1] == ["api"] and "PATCH" in args and "**queued**" in str(kw.get("input_data")):
             blocked.set()
             assert release.wait(5)
         return gh(args, *a, **kw)

@@ -337,8 +337,12 @@ def test_registered_on_every_contract_surface_and_takes_no_lease_of_its_own():
 
     entry = next(e for e in control.get_tools() if e.name == "await_messages")
     assert entry.handler is control_mod._await_messages
-    assert entry.schema["parameters"]["required"] == ["timeout_sec"]
-    assert set(entry.schema["parameters"]["properties"]) == {"timeout_sec"}
+    # Owner Batch4 6B: the same tool also carries the model's own warm/cold sleep;
+    # ``timeout_sec`` still drives the default in-slot wait (nothing is required).
+    assert "required" not in entry.schema["parameters"]
+    assert set(entry.schema["parameters"]["properties"]) == {
+        "timeout_sec", "mode", "senders", "tasks", "runs", "wake_at", "wake_after_sec"}
+    assert entry.schema["parameters"]["properties"]["mode"]["enum"] == ["in_slot", "warm", "cold"]
     # The registered kill timeout sits above the largest window the tool can choose.
     assert entry.timeout_sec == int(config_mod.get_per_call_timeout_ceiling_sec()) + 60
     for surface in (CORE_TOOL_NAMES, LOCAL_READONLY_SUBAGENT_TOOL_NAMES,

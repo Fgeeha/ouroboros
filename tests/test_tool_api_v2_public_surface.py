@@ -51,6 +51,12 @@ def test_legacy_tool_names_are_not_public_schemas(tmp_path):
     assert registry.get_schema_by_name("claude_code_edit") is None
     assert registry.execute("claude_code_edit", {}).startswith("⚠️ Unknown tool")
 
+    # `run_ci_tests` (push, dispatch, wait) is retired with no alias; `get_github_checks` succeeds it
+    # for reading only (tests/test_disabled_tools_policy.py pins the absent shim and table rows).
+    assert "run_ci_tests" not in names and "get_github_checks" in names
+    assert registry.get_schema_by_name("run_ci_tests") is None
+    assert registry.execute("run_ci_tests", {}).startswith("⚠️ Unknown tool")
+
     assert {
         "read_file",
         "write_file",

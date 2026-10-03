@@ -28,6 +28,8 @@ a dict this process happens to still hold.
 
 from __future__ import annotations
 
+from ouroboros.owner_pause import run_operation, OwnerPauseRefused
+
 import datetime as _dt
 import functools
 import json
@@ -43,7 +45,7 @@ from ouroboros.delegate_custody import RunCustody as _RunCustody
 from ouroboros.configured_subagents import SESSION_ACCESS_PROFILES, SESSION_ACCESS_LOWERING
 from ouroboros.tool_capabilities import tool_result_limit
 from ouroboros.tools.registry import ToolContext, ToolEntry
-from ouroboros.tools.tool_result import ToolResult
+from ouroboros.tools.tool_result import ToolResult, _replace_tool_result
 from ouroboros.subagent_work_order import (  # noqa: F401 - compatibility re-export
     assignment_instructions as _assignment_instructions,
 )
@@ -108,7 +110,7 @@ from ouroboros.delegate_interactions import (  # noqa: F401
 # facade back); re-exported here because sibling code, the tests and
 # monkeypatch targets name them on THIS surface.
 from ouroboros.deadline_utils import deadline_expired
-from ouroboros.delegate_directory import blocked_geometry_refusal, default_shaped_directory_options
+from ouroboros.delegate_directory import blocked_geometry_refusal
 from ouroboros.delegate_registration_policy import resolve_registration
 from ouroboros.delegate_shared import (  # noqa: F401
     _emit,
@@ -337,21 +339,6 @@ def _start_argument_refusal(ctx: ToolContext, text: str, selector_root: str, ret
     continuation selector shapes one call cannot combine: a retry replays an old
     key byte-identically while a continuation is a NEW intention over a settled
     run, and a skill-payload selector run keeps its own target semantics."""
-    from ouroboros.contracts.task_contract import task_input_sources
-
-    # Retry replay bypasses assignment composition, so reject the unsupported
-    # source selection before either start path can prepare or replay a request.
-    if task_input_sources({
-        "task_contract": getattr(ctx, "task_contract", {}),
-        "metadata": getattr(ctx, "task_metadata", {}),
-    }) == "declared":
-        return "", _fail(
-            "delegate_start", "INPUT_SOURCE_SELECTION_UNSUPPORTED",
-            "Declared input selection supports scheduled API-model children only; "
-            "native-session composition is not qualified.",
-            definitely_unrun=True, host_fallback=False,
-        )
-
     if not text.strip():
         return "", _fail("delegate_start", "empty_prompt", "prompt is required")
     refusal = _payload_selector_refusal(selector_root, retry_of, bucket, skill_name)
@@ -395,7 +382,8 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
     continuation_token, argument_refusal = _start_argument_refusal(
         ctx, text, selector_root, retry_of, bucket, skill_name, continue_from)
     if argument_refusal:
-        return argument_refusal
+        # This argument boundary precedes daemon access, provisioning and any start.
+        return _replace_tool_result(argument_refusal, meta_updates={"operation_outcome": "completed_no_effect"})
     seconds_basis = ""
     if not str(retry_of or "").strip():
         # Decided BEFORE the daemon is touched: a spent lifetime or a sub-second
@@ -528,10 +516,9 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
                         return _fail("delegate_start", "directory_execution_unavailable", str(exc), definitely_unrun=True)
                     snapshot, snap_error = None, ""
                 else:
-                    if not default_shaped_directory_options(directory_strategy, scope_paths):
-                        return _fail("delegate_start", "directory_execution_unavailable",
-                                     "Directory options apply to ordinary folders; Git workspaces keep their snapshot contract.",
-                                     definitely_unrun=True)
+                    from ouroboros.delegate_directory import git_directory_options_refusal
+                    if error := git_directory_options_refusal(target_root, directory_strategy, scope_paths):
+                        return _fail("delegate_start", "directory_execution_unavailable", error, definitely_unrun=True)
                     snapshot, snap_error = _provision_snapshot(ctx, drive, target_root, invocation_id)
                 if snap_error:
                     _settle_refused_provision(ctx, gateway, snap_error, invocation_id, history_facts)
@@ -593,6 +580,11 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
             **actor_facts,
             processing=processing_info,
         )
+        if not requested and not claim_refusal:
+            claim_refusal = {"reason": "start_request_row_unwritable", "detail":
+                "The durable start-request row could not be written, so the run was NOT started. "
+                "Fix the drive/event log and retry; a run without custody would be unfindable.",
+                **({"definitely_unrun": True} if not recovering else {})}
         if claim_refusal:
             reason = str(claim_refusal.get("reason") or "replacement_custody_unknown")
             detail = str(claim_refusal.get("detail") or "Actor start claim unavailable.")
@@ -601,20 +593,11 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
             return _fail(
                 "delegate_start", reason, detail, **facts,
                 **_retire_orphaned_registration(ctx, gateway, owned_project_id, project_persistent=project_persistent, history_facts=history_facts,
-                    definite_refusal=True,
-                    reason=reason, invocation_id=invocation_id, snapshot_id=snapshot_id,
+                    definite_refusal=not recovering,
+                    reason=reason, invocation_id=invocation_id, snapshot_id=("" if recovering else snapshot_id),
                 ),
             )
-        if not requested:
-            return _fail(
-                "delegate_start", "start_request_row_unwritable",
-                "The durable start-request row could not be written, so the run was "
-                "NOT started: a run launched without its custody trail would be "
-                "unfindable if this worker died. Fix the drive/event log and retry.",
-                **({"definitely_unrun": True} if not recovering else {}), **_retire_orphaned_registration(ctx, gateway, owned_project_id, project_persistent=project_persistent, history_facts=history_facts,
-                    definite_refusal=not recovering, reason="start_request_row_unwritable",
-                    invocation_id=invocation_id, snapshot_id=("" if recovering else snapshot_id)))
-        handle = gateway.start_run(request_body, idempotency_key=invocation_id)
+        handle = run_operation(ctx, gateway.start_run, request_body, idempotency_key=invocation_id)
         run_id = str(handle.get("runId") or handle.get("jobId") or "")
         if not run_id:
             return _fail("delegate_start", "queued_without_run_id",
@@ -622,11 +605,12 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
                          pending_invocation_id=invocation_id, retry_hint=_RETRY_HINT,
                          **_retire_orphaned_registration(ctx, gateway, owned_project_id, project_persistent=project_persistent, history_facts=history_facts,
                              definite_refusal=False, reason="queued_without_run_id", invocation_id=invocation_id))
-    except ClaudexorUnavailable as exc:
+    except (ClaudexorUnavailable, OwnerPauseRefused) as exc:
+        code = getattr(exc, "code", str(exc))
         # A registration we created BEFORE the start must not outlive a failed start.
         # It used to be left behind with nothing anywhere naming its id.
         status = int(getattr(exc, "status_code", 0) or 0)
-        definite = 400 <= status < 500 or not requested
+        definite = (isinstance(exc, OwnerPauseRefused) and not recovering) or 400 <= status < 500 or not requested
         # An UNKNOWN outcome hands back the retry token: only the caller can say
         # whether the next call is a retry of this intention or a new intention, and
         # without the token every next call is a new one. A definite refusal retires
@@ -634,11 +618,11 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
         pending = ({} if definite or not invocation_id else
                    {"pending_invocation_id": invocation_id,
                     "retry_hint": _RETRY_HINT})
-        return _fail("delegate_start", exc.code, str(exc), executor="blocked",
+        return _fail("delegate_start", code, str(exc), executor="blocked",
                      **({"definitely_unrun": True} if not requested else {}),
                      reset_at=getattr(exc, "reset_at", ""), **pending,
                      **_retire_orphaned_registration(ctx, gateway, owned_project_id, project_persistent=project_persistent, history_facts=history_facts,
-                         definite_refusal=definite, reason=str(getattr(exc, "code", "")),
+                         definite_refusal=definite, reason=code,
                          invocation_id=invocation_id, snapshot_id=("" if recovering else snapshot_id)))
     except BaseException as exc:
         # EVERY pre-custody exit leaves a durable disposition, including the ones no

@@ -27,7 +27,6 @@ _MOVED_NAMES = frozenset({
     "_MAX_VIDEO_FILE_BYTES",
     "_MEMORY_AT_DRIVE_MEMORY",
     "_SKILL_OWNER_STATE_FILENAMES",
-    "_SUBAGENT_SECRET_FILE_NAMES",
     "_access_or_block",
     "_annotate_reread",
     "_coerce_line_window",
@@ -38,17 +37,11 @@ _MOVED_NAMES = frozenset({
     "_detect_image_mime",
     "_detect_video_mime",
     "_direct_resource_binding",
-    "_filter_subagent_secret_listing",
-    "_filter_subagent_secret_repo_listing",
     "_is_cognitive_data_path",
     "_is_skill_owner_state_target",
-    "_is_subagent_secret_data_path",
-    "_is_subagent_secret_repo_path",
-    "_is_subagent_secret_repo_target",
     "_list_dir",
     "_list_files",
     "_list_user_files_dir",
-    "_local_readonly_resource_block",
     "_normalize_data_read_path",
     "_profile_roots_hint",
     "_read_file",
@@ -59,7 +52,6 @@ _MOVED_NAMES = frozenset({
     "_send_file",
     "_send_photo",
     "_send_video",
-    "is_restricted_subagent_profile",
 })
 
 
@@ -134,9 +126,13 @@ def test_core_catalog_schema_bytes_and_handler_owners_are_stable():
     # `options` description says optional 0-6 and `options` leaves the required keys. Rolled
     # again for TZ-1 V10: forward_to_worker also writes into a queued task's mailbox, so its
     # description and `task_id` description say "running or queued" and when each reads it.
-    # Diffing the whole catalog base to head shows exactly those edits and nothing else.
+    # Presence peer mail expands only forward_to_worker's description; the
+    # catalog comparison preserves every parameter and handler owner. Rolled again
+    # for same-tree mail: the forward_to_worker description names its peer addressees
+    # as any other task in the caller's tree (parent, sibling, any task sharing the
+    # root) and says Presence observation gaps are disclosed inside the tree too.
     assert hashlib.sha256(schema_bytes).hexdigest() == (
-        "968eecad1c04b7f8a265d17bdb5dc42a8a5239373a0a5724ad8c8d5489d06ef3"
+        "25ab2df2f9cc9c65e4971b7d4e2a5d1013041933aa070849639a01c9a4398e83"
     )
     assert {
         entry.name: (entry.handler.__module__, entry.handler.__name__)

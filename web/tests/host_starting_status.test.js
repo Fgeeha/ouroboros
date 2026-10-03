@@ -26,7 +26,8 @@ test('the reducer says Starting… only where it would say Online', () => {
         [{ pendingSubmissionsCount: 1 }, 'Sending...'],
         [{ queuedManagedCount: 1 }, 'Queued...'],
         [{ waitingModelCount: 1 }, 'Waiting for access'],
-        [{ pausedManagedCount: 1 }, 'Paused (budget)'],
+        [{ pausingManagedCount: 1 }, 'Pausing…'],
+        [{ pausedManagedCount: 1 }, 'Paused'],
     ];
     for (const [input, text] of outranks) {
         assert.equal(computeDerivedChatStatus({ ...input, supervisorStarting: true }).text, text,

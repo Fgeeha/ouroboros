@@ -179,7 +179,8 @@ def test_malformed_selection_has_typed_reason_without_creating_child(registry, s
     assert (result.status, result.code) == ("error", "TOOL_ARG_ERROR")
     assert result.meta["reason"] == "INPUT_SOURCE_SELECTION_INVALID"
     assert registry._ctx.pending_events == []
-    assert not (registry._ctx.drive_root / "task_results").exists()
+    # The launch fence may create its lock parent; a refusal creates no child result.
+    assert not list((registry._ctx.drive_root / "task_results").glob("*.json"))
 
 
 def test_declared_parent_cannot_request_shared_descendant(registry):
@@ -190,19 +191,25 @@ def test_declared_parent_cannot_request_shared_descendant(registry):
     assert registry._ctx.pending_events == []
 
 
-def test_session_route_refused_before_child_or_attachment_side_effects(registry, monkeypatch):
+def test_session_route_accepts_declared_with_the_same_selected_contract(registry, monkeypatch):
+    """A configured-session child (nanny plus leaf) takes the same selection an API child
+    does: the selected contract is stored, inherited inputs are not materialized, and the
+    child dispatches to the harness executor. No route is refused for its kind."""
     import ouroboros.tools.control_scheduling as scheduling
 
     monkeypatch.setattr(control, "load_settings", lambda: _settings("agent_session"))
-    monkeypatch.setattr(scheduling, "_prepare_child_drive",
-                        lambda *_args, **_kwargs: pytest.fail("drive prepared before route refusal"))
     monkeypatch.setattr(scheduling, "_materialize_child_attachment_manifest",
-                        lambda *_args, **_kwargs: pytest.fail("attachments prepared before route refusal"))
-    result = _schedule(registry, input_sources="declared")
-    assert (result.status, result.code) == ("error", "TOOL_ARG_ERROR"), result.text
-    assert result.meta["reason"] == "INPUT_SOURCE_SELECTION_UNSUPPORTED"
-    assert registry._ctx.pending_events == []
-    assert not (registry._ctx.drive_root / "task_results").exists()
+                        lambda *_args, **_kwargs: pytest.fail("inherited inputs were materialized"))
+    result = _schedule(registry, input_sources="declared", context="COMMON_FACTS")
+    assert (result.status, result.code) == ("ok", "OK"), result.text
+    event = registry._ctx.pending_events[-1]
+    assert event["requested_executor"] == "harness"
+    assert event["configured_subagent"]["route"]["kind"] == "agent_session"
+    selected = event["task_contract"]
+    assert selected["input_sources"] == "declared" and selected["context"] == "COMMON_FACTS"
+    assert selected["attachment_manifest"] == []
+    assert "PREVIOUS_CASE" not in json.dumps(selected)
+    assert "INPUT_SOURCE_SELECTION_UNSUPPORTED" not in result.text
 
 
 def test_contract_selection_is_additive_strict_and_has_consistent_precedence():

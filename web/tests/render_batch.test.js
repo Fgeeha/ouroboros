@@ -7,12 +7,43 @@ import {
     createHistoryResyncScheduler,
     createLiveCardBound,
     createTimelineAnchors,
+    feedIsEmpty,
 } from '../modules/chat_render_batch.js';
 import { ElementStub } from './chat_dom_fixture.js';
 
 const chatSource = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
 
-test('the history chrome is one Load-older control; no Load-newer element is ever built', () => {
+test('one history status stays in persistent chrome for gaps, failure and approximate restoration', () => {
+    const doc = { byId: new Map(), createElement: tag => new ElementStub(tag, doc) };
+    const messages = new ElementStub('div', doc), chrome = new ElementStub('div', doc);
+    messages.isConnected = chrome.isConnected = true;
+    const controls = createHistoryControls(messages, chrome);
+    const snapshot = { initialized: true, canOlder: true };
+    controls.render(snapshot, { gaps: true }, true);
+    const note = chrome.querySelector('.chat-history-status');
+    assert.match(note.textContent, /Shown messages may have gaps.*could not be restored exactly/);
+    assert.equal(messages.querySelector('.chat-load-older').querySelector('.chat-load-older-note'), null);
+    controls.render({ ...snapshot, error: new Error('read failed') }, {}, true);
+    assert.equal(chrome.querySelector('.chat-history-status'), note);
+    assert.match(note.textContent, /could not be loaded.*could not be restored exactly/);
+    controls.render(snapshot, { complete: true }, false);
+    assert.equal(chrome.children.length, 0);
+    assert.equal(messages.querySelector('.chat-load-older').querySelector('.chat-load-older-note'), note);
+    assert.equal(note.textContent, 'Beginning of saved history');
+});
+
+test('a status moved into persistent chrome leaves no empty history control padding', () => {
+    const doc = { byId: new Map(), createElement: tag => new ElementStub(tag, doc) };
+    const messages = new ElementStub('div', doc), chrome = new ElementStub('div', doc);
+    messages.isConnected = chrome.isConnected = true;
+    const controls = createHistoryControls(messages, chrome);
+    controls.render({ initialized: true, canOlder: false, canNewer: false }, { gaps: true });
+    assert.equal(controls.olderButton.hidden, true);
+    assert.equal(chrome.querySelector('.chat-history-status')?.hidden, false);
+    assert.equal(messages.querySelector('.chat-load-older')?.hidden, true);
+});
+
+test('history chrome shares one control and derives completeness from physical coverage', () => {
     const doc = { byId: new Map(), createElement: (tag) => new ElementStub(tag, doc) };
     const messages = new ElementStub('div', doc);
     messages.isConnected = true;
@@ -20,16 +51,42 @@ test('the history chrome is one Load-older control; no Load-newer element is eve
     assert.equal('newerButton' in controls, false);
     const snapshot = { initialized: true, canOlder: true, canNewer: true,
         olderExhausted: false, loading: '', error: null };
-    assert.deepEqual(controls.render(snapshot, []), { complete: false, truncated_by: [] });
+    assert.equal(controls.render(snapshot).complete, false);
+    assert.equal(controls.olderButton.textContent, 'Load more history');
     assert.deepEqual(messages.children.map((node) => node.className), ['chat-load-older']);
     assert.equal(messages.querySelector('.chat-load-newer'), null);
-    // A cache with no newer page is the only thing that ever made one appear.
     const exhausted = { ...snapshot, canOlder: false, canNewer: false, olderExhausted: true };
-    assert.deepEqual(controls.render(exhausted, []), { complete: true, truncated_by: [] });
+    assert.equal(controls.render(exhausted, { complete: false, gaps: true }).complete, false,
+        'EOF cannot certify physical coverage');
+    assert.equal(controls.render(exhausted, { complete: true, gaps: false }).complete, true);
     assert.deepEqual(messages.children.map((node) => node.className), ['chat-load-older']);
     assert.equal(messages.querySelector('.chat-load-older')
         .querySelector('.chat-load-older-note').textContent, 'Beginning of saved history');
     assert.equal(controls.olderButton.hidden, true);
+});
+
+test('the empty-Main greeting and the reconnect notice are chrome: a read over them still shows its loading and failure', () => {
+    const doc = { byId: new Map(), createElement: (tag) => new ElementStub(tag, doc) };
+    const messages = new ElementStub('div', doc);
+    messages.isConnected = true;
+    const controls = createHistoryControls(messages);
+    const node = (className) => { const element = doc.createElement('div'); element.className = className; return element; };
+    messages.appendChild(node('chat-bubble assistant typing-bubble'));
+    messages.appendChild(node('chat-empty-welcome'));
+    const notice = node('chat-bubble system');
+    notice.dataset.ephemeral = '1';
+    messages.appendChild(notice);
+    assert.equal(feedIsEmpty(messages), true);
+    assert.equal(controls.beginRecent(), true);
+    controls.render({ initialized: true });
+    assert.equal(messages.querySelector('.chat-load-older').querySelector('.chat-load-older-note').textContent,
+        'Loading saved history…');
+    controls.endRecent(new Error('offline'));
+    assert.equal(controls.recentFailed(), true);
+    controls.endRecent();
+    messages.appendChild(node('chat-bubble assistant'));
+    assert.equal(feedIsEmpty(messages), false);
+    assert.equal(controls.beginRecent(), false, 'a painted transcript gets no loading chrome');
 });
 
 // ─────────────── sticky hydration / replay contracts ──────────────────────
@@ -328,6 +385,64 @@ test('a reader inside Reviews stays anchored when content grows above the attemp
     assert.equal(messages.scrollTop, 1120);
 });
 
+test('adopted live line bookmark serializes its row and restores the cold line with a different DOM key', () => {
+    const box = (top, bottom) => ({ top, bottom, left: 0, right: 600, width: 600, height: bottom - top });
+    const makeNode = (bounds, classes = []) => {
+        const node = { bounds, dataset: {}, isConnected: true, parentElement: null };
+        node.classList = { contains: value => classes.includes(value) };
+        node.getBoundingClientRect = () => node.bounds;
+        node.getClientRects = () => [node.bounds];
+        node.matches = selector => classes.some(value => selector === `.${value}`);
+        node.contains = candidate => {
+            for (let current = candidate; current; current = current.parentElement) if (current === node) return true;
+            return false;
+        };
+        node.closest = selector => {
+            for (let current = node; current; current = current.parentElement) {
+                if (selector === '.chat-live-card' && current.classList.contains('chat-live-card')) return current;
+            }
+            return null;
+        };
+        node.querySelectorAll = selector => selector.includes('.chat-live-line') && node.line ? [node.line] : [];
+        return node;
+    };
+    const messages = makeNode(box(0, 400));
+    messages.scrollTop = 200;
+    const card = makeNode(box(-100, 500), ['chat-live-card']);
+    card.dataset.taskId = 'owner'; card.parentElement = messages;
+    const line = makeNode(box(20, 100), ['chat-live-line']);
+    line.dataset.liveLineKey = 'line-random'; line.dataset.expanded = '1';
+    line.parentElement = card; card.line = line; messages.children = [card];
+    messages.contains = candidate => candidate === card || card.contains(candidate);
+    const records = new Map([['owner', { root: card, items: [{
+        lineKey: 'line-random', historyId: 'progress:41',
+    }] }]]);
+    const anchors = createTimelineAnchors({ messagesDiv: messages, liveCardRecords: records });
+    const saved = anchors.serializeTimelineAnchor();
+    assert.equal(saved.lineKey, 'line-random');
+    assert.equal(saved.lineHistoryId, 'progress:41');
+    assert.equal(saved.lineExpanded, true);
+    assert.equal('node' in saved, false);
+    records.get('owner').items[0] = { lineKey: 'line-random',
+        dedupeKey: 'subagent-lifecycle:child' };
+    const liveLifecycle = anchors.serializeTimelineAnchor();
+    assert.equal(liveLifecycle.lineLifecycleKey, 'subagent-lifecycle:child');
+    assert.equal(liveLifecycle.lineHistoryId, '');
+
+    card.isConnected = line.isConnected = false;
+    const coldCard = makeNode(box(-20, 600), ['chat-live-card']);
+    coldCard.dataset.taskId = 'owner'; coldCard.parentElement = messages;
+    const coldLine = makeNode(box(120, 200), ['chat-live-line']);
+    coldLine.dataset.liveLineKey = 'history-progress-41';
+    coldLine.parentElement = coldCard; coldCard.line = coldLine; messages.children = [coldCard];
+    messages.contains = candidate => candidate === coldCard || coldCard.contains(candidate);
+    records.set('owner', { root: coldCard, groupId: 'owner', items: [{
+        lineKey: coldLine.dataset.liveLineKey, historyId: 'progress:41',
+    }] });
+    assert.equal(anchors.restoreVisibleTimelineAnchor(saved, { exact: true }), true);
+    assert.equal(messages.scrollTop, 300);
+});
+
 test('a card crossing the top with nothing anchorable inside keeps the reader on what follows it', () => {
     // A wait-only block above the viewport (no title, no actions, no timeline
     // line) used to anchor on its own top; when a wait update shrank the block,
@@ -376,4 +491,180 @@ test('a card crossing the top with nothing anchorable inside keeps the reader on
     bubble.bounds = box(84, 260);
     assert.equal(anchors.restoreVisibleTimelineAnchor(anchor), true);
     assert.equal(messages.scrollTop, 260, 'the reader stays on the same message');
+});
+
+// A small layout model: a child's top follows its parent's top, the parent's own
+// scrollTop when the parent scrolls, and its offset in the parent's content.
+function layoutNode({ classes = [], data = {}, y = 0, height = 0, scroll = null, parent = null } = {}) {
+    const node = { classNames: new Set(classes), attrs: { ...data }, y, height, children: [], parentElement: null, isConnected: true };
+    let top = 0;
+    Object.defineProperty(node, 'scrollTop', { get: () => top,
+        set: value => { top = scroll === null ? 0 : Math.max(0, Math.min(scroll, value)); } });
+    Object.defineProperty(node, 'clientHeight', { get: () => node.height });
+    Object.defineProperty(node, 'scrollHeight', { get: () => node.height + (scroll || 0) });
+    node.dataset = new Proxy({}, { get: (_, key) => node.attrs[`data-${String(key).replace(/[A-Z]/g, c => `-${c.toLowerCase()}`)}`] });
+    node.classList = { contains: value => node.classNames.has(value) };
+    const one = selector => selector.startsWith('.') ? node.classNames.has(selector.slice(1))
+        : selector.startsWith('[') ? selector.slice(1, -1).split('=')[0] in node.attrs : false;
+    node.matches = selector => selector.split(',').some(part => one(part.trim()));
+    node.getBoundingClientRect = () => {
+        const parent = node.parentElement;
+        const at = parent ? parent.getBoundingClientRect().top - parent.scrollTop + node.y : node.y;
+        return { top: at, bottom: at + node.height, left: 0, right: 600, width: 600, height: node.height };
+    };
+    node.getClientRects = () => [node.getBoundingClientRect()];
+    const descendants = () => node.children.flatMap(child => [child, ...child.querySelectorAll('*')]);
+    node.querySelectorAll = selector => selector === '*' ? descendants() : descendants().filter(child => child.matches(selector));
+    node.querySelector = selector => selector.startsWith(':scope > ')
+        ? node.children.find(child => child.matches(selector.slice(9))) || null : node.querySelectorAll(selector)[0] || null;
+    node.contains = candidate => {
+        for (let current = candidate; current; current = current.parentElement) if (current === node) return true;
+        return false;
+    };
+    node.closest = selector => {
+        for (let current = node; current; current = current.parentElement) if (current.matches(selector)) return current;
+        return null;
+    };
+    node.append = (...children) => { for (const child of children) { child.parentElement = node; node.children.push(child); } return node; };
+    if (parent) parent.append(node);
+    return node;
+}
+
+// One Project card: a bounded timeline holding `before` lines and the read line,
+// whose fetched full output is itself bounded; one more line follows it.
+function readingCard(feed, { before = 1, bodyMax = 900, full = true, key = 'line-warm', rowHeight = 60, timelineMax = 2000 } = {}) {
+    const card = layoutNode({ classes: ['chat-live-card'], data: { 'data-task-id': 'reader' }, y: 0, height: 900, parent: feed });
+    layoutNode({ data: { 'data-live-summary-button': '' }, y: 0, height: 40, parent: card });
+    const timeline = layoutNode({ data: { 'data-live-timeline': '' }, y: 40, height: 420, scroll: timelineMax, parent: card });
+    const items = [];
+    let y = 0;
+    for (let index = 0; index < before; index += 1) {
+        layoutNode({ classes: ['chat-live-line'], data: { 'data-live-line-key': `${key}-before-${index}` }, y, height: rowHeight, parent: timeline });
+        items.push({ lineKey: `${key}-before-${index}`, historyId: `progress:${index}` });
+        y += rowHeight + 8;
+    }
+    const line = layoutNode({ classes: ['chat-live-line'], y, height: 450, parent: timeline,
+        data: { 'data-live-line-key': key, 'data-expanded': '1' } });
+    layoutNode({ y: 0, height: 30, parent: line });
+    const body = layoutNode({ classes: ['chat-live-line-body', ...(full ? ['chat-live-line-body-full'] : [])],
+        y: 30, height: 420, scroll: full ? bodyMax : null, parent: line });
+    const next = layoutNode({ classes: ['chat-live-line'], data: { 'data-live-line-key': `${key}-next` }, y: y + 458, height: 60, parent: timeline });
+    items.push({ lineKey: key, historyId: 'progress:7', truncated: true, fullRef: 'child' }, { lineKey: `${key}-next`, historyId: 'progress:8' });
+    return { card, timeline, line, body, next, record: { root: card, groupId: 'reader', timelineEl: timeline, items } };
+}
+
+test('a bookmark inside a bounded full output keeps its line, timeline offset and own scroll by identity', () => {
+    const feed = layoutNode({ height: 800, scroll: 5000 });
+    const records = new Map();
+    const anchors = createTimelineAnchors({ messagesDiv: feed, liveCardRecords: records });
+    const warm = readingCard(feed);
+    records.set('reader', warm.record);
+    warm.timeline.scrollTop = 24; warm.body.scrollTop = 360;
+    feed.scrollTop = 150; // the read line's head is above the top edge; its output crosses it
+    assert.ok(warm.body.getBoundingClientRect().top < 0 && warm.body.getBoundingClientRect().bottom > 0);
+    assert.ok(warm.next.getBoundingClientRect().top >= 0, 'a later line is visible below the top edge');
+    feed.scrollTop = 0; // the card's own chrome is first at the top edge; the output is fully in view
+    assert.equal(anchors.captureVisibleTimelineAnchor().node, warm.line, 'a scrolled output on screen is the place being read');
+    warm.body.scrollTop = 0;
+    assert.equal(anchors.captureVisibleTimelineAnchor().node, warm.card, 'an unscrolled output below the edge is not: the first visible node anchors');
+    warm.body.scrollTop = 360; feed.scrollTop = 150;
+    const live = anchors.captureVisibleTimelineAnchor();
+    assert.equal(live.node, warm.line, 'the top edge is inside the output: the reader is there, not at the next line');
+    warm.body.scrollTop = 200; warm.timeline.scrollTop = 30;
+    assert.equal(anchors.restoreVisibleTimelineAnchor(live), true);
+    assert.deepEqual([warm.body.scrollTop, warm.timeline.scrollTop], [200, 30], 'live restores never rewrite the reader\'s own box scrolling');
+    warm.body.scrollTop = 360; warm.timeline.scrollTop = 24;
+    const saved = anchors.serializeTimelineAnchor();
+    assert.equal(saved.lineHistoryId, 'progress:7');
+    assert.equal(saved.innerTop, 360);
+    assert.equal(saved.timelineOffset, 68 - 24);
+    assert.deepEqual(JSON.parse(JSON.stringify(saved)), saved, 'the bookmark stays plain data');
+    assert.equal(saved.nested, undefined, 'no positional DOM path');
+    feed.children.length = 0;
+
+    // Two more lines above the read one, new keys and new markup: identity, not position.
+    for (const [bodyMax, full, exact] of [[900, true, true], [100, true, false], [900, false, false]]) {
+        const cold = readingCard(feed, { before: 3, bodyMax, full, key: `line-cold-${bodyMax}-${full}` });
+        records.set('reader', cold.record);
+        assert.equal(anchors.restoreVisibleTimelineAnchor(saved, { exact: true }), exact, { bodyMax, full });
+        const within = cold.line.getBoundingClientRect().top - cold.timeline.getBoundingClientRect().top;
+        assert.equal(within, saved.timelineOffset, 'the timeline puts the line back at its offset there');
+        assert.equal(cold.line.getBoundingClientRect().top - feed.getBoundingClientRect().top, saved.offset);
+        if (full) assert.equal(cold.body.scrollTop, Math.min(360, bodyMax));
+        assert.equal(anchors.restoreVisibleTimelineAnchor(saved, { cardOnly: true }), true,
+            'a shorter or unfetched output still restores its line; the caller discloses the approximation');
+        feed.children.length = 0;
+    }
+
+    // An earlier row reflowed and the timeline cannot scroll far enough (or at
+    // all): at its limit the line still takes its exact feed offset. Only the
+    // reader's own output box must reach its scroll.
+    for (const [rowHeight, timelineMax, bodyMax, exact] of [[20, 0, 900, true], [100, 0, 900, true], [100, 10, 900, true], [100, 0, 100, false]]) {
+        const cold = readingCard(feed, { rowHeight, timelineMax, bodyMax, key: `line-reflow-${rowHeight}-${timelineMax}-${bodyMax}` });
+        records.set('reader', cold.record);
+        assert.equal(anchors.restoreVisibleTimelineAnchor(saved, { exact: true }), exact, { rowHeight, timelineMax, bodyMax });
+        assert.equal(cold.timeline.scrollTop, Math.min(timelineMax, Math.max(0, rowHeight + 8 - saved.timelineOffset)));
+        assert.equal(cold.line.getBoundingClientRect().top - feed.getBoundingClientRect().top, saved.offset);
+        feed.children.length = 0;
+    }
+});
+
+test('a full output overlapping the feed and its timeline at different places is not visible: it cannot take a visible Review anchor', () => {
+    const feed = layoutNode({ height: 800, scroll: 5000 });
+    const records = new Map();
+    const anchors = createTimelineAnchors({ messagesDiv: feed, liveCardRecords: records });
+    const card = readingCard(feed, { before: 4 });
+    records.set('reader', card.record);
+    // The card's Review detail follows its timeline; the reader scrolled inside it.
+    const detail = layoutNode({ data: { 'data-review-attempt-detail': 'attempt-1' }, y: 480, height: 300, scroll: 400, parent: card.card });
+    detail.scrollTop = 50;
+    // The timeline has left the top edge. Its full output still overlaps the feed,
+    // but only below the timeline, which clips it there.
+    feed.scrollTop = 470;
+    const body = card.body.getBoundingClientRect(), timeline = card.timeline.getBoundingClientRect();
+    const top = feed.getBoundingClientRect().top;
+    assert.ok(body.top < top && body.bottom > top, 'the output crosses the feed top');
+    assert.ok(body.top < timeline.bottom && timeline.bottom <= top, 'and its timeline, but only above the feed');
+    const captured = anchors.captureVisibleTimelineAnchor();
+    assert.equal(captured.node, detail, 'the Review detail being read anchors');
+    assert.equal(anchors.serializeTimelineAnchor().reviewValue, 'attempt-1');
+    // Where the feed and its timeline overlap on the output, the output is read.
+    feed.scrollTop = 400;
+    assert.equal(anchors.captureVisibleTimelineAnchor().node, card.line);
+    feed.children.length = 0;
+});
+
+test('header chrome followed directly by an expanded line anchors that line, so a reopen expands it again', () => {
+    const feed = layoutNode({ height: 800, scroll: 5000 });
+    const records = new Map();
+    const anchors = createTimelineAnchors({ messagesDiv: feed, liveCardRecords: records });
+    const card = readingCard(feed, { before: 0 });
+    records.set('reader', card.record);
+    // The card header is first at the top edge; its unscrolled output fills the view below.
+    assert.equal(card.body.scrollTop, 0);
+    const saved = anchors.serializeTimelineAnchor();
+    assert.equal(saved.lineKey, 'line-warm', 'not the header alone');
+    assert.equal(saved.lineHistoryId, 'progress:7');
+    assert.equal(saved.lineExpanded, true);
+    assert.equal(saved.anchorRole, '');
+    assert.equal(saved.offset, 40);
+    assert.deepEqual([saved.timelineOffset, saved.innerTop], [0, 0]);
+    card.line.attrs['data-expanded'] = '0';
+    assert.equal(anchors.captureVisibleTimelineAnchor().node, card.card, 'a collapsed line discloses nothing: the header anchors');
+    feed.children.length = 0;
+});
+
+test('saved-place readiness waits for the Review detail and an expanded line full output', () => {
+    const item = { lineKey: 'line', historyId: 'progress:3', _fetchingFull: true };
+    const records = new Map([['owner', { groupId: 'owner', items: [item] }]]);
+    const { anchorOwnersReady } = createTimelineAnchors({ messagesDiv: {}, liveCardRecords: records });
+    const line = { lineKey: 'line', lineHistoryId: 'progress:3', lineExpanded: true, cardChain: [{ taskId: 'owner' }] };
+    const reviewReady = id => id !== 'owner';
+    assert.equal(anchorOwnersReady(null, reviewReady), true);
+    assert.equal(anchorOwnersReady(line, reviewReady), false, 'the full output is still loading');
+    assert.equal(anchorOwnersReady({ ...line, lineExpanded: false }, reviewReady), true);
+    item._fetchingFull = false;
+    assert.equal(anchorOwnersReady(line, reviewReady), true);
+    assert.equal(anchorOwnersReady({ reviewKey: 'reviewAttemptDetail', cardChain: [{ taskId: 'owner' }] }, reviewReady), false);
+    assert.equal(anchorOwnersReady({ reviewKey: 'reviewAttemptDetail', cardChain: [{ taskId: 'other' }] }, reviewReady), true);
 });

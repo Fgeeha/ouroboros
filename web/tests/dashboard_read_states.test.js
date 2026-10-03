@@ -154,6 +154,20 @@ function emptyActivity(routes) {
     routes.set(schedulesUrl, response({ tasks: [] }));
 }
 
+test('Activity names known non-Project scope waits without implying a Project', async (t) => {
+    const { mount, routes, ws } = setup(t);
+    emptyActivity(routes);
+    routes.set(queueUrl, response({ queue: { running: [], pending: [{ id: 'main', task: {
+        title: 'Original work', _project_scope_none: true,
+        project_admission_hold: { label: 'Waiting for task scope verification', detail: '<bindings unavailable>' },
+    } }] } }));
+    const activity = initActivity({ mount, ws });
+    await activity.refresh();
+    assert.match(mount.textContent, /Waiting for task scope verification/);
+    assert.doesNotMatch(mount.textContent, /Waiting for Project verification/);
+    assert.match(mount.textContent, /&lt;bindings unavailable&gt;/);
+});
+
 test('Activity failed reads stay unknown; independent successful empty state stays empty', async (t) => {
     const { mount, routes, ws } = setup(t);
     emptyActivity(routes);
@@ -297,7 +311,7 @@ test('Activity reports what a lifecycle action actually did, delete included', a
     await click('schedule-toggle', 'active');
     assert.match(toasts().at(-1), /audit record is incomplete: the change is durable/);
     await click('schedule-toggle', 'active');
-    assert.match(toasts().at(-1), /still running and was not stopped/);
+    assert.match(toasts().at(-1), /queued or running and was not cancelled/);
     await click('schedule-toggle', 'active');
     assert.match(toasts().at(-1), /is unknown/);
     // A clean change with nothing in flight has nothing to disclose.
@@ -689,4 +703,64 @@ test('Activity offers no Enable on a skill row held back by readiness alone', as
     assert.match(row.textContent, /disabled by skill readiness/);
     // Delete stays (it suppresses) and is marked as a skill row for the dialog.
     assert.equal(row.querySelector('[data-act="schedule-delete"]').dataset.managed, '1');
+});
+
+test('saved Pause with unreadable tree authority remains unknown in Activity and shared Restart', async (t) => {
+    const { confirmAndSendRestart } = await import('../modules/chat_activity.js');
+    const { mount, routes, ws } = setup(t);
+    emptyActivity(routes);
+    routes.set(queueUrl, response({ queue: { running: [], pending: [{ id: 'held', task: {
+        id: 'held', root_task_id: 'held', type: 'task', title: 'Saved work', _budget_pause: { reason: 'owner' },
+    } }] } }));
+    routes.set(backgroundUrl, response({ bg_consciousness_enabled: false,
+        active_chat_activities: [{ activity_id: 'held', phase: 'unknown' }], active_chat_activities_complete: false }));
+    await initActivity({ mount, ws }).refresh();
+    assert.match(section(mount, 'queue').textContent, /pause status unknown/);
+    assert.doesNotMatch(section(mount, 'queue').textContent, /paused/);
+    assert.equal(section(mount, 'queue').querySelector('[data-act="task-control"]').dataset.budgetPaused, undefined);
+    let body = '';
+    const result = await confirmAndSendRestart({ ws,
+        openConfirmDialog: async (options) => { body = options.body; return false; } });
+    assert.equal(result, 'cancelled');
+    assert.match(body, /Pause status could not be read/);
+});
+
+test('Activity Resume follows the root census while owner Pause is settling', async (t) => {
+    const { mount, routes, ws } = setup(t);
+    emptyActivity(routes);
+    routes.set(queueUrl, response({ queue: { running: [], pending: ['root', 'child'].map((id) => ({ id, task: {
+        id, root_task_id: 'root', type: 'task', title: id, _budget_pause: { reason: 'owner' },
+    } })) } }));
+    const activity = initActivity({ mount, ws });
+    for (const phase of ['budget_pausing', 'unknown', undefined, 'budget_paused']) {
+        routes.set(backgroundUrl, response({ bg_consciousness_enabled: false,
+            active_chat_activities: phase ? [{ activity_id: 'root', phase }] : [],
+            active_chat_activities_complete: phase !== undefined }));
+        await activity.refresh();
+        for (const id of ['root', 'child']) {
+            const button = section(mount, 'queue').querySelector(`[data-id="${id}"]`);
+            assert.equal(button.dataset.budgetPaused, phase === 'budget_paused' ? '1' : undefined, `${id}: ${phase}`);
+        }
+    }
+});
+
+test('Activity names saved sleep without claiming a budget pause and preserves owner Pause precedence', async (t) => {
+    const { mount, routes, ws } = setup(t);
+    emptyActivity(routes);
+    const queue = { running: [], pending: [{ id: 'sleeping-root', task: {
+        id: 'sleeping-root', root_task_id: 'sleeping-root', type: 'task', title: 'Saved sleep',
+        _budget_pause: { reason: 'sleep' },
+    } }] };
+    routes.set(queueUrl, response({ queue }));
+    const activity = initActivity({ mount, ws });
+    await activity.refresh();
+    assert.match(section(mount, 'queue').textContent, /sleeping/);
+    assert.doesNotMatch(section(mount, 'queue').textContent, /paused \(budget\)/);
+    assert.equal(section(mount, 'queue').querySelector('[data-act="task-control"]').dataset.budgetPaused, '1');
+    queue.budget_root_fences = [{ root_task_id: 'sleeping-root', status: 'paused', cause: 'owner_pause' }];
+    routes.set(backgroundUrl, response({ bg_consciousness_enabled: false,
+        active_chat_activities: [{ activity_id: 'sleeping-root', phase: 'budget_paused' }] }));
+    await activity.refresh();
+    assert.match(section(mount, 'queue').textContent, /paused/);
+    assert.doesNotMatch(section(mount, 'queue').textContent, /sleeping|budget/);
 });
