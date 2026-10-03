@@ -22,6 +22,7 @@ import sys
 from xml.parsers.expat import ExpatError
 
 from ouroboros import windows_autostart
+from ouroboros.launcher_bootstrap import appimage_extracts_and_runs
 from ouroboros.platform_layer import BUNDLE_DIR_ENV, is_unstable_macos_app_path
 from ouroboros.utils import write_bytes_atomic, write_text_atomic
 
@@ -116,7 +117,11 @@ def _desktop_command(exe: Path) -> str:
     # Desktop Entry's two escaping layers: argv quoting, then string escaping.
     quoted = "".join("\\" + c if c in '\\"`$' else c for c in str(exe)).replace("%", "%%")
     quoted = quoted.replace("\\", "\\\\").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
-    return f'"{quoted}" --launch-intent automatic'
+    # A FUSE-less AppImage (README: APPIMAGE_EXTRACT_AND_RUN=1) must stay so in a fresh sign-in
+    # session. The pinned type-2 runtime reads only the FIRST long option, then strips its own.
+    appimage = os.environ.get("APPIMAGE")
+    mode = " --appimage-extract-and-run" if appimage and Path(appimage) == exe and appimage_extracts_and_runs() else ""
+    return f'"{quoted}"{mode} --launch-intent automatic'
 
 
 def _desktop_state(path: Path, exe: Path) -> str:

@@ -4,6 +4,7 @@ from __future__ import annotations
 import configparser
 import json
 import logging
+import os
 from pathlib import Path
 import plistlib
 import re
@@ -49,6 +50,7 @@ def host(tmp_path, monkeypatch):
     monkeypatch.setenv("OUROBOROS_APP_VERSION", "7.2.0")
     monkeypatch.delenv("APPIMAGE", raising=False)
     monkeypatch.delenv("APPDIR", raising=False)
+    monkeypatch.delenv("APPIMAGE_EXTRACT_AND_RUN", raising=False)
     monkeypatch.setattr(startup.Path, "home", lambda: tmp_path)
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
     monkeypatch.setattr(startup, "NATIVE_UNIT", tmp_path / "ouroboros.service")
@@ -93,6 +95,7 @@ def host(tmp_path, monkeypatch):
             exe.touch()
             monkeypatch.setenv("APPIMAGE", str(exe))
             monkeypatch.setenv("APPDIR", str(bundle.parent))
+            monkeypatch.setattr(os.path, "ismount", lambda path: str(path) == str(bundle.parent))  # FUSE-mounted
         return exe
 
     return package, state
@@ -153,6 +156,27 @@ def test_linux_portable_registers_only_its_stable_target(host, tmp_path, appimag
     assert startup.autostart_status()["state"] == "other_copy"
     assert startup.autostart_status(False)["state"] == "off"
     assert not path.exists()
+
+
+@pytest.mark.parametrize("fuse_less", [None, "APPIMAGE_EXTRACT_AND_RUN", "--appimage-extract-and-run"])
+def test_appimage_entry_starts_a_fresh_sign_in_session_in_the_same_mode(host, tmp_path, monkeypatch, fuse_less):
+    package, _ = host
+    exe = package("linux", appimage=True)
+    if fuse_less == "APPIMAGE_EXTRACT_AND_RUN":
+        monkeypatch.setenv("APPIMAGE_EXTRACT_AND_RUN", "1")  # README's FUSE-less command
+    elif fuse_less:
+        monkeypatch.setattr(os.path, "ismount", lambda path: False)  # runtime flag: APPDIR is a plain extracted tree
+    assert startup.autostart_status(True)["state"] == "on"
+    argv = _exec_argv(tmp_path / ".config/autostart/ouroboros.desktop")
+    assert argv[0] == str(exe) and argv[-2:] == ["--launch-intent", "automatic"]
+    # The pinned type-2 runtime at sign-in, with none of this process's environment: the FIRST long
+    # option selects extract-and-run, and the runtime strips that flag before execing AppRun.
+    session_env: dict[str, str] = {}
+    first = next((arg[2:] for arg in argv[1:] if arg.startswith("--")), None)
+    assert ("APPIMAGE_EXTRACT_AND_RUN" in session_env or first == "appimage-extract-and-run") is bool(fuse_less)
+    apprun_argv = [arg for arg in argv[1:] if arg != "--appimage-extract-and-run"]
+    assert parse_launch_options(apprun_argv).launch_intent == "automatic"
+    assert startup.autostart_status()["state"] == "on"  # read back as this copy's own entry
 
 
 def test_linux_native_uses_shipped_unit_and_replaces_xdg_registration(host, tmp_path):
