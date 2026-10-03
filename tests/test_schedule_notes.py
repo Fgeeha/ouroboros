@@ -260,6 +260,23 @@ def test_note_label_reads_both_times_in_the_schedule_zone():
         "Reminder · Ouroboros · for Oct 3 12:00 (UTC)\nCall mother")
 
 
+@pytest.mark.parametrize(("zone", "set_at", "due", "delivered", "label"), [
+    # Clocks go back at 01:00Z: due 02:30 summer time, shown an hour later at 02:30 winter time.
+    ("Europe/Berlin", "2026-10-24T10:00:00Z", "2026-10-25T00:30:00Z", "2026-10-25T01:30:00Z",
+     "written Oct 24 12:00 (UTC+2) · for Oct 25 02:30 (UTC+2) · delivered Oct 25 02:30 (UTC+1)"),
+    ("America/New_York", "2026-10-31T12:00:00-04:00", "2026-11-01T01:30:00-04:00", "2026-11-01T01:30:00-05:00",
+     "written Oct 31 12:00 (UTC-4) · for Nov 1 01:30 (UTC-4) · delivered Nov 1 01:30 (UTC-5)"),
+    # On time, but written before the change: each time keeps its own offset.
+    ("Europe/Berlin", "2026-10-24T10:00:00Z", "2026-10-25T02:00:00Z", "2026-10-25T02:00:10Z",
+     "written Oct 24 12:00 (UTC+2) · for Oct 25 03:00 (UTC+1)"),
+])
+def test_note_label_across_a_dst_change_compares_instants_and_names_each_offset(zone, set_at, due, delivered, label):
+    from supervisor.schedule_notes import note_text
+
+    note = {"text": "Call mother", "set_at": set_at, "scheduled_for": due, "timezone": zone, "author": "Ouroboros"}
+    assert note_text(note, delivered) == f"Reminder · Ouroboros · {label}\nCall mother"
+
+
 @pytest.mark.parametrize(("stored", "expected"), [
     ((True, 5_000_000_001), 5_000_000_001),  # a headless install's first owner transport
     ((True, None), 1), ((False, 77), 1), ((True, 0), 1), ((True, -1001), 1), ((True, "x"), 1),

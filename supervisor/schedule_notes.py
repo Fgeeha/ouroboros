@@ -74,36 +74,39 @@ def consume(record: Dict[str, Any], due_at: str, now: datetime.datetime) -> Tupl
             "scheduled_for": str(due_at or ""), "timezone": str(record.get("timezone") or "")}, True
 
 
-def _clock(raw: str, tz: datetime.tzinfo) -> str:
-    from supervisor.schedule_time import parse_schedule_time
+def _clock(moment: datetime.datetime) -> str:
+    return f"{_MONTHS[moment.month - 1]} {moment.day} {moment:%H:%M}"
 
-    moment = parse_schedule_time(raw, tz)
-    return f"{_MONTHS[moment.month - 1]} {moment.day} {moment:%H:%M}" if moment else ""
+
+def _zone(moment: datetime.datetime) -> str:
+    offset = moment.utcoffset()
+    minutes = int(offset.total_seconds() // 60) if offset is not None else 0
+    return "UTC" if not minutes else f"UTC{'+' if minutes > 0 else '-'}{abs(minutes) // 60}" + (
+        f":{abs(minutes) % 60:02d}" if minutes % 60 else "")
 
 
 def note_text(note: Dict[str, Any], delivered_at: str) -> str:
     """The row: a host-composed signature line, then the mind's words verbatim.
 
     Times are the schedule's zone (the server's when none is stored), named once
-    as a UTC offset; ``delivered`` appears whenever it reads differently from the
-    due time, so a note held back by downtime shows both times.
+    as a UTC offset, or each with its own offset when a DST change lies between
+    them. ``delivered`` appears whenever its minute is not the due minute (real
+    instants, never wall-clock text), so a note held back by downtime shows both.
     """
     from supervisor.schedule_time import parse_schedule_time, timezone_for_schedule
 
     tz = timezone_for_schedule({"timezone": note.get("timezone")})
-    due = _clock(note.get("scheduled_for", ""), tz)
-    delivered = _clock(delivered_at, tz)
-    parts = ["Reminder", str(note.get("author") or "Ouroboros")]
-    if written := _clock(note.get("set_at", ""), tz):
-        parts.append(f"written {written}")
-    parts.append(f"for {due}")
-    if delivered and delivered != due:
-        parts.append(f"delivered {delivered}")
-    offset = (parse_schedule_time(delivered_at, tz) or datetime.datetime.now(tz)).utcoffset()
-    minutes = int(offset.total_seconds() // 60) if offset is not None else 0
-    zone = "UTC" if not minutes else f"UTC{'+' if minutes > 0 else '-'}{abs(minutes) // 60}" + (
-        f":{abs(minutes) % 60:02d}" if minutes % 60 else "")
-    return f"{' · '.join(parts)} ({zone})\n{note['text']}"
+    written, due, delivered = (parse_schedule_time(raw, tz) for raw in (
+        note.get("set_at", ""), note.get("scheduled_for", ""), delivered_at))
+    if delivered and due and int(delivered.timestamp() // 60) == int(due.timestamp() // 60):
+        delivered = None
+    shown = [(label, moment) for label, moment in (("written", written), ("for", due), ("delivered", delivered))
+             if moment]
+    zones = {_zone(moment) for _label, moment in shown} or {_zone(datetime.datetime.now(tz))}
+    each = len(zones) > 1
+    parts = ["Reminder", str(note.get("author") or "Ouroboros"), *(
+        f"{label} {_clock(moment)}" + (f" ({_zone(moment)})" if each else "") for label, moment in shown)]
+    return f"{' · '.join(parts)}{'' if each else f' ({zones.pop()})'}\n{note['text']}"
 
 
 def deliver(notes: List[Dict[str, Any]], drive_root: Any) -> None:
