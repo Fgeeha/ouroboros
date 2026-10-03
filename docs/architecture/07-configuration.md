@@ -94,6 +94,7 @@ A registry of `config.SETTINGS_DEFAULTS` (exact defaults canonical in `settings_
 | OUROBOROS_PROJECT_NAMING_TIMEOUT_SEC | 60 | Project-naming call ceiling |
 | OUROBOROS_PROJECT_NAMING_ASYNC_TIMEOUT_SEC | 8 | Inline naming bound when a card becomes a project (`gateway/projects.py`); a direct Main turn is named in the background once it starts working (`spawn_turn_namer`, bounded by `OUROBOROS_PROJECT_NAMING_TIMEOUT_SEC` + 30 s) |
 | OUROBOROS_UPDATE_LETTER_TIMEOUT_SEC | 120 | Update-letter LIGHT one-shot ceiling, slot wait and provider call together (`update_letter.py`) |
+| OUROBOROS_UI_TRANSLATION_TIMEOUT_SEC | 120 | One translation-generator batch call, slot wait and provider call together (`ui_translation.py`); the output budget per batch is the module constant `UI_TRANSLATION_MAX_TOKENS` |
 | OUROBOROS_UI_LANGUAGE | "" | The owner's interface language for this install: a BCP-47 tag (`ru`, `pt-BR`, `art-x-<slug>` for an invented language), an open set; `""` = not chosen (the English source renders), `en` = chosen English. Written only by `POST /api/ui/i18n/language` through the locked owner writer; read live by the gateway and the Telegram skill, by the mind's runtime block at its next attempt (`ui_language.py`, `i18n_memory.py`, §3 Settings and onboarding) |
 | OUROBOROS_FALLBACK_COOLDOWN_ENABLED | true | 429-aware per-process model cooldown |
 | OUROBOROS_FALLBACK_COOLDOWN_SEC | 120 | Cooldown window |

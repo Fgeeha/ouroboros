@@ -1,3 +1,4 @@
-478
-The OUROBOROS_UI_LANGUAGE row: the install-wide interface-language tag, its
-open value set, its one writer and its readers.
+704
+Two rows: OUROBOROS_UI_LANGUAGE (the install-wide interface-language tag, its
+open value set, its one writer and its readers) and
+OUROBOROS_UI_TRANSLATION_TIMEOUT_SEC (the generator batch-call ceiling).

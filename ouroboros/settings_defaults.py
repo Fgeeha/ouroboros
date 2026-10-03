@@ -149,6 +149,8 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     "OUROBOROS_UI_LANGUAGE": "",
     # LIGHT one-shot ceilings (naming, its gateway wait, the update letter): SSOT here, never consumer magic numbers.
     "OUROBOROS_UPDATE_LETTER_TIMEOUT_SEC": 120,
+    # One translation-generator batch call (ui_translation.py): slot wait and provider call together.
+    "OUROBOROS_UI_TRANSLATION_TIMEOUT_SEC": 120,
     "OUROBOROS_PROJECT_NAMING_TIMEOUT_SEC": 60,
     "OUROBOROS_PROJECT_NAMING_ASYNC_TIMEOUT_SEC": 8,
     # Skill lifecycle lane deadline (wedged-job loud-failure bound).

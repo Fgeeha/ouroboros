@@ -12,7 +12,7 @@ from ouroboros.gateway.widgets import ExtensionLiveSnapshot, WidgetTab, WidgetsR
 from ouroboros.gateway.decision_contracts import DecisionRequest, DecisionResponse  # noqa: F401 -- public re-exports
 from ouroboros.gateway.ui_i18n_contracts import (  # noqa: F401 -- public re-exports
     UiI18nEntry, UiI18nLanguageRequest, UiI18nLanguageSummary, UiI18nMissingRequest,
-    UiI18nMissingResponse, UiI18nProfile, UiI18nResponse, UiI18nStats,
+    UiI18nGenerator, UiI18nMissingResponse, UiI18nProfile, UiI18nResponse, UiI18nStats,
 )
 from ouroboros.gateway.schedule_contracts import (  # noqa: F401 -- public re-exports
     ScheduleActionResponse,
@@ -1544,7 +1544,7 @@ __all__ = [
     "SkillGrantResponse",
     "SkillDeleteResponse",
     "UiPreferencesResponse",
-    "UiI18nProfile", "UiI18nEntry", "UiI18nStats", "UiI18nLanguageSummary",
+    "UiI18nProfile", "UiI18nEntry", "UiI18nStats", "UiI18nLanguageSummary", "UiI18nGenerator",
     "UiI18nResponse", "UiI18nLanguageRequest", "UiI18nMissingRequest", "UiI18nMissingResponse",
     "GitLogResponse",
     "EvolutionDataResponse",

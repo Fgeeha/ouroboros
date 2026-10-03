@@ -35,8 +35,13 @@ def test_language_post_writes_the_setting_creates_the_memory_and_refuses_non_tag
 
     ui_i18n.register_language_hook(lambda event, root, tag: events.append((event, tag)))
     with _client(tmp_path) as client:
+        # A name is the generator's job; this install has no credentialed light model, so
+        # the gateway says exactly that instead of guessing a tag.
         bad = client.post("/api/ui/i18n/language", json={"language": "Russian"})
-        assert bad.status_code == 400 and bad.json()["code"] == "language_not_a_tag"
+        assert bad.status_code == 400 and bad.json()["code"] == "language_needs_model", bad.text
+        # Blank is the not-chosen value itself ("" renders the English source), never a name.
+        blank = client.post("/api/ui/i18n/language", json={"language": "   "}).json()
+        assert blank["ok"] is True and blank["language"] == "" and blank["chosen"] is False
         assert client.post("/api/ui/i18n/language", json={"language": 5}).status_code == 400
         assert client.post("/api/ui/i18n/language", json=[]).status_code == 400
 
@@ -126,3 +131,38 @@ def test_malformed_memory_is_reported_not_replaced(tmp_path, monkeypatch):
         assert client.get("/api/ui/i18n/export").status_code == 409
         assert client.post("/api/ui/i18n/regenerate", json={}).status_code == 409
     assert path.read_text(encoding="utf-8") == '{"schema": 7}'
+
+
+def test_language_post_resolves_a_free_text_language_through_the_generator(tmp_path, monkeypatch):
+    """"Quenya" or "invent a language": the light model answers a tag and a profile; the POST
+    persists that tag and stores the profile (label, instruction, lexicon, direction)."""
+    from ouroboros import config, ui_translation
+
+    monkeypatch.setenv("OUROBOROS_UI_LANGUAGE", "")
+    asked = []
+
+    def fake_resolve(text, *, drive_root=None, client=None):
+        asked.append(text)
+        return {"tag": "art-x-vael", "label": "Vaelic", "direction": "ltr",
+                "instruction": "soft, archaic", "lexicon": "task = vael, settings = norim"}
+
+    monkeypatch.setattr(ui_translation, "resolve_language_request", fake_resolve)
+    with _client(tmp_path) as client:
+        ok = client.post("/api/ui/i18n/language", json={"language": "invent a language and translate everything into it"})
+        assert ok.status_code == 200, ok.text
+        body = ok.json()
+        assert body["language"] == "art-x-vael" and body["english"] is False
+        assert body["profile"] == {"label": "Vaelic", "instruction": "soft, archaic", "direction": "ltr",
+                                   "lexicon": "task = vael, settings = norim"}
+        assert body["generator"]["state"] in ("idle", "running", "no_model", "failed")
+        assert config.load_settings()["OUROBOROS_UI_LANGUAGE"] == "art-x-vael"
+        assert asked == ["invent a language and translate everything into it"]
+
+        # A model failure is a typed 502, and nothing was written.
+        def failing(text, *, drive_root=None, client=None):
+            raise ui_translation.LanguageResolveError("language_resolve_failed", "the model could not be asked")
+
+        monkeypatch.setattr(ui_translation, "resolve_language_request", failing)
+        bad = client.post("/api/ui/i18n/language", json={"language": "Quenya"})
+        assert bad.status_code == 502 and bad.json()["code"] == "language_resolve_failed"
+        assert config.load_settings()["OUROBOROS_UI_LANGUAGE"] == "art-x-vael"

@@ -94,6 +94,15 @@ def _source_hashes() -> Optional[Dict[str, str]]:
         return None
 
 
+def _generator_status() -> Dict[str, Any]:
+    try:
+        from ouroboros.ui_translation import generator_status
+
+        return generator_status()
+    except Exception:
+        return {"state": "idle", "error": "", "updated_at": "", "applied": 0, "language": "", "in_flight": 0}
+
+
 def memory_payload(drive_root: pathlib.Path, tag: str) -> Dict[str, Any]:
     """The GET body for ``tag``: entries only for a non-English language, counts always."""
     english = is_english(tag)
@@ -104,7 +113,10 @@ def memory_payload(drive_root: pathlib.Path, tag: str) -> Dict[str, Any]:
             doc = memory.load_memory(drive_root, tag)
         except memory.MemoryFormatError as exc:
             error = str(exc)
+    generator = _generator_status()
     pending = 0 if english else memory.pending_count(drive_root, tag)
+    if not english and generator.get("language") == tag:
+        pending += int(generator.get("in_flight") or 0)  # a batch out at the model is still pending work
     return {
         "language": tag,
         "chosen": tag != LANGUAGE_NOT_CHOSEN,
@@ -118,6 +130,7 @@ def memory_payload(drive_root: pathlib.Path, tag: str) -> Dict[str, Any]:
         "updated_at": str(doc.get("updated_at") or "") if doc else "",
         "memory_error": error,
         "languages": memory.list_languages(drive_root),
+        "generator": generator,
     }
 
 
@@ -153,13 +166,19 @@ def _language_post_sync(request: Request, body: Any) -> JSONResponse:
         return unsaved_error("language must be a string: a BCP-47 tag such as ru or pt-BR",
                              400, code="language_not_a_tag")
     tag = normalize_language_tag(raw)
-    if tag is None:
-        return unsaved_error(
-            "language must be a BCP-47 tag such as ru, pt-BR or art-x-<slug>; a language name "
-            "or description needs the generator to turn it into a tag first",
-            400, code="language_not_a_tag", language=raw[:120])
     drive_root = request_drive_root(request)
     profile = dict(body.get("profile") or {}) if isinstance(body.get("profile"), dict) else {}
+    if tag is None:
+        # A name or a description ("Quenya", "invent a language"): the generator turns it into
+        # a tag and a profile with one light call; without a model it says so, never guesses.
+        from ouroboros.ui_translation import LanguageResolveError, resolve_language_request
+
+        try:
+            resolved = resolve_language_request(raw, drive_root=drive_root)
+        except LanguageResolveError as exc:
+            return unsaved_error(str(exc), exc.status, code=exc.code, language=raw[:120])
+        tag = resolved["tag"]
+        profile = {**{k: v for k, v in resolved.items() if k != "tag"}, **profile}
     if isinstance(body.get("label"), str) and body["label"].strip():
         profile["label"] = body["label"].strip()
     plural_select = body.get("plural_select") if isinstance(body.get("plural_select"), dict) else None

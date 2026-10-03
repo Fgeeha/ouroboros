@@ -56,6 +56,17 @@ class UiI18nLanguageSummary(TypedDict):
     malformed: bool
 
 
+class UiI18nGenerator(TypedDict):
+    """The translation generator's state in this server process (ouroboros/ui_translation.py)."""
+
+    state: Literal["idle", "running", "no_model", "failed"]
+    error: str  # the last failure, secret-free; "" when the state is not failed/no_model
+    updated_at: str
+    applied: int  # entries written since the process started
+    language: str  # the language the worker last ran for ("" before any run)
+    in_flight: int  # keys of the batch at the model right now (counted into stats.pending)
+
+
 class UiI18nResponse(TypedDict):
     """GET /api/ui/i18n and the body of a successful language POST."""
 
@@ -72,6 +83,7 @@ class UiI18nResponse(TypedDict):
     updated_at: str
     memory_error: str  # nonempty when the stored file is malformed (English fallback in effect)
     languages: list[UiI18nLanguageSummary]
+    generator: UiI18nGenerator
 
 
 class UiI18nLanguageRequest(TypedDict):
@@ -98,6 +110,6 @@ class UiI18nMissingResponse(TypedDict):
 
 
 __all__ = [
-    "UiI18nProfile", "UiI18nEntry", "UiI18nStats", "UiI18nLanguageSummary",
+    "UiI18nProfile", "UiI18nEntry", "UiI18nStats", "UiI18nLanguageSummary", "UiI18nGenerator",
     "UiI18nResponse", "UiI18nLanguageRequest", "UiI18nMissingRequest", "UiI18nMissingResponse",
 ]

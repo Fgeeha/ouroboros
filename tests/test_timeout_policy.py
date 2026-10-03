@@ -1063,3 +1063,16 @@ def test_expired_local_deadline_does_not_dispatch_a_paid_final_call(monkeypatch,
         "execution_status": "failed",
         "reason_code": "deadline_local",
     }
+
+
+def test_ui_translation_timeout_is_a_clamped_config_getter(monkeypatch):
+    from ouroboros.config import SETTINGS_DEFAULTS, get_ui_translation_timeout_sec
+
+    monkeypatch.delenv("OUROBOROS_UI_TRANSLATION_TIMEOUT_SEC", raising=False)
+    assert get_ui_translation_timeout_sec() == float(SETTINGS_DEFAULTS["OUROBOROS_UI_TRANSLATION_TIMEOUT_SEC"])
+    monkeypatch.setenv("OUROBOROS_UI_TRANSLATION_TIMEOUT_SEC", "not-a-number")
+    assert get_ui_translation_timeout_sec() == 120.0
+    monkeypatch.setenv("OUROBOROS_UI_TRANSLATION_TIMEOUT_SEC", "0")
+    assert get_ui_translation_timeout_sec() == 10.0
+    monkeypatch.setenv("OUROBOROS_UI_TRANSLATION_TIMEOUT_SEC", "99999")
+    assert get_ui_translation_timeout_sec() == 600.0

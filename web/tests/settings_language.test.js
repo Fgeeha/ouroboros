@@ -120,7 +120,16 @@ function fakeClient(initial) {
         uiI18n: async () => { calls.push(['uiI18n']); return current; },
         saveUiLanguage: async (body) => {
             calls.push(['saveUiLanguage', body]);
-            if (body.language === 'Quenya') throw Object.assign(new Error('bad'), { status: 400, body: { code: 'language_not_a_tag' } });
+            if (body.language === 'Quenya') throw Object.assign(new Error('bad'), { status: 400, body: { code: 'language_needs_model' } });
+            if (body.language === 'invent a language') {
+                current = { language: 'art-x-vael', english: false, chosen: true, entries: {}, revision: 1, plural_select: null,
+                    profile: { label: 'Vaelic' }, stats: { entries: 0, pending: 0 }, languages: current.languages };
+                return current;
+            }
+            if (body.language === 'art-x-vael') {
+                current = { ...current, plural_select: body.plural_select || null, plural_categories: body.plural_categories || null };
+                return current;
+            }
             current = { language: body.language, english: false, chosen: true, entries: {}, revision: 1,
                 profile: { label: body.label || body.language }, stats: { entries: 0, pending: 0 }, languages: current.languages };
             return current;
@@ -200,7 +209,7 @@ test('Other… opens the free field; a tag saves, a description the gateway cann
     p.otherApply.fire('click');
     await settle();
     assert.equal(client.calls.at(-1)[1].language, 'Quenya');
-    assert.ok(p.note.textContent.startsWith('Not recognized as a language code yet'), p.note.textContent);
+    assert.ok(p.note.textContent.startsWith('A language name needs a model'), p.note.textContent);
     assert.equal(p.select.value, OTHER_VALUE);
     assert.equal(p.other.hidden, false);
 
@@ -254,4 +263,33 @@ test('a page without the block binds nothing and disposes harmlessly', () => {
     const dispose = bindLanguageSettings(new Stub('div'), { client: {}, toast: () => {} });
     assert.equal(typeof dispose, 'function');
     dispose();
+});
+
+test('a described language the gateway resolved to a tag gets its plural map completed in a second save', () => withDocument(async () => {
+    const p = page();
+    const client = fakeClient(ENGLISH);
+    bindLanguageSettings(p.doc, { client, toast: () => {}, navigatorLanguages: [] });
+    await settle();
+    p.select.value = OTHER_VALUE;
+    p.select.fire('change');
+    p.otherInput.value = 'invent a language';
+    p.otherApply.fire('click');
+    await settle();
+    const saves = client.calls.filter(([name]) => name === 'saveUiLanguage').map(([, body]) => body);
+    assert.equal(saves.length, 2, 'the description, then the resolved tag with this engine\'s plural rules');
+    assert.equal(saves[0].language, 'invent a language');
+    assert.equal(saves[0].plural_select, undefined, 'no plural map can be computed for free text');
+    assert.equal(saves[1].language, 'art-x-vael');
+    assert.equal(typeof saves[1].plural_select.map['1'], 'string');
+    assert.equal(p.select.value, 'art-x-vael');
+    assert.ok(p.status.textContent.startsWith('Vaelic: 0 translated'), p.status.textContent);
+}));
+
+test('the status line names the generator state when it is not idle', () => {
+    const base = { english: false, language: 'ru', profile: { label: 'Русский' }, stats: { entries: 5, pending: 2 } };
+    assert.equal(describeStatus({ ...base, generator: { state: 'running' } }), 'Русский: 5 translated · 2 pending · translating…');
+    assert.ok(describeStatus({ ...base, generator: { state: 'no_model' } }).endsWith('no model configured to translate; set one up in Models'));
+    assert.equal(describeStatus({ ...base, generator: { state: 'failed', error: 'budget exhausted' } }),
+        'Русский: 5 translated · 2 pending · translation paused: budget exhausted');
+    assert.equal(describeStatus({ ...base, generator: { state: 'idle' } }), 'Русский: 5 translated · 2 pending');
 });

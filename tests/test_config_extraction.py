@@ -211,6 +211,7 @@ _MOVED_OWNERS = {
     "get_task_idle_timeout_sec": runtime_limits,
     "get_vision_caption_timeout_sec": runtime_limits,
     "get_update_letter_timeout_sec": runtime_limits,
+    "get_ui_translation_timeout_sec": runtime_limits,
     "get_websearch_timeout_sec": runtime_limits,
 }
 

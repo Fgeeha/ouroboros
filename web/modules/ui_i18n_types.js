@@ -45,6 +45,17 @@
  */
 
 /**
+ * The translation generator's state in this server process (ouroboros/ui_translation.py).
+ * @typedef {Object} UiI18nGenerator
+ * @property {'idle'|'running'|'no_model'|'failed'} state
+ * @property {string} error  // the last failure, secret-free; "" unless failed/no_model
+ * @property {string} updated_at
+ * @property {number} applied  // entries written since the process started
+ * @property {string} language  // the language the worker last ran for ("" before any run)
+ * @property {number} in_flight  // keys of the batch at the model right now (counted into stats.pending)
+ */
+
+/**
  * GET /api/ui/i18n and the body of a successful language POST.
  * @typedef {Object} UiI18nResponse
  * @property {boolean=} ok
@@ -60,6 +71,7 @@
  * @property {string} updated_at
  * @property {string} memory_error  // nonempty when the stored file is malformed (English fallback in effect)
  * @property {UiI18nLanguageSummary[]} languages
+ * @property {UiI18nGenerator} generator
  */
 
 /**

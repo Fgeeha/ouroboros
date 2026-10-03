@@ -5,8 +5,9 @@
 // the Settings draft, so it marks nothing dirty. The select lists English, the device's
 // language as a suggestion, every language that already has a memory on disk, and
 // "Other…", which opens a free field: a code (`pt-BR`), a name, or a description of a
-// language to invent. A tag saves at once; anything else is the generator's job to turn
-// into a tag (until that lane answers, the gateway says so and the note repeats it).
+// language to invent. A tag saves at once; a name or a description is resolved by the
+// light model into a tag and a profile (the gateway answers `language_needs_model` when
+// no model is configured, and the note says so).
 import { apiClient } from './api_client.js';
 import { showToast } from './toast.js';
 import { applyPayload, currentLanguage, englishTag, isEnglish, pluralSelectMap, setLanguage } from './i18n.js';
@@ -82,6 +83,10 @@ export function describeStatus(payload) {
     if (stats.pending) parts.push(`${stats.pending} pending`);
     if (typeof stats.stale === 'number' && stats.stale) parts.push(`${stats.stale} stale`);
     if (payload.memory_error) parts.push('stored file unreadable, English shown');
+    const generator = payload.generator || {};
+    if (generator.state === 'running') parts.push('translating…');
+    else if (generator.state === 'no_model') parts.push('no model configured to translate; set one up in Models');
+    else if (generator.state === 'failed') parts.push(`translation paused: ${generator.error || 'the model call failed'}`);
     return `${label}: ${parts.join(' · ')}`;
 }
 
@@ -158,13 +163,29 @@ export function bindLanguageSettings(page, {
         }
         try {
             payload = await client.saveUiLanguage(body);
+            // A name the gateway resolved to a tag has no plural map yet (the browser could
+            // not compute one for free text): complete the header with this engine's rules.
+            if (!tag && payload && !payload.english && !payload.plural_select) {
+                const plural = pluralSelectMap(payload.language);
+                if (plural) {
+                    payload = await client.saveUiLanguage({
+                        language: payload.language,
+                        plural_select: { map: plural.map, period: plural.period },
+                        plural_categories: plural.categories,
+                    });
+                }
+            }
             applyPayload(payload);
             render();
             if (otherInput) otherInput.value = '';
         } catch (error) {
             const code = error?.body?.code || error?.payload?.code || error?.code || '';
-            if (code === 'language_not_a_tag') {
-                setNote('Not recognized as a language code yet. Use a code such as pt-BR, or set up a model so Ouroboros can work out an unusual or invented language.');
+            if (code === 'language_not_a_tag' || code === 'language_needs_model' || code === 'language_resolve_failed') {
+                setNote(code === 'language_needs_model'
+                    ? 'A language name needs a model: set one up in Models, or type a code such as pt-BR.'
+                    : code === 'language_resolve_failed'
+                        ? 'Ouroboros could not work out this language right now. Try again, or type a code such as pt-BR.'
+                        : 'Not recognized as a language. Type a code such as pt-BR, a language name, or describe a language to invent.');
                 if (select) select.value = OTHER_VALUE;
                 if (other) other.hidden = false;
             } else {
