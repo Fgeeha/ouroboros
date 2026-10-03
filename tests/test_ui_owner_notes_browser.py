@@ -24,6 +24,11 @@ DUE = "Call mother about Sunday."
 LATER = "Water the plants."
 LIVE = "The kettle is on."
 BUBBLE = '.chat-bubble[data-system-type="reminder"]'
+# Narrow captures wait for the drawer to slide out and every CSS transition to end.
+SETTLED = """() => Promise.all(document.getAnimations()
+    .filter(animation => typeof CSSTransition === 'function' && animation instanceof CSSTransition)
+    .map(animation => animation.finished.catch(() => null)))
+    .then(() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))))"""
 PREFS = {"enabled": True, "needs_answer": True, "task_done": True, "important": True,
          "main_reply": False, "sound": False, "show_text": True}
 
@@ -85,6 +90,7 @@ def test_notes_reach_main_activity_and_the_live_banner(direct_server_with_data, 
             assert page.locator("#toast-stack .toast").count() == 0, "history replay never rings"
             page.screenshot(path=str(evidence / "main-history-desktop.png"))
             page.set_viewport_size({"width": 390, "height": 844})
+            page.evaluate(SETTLED)
             box = bubble.bounding_box()
             assert box and box["x"] >= 0 and box["x"] + box["width"] <= 390
             page.screenshot(path=str(evidence / "main-history-narrow.png"))
@@ -110,6 +116,8 @@ def test_notes_reach_main_activity_and_the_live_banner(direct_server_with_data, 
             schedules.scroll_into_view_if_needed()
             page.screenshot(path=str(evidence / "activity-desktop.png"), full_page=True)
             page.set_viewport_size({"width": 390, "height": 844})
+            page.wait_for_function("() => document.querySelector('#primary-sidebar').getBoundingClientRect().right <= 1")
+            page.evaluate(SETTLED)
             assert waiting.locator(".activity-sub").evaluate("node => node.scrollWidth <= node.clientWidth + 1")
             page.screenshot(path=str(evidence / "activity-narrow.png"), full_page=True)
         finally:
