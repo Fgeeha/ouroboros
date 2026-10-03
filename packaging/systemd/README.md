@@ -38,7 +38,7 @@ systemctl --user status ouroboros
 ```
 
 After Panic, automatic startup and manual `systemctl --user start` or `restart`
-leave Ouroboros stopped and print "Ouroboros is stopped. Use Start to resume."
+leave Ouroboros stopped; the journal reports "Ouroboros is stopped. Use Start to resume."
 Resume explicitly through the desktop entry or `ouroboros run --start ...`.
 
 To start it automatically with the user session:
