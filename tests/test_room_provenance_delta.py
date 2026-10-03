@@ -154,7 +154,10 @@ def test_block_format_retains_author_direction_transport_and_body(direction):
     assert new.replace("[room=Project Alpha [chat_id=1500]] ", "", 1).encode() == old.encode()
     assert new.endswith(row["text"])
     assert "provider=mail; account=acct; conversation=conv; thread=thread; delivery=accepted" in new
-    assert ("Ouroboros" if direction in {"out", "outgoing", "system"} else "Alex") in new
+    # A host-written System row is attributed to the host, as dialogue_evidence does; only
+    # outgoing speech is Ouroboros's.
+    author = {"out": "Ouroboros", "outgoing": "Ouroboros", "system": "System"}.get(direction, "Alex")
+    assert f"{author} [provider=mail" in new
 
 
 @pytest.mark.parametrize("rooms", [(1, 1, 1, 1), (1, 1500, 987654, None)])

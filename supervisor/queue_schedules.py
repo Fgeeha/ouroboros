@@ -305,9 +305,11 @@ def _schedule_projection_row(raw: Dict[str, Any]) -> Dict[str, Any]:
     row: Dict[str, Any] = {}
     # Keep only lifecycle facts useful to a model.  In particular, the durable
     # task template (including context/attachments) never crosses this seam.
+    # ``last_error`` says why a row did not do its job (a note whose chat write
+    # was not confirmed reads "consumed" otherwise); it is bounded like any text.
     projection_keys = (
         "id", "name", "enabled", "source", "skill", "trigger",
-        "created_at", "last_run_at", "last_task_id", "completed_at", "next_run_at",
+        "created_at", "last_run_at", "last_task_id", "last_error", "completed_at", "next_run_at",
     )
     for key in projection_keys:
         value = raw.get(key)
@@ -699,6 +701,9 @@ def _schedule_running_or_queued(schedule_id: str, drive_root: pathlib.Path | Non
 
 def _task_from_schedule(record: Dict[str, Any], *, task_id: str = "") -> Dict[str, Any]:
     from supervisor.followup_policy import normalize_template, bind_task
+    from supervisor.schedule_notes import is_note
+    if is_note(record):  # a note is shown as written, never re-read as a model task's objective
+        raise ValueError("a kind=notify row is a note, not a task template")
     template = normalize_template(record)
     task_id = task_id or uuid.uuid4().hex[:8]
     # Membership, not truthiness: a template's explicit chat 0 is its hidden partition.
@@ -766,11 +771,14 @@ def check_scheduled_tasks() -> None:
     Claims and reconciliation run under the queue+table locks; every expensive
     step (resource intent, folder checks, memory fork, the allowance read) runs
     without them; admission rechecks and commits under them again
-    (``supervisor/schedule_occurrence.py``)."""
+    (``supervisor/schedule_occurrence.py``). A due ``kind: "notify"`` row is a
+    note: consumed in this pass's one table write, shown after the locks are
+    released (``supervisor/schedule_notes.py``), never a task."""
     global _last_skill_schedule_sync
-    from supervisor import schedule_occurrence as occurrences
+    from supervisor import schedule_notes as notes, schedule_occurrence as occurrences
 
     claims: List[Dict[str, Any]] = []
+    due_notes: List[Dict[str, Any]] = []
     with schedule_transaction(_queue().DRIVE_ROOT):
         now_monotonic = time.monotonic()
         if now_monotonic - _last_skill_schedule_sync >= _SKILL_SCHEDULE_SYNC_INTERVAL_SEC:
@@ -880,6 +888,11 @@ def check_scheduled_tasks() -> None:
                     continue
             if view.get("hold") or view["wait"] or record.get("followup_hold"):
                 continue
+            if notes.is_note(record):
+                note, note_changed = notes.consume(record, due_at, now)
+                due_notes.extend([note] if note else [])
+                changed = changed or note_changed
+                continue
             claims.append(occurrences.claim(record, due_at))
             changed = True
         # Consumed one-shot receipts age out past the unified GC retention (DEVELOPMENT
@@ -894,5 +907,6 @@ def check_scheduled_tasks() -> None:
             if _write_scheduled_tasks(data) is False:
                 return
             _queue().persist_queue_snapshot(reason="scheduled_tasks")
+    notes.deliver(due_notes, _queue().DRIVE_ROOT)
     if claims:
         occurrences.admit([occurrences.prepare(claimed) for claimed in claims])

@@ -225,15 +225,17 @@ def _update_scratchpad(ctx: ToolContext, content: str) -> str:
     return f"OK: scratchpad block appended ({len(content)} chars, ts={block.get('ts', '?')[:16]})"
 
 
-def _main_notice_refusal(ctx: ToolContext, chat_id: object) -> str:
-    """Why this caller may not address Main, or "" when it may.
+def owner_contact_refusal(ctx: ToolContext, chat_id: object) -> str:
+    """Why this caller may not speak to the owner directly, or "" when it may.
 
-    Main is the owner's own conversation. A delegated child answers its parent,
-    and a Presence or agent-to-agent turn speaks for an external conversation;
-    none of them gains a Main voice through this argument.
+    A delegated child answers its parent, and a Presence or agent-to-agent turn
+    speaks for an external conversation; none of them reaches the owner through a
+    Main notice or a note scheduled for later. Shared by both doors; the Main
+    notice adds its room check, a note does not (one started by consciousness is
+    a legitimate contact, BIBLE P0).
     """
-    from ouroboros.contracts.chat_id_policy import HIDDEN_CHAT_ID, is_a2a_chat_id
-    from ouroboros.dialogue_provenance import presence_caller_binding, run_origin
+    from ouroboros.contracts.chat_id_policy import is_a2a_chat_id
+    from ouroboros.dialogue_provenance import presence_caller_binding
 
     for attr in ("task_metadata", "task_contract"):
         data = getattr(ctx, attr, None)
@@ -245,10 +247,25 @@ def _main_notice_refusal(ctx: ToolContext, chat_id: object) -> str:
             return "a delegated task reports to its parent (final result, tree_note or escalate), which decides what reaches the owner"
     if presence_caller_binding(ctx) is not None:
         return "a Presence turn speaks for its external conversation, not in the owner's main chat"
-    if str(chat_id) == str(HIDDEN_CHAT_ID):
-        return "a hidden/headless conversation is not an owner-visible root room"
     if is_a2a_chat_id(chat_id):
         return "an agent-to-agent conversation has no main-chat voice"
+    return ""
+
+
+def _main_notice_refusal(ctx: ToolContext, chat_id: object) -> str:
+    """Why this caller may not address Main, or "" when it may.
+
+    Main is the owner's own conversation: beyond ``owner_contact_refusal``, only
+    an owner-visible root room (a Project or an owner-started root) gains a Main
+    voice through this argument.
+    """
+    from ouroboros.contracts.chat_id_policy import HIDDEN_CHAT_ID
+    from ouroboros.dialogue_provenance import run_origin
+
+    if refusal := owner_contact_refusal(ctx, chat_id):
+        return refusal
+    if str(chat_id) == str(HIDDEN_CHAT_ID):
+        return "a hidden/headless conversation is not an owner-visible root room"
     # Positive external transport ids can share the Project range; neither a
     # number (Main's own id included: a wake or scheduled root runs there too)
     # nor an agent-supplied destination proves an owner-visible room.

@@ -8,6 +8,7 @@ import {
     createNotifier,
     decideNotification,
     attentionStatusText,
+    noticeTitle,
     normalizeNotifyPrefs,
     notifyStatusText,
     readNotifyPrefs,
@@ -468,4 +469,27 @@ test('settings controls paint current state and gate on the master switch', asyn
     // An unknown key is refused rather than stored.
     await notifier.setPref('nope', true);
     assert.equal('nope' in notifier.prefs, false);
+});
+
+test('a reminder and a skill notice ring under the messages toggle, titled by their author', () => {
+    const reminder = {
+        type: 'chat', role: 'system', system_type: 'reminder', chat_id: 1, task_id: '', source: 'Ouroboros',
+        ts: '2026-10-03T12:00:01.000001+00:00',
+        content: 'Reminder · Ouroboros · written Oct 3 14:05 · for Oct 3 15:00 (UTC+3)\nCall mother',
+    };
+    const hit = classifyLiveFrame(reminder, { kind: 'chat', isMain: true });
+    assert.equal(hit.category, 'important', 'no new category and no new toggle');
+    assert.equal(hit.title, 'Reminder from Ouroboros');
+    assert.equal(hit.body, 'Call mother', 'the host signature line stays out of the banner body');
+    assert.equal(hit.key, 'important::2026-10-03T12:00:01.000001+00:00');
+    const seen = new Set();
+    assert.equal(decideNotification(hit, ON, seen).body, '', 'the words stay private until text is on');
+    assert.equal(decideNotification(hit, { ...ON, show_text: true }, seen).body, 'Call mother');
+    assert.equal(decideNotification(hit, { ...ON, important: false }, seen).reason, 'category_off');
+    const notice = classifyLiveFrame({ ...reminder, system_type: 'skill_notice', source: 'calendar',
+        content: 'Notice · calendar\nMeeting with Ivan in 15 min' }, { kind: 'chat', isMain: true });
+    assert.equal(notice.title, 'Notice from calendar');
+    assert.equal(notice.body, 'Meeting with Ivan in 15 min');
+    assert.equal(noticeTitle('skill_notice', ''), 'Notice from a skill');
+    assert.equal(noticeTitle('reminder', 'owner'), 'Reminder from owner', 'a row the owner set is signed by the owner');
 });

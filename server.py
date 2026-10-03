@@ -1321,9 +1321,9 @@ async def lifespan(app):
 
     if not _exit_signalled.is_set():
         _supervisor_stop.clear()  # a fresh lifespan owns a fresh generation (symmetric with the teardown set)
-    if has_startup_ready_provider(settings):
-        _start_supervisor_if_needed(settings)
-    else:
+    # A provider-ready boot starts the supervisor after the extension reload below.
+    startup_provider_ready = has_startup_ready_provider(settings)
+    if not startup_provider_ready:
         _supervisor_ready.set()
         _supervisor_init_done.set()
         log.info("No supported provider or local routing configured. Supervisor not started.")
@@ -1402,7 +1402,7 @@ async def lifespan(app):
     # Startup-only: after the prior process generation is gone, finalize orphaned
     # RUNNING results and resolve an indeterminate post-task synthesis phase.
     # The periodic zombie sweep intentionally does not perform this recovery.
-    if not has_startup_ready_provider(settings):
+    if not startup_provider_ready:
         _run_startup_task_recovery(
             lifespan_drive_root, REPO_DIR, skip_live_data=pytest_default_real_data_dir,
             prior_worker_pids=None if pytest_default_real_data_dir else _startup_worker_pids(lifespan_drive_root),
@@ -1424,6 +1424,9 @@ async def lifespan(app):
             _reload_extensions(lifespan_drive_root, _load_settings, repo_path=repo_path or None)
     except Exception:
         log.error("Extension reload_all at startup failed", exc_info=True)
+    # Only now: the first tick may consume an overdue note; a bus subscriber attached later never sees it.
+    if startup_provider_ready:
+        _start_supervisor_if_needed(settings)
 
     try:
         from ouroboros.mcp_client import (

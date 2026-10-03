@@ -53,4 +53,4 @@ def test_consolidator_preserves_system_direction():
         }
     ])
 
-    assert "[2026-03-19 16:53] [system] Ouroboros: Detailed task summary." in formatted
+    assert "[2026-03-19 16:53] [system] System: Detailed task summary." in formatted
