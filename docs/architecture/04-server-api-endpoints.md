@@ -84,6 +84,8 @@ Every `/api/files/*` operation resolves its requested path and refuses the opera
 | POST | `/api/ui/i18n/import` | `gateway.ui_i18n.api_ui_i18n_import_post` — an enterprise or community memory file (schema 1); owner pins stay |
 | GET | `/api/ui/i18n/export` | `gateway.ui_i18n.api_ui_i18n_export_get` — the memory file as a download |
 | POST | `/api/ui/i18n/regenerate` | `gateway.ui_i18n.api_ui_i18n_regenerate_post` — drop generated entries, keep owner and imported ones |
+| GET | `/api/desktop/autostart` | `gateway.desktop_autostart.api_desktop_autostart_get`: host OS `{state}`, plus `reason` when unavailable |
+| POST | `/api/desktop/autostart` | `gateway.desktop_autostart.api_desktop_autostart_post`: exactly `{enabled: boolean}`, returns observed `{state}`; 400 invalid body, 409 unavailable, 500 OS failure; public `owner_audit`, no settings mirror |
 | GET | `/api/model-catalog` | `gateway.models.api_model_catalog` |
 | POST | `/api/openai-compatible/models` | `gateway.models.api_openai_compatible_models` |
 | POST | `/api/providers/test` | `gateway.models.api_provider_test` |
@@ -146,6 +148,7 @@ Every `/api/files/*` operation resolves its requested path and refuses the opera
 | POST | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/presence/delivery` | `gateway.host_service._api_presence_delivery` |
 | GET | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/presence/work/{work_ref}` | `gateway.host_service._api_presence_work` |
 | POST | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/ui/ws-message` | `gateway.host_service._api_ws_message` |
+| POST | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/notify` | `gateway.host_notify._api_notify` (`notify_owner` grant: one signed `skill_notice` System row in the owner's chat; no model turn) |
 | WS | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/events` | `gateway.host_service._ws_events` |
 
 Rationale: `server.py` owns process startup/lifespan/static mounting, while `gateway/*` owns browser-facing HTTP/WS contracts; this keeps UI and runtime coupling explicit and testable.

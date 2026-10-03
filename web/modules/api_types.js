@@ -457,10 +457,7 @@
  * @property {Object=} transport
  * @property {string=} system_type
  * @property {"timeline"|"reviews"=} card_row
- *   A host-stamped placement fact for a task-keyed System row: "timeline" = a
- *   timeline item of the task's card, "reviews" = the card's Reviews group
- *   carries the fact (the row is still attached to the card); absent = an
- *   ordinary row.
+ *   A host-stamped placement fact for a task-keyed System row: "timeline" = a timeline item of the task's card, "reviews" = the card's Reviews group carries the fact (the row is still attached to the card); absent = an ordinary row.
  * @property {string=} card_row_id  // the row's stable identity across live delivery, outbox replay and history
  * @property {number=} card_row_revision  // canonical source order, independent of delivery timestamp
  * @property {Object=} late_evidence
@@ -472,6 +469,9 @@
  * @property {string=} handoff_id  // immutable origin/destination receipt identity
  * @property {Object=} terminal_time  // host-owned occurrence; ts remains publication time
  * @property {string=} completion_answer  // a Project root's model-authored final answer, mirrored into Main
+ * @property {string=} set_at  // a `reminder` row: when its words were written (live frame only; the text carries the signature)
+ * @property {string=} scheduled_for  // a `reminder` row: the due point it was written for
+ * @property {string=} delivered_at  // a `reminder` row: when the host showed it (later than due after downtime)
  * @property {number=} chat_id
  * @property {boolean=} project_thread  // server-stamped: chat_id is a reserved Project thread; Main never adopts it even before projectChatIds learns the project
  */
@@ -1282,7 +1282,6 @@
  * @property {string=} cleanupWarning
  * @property {ClaudexorVendorCredentialDisposition=} vendorCredentialDisposition
  */
-
 /**
  * Mirrors `gateway/schedule_contracts.py`, which states what each field means.
  * @typedef {Object} ScheduledTasksResponse
@@ -1315,7 +1314,6 @@
  * @typedef {Object} ScheduleDeleteResponse
  * @property {boolean} ok
  */
-
 /**
  * @typedef {Object} TaskPauseRequest
  * @property {string} request_id
@@ -1419,13 +1417,11 @@
  * @property {boolean=} duplicate
  * @property {string=} error
  */
-
 /**
  * @typedef {Object} LogTailResponse
  * @property {string} name
  * @property {Object[]} entries
  */
-
 /**
  * @typedef {Object} SkillDeleteResponse
  * @property {boolean} ok
@@ -1437,7 +1433,6 @@
  * @property {string} extension_reason
  * @property {string=} error
  */
-
 /**
  * @typedef {Object} UiPreferencesResponse
  * @property {string[]} widget_order
@@ -1449,7 +1444,12 @@
  * @property {{mode:'default'|'hidden'|'custom',text:string}} welcome  // install-wide empty-Main UI copy, not chat history
  * @property {boolean=} ok
  */
-
+/**
+ * Host sign-in registration as its OS reports it; `reason` only when unavailable.
+ * @typedef {Object} DesktopAutostartResponse
+ * @property {'unavailable'|'off'|'on'|'other_copy'|'disabled_by_os'} state
+ * @property {string=} reason
+ */
 /**
  * @typedef {Object} UpdateMergePlan
  * @property {boolean=} available

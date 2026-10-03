@@ -1115,6 +1115,17 @@ def update_external_host(hook: pathlib.Path | None, python: str, log: Any, abort
     return {"status": "failed"}
 
 
+def appimage_extracts_and_runs() -> bool:
+    """Whether this AppImage process runs from an extracted tree instead of a FUSE mount."""
+    if "APPIMAGE_EXTRACT_AND_RUN" in os.environ:
+        return True
+    # The type-2 runtime removes the explicit --appimage-extract-and-run
+    # argument before execing AppRun. Its APPDIR is then a regular directory;
+    # a normal FUSE-backed APPDIR is a mount point.
+    appdir = os.environ.get("APPDIR", "").strip()
+    return bool(appdir) and not os.path.ismount(appdir)
+
+
 def parse_launch_options(argv):
     """Parse presentation/seed inputs while tolerating ordinary platform launch arguments."""
     parser = argparse.ArgumentParser(description=__doc__)

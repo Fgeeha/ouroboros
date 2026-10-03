@@ -1,4 +1,4 @@
-"""Interface-language gateway envelopes (``/api/ui/i18n*``), re-exported by ``contracts.py``.
+"""Interface-language gateway envelopes (``/api/ui/i18n*``): their own module beside ``contracts.py``.
 
 Descriptive TypedDicts, the twin of ``web/modules/ui_i18n_types.js``; the memory file they
 describe is ``ouroboros/i18n_memory.py``'s schema 1."""

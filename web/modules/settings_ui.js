@@ -410,6 +410,23 @@ export function renderSettingsPage() {
                 </section>
 
                 <section class="settings-panel" data-settings-panel="behavior">
+                    <div class="form-section" data-autostart-settings hidden>
+                        <!-- Future keep-running-after-close control shares this section. -->
+                        <h3>Startup &amp; background</h3>
+                        <div class="settings-section-copy">
+                            Applies immediately to the host computer running Ouroboros, including when you
+                            connect from another device. Signing in preserves Panic stops and saved pauses.
+                            Closing the desktop window still exits Ouroboros.
+                        </div>
+                        <div class="settings-effort-card">
+                            <label class="local-toggle ui-field ui-field-inline">
+                                <input type="checkbox" class="ui-checkbox" data-autostart-toggle>
+                                Start Ouroboros on the host computer when you sign in
+                            </label>
+                            <div class="settings-inline-status" data-autostart-status role="status" aria-live="polite"></div>
+                        </div>
+                    </div>
+
                     <div class="form-section">
                         <h3>Reasoning Effort</h3>
                         <div class="settings-section-copy">Preferred reasoning effort per task type. Unsupported levels adapt to the route; native mappings, required minimums or provider defaults may apply. Requested, sent and reported effort are recorded in Logs.</div>
@@ -783,7 +800,7 @@ export function renderSettingsPage() {
                             </label>
                             <label class="local-toggle ui-field ui-field-inline">
                                 <input type="checkbox" class="ui-checkbox" data-notify-pref="important">
-                                Messages Ouroboros sends you while it works
+                                Messages Ouroboros sends you while it works, its reminders, and skill notices
                             </label>
                             <label class="local-toggle ui-field ui-field-inline">
                                 <input type="checkbox" class="ui-checkbox" data-notify-pref="main_reply">

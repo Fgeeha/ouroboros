@@ -93,7 +93,7 @@ from ouroboros.server_maintenance import (  # noqa: F401
     _startup_prune_sweeps,
     _startup_worktree_prune,
 )
-from ouroboros.ui_translation import start_background as _start_ui_translation, stop_background as _stop_ui_translation
+from ouroboros.ui_translation import start_background as _start_ui_translation
 from ouroboros.server_restart import (  # noqa: F401
     _live_running_task_ids, _managed_update_pending_kwargs,
     _perform_owner_restart, _safe_restart_serialized,
@@ -1322,9 +1322,9 @@ async def lifespan(app):
 
     if not _exit_signalled.is_set():
         _supervisor_stop.clear()  # a fresh lifespan owns a fresh generation (symmetric with the teardown set)
-    if has_startup_ready_provider(settings):
-        _start_supervisor_if_needed(settings)
-    else:
+    # A provider-ready boot starts the supervisor after the extension reload below.
+    startup_provider_ready = has_startup_ready_provider(settings)
+    if not startup_provider_ready:
         _supervisor_ready.set()
         _supervisor_init_done.set()
         log.info("No supported provider or local routing configured. Supervisor not started.")
@@ -1403,7 +1403,7 @@ async def lifespan(app):
     # Startup-only: after the prior process generation is gone, finalize orphaned
     # RUNNING results and resolve an indeterminate post-task synthesis phase.
     # The periodic zombie sweep intentionally does not perform this recovery.
-    if not has_startup_ready_provider(settings):
+    if not startup_provider_ready:
         _run_startup_task_recovery(
             lifespan_drive_root, REPO_DIR, skip_live_data=pytest_default_real_data_dir,
             prior_worker_pids=None if pytest_default_real_data_dir else _startup_worker_pids(lifespan_drive_root),
@@ -1415,8 +1415,7 @@ async def lifespan(app):
             get_skills_repo_path,
             load_settings as _load_settings,
         )
-        from ouroboros.extension_loader import reload_all as _reload_extensions
-        from ouroboros.extension_loader import set_ws_broadcaster as _set_extension_ws_broadcaster
+        from ouroboros.extension_loader import reload_all as _reload_extensions, set_ws_broadcaster as _set_extension_ws_broadcaster
         _set_extension_ws_broadcaster(broadcast_ws_sync)
         repo_path = get_skills_repo_path()
         if pytest_default_real_data_dir:
@@ -1426,6 +1425,9 @@ async def lifespan(app):
     except Exception:
         log.error("Extension reload_all at startup failed", exc_info=True)
     if not pytest_default_real_data_dir: _start_ui_translation(lifespan_drive_root)  # after the skills registered their tables; fail-soft, no model call  # noqa: E701
+    # Only now: the first tick may consume an overdue note; a bus subscriber attached later never sees it.
+    if startup_provider_ready:
+        _start_supervisor_if_needed(settings)
 
     try:
         from ouroboros.mcp_client import (
@@ -1438,8 +1440,7 @@ async def lifespan(app):
         log.warning("MCP startup reconfigure failed", exc_info=True)
 
     try:
-        from ouroboros.config import get_skills_repo_path
-        from ouroboros.config import load_settings as _load_settings
+        from ouroboros.config import get_skills_repo_path, load_settings as _load_settings
         from ouroboros.extension_reconcile_queue import extension_reconcile_pickup_loop
 
         if pytest_default_real_data_dir:
@@ -1460,7 +1461,6 @@ async def lifespan(app):
         yield
     finally:
         _supervisor_stop.set()  # first: the loop must know a teardown owns what follows
-        _stop_ui_translation()
         _historical_audit.stop()
         log.info("Server shutting down...")
         # Let the loop leave its current tick BEFORE workers are killed and the

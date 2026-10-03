@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 from ouroboros.config import get_context_mode
+from ouroboros.desktop_autostart import runtime_facts as desktop_runtime_facts
 from ouroboros.context_budget import (
     LARGE_CONTEXT_SECTION_CHARS,
     MAX_RECENT_CHAT_TAIL,
@@ -359,14 +360,12 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None, sc
             "allowed_resources": task.get("allowed_resources"),
             "context": task.get("context"),
         },
-        # Server-process presentation posture (launcher-exported; absent = a
-        # web/headless serving process). This is the PROCESS's shell, NOT the
-        # surface the owner's current message came from — that per-message fact
-        # is `owner_client` below. (The former `is_desktop` flag read
-        # OUROBOROS_DESKTOP_MODE, which no producer ever set — retired.)
+        # Host shell/lifecycle, not the sender's per-message `owner_client`.
+        # Launcher-exported presentation is absent on web/headless processes.
         "runtime_env": {
             "presentation": os.environ.get("OUROBOROS_PRESENTATION", "").strip() or "web",
             "platform": sys.platform,
+            **desktop_runtime_facts(),
         },
         # The interface language my human chose for this install (OUROBOROS_UI_LANGUAGE):
         # the chrome, the task rows and Telegram render in it; "chosen": false means the

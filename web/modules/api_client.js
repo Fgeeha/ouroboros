@@ -287,6 +287,10 @@ export const apiClient = {
     importI18n: (memoryDocument) => jsonPost('/api/ui/i18n/import', memoryDocument),
     exportI18nUrl: (language = '') => `/api/ui/i18n/export${language ? `?language=${encodeURIComponent(language)}` : ''}`,
     regenerateI18n: (payload = {}) => jsonPost('/api/ui/i18n/regenerate', payload),
+    /** @returns {Promise<import('./api_types.js').DesktopAutostartResponse>} */
+    desktopAutostart: () => fetchJson('/api/desktop/autostart', { cache: 'no-store' }),
+    /** @returns {Promise<import('./api_types.js').DesktopAutostartResponse>} */
+    setDesktopAutostart: (enabled) => jsonPost('/api/desktop/autostart', { enabled: Boolean(enabled) }),
     saveSettings: (payload) => fetchJson('/api/settings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

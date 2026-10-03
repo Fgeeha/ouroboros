@@ -337,6 +337,68 @@ def test_dispatch_barrier_restore_and_settlement(q, monkeypatch):
     assert occurrences.restore_allowed(task) is False  # unreadable is unknown, never revived
 
 
+def test_running_cron_task_blocks_a_second_due_occurrence(q):
+    """Retire the dispatched token while live, but never claim the next point
+    until that scheduled root leaves the queue."""
+    from supervisor import schedule_occurrence as occurrences
+
+    _row(q, intent={"kind": "system_repo"}, cron=True)
+    q.queue.check_scheduled_tasks()
+    [task] = q.pending
+    assert occurrences.record_dispatch_possible(task) is True
+    q.pending.clear()
+    q.queue.RUNNING[task["id"]] = {"task": task}
+    try:
+        record = _rows(q)["s1"]
+        record["next_run_at"] = "2000-01-02T00:00:00+00:00"
+        from supervisor import queue_schedules
+
+        store = q.queue.load_schedule_store(q.root)
+        store["tasks"][0] = record
+        queue_schedules._write_scheduled_tasks(store, q.root)
+        q.queue.check_scheduled_tasks()
+        assert q.pending == []
+        settled = _rows(q)["s1"]
+        assert "occurrence" not in settled
+        assert settled["last_task_id"] == task["id"]
+        assert settled["next_run_at"] == "2000-01-02T00:00:00+00:00"
+    finally:
+        q.queue.RUNNING.pop(task["id"], None)
+
+
+def test_recreated_cron_row_without_last_task_id_still_waits_for_live_root(q):
+    """A skill can recreate a due row while its earlier task is still live.
+
+    The new row has no history fields, but the running root retains schedule_id.
+    It must not admit a second root merely because last_task_id disappeared.
+    """
+    _row(q, intent={"kind": "system_repo"}, cron=True)
+    q.queue.check_scheduled_tasks()
+    [task] = q.pending
+    from supervisor import schedule_occurrence as occurrences
+
+    assert occurrences.record_dispatch_possible(task) is True
+    q.pending.clear()
+    q.queue.RUNNING[task["id"]] = {"task": task}
+    try:
+        from supervisor import queue_schedules
+
+        removed = q.queue.mutate_scheduled_task(
+            "delete", "s1", reason="owner removed reminder", actor="owner:gateway", drive_root=q.root,
+        )
+        assert removed["changed"] is True
+        assert "s1" not in _rows(q)
+        _row(q, intent={"kind": "system_repo"}, cron=True)
+        assert not _rows(q)["s1"].get("last_task_id")
+        assert queue_schedules._schedule_running_or_queued("s1", q.root) is True
+        q.queue.check_scheduled_tasks()
+        assert q.pending == []
+        assert "occurrence" not in _rows(q)["s1"]
+        assert _rows(q)["s1"]["next_run_at"] == "2000-01-01T00:00:00+00:00"
+    finally:
+        q.queue.RUNNING.pop(task["id"], None)
+
+
 def test_an_unreadable_or_missing_receipt_holds_instead_of_replaying(q):
     _row(q, intent={"kind": "system_repo"}, cron=True)
     q.queue.check_scheduled_tasks()

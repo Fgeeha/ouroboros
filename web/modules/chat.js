@@ -128,6 +128,7 @@ import {
     partitionLocalEchoJournal,
     projectCollapsedActivity,
     positiveTaskTerminalFact,
+    unkeyedFrameEndsTurn,
     projectIdFromTask,
     rawTimestampEpoch,
     stampNodeTimestamp,
@@ -3713,8 +3714,8 @@ export function createChatInstance({
                     if (finished?.clientMessageId) {
                         pendingSubmissions.delete(finished.clientMessageId);
                     }
-                } else if (msg.system_type !== 'terminal_incident') {
-                    // Unkeyed finals clear unscoped state; incidents are informational.
+                } else if (unkeyedFrameEndsTurn(msg)) {
+                    // Unkeyed finals clear unscoped state; incidents, notes and skill notices do not.
                     activeDirectActivities.clear();
                     pendingSubmissions.clear();
                 }

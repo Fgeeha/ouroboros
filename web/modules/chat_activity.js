@@ -1058,6 +1058,15 @@ export function positiveTaskTerminalFact(row) {
 }
 
 /**
+ * Whether an unkeyed live row ends the unscoped Main turn, by its typed kind. An
+ * incident report, a note Ouroboros left for this moment and a skill's notice arrive
+ * in the middle of a conversation and conclude nothing.
+ */
+export function unkeyedFrameEndsTurn(row) {
+    return !['terminal_incident', 'reminder', 'skill_notice'].includes(String(row?.system_type || ''));
+}
+
+/**
  * Single status reducer for the chat header (owner decisions 2A/5A; managed
  * activities added by the project-continuity contract). Priority: disconnected
  * > background live card (Working...) > admitted managed work (Working...) >

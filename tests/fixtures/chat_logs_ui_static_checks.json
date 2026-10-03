@@ -1131,7 +1131,7 @@
     "id": "test_inflight_bare_final_never_ledgers",
     "path": "web/modules/chat.js",
     "kind": "regex",
-    "value": "} else if \\(msg\\.system_type !== 'terminal_incident'\\) \\{[^{}]*?activeDirectActivities\\.clear\\(\\);\\s*pendingSubmissions\\.clear\\(\\);"
+    "value": "} else if \\(unkeyedFrameEndsTurn\\(msg\\)\\) \\{[^{}]*?activeDirectActivities\\.clear\\(\\);\\s*pendingSubmissions\\.clear\\(\\);"
   },
   {
     "id": "test_inflight_reconnect_user_row_retires_pending",

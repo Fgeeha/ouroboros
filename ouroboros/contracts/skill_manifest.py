@@ -42,6 +42,10 @@ VALID_SKILL_PERMISSIONS = frozenset(
         "subscribe_event",
         "inject_chat",
         "presence",
+        # Owner notices through the Host Service (`POST /notify`): one bounded
+        # sentence shown in the owner's chat as a System row signed with the
+        # skill's name; never a model turn. Narrower than inject_chat, granted separately.
+        "notify_owner",
     }
 )
 _EVENT_TOPIC_RE = re.compile(r"^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$")

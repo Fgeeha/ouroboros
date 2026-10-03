@@ -410,6 +410,10 @@ def _target_chat(settings: Dict[str, Any], event: Dict[str, Any]) -> int:
         transport = event.get("transport") if isinstance(event.get("transport"), dict) else {}
         if transport.get("kind") == "telegram":
             return chat_id
+        # ...and the owner's notes and skill notices: System rows written for the
+        # owner, which an owner who left the web should still get on the phone.
+        if event.get("role") == "system" and event.get("system_type") in {"reminder", "skill_notice"}:
+            return chat_id
         return 0
     # No pinned chat configured — only forward events that originate from
     # a Telegram transport conversation so local UI events are never leaked.
@@ -1400,7 +1404,8 @@ def register(api):
                         "**Command mode**: controls which slash commands can be sent from Telegram. "
                         "Use `/menu` in Telegram to see available commands as inline buttons.\n\n"
                         "**Mirror mode**: *all* mirrors every chat message (including web UI) to Telegram — requires Chat ID. "
-                        "*Telegram only* mirrors only Telegram-originated conversations.\n\n"
+                        "*Telegram only* mirrors Telegram-originated conversations, plus Ouroboros's reminders and skill notices "
+                        "when a Chat ID is set.\n\n"
                         "**Mini App Beta** uses a best-effort Cloudflare Quick Tunnel with no SLA and no SSE support. "
                         "It targets native Telegram clients; Telegram WebA/WebK are not supported."
                     ),
@@ -1430,7 +1435,7 @@ def register(api):
                         {"name": "TELEGRAM_MIRROR_MODE", "label": "Mirror mode", "type": "select",
                          "options": [
                              {"value": "all", "label": "Mirror all messages (web + Telegram)"},
-                             {"value": "telegram_only", "label": "Telegram conversations only"},
+                             {"value": "telegram_only", "label": "Telegram conversations, plus reminders and skill notices"},
                          ],
                          "placeholder": "all"},
                         {"name": "TELEGRAM_CHAT_ID", "label": "Telegram Chat ID", "type": "text", "placeholder": "required for 'all' mode"},
