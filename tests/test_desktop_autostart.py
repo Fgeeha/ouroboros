@@ -24,16 +24,19 @@ def host(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
     monkeypatch.setattr(startup, "NATIVE_UNIT", tmp_path / "ouroboros.service")
     monkeypatch.setattr(startup.os, "getuid", lambda: 501, raising=False)
-    state = SimpleNamespace(calls=[], disabled=False, unit="disabled")
+    state = SimpleNamespace(calls=[], override=None, unit="disabled")
 
     def run(argv, **kwargs):
         state.calls.append(argv)
         if argv[0] == "launchctl":
             if argv[1] == "enable":
-                state.disabled = False
+                state.override = "enabled"
                 return ""
             assert argv == ["launchctl", "print-disabled", "gui/501"]
-            return f'{{ "{startup.LABEL}" => {str(state.disabled).lower()} }}'
+            # Live shape (darwin 25): `=> disabled` / `=> enabled`.
+            rows = ['"com.apple.Siri.agent" => disabled']  # a neighbour's override is not ours
+            rows += [f'"{startup.LABEL}" => {state.override}'] if state.override else []
+            return "disabled services = {\n" + "".join(f"\t\t{row}\n" for row in rows) + "\t}"
         assert argv[0:2] == ["systemctl", "--user"] and argv[-1] == "ouroboros.service"
         if argv[2] == "is-enabled":
             return state.unit
@@ -77,9 +80,12 @@ def test_macos_writes_one_launchagent_and_respects_os_override(host, tmp_path):
     assert entry == {"Label": "com.ouroboros.agent", "ProgramArguments": [str(exe), "--launch-intent", "automatic"], "RunAtLoad": True}
     assert not (tmp_path / ".config").exists()
     assert os_state.calls[0] == ["launchctl", "enable", "gui/501/com.ouroboros.agent"]
-    os_state.disabled = True
+    os_state.override = "disabled"  # System Settings or `launchctl disable`, as current macOS prints it
     assert startup.autostart_status()["state"] == "disabled_by_os"
     assert startup.autostart_status(True)["state"] == "on"
+    for printed, expected in (("true", "disabled_by_os"), ("false", "on"), (None, "on")):  # older spelling; no row
+        os_state.override = printed
+        assert startup.autostart_status()["state"] == expected
     entry["ProgramArguments"] = ["/Applications/Other.app/Contents/MacOS/Ouroboros"]
     path.write_bytes(plistlib.dumps(entry))
     assert startup.autostart_status()["state"] == "other_copy"

@@ -97,8 +97,9 @@ def _macos(exe: Path, enabled: bool | None) -> str:
             or entry.get("ProgramArguments") != [str(exe), *AUTOMATIC_ARGS]
             or entry.get("RunAtLoad") is not True or entry.get("KeepAlive", False) is not False):
         return "other_copy"
-    disabled = _run(["launchctl", "print-disabled", f"gui/{os.getuid()}"])
-    return "disabled_by_os" if re.search(r'"' + re.escape(LABEL) + r'"\s*=>\s*true\b', disabled) else "on"
+    # Current macOS prints `=> disabled`/`=> enabled`; older releases printed `=> true`/`=> false`.
+    overrides = _run(["launchctl", "print-disabled", f"gui/{os.getuid()}"])
+    return "disabled_by_os" if re.search(rf'"{re.escape(LABEL)}"\s*=>\s*(?:disabled|true)\b', overrides) else "on"
 
 
 def _desktop_path() -> Path:
