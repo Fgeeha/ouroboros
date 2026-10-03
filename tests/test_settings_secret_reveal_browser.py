@@ -72,6 +72,8 @@ def test_saved_secret_show_preserves_settings_and_drafts(direct_server_with_data
             page.wait_for_selector("#page-chat", timeout=30_000)
             page.click('[data-nav-page="settings"]')
             expect(page.locator("#btn-save-settings")).to_be_enabled(timeout=30_000)
+            # Save is available before the initial page-shown document finishes applying.
+            expect(page.locator("#settings-status")).to_have_text("Settings refreshed", timeout=30_000)
             anthropic_card = page.locator('[data-provider-card="anthropic"]')
             if anthropic_card.get_attribute("open") is None:
                 anthropic_card.locator("summary").click()
