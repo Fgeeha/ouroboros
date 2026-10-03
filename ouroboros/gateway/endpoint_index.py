@@ -13,6 +13,7 @@ HTTP_ENDPOINTS: tuple[str, ...] = (
     "GET /api/state",
     "GET /api/settings",
     "POST /api/settings",
+    "POST /api/settings/secret",
     "GET /api/ui/preferences",
     "POST /api/ui/preferences",
     "POST /api/owner/runtime-mode",

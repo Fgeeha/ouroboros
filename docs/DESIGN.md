@@ -180,6 +180,17 @@ label, control and optional `.ui-field-help`. A placeholder is an example,
 never the field's only name. Help and validation belong to that field without
 changing the alignment of neighboring controls and their actions.
 
+**Secret visibility has one meaning across Settings.** Show reveals the complete
+current value as selectable, read-only text below the unchanged editing field;
+long values wrap within the column. An edited value is shown from the local
+draft; an untouched saved value is read only when requested. A prefix or a
+configured-value placeholder is never a successful reveal. Hide removes that
+text and retains the draft. Viewing changes neither the dirty state nor the
+values submitted by Save or Test. Editing, clearing, reloading or leaving the
+page closes the reveal, and a late read cannot reopen it. Built-in, custom,
+skill-requested and MCP token fields use the same interaction; loading Settings
+keeps saved secrets masked. Pending reads and failures are shown at the field.
+
 Short fixed choices keep native selects, including the platform's own popup.
 A control never widens its column: a select shows its chosen label on one
 line, clipped at its own edge, and the full label stays in the platform's
