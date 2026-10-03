@@ -1,2 +1,0 @@
-67
-Cover PR #1405's existing documentation of the guarded function-local winreg accessor; retain that platform exception while adding the host adapter table.

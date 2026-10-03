@@ -1449,9 +1449,7 @@
  * @property {{mode:'default'|'hidden'|'custom',text:string}} welcome  // install-wide empty-Main UI copy, not chat history
  * @property {boolean=} ok
  */
-
 /** @typedef {{state: 'unavailable'|'off'|'on'|'other_copy'|'disabled_by_os', reason?: string}} DesktopAutostartResponse Host registration and optional unavailability reason. */
-
 /**
  * @typedef {Object} UpdateMergePlan
  * @property {boolean=} available
@@ -1474,7 +1472,9 @@
  * @property {'auto_merge'|'assisted'=} recommended_strategy
  */
 
-/** @typedef {Object} UpdatePreflightRequest */
+/**
+ * @typedef {Object} UpdatePreflightRequest
+ */
 
 /**
  * @typedef {Object} UpdatePreflightResponse
