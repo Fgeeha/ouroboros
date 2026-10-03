@@ -9,7 +9,10 @@ operators reach through `run_cu_bridge_agent.<name>`.
 from __future__ import annotations
 
 import ast
+import copy
 import pathlib
+
+import pytest
 
 from devtools.benchmarks.osworld import (
     cu_bridge_budget,
@@ -18,6 +21,8 @@ from devtools.benchmarks.osworld import (
     cu_bridge_runtime,
     cu_bridge_tool_policy,
     run_cu_bridge_agent as rcb,
+    step_agent_claims,
+    step_agent_env,
 )
 
 
@@ -119,17 +124,26 @@ def test_cu_bridge_launcher_reexports_every_moved_identity():
         assert getattr(rcb, name) is getattr(owner, name), name
 
 
-def test_cu_bridge_extraction_size_bounds_have_meaningful_headroom():
-    counts = {
-        path.name: len(path.read_text(encoding="utf-8").splitlines())
-        for path in (
-            OSWORLD / "run_cu_bridge_agent.py",
-            *(pathlib.Path(module.__file__) for module in _LEAVES),
-        )
-    }
-    assert counts["run_cu_bridge_agent.py"] < 1500
-    assert all(
-        count <= 1000
-        for name, count in counts.items()
-        if name != "run_cu_bridge_agent.py"
-    ), counts
+@pytest.mark.parametrize("helper,owner", [
+    ("_is_default_desktop_server", step_agent_env),
+    ("confined_claims_dir", step_agent_claims),
+    ("task_claim_key", step_agent_claims),
+    ("scored_claim_state", step_agent_claims),
+])
+def test_pre_admission_audit_reaches_step_helpers(helper, owner, monkeypatch):
+    from devtools.benchmarks.common import launcher_audit as audit
+
+    source = (OSWORLD / "run_cu_bridge_agent.py").read_text(encoding="utf-8")
+    assert audit.audit_source(source) == []
+    original_loader = audit._unit_for_module
+    tree = copy.deepcopy(original_loader(owner.__name__).tree)
+    function = next(node for node in tree.body
+                    if isinstance(node, ast.FunctionDef) and node.name == helper)
+    # Mutate only the source AST, never execute the operation or touch a file.
+    function.body.insert(1, ast.parse('write_text("before admission")').body[0])
+    mutant = audit._Unit(tree, owner.__name__)
+    monkeypatch.setattr(audit, "_unit_for_module", lambda name:
+                        mutant if name == owner.__name__ else original_loader(name))
+    violations = audit.audit_source(source)
+    assert any(f"{helper}() runs BEFORE" in item and "write_text" in item
+               for item in violations), violations

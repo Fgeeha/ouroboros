@@ -326,8 +326,8 @@ def main() -> int:
 
     # Guards: never drive the live desktop server or publish a bench connection
     # into the owner's live skill state (mirrors run_step_agent.py).
-    from devtools.benchmarks.osworld.run_step_agent import (
-        _is_default_desktop_server,
+    from devtools.benchmarks.osworld.step_agent_env import _is_default_desktop_server
+    from devtools.benchmarks.osworld.step_agent_claims import (
         confined_claims_dir,
         scored_claim_state,
         task_claim_key,

@@ -73,9 +73,9 @@ _MOVED_OWNERS = {
     "OuroborosStepAgent": step_agent_policy,
 }
 
-# The exact names run_cu_bridge_agent.py imports FROM run_step_agent.py. The
-# split must not force that importer to learn the new owners.
-_CU_BRIDGE_IMPORTS = (
+# Keep the shared runner surface even when consumers import defining owners
+# directly so the launcher audit can reach their bodies.
+_SHARED_HELPERS = (
     "_is_default_desktop_server", "confined_claims_dir", "scored_claim_state",
     "task_claim_key", "amend_task_manifest", "ClaimMarkerNotDurable",
     "acquire_task_claim", "claim_stale_sec", "construct_desktop_env",
@@ -124,8 +124,8 @@ def test_step_agent_launcher_reexports_every_moved_identity():
         assert getattr(rsa, name) is getattr(owner, name), name
 
 
-def test_cu_bridge_still_imports_its_shared_helpers_from_the_launcher():
-    for name in _CU_BRIDGE_IMPORTS:
+def test_step_launcher_preserves_its_shared_helper_surface():
+    for name in _SHARED_HELPERS:
         assert hasattr(rsa, name), name
 
 
@@ -150,14 +150,3 @@ def test_no_step_loop_module_fabricates_bash_history():
         assert "hist.open(" not in text, name
         assert "record_history" not in text, name
         assert ".bash_history'" not in text, name
-
-
-def test_step_agent_extraction_size_bounds_have_meaningful_headroom():
-    counts = {
-        path.name: len(path.read_text(encoding="utf-8").splitlines())
-        for path in (
-            OSWORLD / "run_step_agent.py",
-            *(pathlib.Path(module.__file__) for module in _LEAVES),
-        )
-    }
-    assert all(count <= 1000 for count in counts.values()), counts

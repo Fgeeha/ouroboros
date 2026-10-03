@@ -1,6 +1,6 @@
 """Cross-lane task claims and the scored-claim ledger for OSWorld runs.
 
-Verbatim extraction from ``run_step_agent.py`` (v7 stream W): claim-directory
+Verbatim extraction from ``run_step_agent.py``: claim-directory
 confinement, the claim key, staleness, acquisition and release, plus the
 durable unconfirmed/scored markers that make overlapping lanes, resumes and
 retry passes safe over one shared results tree (METHODOLOGY §7.9).
