@@ -457,7 +457,7 @@ def _render_index_text(
         "",
         "### Coverage index",
         "",
-        f"All {len(facts_by_path):,} tracked path(s), one row each: a bare path is "
+        f"All {len(facts_by_path):,} tracked path(s): a bare path is "
         "`indexed` (readable in full); every other class is `disposition<TAB>path`. "
         "The policy-excluded classes (excluded_test, excluded_dir, binary_media, "
         "vendored_minified) are collapsed to one `disposition<TAB>directory/ (N "
