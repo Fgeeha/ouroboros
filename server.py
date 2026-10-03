@@ -1424,8 +1424,7 @@ async def lifespan(app):
             _reload_extensions(lifespan_drive_root, _load_settings, repo_path=repo_path or None)
     except Exception:
         log.error("Extension reload_all at startup failed", exc_info=True)
-    # Only now: the first scheduler tick can consume an overdue note, and an event-bus
-    # subscriber (Telegram's chat.outbound) attached after that publish never sees it.
+    # Only now: the first tick may consume an overdue note; a bus subscriber attached later never sees it.
     if startup_provider_ready:
         _start_supervisor_if_needed(settings)
 
