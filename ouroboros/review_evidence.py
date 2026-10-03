@@ -903,9 +903,14 @@ def format_review_evidence_for_prompt(
     *,
     max_chars: int = 0,
     acceptance_panels: Any = None,
+    plan_review: Any = None,
     **_kwargs,
 ) -> str:
     """Format review evidence as JSON for prompt injection.
+
+    ``plan_review`` is the task's plan-review facts slice (``plan_review_facts``),
+    already bounded by its builder: it leads the text and consumes none of
+    ``max_chars``, which keeps bounding the commit/advisory and acceptance evidence.
 
     When *max_chars* is 0 (default) the full JSON is returned — no truncation.
     Callers that inject evidence into bounded prompts (summaries, reflections)
@@ -992,9 +997,12 @@ def format_review_evidence_for_prompt(
             truncate_review_artifact(foreign_section, limit=max(1, room))
             if max_chars > 0 and len(foreign_section) > max(1, room) else foreign_section
         )
-    if not sections:
-        return "(no commit/advisory review evidence recorded for this task)"
-    return "\n\n".join(sections)
+    body = "\n\n".join(sections) if sections else "(no commit/advisory review evidence recorded for this task)"
+    if isinstance(plan_review, dict) and plan_review:
+        from ouroboros.plan_review_facts import render_plan_review_section
+
+        return render_plan_review_section(plan_review) + "\n\n" + body
+    return body
 
 
 def _attempt_to_dict(item: Any) -> Dict[str, Any]:
