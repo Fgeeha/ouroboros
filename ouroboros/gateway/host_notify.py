@@ -17,8 +17,6 @@ from typing import Any, Dict, Optional
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from ouroboros.event_bus import (OWNER_NOTIFICATION_KEY_CHARS, OWNER_NOTIFICATION_TEXT_CHARS, emit_owner_notification,
-                                 owner_notification_chat_id)
 from ouroboros.gateway._helpers import run_sync_to_completion
 from ouroboros.gateway.host_service import HostServiceAuthError, HostServiceContext, _authenticated, _json_error
 from ouroboros.utils import utc_now_iso
@@ -31,6 +29,12 @@ async def _api_notify(request: Request) -> JSONResponse:
     events row (its live browser frame is the append's log-sink copy) plus the
     ``owner.notification`` topic. ``key`` is the producer's identity for the
     notice (a redelivery collapses on the client); a failed write is 503."""
+    # Parked: the events-row carrier this handler emitted through was dropped
+    # with the accepted chat-row design; the route is unmounted until the
+    # handler is reshaped onto the System-row seam.
+    from ouroboros.event_bus import (OWNER_NOTIFICATION_KEY_CHARS, OWNER_NOTIFICATION_TEXT_CHARS,
+                                     emit_owner_notification, owner_notification_chat_id)
+
     ctx: HostServiceContext = request.app.state.host_service_context
     try:
         skill_name, _ = await _authenticated(ctx, request.headers.get("x-skill-token", ""), "notify_owner")

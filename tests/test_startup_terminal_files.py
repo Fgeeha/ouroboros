@@ -513,17 +513,12 @@ def test_lifespan_does_not_race_recovery_against_provider_supervisor():
     import server
 
     tree = ast.parse(textwrap.dedent(inspect.getsource(server.lifespan)))
-    gate = [node for node in ast.walk(tree) if isinstance(node, ast.Assign)
-            and ast.unparse(node.value) == "has_startup_ready_provider(settings)"
-            and any(isinstance(target, ast.Name) and target.id == "startup_provider_ready"
-                    for target in node.targets)]
-    assert len(gate) == 1
     branches = [node for node in ast.walk(tree) if isinstance(node, ast.If)
-                and ast.unparse(node.test) == "not startup_provider_ready"]
-    assert len(branches) == 2
+                and ast.unparse(node.test) == "not has_startup_ready_provider(settings)"]
+    assert len(branches) == 1
     recovery = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Name) and node.func.id == "_run_startup_task_recovery"]
-    assert len(recovery) == 1 and sum(recovery[0] in list(ast.walk(branch)) for branch in branches) == 1
+    assert len(recovery) == 1 and recovery[0] in list(ast.walk(branches[0]))
     assert "skip_live_data=pytest_default_real_data_dir" in ast.unparse(recovery[0])
 
 

@@ -1306,8 +1306,11 @@ async def lifespan(app):
     except Exception:
         log.warning("Native skills bootstrap failed", exc_info=True)
 
-    # Reconcile project chat IDs before /api/state or context reads them, so
-    # inherited rooms are partitioned from turn one. Idempotent; never prunes.
+    # Boot-reconcile the project registry BEFORE /api/state and context-building
+    # can rely on registered_project_chat_ids (the multi-project isolation SSOT):
+    # register any pre-existing data/projects/<id>/ store whose row is missing, so
+    # an inherited project's raw chat is partitioned from turn one (not only after
+    # the 300s periodic tick). Idempotent and never prunes.
     try:
         if not pytest_default_real_data_dir:
             from ouroboros.projects_registry import reconcile_projects
@@ -1317,10 +1320,9 @@ async def lifespan(app):
 
     if not _exit_signalled.is_set():
         _supervisor_stop.clear()  # a fresh lifespan owns a fresh generation (symmetric with the teardown set)
-    from supervisor.log_addressing import install_startup_notification_sink
-    install_startup_notification_sink(settings, lifespan_drive_root, broadcast_ws_sync)
-    startup_provider_ready = has_startup_ready_provider(settings)
-    if not startup_provider_ready:
+    if has_startup_ready_provider(settings):
+        _start_supervisor_if_needed(settings)
+    else:
         _supervisor_ready.set()
         _supervisor_init_done.set()
         log.info("No supported provider or local routing configured. Supervisor not started.")
@@ -1363,7 +1365,6 @@ async def lifespan(app):
         init_global_event_bus().set_loop(_event_loop)
         init_global_supervisor(lifespan_drive_root)
         host_service_app = create_host_service_app(lifespan_drive_root)
-        host_service_app.state.notification_scheduler_ready = lambda: bool(_supervisor_thread and _supervisor_thread.is_alive() and _supervisor_ready.is_set())
         host_port = host_service_port()
         # Bind before starting the asyncio task: uvicorn's bind-error SystemExit
         # otherwise escapes run_forever and kills the main server. Keep that
@@ -1397,9 +1398,10 @@ async def lifespan(app):
     except Exception:
         log.warning("Stale skill-review reconciliation at startup failed", exc_info=True)
 
-    # Startup-only: finalize orphaned RUNNING results and indeterminate post-task synthesis.
+    # Startup-only: after the prior process generation is gone, finalize orphaned
+    # RUNNING results and resolve an indeterminate post-task synthesis phase.
     # The periodic zombie sweep intentionally does not perform this recovery.
-    if not startup_provider_ready:
+    if not has_startup_ready_provider(settings):
         _run_startup_task_recovery(
             lifespan_drive_root, REPO_DIR, skip_live_data=pytest_default_real_data_dir,
             prior_worker_pids=None if pytest_default_real_data_dir else _startup_worker_pids(lifespan_drive_root),
@@ -1421,9 +1423,7 @@ async def lifespan(app):
             _reload_extensions(lifespan_drive_root, _load_settings, repo_path=repo_path or None)
     except Exception:
         log.error("Extension reload_all at startup failed", exc_info=True)
-    # The first scheduler tick can consume an overdue notice; subscribers have no replay.
-    if startup_provider_ready:
-        _start_supervisor_if_needed(settings)
+
     try:
         from ouroboros.mcp_client import (
             reconfigure_from_settings as _mcp_reconfigure_startup,

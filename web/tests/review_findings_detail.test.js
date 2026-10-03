@@ -395,3 +395,4 @@ test('a carried finding is explained on a not-sent seat and on a failed seat ali
     assert.doesNotMatch(detail({ ok: false, operation_state: 'not_dispatched', error: 'health_skip' }), /earlier finding/);
     assert.doesNotMatch(detail({ ok: false, error: 'transport died' }), /earlier finding/);
 });
+
