@@ -1018,7 +1018,9 @@ def test_ancestor_can_relay_to_a_true_grandchild_without_owner_spoof(tmp_path):
     assert entry["source_task_id"] == "parent"
     assert entry["relayed_from_task_id"] == "peer"
 
-    # A shared root label plus a parent-cycle is not a descendant proof.
+    # A shared root label plus a parent-cycle is not a descendant proof: the label
+    # admits CONTEXT (a peer_task row the recipient judges, relation ``tree``), never
+    # ancestor steering or a relay, which keep the durable parent chain.
     write_task_result(
         tmp_path, "cycle-a", STATUS_RUNNING, parent_task_id="cycle-b",
         root_task_id="parent", child_drive_root=str(child_drive), result="running",
@@ -1027,7 +1029,12 @@ def test_ancestor_can_relay_to_a_true_grandchild_without_owner_spoof(tmp_path):
         tmp_path, "cycle-b", STATUS_RUNNING, parent_task_id="cycle-a",
         root_task_id="parent", result="running",
     )
-    assert "TASK_FORBIDDEN" in _forward_to_worker(ctx, "cycle-a", "must not deliver")
+    relayed = _forward_to_worker(ctx, "cycle-a", "peer evidence", relayed_from_task_id="peer")
+    assert "TASK_FORBIDDEN" in relayed and "ancestor-only act" in relayed
+    assert "message from a peer task" in _forward_to_worker(ctx, "cycle-a", "context, not steering")
+    [row] = drain_owner_entries(child_drive, "cycle-a", seen_ids=set())
+    assert (row["provenance"], row["relation"]) == ("peer_task", "tree")
+    assert row["source_task_id"] == "parent" and not row.get("relayed_from_task_id")
 
 
 def test_replacement_is_refused_before_gateway_or_post(monkeypatch, tmp_path):

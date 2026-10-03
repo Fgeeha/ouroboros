@@ -216,7 +216,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── project_dialogue.py  ← Read-only chat lens + append-only `logs/chat_annotations.jsonl`; the sidecar routes nothing but the token-bound `needs_manual_target` decision card; `build_owner_message_ref`, `routing_refusal_cause` (the owner-facing `cause` sentence), `room_membership` (§3 Chat and Projects)
       ├── project_lease.py     ← One-writer-per-project lease in `assign_tasks`; same-project subagent swarms exempt; `""` is no lane
       ├── context.py           ← Main context assembly and Available-subagents catalog; ordinary shared context retains authored knowledge summaries and an explicit missing-overview gap
-      ├── context_input_selection.py ← Optional declared-source API-child composition and validation; ordinary shared continuity stays default (§6 Selected first-input sources)
+      ├── context_input_selection.py ← Optional declared-source child composition and validation (API model or configured session); ordinary shared continuity stays default (§6 Selected first-input sources)
       ├── main_context_authority.py ← Deep-copies the context authority; replaces only oversized raw result strings with source-resolvable narrative or a typed gap
       ├── client_surface.py    ← Closed-key bounded client-surface normalizer; surface identity excludes viewport/narrow_layout (§4 WebSocket protocol)
       ├── context_fit.py       ← Deterministic Max/Low/Nano context projections from one immutable core with labelled measurement + typed reclaim deficit; owns the ONE message-side transcript cache seal; no routing/retry/global-mode authority (§6 Context fitting, retry, and compaction)

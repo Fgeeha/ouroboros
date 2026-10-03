@@ -502,7 +502,7 @@ def _addressed_wakes(ctx: Any, state: dict[str, Any]) -> list[dict[str, Any]]:
             "provenance": str(entry.get("provenance") or "owner"),
             "source_task_id": str(entry.get("source_task_id") or ""),
             "relayed_from_task_id": str(entry.get("relayed_from_task_id") or ""),
-            # The peer relation the drain projected (sibling / parent): the sender's
+            # The peer relation the drain projected (a PEER_RELATION_LABELS key): the sender's
             # typed place, carried so a wake never signs a child or sibling as an
             # ancestor or owner (the same fact the round-top prefix reads).
             **({"relation": str(entry["relation"])} if str(entry.get("relation") or "") else {}),

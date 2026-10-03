@@ -538,10 +538,16 @@ def peer_relation_to(
     tid: str,
     data: Dict[str, Any],
 ) -> str:
-    """``parent`` / ``sibling`` when ``tid`` is the caller's parent or shares its
-    parent inside ONE durable tree, else ``""``. The caller's own lineage comes
-    from its task metadata, falling back to its durable result; a recipient in
-    another root is never a peer even when the parent ids coincide."""
+    """``parent`` / ``sibling`` / ``tree`` when ``tid`` is the caller's parent,
+    shares its parent, or shares its durable tree root (the blackboard's own
+    ``root_task_id`` scope: a cousin, an uncle, the root itself, a predecessor's
+    child reached by a continuation root), else ``""``. The caller's own lineage
+    comes from its task metadata, falling back to its durable result; a caller
+    with no parent is a root and its own tree. A recipient with no root carrier
+    and no parent is its own root (a direct-chat root); a missing sibling root
+    is never inferred, and a recipient in another root is never a peer even
+    when the parent ids coincide. Shared-root labels grant context, never
+    ancestry: relay and steering keep ``durable_descendant_of``."""
     from ouroboros.task_status import load_effective_task_result
 
     if tid == current_task_id:
@@ -552,20 +558,21 @@ def peer_relation_to(
         own = load_effective_task_result(status_drive_root, current_task_id) or {}
         caller_parent = caller_parent or str(own.get("parent_task_id") or "").strip()
         caller_root = caller_root or str(own.get("root_task_id") or "").strip()
-    if not caller_parent or not caller_root:
+    if not caller_root and not caller_parent:
+        caller_root = current_task_id
+    if not caller_root:
         return ""
-    if tid == caller_parent:
-        relation = "parent"
-    elif str(data.get("parent_task_id") or "").strip() == caller_parent:
-        relation = "sibling"
-    else:
-        return ""
+    recipient_parent = str(data.get("parent_task_id") or "").strip()
     recipient_root = str(data.get("root_task_id") or "").strip()
-    # A direct-chat root may have no root_task_id carrier. The child's exact
-    # parent/root pair still proves this root; never infer a missing sibling root.
-    if not recipient_root and not data.get("parent_task_id") and tid == caller_root == caller_parent:
+    if not recipient_root and not recipient_parent:
         recipient_root = tid
-    return relation if recipient_root == caller_root else ""
+    if recipient_root != caller_root:
+        return ""
+    if caller_parent and tid == caller_parent:
+        return "parent"
+    if caller_parent and recipient_parent == caller_parent:
+        return "sibling"
+    return "tree"
 
 
 def peer_contribution_admission(
@@ -580,8 +587,8 @@ def peer_contribution_admission(
     """``(relation, refusal)`` for a ``forward_to_worker`` recipient that is not
     the caller's descendant (serial addressed turns, peer contributions).
 
-    ``relation`` is ``parent``/``sibling`` when the recipient is a peer inside the
-    caller's tree and the write may proceed. ``refusal`` is a typed ``ToolResult``
+    ``relation`` is a ``PEER_RELATION_LABELS`` key (``parent``/``sibling``/``tree``)
+    when the recipient is a peer inside the caller's tree and the write may proceed. ``refusal`` is a typed ``ToolResult``
     when it IS a peer but relay was asked (an ancestor-only act), or its
     cancellation is pending, or that state cannot be read: a peer holds no
     authority over the recipient, so it never writes blind — the fail-soft
@@ -590,6 +597,7 @@ def peer_contribution_admission(
     path. ``("", None)`` means the recipient is no peer at all.
     """
     from ouroboros.cancel_intents import cancel_pending
+    from ouroboros.owner_mailbox import PEER_RELATION_LABELS
     from ouroboros.tools.tool_result import ToolResult
 
     relation = peer_relation_to(status_drive_root, current_task_id, metadata, tid, data)
@@ -598,7 +606,7 @@ def peer_contribution_admission(
     if relayed_from:
         return "", ToolResult(status="blocked", code="LEGACY_BLOCKED", text=(
             f"⚠️ TASK_FORBIDDEN: a relayed message reaches only your own descendants; "
-            f"task {tid} is your {relation} — relay is an ancestor-only act."))
+            f"task {tid} is {PEER_RELATION_LABELS[relation]['receipt']} — relay is an ancestor-only act."))
     try:
         pending = cancel_pending(status_drive_root, tid, strict=True)
     except Exception:
