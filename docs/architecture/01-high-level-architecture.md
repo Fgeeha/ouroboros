@@ -311,6 +311,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── launcher_server_reaper.py ← POSIX same-install server discovery, pre-signal descendant capture, root-first termination, live identity revalidation; PID-lock-owning launcher only (Runtime topology below)
       ├── launcher_windows_runtime.py ← Windows-only pythonnet/pywebview runtime preparation
       ├── desktop_autostart.py, windows_autostart.py ← Host sign-in adapter table; packaged-launcher gate, Windows registry, macOS LaunchAgent and Linux systemd/XDG state (Runtime topology below)
+      ├── plan_review_facts.py ← Bounded plan-review facts for the learning surfaces: the reflection's plan-review slice and the late-settlement reflection row, with a source pointer and named omissions, never a score (§6 Post-task reflection)
       ├── provider_models.py   ← Model-ID helpers; the `ACTIVE_MODEL_SETTING_KEYS` vs `LEGACY_MODEL_SETTING_KEYS` split keeps Heavy out of startup/Provider Test/new consumers while migration/history still read it
       ├── runtime_mode_policy.py ← Protected-path policy (safety-critical files, frozen contracts, release/managed invariants) shared by the registry, git tools, and gateway guards (§6 Safety and runtime mode)
       ├── schedule_contract.py ← Schedule id, 5-field cron, IANA timezone validation SSOT
@@ -540,6 +541,8 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
 `devtools/` is excluded from runtime imports and package discovery; review applies, outputs stay external, and sentinels suppress isolated-root rotation warnings. In `devtools/benchmarks/cybergym/`, `cybergym_adapter` settles budgets/results; `cybergym_custody._CustodyMixin` owns gateway admission and normal/cancelled waits with distinct bounds and shared custody. `cybergym_lifecycle._LifecycleMixin` owns startup, verification and cleanup. `cybergym_dispatch` shares timed pause/probe across transport and workspace-custody gates; budget probes follow settlements. Sibling startup latches release zero-send claims for row-free requeue; typed stops keep never-dispatched ids row-free. `devtools/e2e_live/` is the live E2E stand — K staggered isolated real servers running the owner-shaped scenarios SM1, SW1 and SK1, accepted over durable artifacts and a browser probe, admitted through the same seed gate and manifest seams as the benchmark launchers. Its operator manual is `devtools/e2e_live/README.md`; the one rule binding runtime changes is DEVELOPMENT "Live E2E stand".
 
 `devtools/benchmarks/cowork_bench/` runs a clean seed in pinned containers with a persistent MCP proxy. Its launcher owns spending, limits and ledgers; `official_receipt.py` reads exact evaluator bytes, `eval_attempt.py` claims each official evaluation once and runs the opt-in audit-only diagnostic; the audit keeps scoring authority (see `METHODOLOGY.md`).
+
+`devtools/benchmarks/osworld/` keeps admission, actor attestation, finalization and CLI entry points in `run_step_agent.py` and `run_cu_bridge_agent.py`. Their `step_agent_*` and `cu_bridge_*` leaves own environment, claims, actions, policy, prompts and accounting; the runners re-export the shared surface. The module map is `devtools/benchmarks/osworld/README.md`.
 
 ### Gateway Boundary v1
 

@@ -364,6 +364,14 @@ def test_a_panel_that_settles_after_the_task_ended_is_attached_and_announced_onc
         {"slots": {"a": "ok"}, "total": 1}, result=stored) is False
     assert ctx.event_queue.empty()
     assert json.dumps(load_task_result(tmp_path, "late-root")["review_projection"], sort_keys=True) == before
+    # The settled verdict reaches the learning log exactly once: one bounded row from the
+    # announced settlement, none from the replay that announced nothing.
+    rows = [json.loads(line) for line in (tmp_path / "logs" / "task_reflections.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()]
+    late_rows = [row for row in rows if row.get("type") == "acceptance_late_settlement"]
+    assert len(late_rows) == 1 and late_rows[0]["task_id"] == "late-root"
+    assert late_rows[0]["supplement_id"] == "acceptance-late:acceptance-subject-one"
+    assert "reviewers later passed it" in late_rows[0]["reflection"]
 
 
 def test_the_late_row_never_reports_a_reviewer_whose_outcome_is_unknown_as_answered():
