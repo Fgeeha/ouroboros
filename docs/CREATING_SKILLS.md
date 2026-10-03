@@ -609,8 +609,8 @@ Some settings keys are protected: `OPENROUTER_API_KEY`,
 `GITHUB_TOKEN`, `OUROBOROS_NETWORK_PASSWORD`. These keys are NEVER
 forwarded to a skill by default, even when listed in
 `env_from_settings`. Custom secret keys stored in Settings → Secrets
-are treated the same way. Host permissions such as `inject_chat`, `presence`, and
-chat event subscriptions also require explicit, content-hash-bound owner
+are treated the same way. Host permissions such as `inject_chat`, `presence`,
+`notify_owner` and chat event subscriptions also require explicit, content-hash-bound owner
 consent. The desktop launcher's owner-grant bridge records these grants.
 
 The Skills UI surfaces missing grants on the skill card. The agent
