@@ -8,6 +8,7 @@ findings no longer change severity based on its working-window size.
 
 import hashlib
 import json
+import re
 import subprocess
 from types import SimpleNamespace
 
@@ -800,7 +801,9 @@ def test_the_brief_carries_the_index_the_governance_tiers_and_both_manifests(tmp
     # The index: every tracked path's class, the touched paths' facts and their
     # importers — and no file body (beta.py imports alpha.py, so it is listed).
     assert "## Repository index" in task
-    assert "indexed\talpha.py" in task and "beta.py" in task
+    # An ordinary path is a bare row (the `indexed` label is implied, not repeated).
+    assert re.search(r"^alpha\.py$", task, re.M) and "beta.py" in task
+    assert "indexed\talpha.py" not in task
     assert manifest["repository_index"]["strategy"] == "repository_index"
     # alpha.py, gamma.py, prompts/SYSTEM.md
     assert manifest["repository_index"]["touched_count"] == 3

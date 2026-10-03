@@ -1741,7 +1741,7 @@ def test_osworld_shell_action_does_not_fabricate_bash_history():
     command into ~/.bash_history to satisfy terminal-task evaluators (hidden
     verifier knowledge / answer fitting). The only allowed mention is the
     docstring documenting that we deliberately do not do it."""
-    src = (REPO_ROOT / "devtools" / "benchmarks" / "osworld" / "run_step_agent.py").read_text(encoding="utf-8")
+    src = (REPO_ROOT / "devtools/benchmarks/osworld/step_agent_actions.py").read_text(encoding="utf-8")
     # No history-file write in the emitted snippet, no record_history plumbing.
     assert "hist.open(" not in src
     assert "record_history" not in src

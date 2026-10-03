@@ -57,6 +57,7 @@ import textwrap
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+from ouroboros.tools.arg_feedback import payload_item_feedback, with_argument_notes
 from ouroboros.config import get_runtime_mode
 from ouroboros.runtime_mode_policy import (
     core_patch_notice,
@@ -75,6 +76,24 @@ from ouroboros.tools.registry import ToolContext, ToolEntry, active_repo_dir_for
 from ouroboros.utils import safe_relpath, write_text
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Payload item vocabulary (shared with core._write_file)
+# ---------------------------------------------------------------------------
+
+# The ONE declaration of the `edits` item shape: the published schema in
+# get_tools() and the pre-edit guard both DERIVE from it, so the declared shape
+# cannot drift from what the tool reads. `count` is optional; the rest are required.
+_EDIT_BATCH_ITEM_PROPERTIES: Dict[str, Dict[str, Any]] = {
+    "path": {"type": "string"},
+    "old_str": {"type": "string"},
+    "new_str": {"type": "string"},
+    "count": {"type": "integer", "default": 1,
+              "description": "Exact number of occurrences expected AND replaced."},
+}
+_EDIT_BATCH_ITEM_KEYS: Tuple[str, ...] = tuple(_EDIT_BATCH_ITEM_PROPERTIES)
+_EDIT_BATCH_ITEM_REQUIRED: Tuple[str, ...] = ("path", "old_str", "new_str")
 
 
 # ---------------------------------------------------------------------------
@@ -790,6 +809,11 @@ def _edit_batch(
 ) -> str:
     if not edits or not isinstance(edits, list):
         return "⚠️ EDIT_BATCH_ERROR: edits must be a non-empty array."
+    item_refusal, notes = payload_item_feedback(
+        ctx, edits, _EDIT_BATCH_ITEM_PROPERTIES, item_label="edit", options={"root": root},
+    )
+    if item_refusal:
+        return item_refusal
     contents: Dict[str, str] = {}
     targets: Dict[str, pathlib.Path] = {}
     applied: List[str] = []
@@ -803,9 +827,6 @@ def _edit_batch(
     mutation_binding: ResolvedResourceBinding | None = None
     located = 0  # misses diagnosed so far (bounded per call)
     for idx, edit in enumerate(edits, 1):
-        if not isinstance(edit, dict):
-            errors.append(f"edit {idx}: must be an object")
-            continue
         item_binding = next(binding_iter, None)
         path = str(edit.get("path", "") or "")
         old_str = edit.get("old_str", "")
@@ -880,11 +901,11 @@ def _edit_batch(
             )
         changed.append(rel)
     footer = _finish_mutation(ctx, changed, "edit_batch", mutation_binding)
-    return (
+    return with_argument_notes(ctx, (
         f"✅ edit_batch applied {len(applied)} edit(s) across {len(changed)} file(s):\n"
         + "\n".join("  " + a for a in applied)
         + f"\n{footer}"
-    )
+    ), notes)
 
 
 # ---------------------------------------------------------------------------
@@ -987,13 +1008,9 @@ def get_tools() -> List[ToolEntry]:
                 "use count>1 for identical repeated edits instead of many edit_text calls."
             ),
             "parameters": {"type": "object", "properties": {
-                "edits": {"type": "array", "items": {"type": "object", "properties": {
-                    "path": {"type": "string"},
-                    "old_str": {"type": "string"},
-                    "new_str": {"type": "string"},
-                    "count": {"type": "integer", "default": 1,
-                              "description": "Exact number of occurrences expected AND replaced."},
-                }, "required": ["path", "old_str", "new_str"]}},
+                "edits": {"type": "array", "items": {"type": "object",
+                    "properties": {k: dict(v) for k, v in _EDIT_BATCH_ITEM_PROPERTIES.items()},
+                    "required": list(_EDIT_BATCH_ITEM_REQUIRED)}},
                 "root": {"type": "string", "enum": ["active_workspace", "system_repo"], "default": "active_workspace"},
             }, "required": ["edits"]},
         }, _edit_batch, is_code_tool=True, mutates_worktree=True),

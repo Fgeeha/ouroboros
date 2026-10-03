@@ -12,12 +12,61 @@ from __future__ import annotations
 
 from typing import Any, Iterable
 
-from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
+from ouroboros.tools.tool_result import (
+    ToolResult, _publish_tool_result, _published_tool_result, _replace_tool_result,
+)
 
 
 def ignored_argument_note(name: str, value: Any, why: str) -> str:
     """One result line for an argument that took the omitted path."""
     return f"{name}={value!r} ignored: {why}"
+
+
+def with_argument_notes(ctx: Any, result: str, notes: list[str]) -> str:
+    """Keep an inner producer's typed outcome when disclosing omitted arguments."""
+    if not notes:
+        return result
+    text = result + "\n" + "\n".join(notes)
+    prior = _published_tool_result(ctx, None)
+    if isinstance(prior, ToolResult) and prior.text == result:
+        return _publish_tool_result(ctx, _replace_tool_result(prior, text=text))
+    return text
+
+
+def payload_item_feedback(
+    ctx: Any, items: Any, properties: dict, *, item_label: str, options: dict,
+) -> tuple[str, list[str]]:
+    """Validate file/edit payloads before writes; harmless extras take omission.
+
+    The item schema owns the consumed keys. Other keys cannot override the call:
+    empty values and repeats of call-wide options are disclosed, requested changes
+    are refused together so no sibling is written under an unintended contract.
+    """
+    problems, notes = [], []
+    if not isinstance(items, list):
+        problems.append(f"{item_label} payload={items!r}: use an array of objects")
+    else:
+        for idx, item in enumerate(items, 1):
+            name = f"{item_label} {idx}"
+            if not isinstance(item, dict):
+                problems.append(f"{name}={item!r}: not an object; use an object with {', '.join(properties)}")
+                continue
+            for key, value in item.items():
+                if key in properties:
+                    continue
+                repeated = key in options and type(value) is type(options[key]) and value == options[key]
+                empty = value is None or value == "" or value == [] or value == {}
+                if repeated or empty:
+                    notes.append(ignored_argument_note(
+                        f"{name}.{key}", value,
+                        "same as the call-wide option" if repeated else "empty optional value",
+                    ))
+                else:
+                    repair = (f"set {key}={value!r} on a separate call" if key in options
+                              else f"remove {key}; item fields are {', '.join(properties)}")
+                    problems.append(f"{name}.{key}={value!r}: cannot override this call; {repair}")
+    refusal = argument_refusal(ctx, "TOOL_ARG_ERROR", problems, effect="Nothing was written.") if problems else ""
+    return refusal, notes
 
 
 def argument_refusal(
