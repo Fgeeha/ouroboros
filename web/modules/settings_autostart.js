@@ -37,8 +37,9 @@ export function bindAutostartControl(page) {
             const snapshot = await apiClient.desktopAutostart();
             if (!destroyed && !busy && current === generation) paint(snapshot);
         } catch (error) {
-            // Availability unknown stays hidden; a visible block reports the failed read.
-            if (destroyed || busy || current !== generation || section.hidden) return;
+            // Shown even before any state is known: a lasting read failure stays explained.
+            if (destroyed || busy || current !== generation) return;
+            section.hidden = false;
             box.disabled = true;
             setInlineStatus(status, `Could not read the host startup entry: ${error.message}`, 'danger');
         }

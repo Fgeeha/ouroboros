@@ -169,6 +169,28 @@ test('a failed write and failed read never assert a guessed host state', async (
     assert.equal(block.box.disabled, false);
 });
 
+test('a failed first read shows the block with the error and retries when Settings opens', async (t) => {
+    let failing = true;
+    const win = withApi(t, {
+        read: async () => {
+            if (failing) throw new Error('systemctl did not answer');
+            return { state: 'off' };
+        },
+    });
+    const block = fakeBlock();
+    bindAutostartControl(block.page);
+    await settle();
+    assert.equal(block.section.hidden, false, 'a lasting read error is explained, not hidden');
+    assert.equal(block.box.disabled, true);
+    assert.equal(block.status.textContent, 'Could not read the host startup entry: systemctl did not answer');
+    assert.equal(block.status.dataset.tone, 'danger');
+    failing = false;
+    win.fire('ouro:page-shown', { detail: { page: 'settings' } });
+    await settle();
+    assert.equal(block.box.disabled, false);
+    assert.equal(block.status.textContent, '');
+});
+
 test('pagehide releases every listener the block took', async (t) => {
     const win = withApi(t, { read: async () => ({ state: 'off' }) });
     const block = fakeBlock();
