@@ -339,21 +339,6 @@ def _start_argument_refusal(ctx: ToolContext, text: str, selector_root: str, ret
     continuation selector shapes one call cannot combine: a retry replays an old
     key byte-identically while a continuation is a NEW intention over a settled
     run, and a skill-payload selector run keeps its own target semantics."""
-    from ouroboros.contracts.task_contract import task_input_sources
-
-    # Retry replay bypasses assignment composition, so reject the unsupported
-    # source selection before either start path can prepare or replay a request.
-    if task_input_sources({
-        "task_contract": getattr(ctx, "task_contract", {}),
-        "metadata": getattr(ctx, "task_metadata", {}),
-    }) == "declared":
-        return "", _fail(
-            "delegate_start", "INPUT_SOURCE_SELECTION_UNSUPPORTED",
-            "Declared input selection supports scheduled API-model children only; "
-            "native-session composition is not qualified.",
-            definitely_unrun=True, host_fallback=False,
-        )
-
     if not text.strip():
         return "", _fail("delegate_start", "empty_prompt", "prompt is required")
     refusal = _payload_selector_refusal(selector_root, retry_of, bucket, skill_name)

@@ -721,12 +721,6 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
     except SubagentSelectionError as exc:
         return _publish_scheduling_refusal(ctx, "error", "TOOL_ARG_ERROR", f"⚠️ {exc.code}: {exc.detail}")
     route = configured_subagent.get("route") if isinstance(configured_subagent.get("route"), dict) else {}
-    if fields.get("input_sources") == "declared" and route.get("kind") != "api_model":
-        return _publish_scheduling_refusal(
-            ctx, "error", "TOOL_ARG_ERROR",
-            "⚠️ INPUT_SOURCE_SELECTION_UNSUPPORTED (schedule_subagent): input_sources=declared "
-            "requires an api_model actor; agent_session composition is not qualified.",
-            reason="INPUT_SOURCE_SELECTION_UNSUPPORTED")
     if fields.get("directory_strategy") == "copy" and route.get("kind") != "agent_session":
         return _publish_scheduling_refusal(
             ctx, "error", "TOOL_ARG_ERROR",
