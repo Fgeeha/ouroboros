@@ -321,3 +321,19 @@ test('a 503 settings_save_timeout keeps the wizard open with "Check status", whi
         assert.deepEqual(replaced, ['/']);
     }, { fetch, location });
 });
+
+
+test('the summary step stages the language and applies it only after the completion transaction', async () => {
+    // The harness renders inert elements, so the control itself is exercised in settings_language.test.js
+    // (`stage` hands the choice over instead of writing). The wizard's part is the order: bind in
+    // staging mode, then the one language writer after `completeOnboardingAtomically` and before the
+    // completion is announced — a write before it would create settings.json ahead of the transaction.
+    const fs = await import('node:fs/promises');
+    const source = await fs.readFile(new URL('../modules/onboarding_wizard.js', import.meta.url), 'utf8');
+    assert.match(source, /bindLanguageSettings\(root, \{ stage: \(value\) => \{ state\.languageChoice = value; \} \}\)/);
+    const complete = source.indexOf('const result = await completeOnboardingAtomically(payload);');
+    const apply = source.indexOf('await applyStagedLanguage();', complete);
+    const announce = source.indexOf('announceCompletion(result);', complete);
+    assert.ok(complete > 0 && apply > complete && announce > apply, 'complete → apply the staged language → announce');
+    assert.match(source, /await saveLanguageChoice\(choice\)/, 'the shared writer, not a second path');
+});

@@ -32,7 +32,7 @@ const RU = {
         [CODE_PREFIX + 'time.at']: { text: 'в' },
         'New task in {name}': { text: 'Новая задача в {name}' },
         'Not started: the request was empty': { text: 'Не запущено: запрос пуст' },
-        [CODE_PREFIX + 'cancel.source.http_single']: { text: 'Остановлена из приложения (Stop now)' },
+        'Stopped from the app ({control})': { text: 'Остановлена из приложения ({control})' },
         [CODE_PREFIX + 'cancel.scope_cascade']: { text: 'эта задача и её подзадачи' },
     },
 };

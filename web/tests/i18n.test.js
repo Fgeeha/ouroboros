@@ -104,7 +104,7 @@ test('the plural map is only written for a tag the engine really supports', () =
 });
 
 test('tr treats a code whose English moved since generation as a stale miss', async () => {
-    applyPayload({ ...RU, entries: { ...RU_ENTRIES, [CODE_PREFIX + 'task.headline.warn']: { text: 'Готово с оговорками', source: 'Done with warnings' } } });
+    applyPayload({ ...RU, entries: { ...RU_ENTRIES, [CODE_PREFIX + 'task.headline.warn']: { text: 'Готово с оговорками', provenance: 'generated', source: 'Done with warnings' } } });
     assert.equal(tr('task.headline.warn', 'Done with warnings'), 'Готово с оговорками');
     assert.equal(tr('task.headline.warn', 'Finished with warnings'), 'Finished with warnings', 'the reworded English shows until regenerated');
     assert.deepEqual(pendingMisses(), [CODE_PREFIX + 'task.headline.warn']);
@@ -599,4 +599,47 @@ test('concurrent switches leave one translator, so English comes back whole', ()
         deliver([{ type: 'childList', addedNodes: [root] }]);
         assert.equal(JSON.stringify(snapshot(root)), english);
     });
+});
+
+
+test('an invented language renders the `other` form and a stored plural map wins over the engine', () => {
+    applyPayload({ ...RU, language: 'art-x-vael', entries: { '{n} notes': { forms: { one: 'ONE {n}', other: 'OTHER {n}' } } }, plural_select: null });
+    assert.equal(fmt('{n} notes', { n: 1 }), 'OTHER 1', 'no CLDR data: the agreed fallback, not the browser locale\'s grammar');
+    applyPayload({ ...RU, language: 'art-x-vael', entries: { '{n} notes': { forms: { one: 'ONE {n}', other: 'OTHER {n}' } } }, plural_select: { map: { '1': 'one', '0': 'other' }, period: 10 } });
+    assert.equal(fmt('{n} notes', { n: 1 }), 'ONE 1', 'an imported pack\'s own rules select the form');
+    assert.equal(fmt('{n} notes', { n: 11 }), 'ONE 11', 'periodic map');
+    assert.equal(fmt('{n} notes', { n: 5 }), 'OTHER 5');
+    applyPayload(RU);
+});
+
+test('a pin keeps rendering after an upstream reword; only a generated entry yields to the new English', () => {
+    applyPayload({ ...RU, entries: {
+        'code:task.headline.done': { text: 'Готово', provenance: 'imported', source: 'Done' },
+        'code:task.headline.warn': { text: 'С предупреждениями', provenance: 'generated', source: 'Done with warnings' },
+        'code:cancel.reason_preview_note': { text: '(превью)', provenance: 'generated', source: '(preview; the full reason is kept with the task)' },
+    } });
+    assert.equal(tr('task.headline.done', 'Finished'), 'Готово', 'the import stays visible whatever the English says');
+    assert.equal(tr('task.headline.warn', 'Finished with warnings'), 'Finished with warnings', 'a generated entry whose English moved shows the English');
+    assert.ok(pendingMisses().includes('code:task.headline.warn') && !pendingMisses().includes('code:task.headline.done'), 'only the generated one is reported stale');
+    assert.equal(tr('cancel.reason_preview_note', ' (preview; the full reason is kept with the task)'), '(превью)', 'edge whitespace is not a reword');
+    applyPayload(RU);
+});
+
+test('re-applying the overlay to an unchanged inline composite writes nothing', () => {
+    applyPayload(RU);
+    const code = el('code', {}, 'pt-BR');
+    const help = el('div', { class: 'settings-inline-note' }, 'Type a code such as ', code, ' or a name.');
+    const root = el('div', {}, help);
+    const translator = createTranslator();
+    translator.applyTo(root);
+    assert.equal(help.textContent, 'Введите код, например pt-BR, или название.');
+    let writes = 0;
+    const original = help.replaceChildren.bind(help);
+    help.replaceChildren = (...nodes) => { writes += 1; return original(...nodes); };
+    translator.applyTo(root);
+    translator.applyTo(help);
+    assert.equal(writes, 0, 'our output stands and nothing changed: the observer must not be woken');
+    assert.equal(help.textContent, 'Введите код, например pt-BR, или название.');
+    translator.restore(root);
+    assert.equal(help.textContent, 'Type a code such as pt-BR or a name.');
 });

@@ -221,7 +221,10 @@ def test_the_exemption_sets_are_exactly_the_declared_ones():
         "OUROBOROS_CONTEXT_MODE", "OUROBOROS_CONTEXT_MODE_AUTO_LOW", "OUROBOROS_SAFETY_MODE")
     assert cfg.ENDPOINT_AUTHORED_SETTINGS == frozenset(
         {"OUROBOROS_SUBSCRIPTION_PRESET_VERSION", "OUROBOROS_SUBAGENT_PRESET_RECEIPT",
-         "OUROBOROS_ONBOARDING_COMPLETED_AT", "OUROBOROS_UI_LANGUAGE"})
+         "OUROBOROS_ONBOARDING_COMPLETED_AT"})
+    # One writer, but an ordinary runtime setting otherwise: exported to the environment like the rest.
+    assert cfg.ENDPOINT_WRITTEN_SETTINGS == frozenset({"OUROBOROS_UI_LANGUAGE"})
+    assert "OUROBOROS_UI_LANGUAGE" not in cfg.SETTINGS_KEYS_NOT_EXPORTED_TO_ENV
     assert cfg.ENDPOINT_AUTHORED_SETTINGS <= cfg.SETTINGS_KEYS_NOT_EXPORTED_TO_ENV
     # The exported set is DERIVED, never hand-kept: a new key exports by default and
     # an exclusion is a decision written into the one list.

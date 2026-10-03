@@ -183,3 +183,13 @@ def test_get_omits_the_lexicon_and_import_checks_its_schema(tmp_path, monkeypatc
         assert memory.load_memory(tmp_path, "qya")["schema"] == 1
         ok = client.post("/api/ui/i18n/import", json={"schema": 1, "language": "qya", "entries": {"Settings": {"text": "Sanyar"}}})
         assert ok.status_code == 200, ok.text
+
+
+def test_a_generic_settings_save_names_the_language_writer_it_skipped(tmp_path, monkeypatch):
+    monkeypatch.setenv("OUROBOROS_UI_LANGUAGE", "")
+    with _client(tmp_path) as client:
+        response = client.post("/api/settings", json={"OUROBOROS_UI_LANGUAGE": "de"})
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body.get("ignored_keys") == {"OUROBOROS_UI_LANGUAGE": "POST /api/ui/i18n/language"}, body
+        assert client.get("/api/ui/i18n").json()["language"] != "de", "the generic save did not move the language"

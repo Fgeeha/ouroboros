@@ -19,8 +19,8 @@ const OBSERVATION_LIMIT = 2000;
 // does (DESIGN "Quiz card"): the default path the task took, and that silence was not
 // read as consent. The card stays answerable either way.
 const waitEndedText = (assumption) => (assumption
-    ? `The wait ended; the task continued under its assumption (${assumption}) — you can still answer.`
-    : 'The wait ended without an answer; the task continued and did not take silence as consent — you can still answer.');
+    ? fmt('The wait ended; the task continued under its assumption ({assumption}) — you can still answer.', { assumption })
+    : tr('quiz.wait_ended_no_answer', 'The wait ended without an answer; the task continued and did not take silence as consent — you can still answer.'));
 
 // Neutral, factual statuses (owner decision 15~A): the card never scolds the
 // router — it states what the click does and what happened.
@@ -400,7 +400,7 @@ export function createChatDecision({
     function hostFactsLine(text) {
         const line = document.createElement('div');
         line.className = 'chat-quiz-host-facts';
-        line.textContent = tx(text);
+        line.textContent = text;  // ids, times and counts of one question: a sentence, not a translation key
         return line;
     }
 
@@ -667,8 +667,9 @@ export function createChatDecision({
         if (quiz.stake) {
             const stake = document.createElement('div');
             stake.className = 'chat-quiz-stake';
-            if (mountMarkdown) mountMarkdown(stake, `At stake: ${quiz.stake}`);
-            else stake.textContent = `At stake: ${quiz.stake}`;
+            const stakeText = `${tr('quiz.at_stake', 'At stake:')} ${quiz.stake}`;
+            if (mountMarkdown) mountMarkdown(stake, stakeText);
+            else stake.textContent = stakeText;
             card.append(stake);
         }
 
@@ -723,7 +724,7 @@ export function createChatDecision({
             commentField.className = 'chat-quiz-comment';
             commentField.rows = 2;
             commentField.maxLength = MAX_DECISION_COMMENT;
-            commentField.placeholder = 'Your answer or comment…';
+            commentField.placeholder = tr('quiz.answer_placeholder', 'Your answer or comment…');
             const send = document.createElement('button');
             send.type = 'button';
             send.className = 'chat-quiz-send';
@@ -764,8 +765,8 @@ export function createChatDecision({
             if (wait.waiting) assumption.classList.add('chat-quiz-wait');
             else if (waitEnded) assumption.classList.add('chat-quiz-wait-ended');
             assumption.textContent = wait.waiting
-                ? 'Waiting for your answer; Stop and the task deadline still apply.'
-                : (waitEnded ? waitEndedText(quiz.assumption) : `Continuing meanwhile: ${quiz.assumption}`);
+                ? tr('quiz.waiting_clause', 'Waiting for your answer; Stop and the task deadline still apply.')
+                : (waitEnded ? waitEndedText(quiz.assumption) : fmt('Continuing meanwhile: {assumption}', { assumption: quiz.assumption }));
             card.append(assumption);
         }
 

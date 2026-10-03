@@ -277,3 +277,9 @@ def test_proactive_pushes_read_the_install_language_not_the_retired_bridge_key(p
     assert notifier._notifier_language() == ""
     source = (Path(_ROOT / "lib" / "telegram_notifier.py")).read_text(encoding="utf-8")
     assert 'settings.get("TELEGRAM_LANGUAGE")' not in source, "no second language authority in the bridge"
+
+
+def test_format_falls_back_for_any_formatting_failure_of_a_translated_template(plugin, tmp_path, monkeypatch):
+    monkeypatch.setenv("OUROBOROS_UI_LANGUAGE", "ru")
+    _seed(tmp_path / "data", "ru", {"code:tg.menu.lang_changed": {"text": "✅ Язык: {language.foo}"}})  # an attribute field no caller supplies
+    assert plugin._LOCALIZED_TEXTS["ru"].format("lang_changed", language="Русский") == "✅ Interface language changed to Русский"

@@ -1,5 +1,5 @@
 import { plainCauseText } from './utils.js';
-import { tr } from './i18n.js';
+import { fmt, tr } from './i18n.js';
 
 // Twin of supervisor.cancel_publication.cancel_cause_clauses. IDs stay in
 // cancel_origin/lineage details; a compact sentence never guesses an actor.
@@ -13,6 +13,8 @@ export const CANCEL_SOURCE_PHRASES = {
     snapshot_restore: 'The server stopped while this task was still running',
     agent_tool: 'Stopped by Ouroboros',
 };
+// The English control word each app-stop phrase names (owner decision: these five words stay English).
+export const CANCEL_CONTROL_WORDS = { http_single: 'Stop now', http_cascade: 'Stop now', http_graceful: 'Wrap up' };
 // Twin of CANCEL_SOURCE_LABELS: a producer's own fixed label restates its phrase.
 export const CANCEL_SOURCE_LABELS = {
     http_graceful: 'owner requested finalize-then-stop',
@@ -46,9 +48,13 @@ export function cancelCauseClauses(origin, record = {}) {
     const stated = String(origin.reason || '');
     const label = Object.hasOwn(CANCEL_SOURCE_LABELS, source) ? CANCEL_SOURCE_LABELS[source] : null;
     // The English phrases stay the source (twin of the Python table); an install language reads
-    // them by code (web/modules/i18n.js). A source with no phrase stays raw in every language.
+    // them by code (web/modules/i18n.js). The five task-control words stay English by decision:
+    // a phrase that names one carries it as an operand the translation cannot touch. A source
+    // with no phrase stays raw in every language.
     return [
-        Object.hasOwn(CANCEL_SOURCE_PHRASES, source) ? tr(`cancel.source.${source}`, CANCEL_SOURCE_PHRASES[source]) : source,
+        Object.hasOwn(CANCEL_CONTROL_WORDS, source)
+            ? fmt('Stopped from the app ({control})', { control: CANCEL_CONTROL_WORDS[source] })
+            : Object.hasOwn(CANCEL_SOURCE_PHRASES, source) ? tr(`cancel.source.${source}`, CANCEL_SOURCE_PHRASES[source]) : source,
         stated.split(/\s+/).filter(Boolean).join(' ') === label ? '' : reasonPreview(stated),
         origin.scope === 'cascade' ? tr('cancel.scope_cascade', 'this task and its sub-tasks') : '',
         relation,

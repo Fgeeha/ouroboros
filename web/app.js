@@ -29,7 +29,7 @@ import { initUpdateStatus } from './modules/update_status.js';
 import { initDashboard } from './modules/dashboard.js';
 import { hydrateNavIcons } from './modules/page_icons.js';
 
-import { fmt, refreshDictionary, setLanguage, storedLanguage } from './modules/i18n.js';
+import { fmt, markBootRead, refreshDictionary, setLanguage, storedLanguage, tr } from './modules/i18n.js';
 import { initOnboardingOverlay } from './modules/onboarding_overlay.js';
 import { installAltMenuSuppression, installDesktopShellLinkInterceptor } from './modules/ui_helpers.js';
 import { nameProjectReference, projectReference } from './modules/project_reference.js';
@@ -706,7 +706,7 @@ function paintProjectsNav() {
             kebab.type = 'button';
             kebab.className = 'nav-project-kebab';
             kebab.textContent = '⋯';
-            kebab.title = 'Project actions';
+            kebab.title = tr('project.kebab_title', 'Project actions');
             kebab.setAttribute('aria-label', fmt('Actions for {name}', { name: project.name || project.id }));
             kebab.addEventListener('click', (event) => {
                 event.stopPropagation();
@@ -900,9 +900,9 @@ apiFetch('/api/ui/preferences', { cache: 'no-store' })
 // answers the chosen tag and the memory the overlay paints from at /api/ui/i18n. Other
 // clients learn about a change from the frames below; the settings save path broadcasts
 // nothing, so these are the only cross-client signals.
-apiClient.uiI18n()
-    .then((i18n) => setLanguage(i18n.language, i18n))
-    .catch(() => setLanguage(storedLanguage()));
+markBootRead(apiClient.uiI18n()
+    .then((i18n) => { setLanguage(i18n.language, i18n); return i18n; })
+    .catch(() => { setLanguage(storedLanguage()); return null; }));
 ws.on('ui_language_changed', () => { refreshDictionary(); });
 ws.on('ui_i18n_updated', () => { refreshDictionary(); });
 

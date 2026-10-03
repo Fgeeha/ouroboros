@@ -89,7 +89,7 @@ export async function continueTaskAction(taskId, { request = continueTask, stora
 }
 
 function renderSuccessor(button, successorId) {
-    button.textContent = 'Continued';
+    button.textContent = tr('task.continue.continued', 'Continued');
     button.disabled = true;
     button.dataset.continueSuccessor = successorId;
 }

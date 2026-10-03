@@ -1,6 +1,7 @@
 /** Rich, sanitized markdown rendering for assistant and system chat messages. */
 
 import { safeExternalUrl } from './utils.js';
+import { tr } from './i18n.js';
 import { applyChartTheme, onThemeChange } from './theme_palette.js';
 
 const CHART_TYPES = new Set([
@@ -321,9 +322,9 @@ function createCodeBlock(source, language = '') {
     copy.type = 'button';
     copy.className = 'md-code-copy';
     copy.dataset.codeCopy = '';
-    copy.setAttribute('aria-label', 'Copy code');
-    copy.title = 'Copy code';
-    copy.textContent = 'Copy';
+    copy.setAttribute('aria-label', tr('code.copy_code', 'Copy code'));
+    copy.title = tr('code.copy_code', 'Copy code');
+    copy.textContent = tr('code.copy', 'Copy');
     const pre = document.createElement('pre');
     const code = document.createElement('code');
     code.className = `language-${language || 'plain'}`;
@@ -851,16 +852,16 @@ export function enhanceChatMarkdown(rootEl, { onDomWrite = writeDirectly, onThem
             await copyCode(code);
             if (state.destroyed) return;
             button.classList.add('is-copied');
-            button.textContent = 'Copied';
+            button.textContent = tr('code.copied', 'Copied');
             const timer = setTimeout(() => {
                 state.timers.delete(timer);
                 if (state.destroyed || button.isConnected === false) return;
                 button.classList.remove('is-copied');
-                button.textContent = 'Copy';
+                button.textContent = tr('code.copy', 'Copy');
             }, 1200);
             state.timers.add(timer);
         } catch {
-            if (!state.destroyed) button.textContent = 'Copy failed';
+            if (!state.destroyed) button.textContent = tr('code.copy_failed', 'Copy failed');
         }
     };
     ROOT_STATE.set(rootEl, state);

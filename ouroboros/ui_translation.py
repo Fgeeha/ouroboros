@@ -25,9 +25,12 @@ accounted light-model call per batch of up to ``BATCH_KEYS`` keys with a stable 
 prompt cache carries the fixed part. Every answer is validated before it is written: a
 value may use only the placeholders its source has, never markup, and a plural key
 answers one form per CLDR category the browser recorded. An invalid or missing answer
-goes back to the queue with its attempt count; a key that failed ``MAX_ATTEMPTS`` batches
-is dropped and logged (a transport bound, not a judgement). A batch cut by the output
-budget is a failed batch, never a partially trusted one. Each applied batch broadcasts
+goes back to the queue with its attempt count; a key whose answers failed ``MAX_ATTEMPTS``
+batches is refused durably (the memory's ``refused`` ledger, cleared by Regenerate) and
+logged — a transport bound, not a judgement. A transport, provider, budget or output-limit
+failure requeues the batch WITHOUT counting an attempt: an outage must not turn into
+permanent English. A batch cut by the output budget is a failed batch, never a partially
+trusted one. Each applied batch broadcasts
 ``ui_i18n_updated`` so every client repaints from the new revision.
 
 A free-text language ("Quenya", "invent a language and translate everything into it")
@@ -39,7 +42,7 @@ a lexicon every later batch reuses. Without a credentialed model the gateway say
 
 Cost: every call runs under ``UsageScope(category="ui_translation", non_task_operation=True)``
 with the install's global budget, like the update letter; a budget refusal stops the
-run and keeps the queue.
+run and keeps the queue (attempts untouched).
 """
 
 from __future__ import annotations
@@ -297,7 +300,7 @@ def _source_text(key: str, facts: Dict[str, Any], catalog: Dict[str, Dict[str, A
     if key in catalog:
         return catalog[key]["text"]
     context = facts.get("context") if isinstance(facts.get("context"), dict) else {}
-    source = str(context.get("source") or "").strip()
+    source = memory.key_text(context.get("source"))  # as the browser keys it: whitespace collapsed
     if source:
         return source
     return "" if memory.is_code_key(key) else memory.split_scope(key)[0]
@@ -393,12 +396,16 @@ def _translate_taken(drive_root: pathlib.Path, tag: str, taken: List[Tuple[str, 
     if not batch:
         return facts
 
-    def _requeue(items: List[Dict[str, Any]], *, error: str) -> None:
+    def _requeue(items: List[Dict[str, Any]], *, error: str, count: bool = True) -> None:
+        """Back to the queue. ``count`` is for an answer the model gave that no rule accepted —
+        the only failure a key can exhaust. A transport, provider, budget or output-limit
+        failure is not the key's doing and costs it no attempt."""
         for item in items:
             queued = dict(item["queued"])
-            queued["attempts"] = int(queued.get("attempts") or 0) + 1
+            if count:
+                queued["attempts"] = int(queued.get("attempts") or 0) + 1
             queued["last_error"] = error[:200]
-            if queued["attempts"] >= MAX_ATTEMPTS:
+            if count and queued["attempts"] >= MAX_ATTEMPTS:
                 facts["dropped"] += 1
                 refused.append(item["key"])
                 log.warning("ui translation: dropping %r after %d failed batches (%s)", item["key"], queued["attempts"], error[:120])
@@ -415,19 +422,15 @@ def _translate_taken(drive_root: pathlib.Path, tag: str, taken: List[Tuple[str, 
         facts["requeued"] = len(batch)
         facts["error"] = exc.code
         return facts
-    except Exception as exc:  # noqa: BLE001 — a failed batch is requeued with its cause
+    except Exception as exc:  # noqa: BLE001 — a failed batch is requeued with its cause, attempts untouched
         error = f"{type(exc).__name__}: {exc}"
-        _requeue(batch, error=error)
+        _requeue(batch, error=error, count=False)
         memory.requeue_pending(drive_root, tag, back)
-        if refused:
-            _refuse(drive_root, tag, refused, error[:120])
         facts["error"] = error[:200]
         return facts
     if stop in _OUTPUT_LIMIT_STOPS:
-        _requeue(batch, error=f"output budget hit ({stop})")
+        _requeue(batch, error=f"output budget hit ({stop})", count=False)
         memory.requeue_pending(drive_root, tag, back)
-        if refused:
-            _refuse(drive_root, tag, refused, f"output budget hit ({stop})")
         facts["error"] = "output_truncated"
         return facts
     parsed = _json_object(content) or {}
@@ -446,6 +449,12 @@ def _translate_taken(drive_root: pathlib.Path, tag: str, taken: List[Tuple[str, 
     rejected: List[Dict[str, Any]] = []
     for item in batch:
         value = _validate_answer(item, by_id.get(item["id"]) or {}, categories)
+        if value is not None:
+            try:  # the writer's own rule, per key: an answer it would refuse never poisons the batch
+                memory.validate_candidate(item["key"], value, source=item["text"])
+            except memory.MemoryFormatError as exc:
+                log.info("ui translation: answer for %r refused by the memory rule: %s", item["key"], exc)
+                value = None
         if value is None:
             rejected.append(item)
         else:

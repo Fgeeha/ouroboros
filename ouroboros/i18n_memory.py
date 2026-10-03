@@ -229,11 +229,16 @@ def _validate_value(key: str, entry: Dict[str, Any]) -> Dict[str, Any]:
         raise MemoryFormatError(f"entry {key!r} has neither text nor forms")
     if text is not None and forms is not None:
         raise MemoryFormatError(f"entry {key!r} has both text and forms")
-    source_text, _ = split_scope(key) if not is_code_key(key) else (key, "")
-    allowed = placeholders(source_text) if not is_code_key(key) else None
+    # The English the value translates: the key itself for rendered chrome, the recorded
+    # ``source`` for a code entry (absent on an old import: nothing to compare with).
+    if is_code_key(key):
+        source_text = entry.get("source") if isinstance(entry.get("source"), str) else None
+    else:
+        source_text = split_scope(key)[0]
+    allowed = placeholders(source_text) if source_text is not None else None
     out: Dict[str, Any] = {}
     if text is not None:
-        out["text"] = _validate_text(key, text, allowed)
+        out["text"] = _validate_text(key, text, allowed, source_text)
     else:
         if not isinstance(forms, dict) or not forms:
             raise MemoryFormatError(f"entry {key!r} forms must be a nonempty object")
@@ -241,9 +246,19 @@ def _validate_value(key: str, entry: Dict[str, Any]) -> Dict[str, Any]:
         for category, value in forms.items():
             if not isinstance(category, str) or not category or len(category) > 16:
                 raise MemoryFormatError(f"entry {key!r} has a bad plural category")
-            cleaned[category] = _validate_text(key, value, allowed)
+            cleaned[category] = _validate_text(key, value, allowed, source_text)
         out["forms"] = cleaned
     return out
+
+
+def validate_candidate(key: str, value: Dict[str, Any], *, source: Optional[str] = None) -> Dict[str, Any]:
+    """The entry the generator is about to write, validated by the same rule the writer applies
+    (so an answer the model gave is refused per key, never as a whole batch at write time).
+    Raises ``MemoryFormatError``."""
+    candidate = {**value, "provenance": "generated"}
+    if is_code_key(key) and isinstance(source, str):
+        candidate["source"] = source[:MAX_KEY_CHARS]
+    return _validate_entry(key, candidate)
 
 
 def markup_tokens(text: object) -> set:
@@ -253,16 +268,30 @@ def markup_tokens(text: object) -> set:
     return set(_MARKUP_RE.findall(str(text or "")))
 
 
-def _validate_text(key: str, value: Any, allowed: Optional[set]) -> str:
+_BRACE_RE = re.compile(r"\{[^{}]*\}")
+
+
+def brace_tokens(text: object) -> set:
+    """Every ``{...}`` field of ``text``: placeholders and anything else ``str.format`` would try
+    to resolve (``{language.foo}``, ``{x[0]}``, ``{x!r}``). A translation may carry only the
+    fields its source has, so a consumer's ``.format`` never meets a field it cannot fill."""
+    return set(_BRACE_RE.findall(str(text or "")))
+
+
+def _validate_text(key: str, value: Any, allowed: Optional[set], source: Optional[str]) -> str:
+    """One rule for generated answers, imports and stored entries: ``source`` is the English the
+    value translates (a text key IS its source; a code entry carries it as ``source``), and the
+    value may use exactly the source's placeholders, only the source's angle-bracket tokens and
+    no ``{...}`` field the source lacks. ``None`` source (an old import of a code key): the strict
+    no-markup rule and no placeholder check."""
     if not isinstance(value, str):
         raise MemoryFormatError(f"entry {key!r} value must be a string")
     if len(value) > MAX_VALUE_CHARS:
         raise MemoryFormatError(f"entry {key!r} value is too long")
-    # No markup the source did not have: a text key IS its source; a code key's English is not
-    # at hand here, so a code entry carries no angle-bracket text at all.
-    source_tokens = markup_tokens(split_scope(key)[0]) if not is_code_key(key) else set()
-    if markup_tokens(value) - source_tokens:
+    if markup_tokens(value) - (markup_tokens(source) if source is not None else set()):
         raise MemoryFormatError(f"entry {key!r} value carries markup")
+    if source is not None and brace_tokens(value) - brace_tokens(source):
+        raise MemoryFormatError(f"entry {key!r} value carries a {{...}} field the source lacks")
     if not inline_slots_balanced(value):
         raise MemoryFormatError(f"entry {key!r} value has an unbalanced inline slot")
     if allowed is not None:
@@ -461,15 +490,16 @@ def apply_generated(doc: Dict[str, Any], items: Dict[str, Dict[str, Any]], *, mo
         current = doc["entries"].get(key)
         if current and current.get("provenance") in ("owner", "imported"):
             continue
-        entry = _validate_entry(key, {**value, "provenance": "generated"})
+        candidate = {**value, "provenance": "generated"}
+        if sources and is_code_key(key) and isinstance(sources.get(key), str):
+            candidate["source"] = sources[key][:MAX_KEY_CHARS]  # validated against the English it translates
+        entry = _validate_entry(key, candidate)
         entry["model"] = str(model or "")[:400]
         entry["at"] = stamp
         if attempt_id:
             entry["attempt_id"] = str(attempt_id)[:400]
         if source_hashes and key in source_hashes:
             entry["source_hash"] = source_hashes[key]
-        if sources and is_code_key(key) and isinstance(sources.get(key), str):
-            entry["source"] = sources[key][:MAX_KEY_CHARS]
         doc["entries"][key] = entry
         doc.setdefault("refused", {}).pop(key, None)
         applied += 1
@@ -656,7 +686,8 @@ def tr(key: str, lang: Optional[str] = None, default: Optional[str] = None, *,
     doc = cached_memory(_drive_root(drive_root), tag)
     if not doc:
         return default
-    text = entry_text(doc["entries"].get(key), doc)
+    lookup = key if is_code_key(key) else key_text(key)  # a text key is stored as the reader sees it
+    text = entry_text(doc["entries"].get(lookup), doc)
     return text if text is not None else default
 
 
@@ -675,7 +706,8 @@ def fmt(key: str, params: Optional[Dict[str, Any]] = None, lang: Optional[str] =
     if tag and not is_english(tag):
         doc = cached_memory(_drive_root(drive_root), tag)
         if doc:
-            text = entry_text(doc["entries"].get(key), doc, params.get("n"))
+            lookup = key if is_code_key(key) else key_text(key)
+            text = entry_text(doc["entries"].get(lookup), doc, params.get("n"))
             if text is not None:
                 template = text
     try:

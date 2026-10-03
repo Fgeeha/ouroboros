@@ -75,8 +75,13 @@ export const USER_CONTENT = [
 
 const state = {
     language: '', english: true, revision: 0, entries: Object.create(null), scopes: [],
-    plural: null, profile: null, stats: null, languages: [], payload: null,
+    plural: null, pluralMap: null, profile: null, stats: null, languages: [], payload: null,
 };
+// The SPA's boot read of the memory, so a control that mounts before it answers waits for it
+// instead of reading the gateway a second time.
+let bootRead = null;
+export function markBootRead(promise) { bootRead = Promise.resolve(promise).catch(() => null); return bootRead; }
+export function pendingBootRead() { return bootRead; }
 let translator = null;
 // Every switch runs on ONE chain: two concurrent setLanguage calls cannot each build a
 // translator and leave the loser's MutationObserver attached and unreachable.
@@ -105,17 +110,21 @@ export function localeDirection(tag) {
     } catch { return ''; }
 }
 
+/** Whether this engine has CLDR data for `tag`. An invented or unknown language has none, and
+ *  Intl would otherwise answer silently with the default locale's rules. */
+export function engineKnowsLocale(tag) {
+    try { return Intl.PluralRules.supportedLocalesOf([String(tag || '')]).length > 0; } catch { return false; }
+}
+
 function makePluralRules(tag) {
-    if (!tag || typeof Intl === 'undefined' || typeof Intl.PluralRules !== 'function') return null;
+    if (!tag || typeof Intl === 'undefined' || typeof Intl.PluralRules !== 'function' || !engineKnowsLocale(tag)) return null;
     try { return new Intl.PluralRules(tag); } catch { return null; }
 }
 
 /** `{map: {"0": "other", …}, period, categories}` for a tag, as the memory stores it so Python
  *  (which has no Intl) can select the same plural form. Null when the engine does not know the tag. */
 export function pluralSelectMap(tag) {
-    try {
-        if (!Intl.PluralRules.supportedLocalesOf([String(tag || '')]).length) return null;
-    } catch { return null; }
+    if (!engineKnowsLocale(tag)) return null;
     const rules = makePluralRules(tag);
     if (!rules) return null;
     const map = {};
@@ -132,8 +141,18 @@ export function pluralSelectMap(tag) {
 // ---------------------------------------------------------------------------
 
 function pluralCategory(n) {
-    if (typeof n !== 'number' || !Number.isFinite(n) || !state.plural) return 'other';
-    try { return state.plural.select(Math.abs(n)); } catch { return 'other'; }
+    if (typeof n !== 'number' || !Number.isFinite(n)) return 'other';
+    // The memory's own rules first — the same map Python selects with (an imported pack may
+    // carry its own); then this engine's CLDR rules; `other` for a language nobody has rules for.
+    const stored = state.pluralMap;
+    const value = Math.abs(n);
+    if (stored && stored.map && typeof stored.map === 'object' && Number.isInteger(value)) {
+        const period = Number(stored.period) || 0;
+        const picked = stored.map[String(period ? value % period : value)];
+        if (typeof picked === 'string') return picked;
+    }
+    if (!state.plural) return 'other';
+    try { return state.plural.select(value); } catch { return 'other'; }
 }
 
 /** The text an entry yields: `text`, or the plural form `n` selects (then `other`, `many`, first). */
@@ -269,8 +288,10 @@ export function tr(code, english = '') {
     const entry = state.entries[CODE_PREFIX + code];
     const text = entryText(entry);
     if (typeof text === 'string') {
-        // The entry remembers the English it translated; a reworded source is a stale miss.
-        if (typeof entry.source === 'string' && entry.source !== english) {
+        // A generated entry remembers the English it translated; a reworded source is a stale
+        // miss and the English shows until the generator catches up. An owner's or an import's
+        // pin keeps rendering whatever the English says: a pin survives an upstream reword.
+        if (entry.provenance === 'generated' && typeof entry.source === 'string' && keyText(entry.source) !== keyText(english)) {
             noteMiss(CODE_PREFIX + code, { source: english, stale: true });
             return english;
         }
@@ -464,12 +485,15 @@ export function createTranslator({
         if (!doc || typeof doc.createTextNode !== 'function' || typeof el.replaceChildren !== 'function') return;
         const { key, slots } = inlineKey(el);
         const stash = el.__ouroInline;
-        // Our own output still in place → the source is the stashed English, with the slots'
-        // English text put back before anything is rebuilt; otherwise the app rewrote the
-        // composite and what stands now IS the source.
-        if (stash && key === stash.out) restoreSlotTexts(stash.slots, stash.slotTexts);
-        const source = stash && key === stash.out ? stash.src : key;
+        // Our own output still in place → the source is the stashed English; otherwise the app
+        // rewrote the composite and what stands now IS the source.
+        const ours = Boolean(stash && key === stash.out);
+        const source = ours ? stash.src : key;
         const { text: translated, found } = lookupString(source, el);
+        // Idempotent: our output stands and the translation has not changed → not one DOM write
+        // (a write here would wake the observer, which would bring the node back here, forever).
+        if (ours && translated === stash.text) return;
+        if (ours) restoreSlotTexts(stash.slots, stash.slotTexts);  // the slots' English back before any rebuild
         if (translated === source) {
             if (stash) {
                 el.replaceChildren(...stash.nodes);
@@ -484,7 +508,7 @@ export function createTranslator({
         const originalTexts = stash ? stash.slotTexts : slotTexts(slots);
         if (stash) el.replaceChildren(...stash.nodes);
         rebuildInline(el, translated, originalSlots, doc);
-        el.__ouroInline = { src: source, out: inlineKey(el).key, nodes: originals, slots: originalSlots, slotTexts: originalTexts };
+        el.__ouroInline = { src: source, out: inlineKey(el).key, text: translated, nodes: originals, slots: originalSlots, slotTexts: originalTexts };
     }
 
     /** The composite a text node belongs to: its parent, or — for the text of an inline
@@ -621,6 +645,8 @@ export function applyPayload(payload) {
     state.revision = Number(data.revision) || 0;
     state.entries = Object.assign(Object.create(null), data.entries && typeof data.entries === 'object' ? data.entries : {});
     state.scopes = collectScopes(state.entries);
+    const stored = data.plural_select;
+    state.pluralMap = !state.english && stored && typeof stored === 'object' && stored.map && typeof stored.map === 'object' ? stored : null;
     state.plural = state.english ? null : makePluralRules(state.language);
     state.profile = data.profile && typeof data.profile === 'object' ? data.profile : null;
     state.stats = data.stats && typeof data.stats === 'object' ? data.stats : null;

@@ -110,7 +110,7 @@ class Texts(Mapping[str, str]):
         template = self[key]
         try:
             return template.format(**params)
-        except (KeyError, IndexError, ValueError):
+        except Exception:  # noqa: BLE001 — any formatting failure of a translated template falls back to English
             log.warning("telegram i18n: template %s.%s does not take its parameters; English used", self._table, key)
             return self._rows[key].format(**params)
 

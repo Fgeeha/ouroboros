@@ -35,7 +35,7 @@ import weakref
 from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Tuple
 
 from .telegram_api import _TELEGRAM_TEXT_LIMIT, _u16len
-from .telegram_i18n import Index, phrase
+from .telegram_i18n import Index
 from .telegram_state import _read_json_file, _state_file
 
 _QUIZ_STATE_FILE = "quiz_state.json"
@@ -156,7 +156,7 @@ def render_quiz_text(question: str, labels: List[str], stake: str, assumption: s
     details = list(option_details or [])
     lines = _project_line(project_name, lang)
     if host_facts:
-        lines.append(phrase(host_facts, lang))  # the host's sentence, translated when the memory knows it
+        lines.append(host_facts)  # ids, times and counts of one question: a sentence, not a translation key
     lines.append(f"{texts['question']}: {question}")
     if stake:
         lines.append(f"{texts['stake']}: {stake}")

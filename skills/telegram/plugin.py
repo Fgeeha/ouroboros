@@ -1197,7 +1197,7 @@ def _make_document(api):
                             except TelegramRequestRejected as exc:
                                 if not exc.plain_retry_safe:
                                     raise
-                        await client.send_message(chat_id, notice + t["file_open_app_hint"], parse_mode="")
+                        await client.send_message(chat_id, notice + " " + t["file_open_app_hint"], parse_mode="")
                         return
                     file_handle = source.open("rb")
                     file_bytes = file_handle

@@ -278,3 +278,29 @@ def test_markup_the_source_has_is_not_injected_markup():
     doc["entries"] = {"code:tg.menu.hello": {"text": "Привет <server>", "provenance": "generated"}}
     with pytest.raises(memory.MemoryFormatError, match="carries markup"):
         memory.validate_memory(doc)
+
+
+def test_brace_fields_the_source_lacks_are_refused_and_a_code_entry_is_judged_against_its_source(tmp_path):
+    doc = memory.new_memory("ru")
+    doc["entries"]["code:tg.menu.lang_changed"] = {"text": "Язык: {language} {language.foo}", "provenance": "generated",
+                                                   "source": "Interface language changed to {language}"}
+    with pytest.raises(memory.MemoryFormatError, match="field the source lacks"):
+        memory.validate_memory(doc)
+    doc["entries"]["code:tg.menu.lang_changed"] = {"text": "Язык: {language}", "provenance": "generated",
+                                                   "source": "Interface language changed to {language}"}
+    assert memory.validate_memory(doc)["entries"]["code:tg.menu.lang_changed"]["text"] == "Язык: {language}"
+    doc["entries"]["code:tg.menu.lang_title"] = {"text": "Отправьте `/language <name>`", "provenance": "generated",
+                                                 "source": "send `/language <name>`"}
+    assert "<name>" in memory.validate_memory(doc)["entries"]["code:tg.menu.lang_title"]["text"]
+    doc["entries"]["code:tg.menu.lang_title"] = {"text": "Отправьте `/language <name>`", "provenance": "imported"}
+    with pytest.raises(memory.MemoryFormatError, match="carries markup"):
+        memory.validate_memory(doc)  # no recorded source: nothing says the angle text is the source's own
+    candidate = memory.validate_candidate("code:tg.menu.lang_title", {"text": "Отправьте `/language <name>`"}, source="send `/language <name>`")
+    assert candidate["source"] == "send `/language <name>`"
+
+
+def test_text_keys_are_read_as_the_reader_sees_them(tmp_path, monkeypatch):
+    monkeypatch.setenv("OUROBOROS_UI_LANGUAGE", "ru")
+    memory.update_memory(tmp_path, "ru", lambda doc: (memory.apply_generated(doc, {"Open the file now": {"text": "Откройте файл"}}, model="t"), doc)[1], create=True)
+    assert memory.tr("Open the  file\n   now", drive_root=tmp_path) == "Откройте файл", "a relayed sentence with source-layout whitespace finds its entry"
+    assert memory.fmt("Open   the file now", drive_root=tmp_path) == "Откройте файл"

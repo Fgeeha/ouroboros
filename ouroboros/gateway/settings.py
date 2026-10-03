@@ -20,6 +20,7 @@ from ouroboros.config import (
     load_settings,
 )
 from ouroboros.config import ENDPOINT_AUTHORED_SETTINGS as _ENDPOINT_AUTHORED_SETTINGS
+from ouroboros.config import ENDPOINT_WRITTEN_SETTINGS as _ENDPOINT_WRITTEN_SETTINGS, ENDPOINT_WRITERS as _ENDPOINT_WRITERS
 from ouroboros.gateway._helpers import json_error, json_exception, request_drive_root
 from ouroboros.gateway.owner_settings import (
     CommitBoundary,
@@ -334,7 +335,7 @@ def _merge_settings_payload(current: Dict[str, Any], body: Dict[str, Any]) -> Di
     from ouroboros.config import get_runtime_mode
     from ouroboros.runtime_mode_policy import runtime_mode_at_least
 
-    skipped = {"OUROBOROS_CONTEXT_MODE_AUTO_LOW"} | _ENDPOINT_AUTHORED_SETTINGS
+    skipped = {"OUROBOROS_CONTEXT_MODE_AUTO_LOW"} | _ENDPOINT_AUTHORED_SETTINGS | _ENDPOINT_WRITTEN_SETTINGS
     if not runtime_mode_at_least(get_runtime_mode(), "cyber_pro"):
         skipped |= {"OUROBOROS_CONTEXT_MODE", "OUROBOROS_RUNTIME_MODE", "OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS", "OUROBOROS_SAFETY_MODE"}
     # Cyber authors controls through the same writer. Install receipts remain facts;
@@ -1426,6 +1427,10 @@ def _api_settings_post_locked(request: Request, body: Any) -> JSONResponse:
                 "from the next task."
             )
         resp: Dict[str, Any] = {"status": "saved"}
+        # A key with its own writer is skipped here, and the save says so instead of reading as applied.
+        ignored = sorted(k for k in body if k in _ENDPOINT_WRITTEN_SETTINGS)
+        if ignored:
+            resp["ignored_keys"] = {k: _ENDPOINT_WRITERS.get(k, "its own endpoint") for k in ignored}
         if agent_task_running:
             resp["agent_task_running"] = True
         if not all_changed:

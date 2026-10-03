@@ -211,7 +211,8 @@ def test_a_provider_failure_requeues_the_batch_and_names_the_cause(tmp_path, lig
     facts = gen.translate_batch(tmp_path, "ru", client=Broken())
     assert facts["requeued"] == 1 and facts["error"].startswith("ConnectionError")
     pending = dict(memory.take_pending(tmp_path, "ru", 10))
-    assert pending["Settings"]["attempts"] == 1
+    assert pending["Settings"]["last_error"].startswith("ConnectionError")
+    assert not pending["Settings"].get("attempts"), "a provider failure is not the key's doing: no attempt counted"
 
 
 def test_without_a_credentialed_light_model_the_queue_is_kept_and_the_state_says_so(tmp_path, monkeypatch):
@@ -486,3 +487,62 @@ def test_answers_may_keep_the_sources_own_angle_bracket_text(light):
     assert gen._validate_answer(item, kept, []) == kept
     assert gen._validate_answer(item, {"text": "Инструменты <em>появляются</em> как <1>mcp_<server>__<tool></1>."}, []) is None, "a tag the source lacks"
     assert gen._validate_answer(item, {"text": "Инструменты появляются как <1>mcp_<server>__<tool>.</1>"}, []) == {"text": "Инструменты появляются как <1>mcp_<server>__<tool>.</1>"}
+
+
+def test_a_provider_failure_requeues_the_batch_without_counting_an_attempt(tmp_path, light):
+    _ru(tmp_path)
+    memory.record_missing(tmp_path, "ru", [{"key": "Settings", "context": {}}, {"key": "Files", "context": {}}])
+
+    class Outage:
+        def chat(self, **kwargs):
+            raise RuntimeError("provider 503: upstream unavailable")
+
+    light.setattr(gen, "_broadcast", lambda frame: None)
+    for _ in range(gen.MAX_ATTEMPTS + 1):
+        facts = gen.translate_batch(tmp_path, "ru", client=Outage())
+        assert facts["error"].startswith("RuntimeError") and facts["requeued"] == 2 and facts["dropped"] == 0
+    pending = dict(memory.take_pending(tmp_path, "ru", 10))
+    assert set(pending) == {"Settings", "Files"}, "an outage keeps every key in the queue"
+    assert all(not row.get("attempts") for row in pending.values()), "an outage costs a key no attempt"
+    assert memory.load_memory(tmp_path, "ru")["refused"] == {}, "nothing is refused for a failure that is not the key's"
+    assert all(row.get("last_error", "").startswith("RuntimeError") for row in pending.values())
+
+
+def test_a_cut_answer_requeues_without_counting_an_attempt(tmp_path, light):
+    _ru(tmp_path)
+    memory.record_missing(tmp_path, "ru", [{"key": "Settings", "context": {}}])
+    light.setattr(gen, "_broadcast", lambda frame: None)
+    facts = gen.translate_batch(tmp_path, "ru", client=FakeLight([("{\"translations\": [{\"id\": 0, \"te", "length")]))
+    assert facts["error"] == "output_truncated"
+    pending = dict(memory.take_pending(tmp_path, "ru", 10))
+    assert not pending["Settings"].get("attempts")
+
+
+def test_a_faithful_answer_keeps_a_code_sources_own_angle_text(tmp_path, light):
+    _ru(tmp_path)
+    gen.register_catalog("tg.menu_test", lambda: {"lang_title": "For any other language send `/language <name>`"}, "test table")
+    memory.record_missing(tmp_path, "ru", [{"key": "code:tg.menu_test.lang_title", "context": {"source": "For any other language send `/language <name>`"}}])
+    light.setattr(gen, "_broadcast", lambda frame: None)
+    facts = gen.translate_batch(tmp_path, "ru", client=FakeLight([_answer([{"id": 0, "text": "Для другого языка отправьте `/language <name>`"}])]))
+    assert facts["applied"] == 1 and facts["dropped"] == 0, facts
+    entry = memory.load_memory(tmp_path, "ru")["entries"]["code:tg.menu_test.lang_title"]
+    assert "<name>" in entry["text"] and entry["source"].endswith("<name>`")
+
+
+def test_an_answer_with_a_brace_field_the_source_lacks_is_refused_per_key_not_per_batch(tmp_path, light):
+    _ru(tmp_path)
+    gen.register_catalog("tg.menu_test2", lambda: {"lang_changed": "✅ Interface language changed to {language}", "hello": "Hello"}, "test table")
+    memory.record_missing(tmp_path, "ru", [
+        {"key": "code:tg.menu_test2.lang_changed", "context": {"source": "✅ Interface language changed to {language}"}},
+        {"key": "code:tg.menu_test2.hello", "context": {"source": "Hello"}},
+    ])
+    light.setattr(gen, "_broadcast", lambda frame: None)
+    facts = gen.translate_batch(tmp_path, "ru", client=FakeLight([_answer([
+        {"id": 0, "text": "✅ Язык: {language} {language.foo}"},   # a field str.format cannot resolve
+        {"id": 1, "text": "Привет"},
+    ])]))
+    assert facts["applied"] == 1 and facts["requeued"] == 1, facts
+    doc = memory.load_memory(tmp_path, "ru")
+    assert doc["entries"]["code:tg.menu_test2.hello"]["text"] == "Привет", "a valid peer is written"
+    pending = dict(memory.take_pending(tmp_path, "ru", 10))
+    assert pending["code:tg.menu_test2.lang_changed"]["attempts"] == 1, "the bad answer costs its key one attempt"

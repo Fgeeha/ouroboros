@@ -140,7 +140,14 @@ function fakeClient(initial) {
                 profile: { label: body.label || body.language }, stats: { entries: 0, pending: 0 }, languages: current.languages };
             return current;
         },
-        importI18n: async (doc) => { calls.push(['importI18n', doc]); return { result: { added: 2, replaced: 1 } }; },
+        importI18n: async (doc) => {
+            calls.push(['importI18n', doc]);
+            // The gateway answers counts only; the memory on disk now has this language too.
+            if (doc && doc.language && !(current.languages || []).some((row) => row.language === doc.language)) {
+                current = { ...current, languages: [...(current.languages || []), { language: doc.language, label: doc.label || doc.language, entries: Object.keys(doc.entries || {}).length }] };
+            }
+            return { result: { added: 2, replaced: 1 } };
+        },
         exportI18nUrl: (language) => `/api/ui/i18n/export?language=${language}`,
         regenerateI18n: async (body) => { calls.push(['regenerateI18n', body]); return { ok: true }; },
     };
@@ -153,7 +160,7 @@ function withDocument(fn, { body = null, window = null } = {}) {
     if (window) globalThis.window = window;
     globalThis.localStorage = { getItem: () => null, setItem() {} };
     // Module state is process-wide: every test starts from "no payload applied yet".
-    const reset = import('../modules/i18n.js').then(({ applyPayload }) => applyPayload(null));
+    const reset = import('../modules/i18n.js').then(({ applyPayload, markBootRead }) => { applyPayload(null); markBootRead(null); });
     return reset.then(fn).finally(() => {
         for (const [key, existed, value] of saved) {
             if (existed) globalThis[key] = value;
@@ -259,13 +266,16 @@ test('import reads the chosen file into the import endpoint and reloads; export 
 
     p.importButton.fire('click');
     assert.equal(p.importFile.clicked, 1);
-    p.importFile.files = [{ text: async () => JSON.stringify({ schema: 1, language: 'ru', entries: {} }) }];
+    const readsBefore = client.calls.filter(([name]) => name === 'uiI18n').length;
+    p.importFile.files = [{ text: async () => JSON.stringify({ schema: 1, language: 'de', label: 'Deutsch', entries: { Settings: { text: 'Einstellungen' } } }) }];
     p.importFile.fire('change');
     await settle();
     const imported = client.calls.find(([name]) => name === 'importI18n');
-    assert.deepEqual(imported[1], { schema: 1, language: 'ru', entries: {} });
+    assert.deepEqual(imported[1], { schema: 1, language: 'de', label: 'Deutsch', entries: { Settings: { text: 'Einstellungen' } } });
     assert.deepEqual(toasts.at(-1), ['Imported 2 new and replaced 1 translations.', 'success']);
     assert.equal(p.importFile.value, '');
+    assert.equal(client.calls.filter(([name]) => name === 'uiI18n').length, readsBefore + 1, 'an import of another language\'s pack re-reads the memory once');
+    assert.ok(p.select.children.some((o) => o.value === 'de'), 'the imported language appears in the select without a reload');
 
     p.importFile.files = [{ text: async () => 'not json' }];
     p.importFile.fire('change');
@@ -275,10 +285,12 @@ test('import reads the chosen file into the import endpoint and reloads; export 
     p.exportButton.fire('click');
     assert.deepEqual(opened, ['/api/ui/i18n/export?language=ru']);
 
+    const readsBeforeRegen = client.calls.filter(([name]) => name === 'uiI18n').length;
     p.regenerateButton.fire('click');
     await settle();
     const regen = client.calls.find(([name]) => name === 'regenerateI18n');
     assert.deepEqual(regen[1], { language: 'ru' });
+    assert.equal(client.calls.filter(([name]) => name === 'uiI18n').length, readsBeforeRegen + 1, 'regenerate re-reads the memory once');
     assert.equal(toasts.at(-1)[1], 'success');
 }));
 
@@ -377,3 +389,58 @@ test('the status line names the generator state when it is not idle', () => {
         'Русский: 5 translated · 2 pending · translation paused: budget exhausted');
     assert.equal(describeStatus({ ...base, generator: { state: 'idle' } }), 'Русский: 5 translated · 2 pending');
 });
+
+
+test('a control mounted while the SPA boot read is in flight waits for it instead of reading again', () => withDocument(async () => {
+    const { applyPayload, markBootRead } = await import('../modules/i18n.js');
+    let finish;
+    markBootRead(new Promise((resolve) => { finish = resolve; }).then(() => { applyPayload({ ...ENGLISH, language: 'ru', english: false, chosen: true, entries: {}, revision: 2, profile: { label: 'Русский' }, stats: { entries: 3, pending: 0 } }); return null; }));
+    const p = page();
+    const client = fakeClient(ENGLISH);
+    bindLanguageSettings(p.doc, { client, toast: () => {}, navigatorLanguages: [] });
+    await settle();
+    assert.equal(client.calls.filter(([name]) => name === 'uiI18n').length, 0, 'no second boot read');
+    finish();
+    await settle();
+    assert.equal(client.calls.filter(([name]) => name === 'uiI18n').length, 0);
+    assert.equal(p.status.textContent, 'Русский: 3 translated');
+    assert.equal(p.select.value, 'ru');
+}));
+
+test('with a stage callback the control hands the choice over instead of writing it', () => withDocument(async () => {
+    const p = page();
+    const client = fakeClient(ENGLISH);
+    const staged = [];
+    bindLanguageSettings(p.doc, { client, toast: () => {}, navigatorLanguages: [], stage: (value) => staged.push(value) });
+    await settle();
+    p.select.value = 'ru';
+    p.select.fire('change');
+    await settle();
+    assert.deepEqual(staged, ['ru']);
+    assert.equal(client.calls.filter(([name]) => name === 'saveUiLanguage').length, 0, 'nothing is written before setup completes');
+    assert.equal(p.status.textContent, 'Will be applied when setup finishes: ru');
+    assert.equal(p.select.value, 'ru');
+    p.select.value = OTHER_VALUE;
+    p.select.fire('change');
+    p.otherInput.value = 'Quenya';
+    p.otherApply.fire('click');
+    await settle();
+    assert.deepEqual(staged, ['ru', 'Quenya']);
+    assert.equal(p.status.textContent, 'Will be applied when setup finishes: Quenya');
+    assert.equal(p.select.value, OTHER_VALUE);
+    assert.equal(p.otherInput.value, 'Quenya');
+}));
+
+test('the status line names refused strings, and an invented tag sends no engine direction', () => withDocument(async () => {
+    const p = page();
+    const client = fakeClient({ ...ENGLISH, language: 'ru', english: false, chosen: true, profile: { label: 'Русский' }, stats: { entries: 10, pending: 0, refused: 2 } });
+    bindLanguageSettings(p.doc, { client, toast: () => {}, navigatorLanguages: [] });
+    await settle();
+    assert.equal(p.status.textContent, 'Русский: 10 translated · 2 refused (no valid translation; Regenerate retries them)');
+    const { saveLanguageChoice } = await import('../modules/settings_language.js');
+    await saveLanguageChoice('art-x-vael', client);
+    const body = client.calls.filter(([name]) => name === 'saveUiLanguage').at(-1)[1];
+    assert.equal(body.language, 'art-x-vael');
+    assert.equal(body.profile, undefined, 'the engine has no opinion on an invented language\'s direction');
+    assert.equal(body.plural_select, undefined);
+}));

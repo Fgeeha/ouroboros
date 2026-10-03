@@ -36,14 +36,22 @@ def test_every_interface_language_envelope_has_a_field_identical_browser_twin():
     assert "import('./ui_i18n_types.js').UiI18nResponse" in client
 
 
-def test_the_language_key_has_one_writer():
-    """The generic settings save skips endpoint-authored keys; the language is one of them."""
-    from ouroboros.config import ENDPOINT_AUTHORED_SETTINGS
+def test_the_language_key_has_one_writer_and_still_reaches_every_process():
+    """The generic settings save skips the language key (its endpoint is the one writer) — and the
+    key is still projected into the environment, where every process reads it after a restart."""
+    from ouroboros.config import ENDPOINT_WRITTEN_SETTINGS, ENDPOINT_WRITERS, apply_settings_to_env, settings_env_keys
 
-    assert "OUROBOROS_UI_LANGUAGE" in ENDPOINT_AUTHORED_SETTINGS
+    assert "OUROBOROS_UI_LANGUAGE" in ENDPOINT_WRITTEN_SETTINGS
+    assert ENDPOINT_WRITERS["OUROBOROS_UI_LANGUAGE"] == "POST /api/ui/i18n/language"
     from ouroboros.gateway import settings as gateway_settings
 
-    assert "OUROBOROS_UI_LANGUAGE" in gateway_settings._ENDPOINT_AUTHORED_SETTINGS  # noqa: SLF001 — the skip set the merger reads
+    merged = gateway_settings._merge_settings_payload({"OUROBOROS_UI_LANGUAGE": "en"}, {"OUROBOROS_UI_LANGUAGE": "de"})  # noqa: SLF001
+    assert merged["OUROBOROS_UI_LANGUAGE"] == "en", "a generic save cannot move the language"
+    # Restart-shaped: the saved choice is projected into a fresh environment.
+    assert "OUROBOROS_UI_LANGUAGE" in settings_env_keys()
+    env: dict = {}
+    apply_settings_to_env({"OUROBOROS_UI_LANGUAGE": "ru"}, environ=env)
+    assert env.get("OUROBOROS_UI_LANGUAGE") == "ru"
 
 
 def test_the_server_lifespan_is_an_async_context_manager():

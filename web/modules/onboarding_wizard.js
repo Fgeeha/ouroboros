@@ -9,7 +9,7 @@ import {
     readCompletionAnswer,
 } from './onboarding_agents_step.js';
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
-import { bindLanguageSettings, languageBlockHtml } from './settings_language.js';
+import { bindLanguageSettings, languageBlockHtml, saveLanguageChoice } from './settings_language.js';
 import { installAltMenuSuppression, installDesktopShellLinkInterceptor } from './ui_helpers.js';
 import { createModelRolesEditor, modelRolesHost, modelRoleMap, parseModelSource } from './model_roles.js';
 import { availableSubagentsEditorHost } from './subagents_settings.js';
@@ -420,12 +420,8 @@ import { accountRowFacts } from './harness_accounts.js';
             if (trim(state.minimaxRegion) && !['global_en', 'cn_zh'].includes(trim(state.minimaxRegion).toLowerCase())) {
                 return 'MiniMax Region must be global_en or cn_zh.';
             }
-            if (localSource && !hasRemote && trim(state.localRoutingMode) === 'cloud') {
-                return 'Local-only setups must route at least one model to the local runtime.';
-            }
-        if (localSource && localSource.includes('/') && !isLocalFilesystemSource(localSource) && !localFilename) {
-            return 'Local HuggingFace sources need a GGUF filename.';
-        }
+            if (localSource && !hasRemote && trim(state.localRoutingMode) === 'cloud') return 'Local-only setups must route at least one model to the local runtime.';
+        if (localSource && localSource.includes('/') && !isLocalFilesystemSource(localSource) && !localFilename) return 'Local HuggingFace sources need a GGUF filename.';
         if (localSource && (!Number.isInteger(Number(state.localContextLength)) || Number(state.localContextLength) <= 0)) {
             return 'Local context length must be a positive integer.';
         }
@@ -457,9 +453,7 @@ import { accountRowFacts } from './harness_accounts.js';
             if (hasModelSubscription() && !hasApiAccess() && state[field.stateKey] === '') continue;
             const value = Number(state[field.stateKey]);
             const min = Number(field.min || 0.01);
-            if (!Number.isFinite(value) || value < min) {
-                return `${field.title || field.label || 'Budget'} must be greater than zero.`;
-            }
+            if (!Number.isFinite(value) || value < min) return `${field.title || field.label || 'Budget'} must be greater than zero.`;
         }
         return '';
     }
@@ -661,9 +655,7 @@ import { accountRowFacts } from './harness_accounts.js';
             || state.availableSubagents?.items || []).length;
         const actors = `${actorCount} Available subagent${actorCount === 1 ? '' : 's'}`;
         if (!labels.length) return `${actors} · API/local access only`;
-        if (state.skipSubscriptionPresets) {
-            return `${actors} · ${labels.join(', ')} connected · automatic subscription preset skipped`;
-        }
+        if (state.skipSubscriptionPresets) return `${actors} · ${labels.join(', ')} connected · automatic subscription preset skipped`;
         return `${actors} · ${labels.join(', ')} connected`;
     }
 
@@ -1086,7 +1078,7 @@ import { accountRowFacts } from './harness_accounts.js';
         `;
         bindEvents();
         disposeLanguage?.();   // the Language block lives on the summary step only; its binder owns its listeners
-        disposeLanguage = state.currentStep === 'summary' && !state.completedRestartMode ? bindLanguageSettings(root) : null;
+        disposeLanguage = state.currentStep === 'summary' && !state.completedRestartMode ? bindLanguageSettings(root, { stage: (value) => { state.languageChoice = value; } }) : null;
         renderLocalStatus();
     }
 
@@ -1467,8 +1459,19 @@ import { accountRowFacts } from './harness_accounts.js';
         return answer.receipt;
     }
 
+    // The summary step's Language control stages its choice (a write before completion would create
+    // settings.json ahead of the transaction and disqualify the fresh-install defaults and presets);
+    // it goes through the one language writer right after. One that cannot be applied yet leaves
+    // the install in English; Settings → Appearance offers the same control.
+    async function applyStagedLanguage() {
+        const choice = trim(state.languageChoice);
+        if (!choice) return;
+        try { await saveLanguageChoice(choice); } catch (error) { console.warn('onboarding: language not applied yet; choose it in Settings → Appearance', error); }
+    }
+
     async function saveWizardPayload(payload) {
         const result = await completeOnboardingAtomically(payload);
+        await applyStagedLanguage();
         await agentsStep?.disposeForCompletion();
         agentsStep = null;
         announceCompletion(result);
