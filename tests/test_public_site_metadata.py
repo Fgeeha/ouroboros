@@ -339,6 +339,47 @@ def test_readme_and_homepage_state_upstream_status_plainly():
     assert "Self-reported, full traces" in readme
     assert "self-reported" in homepage.lower()
     assert "Open submission" in homepage
+    for text in (readme, homepage):
+        for line in text.splitlines():
+            if "terminal-bench-2-1/pull/" in line:
+                if text == readme:
+                    assert "Self-reported; community submissions closed" in line
+                assert "submission open" not in line.lower()
+                assert "open submission" not in line.lower()
+    for root in (SITE, DOCS):
+        benchmarks = (root / "benchmarks/index.html").read_text(encoding="utf-8")
+        assert "closed community submissions on September 19, 2026" in benchmarks
+        for line in benchmarks.splitlines():
+            if "terminal-bench-2-1/pull/" in line:
+                assert "community submissions closed" in line
+
+
+def test_russian_talk_is_secondary_and_explicitly_labelled():
+    url = "https://www.youtube.com/watch?v=8IWLBsQU7qE"
+    for root in (SITE, DOCS):
+        homepage = (root / "index.html").read_text(encoding="utf-8")
+        resources = homepage.split('id="resources"', 1)[1].split("</p>", 1)[0]
+        assert f'{url}&amp;t=4881s">Talk in Russian</a>' in resources
+        assert "agent architecture at Practical ML Conf 2026" in resources
+        assert "subtitles" not in resources.lower()
+        assert '<html lang="en">' in homepage
+        assert homepage.index("Download the desktop app") < homepage.index('id="resources"')
+    readme = (REPO / "README.md").read_text(encoding="utf-8")
+    assert f"[Talk in Russian]({url}&t=4881s)" in readme
+    assert readme.index("Download for macOS") < readme.index("Talk in Russian")
+
+
+def test_model_access_copy_distinguishes_main_from_delegated_subscriptions():
+    readme = (REPO / "README.md").read_text(encoding="utf-8")
+    for root in (SITE, DOCS):
+        install = (root / "install/index.html").read_text(encoding="utf-8")
+        copy = install.split("<strong>Model access:</strong> ", 1)[1].split("</p>", 1)[0]
+        assert "Codex account as the Main model source" in copy
+        assert "supported remote provider API key" in copy
+        assert "local GGUF model" in copy
+        assert "Claude Code and Cursor subscriptions can run delegated coding and review" in copy
+        assert "they are not Main model sources" in copy
+        assert copy.replace("choose ", "To run tasks, choose ", 1) in readme
 
 
 def test_readme_and_benchmark_page_keep_claim_values_in_sync():
