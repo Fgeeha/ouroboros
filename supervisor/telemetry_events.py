@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict
 
+from ouroboros.owner_mailbox import PEER_RELATION_LABELS
 from ouroboros.utils import append_jsonl, utc_now_iso
 
 log = logging.getLogger(__name__)
@@ -50,7 +51,7 @@ def _handle_task_message_injected(evt: Dict[str, Any], ctx: Any) -> None:
         "task_id": evt.get("task_id", ""),
         "source_task_id": evt.get("source_task_id", ""),
         "provenance": evt.get("provenance", ""),
-        **({"relation": evt["relation"]} if evt.get("relation") in {"parent", "sibling"} else {}),
+        **({"relation": evt["relation"]} if evt.get("relation") in PEER_RELATION_LABELS else {}),
         "relayed_from_task_id": evt.get("relayed_from_task_id", ""),
         "text_preview": str(evt.get("text_preview") or "")[:200],
     }

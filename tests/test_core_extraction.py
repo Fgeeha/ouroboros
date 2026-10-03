@@ -127,9 +127,12 @@ def test_core_catalog_schema_bytes_and_handler_owners_are_stable():
     # again for TZ-1 V10: forward_to_worker also writes into a queued task's mailbox, so its
     # description and `task_id` description say "running or queued" and when each reads it.
     # Presence peer mail expands only forward_to_worker's description; the
-    # catalog comparison preserves every parameter and handler owner.
+    # catalog comparison preserves every parameter and handler owner. Rolled again
+    # for same-tree mail: the forward_to_worker description names its peer addressees
+    # as any other task in the caller's tree (parent, sibling, any task sharing the
+    # root) and says Presence observation gaps are disclosed inside the tree too.
     assert hashlib.sha256(schema_bytes).hexdigest() == (
-        "d51c4783df9c532f763a7d57c0ff732b86ca397c0875e151fcc1430fb8e3489e"
+        "25ab2df2f9cc9c65e4971b7d4e2a5d1013041933aa070849639a01c9a4398e83"
     )
     assert {
         entry.name: (entry.handler.__module__, entry.handler.__name__)
