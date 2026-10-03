@@ -12,6 +12,7 @@ import httpx
 from ouroboros.utils import iter_jsonl_objects, truncate_review_artifact
 
 from ..scripts.telegram_settings import load_settings
+from .telegram_i18n import Index
 
 
 _RUNTIME_STATE_TIMEOUT_SEC = 2.0
@@ -234,16 +235,11 @@ _SUBAGENT_ICONS = {
 # Terminal states lock the bubble's final look; 'interrupted' is retryable so its
 # bubble stays editable for the resumed run.
 _SUBAGENT_TERMINAL = {"completed", "completed_warn", "failed", "cancelled", "rejected"}
-_SUBAGENT_LABELS = {
-    "en": {"scheduled": "queued", "running": "running", "update": "running", "progress": "running",
-           "completed": "done", "completed_warn": "done (warn)", "failed": "failed",
-           "cancelled": "cancelled", "rejected": "rejected (duplicate)",
-           "interrupted": "interrupted", "_title": "subagent"},
-    "ru": {"scheduled": "в очереди", "running": "работает", "update": "работает", "progress": "работает",
-           "completed": "готов", "completed_warn": "готов (warn)", "failed": "ошибка",
-           "cancelled": "отменён", "rejected": "отклонён (дубль)",
-           "interrupted": "прерван", "_title": "субагент"},
-}
+_SUBAGENT_LABELS_EN = {"scheduled": "queued", "running": "running", "update": "running", "progress": "running",
+    "completed": "done", "completed_warn": "done (warn)", "failed": "failed",
+    "cancelled": "cancelled", "rejected": "rejected (duplicate)",
+    "interrupted": "interrupted", "_title": "subagent"}
+_SUBAGENT_LABELS = Index("subagent", _SUBAGENT_LABELS_EN, "the status words of a subagent card")
 
 
 def _subagent_card_text(event: Dict[str, Any], sub_event: str, lang: str) -> str:
@@ -256,7 +252,7 @@ def _subagent_card_text(event: Dict[str, Any], sub_event: str, lang: str) -> str
     fresh content — so the message updates in place instead of Telegram
     rejecting an identical edit and forcing a brand-new bubble. Sent verbatim
     as plain text (no HTML parse risk)."""
-    labels = _SUBAGENT_LABELS.get(lang, _SUBAGENT_LABELS["en"])
+    labels = _SUBAGENT_LABELS[lang]
     icon = _SUBAGENT_ICONS.get(sub_event, "🟡")
     role = str(event.get("subagent_role") or "").strip()
     child_ref = str(event.get("subagent_task_id") or event.get("task_id") or "").strip()

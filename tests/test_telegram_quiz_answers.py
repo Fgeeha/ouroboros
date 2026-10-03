@@ -415,6 +415,25 @@ def _recording_client(plugin):
     return Recording, calls
 
 
+def _install_language(plugin, tmp_path, monkeypatch, lang):
+    """The install's interface language for the card: English, or Russian from a translation
+    memory seeded with the card's own lines (what the generator or an import would write)."""
+    from ouroboros import i18n_memory as memory
+
+    root = tmp_path / "data"
+    plugin.telegram_i18n.configure(root)
+    monkeypatch.setenv("OUROBOROS_UI_LANGUAGE", lang)
+    if lang == "ru":
+        memory.update_memory(root, "ru", lambda doc: (memory.apply_generated(doc, {
+            "code:tg.quiz.hint": {"text": _HINT_RU},
+            "code:tg.quiz.project": {"text": "Проект"},
+            "code:tg.quiz.question": {"text": "Вопрос"},
+            "code:tg.quiz.stake": {"text": "Что на кону"},
+            "code:tg.quiz.meanwhile": {"text": "Пока продолжаю так"},
+            "code:tg.quiz.waiting": {"text": "Жду вашего ответа; Stop и срок задачи по-прежнему действуют."},
+        }, model="test"), doc)[1], create=True)
+
+
 def _send_full_card(plugin, tmp_path, monkeypatch, event, **settings):
     _settings(tmp_path, **settings)
     recording, calls = _recording_client(plugin)
@@ -458,8 +477,8 @@ def _plain_calls(calls):
 def test_short_card_is_one_message_with_project_facts_details_and_star(
         tmp_path, monkeypatch, lang, expected_body, hint_text):
     plugin = _load_plugin()
-    _api, calls, token, record = _send_full_card(
-        plugin, tmp_path, monkeypatch, _FULL_EVENT, TELEGRAM_LANGUAGE=lang)
+    _install_language(plugin, tmp_path, monkeypatch, lang)
+    _api, calls, token, record = _send_full_card(plugin, tmp_path, monkeypatch, _FULL_EVENT)
     assert len(calls) == 1 and calls[0][0] == "sendMessage"
     data = calls[0][1]
     assert data["text"] == f"{expected_body}\n{hint_text}"
@@ -478,8 +497,8 @@ def test_short_card_is_one_message_with_project_facts_details_and_star(
 ], ids=["en", "ru"])
 def test_waiting_line_is_localized_and_dropped_from_the_settled_text(tmp_path, monkeypatch, lang, waiting):
     plugin = _load_plugin()
-    _api, calls, _token, record = _send_full_card(
-        plugin, tmp_path, monkeypatch, {**_FULL_EVENT, "wait_for_answer": True}, TELEGRAM_LANGUAGE=lang)
+    _install_language(plugin, tmp_path, monkeypatch, lang)
+    _api, calls, _token, record = _send_full_card(plugin, tmp_path, monkeypatch, {**_FULL_EVENT, "wait_for_answer": True})
     assert waiting in calls[0][1]["text"]
     assert waiting not in record["text"]
     assert record["text"].splitlines()[-1] == "2. ★ postgres — scales, needs a server"

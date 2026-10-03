@@ -987,6 +987,46 @@ async def _api_chat_decision(request: Request) -> JSONResponse:
     return JSONResponse(payload, status_code=status)
 
 
+async def _api_ui_language(request: Request) -> JSONResponse:
+    """Relay the owner's interface-language choice through the ONE language writer.
+
+    The same seam as ``POST /api/ui/i18n/language`` (``ui_i18n.choose_language``): a tag, a
+    language name or a description, resolved and written once for the whole install.
+    ``inject_chat`` is the owner grant that already lets this skill speak as the owner's
+    chat input; relaying the owner's own ``/language`` command needs nothing more.
+    """
+    ctx: HostServiceContext = request.app.state.host_service_context
+    try:
+        skill_name, _token_payload = await _authenticated(ctx, request.headers.get("x-skill-token", ""), "inject_chat")
+    except HostServiceAuthError as exc:
+        return _json_error(str(exc), 403)
+    if not ctx.rate_limiter.allow(f"{skill_name}:language"):
+        return _json_error("rate limit exceeded", 429)
+    try:
+        body = await request.json()
+    except Exception:
+        return _json_error("invalid json", 400)
+    if not isinstance(body, dict):
+        return _json_error("request body must be a JSON object", 400)
+    from ouroboros.gateway.owner_settings import SettingsDocumentBusy
+    from ouroboros.gateway.ui_i18n import choose_language
+
+    def _audit(facts: Dict[str, Any]) -> None:
+        append_jsonl(ctx.data_dir / "logs" / "events.jsonl", {
+            "ts": utc_now_iso(), "type": "owner_api_action", "action": "ui_language",
+            "client_host": f"host_service:{skill_name}", **facts,
+        })
+
+    try:
+        status, payload = await asyncio.to_thread(choose_language, ctx.data_dir, body, audit=_audit)
+    except SettingsDocumentBusy as exc:
+        return JSONResponse({"ok": False, "error": str(exc), "code": "settings_busy"}, status_code=503)
+    except Exception as exc:
+        log.debug("Host service language relay failed", exc_info=True)
+        return _json_error(str(exc), 500)
+    return JSONResponse(payload, status_code=status)
+
+
 async def _api_ws_message(request: Request) -> JSONResponse:
     """WS-out bridge: relay a namespaced extension WS event to browser clients.
 
@@ -1406,6 +1446,7 @@ def create_host_service_app(
             Route("/chat/operations/{operation_ref:path}", _api_chat_operation, methods=["GET"]),
             Route("/chat/cancel", _api_chat_cancel, methods=["POST"]),
             Route("/chat/decision", _api_chat_decision, methods=["POST"]),
+            Route("/ui/language", _api_ui_language, methods=["POST"]),
             Route("/presence/turn", _api_presence_turn, methods=["POST"]),
             Route("/presence/delivery", _api_presence_delivery, methods=["POST"]),
             Route("/presence/work/{work_ref}", _api_presence_work, methods=["GET"]),

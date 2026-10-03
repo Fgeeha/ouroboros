@@ -7,7 +7,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
     applyPayload, createTranslator, englishTag, entryText, flushMisses, fmt, fmtInto,
-    pendingMisses, pluralSelectMap, setLanguage, setMissTransport, tr, translateString,
+    pendingMisses, pluralSelectMap, setLanguage, setMissTransport, tr, translateString, tx,
     CODE_PREFIX, EXCLUDE_SELECTOR, SCOPE_SEPARATOR, SKIP_ROOTS, USER_CONTENT,
 } from '../modules/i18n.js';
 
@@ -111,6 +111,20 @@ test('tr answers the English source in English and the memory sentence otherwise
     assert.deepEqual(sent[0].items.map((item) => item.key), [CODE_PREFIX + 'task.headline.warn']);
     assert.equal(sent[0].items[0].context.source, 'Done with warnings');
     assert.deepEqual(pendingMisses(), []);
+});
+
+test('tx translates a host-composed sentence the memory knows and reports one it does not', async () => {
+    applyPayload(EN);
+    assert.equal(tx('Not started: the request was empty'), 'Not started: the request was empty');
+    applyPayload({ ...RU, entries: { ...RU_ENTRIES, 'Not started: the request was empty': { text: 'Не запущено: запрос пуст' } } });
+    assert.equal(tx('Not started: the request was empty'), 'Не запущено: запрос пуст');
+    assert.equal(tx('  Not started: the request was empty '), 'Не запущено: запрос пуст');
+    assert.equal(tx('Not moved: the project is no longer available'), 'Not moved: the project is no longer available');
+    assert.deepEqual(pendingMisses(), ['Not moved: the project is no longer available']);
+    sent.length = 0;
+    await flushMisses();
+    assert.equal(sent[0].items[0].context.role, 'host-text');
+    assert.equal(tx(''), '');
 });
 
 test('fmt fills placeholders into the translated template and selects the plural form by n', () => {

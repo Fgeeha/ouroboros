@@ -231,6 +231,21 @@ export function tr(code, english = '') {
     return english;
 }
 
+/**
+ * A sentence the host composed in English from its own closed tables and this client merely
+ * shows (a routing refusal, a Continue cause): translated when the memory knows the exact
+ * sentence, otherwise shown as it is and reported, so the next one of its kind reads translated.
+ * Never for model prose or owner-supplied names.
+ */
+export function tx(text) {
+    const source = String(text ?? '').trim();
+    if (!source || state.english) return source;
+    const found = entryText(state.entries[source]);
+    if (typeof found === 'string') return found;
+    noteMiss(source, { role: 'host-text' });
+    return source;
+}
+
 const PLACEHOLDER_RE = /\{([A-Za-z_][A-Za-z0-9_]*)\}/g;
 
 function fill(template, params) {

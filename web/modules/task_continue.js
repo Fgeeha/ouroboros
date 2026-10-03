@@ -10,6 +10,7 @@
 
 import { continueTask, fetchTaskDetail } from './api_client.js';
 import { ensureLiveActionsEl, ownLiveActionsEl } from './chat_activity.js';
+import { fmt, tr, tx } from './i18n.js';
 import { taskDoneIsTerminal, taskReasonPhrase } from './log_events.js';
 import { showToast } from './toast.js';
 import { setInlineStatus } from './ui_primitives.js';
@@ -138,7 +139,7 @@ export function syncContinueAction(record, detail, { read = fetchTaskDetail } = 
             note.dataset.continueRefusal = String(record.groupId || '');
             actions.appendChild(note);
         }
-        setInlineStatus(note, `Continue unavailable. ${taskReasonPhrase(view.cause)}`, 'neutral');
+        setInlineStatus(note, `${tr('task.continue.unavailable', 'Continue unavailable.')} ${taskReasonPhrase(view.cause)}`, 'neutral');
         return !refusal;
     }
     refusal?.remove();
@@ -155,7 +156,8 @@ export function syncContinueAction(record, detail, { read = fetchTaskDetail } = 
     }
     button.textContent = view.kind === 'retry' ? 'Retry Continue' : 'Continue';
     button.disabled = false;
-    button.title = view.kind === 'retry' ? 'Retry the same unconfirmed Continue action' : `Start a new task that continues this interrupted one (${view.cause || 'technical interruption'})`;
+    button.title = view.kind === 'retry' ? tr('task.continue.retry_title', 'Retry the same unconfirmed Continue action')
+        : fmt('Start a new task that continues this interrupted one ({cause})', { cause: tx(view.cause || 'technical interruption') });
     button.onclick = async (event) => {
         event.stopPropagation();
         button.disabled = true;

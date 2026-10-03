@@ -215,12 +215,21 @@ def test_failed_edit_is_logged_and_not_retried(card):
     assert card.api.logs == [("warning", "Telegram quiz card edit failed (expired_terminal).")]
 
 
-def test_card_follows_the_bridge_language(card):
-    (card.api.state_dir / "settings.json").write_text(
-        json.dumps({"TELEGRAM_CHAT_ID": "42", "TELEGRAM_LANGUAGE": "ru"}), encoding="utf-8")
+def test_card_follows_the_install_language(card, tmp_path, monkeypatch):
+    """The card's own lines come from the install's translation memory under the one
+    interface language — not from a bridge-private setting or a shipped dictionary."""
+    from ouroboros import i18n_memory as memory
+
+    root = tmp_path / "data"
+    card.plugin.telegram_i18n.configure(root)
+    monkeypatch.setenv("OUROBOROS_UI_LANGUAGE", "ru")
+    memory.update_memory(root, "ru", lambda doc: (memory.apply_generated(doc, {
+        "code:tg.quiz.answered_line": {"text": "Ответ: {answer}"}}, model="test"), doc)[1], create=True)
     card.send(wait_for_answer=True)
     (edit,) = card.apply("answered", answered_index=0)
     assert edit[2].endswith("\nОтвет: 1. sqlite")
+    # A line the memory lacks stays English rather than blank or guessed.
+    assert "Question: Which db?" in edit[2]
 
 
 def test_the_manifest_declares_every_topic_register_subscribes(tmp_path):

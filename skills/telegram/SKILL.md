@@ -1,7 +1,7 @@
 ---
 name: telegram
 description: Owner-only Telegram text bridge and Mini App gateway for the existing Ouroboros interface.
-version: 1.2.9
+version: 1.3.0
 type: extension
 entry: plugin.py
 plugin_api: "2.0"
@@ -33,7 +33,10 @@ this integration's 10 MiB download cap) can be sent to Ouroboros, with or withou
 caption; replies, photos, videos, documents, typing state, subagent cards, quiz
 cards, and opt-in notifications are mirrored back to that owner. A quiz card is
 answered by tapping an option or by replying to the card with a free-form
-answer; both reach the same host decision ingress as the web UI. Slash commands
+answer; both reach the same host decision ingress as the web UI. The bridge speaks
+the install's interface language (Settings → Appearance → Language, or `/language`
+here): its own lines are English source translated by the install's translation
+memory, so the bot ships no dictionary and follows any language the owner chooses. Slash commands
 keep their ordinary command-mode rules even in replies; quote a literal command
 as code or include it inside an explanation to send it as a quiz answer.
 

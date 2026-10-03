@@ -31,7 +31,7 @@ from __future__ import annotations
 import logging
 import os
 import pathlib
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -160,13 +160,22 @@ def _merge_header(doc: Dict[str, Any], profile: Dict[str, Any], plural_select: A
     return doc if changed else None
 
 
-def _language_post_sync(request: Request, body: Any) -> JSONResponse:
+def choose_language(drive_root: pathlib.Path, body: Any, *,
+                    audit: Optional[Callable[[Dict[str, Any]], None]] = None) -> Tuple[int, Dict[str, Any]]:
+    """The ONE writer of the install's interface language: ``(status, payload)``.
+
+    ``body["language"]`` is a BCP-47 tag, or a name/description the generator resolves into
+    a tag and a profile (``language_needs_model`` 400 without a credentialed light model,
+    ``language_resolve_failed`` 502). The tag is written through the locked owner-settings
+    writer, the memory header is created or merged, ``ui_language_changed`` is broadcast and
+    the generator hooks fire. Shared by ``POST /api/ui/i18n/language`` (the browser) and the
+    Host Service's ``/ui/language`` (a skill relaying the owner, e.g. Telegram's ``/language``).
+    ``SettingsDocumentBusy`` propagates: each caller answers it in its own typed shape."""
     raw = body.get("language") if isinstance(body, dict) else None
     if not isinstance(raw, str):
-        return unsaved_error("language must be a string: a BCP-47 tag such as ru or pt-BR",
-                             400, code="language_not_a_tag")
+        return 400, {"ok": False, "saved": False, "code": "language_not_a_tag",
+                     "error": "language must be a string: a BCP-47 tag such as ru or pt-BR, or a language name"}
     tag = normalize_language_tag(raw)
-    drive_root = request_drive_root(request)
     profile = dict(body.get("profile") or {}) if isinstance(body.get("profile"), dict) else {}
     if tag is None:
         # A name or a description ("Quenya", "invent a language"): the generator turns it into
@@ -176,7 +185,7 @@ def _language_post_sync(request: Request, body: Any) -> JSONResponse:
         try:
             resolved = resolve_language_request(raw, drive_root=drive_root)
         except LanguageResolveError as exc:
-            return unsaved_error(str(exc), exc.status, code=exc.code, language=raw[:120])
+            return exc.status, {"ok": False, "saved": False, "code": exc.code, "error": str(exc), "language": raw[:120]}
         tag = resolved["tag"]
         profile = {**{k: v for k, v in resolved.items() if k != "tag"}, **profile}
     if isinstance(body.get("label"), str) and body["label"].strip():
@@ -208,13 +217,24 @@ def _language_post_sync(request: Request, body: Any) -> JSONResponse:
                 plural_categories=plural_categories)
         except memory.MemoryFormatError as exc:
             memory_error = str(exc)
-    _owner_audit(request, "ui_language", {"ui_language": tag, "previous_ui_language": previous})
+    if audit is not None:
+        audit({"ui_language": tag, "previous_ui_language": previous})
     _broadcast({"type": "ui_language_changed", "language": tag})
     _notify("language_set", drive_root, tag)
     payload = memory_payload(drive_root, tag)
     if memory_error and not payload.get("memory_error"):
         payload["memory_error"] = memory_error
-    return JSONResponse({"ok": True, **payload})
+    return 200, {"ok": True, **payload}
+
+
+def _language_post_sync(request: Request, body: Any) -> JSONResponse:
+    status, payload = choose_language(
+        request_drive_root(request), body,
+        audit=lambda facts: _owner_audit(request, "ui_language", facts))
+    if status >= 400:
+        extra = {k: v for k, v in payload.items() if k not in ("ok", "saved", "error")}
+        return unsaved_error(str(payload.get("error") or "language refused"), status, **extra)
+    return JSONResponse(payload)
 
 
 @owner_write_guard
@@ -322,7 +342,7 @@ async def api_ui_i18n_regenerate_post(request: Request) -> JSONResponse:
 
 
 __all__ = [
-    "register_language_hook", "memory_payload",
+    "register_language_hook", "memory_payload", "choose_language",
     "api_ui_i18n_get", "api_ui_i18n_language_post", "api_ui_i18n_missing_post",
     "api_ui_i18n_import_post", "api_ui_i18n_export_get", "api_ui_i18n_regenerate_post",
 ]

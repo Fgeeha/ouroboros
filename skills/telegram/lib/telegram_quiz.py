@@ -32,9 +32,10 @@ import asyncio
 import hashlib
 import json
 import weakref
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Tuple
 
 from .telegram_api import _TELEGRAM_TEXT_LIMIT, _u16len
+from .telegram_i18n import Index
 from .telegram_state import _read_json_file, _state_file
 
 _QUIZ_STATE_FILE = "quiz_state.json"
@@ -48,50 +49,28 @@ _ANSWERED_EDIT_RESERVE = _ANSWER_ECHO_MAX + 32
 
 HostPost = Callable[[Any, str, Dict[str, Any]], Awaitable[Tuple[int, Dict[str, Any]]]]
 
-_TEXTS = {
-    "en": {
-        "hint": "Tap an option, or reply to this message with your own answer.",
-        "hint_open": "Reply to this message with your answer.",
-        "recorded": "✅ Answer delivered to the task.",
-        "late_delivered": "✅ The task had already finished — your answer was delivered to the chat.",
-        "late_recorded": "✅ Answer recorded. The task had already finished and this card has no chat to deliver it to.",
-        "already": "This question was already answered.",
-        "expired": "This question has expired — the task moved on.",
-        "gone": "This question is no longer known to Ouroboros.",
-        "failed": "Could not deliver the answer (HTTP {status}). Try again.",
-        "answered_line": "Answered: {answer}",
-        "answered_plain": "Answered.",
-        "resumed": "The task continued; an answer is still accepted.",
-        "expired_terminal": "The task finished; a late answer is accepted as your message.",
-        "superseded": "Replaced by a newer question.",
-        "project": "Project",
-        "question": "Question",
-        "stake": "At stake",
-        "meanwhile": "Continuing meanwhile",
-        "waiting": "Waiting for your answer; Stop and the task deadline still apply.",
-    },
-    "ru": {
-        "hint": "Нажмите вариант или ответьте на это сообщение своим текстом.",
-        "hint_open": "Ответьте на это сообщение своим текстом.",
-        "recorded": "✅ Ответ передан задаче.",
-        "late_delivered": "✅ Задача уже завершилась — ответ доставлен в чат.",
-        "late_recorded": "✅ Ответ записан. Задача уже завершилась, а доставлять его в чат некуда.",
-        "already": "На этот вопрос уже отвечали.",
-        "expired": "Вопрос устарел — задача уже двинулась дальше.",
-        "gone": "Этот вопрос Ouroboros больше не знает.",
-        "failed": "Не удалось передать ответ (HTTP {status}). Попробуйте ещё раз.",
-        "answered_line": "Ответ: {answer}",
-        "answered_plain": "Ответ получен.",
-        "resumed": "Задача продолжила работу; ответ всё ещё принимается.",
-        "expired_terminal": "Задача завершилась; поздний ответ придёт как ваше сообщение.",
-        "superseded": "Вопрос заменён более новым.",
-        "project": "Проект",
-        "question": "Вопрос",
-        "stake": "Что на кону",
-        "meanwhile": "Пока продолжаю так",
-        "waiting": "Жду вашего ответа; Stop и срок задачи по-прежнему действуют.",
-    },
+_TEXTS_EN = {
+    "hint": "Tap an option, or reply to this message with your own answer.",
+    "hint_open": "Reply to this message with your answer.",
+    "recorded": "✅ Answer delivered to the task.",
+    "late_delivered": "✅ The task had already finished — your answer was delivered to the chat.",
+    "late_recorded": "✅ Answer recorded. The task had already finished and this card has no chat to deliver it to.",
+    "already": "This question was already answered.",
+    "expired": "This question has expired — the task moved on.",
+    "gone": "This question is no longer known to Ouroboros.",
+    "failed": "Could not deliver the answer (HTTP {status}). Try again.",
+    "answered_line": "Answered: {answer}",
+    "answered_plain": "Answered.",
+    "resumed": "The task continued; an answer is still accepted.",
+    "expired_terminal": "The task finished; a late answer is accepted as your message.",
+    "superseded": "Replaced by a newer question.",
+    "project": "Project",
+    "question": "Question",
+    "stake": "At stake",
+    "meanwhile": "Continuing meanwhile",
+    "waiting": "Waiting for your answer; Stop and the task deadline still apply.",
 }
+_TEXTS = Index("quiz", _TEXTS_EN, "the question cards sent to the owner's phone: hints, outcomes, lifecycle lines")
 
 # A remembered card's lifecycle only moves forward, as on the web card: a closed
 # wait or an expiry never reopens a settled card, and nothing downgrades an answer.
@@ -109,8 +88,8 @@ _CARD_LOCKS: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Dict[str, asy
 _RETAINED_FACTS: Dict[str, Dict[str, Any]] = {}
 
 
-def _texts(lang: str) -> Dict[str, str]:
-    return _TEXTS["ru" if lang == "ru" else "en"]
+def _texts(lang: str) -> Mapping[str, str]:
+    return _TEXTS[lang]
 
 
 def hint(lang: str) -> str:

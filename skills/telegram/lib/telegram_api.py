@@ -9,6 +9,7 @@ from typing import Any, BinaryIO, Dict, Optional
 import httpx
 
 from ..scripts.telegram_settings import validate_telegram_proxy as _telegram_proxy
+from .telegram_i18n import Index
 
 # Telegram hard-caps a single sendMessage at 4096 UTF-16 code units.
 _TELEGRAM_TEXT_LIMIT = 4096
@@ -835,105 +836,78 @@ class TelegramClient:
             return str(exc) == "Telegram API editMessageText: message is not modified."
 
 
-_LOCALIZED_TEXTS = {
-    "en": {
-        "menu_title_strict": "🤖 **Ouroboros Control Panel**\nStrict mode is active. Commands are blocked.\n\nSelect action:",
-        "menu_title": "🤖 **Ouroboros Control Centre**\nCommand Mode: `{command_mode}`\nLanguage: `{lang}`\n\nExplore and monitor the core using the buttons below:",
-        "btn_metrics": "📉 Status & Metrics",
-        "btn_mind": "🧠 Mind & BG",
-        "btn_language": "🌐 Select language",
-        "btn_refresh": "🔄 Update parameter card",
-        "btn_back": "⬅️ Back to main panel",
-        "btn_stop_bg": "🔴 Pause background thoughts",
-        "btn_start_bg": "🟢 Resume background thoughts",
-        "btn_thoughts": "💭 What are you thinking about?",
-        "metrics_title": "📊 **Ouroboros live metrics**\n\n{info_text}\n---",
-        "mind_title": "🧠 **Background Consciousness**\n\nCurrent state: {state_str}\n\nBackground thinking processes information between your chat queries.",
-        "mind_thoughts": "\n\n**Recent thoughts catalog:**\n{thoughts_text}",
-        "mind_state_active": "🟢 **Thinking** (running)",
-        "mind_state_sleeping": "🔴 **Sleeping** (paused)",
-        "lang_title": "🌐 Select chatbot bridge interface language:\nCurrently active: **English**",
-        "lang_en": "🇬🇧 English",
-        "lang_ru": "🇷🇺 Русский",
-        "help_text": (
-            "🤖 **Ouroboros Telegram Help**\n\n"
-            "Available commands:\n"
-            "• `/menu` — Show interactive control panel with active tabs\n"
-            "• `/language` — Change bridge interface language\n"
-            "• `/status` — Request live system status (if allowed)\n"
-            "• `/help` — Show this friendly usage guide\n\n"
-            "Modes description (changed in Web UI → Settings → Telegram):\n"
-            "• **strict** — block all command injections (only `/menu`, `/help`, `/language`)\n"
-            "• **safe_commands** — allow status monitoring\n"
-            "• **full_access** — allow status + background loop start/stop"
-        ),
-        "slash_blocked_strict": "⛔ Slash commands are not allowed in strict mode. Use `/menu` to see available options, or change mode in Settings → Telegram.",
-        "slash_blocked_mode": "⛔ This command is not allowed in the current mode. Use `/menu` to see available options.",
-        "not_authorized": "Not authorized",
-        "updating_status": "Updating status metrics...",
-        "extracting_thoughts": "Extracting thoughts...",
-        "injecting_consciousness": "Injecting consciousness signal...",
-        "restricted_safe": "⛔ Restricted in safe mode",
-        "lang_changed": "✅ Language changed to English",
-        "unknown_command": "Unknown command",
-        "metrics_budget_status": "• **Budget Status:**\n  Spent: `${spent_usd:.4f}`\n  Limit: `${total_budget:.2f}`\n  Remaining: `${rem:.4f}`\n\n• **System Environment:**\n  Branch: `{branch}`\n  BG Thoughts: `{bg_status}`",
-        "bg_active_label": "ACTIVE",
-        "bg_sleeping_label": "SLEEPING",
-        "btn_settings": "⚙️ Settings",
-        "settings_title": "⚙️ **Telegram Settings**\nConfigure the Telegram control panel and message display:",
-        "btn_silent_on": "🔕 Silent Mode: ON",
-        "btn_silent_off": "🔔 Silent Mode: OFF",
-        "silent_toggled_on": "🔕 Silent mode enabled — new thoughts will replace the last message",
-        "silent_toggled_off": "🔔 Silent mode disabled — each thought becomes a new message",
-    },
-    "ru": {
-        "menu_title_strict": "🤖 **Панель управления Ouroboros**\nРежим Strict активен. Команды заблокированы.\n\nВыберите действие:",
-        "menu_title": "🤖 **Центр управления Ouroboros**\nРежим команд: `{command_mode}`\nЯзык: `{lang}`\n\nУправляйте и следите за ядром с помощью кнопок:",
-        "btn_metrics": "📉 Статус и метрики",
-        "btn_mind": "🧠 Фоновое сознание",
-        "btn_language": "🌐 Выбор языка",
-        "btn_refresh": "🔄 Обновить показатели",
-        "btn_back": "⬅️ Назад в меню",
-        "btn_stop_bg": "🔴 Приостановить размышления",
-        "btn_start_bg": "🟢 Продолжить размышления",
-        "btn_thoughts": "💭 О чём ты думаешь сейчас?",
-        "metrics_title": "📊 **Живые показатели Ouroboros**\n\n{info_text}\n---",
-        "mind_title": "🧠 **Фоновое Сознание**\n\nТекущее состояние: {state_str}\n\nФоновое мышление анализирует информацию между вашими запросами.",
-        "mind_thoughts": "\n\n**Последние мысли из лога:**\n{thoughts_text}",
-        "mind_state_active": "🟢 **Думает** (активно)",
-        "mind_state_sleeping": "🔴 **Спит** (на паузе)",
-        "lang_title": "🌐 Выберите язык интерфейса бота-моста:\nАктивный язык: **Русский**",
-        "lang_en": "🇬🇧 English",
-        "lang_ru": "🇷🇺 Русский",
-        "help_text": (
-            "🤖 **Справка по Telegram в Ouroboros**\n\n"
-            "Доступные команды:\n"
-            "• `/menu` — Открыть интерактивную панель управления\n"
-            "• `/language` — Изменить и настроить язык интерфейса\n"
-            "• `/status` — Запросить текущий статус системы (если разрешено)\n"
-            "• `/help` — Показать это руководство\n\n"
-            "Описание режимов (меняется в Web UI → Settings → Telegram):\n"
-            "• **strict** — блокировать ввод команд (доступны только `/menu`, `/help`, `/language`)\n"
-            "• **safe_commands** — разрешить просмотр метрик и статуса\n"
-            "• **full_access** — доступ ко всем кнопкам, включая запуск/паузу фонового сознания"
-        ),
-        "slash_blocked_strict": "⛔ Слэш-команды запрещены в режиме strict. Используйте `/menu` или измените режим в Settings → Telegram.",
-        "slash_blocked_mode": "⛔ Эта команда не разрешена в текущем режиме. Используйте `/menu` для вызова управления.",
-        "not_authorized": "Доступ ограничен",
-        "updating_status": "Обновление метрик...",
-        "extracting_thoughts": "Извлечение мыслей...",
-        "injecting_consciousness": "Отправка сигнала сознания...",
-        "restricted_safe": "⛔ Ограничено в режиме Safe",
-        "lang_changed": "✅ Язык интерфейса изменен на Русский",
-        "unknown_command": "Неизвестная команда",
-        "metrics_budget_status": "• **Бюджетный статус:**\n  Потрачено: `${spent_usd:.4f}`\n  Лимит: `${total_budget:.2f}`\n  Осталось: `${rem:.4f}`\n\n• **Окружение системы:**\n  Ветка Git: `{branch}`\n  Фоновые мысли: `{bg_status}`",
-        "bg_active_label": "АКТИВНЫ",
-        "bg_sleeping_label": "СПЯТ",
-        "btn_settings": "⚙️ Настройки",
-        "settings_title": "⚙️ **Настройки Telegram**\nНастройте панель Telegram и отображение сообщений:",
-        "btn_silent_on": "🔕 Тихий режим: ВКЛ",
-        "btn_silent_off": "🔔 Тихий режим: ВЫКЛ",
-        "silent_toggled_on": "🔕 Тихий режим включён — новые мысли будут заменять предыдущее сообщение",
-        "silent_toggled_off": "🔔 Тихий режим выключен — каждая мысль становится отдельным сообщением",
-    }
+_MENU_TEXTS_EN = {
+    "menu_title_strict": "🤖 **Ouroboros Control Panel**\nStrict mode is active. Commands are blocked.\n\nSelect action:",
+    "menu_title": "🤖 **Ouroboros Control Centre**\nCommand Mode: `{command_mode}`\nLanguage: `{language}`\n\nExplore and monitor the core using the buttons below:",
+    "btn_metrics": "📉 Status & Metrics",
+    "btn_mind": "🧠 Mind & BG",
+    "btn_tasks": "📋 Tasks",
+    "btn_language": "🌐 Interface language",
+    "btn_refresh": "🔄 Update parameter card",
+    "btn_back": "⬅️ Back to main panel",
+    "btn_stop_bg": "🔴 Pause background thoughts",
+    "btn_start_bg": "🟢 Resume background thoughts",
+    "btn_thoughts": "💭 What are you thinking about?",
+    "metrics_title": "📊 **Ouroboros live metrics**\n\n{info_text}\n---",
+    "mind_title": "🧠 **Background Consciousness**\n\nCurrent state: {state_str}\n\nBackground thinking processes information between your chat queries.",
+    "mind_thoughts": "\n\n**Recent thoughts catalog:**\n{thoughts_text}",
+    "mind_state_active": "🟢 **Thinking** (running)",
+    "mind_state_sleeping": "🔴 **Sleeping** (paused)",
+    "tasks_title": "📋 Tasks",
+    "lang_title": (
+        "🌐 **Interface language of this installation**\n"
+        "The web UI, the desktop window and this bot follow one choice.\n"
+        "Currently active: **{language}**\n\n"
+        "For any other language send `/language <name>` — a code such as pt-BR, a language name, "
+        "or a description of a language to invent."
+    ),
+    "lang_english": "🇬🇧 English (source)",
+    "lang_changed": "✅ Interface language changed to {language}",
+    "lang_failed": "⚠️ The language could not be changed: {reason}",
+    "lang_needs_model": "⚠️ A language name needs a model: set one up in Settings → Models, or send a code such as `/language pt-BR`.",
+    "help_text": (
+        "🤖 **Ouroboros Telegram Help**\n\n"
+        "Available commands:\n"
+        "• `/menu` — Show interactive control panel with active tabs\n"
+        "• `/language` — Change the interface language of this installation\n"
+        "• `/status` — Request live system status (if allowed)\n"
+        "• `/help` — Show this friendly usage guide\n\n"
+        "Modes description (changed in Web UI → Settings → Telegram):\n"
+        "• **strict** — block all command injections (only `/menu`, `/help`, `/language`)\n"
+        "• **safe_commands** — allow status monitoring\n"
+        "• **full_access** — allow status + background loop start/stop"
+    ),
+    "slash_blocked_strict": "⛔ Slash commands are not allowed in strict mode. Use `/menu` to see available options, or change mode in Settings → Telegram.",
+    "slash_blocked_mode": "⛔ This command is not allowed in the current mode. Use `/menu` to see available options.",
+    "not_authorized": "Not authorized",
+    "updating_status": "Updating status metrics...",
+    "extracting_thoughts": "Extracting thoughts...",
+    "injecting_consciousness": "Injecting consciousness signal...",
+    "restricted_safe": "⛔ Restricted in safe mode",
+    "unknown_command": "Unknown command",
+    "use_miniapp": "Use the Mini App.",
+    "update_failed": "Could not deliver that Telegram update to Ouroboros.",
+    "metrics_budget_status": "• **Budget Status:**\n  Spent: `${spent_usd:.4f}`\n  Limit: `${total_budget:.2f}`\n  Remaining: `${rem:.4f}`\n\n• **System Environment:**\n  Branch: `{branch}`\n  BG Thoughts: `{bg_status}`",
+    "budget_unbounded": "unbounded",
+    "bg_active_label": "ACTIVE",
+    "bg_sleeping_label": "SLEEPING",
+    "btn_settings": "⚙️ Settings",
+    "settings_title": "⚙️ **Telegram Settings**\nConfigure the Telegram control panel and message display:",
+    "btn_silent_on": "🔕 Silent Mode: ON",
+    "btn_silent_off": "🔔 Silent Mode: OFF",
+    "silent_toggled_on": "🔕 Silent mode enabled — new thoughts will replace the last message",
+    "silent_toggled_off": "🔔 Silent mode disabled — each thought becomes a new message",
+    "cmd_menu": "Interactive panel",
+    "cmd_language": "Interface language",
+    "cmd_status": "Request status",
+    "cmd_help": "Usage guide",
+    "cmd_evolve": "Start an evolution campaign",
+    "cmd_bg": "Background consciousness on/off",
+    "cmd_review": "Run a self-review",
+    "cmd_restart": "Restart the agent",
+    "cmd_panic": "Emergency stop",
 }
+# Every line the bridge composes is English source here and translated by the install's
+# memory under the one interface language (lib/telegram_i18n.py); the skill ships no
+# dictionary, the light model fills the memory when a language is chosen.
+_LOCALIZED_TEXTS = Index("menu", _MENU_TEXTS_EN, "the Telegram bot's control panel: titles, buttons, notices, command descriptions")

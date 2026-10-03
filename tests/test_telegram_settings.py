@@ -154,9 +154,9 @@ def test_untrusted_settings_route_ignores_owner_but_saves_ordinary_fields(
     tmp_path: Path, host: str | None, marker: str
 ) -> None:
     plugin = _load_plugin()
-    merge_settings(tmp_path, {"TELEGRAM_CHAT_ID": "42", "TELEGRAM_LANGUAGE": "en"})
+    merge_settings(tmp_path, {"TELEGRAM_CHAT_ID": "42", "TELEGRAM_COMMAND_MODE": "full_access"})
     request = _RouteRequest(
-        {"TELEGRAM_CHAT_ID": "99", "TELEGRAM_LANGUAGE": "ru"},
+        {"TELEGRAM_CHAT_ID": "99", "TELEGRAM_COMMAND_MODE": "strict"},
         host=host,
         marker=marker,
     )
@@ -165,7 +165,7 @@ def test_untrusted_settings_route_ignores_owner_but_saves_ordinary_fields(
     assert response.status_code == 200
     assert body["ok"] is True and body["owner_ignored"] is True
     assert load_settings(tmp_path)["TELEGRAM_CHAT_ID"] == "42"
-    assert load_settings(tmp_path)["TELEGRAM_LANGUAGE"] == "ru"
+    assert load_settings(tmp_path)["TELEGRAM_COMMAND_MODE"] == "strict"
 
 
 def test_unmarked_loopback_route_may_change_and_reset_owner(tmp_path: Path) -> None:
@@ -262,7 +262,7 @@ def test_settings_route_returns_bounded_conflict_for_busy_store(tmp_path: Path, 
     monkeypatch.setattr(sys.modules[plugin._make_settings_save.__module__], "merge_settings", busy)
     response = asyncio.run(
         plugin._make_settings_save(_RouteApi(tmp_path))(
-            _RouteRequest({"TELEGRAM_LANGUAGE": "ru"})
+            _RouteRequest({"TELEGRAM_COMMAND_MODE": "strict"})
         )
     )
     assert response.status_code == 409
@@ -332,9 +332,12 @@ def test_proxy_form_is_masked_preserves_empty_and_explicitly_clears(tmp_path, ho
     assert load_settings(tmp_path)["TELEGRAM_PROXY"] == proxy
     hydrated = request(method="GET")
     assert b"TELEGRAM_PROXY" not in hydrated.body and b"proxy-secret" not in hydrated.body
-    assert request({"TELEGRAM_PROXY": "", "TELEGRAM_LANGUAGE": "ru"}).status_code == 200
+    assert request({"TELEGRAM_PROXY": "", "TELEGRAM_COMMAND_MODE": "strict"}).status_code == 200
     assert load_settings(tmp_path)["TELEGRAM_PROXY"] == proxy
-    assert load_settings(tmp_path)["TELEGRAM_LANGUAGE"] == "ru"
+    assert load_settings(tmp_path)["TELEGRAM_COMMAND_MODE"] == "strict"
+    # The language is the install's, not the bridge's: the form neither shows nor stores it.
+    assert request({"TELEGRAM_LANGUAGE": "ru"}).status_code == 200
+    assert "TELEGRAM_LANGUAGE" not in load_settings(tmp_path)
     refused = request({"TELEGRAM_PROXY": "socks5://owner:proxy-secret@bad-host"})
     assert refused.status_code == 400
     failure = json.loads(refused.body)

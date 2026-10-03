@@ -30,6 +30,7 @@ const RU = {
         [CODE_PREFIX + 'time.yesterday']: { text: 'Вчера' },
         [CODE_PREFIX + 'time.at']: { text: 'в' },
         'New task in {name}': { text: 'Новая задача в {name}' },
+        'Not started: the request was empty': { text: 'Не запущено: запрос пуст' },
     },
 };
 const EN = { language: '', english: true, revision: 0, entries: {} };
@@ -46,6 +47,8 @@ function englishReadings() {
             (key) => taskReasonPhrase(key)),
         question: questionPresentation({ quiz_state: 'open', owner_wait_state: 'waiting' }).status,
         pending: routingAnnotationText({ status: 'pending' }),
+        refused: routingAnnotationText({ status: 'refused', cause: 'Not started: the request was empty' }),
+        refusedUnknown: routingAnnotationText({ status: 'refused', cause: 'Not started: something new' }),
         steered: routingAnnotationText({ action: 'steer_task', status: 'delivered', target: 'abc' }),
         option: routingOptionLabel({ action: 'new_task_in_project', project_name: 'Docs' }),
         yesterday: formatMsgTime(yesterday.toISOString()),
@@ -65,6 +68,7 @@ test('in English every catalog reading is the source text and matches the twin f
     assert.equal(en.rawCode, 'no_such_cause_code');
     assert.equal(en.question, 'Waiting for your answer');
     assert.equal(en.pending, 'Choosing the right destination…');
+    assert.equal(en.refused, 'Not started: the request was empty');
     assert.equal(en.steered, 'Steered task · Task');
     assert.equal(en.option, 'New task in Docs');
     assert.equal(en.yesterday.short, 'Yesterday, 10:05');
@@ -89,6 +93,8 @@ test('an install language reads the same tables by code; what the memory lacks s
     ]);
     assert.equal(ru.question, 'Ждёт вашего ответа');
     assert.equal(ru.pending, 'Выбираю адресата…');
+    assert.equal(ru.refused, 'Не запущено: запрос пуст', 'a host-composed refusal the memory knows reads translated');
+    assert.equal(ru.refusedUnknown, 'Not started: something new', 'one it does not know stays English');
     assert.equal(ru.steered, 'Задача направлена · Задача');
     assert.equal(ru.option, 'Новая задача в Docs');
     assert.equal(ru.yesterday.short, 'Вчера, 10:05');

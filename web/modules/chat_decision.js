@@ -6,6 +6,7 @@ import { renderRoutingAnnotation, routingOptionLabel } from './chat_activity.js'
 import { nameProjectReference, projectReference } from './project_reference.js';
 import { ANSWERABLE_QUIZ_STATES, QUIZ_LIFECYCLE, questionPresentation, waitFacts } from './question_presentation.js';
 import { bindEnterSubmit } from './ui_interactions.js';
+import { fmt, tr, tx } from './i18n.js';
 
 const WAIT_FIELDS = ['wait_for_answer', 'wait_ended_at', 'owner_wait_state', 'owner_wait_resume_reason'];
 // What one observation of a question carries: its identity, lifecycle, recorded answer and wait facts.
@@ -836,16 +837,15 @@ export function createChatDecision({
                 setRoutingCardState(card,
                     body.state === 'open' ? 'open' : body.state,
                     Number.isInteger(body.answered_index) ? body.answered_index : null);
-                showToast(body.state === 'open'
-                    ? `Not routed: ${body.cause || body.reason || 'the destination refused this message'} — pick again.`
-                    : body.state === 'pending'
-                        ? 'Another choice is already being routed.'
-                        : 'This message was already routed.', 'error');
+                const cause = tx(body.cause || body.reason || tr('routing.refused_generic', 'the destination refused this message'));
+                showToast(body.state === 'open' ? fmt('Not routed: {cause} — pick again.', { cause })
+                    : body.state === 'pending' ? tr('routing.another_choice_in_flight', 'Another choice is already being routed.')
+                        : tr('routing.already_routed', 'This message was already routed.'), 'error');
                 return;
             }
-            showToast(`Could not route the message (${status || 'network error'}) — try again.`, 'error');
+            showToast(fmt('Could not route the message ({status}) — try again.', { status: status || tr('routing.network_error', 'network error') }), 'error');
         } catch (err) {
-            showToast('Could not route the message (network error) — try again.', 'error');
+            showToast(fmt('Could not route the message ({status}) — try again.', { status: tr('routing.network_error', 'network error') }), 'error');
         } finally {
             delete card.dataset.pending;
         }

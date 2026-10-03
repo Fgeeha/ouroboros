@@ -11,7 +11,7 @@ import { delegatedActivityBodyHtml, delegatedHeadline, delegatedLineView } from 
 import { joinMarkdownHeadings, MARKDOWN_FENCED_CODE } from './utils.js';
 import { REUSABLE_TASK_IDS } from './task_control_menu.js';
 import { apiFetch } from './api_client.js';
-import { currentLanguage, fmt, isEnglish, tr } from './i18n.js';
+import { currentLanguage, fmt, isEnglish, tr, tx } from './i18n.js';
 import {
     accountedUpperBound,
     accountedUpperBoundWithChildren,
@@ -1263,7 +1263,7 @@ export function routingAnnotationText(annotation) {
     // it outranks the status matrix below. Absent on scheduled/delivered/
     // pending rows and on the picker frame, so those labels are unchanged.
     const cause = String(annotation.cause || '').trim();
-    if (cause) return cause;
+    if (cause) return tx(cause);
     const action = String(annotation.action || '');
     const status = String(annotation.status || '');
     const target = String(annotation.target || '');

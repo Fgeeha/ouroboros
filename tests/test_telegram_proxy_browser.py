@@ -103,7 +103,7 @@ def test_actual_form_configures_edits_keeps_and_clears_proxy(direct_server_with_
             assert "synthetic-secret" not in page.content()
             current.screenshot(path=str(evidence / "telegram-proxy-configured.png"))
             # An ordinary unrelated Save does not clear a masked empty field.
-            current.locator('[name="TELEGRAM_LANGUAGE"]').select_option("ru")
+            current.locator('[name="TELEGRAM_COMMAND_MODE"]').select_option("strict")
             current.get_by_role("button", name="Save Telegram settings").click()
             expect(current.locator('[data-extension-settings-status]')).to_contain_text("Telegram settings saved.")
             assert json.loads(state.read_text(encoding="utf-8"))["TELEGRAM_PROXY"] == first

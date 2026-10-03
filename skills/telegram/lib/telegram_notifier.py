@@ -23,7 +23,11 @@ from .telegram_state import (
 )
 from ..scripts.telegram_settings import telegram_proxy
 from ouroboros.contracts.chat_id_policy import WEB_UI_CHAT_ID, is_project_chat_id
+from ouroboros import i18n_memory as _memory
 from ouroboros.project_dialogue import OUTCOME_PHASE_HEADLINE
+
+from . import telegram_i18n
+from .telegram_i18n import Index
 
 
 def _notify_enabled(settings: Dict[str, Any], key: str) -> bool:
@@ -110,8 +114,7 @@ async def _check_budget_notify(
     notified = int(state.get("budget_threshold") or 0)
     delivered = False
     if crossed > notified:
-        msg = (f"⚠️ Бюджет: {pct:.0f}% (${spent:.2f} / ${total:.2f})" if lang == "ru"
-               else f"⚠️ Budget: {pct:.0f}% (${spent:.2f} / ${total:.2f})")
+        msg = _NOTIFY[lang]["budget"].format(pct=f"{pct:.0f}", spent=f"{spent:.2f}", total=f"{total:.2f}")
         outcome, exc = await _push_notification(api, chat_id, msg, trust_env=trust_env)
         if outcome == "transient":
             return exc, False
@@ -158,12 +161,25 @@ def _summary_ids_in_tail(api, limit: int = 200) -> list:
 # can never mean one thing on the card and another on a phone. ``working`` is excluded
 # on purpose — a pre-finalization row is not a finish, and its absence is what makes the
 # legacy axes fallback below fire.
-_PHASE_WORDS = {
-    "en": {phase: word.lower() for phase, word in OUTCOME_PHASE_HEADLINE.items()
-           if phase != "working"},
-    "ru": {"done": "готова", "warn": "готова с предупреждениями",
-           "error": "ошибка", "cancelled": "отменена"},
-}
+_PHASE_WORDS = {phase: word.lower() for phase, word in OUTCOME_PHASE_HEADLINE.items() if phase != "working"}
+
+
+def _phase_word(phase: str, lang: str) -> str:
+    """The lowercase status word in the install language: the host's own headline table
+    read by code through the translation memory (the same entry the web card paints)."""
+    source = OUTCOME_PHASE_HEADLINE.get(phase) or OUTCOME_PHASE_HEADLINE["done"]
+    if telegram_i18n.english(lang):
+        return source.lower()
+    found = _memory.tr(f"{_memory.CODE_PREFIX}task.headline.{phase}", lang, source, drive_root=telegram_i18n.drive_root())
+    return str(found or source).lower()
+
+
+# The two push lines this transport composes itself; everything else it relays is the
+# host's own sentence (``telegram_i18n.phrase``).
+_NOTIFY = Index("notify", {
+    "task_finished": "{icon} Task {id} {word}{tail}",
+    "budget": "⚠️ Budget: {pct}% (${spent} / ${total})",
+}, "push notifications about finished tasks and the budget")
 _PHASE_ICONS = {"done": "✅", "warn": "⚠️", "error": "❌", "cancelled": "🚫"}
 
 # A finish that is not clean always reaches the owner's phone. Telegram's text bridge is
@@ -238,22 +254,21 @@ async def _check_tasks_notify(
         # cancelled task is never announced as "done". Legacy rows and
         # pre-finalization "working" rows keep the axes rule.
         phase = str(e.get("outcome_phase") or "")
-        words = _PHASE_WORDS["ru" if lang == "ru" else "en"]
-        if phase in words:
-            icon, word = _PHASE_ICONS[phase], words[phase]
+        if phase in _PHASE_WORDS:
+            icon, word = _PHASE_ICONS[phase], _phase_word(phase, lang)
         else:
             healthy = outcome in ("", "completed", "done") and not degraded
-            icon, word = ("✅" if healthy else "⚠️"), words["done"]
+            icon, word = ("✅" if healthy else "⚠️"), _phase_word("done", lang)
             if outcome and outcome not in ("completed", "done"):
                 parts.append(outcome)
         tail = (" · " + " · ".join(parts)) if parts else ""
-        msg = (f"{icon} Задача {tid[:8]} {word}{tail}" if lang == "ru" else f"{icon} Task {tid[:8]} {word}{tail}")
+        msg = _NOTIFY[lang]["task_finished"].format(icon=icon, id=tid[:8], word=word, tail=tail)
         # The card's reason line, exactly as the host composed it for this task's
         # durable row — never a second sentence written here, and never a second
-        # rendering of the cause table.
+        # rendering of the cause table; the memory may know the sentence's translation.
         reason = str(e.get("reason_detail") or "").strip()
         if reason:
-            msg += "\n" + reason
+            msg += "\n" + telegram_i18n.phrase(reason, lang)
         send_outcome, exc = await _push_notification(api, chat_id, msg, trust_env=trust_env)
         if send_outcome == "transient":
             # Stop the batch on the first transient failure: every further

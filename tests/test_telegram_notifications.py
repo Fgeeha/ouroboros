@@ -161,10 +161,12 @@ def test_phase_words_are_derived_from_the_host_headline_table():
     from ouroboros.project_dialogue import OUTCOME_PHASE_HEADLINE
 
     nt = _load()
-    assert nt._PHASE_WORDS["en"] == {
+    assert nt._PHASE_WORDS == {
         phase: word.lower() for phase, word in OUTCOME_PHASE_HEADLINE.items() if phase != "working"}
-    assert "working" not in nt._PHASE_WORDS["en"]
-    assert nt._PHASE_WORDS["en"]["warn"] == "done with warnings"
+    assert "working" not in nt._PHASE_WORDS
+    assert nt._PHASE_WORDS["warn"] == "done with warnings"
+    # Another language reads the SAME headline table by code through the install's memory.
+    assert nt._phase_word("warn", "") == "done with warnings"
 
 
 def test_enabling_task_notifications_later_never_blasts_the_backlog(tmp_path, monkeypatch):
@@ -763,6 +765,17 @@ def test_tasks_notify_word_and_icon_follow_the_host_phase(tmp_path, monkeypatch)
         "⚠️ Task odd1 done · failed",  # unknown phase: the legacy axes rule
     ]
     _Rec.sent = []
+    # Russian is not a second table: the install's translation memory holds the push
+    # template and the host's headline words, written by the generator or an import.
+    from ouroboros import i18n_memory as memory
+
+    nt.telegram_i18n.configure(data)
+    monkeypatch.setenv("OUROBOROS_UI_LANGUAGE", "ru")
+    memory.update_memory(data, "ru", lambda doc: (memory.apply_generated(doc, {
+        "code:tg.notify.task_finished": {"text": "{icon} Задача {id} {word}{tail}"},
+        "code:task.headline.error": {"text": "Ошибка"}, "code:task.headline.cancelled": {"text": "Отменена"},
+        "code:task.headline.warn": {"text": "Готова с предупреждениями"}, "code:task.headline.done": {"text": "Готова"},
+    }, model="test"), doc)[1], create=True)
     asyncio.run(nt._check_tasks_notify(api, {"TELEGRAM_NOTIFY_TASKS": "on"}, 42, {"notified_task_ids": []}, "ru"))
     assert [text for _chat, text in _Rec.sent] == [
         "❌ Задача fail1 ошибка · 3r",
