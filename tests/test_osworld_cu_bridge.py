@@ -16,6 +16,12 @@ import pytest
 
 from devtools.benchmarks.common.model_slots import pin_single_model
 from devtools.benchmarks.osworld import run_cu_bridge_agent as rcb
+from devtools.benchmarks.osworld import (
+    cu_bridge_budget,
+    cu_bridge_gate,
+    cu_bridge_runtime,
+    cu_bridge_tool_policy,
+)
 from ouroboros.extension_loader import extension_surface_name
 
 
@@ -26,6 +32,22 @@ def _cu_actor_settings():
     settings = {}
     pin_single_model(_CU_ACTOR_MODEL, target=settings)
     return settings
+
+
+# The cu_bridge runner has owner leaves. A seam like
+# `_api` is now owned by one module and bound by name in the others, so a patch
+# that reached only `rcb` would silently miss the leaf that actually calls it.
+_CU_BRIDGE_MODULES = (
+    rcb, cu_bridge_runtime, cu_bridge_tool_policy, cu_bridge_gate, cu_bridge_budget,
+)
+
+
+def _patch_bridge_seam(monkeypatch, name, value):
+    """Patch a cu_bridge seam on EVERY module that binds it."""
+    bound = [module for module in _CU_BRIDGE_MODULES if hasattr(module, name)]
+    assert bound, name
+    for module in bound:
+        monkeypatch.setattr(module, name, value)
 
 
 def test_infeasible_checks_final_answer_fields_only():
@@ -979,7 +1001,7 @@ def _cu_bridge_stubs(monkeypatch, tmp_path, *, reward=1.0):
             return {"task_id": "t1"}
         return {"status": "completed", "final_answer": "done"}
 
-    monkeypatch.setattr(rcb, "_api", _api)
+    _patch_bridge_seam(monkeypatch, "_api", _api)
     return rcb, env
 
 
@@ -1786,7 +1808,7 @@ def test_gate_round_posts_a_fresh_memory_gate_phase_task_and_reads_the_verdict(m
                     "total_rounds": 4}
         raise AssertionError((method, path))
 
-    monkeypatch.setattr(rcb, "_api", fake_api)
+    _patch_bridge_seam(monkeypatch, "_api", fake_api)
     args = _GateArgs(feasibility_gate=True, task_timeout_sec=3600)
     args.allow_a11y = False
     args.ouroboros_url = "http://127.0.0.1:1"
@@ -2030,7 +2052,7 @@ def test_audit_reads_policy_turns_not_physical_calls():
                                   5, 0)["audited"] is False
 
 
-def test_gate_turns_are_enforced_per_task_from_the_live_event_log(tmp_path):
+def test_gate_turns_are_enforced_per_task_from_the_live_event_log(tmp_path, monkeypatch):
     """The runtime round cap is SERVER-wide and the gate is a separate task, so a
     reserve that is only arithmetic lets the gate consume the worker's allowance.
 
@@ -2069,14 +2091,14 @@ def test_gate_turns_are_enforced_per_task_from_the_live_event_log(tmp_path):
         _write_rounds(3 if polls["n"] < 2 else rcb._GATE_TURN_RESERVE)
         return {"status": "running"}
 
-    orig_api, orig_sleep = rcb._api, rcb.time.sleep
-    rcb._api = fake_api
+    orig_sleep = rcb.time.sleep
+    _patch_bridge_seam(monkeypatch, "_api", fake_api)
     rcb.time.sleep = lambda s: None
     try:
         out = rcb._await_gate_task("http://x", task_id, time.time() + 3600,
                                    turn_budget=rcb._GATE_TURN_RESERVE, data_dir=tmp_path)
     finally:
-        rcb._api, rcb.time.sleep = orig_api, orig_sleep
+        rcb.time.sleep = orig_sleep
 
     assert out["status"] == "turn_budget_exhausted"
     assert out["policy_turns"] == rcb._GATE_TURN_RESERVE
