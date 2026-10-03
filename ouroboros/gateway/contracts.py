@@ -909,6 +909,13 @@ class UiPreferencesResponse(TypedDict):
     welcome: dict[str, str]  # install-wide empty-Main UI copy: mode default|hidden|custom and plain text
 
 
+class DesktopAutostartResponse(TypedDict):
+    """GET/POST /api/desktop/autostart: the host's sign-in registration as its OS reports it."""
+
+    state: Literal["unavailable", "off", "on", "other_copy", "disabled_by_os"]
+    reason: NotRequired[str]  # present only when unavailable
+
+
 class GitLogResponse(TypedDict):
     commits: list[Dict[str, Any]]
     # Tag rows: {tag, date, sha (peeled commit), message} — the mirror said ``list[str]`` while ``list_versions``
