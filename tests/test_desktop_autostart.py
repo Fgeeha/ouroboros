@@ -165,15 +165,26 @@ def test_linux_browser_fallback_still_configures_the_packaged_host(host, monkeyp
     assert startup.autostart_status(True)["state"] == "on"
 
 
-@pytest.mark.parametrize("version", ["7.1.9", "", "unknown", "7.2.0-rc.1"])
-def test_old_or_unproven_launcher_cannot_register(host, monkeypatch, version):
+@pytest.mark.parametrize(("version", "reason"), [
+    ("7.1.9", "newer app build"), ("v7.1.12-rc.3", "newer app build"),
+    ("", "could not be confirmed"), ("unknown", "could not be confirmed"), ("7.2", "could not be confirmed"),
+])
+def test_old_or_unproven_launcher_cannot_register(host, monkeypatch, version, reason):
     package, os_state = host
     package("darwin")
     monkeypatch.setenv("OUROBOROS_APP_VERSION", version)
     for enable in (None, True, False):
         status = startup.autostart_status(enable)
-        assert status["state"] == "unavailable" and "newer app build" in status["reason"]
+        assert status["state"] == "unavailable" and reason in status["reason"]
     assert os_state.calls == []
+
+
+@pytest.mark.parametrize("version", ["7.2.0", "7.2.0-rc.1", "v7.10.0-rc.2"])
+def test_a_prerelease_suffix_does_not_make_a_new_launcher_old(host, monkeypatch, version):
+    package, _ = host
+    package("darwin")
+    monkeypatch.setenv("OUROBOROS_APP_VERSION", version)
+    assert startup.autostart_status() == {"state": "off"}
 
 
 @pytest.mark.parametrize("kind", ["source_launcher", "source_server", "unstable_macos", "missing_appimage"])

@@ -53,11 +53,11 @@ def launcher_target() -> tuple[Path | None, str]:
             return None, "Open Ouroboros from its stable AppImage file first."
     if exe is None or not exe.is_absolute() or not exe.is_file():
         return None, "Available only when the host runs the packaged desktop app."
-    try:
-        version = tuple(int(part) for part in os.environ.get("OUROBOROS_APP_VERSION", "").lstrip("v").split("."))
-    except ValueError:
-        version = ()
-    if len(version) != 3 or version < (7, 2, 0):
+    # The release triple decides; a pre-release suffix (`7.6.0-rc.1`) does not make a build old.
+    release = re.match(r"v?(\d+)\.(\d+)\.(\d+)", os.environ.get("OUROBOROS_APP_VERSION", "").strip())
+    if release is None:
+        return None, "This app build's version could not be confirmed; sign-in startup needs 7.2.0 or later."
+    if tuple(map(int, release.groups())) < (7, 2, 0):
         return None, "Sign-in startup needs a newer app build (7.2.0 or later)."
     return exe, ""
 
