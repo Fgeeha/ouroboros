@@ -11,6 +11,7 @@ import {
     createStateSnapshotSequencer,
     isForegroundLiveCard,
     routingAnnotationText,
+    unkeyedFrameEndsTurn,
 } from '../modules/chat_activity.js';
 
 const chatSource = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
@@ -26,7 +27,7 @@ test('review-only owner anchors do not advertise foreground task activity', () =
 test('unkeyed terminal incidents do not clear unrelated live turns', () => {
     // The cleanup guard also requires positive terminal evidence. Keep this
     // source contract resilient to the guard's explicit conjunction while
-    // still checking the incident carve-out below it.
+    // still checking the carve-out below it (the typed kinds that end nothing).
     const cleanupStart = chatSource.indexOf('if (!finalizing && (!explicitTaskId || typedTerminal))');
     const finalCleanup = chatSource.slice(
         cleanupStart,
@@ -34,11 +35,25 @@ test('unkeyed terminal incidents do not clear unrelated live turns', () => {
     );
     assert.match(
         finalCleanup,
-        /} else if \(msg\.system_type !== 'terminal_incident'\) \{[^}]*?activeDirectActivities\.clear\(\);[^}]*?pendingSubmissions\.clear\(\);\s*}\s*}/,
+        /} else if \(unkeyedFrameEndsTurn\(msg\)\) \{[^}]*?activeDirectActivities\.clear\(\);[^}]*?pendingSubmissions\.clear\(\);\s*}\s*}/,
     );
     // Ordinary unkeyed finals retain their existing global cleanup semantics.
     assert.match(finalCleanup, /activeDirectActivities\.clear\(\);/);
     assert.match(finalCleanup, /pendingSubmissions\.clear\(\);/);
+});
+
+test('a note or skill notice arriving mid-turn keeps Thinking/Sending; an ordinary unkeyed final still ends it', () => {
+    // What the live handler does with the unscoped turn for each frame (the branch pinned above).
+    const turn = { isConnected: true, hasActiveLiveCard: false, activeDirectCount: 1, pendingSubmissionsCount: 1 };
+    const after = (frame) => computeDerivedChatStatus(unkeyedFrameEndsTurn(frame)
+        ? { ...turn, activeDirectCount: 0, pendingSubmissionsCount: 0 } : turn).text;
+    for (const kind of ['reminder', 'skill_notice', 'terminal_incident']) {
+        assert.equal(after({ role: 'system', system_type: kind, task_id: '', content: 'Call mother' }), 'Thinking...', kind);
+    }
+    assert.equal(after({ role: 'assistant', task_id: '', content: 'Done.' }), 'Online');
+    assert.equal(after({ role: 'system', system_type: 'startup_notice', task_id: '' }), 'Online');
+    // The kind decides, never the words: a reply that quotes a reminder still ends the turn.
+    assert.equal(after({ role: 'assistant', task_id: '', content: 'Reminder · Ouroboros · written Oct 3 14:05' }), 'Online');
 });
 
 test('routing receipts display the event-time label while keeping raw target metadata', () => {
