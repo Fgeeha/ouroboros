@@ -394,7 +394,10 @@ class TestForwardToWorkerTool(unittest.TestCase):
             [row] = drain_owner_entries(sib_drive, "sib")
             self.assertEqual(row["relation"], "sibling")
 
-    def test_a_siblings_child_and_another_root_are_forbidden(self):
+    def test_a_siblings_child_is_a_tree_peer_and_another_root_stays_forbidden(self):
+        """A nephew shares the caller's root: admitted as context-only ``peer_task`` with
+        the stamped relation ``tree`` (the blackboard's own scope). The same parent id
+        under another root is still no peer at all."""
         from ouroboros.owner_mailbox import drain_owner_entries
         from ouroboros.tools.core import _forward_to_worker
 
@@ -402,17 +405,140 @@ class TestForwardToWorkerTool(unittest.TestCase):
             canonical, _ = self._peer_tree(tmp)
             ctx = self._caller(canonical)
 
-            nephew = _forward_to_worker(ctx, "nephew", "a sibling's child is no peer of mine")
+            nephew = _forward_to_worker(ctx, "nephew", "a sibling's child shares my tree")
             stranger = _forward_to_worker(ctx, "stranger", "same parent id, other root")
             sibling = _forward_to_worker(ctx, "sib2", "same parent, same root")
 
-            for refused in (nephew, stranger):
-                self.assertIn("TASK_FORBIDDEN", refused)
-                self.assertIn("the parent nor a sibling", refused)
-                self.assertIn("nor an active independent root", refused)
-            self.assertIn("message from a peer task", sibling)
-            for task_id in ("nephew", "stranger"):
-                self.assertEqual(drain_owner_entries(canonical, task_id), [])
+            self.assertIn("message from a peer task", nephew)
+            self.assertIn("a task in your tree", nephew)
+            self.assertNotIn("independent", nephew)
+            [row] = drain_owner_entries(canonical, "nephew")
+            self.assertEqual((row["provenance"], row["relation"], row["source_task_id"]),
+                             ("peer_task", "tree", "me"))
+            self.assertIn("TASK_FORBIDDEN", stranger)
+            self.assertIn("the parent nor a sibling", stranger)
+            self.assertIn("sharing its root", stranger)
+            self.assertIn("nor an active independent root", stranger)
+            self.assertEqual(drain_owner_entries(canonical, "stranger"), [])
+            self.assertIn("your sibling", sibling)
+
+    @staticmethod
+    def _grandchild(canonical):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(drive_root=canonical, task_id="kid", task_metadata={
+            "parent_task_id": "me", "root_task_id": "root1", "budget_drive_root": str(canonical)})
+
+    def test_grandchild_reaches_its_root_as_a_tree_peer_under_the_strict_cancel_read(self):
+        """On a live install a grandchild's message to its own root rode the host-listed-roots
+        path as ``independent_task`` (mislabelled, fail-soft cancel read). It is a tree peer:
+        context-only, labelled, and refused typed when the recipient's cancel state is unreadable."""
+        from ouroboros.owner_mailbox import drain_owner_entries
+        from ouroboros.tools.core import _forward_to_worker
+
+        with tempfile.TemporaryDirectory() as tmp:
+            canonical, _ = self._peer_tree(tmp)
+            out = _forward_to_worker(self._grandchild(canonical), "root1", "a grandchild's interim position")
+
+            self.assertIn("message from a peer task", out)
+            self.assertIn("a task in your tree", out)
+            self.assertNotIn("independent", out)
+            [row] = drain_owner_entries(canonical, "root1")
+            self.assertEqual((row["provenance"], row["relation"], row["source_task_id"]),
+                             ("peer_task", "tree", "kid"))
+
+            projection = canonical / "state" / "cancel_intents.json"
+            projection.parent.mkdir(parents=True, exist_ok=True)
+            projection.write_bytes(b'{"intents": [broken')
+            refused = _forward_to_worker(self._grandchild(canonical), "root1", "second position")
+            self.assertIn("TASK_CANCEL_STATE_UNAVAILABLE", refused)
+            self.assertIn("NOT written", refused)
+            self.assertNotIn("second position", [r["text"] for r in drain_owner_entries(canonical, "root1")])
+
+    def test_continuation_root_without_a_parent_reaches_its_predecessors_child(self):
+        """A continuation root carries its predecessor's root label and has no parent (the
+        one refusal observed live, 2026-09-28): same tree, admitted as ``tree``; another
+        root stays refused."""
+        from types import SimpleNamespace
+        from ouroboros.owner_mailbox import drain_owner_entries
+        from ouroboros.task_results import STATUS_RUNNING, write_task_result
+        from ouroboros.tools.core import _forward_to_worker
+
+        with tempfile.TemporaryDirectory() as tmp:
+            canonical, sib_drive = self._peer_tree(tmp)
+            write_task_result(canonical, "cont", STATUS_RUNNING, root_task_id="root1", result="running")
+            ctx = SimpleNamespace(drive_root=canonical, task_id="cont",
+                                  task_metadata={"root_task_id": "root1", "budget_drive_root": str(canonical)})
+
+            out = _forward_to_worker(ctx, "sib", "the predecessor's child hears its successor")
+            stranger = _forward_to_worker(ctx, "stranger", "other root")
+
+            self.assertIn("a task in your tree", out)
+            [row] = drain_owner_entries(sib_drive, "sib")
+            self.assertEqual((row["provenance"], row["relation"], row["source_task_id"]),
+                             ("peer_task", "tree", "cont"))
+            self.assertIn("TASK_FORBIDDEN", stranger)
+            self.assertEqual(drain_owner_entries(canonical, "stranger"), [])
+
+    def test_grandchild_reaches_a_root_without_a_root_carrier_but_no_sibling_root_is_inferred(self):
+        from types import SimpleNamespace
+        from ouroboros.owner_mailbox import drain_owner_entries
+        from ouroboros.task_results import STATUS_RUNNING, write_task_result
+        from ouroboros.tools.core import _forward_to_worker
+
+        with tempfile.TemporaryDirectory() as tmp:
+            canonical = pathlib.Path(tmp) / "canonical"
+            write_task_result(canonical, "root0", STATUS_RUNNING, root_task_id=None, _is_direct_chat=True, result="running")
+            write_task_result(canonical, "c0", STATUS_RUNNING, parent_task_id="root0", root_task_id="root0", result="running")
+            write_task_result(canonical, "g0", STATUS_RUNNING, parent_task_id="c0", root_task_id="root0", result="running")
+            # A sibling of c0 whose root carrier is missing: its root is never inferred.
+            write_task_result(canonical, "s0", STATUS_RUNNING, parent_task_id="root0", result="running")
+            ctx = SimpleNamespace(drive_root=canonical, task_id="g0", task_metadata={
+                "parent_task_id": "c0", "root_task_id": "root0", "budget_drive_root": str(canonical)})
+
+            to_root = _forward_to_worker(ctx, "root0", "up two levels")
+            to_uncarried = _forward_to_worker(ctx, "s0", "a sibling root is never inferred")
+
+            self.assertIn("a task in your tree", to_root)
+            [row] = drain_owner_entries(canonical, "root0")
+            self.assertEqual((row["provenance"], row["relation"]), ("peer_task", "tree"))
+            self.assertIn("TASK_FORBIDDEN", to_uncarried)
+            self.assertEqual(drain_owner_entries(canonical, "s0"), [])
+
+    def test_relay_to_a_tree_peer_is_an_ancestor_only_act(self):
+        from ouroboros.owner_mailbox import drain_owner_entries
+        from ouroboros.tools.core import _forward_to_worker
+
+        with tempfile.TemporaryDirectory() as tmp:
+            canonical, _ = self._peer_tree(tmp)
+            refused = _forward_to_worker(self._caller(canonical), "nephew", "relayed", relayed_from_task_id="kid")
+
+            self.assertIn("TASK_FORBIDDEN", refused)
+            self.assertIn("ancestor-only act", refused)
+            self.assertIn("a task in your tree", refused)
+            self.assertEqual(drain_owner_entries(canonical, "nephew"), [])
+
+    def test_a_presence_root_reached_from_its_tree_keeps_the_execution_observation(self):
+        """The roster path put the Presence root's shared observation on the receipt; a
+        sender inside its tree keeps it (persistence proof, not a read). An ordinary peer
+        receipt carries none."""
+        from ouroboros.task_results import STATUS_RUNNING, write_task_result
+        from ouroboros.tools.core import _forward_to_worker
+
+        with tempfile.TemporaryDirectory() as tmp:
+            canonical, _ = self._peer_tree(tmp)
+            # The observation is derived by the effective reader from the Presence record
+            # (a direct-chat row whose metadata carries the presence binding), never stored.
+            write_task_result(canonical, "root1", STATUS_RUNNING, root_task_id="root1", result="running",
+                              _is_direct_chat=True, metadata={"source": "presence", "presence": {"room": "r"}})
+
+            observed = _forward_to_worker(self._grandchild(canonical), "root1", "to the presence root")
+            plain = _forward_to_worker(self._caller(canonical), "sib", "an ordinary peer")
+
+            self.assertIn("a task in your tree", observed)
+            self.assertIn("execution_observation=", observed)
+            self.assertIn('"kind": "presence"', observed)
+            self.assertNotIn("execution_observation", plain)
 
     def test_relay_on_the_peer_branch_is_forbidden(self):
         from ouroboros.owner_mailbox import drain_owner_entries

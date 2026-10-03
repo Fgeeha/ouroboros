@@ -1126,11 +1126,13 @@ def _forward_to_worker(
     ctx: ToolContext, task_id: str, message: str, relayed_from_task_id: str = "",
 ) -> str:
     """Write task context to the recipient's mailbox, never owner text.
-    Descendants receive ancestor/relayed context; parent/sibling contributions
-    retain their relation. Listed roots and inline Presence receive independent
-    task context. Receipts prove persistence, not a read, in the recipient's drive."""
+    Descendants receive ancestor/relayed context; contributions inside one tree
+    (parent, sibling, any task sharing the root) retain their relation. Listed
+    roots and inline Presence receive independent task context. Receipts prove
+    persistence, not a read, in the recipient's drive."""
     from ouroboros.owner_mailbox import (
-        PROVENANCE_INDEPENDENT_TASK, PROVENANCE_PEER_TASK, TASK_MESSAGE_MAX_CHARS, write_task_message,
+        PEER_RELATION_LABELS, PROVENANCE_INDEPENDENT_TASK, PROVENANCE_PEER_TASK, TASK_MESSAGE_MAX_CHARS,
+        write_task_message,
     )
     from ouroboros.peer_roster import (
         durable_descendant_of, independent_message_target, peer_contribution_admission,
@@ -1181,9 +1183,10 @@ def _forward_to_worker(
     relation = ""
     listed_root = None
     if not durable_descendant_of(status_drive_root, tid, data, current_task_id):
-        # A peer inside the tree (the caller's parent or sibling) before the host
-        # roster; its typed admission (relay refused, cancel state read strictly)
-        # lives beside the roster's other addressability rules in peer_roster.
+        # A peer inside the tree (the caller's parent, a sibling, or any task sharing
+        # its root) before the host roster; its typed admission (relay refused, cancel
+        # state read strictly) lives beside the roster's other addressability rules
+        # in peer_roster.
         relation, refusal = peer_contribution_admission(
             status_drive_root, current_task_id, metadata, tid, data, relayed_from=relayed_from)
         if refusal is not None:
@@ -1193,8 +1196,9 @@ def _forward_to_worker(
         else:
             listed_root = independent_message_target(status_drive_root, tid, data)
             if listed_root is None:
-                return (f"⚠️ TASK_FORBIDDEN: task {tid} is neither a descendant, the parent nor a sibling "
-                        "of the current task, nor an active independent root the host lists or an inline Presence mailbox.")
+                return (f"⚠️ TASK_FORBIDDEN: task {tid} is neither a descendant of the current task, nor a task "
+                        "in its tree (the parent nor a sibling nor any task sharing its root), nor an active "
+                        "independent root the host lists or an inline Presence mailbox.")
             if relayed_from:
                 return f"⚠️ TASK_FORBIDDEN: a relayed message reaches only your own descendants; task {tid} is an independent recipient."
             provenance = PROVENANCE_INDEPENDENT_TASK
@@ -1247,17 +1251,23 @@ def _forward_to_worker(
                 "(independent_task, never owner text). This proves persistence, not that its model read it; "
                 "if the turn continues, its checkpoint can read it. "
                 f"execution_observation={observation}. Files cannot be attached to messages between tasks.")
+    # A Presence root reached from inside its own tree keeps the shared execution
+    # observation on the receipt (persistence proof, not a read), as the roster path gives it.
+    presence = data.get("execution_observation") if provenance == PROVENANCE_PEER_TASK else None
+    observed = (f" execution_observation={json.dumps(presence, ensure_ascii=False, sort_keys=True)}."
+                if isinstance(presence, dict) and presence.get("kind") == "presence" else "")
+    as_peer = PEER_RELATION_LABELS.get(relation, {}).get("receipt") or relation
     if receipt == MAIL_QUEUED:
-        as_from = (f" as a message from a peer task (your {relation}; never owner text or an ancestor's steering)"
+        as_from = (f" as a message from a peer task ({as_peer}; never owner text or an ancestor's steering)"
                    if provenance == PROVENANCE_PEER_TASK else " as a message from this task (never owner text)"
                    if listed_root is not None else "")
         return (f"Message forwarded to task {tid}: written to its mailbox{as_from} ({MAIL_QUEUED}); task {tid} has not "
                 "started, so nothing has read it: it reads it when it starts, and if it ends unstarted its result keeps "
-                "it as unread mail. Files cannot be attached to messages between tasks.")
+                f"it as unread mail.{observed} Files cannot be attached to messages between tasks.")
     if provenance == PROVENANCE_PEER_TASK:
         return (f"Message forwarded to task {tid}: written to its mailbox as a message from a peer task "
-                f"(your {relation}; never owner text or an ancestor's steering); it reads it at its next "
-                "checkpoint. Files cannot be attached to messages between tasks.")
+                f"({as_peer}; never owner text or an ancestor's steering); it reads it at its next "
+                f"checkpoint.{observed} Files cannot be attached to messages between tasks.")
     if listed_root is not None:
         return (f"Message forwarded to task {tid}: written to its mailbox as a message from this task "
                 "(never owner text); it reads it at its next checkpoint. Files cannot be attached to messages between tasks.")
