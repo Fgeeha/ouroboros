@@ -1368,6 +1368,8 @@ engineering rules; no second policy list may exist.
 never *look, I am still working*. It exists so the owner can leave the window
 and still be reached by a question or a finished task.
 
+**Startup & background.** Settings → Behavior owns host lifecycle choices, separate from the client-local Appearance controls. Sign-in startup is off until the owner opts in and always names the computer running Ouroboros, even in a remote client. OS registration is the truth: another copy, an OS-disabled entry and an unavailable app build remain visible rather than becoming a saved-settings guess. Automatic startup preserves Panic stops and saved pauses; an explicit owner start releases Panic. Closing the desktop window still exits; keeping it running after close has no control yet. Android deliberately keeps its existing automatic boot entry by default, with the same Panic-preservation contract.
+
 **When the client runs.** Notifications are a property of a running client. This
 version adds no tray agent, no background process and no push channel, so
 closing Ouroboros ends them. The existing Telegram bridge remains the separate

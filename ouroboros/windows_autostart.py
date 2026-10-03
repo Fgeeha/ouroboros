@@ -24,7 +24,7 @@ from typing import Any, Literal, Optional
 
 from ouroboros.platform_layer import BUNDLE_DIR_ENV, IS_WINDOWS
 
-AutostartState = Literal["unavailable", "off", "on", "other_copy", "disabled_in_windows"]
+AutostartState = Literal["unavailable", "off", "on", "other_copy", "disabled_by_os"]
 
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 APPROVED_KEY = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
@@ -96,7 +96,7 @@ def autostart_state() -> AutostartState:
         return "other_copy"
     switch = _read_value(APPROVED_KEY)
     if isinstance(switch, bytes) and switch[:1] and switch[0] & 1:
-        return "disabled_in_windows"
+        return "disabled_by_os"
     return "on"
 
 

@@ -25,10 +25,10 @@ The manifest is the SSOT of the module→domain assignment (1:1, complete over t
 | D15 | Memory, knowledge, consciousness & self-evolution | 23 | 0 |
 | D16 | Observability, usage accounting & cost | 15 | 0 |
 | D17 | Projects, workspaces & task results | 27 | 0 |
-| D18 | Launcher, packaging, platform & shared substrate | 16 | 0 |
+| D18 | Launcher, packaging, platform & shared substrate | 17 | 0 |
 | D19 | Frozen contracts (ABI) | 10 | 0 |
 | D20 | Presence | 10 | 0 |
-| **total** | | **618** | **0** |
+| **total** | | **619** | **0** |
 
 ## Dependency direction matrix (strict, pinned)
 
@@ -826,6 +826,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `launcher.py`
 - `ouroboros/__init__.py`
 - `ouroboros/cli.py`
+- `ouroboros/desktop_autostart.py`
 - `ouroboros/jsonl_tail.py`
 - `ouroboros/launcher_bootstrap.py`
 - `ouroboros/launcher_server_reaper.py`

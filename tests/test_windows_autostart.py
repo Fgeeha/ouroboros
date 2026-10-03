@@ -9,23 +9,14 @@ from __future__ import annotations
 import json
 import pathlib
 import sys
+from contextlib import nullcontext
+from types import SimpleNamespace
 
 import pytest
 from starlette.applications import Starlette
 
-from ouroboros import windows_autostart as autostart
+from ouroboros import desktop_autostart, windows_autostart as autostart
 from ouroboros.gateway.router import collect_routes
-
-
-class _Key:
-    def __init__(self, path: str):
-        self.path = path
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
 
 
 class _FakeWinreg:
@@ -41,24 +32,24 @@ class _FakeWinreg:
         assert root == self.HKEY_CURRENT_USER
         if path not in self.keys:
             raise FileNotFoundError(path)
-        return _Key(path)
+        return nullcontext(path)
 
     def CreateKeyEx(self, root, path, reserved=0, access=0):
         assert root == self.HKEY_CURRENT_USER
         self.keys.setdefault(path, {})
-        return _Key(path)
+        return nullcontext(path)
 
     def QueryValueEx(self, key, name):
-        values = self.keys[key.path]
+        values = self.keys[key]
         if name not in values:
             raise FileNotFoundError(name)
         return values[name]
 
     def SetValueEx(self, key, name, reserved, kind, value):
-        self.keys[key.path][name] = (value, kind)
+        self.keys[key][name] = (value, kind)
 
     def DeleteValue(self, key, name):
-        values = self.keys[key.path]
+        values = self.keys[key]
         if name not in values:
             raise FileNotFoundError(name)
         del values[name]
@@ -72,6 +63,9 @@ def registry(monkeypatch):
     fake = _FakeWinreg()
     monkeypatch.setitem(sys.modules, "winreg", fake)
     monkeypatch.setattr(autostart, "IS_WINDOWS", True)
+    monkeypatch.setattr(desktop_autostart, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setenv("OUROBOROS_MANAGED_BY_LAUNCHER", "1")
+    monkeypatch.setenv("OUROBOROS_APP_VERSION", "7.2.0")
     monkeypatch.delenv("OUROBOROS_PRESENTATION", raising=False)
     monkeypatch.delenv("OUROBOROS_BUNDLE_DIR", raising=False)
     return fake
@@ -125,7 +119,7 @@ def test_turning_on_writes_the_quoted_launcher_and_off_removes_it(packaged, regi
 def test_windows_startup_apps_switch_is_reported_and_cleared(packaged, registry):
     autostart.set_autostart(True)
     registry.keys.setdefault(autostart.APPROVED_KEY, {})[autostart.VALUE_NAME] = _approved(0x03)
-    assert autostart.autostart_state() == "disabled_in_windows"
+    assert autostart.autostart_state() == "disabled_by_os"
     registry.keys[autostart.APPROVED_KEY][autostart.VALUE_NAME] = _approved(0x02)
     assert autostart.autostart_state() == "on"
     registry.keys[autostart.APPROVED_KEY][autostart.VALUE_NAME] = _approved(0x07)
@@ -174,10 +168,13 @@ def test_the_toggle_never_enters_the_settings_draft():
     """Like the notification block: no `s-` field, and edits never mark the server draft dirty."""
     root = pathlib.Path(__file__).resolve().parents[1]
     markup = (root / "web" / "modules" / "settings_ui.js").read_text(encoding="utf-8")
-    panel = markup[markup.index('data-settings-panel="appearance"'):]
+    panel = markup[markup.index('data-settings-panel="behavior"'):]
     panel = panel[:panel.index("</section>")]
-    assert "data-autostart-settings" in panel, "the block lives on the Appearance tab"
-    block = panel[panel.index("data-autostart-settings"):]
+    assert "data-autostart-settings" in panel, "the block lives on the Behavior tab"
+    block = panel[panel.index("data-autostart-settings"):panel.index("<h3>Reasoning Effort</h3>")]
+    assert "host computer" in block
+    assert "Startup &amp; background" in block
+    assert "data-autostart-settings" not in markup.split('data-settings-panel="appearance"')[1]
     for attribute in ('id="s-', 'name="s-'):
         assert attribute not in block
     settings = (root / "web" / "modules" / "settings.js").read_text(encoding="utf-8")
@@ -195,7 +192,7 @@ def client(tmp_path):
 
 
 def test_endpoints_report_unavailable_outside_the_packaged_desktop(registry, client):
-    assert client.get("/api/desktop/autostart").json() == {"state": "unavailable"}
+    assert client.get("/api/desktop/autostart").json()["state"] == "unavailable"
     response = client.post("/api/desktop/autostart", json={"enabled": True})
     assert response.status_code == 409
     assert registry.keys == {}

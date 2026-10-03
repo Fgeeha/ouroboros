@@ -1450,10 +1450,7 @@
  * @property {boolean=} ok
  */
 
-/**
- * @typedef {Object} DesktopAutostartResponse
- * @property {'unavailable'|'off'|'on'|'other_copy'|'disabled_in_windows'} state  // Windows sign-in entry of THIS packaged copy
- */
+/** @typedef {{state: 'unavailable'|'off'|'on'|'other_copy'|'disabled_by_os', reason?: string}} DesktopAutostartResponse Host registration and optional unavailability reason. */
 
 /**
  * @typedef {Object} UpdateMergePlan
@@ -1477,9 +1474,7 @@
  * @property {'auto_merge'|'assisted'=} recommended_strategy
  */
 
-/**
- * @typedef {Object} UpdatePreflightRequest
- */
+/** @typedef {Object} UpdatePreflightRequest */
 
 /**
  * @typedef {Object} UpdatePreflightResponse

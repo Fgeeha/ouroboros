@@ -1,18 +1,15 @@
 import { apiClient } from './api_client.js';
 import { setInlineStatus } from './ui_primitives.js';
 
-/* Start with Windows (Appearance tab). Not a server setting: the Windows sign-in
-   entry of the host running Ouroboros, applied on click — so, like the
-   notification block, no `s-` field and no part of the /api/settings draft.
-   Windows can change the entry too, so the block re-reads it whenever Settings
-   is shown. Only the states below reveal it; `unavailable` (every run except the
-   packaged Windows desktop copy) and anything unknown keep it hidden. */
+/* Host startup is an immediate OS edit, separate from the /api/settings draft.
+   Re-read when Settings opens: the OS can change the same registration. */
 
 const NOTES = {
+    unavailable: 'Sign-in startup is unavailable on this host.',
     on: '',
     off: '',
-    other_copy: 'Windows starts Ouroboros at sign-in from a different entry (another copy, or one set up by hand). Turn this on to start this copy instead.',
-    disabled_in_windows: 'Turned off in Windows Startup apps. Turn this on to start Ouroboros at sign-in again.',
+    other_copy: 'This host starts Ouroboros at sign-in from a different entry (another copy, or one set up by hand). Turn this on to start this copy instead.',
+    disabled_by_os: 'Turned off in the host operating system. Turn this on to enable it, or check the host’s startup settings if it stays disabled.',
 };
 
 export function bindAutostartControl(page) {
@@ -24,12 +21,12 @@ export function bindAutostartControl(page) {
     let busy = false;
     let generation = 0;
 
-    const paint = (state) => {
+    const paint = ({ state, reason }) => {
         const known = Object.hasOwn(NOTES, state);
         section.hidden = !known;
         box.checked = state === 'on';
-        box.disabled = false;
-        const note = known ? NOTES[state] : '';
+        box.disabled = state === 'unavailable';
+        const note = known ? (reason || NOTES[state]) : '';
         setInlineStatus(status, note, note ? 'warn' : 'muted');
     };
 
@@ -37,13 +34,13 @@ export function bindAutostartControl(page) {
         if (busy || destroyed) return;
         const current = ++generation;
         try {
-            const { state } = await apiClient.desktopAutostart();
-            if (!destroyed && !busy && current === generation) paint(state);
+            const snapshot = await apiClient.desktopAutostart();
+            if (!destroyed && !busy && current === generation) paint(snapshot);
         } catch (error) {
             // Availability unknown stays hidden; a visible block reports the failed read.
             if (destroyed || busy || current !== generation || section.hidden) return;
             box.disabled = true;
-            setInlineStatus(status, `Could not read the Windows startup entry: ${error.message}`, 'danger');
+            setInlineStatus(status, `Could not read the host startup entry: ${error.message}`, 'danger');
         }
     };
 
@@ -55,22 +52,22 @@ export function bindAutostartControl(page) {
         box.disabled = true;
         setInlineStatus(status, '', 'muted');
         try {
-            const { state } = await apiClient.setDesktopAutostart(wanted);
+            const snapshot = await apiClient.setDesktopAutostart(wanted);
             busy = false;
-            if (!destroyed) paint(state);
+            if (!destroyed) paint(snapshot);
         } catch (error) {
-            // A refusal may land between the two registry writes: show what Windows now holds.
-            let state;
-            try { ({ state } = await apiClient.desktopAutostart()); } catch { /* current state is unknown */ }
+            // A refusal may land between the two OS registration writes: show what the OS now holds.
+            let snapshot;
+            try { snapshot = await apiClient.desktopAutostart(); } catch { /* current state is unknown */ }
             busy = false;
             if (destroyed) return;
-            if (state === undefined) {
-                box.checked = !wanted; // last observed value, not a claim about the current registry
+            if (snapshot === undefined) {
+                box.checked = !wanted; // last observed value, not a claim about the current OS registration
                 box.disabled = true;
-                setInlineStatus(status, `Could not change the Windows startup entry: ${error.message}. Current Windows state could not be read; reopen Settings to retry.`, 'danger');
+                setInlineStatus(status, `Could not change the host startup entry: ${error.message}. Current host state could not be read; reopen Settings to retry.`, 'danger');
             } else {
-                paint(state);
-                setInlineStatus(status, `Could not change the Windows startup entry: ${error.message}`, 'danger');
+                paint(snapshot);
+                setInlineStatus(status, `Could not change the host startup entry: ${error.message}`, 'danger');
             }
         }
     };

@@ -56,8 +56,8 @@ function withApi(t, { read, write }) {
     return win;
 }
 
-test('the block stays hidden unless this is a packaged Windows desktop copy', async (t) => {
-    for (const state of ['unavailable', 'something_newer', undefined]) {
+test('unknown states stay hidden; unavailable hosts show a disabled explanation', async (t) => {
+    for (const state of ['something_newer', undefined]) {
         withApi(t, { read: async () => ({ state }) });
         const block = fakeBlock();
         bindAutostartControl(block.page);
@@ -67,7 +67,7 @@ test('the block stays hidden unless this is a packaged Windows desktop copy', as
     }
 });
 
-test('the registry state paints the toggle and explains entries it does not own', async (t) => {
+test('the OS state paints the toggle and explains entries it does not own', async (t) => {
     let state = 'on';
     const win = withApi(t, { read: async () => ({ state }) });
     const block = fakeBlock();
@@ -77,23 +77,23 @@ test('the registry state paints the toggle and explains entries it does not own'
     assert.equal(block.box.checked, true);
     assert.equal(block.status.textContent, '');
 
-    state = 'disabled_in_windows'; // switched off in Windows Startup apps meanwhile
+    state = 'disabled_by_os'; // switched off in Windows Startup apps meanwhile
     win.fire('ouro:page-shown', { detail: { page: 'settings' } });
     await settle();
     assert.equal(block.box.checked, false);
-    assert.match(block.status.textContent, /Turned off in Windows Startup apps/);
+    assert.match(block.status.textContent, /Turned off in the host operating system/);
     assert.equal(block.status.dataset.tone, 'warn');
 
     state = 'other_copy';
     win.fire('ouro:page-shown', { detail: { page: 'chat' } });
     await settle();
-    assert.match(block.status.textContent, /Startup apps/, 'another page does not trigger a read');
+    assert.match(block.status.textContent, /host operating system/, 'another page does not trigger a read');
     win.fire('ouro:page-shown', { detail: { page: 'settings' } });
     await settle();
     assert.match(block.status.textContent, /from a different entry \(another copy/);
 });
 
-test('a click applies at once and a refused change shows what Windows now holds', async (t) => {
+test('a click applies at once and a refused change shows what the OS now holds', async (t) => {
     const writes = [];
     let server = 'off';
     let refuse = false;
@@ -120,7 +120,7 @@ test('a click applies at once and a refused change shows what Windows now holds'
     await block.click(false);
     assert.deepEqual(writes, [true, false]);
     assert.equal(block.box.checked, true, 'the entry is still there, so the toggle says so');
-    assert.match(block.status.textContent, /Could not change the Windows startup entry: access denied/);
+    assert.match(block.status.textContent, /Could not change the host startup entry: access denied/);
     assert.equal(block.status.dataset.tone, 'danger');
 
     refuse = false;
@@ -146,7 +146,7 @@ test('a read that started before a click cannot repaint over the owner choice', 
     assert.equal(block.box.checked, true);
 });
 
-test('a failed write and failed read never assert a guessed Windows state', async (t) => {
+test('a failed write and failed read never assert a guessed host state', async (t) => {
     let unreadable = false;
     const win = withApi(t, {
         read: async () => {
@@ -160,7 +160,7 @@ test('a failed write and failed read never assert a guessed Windows state', asyn
     await settle();
     await block.click(true);
     assert.equal(block.box.disabled, true);
-    assert.match(block.status.textContent, /Current Windows state could not be read/);
+    assert.match(block.status.textContent, /Current host state could not be read/);
     assert.equal(block.status.dataset.tone, 'danger');
     unreadable = false;
     win.fire('ouro:page-shown', { detail: { page: 'settings' } });
@@ -181,3 +181,15 @@ test('pagehide releases every listener the block took', async (t) => {
     assert.equal(win.has('ouro:page-shown'), false);
     assert.equal(win.has('pagehide'), false);
 });
+
+for (const reason of ['Sign-in startup needs a newer app build (7.2.0 or later).', 'Move Ouroboros to Applications before enabling sign-in startup.']) {
+    test(reason, async (t) => {
+        withApi(t, { read: async () => ({ state: 'unavailable', reason }) });
+        const block = fakeBlock();
+        bindAutostartControl(block.page);
+        await settle();
+        assert.equal(block.section.hidden, false);
+        assert.equal(block.box.disabled, true);
+        assert.equal(block.status.textContent, reason);
+    });
+}
