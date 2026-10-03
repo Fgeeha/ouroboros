@@ -77,7 +77,7 @@ def test_display_redacts_typed_details_without_mutating_custody():
     ("invalid_request", 400, False, "bad_request", False, "", 42),
     ("invalid_request", 400, False, "bad_request", False, "", "  "),
     ("auth_required", 401, False, "auth_error", False, "auth", "context_length_exceeded"),
-    ("subscription_window_exhausted", 429, False, "subscription_window_exhausted", True, "quota", "context_length_exceeded"),
+    ("subscription_window_exhausted", 429, False, "subscription_window_exhausted", False, "quota", "context_length_exceeded"),
     ("unsupported_parameter", 400, False, "bad_request", False, "", "context_length_exceeded"),
     ("invalid_request", 400, True, "provider_outcome_unknown", False, "", "context_length_exceeded"),
 ])
@@ -412,8 +412,9 @@ def test_proven_never_started_quota_attempts_do_not_spend_generation_limit(setup
     gateway.results, gateway.dispatch = [refused] * 3 + [result()], ["not_started"] * 3 + ["response_received"]
     with ua.physical_attempt_limit(1):
         for _ in range(3):
-            with pytest.raises(transport.ClaudexorModelNotDispatched):
+            with pytest.raises(transport.ClaudexorModelNotDispatched) as no_start:
                 client.chat([], MODEL)
+            assert no_start.value.presence_all_operations_not_started is True
         client.chat([], MODEL)
         with pytest.raises(ua.PhysicalAttemptLimitExceeded):
             client.chat([], MODEL)
@@ -434,18 +435,35 @@ def test_unknown_outcome_keeps_its_generation_limit_claim(setup):
 
 def test_confirmed_provider_failure_settles_real_usage_before_raising(setup):
     root, gateway, client = setup
+    # Auto asks the engine once more; it reselects the refused account, which ends rotation.
     gateway.results = [result(outcome="failed", cash=0.13, knowledge="exact", problem={
         "code": "subscription_window_exhausted", "message": "window exhausted", "retryable": True,
         "context": {"resetsAt": "2099-01-01T00:00:00Z", "httpStatus": 429},
-    })]
+    })] * 2
+    gateway.dispatch = ["response_received"] * 2
     with pytest.raises(transport.ClaudexorModelError) as raised:
         client.chat([{"role": "user", "content": "hi"}], MODEL, model_role="vision")
     error = raised.value
+    assert error.account_rotation["stop"] == "engine_reselected_refused_account"
     assert error.code == "subscription_window_exhausted" and error.model_role == "vision"
     assert error.reset_at == "2099-01-01T00:00:00Z"
     assert error.physical_attempt_capture.state == "settled"
+    assert getattr(error, "presence_all_operations_not_started", False) is False
     assert ledger(root)[-1]["cost_usd"] == 0.13 and ledger(root)[-1]["prompt_tokens"] == 20
     assert retained(root) == gateway.results[0]
+
+
+def test_earlier_dispatched_rotation_cannot_hide_behind_final_not_started(setup):
+    _root, gateway, client = setup
+    refusal = {"code": "subscription_window_exhausted", "message": "quota", "retryable": True,
+               "context": {"resetsAt": "2099-01-01T00:00:00Z", "httpStatus": 429}}
+    gateway.results = [result(outcome="failed", problem=refusal),
+                       result(outcome="failed", problem=refusal)]
+    gateway.dispatch = ["response_received", "not_started"]
+    with pytest.raises(transport.ClaudexorModelNotDispatched) as caught:
+        client.chat([{"role": "user", "content": "hi"}], MODEL)
+    assert caught.value.presence_all_operations_not_started is False
+    assert len(gateway.accepted_operations) == 2
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
@@ -480,7 +498,8 @@ def test_field_refusal_retains_then_acknowledges_once_with_display(setup, asynch
 
 
 @pytest.mark.parametrize("code,vendor", [("unsupported_parameter", ""),
-    ("provider_failed", "context_length_exceeded"), ("invalid_request", "context_length_exceeded")])
+    ("provider_failed", "context_length_exceeded"), ("invalid_request", "context_length_exceeded"),
+    ("transport_not_delivered", "")])
 def test_proven_not_started_releases_and_never_fabricates_provider_usage(setup, code, vendor):
     root, gateway, client = setup
     gateway.results = [result(outcome="failed", problem={"code": code, "message": "Controlled refusal",
@@ -494,6 +513,35 @@ def test_proven_not_started_releases_and_never_fabricates_provider_usage(setup, 
     assert gateway.uploads[0][0]["options"]["temperature"] == 0.2
     assert [row["state"] for row in ledger(root)] == ["reserved", "dispatched", "released"]
     assert len(gateway.accepted_operations) == 1
+
+
+@pytest.mark.parametrize("proof", ["connection_not_written", "incomplete_upload"])
+@pytest.mark.parametrize("proven", [True, False])
+def test_upload_proof_refines_terminal_without_resending_or_inventing_usage(setup, proof, proven):
+    from ouroboros.loop_llm_call import classify_llm_exception
+
+    root, gateway, client = setup
+    problem = {"code": "transport_not_delivered" if proven else "transport_unknown",
+               "message": "Controlled transport outcome", "retryable": proven,
+               "context": {"proof": proof, "bodyBytes": 3_000_000,
+                           "handedToSocketBytes": 65_536 if proven else 3_000_000}}
+    value = result(outcome="failed" if proven else "unknown", problem=problem)
+    value.update(message=None, usage={"input_tokens": None, "output_tokens": None},
+                 cost={"knowledge": "unknown", "cashUsd": None, "valuationUsd": None})
+    gateway.results = [value]
+    gateway.dispatch = ["not_started" if proven else "unknown"]
+    original_detail = gateway.detail
+    gateway.detail = lambda index: {**original_detail(index), "dispatch": {
+        "state": gateway.dispatch[index], "startedAt": "2026-09-30T00:00:00Z", "route": dict(ROUTE)}}
+    with pytest.raises(transport.ClaudexorModelError) as raised:
+        client.chat([{"role": "user", "content": "hi"}], MODEL)
+    error = raised.value
+    assert isinstance(error, transport.ClaudexorModelNotDispatched) is proven
+    assert error.problem == problem
+    assert ledger(root)[-1]["state"] == ("released" if proven else "unresolved")
+    classified = classify_llm_exception(error)
+    assert classified.retry_same_request is proven
+    assert len(gateway.accepted_operations) == len(gateway.creates) == 1
 
 
 def test_typed_subject_refusal_suppresses_next_auto_preference(setup):

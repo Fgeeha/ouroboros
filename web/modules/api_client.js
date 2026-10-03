@@ -33,7 +33,12 @@ export async function fetchJson(url, init = {}, options = {}) {
     let data = null;
     try {
         data = await response.json();
-    } catch {
+    } catch (error) {
+        // A body read cut by the caller's own cancellation is a cancellation,
+        // not a reply: swallowing it here once turned a navigation-aborted
+        // Widgets list into a resolved "error object" that a consumer read as
+        // an EMPTY authoritative list and stopped kept-running frames on.
+        if (error?.name === 'AbortError' || init?.signal?.aborted) throw error;
         data = { error: `non-json response (HTTP ${response.status})` };
     }
     if (!response.ok || (options.rejectOkFalse && data && data.ok === false)) {
@@ -84,33 +89,58 @@ export function createTask(payload) {
  * "immediate" (or absent) keeps today's hard cancel byte-identical.
  * Shared by the Chat live-card stop control and the Activity tab.
  * @param {string} taskId
- * @param {{cascade?: boolean, stopPolicy?: string}} [options]
+ * @param {{cascade?: boolean, stopPolicy?: string, stopActionId?: string}} [options]
  * @returns {Promise<import('./api_types.js').TaskCancelResponse>}
  */
-export function cancelTask(taskId, { cascade = false, stopPolicy = '' } = {}) {
+export function cancelTask(taskId, { cascade = false, stopPolicy = '', stopActionId = '' } = {}) {
     const url = `/api/tasks/${encodeURIComponent(taskId)}/cancel`;
     const policy = String(stopPolicy || '');
+    /** @type {import('./api_types.js').TaskCancelRequest} */
     const body = {
         ...(cascade ? { cascade: true } : {}),
         ...(policy && policy !== 'immediate' ? { stop_policy: policy } : {}),
+        ...(stopActionId ? { stop_action_id: stopActionId } : {}),
     };
     return Object.keys(body).length ? jsonPost(url, body) : fetchJson(url, { method: 'POST' });
 }
 
-/** Canonical task-file address shared by live delivery, replay and source links. */
-export function taskArtifactDownloadUrl(taskId, name) {
-    if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(String(taskId || ''))
+const TASK_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
+const plainSegments = (text) => typeof text === 'string' && !!text && !text.includes('\\') && !text.includes('\0')
+    && text.split('/').every((part) => part && part !== '.' && part !== '..');
+// Python quote(safe='') spelling of one path segment.
+const encodeSegment = (text) => encodeURIComponent(text).replace(/[!'()*]/g, char => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
+
+/**
+ * Canonical task-file address shared by live delivery, replay and source links. A nested
+ * result file (`relpath` = its store-relative path, ending in `name`) is addressed exactly
+ * with `?relpath=`; the bare name only ever selects a top-level file.
+ */
+export function taskArtifactDownloadUrl(taskId, name, relpath = '') {
+    if (!TASK_ID_RE.test(String(taskId || ''))
         || typeof name !== 'string' || !name || name.startsWith('.') || /[/\\]/.test(name)) return '';
-    const encodedName = encodeURIComponent(name).replace(/[!'()*]/g, char => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
-    return `/api/tasks/${encodeURIComponent(taskId)}/artifacts/${encodedName}`;
+    const url = `/api/tasks/${encodeURIComponent(taskId)}/artifacts/${encodeSegment(name)}`;
+    if (!relpath || relpath === name) return url;
+    if (!plainSegments(relpath) || relpath.split('/').at(-1) !== name) return '';
+    return `${url}?relpath=${encodeURIComponent(relpath)}`;
 }
 
-/** URL for one published immutable source handle. */
+/**
+ * Address of the on-demand ZIP of one recorded result directory (store-relative, plain
+ * segments): `{basename}.zip?archive={directory}` on the task-file route; '' for a
+ * directory the route would refuse.
+ */
+export function taskArtifactArchiveUrl(taskId, directory) {
+    if (!TASK_ID_RE.test(String(taskId || '')) || !plainSegments(directory)) return '';
+    const name = `${directory.split('/').at(-1)}.zip`;
+    return `/api/tasks/${encodeURIComponent(taskId)}/artifacts/${encodeSegment(name)}?archive=${encodeURIComponent(directory)}`;
+}
+
+/** URL for one published immutable source handle (a delegated run's journal range included). */
 export function taskSourceDownloadUrl(taskId, ref) {
     const path = typeof ref?.path === 'string' ? ref.path : '';
     if (!taskId || ref?.root !== 'artifact_store' || ref?.kind !== 'task_source'
         || !/^[0-9a-f]{64}$/.test(ref?.sha256 || '')
-        || !/^source_handles\/(tool_results|context_checkpoints)\/[A-Za-z0-9][A-Za-z0-9._-]*$/.test(path)
+        || !/^source_handles\/(tool_results|context_checkpoints|delegated_activity)\/[A-Za-z0-9][A-Za-z0-9._-]*$/.test(path)
         || !Number.isSafeInteger(ref?.size) || ref.size < 0) return '';
     const name = path.split('/').at(-1);
     const url = taskArtifactDownloadUrl(taskId, name);
@@ -136,6 +166,40 @@ export function hurryTask(taskId, requestId) {
     return jsonPost(
         `/api/tasks/${encodeURIComponent(taskId)}/hurry`,
         { request_id: String(requestId || '') },
+        { rejectOkFalse: true },
+    );
+}
+
+/**
+ * Owner Pause of a whole task tree (Batch4): text-free like hurry — the body is
+ * ONLY the stable request_id (the same id on retry is idempotent). The answer
+ * arrives after the root's durable fence landed; its `state` is `requested`
+ * while members still settle, `paused` once saved, or `released` on replay
+ * after that action was resumed. A 202 `latch_pending` answer is accepted
+ * (the fence is durable) and the SAME id completes its queue latch. An
+ * intentional new Pause uses a fresh id.
+ * @param {string} taskId
+ * @param {string} requestId
+ */
+export function pauseTask(taskId, requestId) {
+    return jsonPost(
+        `/api/tasks/${encodeURIComponent(taskId)}/pause`,
+        { request_id: String(requestId || '') },
+        { rejectOkFalse: true },
+    );
+}
+
+/**
+ * Owner Continue of an interrupted root (Batch4): the body is ONLY the action
+ * nonce the caller keeps across retries and reloads, so the same press answers
+ * the same admission; a different nonce is a new press.
+ * @param {string} taskId
+ * @param {string} actionNonce
+ */
+export function continueTask(taskId, actionNonce) {
+    return jsonPost(
+        `/api/tasks/${encodeURIComponent(taskId)}/continue`,
+        { action_nonce: String(actionNonce || '') },
         { rejectOkFalse: true },
     );
 }
@@ -210,7 +274,7 @@ export const apiClient = {
     state: () => fetchJson('/api/state', { cache: 'no-store' }),
     settings: () => fetchJson('/api/settings', { cache: 'no-store' }),
     /** @returns {Promise<import('./api_types.js').UiPreferencesResponse>} */
-    uiPreferences: () => fetchJson('/api/ui/preferences', { cache: 'no-store' }),
+    uiPreferences: (init = {}) => fetchJson('/api/ui/preferences', { cache: 'no-store', ...init }),
     saveUiPreferences: (payload) => jsonPost('/api/ui/preferences', payload),
     saveSettings: (payload) => fetchJson('/api/settings', {
         method: 'POST',
@@ -254,7 +318,7 @@ export const apiClient = {
      * payload `revision`.
      * @returns {Promise<import('./api_types.js').WidgetsResponse>}
      */
-    widgets: () => fetchJson('/api/widgets', { cache: 'no-store' }),
+    widgets: (init = {}) => fetchJson('/api/widgets', { cache: 'no-store', ...init }),
     skillPublishPreflight,
     createTask,
     skillLifecycleQueue: () => fetchJson('/api/skills/lifecycle-queue', { cache: 'no-store' }),

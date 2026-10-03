@@ -248,6 +248,15 @@ def commit_review_contract_fingerprint() -> str:
         if any(triad_actor_ids):
             for row, actor in zip(triad_rows, triad_actor_ids):
                 row.append(actor)
+        # A direct api row saved as native delivery (#1334) is the same kind of
+        # contract change with no actor id to carry it; the column appears only
+        # when such a row exists, so every other panel keeps its exact bytes.
+        native_direct = [bool(flag) and not actor and str(getattr(route, "value", route) or "") == "api_chat"
+                         for flag, actor, route in zip(row_plan.get("retrieves") or [], triad_actor_ids
+                                                       or [""] * len(triad_rows), row_plan["routes"])]
+        if any(native_direct):
+            for row, native in zip(triad_rows, native_direct):
+                row.append("native_retrieval" if native else "")
         scope_slots = list(scope_reviewer_slots())
         scope_rows = [
             [
@@ -825,6 +834,7 @@ def _invalidate_advisory(
             mutation_root=mutation_root or pathlib.Path(ctx.repo_dir),
             changed_paths=changed_paths,
             source_tool=source_tool or _current_review_tool_name(ctx),
+            mutating_task_id=str(getattr(ctx, "task_id", "") or ""),
         )
     except Exception:
         pass
@@ -1091,7 +1101,8 @@ def _check_advisory_freshness(ctx: ToolContext, commit_message: str,
             "Or bypass: commit_reviewed(commit_message='...', skip_advisory_review=True) (audited)."
         )
 
-    if matching_run and matching_run.status == "preflight_blocked":
+    if matching_run and (matching_run.status == "preflight_blocked" or
+                         matching_run.reason_kind == "release_metadata_unavailable"):
         preflight_detail = (matching_run.raw_result or "").strip()
         # H4 (capinv-447): the status is shared by several deterministic checks;
         # name the problem class only when the typed cause is recorded.
@@ -1099,6 +1110,7 @@ def _check_advisory_freshness(ctx: ToolContext, commit_message: str,
         cause = {
             "syntax": "The advisory delivery was skipped because a staged `.py` file has a SyntaxError.",
             "release_metadata": "The advisory delivery was skipped because the deterministic release metadata preflight failed.",
+            "release_metadata_unavailable": "Release metadata evidence could not be read; this is not a reviewer verdict or proof of a changed snapshot.",
         }.get(reason_kind, "The advisory delivery was skipped by a deterministic preflight check (exact cause below).")
         return (
             f"⚠️ ADVISORY_PRE_REVIEW_REQUIRED: Last advisory run for this snapshot "
@@ -1109,8 +1121,11 @@ def _check_advisory_freshness(ctx: ToolContext, commit_message: str,
         )
 
     if latest and latest.status == "stale" and state.last_stale_from_edit_ts:
+        # Attribution only for a marker scoped to this checkout (or unscoped).
+        writer = (f" by {state.stale_marker_attribution_note(str(getattr(ctx, 'task_id', '') or ''))}"
+                  if state.last_stale_repo_key in ("", repo_key) else "")
         stale_reason = (f"Advisory invalidated by worktree edit at "
-                        f"{state.last_stale_from_edit_ts}. Re-run advisory after all edits.")
+                        f"{state.last_stale_from_edit_ts}{writer}. Re-run advisory after all edits.")
     elif latest:
         stale_reason = (f"Latest run: status={latest.status}, hash={latest.snapshot_hash[:12]}, "
                         f"ts={latest.ts}. Snapshot changed (files edited after advisory ran).")
@@ -1218,15 +1233,15 @@ def bind_author_commit_candidate(ctx: ToolContext, commit_message: str, pre_fing
     from ouroboros.tools import git as git_mod
     author_source = ctx._author_commit_source
     from ouroboros.review_records import build_author_disposition_from_mapping
-    from ouroboros.tools.review import _preflight_check
+    from ouroboros.tools.review import _preflight_check, format_name_status_for_preflight
     from ouroboros.config import get_review_enforcement
 
     author = build_author_disposition_from_mapping(ctx._author_commit_decision, subject_hash=pre_fingerprint["fingerprint"],
         reviewer_signal=author_source.block_reason or author_source.status, enforcement=get_review_enforcement())
     author["review_reference"] = ctx._author_commit_reference
     ctx._author_commit_record = author
-    preflight = _preflight_check(commit_message, git_mod.run_cmd(["git", "diff", "--cached", "--name-status"], cwd=ctx.repo_dir), ctx.repo_dir)
-    return preflight
+    staged = git_mod.run_cmd(["git", "diff", "--cached", "--name-status"], cwd=ctx.repo_dir)
+    return _preflight_check(commit_message, format_name_status_for_preflight(staged), ctx.repo_dir)
 
 
 def record_bound_commit_success(ctx: ToolContext, commit_message: str, started_at: float, before: dict, after: dict) -> None:

@@ -219,7 +219,7 @@ function makeInstance(mount) {
     };
     let generation = 0;
     const stateSnapshots = {
-        begin: () => ({ generation: ++generation, requestedAt: Date.now() }),
+        begin: () => ({ generation: ++generation, requestedAt: Date.now() }), gate() { return Promise.resolve(this.begin()); },
         isCurrent: () => true,
         apply() {},
     };
@@ -255,7 +255,16 @@ const PLAIN_ROW = {
     ts: '2026-08-31T00:00:00Z',
 };
 
-test('plain project row renders escaped text with Open Project and no markdown machinery', async () => {
+// The stub DOM does not aggregate descendant text, so a reference is read by its own parts.
+const referenceShape = (node) => ({
+    intent: node?.dataset?.intent,
+    pill: Boolean(node?.classList?.contains('chat-quiz-project')),
+    parts: (node?.children || []).map((child) => child.textContent),
+    spoken: node?.getAttribute?.('aria-label'),
+});
+const LAUNCH_REFERENCE = { intent: 'open-project', pill: true, parts: ['', 'Launch', '↗'], spoken: 'Open project Launch' };
+
+test('plain project row renders escaped text with the Project reference and no markdown machinery', async () => {
     const { prior, mount } = installDom();
     let instance;
     try {
@@ -276,9 +285,10 @@ test('plain project row renders escaped text with Open Project and no markdown m
         const message = bubble.querySelector('.message');
         const actions = bubble.children.find((node) => node.classList.contains('system-message-actions'));
         assert.equal(message.contains(actions), false);
-        assert.equal(bubble.children.indexOf(actions), bubble.children.indexOf(message) + 1);
+        assert.equal(bubble.children.indexOf(actions), bubble.children.indexOf(message) + 2);
         assert.ok(actions, 'system-message-actions container present');
-        assert.equal(actions.children[0]?.textContent, 'Open Project ↗');
+        // The row points at its Project with the one reference, never a button of its own.
+        assert.deepEqual(referenceShape(actions.children[0]), LAUNCH_REFERENCE);
     } finally {
         instance?.destroy();
         restoreDom(prior);
@@ -312,15 +322,12 @@ test('a completion row carrying the answer renders as an ordinary Ouroboros mess
         assert.doesNotMatch(bubble.innerHTML, /Open the Project for details|Completed/);
         const message = bubble.querySelector('.message');
         const actions = bubble.children.find((node) => node.classList.contains('system-message-actions'));
-        assert.equal(bubble.children.indexOf(actions), bubble.children.indexOf(message) + 1);
-        // One control: the Project chip names the Project and opens it; no second button.
+        assert.equal(bubble.children.indexOf(actions), bubble.children.indexOf(message) + 2);
+        // One control, and the SAME one the System row carries: the voice of a row never
+        // chooses how the UI points at its Project.
         assert.equal(actions.children.length, 1);
         const chip = actions.children[0];
-        assert.ok(chip.classList.contains('chat-quiz-project'));
-        // The stub DOM does not aggregate descendant text, so read the chip's own parts.
-        const chipText = chip.children.map((node) => node.textContent).join('');
-        assert.match(chipText, /Launch/);
-        assert.doesNotMatch(chipText, /Open Project/);
+        assert.deepEqual(referenceShape(chip), LAUNCH_REFERENCE);
         // The stub DOM has no event loop: run the chip's own click listener and
         // capture what it hands to the window.
         let opened = null;
@@ -334,7 +341,9 @@ test('a completion row carrying the answer renders as an ordinary Ouroboros mess
             globalThis.window.dispatchEvent = priorDispatch;
             globalThis.CustomEvent = priorCustomEvent;
         }
-        assert.deepEqual(opened, { type: 'ouro:open-project', detail: { project: { id: 'launch', name: 'Launch' } } });
+        assert.deepEqual(opened, {
+            type: 'ouro:open-project', detail: { project: { id: 'launch', name: 'Launch' }, task_id: '', quiz_id: '' },
+        });
     } finally {
         instance?.destroy();
         restoreDom(prior);
@@ -393,7 +402,7 @@ test('the fold is CSS over the complete answer: clamp always, fade only when fol
     assert.match(rules, /\.chat-bubble\.project-answer\.is-folded > \.message \{[^}]*mask-image/);
     assert.doesNotMatch(rules, /user-select|font-size: \d|#[0-9a-fA-F]{3,6}\b/);
     // chat.js stays a caller: the decoration lives in its own module.
-    assert.match(chatSource, /decorateProjectRow\(bubble, \{ role, projectId, projectName \}\)/);
+    assert.match(chatSource, /decorateProjectRow\(bubble, \{ role, projectId, projectName,/);
 });
 
 test('plain system row renders identically live and after history reload', async () => {
@@ -653,11 +662,14 @@ test('render arm order and enhancement guard are pinned in source', () => {
     );
 });
 
-test('chat bubble heading clamp is scoped in style.css', () => {
-    // Inside chat bubbles every markdown heading is a subsection label at body
-    // size (DESIGN.md §2); the global md-h1 page-size rule stays for non-chat
-    // surfaces, and the live-card timeline carries its own inline clamp.
+test('chat bubble heading ladder is scoped in style.css', () => {
+    // Only a full rich answer (`.message.ui-rich-content`) follows the reading
+    // ladder (DESIGN.md §1, §5); compact Markdown in a bubble (a Skill Review
+    // report) keeps every heading a body-size semibold label; the global md-h1
+    // page-size rule stays for non-chat surfaces, and the live-card timeline
+    // carries its own inline clamp.
     assert.match(styleSource, /\.chat-bubble \.message \.md-h1,\n\.chat-bubble \.message \.md-h2,\n\.chat-bubble \.message \.md-h3 \{\n\s+font-size: var\(--type-body\);\n\s+font-weight: 600;\n\}/);
+    assert.match(styleSource, /\n\.chat-bubble \.message:where\(\.ui-rich-content\) :is\(\.md-h1, \.md-h2\) \{ font-size: var\(--md-heading-major\); \}\n\.chat-bubble \.message:where\(\.ui-rich-content\) \.md-h3 \{ font-size: var\(--md-heading-minor\); \}\n/);
     // The timeline label follows its row's size: collapsed rows are meta size,
     // an expanded row is body size (DESIGN.md §5, "summary outranks details").
     // Unambiguous block scan (indent, then a non-space start): the `(\s+[^\n]+\n)*`
@@ -669,7 +681,7 @@ test('chat bubble heading clamp is scoped in style.css', () => {
     assert.match(styleSource, decl('\\.chat-live-line-title', 'font-size: var\\(--type-meta\\);'));
     assert.match(styleSource, decl('\\.chat-live-line\\[data-expanded="1"\\] \\.chat-live-line-body', 'font-size: var\\(--type-body\\);'));
     assert.match(styleSource, decl('\\.chat-live-activity', 'font-size: var\\(--type-body\\);'));
-    // The rich bubble renderer demotes h4-h6 to the smallest label so the clamp reaches them.
+    // The rich bubble renderer gives h4-h6 the smallest label class, as the compact one demotes them.
     const richSource = readFileSync(new URL('../modules/chat_markdown.js', import.meta.url), 'utf8');
     assert.match(richSource, /querySelectorAll\('h1, h2, h3, h4, h5, h6'\)[\s\S]{0,160}Math\.min\(Number\(heading\.tagName\.slice\(1\)\), 3\)/);
 });

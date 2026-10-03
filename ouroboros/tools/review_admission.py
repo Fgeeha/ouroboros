@@ -266,20 +266,18 @@ def triad_not_dispatched_records(
     restricts the records to the api rows (the Q28-A oversize drop); the
     default covers every row (the Q25-A admission block). ``slot`` keeps each
     seat's ORIGINAL 1-based position in the configured plan."""
-    from ouroboros.review_execution import delivery_retrieves
+    from ouroboros.reviewer_slot_config import row_plan_retrieves
 
     models = list(row_plan.get("models") or [])
     routes = list(row_plan.get("routes") or [])
     slot_ids = list(row_plan.get("slot_ids") or [])
-    actors = list(row_plan.get("subagent_ids") or [])
     records = []
     for index, model in enumerate(models):
         if only_api and (
-            # A retrieving row (session, or configured-subagent api row) never
-            # received the packet; the packet drop is not its withholding and
-            # it keeps its live seat.
-            index >= len(routes)
-            or delivery_retrieves(routes[index], actors[index] if index < len(actors) else "")
+            # A retrieving row (session, native api row or configured-subagent
+            # api row) never received the packet; the packet drop is not its
+            # withholding and it keeps its live seat.
+            index >= len(routes) or row_plan_retrieves(row_plan, index)
         ):
             continue
         records.append({
@@ -306,19 +304,15 @@ def drop_api_rows(row_plan: dict) -> dict:
 
     Q28-A: an irreducible oversize packet drops the api subset when the session
     rows alone satisfy the quorum. The caller records the drop loudly."""
-    from ouroboros.review_execution import delivery_retrieves
+    from ouroboros.reviewer_slot_config import row_plan_retrieves
 
     routes = list(row_plan.get("routes") or [])
-    actors = list(row_plan.get("subagent_ids") or [])
-    # The RETRIEVES class survives the drop: a configured-subagent api row never
-    # received the oversized packet, so packet overflow is not its failure.
-    keep = [
-        i for i, r in enumerate(routes)
-        if delivery_retrieves(r, actors[i] if i < len(actors) else "")
-    ]
+    # The RETRIEVES class survives the drop: a native or configured-subagent api
+    # row never received the oversized packet, so packet overflow is not its failure.
+    keep = [i for i in range(len(routes)) if row_plan_retrieves(row_plan, i)]
     filtered = dict(row_plan)
     for key in ("models", "routes", "efforts", "session_targets",
-                "session_profiles", "slot_ids", "subagent_ids", "use_local"):
+                "session_profiles", "slot_ids", "subagent_ids", "retrieves", "use_local"):
         rows = list(row_plan.get(key) or [])
         filtered[key] = [rows[i] for i in keep if i < len(rows)]
     return filtered
@@ -572,8 +566,9 @@ def commit_gate_paid_seats(triad_prepared, triad_exited, scope_rows) -> list:
     send's output reservation, so the wave is priced the way
     ``reserve_attempt`` prices it. Every scope seat is a retrieving one."""
 
-    from ouroboros.review_execution import ReviewRouteKind, delivery_retrieves
+    from ouroboros.review_execution import ReviewRouteKind
     from ouroboros.review_native_episode import native_first_send_chars
+    from ouroboros.reviewer_slot_config import row_plan_retrieves
     from ouroboros.reviewer_slot_config import SCOPE_ROLE_HINT
     from ouroboros.tools.review_multi_model import (
         TRIAD_ROLE_HINT, TRIAD_USER_TURN, _review_output_budget, triad_api_messages,
@@ -618,14 +613,14 @@ def commit_gate_paid_seats(triad_prepared, triad_exited, scope_rows) -> list:
     row_plan = triad_prepared.get("row_plan") or {}
     models = list(triad_prepared.get("models") or row_plan.get("models") or [])
     routes = list(triad_prepared.get("routes") or row_plan.get("routes") or [])
-    slot_ids, actors = list(row_plan.get("slot_ids") or []), list(row_plan.get("subagent_ids") or [])
+    slot_ids = list(row_plan.get("slot_ids") or [])
     triad_chars = None
     for index, model in enumerate(models):
         route = routes[index] if index < len(routes) else "api_chat"
         slot_id = str(slot_ids[index] if index < len(slot_ids) else f"slot_{index + 1}")
         if _session(route):
             continue
-        if delivery_retrieves(route, actors[index] if index < len(actors) else ""):
+        if row_plan_retrieves({**row_plan, "routes": routes}, index):
             chars = native_first_send_chars(
                 str(triad_prepared.get("target_repo") or ""), surface="multi_model_review",
                 role_hint=TRIAD_ROLE_HINT, slot_id=slot_id,

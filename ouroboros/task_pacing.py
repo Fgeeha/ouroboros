@@ -125,18 +125,17 @@ def _supplied_budget_profile(ctx: Any) -> Any:
 
 
 def observe_budget_profile(ctx: Any) -> Dict[str, Any]:
-    """The task's normalized budget_profile resolved SIDE-EFFECT FREE (R49): the
-    reader the coordination poll (``delegate_supervision._time_fact``) uses."""
+    """The task's normalized budget_profile, with defaults and no side effects.
+
+    Coordination observation (``delegate_supervision._time_fact``, R49) and
+    ordinary resolution share this reader. The retired ``until_deadline`` /
+    ``stall_rounds_threshold`` aliases require no migration write or event.
+    """
     return normalize_budget_profile(_supplied_budget_profile(ctx))
 
 
-def resolve_budget_profile(ctx: Any) -> Dict[str, Any]:
-    """The task's normalized budget_profile (from task_contract; absent ->
-    defaults). The deprecated ``until_deadline`` / ``stall_rounds_threshold``
-    aliases and their deprecation row are gone (7.0 ABI window), so this is
-    the same side-effect-free read as ``observe_budget_profile``; both names
-    stay so the observer contract remains explicit at its call sites."""
-    return normalize_budget_profile(_supplied_budget_profile(ctx))
+# Both public names retain their caller contracts over the same pure read.
+resolve_budget_profile = observe_budget_profile
 
 
 def _acceptance_floor_sec() -> float:
@@ -522,6 +521,14 @@ def resolve_task_cost_ceiling(ctx: Any, budget_remaining_usd: Optional[float]) -
         scope = current_usage_scope()
         if scope is not None:
             root_cap = getattr(scope, "root_limit_usd", None)
+            if root_cap is None:  # a Continue's successor: the original root's carried group cap
+                root_cap = getattr(scope, "billing_group_limit_usd", None)
+            if scope.billing_group_id:
+                from ouroboros.usage_admission import task_money_snapshot
+                snapshot = task_money_snapshot(scope.drive_root, {"id": scope.task_id}, scope.root_task_id,
+                                               root_limit=scope.root_limit_usd)
+                if snapshot is not None:
+                    root_cap = snapshot["root_limit_usd"]
             root_ceiling = getattr(scope, "root_cost_ceiling_usd", None)
             non_root_member = bool(
                 scope.root_task_id and scope.task_id and scope.root_task_id != scope.task_id
@@ -687,11 +694,15 @@ def prospective_wrapup_attempt_request(
 
     ``model_turn_state`` is the caller's active-turn transport slot. A candidate
     that a forced send is admitted against must be priced from the SAME slot
-    value the send will carry, or the two payloads differ by that field alone."""
+    value the send will carry, or the two payloads differ by that field alone.
+    Under a bound Main clock (``send_clock``) the copy carries a line of its own
+    sample, so its price is advice: the send seals a fresh line and is admitted
+    again at its own price (``loop_forced_finalization._forced_admission_predicate``)."""
     from ouroboros.llm import _attempt_request, _finalized_physical_candidate
     from ouroboros.loop_llm_call import MAIN_LOOP_MAX_TOKENS
     from ouroboros.request_wire_recovery import request_wire_call_scope
     from ouroboros.pricing import infer_provider_from_model
+    from ouroboros.send_clock import stamp_clock_note
     from ouroboros.usage_accounting import AttemptRequest, _merge_scope
     from ouroboros.model_slots import resolve_processing_preference
 
@@ -711,11 +722,11 @@ def prospective_wrapup_attempt_request(
         from ouroboros.llm_claudexor import _request, prepare_processing_target
 
         target = prepare_processing_target(target)
-        candidate = _request(target, messages, tools, {"reasoning_effort": reasoning_effort,
+        candidate = stamp_clock_note(_request(target, messages, tools, {"reasoning_effort": reasoning_effort,
             "model_role": model_role, "model_account_override": model_account_override,
             "model_turn_state": model_turn_state,
             "processing_preference": processing_preference,
-            "cache_affinity": cache_affinity, "prospective": True})
+            "cache_affinity": cache_affinity, "prospective": True}))
         return _merge_scope(replace(_attempt_request(target, candidate),
             force_unknown_reservation=True, max_completion_tokens=MAIN_LOOP_MAX_TOKENS))[0]
     with request_wire_call_scope():
@@ -727,9 +738,10 @@ def prospective_wrapup_attempt_request(
             **main_loop_wire_options(model, allow_server_web_search=allow_server_web_search),
         )
         llm._normalize_payload_cache_ttl(target, candidate)
+        anthropic = target.get("provider") == "anthropic"
         candidate = _finalized_physical_candidate(
-            target, candidate,
-            "messages" if target.get("provider") == "anthropic" else "chat.completions",
+            target, stamp_clock_note(candidate, blocks=anthropic),
+            "messages" if anthropic else "chat.completions",
         )
         llm._pop_thread_disclosure("_cache_breakpoint_tls")
     return _merge_scope(_attempt_request(target, candidate))[0]
@@ -746,6 +758,7 @@ def prepared_wrapup_candidate(
     from ouroboros.loop_llm_call import _prepare_main_messages
     from ouroboros.model_slots import task_model_binding, task_processing_preference
     from ouroboros.model_wait import current_model_wait
+    from ouroboros.send_clock import MainSendClock, main_clock_policy
 
     owner_ctx = getattr(getattr(ctx, "tools", None), "_ctx", None)
     waiter = current_model_wait()
@@ -765,21 +778,24 @@ def prepared_wrapup_candidate(
         model_role=role,
         model_account_override=account,
     )
-    request = prospective_wrapup_attempt_request(
-        llm=ctx.llm, messages=send_messages, model=ctx.active_model,
-        reasoning_effort=ctx.active_effort, tools=ctx.tool_schemas,
-        allow_server_web_search=allow_server_web_search,
-        prompt_tokens=int(ctx.accumulated_usage.get("_context_prompt_estimate") or 0),
-        model_role=role,
-        model_account_override=account,
-        model_turn_state=getattr(owner_ctx, "model_turn_state", None),
-        # The admitted candidate must be the payload the send will produce: the
-        # main loop declares the same install-scoped cache affinity, so this
-        # prepared copy binds the same key as that dispatch does.
-        cache_affinity="" if getattr(ctx, "active_use_local", False) else cache_key_for_model(ctx.active_model),
-        processing_preference=task_processing_preference(
-            {"task_metadata": getattr(owner_ctx, "task_metadata", {})}, model_role=role),
-    )
+    # The forced send seals Main's clock line; its priced copy carries one too.
+    with MainSendClock(main_clock_policy(getattr(owner_ctx, "task_metadata", {}),
+                                         task_type=str(getattr(ctx, "task_type", "") or ""))).bound():
+        request = prospective_wrapup_attempt_request(
+            llm=ctx.llm, messages=send_messages, model=ctx.active_model,
+            reasoning_effort=ctx.active_effort, tools=ctx.tool_schemas,
+            allow_server_web_search=allow_server_web_search,
+            prompt_tokens=int(ctx.accumulated_usage.get("_context_prompt_estimate") or 0),
+            model_role=role,
+            model_account_override=account,
+            model_turn_state=getattr(owner_ctx, "model_turn_state", None),
+            # The admitted candidate must be the payload the send will produce: the
+            # main loop declares the same install-scoped cache affinity, so this
+            # prepared copy binds the same key as that dispatch does.
+            cache_affinity="" if getattr(ctx, "active_use_local", False) else cache_key_for_model(ctx.active_model),
+            processing_preference=task_processing_preference(
+                {"task_metadata": getattr(owner_ctx, "task_metadata", {})}, model_role=role),
+        )
     return request, send_messages
 
 

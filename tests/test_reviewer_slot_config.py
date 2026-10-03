@@ -374,7 +374,23 @@ def test_absent_structured_key_serves_the_default_panel(monkeypatch):
     assert [(r.slot_id, r.target_id) for r in config.scope] == [
         ("scope_slot_1", "m/scope")]
     assert config.advisory.enabled is True and config.advisory.kind == "api_chat"
-    assert commit_triad_delivery()["legacy_skill_fingerprint"] is True
+    # #1334: the shipped triad reads the work itself on the same models, so it
+    # no longer carries the historical all-packet skill fingerprint identity.
+    assert all(r.delivery == "native" and r.native_retrieval and r.retrieves for r in config.triad)
+    assert not any(r.delivery for r in config.scope)
+    delivery = commit_triad_delivery()
+    assert delivery["retrieves"] == [True, True] and delivery["legacy_skill_fingerprint"] is False
+
+
+def test_default_panel_with_the_packet_default_keeps_its_historical_fingerprint(monkeypatch):
+    import ouroboros.reviewer_slot_config as rsc
+
+    monkeypatch.delenv(REVIEWER_SLOTS_ENV, raising=False)
+    _clear_legacy(monkeypatch)
+    monkeypatch.setenv("OUROBOROS_REVIEW_MODELS", "m/one,m/two")
+    monkeypatch.setattr(rsc, "DEFAULT_TRIAD_DELIVERY", "")
+    delivery = commit_triad_delivery()
+    assert delivery["retrieves"] == [False, False] and delivery["legacy_skill_fingerprint"] is True
 
 
 def test_default_panel_efforts_resolve_to_the_surface_defaults(monkeypatch):
@@ -405,7 +421,7 @@ def test_retired_phase5_route_envs_are_ignored(monkeypatch):
     assert config.advisory.kind == "api_chat"
     assert config.advisory.target_id == ""
     delivery = commit_triad_delivery()
-    assert delivery["legacy_skill_fingerprint"] is True
+    assert delivery["legacy_skill_fingerprint"] is False  # native default (#1334), no session routing
     assert delivery["session_targets"] == ["", ""]
 
 
@@ -516,30 +532,24 @@ def test_scope_slots_from_structured_config(monkeypatch):
 
 def test_session_executor_prefers_the_slots_own_target(monkeypatch):
     from ouroboros.review_execution import (
-        AgentSessionReviewExecutor,
-        ReviewAssignment,
         ReviewRouteKind,
         ReviewRouteUnavailable,
+        session_route_for_review_slot,
     )
-    from ouroboros.review_substrate import ReviewRequest, ReviewSlot
+    from ouroboros.review_substrate import ReviewSlot
 
     monkeypatch.delenv("OUROBOROS_REVIEW_SESSION_ROUTE", raising=False)
     monkeypatch.delenv("OUROBOROS_SUBAGENT_HARNESS", raising=False)
-    request = ReviewRequest(surface="scope_review", goal="g")
     slot = ReviewSlot(slot_id="s_owner", model="codex=gpt-5.6-sol", effort="xhigh",
                       route=ReviewRouteKind.AGENT_SESSION,
                       session_target="codex=gpt-5.6-sol")
-    executor = AgentSessionReviewExecutor(
-        ReviewAssignment(request=request, slot=slot))
-    route = executor._session_route()
+    route = session_route_for_review_slot(slot)
     assert (route.route_id, route.model, route.effort) == ("codex", "gpt-5.6-sol", "xhigh")
 
     # Without a per-row target the shared-route absence stays a typed refusal.
-    bare = AgentSessionReviewExecutor(ReviewAssignment(
-        request=request,
-        slot=ReviewSlot(slot_id="s2", model="m", route=ReviewRouteKind.AGENT_SESSION)))
+    bare = ReviewSlot(slot_id="s2", model="m", route=ReviewRouteKind.AGENT_SESSION)
     with pytest.raises(ReviewRouteUnavailable):
-        bare._session_route()
+        session_route_for_review_slot(bare)
 
 
 # ---------------------------------------------------------------------------
@@ -710,26 +720,21 @@ def test_effort_field_is_the_single_source_over_an_embedded_target_effort(monkey
     _clear_legacy(monkeypatch)
     monkeypatch.delenv(REVIEWER_SLOTS_ENV, raising=False)
     from ouroboros.review_execution import (
-        AgentSessionReviewExecutor,
-        ReviewAssignment,
         ReviewRouteKind,
+        session_route_for_review_slot,
     )
-    from ouroboros.review_substrate import ReviewRequest, ReviewSlot
-
-    request = ReviewRequest(surface="scope_review", goal="g")
+    from ouroboros.review_substrate import ReviewSlot
     # Field says max; the target embeds :low. The field must win.
     slot = ReviewSlot(slot_id="s", model="codex=gpt-5.6-sol:low", effort="max",
                       route=ReviewRouteKind.AGENT_SESSION,
                       session_target="codex=gpt-5.6-sol:low")
-    route = AgentSessionReviewExecutor(
-        ReviewAssignment(request=request, slot=slot))._session_route()
+    route = session_route_for_review_slot(slot)
     assert (route.route_id, route.model, route.effort) == ("codex", "gpt-5.6-sol", "max")
     # Empty field → empty effort (embedded value is dropped, not resurrected).
     bare = ReviewSlot(slot_id="s2", model="x", effort="",
                       route=ReviewRouteKind.AGENT_SESSION,
                       session_target="codex=gpt-5.6-sol:low")
-    assert AgentSessionReviewExecutor(
-        ReviewAssignment(request=request, slot=bare))._session_route().effort == ""
+    assert session_route_for_review_slot(bare).effort == ""
 
 
 def test_all_delegated_triad_writes_no_fallback_record_and_reaches_acceptance(monkeypatch):
@@ -753,10 +758,16 @@ def test_all_delegated_triad_writes_no_fallback_record_and_reaches_acceptance(mo
     }
     # R12: the FIRST save that makes the triad retrieve discloses once, with the
     # measured numbers and the rows; a save that keeps it retrieving is silent.
-    disclosure = reviewer_slot_save_check(json.dumps(payload))
+    packet_only = {**payload, "triad": [{"slot_id": "p1", "route": {"kind": "api_chat", "target_id": "m/one"}}]}
+    disclosure = reviewer_slot_save_check(json.dumps(payload), previous_raw=json.dumps(packet_only))
     assert "t1 (agent session codex" in disclosure and "≈12 s" in disclosure and "$0.07" in disclosure
-    assert reviewer_slot_save_check(json.dumps(payload), previous_raw="") == disclosure
     assert reviewer_slot_save_check(json.dumps(payload), previous_raw=json.dumps(payload)) == ""
+    # No stored value ran the shipped default panel: its triad already reads
+    # natively (#1334), so nothing newly retrieves — unless the default is packet.
+    assert reviewer_slot_save_check(json.dumps(payload)) == ""
+    with monkeypatch.context() as packet_default:
+        packet_default.setattr("ouroboros.reviewer_slot_config.DEFAULT_TRIAD_DELIVERY", "")
+        assert reviewer_slot_save_check(json.dumps(payload), previous_raw="") == disclosure
     _set_structured(monkeypatch, payload)
     project_reviewer_slots_into_env()
     assert not (pathlib.Path(DATA_DIR) / "state" / "reviewer_slot_api_fallback.json").exists()

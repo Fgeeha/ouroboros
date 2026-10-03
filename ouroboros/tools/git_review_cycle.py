@@ -378,12 +378,7 @@ def _mark_failed_bypass_advisory_stale(
 ) -> None:
     """Prevent a failed bypass preflight from satisfying later freshness checks."""
     try:
-        from ouroboros.review_state import (
-            compute_snapshot_hash,
-            make_repo_key,
-            update_state,
-            _utc_now,
-        )
+        from ouroboros.review_state import compute_snapshot_hash, make_repo_key, update_state, _utc_now
 
         snapshot_hash = compute_snapshot_hash(
             pathlib.Path(ctx.repo_dir),
@@ -397,6 +392,7 @@ def _mark_failed_bypass_advisory_stale(
             state.last_stale_from_edit_ts = _utc_now()
             state.last_stale_reason = "tests_preflight_blocked"
             state.last_stale_repo_key = repo_key
+            state.last_stale_task_id = str(getattr(ctx, "task_id", "") or "")
 
         update_state(pathlib.Path(ctx.drive_root), _mutate)
     except Exception:
@@ -687,16 +683,16 @@ def _run_reviewed_stage_cycle(
     # Free-cycle identity runs before advisory freshness and any paid dispatch.
     author_source = getattr(ctx, "_author_commit_source", None)
     gate_outcome = None if author_source is not None else _git()._free_cycle_gate(
-        ctx, commit_message, commit_start,
-        pre_fingerprint=pre_fingerprint, review_rebuttal=review_rebuttal,
-        goal=goal, scope=scope,
+        ctx, commit_message, commit_start, pre_fingerprint=pre_fingerprint,
+        review_rebuttal=review_rebuttal, goal=goal, scope=scope,
     )
     advisory_replay: Optional[Dict[str, Any]] = None
     if author_source is not None:
         from ouroboros.tools.commit_gate import bind_author_commit_candidate
         preflight = bind_author_commit_candidate(ctx, commit_message, pre_fingerprint)
         if preflight:
-            return {"status": "blocked", "message": preflight, "block_reason": "preflight"}
+            from ouroboros.commit_admission import preflight_evidence_unavailable
+            return {"status": "blocked", "message": preflight, "block_reason": "infra_failure" if preflight_evidence_unavailable(preflight) else "preflight"}
         advisory_replay = {"advisory_replay": "Explicit current-author continuation; original reviewer facts retained.", "replay_reason": "author_finish"}
         skip_advisory_pre_review = True
     if gate_outcome is not None:

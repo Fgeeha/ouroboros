@@ -262,6 +262,43 @@ def test_legacy_claude_code_edit_contract_also_disables_delegate_start(tmp_path,
     assert "delegate_start" in set(reg.available_tools())
 
 
+def test_retired_run_ci_tests_has_no_shim_and_no_table_row(tmp_path, monkeypatch):
+    """`run_ci_tests` pushed a branch and dispatched a workflow; its successor
+    `get_github_checks` only reads. A saved contract that withheld the retired
+    tool therefore withholds nothing of the successor, and the dead name stays
+    inert: blocked as disabled where a contract names it, unknown elsewhere."""
+    import importlib.util
+
+    from ouroboros.safety import TOOL_POLICY
+    from ouroboros.tool_capabilities import OBSERVE_WORLD_MUTATION_TOOLS
+    from ouroboros.tools import github
+    from ouroboros.tools.registry_guards import _GITHUB_TOKEN_TOOLS
+
+    monkeypatch.setattr(github, "github_token_from_env_or_settings", lambda: "fixture-token")
+    repo, data = tmp_path / "repo", tmp_path / "data"
+    repo.mkdir()
+    data.mkdir()
+    reg = ToolRegistry(repo_dir=repo, drive_root=data)
+    assert importlib.util.find_spec("ouroboros.tools.ci") is None
+    assert "ci" not in ToolRegistry._FROZEN_TOOL_MODULES and "github" in ToolRegistry._FROZEN_TOOL_MODULES
+    for table in (TOOL_POLICY, OBSERVE_WORLD_MUTATION_TOOLS, _GITHUB_TOKEN_TOOLS):
+        assert "run_ci_tests" not in table
+    assert "get_github_checks" in TOOL_POLICY and "get_github_checks" in _GITHUB_TOKEN_TOOLS
+
+    contract = build_task_contract({"description": "x", "disabled_tools": ["run_ci_tests"]})
+    reg.set_context(ToolContext(repo_dir=repo, drive_root=data, task_metadata={"task_contract": contract}))
+    dead = reg.execute("run_ci_tests", {})
+    assert "RESOURCE_CONSTRAINT_BLOCKED" in dead and "disabled_tools" in dead
+    assert "get_github_checks" in set(reg.available_tools())
+    assert reg.get_schema_by_name("get_github_checks") is not None
+
+    # A contract that names the successor does withhold it; without one the dead name is unknown.
+    contract = build_task_contract({"description": "x", "disabled_tools": ["get_github_checks"]})
+    reg.set_context(ToolContext(repo_dir=repo, drive_root=data, task_metadata={"task_contract": contract}))
+    assert "get_github_checks" not in set(reg.available_tools())
+    assert reg.execute("run_ci_tests", {}).startswith("⚠️ Unknown tool")
+
+
 def test_subagent_inherits_disabled_tools():
     """control.py builds the child contract by spreading the parent contract into
     metadata.task_contract; disabled_tools must survive that spread so a subagent

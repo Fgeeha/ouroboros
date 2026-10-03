@@ -3,6 +3,7 @@
 Queue, reservation, promotion, snapshot, result and annotation writers are real.
 Only model/process/bridge boundaries and isolated roots differ.
 """
+import asyncio
 import copy
 import json
 import os
@@ -62,7 +63,7 @@ def rows(path):
 
 
 @pytest.fixture
-def host(tmp_path, monkeypatch):
+def host(tmp_path, monkeypatch, request):
     root = tmp_path / "data"
     root.mkdir()
     repo_root = tmp_path / "isolated-repo"
@@ -111,6 +112,17 @@ def host(tmp_path, monkeypatch):
                                "task_metadata": copy.deepcopy(kwargs.get("task_metadata"))})
         raise ForbiddenModelEntry("Swarm entered the model-owning chat lane before managed admission")
 
+    # Windows creates its asyncio socketpair through connect. Prepare the loop
+    # before sealing sockets; API calls still run with every network/model guard.
+    event_loop = asyncio.new_event_loop()
+    def close_loop():
+        try:
+            event_loop.run_until_complete(event_loop.shutdown_asyncgens())
+            event_loop.run_until_complete(event_loop.shutdown_default_executor())
+        finally:
+            event_loop.close()
+    request.addfinalizer(close_loop)
+
     monkeypatch.setattr(LLMClient, "chat", forbidden_model)
     monkeypatch.setattr(LLMClient, "chat_async", forbidden_model_async)
     monkeypatch.setattr(lane, "_run_chat_task", forbidden_lane)
@@ -134,7 +146,8 @@ def host(tmp_path, monkeypatch):
     assert os.environ.get("OUROBOROS_ALLOW_LIVE_DATA_TESTS") != "1"
     assert os.environ.get("OUROBOROS_ALLOW_LIVE_REPO_TESTS") != "1"
     return SimpleNamespace(root=root, ctx=ctx, bridge=bridge, pending=pending, running=running,
-                           notices=notices, attempts=model_attempts, monkeypatch=monkeypatch)
+                           notices=notices, attempts=model_attempts, monkeypatch=monkeypatch,
+                           run_async=event_loop.run_until_complete)
 
 
 def incoming_case(host, room, *, caption_only=False):
@@ -306,7 +319,7 @@ def test_existing_admission_refusal_text_and_order(host, failure):
     if failure == "update":
         host.monkeypatch.setattr(workers, "repo_writer_admission_closed", lambda: "destructive_test_window")
 
-    def budget(_state, *, strict):
+    def budget(_state, *, strict, **_display_read):
         budget_calls.append({"strict": strict})
         if failure == "update":
             pytest.fail("budget floor ran before the rejecting owner-conversation floor")

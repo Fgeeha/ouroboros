@@ -181,6 +181,7 @@ async def _query_model(
     session_profile: str = "",
     surface: str = "multi_model_review", session_policy: dict = None, usage_attribution: dict = None,
     retry_key: str = "", subagent_id: str = "", use_local: bool | None = None, task_evidence: dict = None,
+    native_retrieval: bool = False,
 ):
     async with semaphore:
         slot = None
@@ -189,9 +190,10 @@ async def _query_model(
             from ouroboros.review_substrate import ReviewRequest, ReviewSlot, run_review_request
             slot_route = route if route is not None else ReviewRouteKind.API_CHAT
             delegated = slot_route is ReviewRouteKind.AGENT_SESSION
-            # RETRIEVES class (session row OR configured-subagent api row): the
-            # compact session task replaces the assembled pack for both.
-            retrieves = delivery_retrieves(slot_route, subagent_id)
+            # RETRIEVES class (session row, native api row or configured-subagent
+            # api row): the compact session task replaces the assembled pack.
+            native_retrieval = bool(native_retrieval) and not delegated
+            retrieves = native_retrieval or delivery_retrieves(slot_route, subagent_id)
             from ouroboros.review_evidence import commit_review_evidence_refs, commit_review_evidence_section
             evidence = task_evidence or {}
             policy = dict(session_policy or {"output_contract": _rev().REVIEW_JSON_ARRAY_CONTRACT}) if retrieves else {}
@@ -235,6 +237,7 @@ async def _query_model(
                 session_target=session_target if delegated else "",
                 session_profile=session_profile,
                 subagent_id=str(subagent_id or ""),
+                native_retrieval_override=True if native_retrieval else None,
             )
             loop = asyncio.get_running_loop()
             # run_in_executor copies no context: carry the usage scope (and its
@@ -291,7 +294,8 @@ async def _multi_model_review_async(content: str, prompt: str,
                                      session_policy: dict = None,
                                      usage_attribution: dict = None,
                                      retry_key: str = "", task_evidence: dict = None):
-    from ouroboros.review_execution import ReviewRouteKind, delivery_retrieves
+    from ouroboros.review_execution import ReviewRouteKind
+    from ouroboros.reviewer_slot_config import row_plan_retrieves
 
     row_routes = list(routes or []) + [ReviewRouteKind.API_CHAT] * max(0, len(models) - len(routes or []))
     # Per-row strength/target/identity vectors (6.1). Absent tails keep the
@@ -306,13 +310,12 @@ async def _multi_model_review_async(content: str, prompt: str,
     row_ids = _row_vector("slot_ids", lambda idx: _rev().slot_id_for_row(idx + 1))
     row_actors = _row_vector("subagent_ids", lambda idx: "")
     row_local = _row_vector("use_local", lambda idx: None)
-    # Pack assembly follows the RETRIEVES class, not the route name: an
-    # api-route row bound to a configured subagent retrieves with its own
-    # tools and must never trigger (or be counted into) the assembled pack.
-    any_api_rows = any(
-        not delivery_retrieves(route, row_actors[idx])
-        for idx, route in enumerate(row_routes[:len(models)])
-    )
+    # Pack assembly follows the RETRIEVES class, not the route name: a native
+    # or configured-subagent api row retrieves with its own tools and must
+    # never trigger (or be counted into) the assembled pack.
+    plan = {**(row_plan or {}), "routes": row_routes, "subagent_ids": row_actors}
+    row_retrieves = [row_plan_retrieves(plan, idx) for idx in range(len(models))]
+    any_api_rows = not all(row_retrieves)
     if not content:
         return {"error": "content is required"}
     if not prompt and any_api_rows:
@@ -341,7 +344,9 @@ async def _multi_model_review_async(content: str, prompt: str,
                      effort=row_efforts[idx], session_target=row_targets[idx],
                      session_profile=row_profiles[idx], surface=surface,
                      session_policy=session_policy, usage_attribution=usage_attribution,
-                     retry_key=retry_key, subagent_id=row_actors[idx], use_local=row_local[idx], task_evidence=task_evidence)
+                     retry_key=retry_key, subagent_id=row_actors[idx], use_local=row_local[idx], task_evidence=task_evidence,
+                     native_retrieval=row_retrieves[idx] and row_routes[idx] is ReviewRouteKind.API_CHAT
+                     and not row_actors[idx])
         for idx, m in enumerate(models)
     ]
     results = await asyncio.gather(*tasks)

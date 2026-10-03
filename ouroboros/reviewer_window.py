@@ -47,9 +47,10 @@ SESSION_ROUTE_PROVIDER = "agent_session"
 # store and reads it back from the cache.
 #
 # HOW OFTEN a route may be fetched at all is deliberately NOT answered here.
-# ``capability_evidence.probe`` owns that through the TTL on the record it stores
+# ``capability_evidence.probe`` owns remote fetches through the TTL on the record it stores
 # (confirmed 24h / failed 10 min) and returns the cache without touching the network
-# inside it. A process-lifetime ``_LAZY_WINDOW_PROBED`` memo used to answer it here
+# inside it; local capacity is read from the current serving instance.
+# A process-lifetime ``_LAZY_WINDOW_PROBED`` memo used to answer it here
 # too, and because the memo never expired while the evidence did, a healthy install
 # that stayed up past the 24h TTL read its own reviewers as EXPIRED forever: every
 # later resolution took the no-fetch path, so the whole process sized every review
@@ -151,6 +152,11 @@ def reviewer_route(model_id: str, *, session: bool = False) -> tuple:
 
         return provider, str(
             resolve_minimax_base_url(runtime_settings().get("MINIMAX_REGION") or "") or "")
+    if provider == "zai":
+        # Z.ai's base url is selected by the plan, the same way MiniMax's is by region.
+        from ouroboros.provider_models import resolve_zai_base_url
+
+        return provider, resolve_zai_base_url(runtime_settings().get("ZAI_PLAN") or "")
     settings_key = {
         "openai": "OPENAI_BASE_URL",
         "openai-compatible": "OPENAI_COMPATIBLE_BASE_URL",
@@ -177,9 +183,9 @@ def resolve_reviewer_window(
     policy. The probe is metadata-only — never generative, never
     a paid call — so an env-only pin can become known through a path it would
     otherwise never reach, and it stays re-confirmable for as long as the process
-    lives: ``probe`` serves the cache untouched inside its TTL and only reaches the
-    network once that TTL is spent, which is the whole of the rate limit this
-    surface needs (see the module-level note on ``_LAZY_ROUTE_LOCKS``).
+    lives: remote probes serve the cache inside its TTL and reach the network once
+    it expires; local probes read the current serving instance (see the
+    module-level note on ``_LAZY_ROUTE_LOCKS``).
 
     ``use_local=None`` (the default) derives the EFFECTIVE route from
     ``provider_models.review_model_uses_local`` — the same predicate every review
@@ -191,9 +197,8 @@ def resolve_reviewer_window(
     triad/plan prompts against the unknown-route 1M assumption. Callers pass an
     explicit bool only to pin a route the predicate cannot see.
 
-    Concurrent resolutions of the SAME route serialise on that route's lock and the
-    second one reads the evidence the first stored, instead of duplicating its
-    fetch."""
+    Concurrent resolutions of the SAME route serialise on that route's lock,
+    sharing remote fetches through the cache."""
     model = str(model_id or "")
     try:
         from ouroboros.capability_evidence import model_account_options, probe, route_fingerprint

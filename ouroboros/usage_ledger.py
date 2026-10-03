@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, Optional, Sequence, Tuple
 
 from ouroboros.utils import append_jsonl, replace_atomic, utc_now_iso
+from ouroboros._usage_money import LiteralFloat, amount, durable_literals
 
 log = logging.getLogger(__name__)
 
@@ -42,7 +43,7 @@ _TERMINAL = frozenset({"settled", "unresolved", "released"})
 
 __all__ = (
     "LEDGER_REL", "LOCK_REL", "QUARANTINE_REL", "UsageAccountingError", "UsageLedgerCorrupt",
-    "is_abandoned_settlement",
+    "UsageLockUnavailable", "UsageNonFiniteMoney", "is_abandoned_settlement",
 )
 
 
@@ -52,6 +53,25 @@ class UsageAccountingError(RuntimeError):
 
 class UsageLedgerCorrupt(UsageAccountingError):
     """Raised when durable history is structurally invalid."""
+
+
+class UsageNonFiniteMoney(UsageAccountingError):
+    """Nonfinite monetary evidence: preserve bytes, never quarantine or zero it."""
+
+
+class UsageLockUnavailable(UsageAccountingError):
+    """A named monetary lock was not acquired: the caller's timeout ran out, or
+    the platform refused the lock outright.
+
+    Distinct from corruption and validation failures: display readers may serve
+    their last validated snapshot only for positive contention. Platform refusal
+    and unknown failures propagate; every monetary caller fails closed.
+    """
+
+    def __init__(self, message: str, *, reason: str = "unknown", error_number: int | None = None):
+        super().__init__(message)
+        self.reason = reason
+        self.error_number = error_number
 
 
 def is_abandoned_settlement(row: Dict[str, Any]) -> bool:
@@ -214,25 +234,28 @@ def _named_lock(
     )
 
     path = root / "state" / filename
+    outcome: dict = {}
     fd = acquire_exclusive_file_lock(  # ENOLCK is the name tier for ordinary locks; money never runs there
         path, timeout_sec=timeout_sec, stale_sec=stale_sec, owner_aware_stale=True,
-        refuse_name_tier_errnos=frozenset({errno.ENOLCK}),
+        refuse_name_tier_errnos=frozenset({errno.ENOLCK}), outcome=outcome,
     )
     if fd is None:
-        raise UsageAccountingError(f"usage accounting lock unavailable: {path}")
+        raise UsageLockUnavailable(f"usage accounting lock unavailable: {path}",
+                                   reason=outcome.get("reason", "unknown"), error_number=outcome.get("errno"))
     try:
         yield lambda: refresh_exclusive_file_lock(path, fd)
     finally:
         release_exclusive_file_lock(path, fd)
 
 
+USAGE_LOCK_TIMEOUT_SEC = 45.0
+
+
 @contextlib.contextmanager
-def _locked(root: pathlib.Path) -> Iterator[Callable[[], bool]]:
-    # Operator fix 2026-07-23: 4.0s starves under a grown ledger (reserve_attempt
-    # re-reads the whole usage_attempts.jsonl under this lock — ~0.5s hold at 20MB),
-    # failing healthy tasks with UsageAccountingError at >=10 concurrent workers.
-    # Waiting longer is always correct here; the transaction itself stays atomic.
-    with _named_lock(root, LOCK_REL.name, timeout_sec=45.0, stale_sec=90.0) as heartbeat:
+def _locked(root: pathlib.Path, *, timeout_sec: float = USAGE_LOCK_TIMEOUT_SEC) -> Iterator[Callable[[], bool]]:
+    # Bounded maintenance and post-response custody. Task-owned pre-send policy
+    # supplies short acquisition slices; it never retries the transaction body.
+    with _named_lock(root, LOCK_REL.name, timeout_sec=timeout_sec, stale_sec=90.0) as heartbeat:
         yield heartbeat
 
 
@@ -394,8 +417,11 @@ def _validate_records(
         _validate_candidate_facts(row, sequence)
         for numeric_field in (
             "cost_usd", "reservation_upper_bound_usd", "reservation_usd",
-            "max_budget_usd", "global_limit_usd", "root_limit_usd",
+            "max_budget_usd", "global_limit_usd", "root_limit_usd", "billing_group_limit_usd",
         ):
+            # Nonfinite money is not a torn row. Its distinct error bypasses
+            # tail quarantine, including incremental fallback and compaction.
+            amount(row.get(numeric_field))
             if row.get(numeric_field) is not None and _number(row.get(numeric_field)) is None:
                 raise UsageLedgerCorrupt(f"invalid {numeric_field} in usage row seq={sequence}")
         for token_field in (
@@ -504,6 +530,21 @@ def _validate_records(
     _close_baseline_block()
 
 
+def _decode_record(chunk: bytes) -> Optional[Dict[str, Any]]:
+    """One JSONL grammar for full, incremental and unlocked prepared reads.
+
+    Only empty CR/LF lines are empty records. UTF-8 (without BOM), object
+    shape and literal money spelling are identical in every cache state.
+    """
+    raw = chunk.rstrip(b"\r\n")
+    if not raw:
+        return None
+    row = json.loads(raw.decode("utf-8"), parse_float=LiteralFloat)
+    if not isinstance(row, dict):
+        raise ValueError("row is not an object")
+    return row
+
+
 def _read_records_locked(root: pathlib.Path) -> list[Dict[str, Any]]:
     path = root / LEDGER_REL
     try:
@@ -519,21 +560,16 @@ def _read_records_locked(root: pathlib.Path) -> list[Dict[str, Any]]:
     last_nonempty = nonempty[-1] if nonempty else -1
     offset = 0
     for index, chunk in enumerate(chunks):
-        raw = chunk.rstrip(b"\r\n")
-        if not raw:
-            offset += len(chunk)
-            continue
         try:
-            row = json.loads(raw.decode("utf-8"))
-            if not isinstance(row, dict):
-                raise ValueError("row is not an object")
+            row = _decode_record(chunk)
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
             if index == last_nonempty:
                 _quarantine_tail(root, chunk, offset, f"{type(exc).__name__}: {exc}")
                 break
             raise UsageLedgerCorrupt(f"corrupt usage ledger row before tail: {index + 1}") from exc
-        records.append(row)
-        record_locations.append((offset, chunk))
+        if row is not None:
+            records.append(row)
+            record_locations.append((offset, chunk))
         offset += len(chunk)
     try:
         _validate_records(records)
@@ -618,17 +654,19 @@ def _ledger_resume_state(
 
 
 def _read_new_records_locked(
-    root: pathlib.Path, resume: LedgerResumeState
+    root: pathlib.Path, resume: LedgerResumeState, *, private: bool = False
 ) -> Optional[Tuple[list[Dict[str, Any]], LedgerResumeState]]:
     """Incrementally read rows appended after ``resume``; ``None`` = full refold.
 
     Returns ``(new_records, new_resume)`` when the resume fingerprint still
     matches and the appended tail parses and validates as a seq-continuous,
-    transition-legal continuation. Returns ``None`` whenever the resume state
-    cannot be trusted — file replaced (inode/device change), shrunk below the
-    resume offset, rewritten in place (same size, different mtime), or a
+    transition-legal continuation. Returns ``None`` on a detectable break —
+    file replaced (inode/device change), shrunk below the resume offset,
+    rewritten in place at the same size (different mtime), or a
     torn/structurally invalid tail — so the caller re-reads through the normal
-    ``_read_records_locked``, which OWNS quarantine. This function never
+    ``_read_records_locked``, which OWNS quarantine. Bytes before the offset are
+    never reread: a same-inode rewrite that grows the file can go undetected, so
+    history changes only by atomic replacement. This function never
     truncates or otherwise mutates the ledger, and must be called under the
     held ledger lock.
     """
@@ -659,31 +697,33 @@ def _read_new_records_locked(
         return None
     records: list[Dict[str, Any]] = []
     for chunk in data.splitlines():
-        raw = chunk.rstrip(b"\r")
-        if not raw:
-            continue
         try:
-            row = json.loads(raw.decode("utf-8"))
-            if not isinstance(row, dict):
-                raise ValueError("row is not an object")
+            row = _decode_record(chunk)
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
             return None
-        records.append(row)
-    seeded_states = dict(resume.states)
-    seeded_late_receipt_ids = set(resume.late_receipt_ids)
+        if row is not None:
+            records.append(row)
+    touched = {str(row.get("attempt_id") or "") for row in records}
+    seeded_states = {key: resume.states[key] for key in touched if key in resume.states}
+    seeded_late_receipt_ids = touched.intersection(resume.late_receipt_ids)
     try:
         _validate_records(records, start_seq=resume.row_count + 1, states=seeded_states,
                           late_receipt_ids=seeded_late_receipt_ids)
     except UsageLedgerCorrupt:
         return None
+    states = resume.states if private else dict(resume.states)
+    late_ids = resume.late_receipt_ids if private else set(resume.late_receipt_ids)
+    states.update(seeded_states)
+    late_ids.difference_update(touched)
+    late_ids.update(seeded_late_receipt_ids)
     return records, LedgerResumeState(
         stat.st_ino,
         stat.st_dev,
         stat.st_size,
         stat.st_mtime_ns,
         resume.row_count + len(records),
-        seeded_states,
-        seeded_late_receipt_ids,
+        states,
+        late_ids,
     )
 
 
@@ -691,6 +731,7 @@ def _append_rows_locked(
     root: pathlib.Path,
     records: Sequence[Dict[str, Any]],
     rows: Sequence[Dict[str, Any]],
+    *, resume: Optional[LedgerResumeState] = None,
 ) -> list[Dict[str, Any]]:
     if not rows:
         return []
@@ -698,8 +739,16 @@ def _append_rows_locked(
     materialized: list[Dict[str, Any]] = []
     for raw in rows:
         sequence += 1
-        materialized.append({**raw, "seq": sequence, "ts": str(raw.get("ts") or utc_now_iso())})
-    _validate_records([*records, *materialized])
+        materialized.append(durable_literals({**raw, "seq": sequence, "ts": str(raw.get("ts") or utc_now_iso())}))
+    if resume is None:
+        _validate_records([*records, *materialized])
+    else:
+        if resume.row_count != len(records):
+            raise UsageLedgerCorrupt("append resume does not match the validated prefix")
+        touched = {str(row.get("attempt_id") or "") for row in materialized}
+        _validate_records(materialized, start_seq=resume.row_count + 1,
+                          states={key: resume.states[key] for key in touched if key in resume.states},
+                          late_receipt_ids=touched.intersection(resume.late_receipt_ids))
     payload = b"".join(
         (json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
         for row in materialized

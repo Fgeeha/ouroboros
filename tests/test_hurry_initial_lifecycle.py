@@ -68,6 +68,7 @@ def pool(tmp_path, monkeypatch):
     proc.is_alive = lambda: proc.alive
     slot = workers.Worker(0, proc, stdqueue.Queue())
     monkeypatch.setattr(workers, "WORKERS", {0: slot})
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     state.update_state(lambda row: row.update(owner_chat_id=1))
     return SimpleNamespace(root=tmp_path, slot=slot, events=events, jobs=jobs, respawns=respawns)
 
@@ -89,18 +90,24 @@ def _enqueue_origin(pool, monkeypatch, origin):
         state.update_state(lambda row: row.update(evolution_mode_enabled=True))
         queue.enqueue_evolution_task_if_needed()
         task_id = queue.PENDING[0]["id"]
+    elif origin == "plain":  # a receipt-less row: a legacy snapshot or a failed resolver receipt
+        task_id = queue.enqueue_task({"id": "plain", "type": "task", "chat_id": 1})["id"]
     else:
         from supervisor import update_merge
 
         task_id = "update_assisted_merge_test"
         tx = {"task_id": task_id, "phase": "assisted_resolution", "owner_chat_id": 1,
-              "target_sha": "target", "pre_update_sha": "baseline"}
+              "target_sha": "target", "pre_update_sha": "baseline", "resolver_submitted_id": ""}
         update_merge.write_update_tx(tx)
         assert update_merge.enqueue_assisted_resolution_task(tx) == task_id
         assert not workers.worker_pool_admission_state()["available"]
         assert workers.repo_writer_task_allowed(queue.PENDING[0])
     assert len(queue.PENDING) == 1
-    assert not results.task_result_path(pool.root, task_id, create=False).exists()
+    if origin == "plain":  # hurry seeds the receipt-less row's missing lifecycle
+        assert not results.task_result_path(pool.root, task_id, create=False).exists()
+    else:  # host producers admit with their own positive scheduled receipt
+        receipt = results.load_task_result(pool.root, task_id, strict=True)
+        assert receipt["status"] == "scheduled" and receipt["host_admission"]["status"] == "accepted"
     return task_id
 
 
@@ -111,20 +118,41 @@ def _hurry(root, task_id):
         return client.post(f"/api/tasks/{task_id}/hurry", json={"request_id": "request-1"})
 
 
-@pytest.mark.parametrize("origin", ["review", "evolution", "assisted", "restore"])
+@pytest.mark.parametrize("origin", ["review", "evolution", "assisted", "restore", "plain"])
 @pytest.mark.parametrize("phase", ["pending", "assigned"])
 @pytest.mark.parametrize("exitcode", [-11, 1])
 def test_real_admission_hurry_and_pre_running_death_recover(pool, monkeypatch, origin, phase, exitcode):
     task_id = _enqueue_origin(pool, monkeypatch, origin)
+    before_hurry = results.load_task_result(pool.root, task_id, strict=True)
     if phase == "assigned":
         workers.assign_tasks()
         assert task_id in queue.RUNNING
-        assert not results.task_result_path(pool.root, task_id, create=False).exists()
+        before_hurry = results.load_task_result(pool.root, task_id, strict=True)
+        assert before_hurry["status"] == ("requested" if origin == "plain" else "scheduled")
+        assert before_hurry["admitted_dispatch"] == "possible"
     response = _hurry(pool.root, task_id)
     assert response.status_code == 200, response.text
     row = results.load_task_result(pool.root, task_id, strict=True)
-    assert row["status"] == ("scheduled" if phase == "pending" else "running")
-    assert set(row) == {"task_id", "status", "_schema_version", "ts", "updated_at", "owner_hurry"}
+    if phase == "pending" and origin == "plain":
+        # Only a receipt-less row is seeded, from its exact admitted queue facts.
+        assert row["status"] == "scheduled"
+        admitted = queue.PENDING[0]
+        persisted = {key for key in (
+            "type", "chat_id", "metadata", "task_contract", "parent_task_id", "delegation_role",
+            "project_id", "workspace_root", "workspace_mode", "memory_mode", "budget_drive_root",
+            "queued_at", "admitted_dispatch", "_admission_owner_token", "origin_message_text",
+            "origin_message_ref", "objective", "title", "suggested_name", "original_task_id", "timeout_retry_from",
+            "deadline_at", "root_cost_ceiling_usd", "billing_group", "task_constraint", "objective_author",
+            "owner_corpus", "task_group_id", "task_group",
+        ) if key in admitted}
+        assert set(row) == ({"task_id", "status", "_schema_version", "ts", "updated_at", "owner_hurry",
+                             "root_task_id", "description", "task_attempt"} | persisted)
+        assert all(row[key] == admitted[key] for key in persisted)
+        assert row["root_task_id"] == task_id and row["description"] == admitted.get("text", "")
+        # The host attempt key (terminal_time witness), never the queue-private `_attempt`.
+        assert row["task_attempt"] == admitted["_attempt"]
+    else:
+        assert {key: value for key, value in row.items() if key != "owner_hurry"} == before_hurry
     assert row["owner_hurry"]["attempt_key"] == 1
     assert [entry["kind"] for entry in drain_owner_entries(pool.root, task_id)] == [KIND_HURRY]
     assert not (pool.root / "logs/chat.jsonl").exists()
@@ -153,7 +181,7 @@ def test_real_admission_hurry_and_pre_running_death_recover(pool, monkeypatch, o
 
 
 def test_initializer_holds_queue_lock_and_does_not_rewrite_existing_wait(pool, monkeypatch):
-    task_id = _enqueue_origin(pool, monkeypatch, "review")
+    task_id = _enqueue_origin(pool, monkeypatch, "plain")
     actual = results.write_task_result
     calls = []
 
@@ -165,7 +193,12 @@ def test_initializer_holds_queue_lock_and_does_not_rewrite_existing_wait(pool, m
 
     monkeypatch.setattr(results, "write_task_result", observe)
     _admit_hurry_locked(task_id)
-    assert calls == [{"create_only": True, "strict_existing_dict": True}]
+    assert len(calls) == 1
+    assert calls[0]["create_only"] is True and calls[0]["strict_existing_dict"] is True
+    row = results.load_task_result(pool.root, task_id, strict=True)
+    assert {key: value for key, value in calls[0].items() if key not in {"create_only", "strict_existing_dict"}} == {
+        key: value for key, value in row.items() if key not in {"task_id", "status", "_schema_version", "ts", "updated_at"}}
+    assert row["root_task_id"] == task_id and row["metadata"] == queue.PENDING[0]["metadata"]
     actual(pool.root, task_id, "running", owner_wait={"state": "waiting", "wait_id": "w", "source_ref": {"sha256": "source"}},
            metadata={"grant": "preserved"}, started_at="original", model_waits={"quota": "kept"})
     path = results.task_result_path(pool.root, task_id)
@@ -252,7 +285,7 @@ def test_invalid_existing_bytes_refuse_create_and_hurry(pool, monkeypatch, raw):
 def test_storage_failure_does_not_write_hurry(pool, monkeypatch, failure):
     from ouroboros import owner_hurry
 
-    tid = _enqueue_origin(pool, monkeypatch, "review")
+    tid = _enqueue_origin(pool, monkeypatch, "plain")
     def fail(*args, **kwargs):
         raise OSError("storage unavailable")
     monkeypatch.setattr(results, "load_task_result" if failure == "read" else "write_task_result", fail)

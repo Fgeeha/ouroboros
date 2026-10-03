@@ -11,12 +11,20 @@ from __future__ import annotations
 import hashlib
 import logging
 import pathlib
+import stat
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from ouroboros.contracts.skill_manifest import SkillManifest, SkillManifestError, canonical_skill_name, parse_skill_manifest_text
 from ouroboros.contracts.plugin_api import FORBIDDEN_SKILL_SETTINGS
 from ouroboros.contracts.schema_versions import with_schema_version
+# Peer-conflict projection lives in its own leaf (module-size gate); it is
+# re-exported here so every historical import site keeps working unchanged.
+from ouroboros.skill_conflicts import (
+    _MAX_CONFLICT_PROJECTION,  # noqa: F401
+    enabled_skill_conflicts,  # noqa: F401
+    skill_conflict_status,  # noqa: F401
+)
 from ouroboros.skill_review_status import STATUS_BLOCKERS, STATUS_CLEAN, STATUS_PENDING, STATUS_WARNINGS, VALID_SKILL_REVIEW_STATUSES, aggregate_skill_review_status, normalize_skill_review_status, skill_review_gate
 from ouroboros.utils import append_jsonl, atomic_write_json, read_json_dict, utc_now_iso
 from ouroboros.review_records import validate_author_disposition
@@ -127,6 +135,10 @@ class LoadedSkill:
     source: str = "native"
     is_self_authored: bool = False
     identity_collision: bool = False
+
+    @property
+    def conflicts(self) -> tuple[str, ...]:
+        return tuple(self.manifest.conflicts or ())
 
     @property
     def available_for_execution(self) -> bool:
@@ -316,16 +328,13 @@ def _iter_payload_files(
     manifest_scripts: Optional[List[Dict[str, Any]]] = None,
     include_control_files: bool = False,
 ) -> List[pathlib.Path]:
-    """Return files hashed for review freshness.
+    """List regular runtime payload files, excluding cache trees and symlink escapes.
 
-    The hash covers every regular runtime-reachable file under ``skill_dir``
-    except metadata/cache paths, lifecycle control files
-    (``HASH_EXEMPT_CONTROL_FILENAMES``), and symlink escapes. Manifest entry
-    points are re-added only when confined, keeping executable and reviewed
-    surfaces aligned. ``include_control_files=True`` reproduces the legacy
-    pre-v6.31 hash (control files included) for one-shot state migration.
-    Sensitive-looking filenames refuse ordinary loading; Cyber includes them
-    in the same byte hash and review pack rather than silently omitting them.
+    Confined manifest entries are re-added even under excluded directories,
+    keeping executable entry points inside the reviewed surface.
+    Native lifecycle markers are omitted unless ``include_control_files`` requests
+    their legacy pre-v6.31 hash. Sensitive filenames refuse ordinary loading;
+    Cyber includes them in the byte hash and review pack.
     """
     out: List[pathlib.Path] = []
     seen: set[pathlib.Path] = set()
@@ -345,15 +354,13 @@ def _iter_payload_files(
         resolved = (skill_dir / rel).resolve()
         try:
             resolved.relative_to(resolved_root)
-        except ValueError:
+            # is_file() hides ELOOP; an unreadable declared entry cannot be omitted from its hash.
+            if stat.S_ISREG(resolved.stat().st_mode):
+                _add(resolved)
+        except (ValueError, FileNotFoundError, NotADirectoryError):
             return
-        if resolved.is_file():
-            _add(resolved)
 
-    # Broad walk: everything runtime-reachable, minus metadata/cache names.
-    # Every candidate is resolved back under skill_dir so symlinks cannot leak
-    # outside files into reviewer prompts. Sensitive-path policy is shared with
-    # repo review.
+    # Confinement and the shared sensitive-path policy still cover every candidate.
     from ouroboros.tools.review_helpers import (
         _SENSITIVE_EXTENSIONS,
         _SENSITIVE_NAMES,
@@ -373,15 +380,21 @@ def _iter_payload_files(
         return False
 
     if resolved_root.is_dir():
-        for path in sorted(resolved_root.rglob("*")):
+        paths = []
+        pending = [resolved_root]
+        while pending:
+            directory = pending.pop()
+            for path in directory.glob("*"):
+                if path.name in _SKILL_DIR_CACHE_NAMES:
+                    continue
+                if path.is_dir() and not path.is_symlink():
+                    pending.append(path)
+                else:
+                    paths.append(path)
+        for path in sorted(paths):
             if not path.is_file():
                 continue
-            try:
-                rel_parts = path.relative_to(resolved_root).parts
-            except ValueError:
-                continue
-            if any(part in _SKILL_DIR_CACHE_NAMES for part in rel_parts):
-                continue
+            rel_parts = path.relative_to(resolved_root).parts
             # Only the TOP-LEVEL lifecycle marker of a NATIVE-bucket payload is
             # hash-exempt (the launcher writes it there; P3: everywhere else a
             # file by that name is ordinary runtime-reachable payload and stays
@@ -499,7 +512,7 @@ def compute_content_hash(
 
 
 def load_enabled(drive_root: pathlib.Path, name: str) -> bool:
-    state = read_json_dict(skill_state_dir(drive_root, name) / "enabled.json")
+    state = read_json_dict(skill_state_dir_path(drive_root, name) / "enabled.json")
     if not isinstance(state, dict):
         return False
     enabled = state.get("enabled")
@@ -738,7 +751,7 @@ def _merge_allowed(*value_groups: Any, allowed: set[str], upper: bool = False) -
 
 
 def load_skill_grants(drive_root: pathlib.Path, name: str) -> Dict[str, Any]:
-    data = read_json_dict(skill_state_dir(drive_root, name) / GRANTS_FILENAME)
+    data = read_json_dict(skill_state_dir_path(drive_root, name) / GRANTS_FILENAME)
     if not isinstance(data, dict):
         return {"granted_keys": [], "granted_permissions": [], "updated_at": ""}
     keys = _unique_text(data.get("granted_keys"), upper=True)
@@ -1395,6 +1408,34 @@ def discover_selected_skill_candidates(
     )
 
 
+def discover_skill_identity(
+    drive_root: pathlib.Path,
+    name: str,
+    *,
+    repo_path: str | None = None,
+) -> List[LoadedSkill]:
+    """Load one identity with ORDINARY discovery semantics, nothing else read.
+
+    Same inventory and collision rules as ``discover_skills`` restricted to one
+    canonical name — no manifestless opt-in, so a directory without a manifest
+    beside a valid skill of the same name stays invisible here exactly as it is
+    to passive discovery. This is the resolver every EXECUTION caller uses
+    (liveness, reconcile, the extension child); the repair/publication lanes
+    keep ``discover_selected_skill_candidates`` and its deliberately stricter
+    manifestless ambiguity.
+    """
+    if repo_path is None:
+        from ouroboros.config import get_skills_repo_path
+
+        repo_path = get_skills_repo_path()
+    safe = _sanitize_skill_name(name)
+    candidates = tuple(
+        item for item in _skill_location_inventory(drive_root, repo_path=repo_path)
+        if item.name == safe
+    )
+    return _load_skill_location_candidates(candidates, drive_root=drive_root)
+
+
 def find_skill(
     drive_root: pathlib.Path,
     name: str,
@@ -1403,52 +1444,10 @@ def find_skill(
 ) -> Optional[LoadedSkill]:
     """Return one skill by name, including broken manifests with ``load_error``."""
     safe = _sanitize_skill_name(name)
-    for skill in discover_skills(drive_root, repo_path=repo_path):
+    for skill in discover_skill_identity(drive_root, name, repo_path=repo_path):
         if skill.name == safe:
             return skill
     return None
-
-
-_MAX_CONFLICT_PROJECTION = 8
-
-
-def enabled_skill_conflicts(
-    skill: LoadedSkill,
-    skills: List[LoadedSkill],
-) -> List[str]:
-    """Return enabled installed peers conflicting with ``skill``.
-
-    A declaration on either side is authoritative, so one-sided manifests are
-    enforced symmetrically. Missing and disabled peers are deliberately inert.
-    """
-    declared = set(skill.manifest.conflicts or [])
-    conflicts = {
-        peer.name
-        for peer in skills
-        if peer.name != skill.name
-        and peer.enabled
-        and (
-            peer.name in declared
-            or skill.name in set(peer.manifest.conflicts or [])
-        )
-    }
-    return sorted(conflicts)
-
-
-def skill_conflict_status(
-    skill: LoadedSkill,
-    skills: List[LoadedSkill],
-) -> Optional[Dict[str, Any]]:
-    """Return a bounded API-safe projection of enabled peer conflicts."""
-    names = enabled_skill_conflicts(skill, skills)
-    if not names:
-        return None
-    visible = names[:_MAX_CONFLICT_PROJECTION]
-    return {
-        "code": "skill_conflict",
-        "skills": visible,
-        "omitted": len(names) - len(visible),
-    }
 
 
 def list_available_for_execution(
@@ -1590,7 +1589,7 @@ __all__ = [
     "AutoGrantOutcome", "LoadedSkill", "HASH_EXEMPT_CONTROL_FILENAMES",
     "SkillReviewState", "auto_grant_if_enabled",
     "VALID_REVIEW_STATUSES", "compute_content_hash", "reduce_skill_content_hash", "discover_skills",
-    "discover_selected_skill_candidates", "find_skill",
+    "discover_selected_skill_candidates", "discover_skill_identity", "find_skill",
     "enabled_skill_conflicts", "skill_conflict_status",
     "grant_status_for_skill", "is_self_authored_skill_dir", "list_available_for_execution",
     "load_enabled", "load_review_state", "load_skill_grants", "load_skill",

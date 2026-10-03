@@ -45,7 +45,7 @@ function makeInstance({ details = {}, calls = [], state = { census: null } } = {
         state: { activePage: 'chat', projectChatIds: new Set(), unreadCount: 0 },
         updateUnreadBadge() {},
         stateSnapshots: {
-            begin: () => ({ generation: ++generation, requestedAt: Date.now() }),
+            begin: () => ({ generation: ++generation, requestedAt: Date.now() }), gate() { return Promise.resolve(this.begin()); },
             isCurrent: () => true,
             // The page-wide sequencer fans a fetched census into the instance.
             apply: (request, data) => { inst?.hydrateStateSnapshot(data, request.requestedAt); },
@@ -122,6 +122,36 @@ test('the census alone moves the header between Thinking... and Online', () => {
         fx.census([], true);
         assert.equal(fx.status(), 'Online');
         assert.equal(fx.typingHidden(), true);
+    } finally { fx.instance.destroy(); restoreDom(fx.prior); }
+});
+
+test('a direct owner Pause agrees between the actual card and header, then Resume restores Thinking', () => {
+    const fx = makeInstance();
+    try {
+        const id = 'paused-direct-turn';
+        fx.handlers.get('chat')({ chat_id: 1, task_id: id, role: 'assistant', is_progress: true,
+            _is_direct_chat: true, cancelable: true, content: 'Checking the saved work.', ts: '2026-09-28T06:00:00Z' });
+        const row = { activity_id: id, chat_id: 1, kind: 'direct_chat' };
+        fx.census([{ ...row, phase: 'thinking' }], true);
+        assert.equal(fx.status(), 'Thinking...');
+        fx.census([{ ...row, phase: 'budget_pausing' }], true);
+        assert.equal(fx.status(), 'Pausing…');
+        assert.equal(fx.card(id).querySelector('[data-live-phase]')?.textContent, 'Pausing…');
+        fx.census([{ ...row, phase: 'budget_paused' }], true);
+        assert.equal(fx.status(), 'Paused');
+        assert.equal(fx.typingHidden(), true);
+        assert.equal(fx.card(id).querySelector('[data-live-phase]')?.textContent, 'Paused');
+        assert.equal(fx.card(id).querySelector('[data-live-typing]')?.style.display, 'none');
+        fx.census([{ ...row, phase: 'unknown' }], false);
+        assert.equal(fx.status(), 'Activity unconfirmed');
+        assert.equal(fx.typingHidden(), true);
+        assert.equal(fx.card(id).querySelector('[data-live-phase]')?.textContent, 'Activity unconfirmed');
+        assert.equal(fx.card(id).querySelector('[data-live-typing]')?.style.display, 'none');
+        fx.census([{ ...row, phase: 'budget_paused' }], true);
+        assert.equal(fx.status(), 'Paused');
+        fx.census([{ ...row, phase: 'thinking' }], true);
+        assert.equal(fx.status(), 'Thinking...');
+        assert.equal(fx.card(id).querySelector('[data-live-phase]')?.textContent, 'Working');
     } finally { fx.instance.destroy(); restoreDom(fx.prior); }
 });
 

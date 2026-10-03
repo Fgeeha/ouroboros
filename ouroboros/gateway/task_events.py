@@ -709,7 +709,9 @@ def _event_from_log_entry(source: str, line_no: int, entry: Dict[str, Any], root
     elif source == "chat":
         event_type = "message"
     elif source == "tools":
-        event_type = "tool_call"
+        # A call's start and wait-ended rows keep their own type (#1316): only the
+        # settlement is a "tool_call" event, so a replay counts each call once.
+        event_type = event_type if event_type in {"tool_call_started", "tool_call_timeout"} else "tool_call"
     data = dict(entry)
     data = public_task_result(
         data,

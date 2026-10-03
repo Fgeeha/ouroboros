@@ -54,7 +54,6 @@ TOOL_MODULES = [
     "ouroboros.tools.git_rollback",
     "ouroboros.tools.git_pr",
     "ouroboros.tools.github",
-    "ouroboros.tools.ci",
     "ouroboros.tools.verify",
 ]
 
@@ -99,22 +98,22 @@ def test_tool_set_matches(registry):
 
 EXPECTED_TOOLS = [
     "browse_page", "browser_action",
-    "run_ci_tests",
     "preflight_review", "review_status",
     "compact_context", "set_tool_timeout", "request_restart",
-    "promote_to_stable", "schedule_subagent", "schedule_followup",
+    "promote_to_stable", "schedule_subagent", "schedule_followup", "manage_schedules",
     "configure_presence", "initiate_presence",
     "integrate_subagent_patch", "compare_subagent_patches",
     # C1: the explicit acceptance seam for a delegated run's captured patch —
     # a first-class tool, so the registry contract must name it.
-    "integrate_delegated_patch", "cancel_task",
+    "integrate_delegated_patch", "cancel_task", "resume_child_task",
     "peek_task", "discard_child_result", "override_delegation_constraint",
     "request_deep_self_review", "chat_history", "update_scratchpad",
     "send_user_message", "update_identity", "toggle_evolution",
     "toggle_consciousness",
     "set_next_wakeup", "switch_model", "get_task_result",
-    "wait_task", "wait_tasks", "tree_note", "tree_read",
+    "wait_task", "wait_tasks", "await_messages", "tree_note", "tree_read",
     "delegate_start", "delegate_wait", "delegate_cancel", "delegate_answer",
+    "delegate_message",
     "read_file", "list_files", "write_file", "edit_text",
     "apply_patch", "edit_batch",
     "send_photo", "send_video", "send_file", "send_links", "search_code", "query_code", "escalate",
@@ -124,7 +123,7 @@ EXPECTED_TOOLS = [
     "vcs_pull_ff", "vcs_restore", "vcs_revert",
     "fetch_pr_ref", "create_integration_branch", "cherry_pick_pr_commits",
     "stage_adaptations", "stage_pr_merge", "vcs_rollback",
-    "list_github_prs", "get_github_pr", "comment_on_pr",
+    "list_github_prs", "get_github_pr", "get_github_checks", "comment_on_pr", "pr_merge",
     "list_github_issues", "get_github_issue", "comment_on_issue",
     "close_github_issue", "create_github_issue",
     "codebase_health", "knowledge_read", "knowledge_write", "knowledge_list",
@@ -132,7 +131,8 @@ EXPECTED_TOOLS = [
     "promote_chat_to_task", "route_to_project", "list_projects", "steer_task",
     "ensure_project_scope", "schedule_followup",
     "memory_map", "memory_update_registry",
-    "plan_task", "recent_tasks", "task_acceptance_review", "verify_and_record", "web_search",
+    "plan_task", "recent_tasks", "live_roots", "update_focus",
+    "task_acceptance_review", "finish_task", "verify_and_record", "web_search",
     "start_service", "service_status", "service_logs", "stop_service",
     "run_command", "run_script",
     "list_skills", "skill_review", "skill_exec", "toggle_skill", "skill_owner_action",
@@ -227,10 +227,10 @@ def test_frozen_registry_includes_packaged_tool_modules(monkeypatch):
         "review_status",
         "plan_task",
         "vcs_rollback",
-        "run_ci_tests",
         # github.py is in _FROZEN_TOOL_MODULES — PR inspection tools must work in frozen builds
         "list_github_prs",
         "get_github_pr",
+        "get_github_checks",
         "comment_on_pr",
         "query_code",
     }
@@ -443,7 +443,7 @@ def test_no_oversized_modules():
 
 @pytest.mark.size_ratchet
 def test_size_ratchet_manifest_matches_live_tree():
-    """Exact module/function/band/byte debt matches the untruncated candidate tree."""
+    """Module/function/band/byte debt matches the untruncated candidate tree (a band entry may stay at 1501-1600 lines)."""
     from ouroboros.review import validate_size_ratchet
 
     errors = validate_size_ratchet(REPO)
@@ -457,8 +457,8 @@ def test_size_ratchet_transition_against_explicit_base():
     CI exports ``OURO_SIZE_RATCHET_BASE_REF`` (PR base SHA / push
     ``event.before``); without it the check degrades to the tip's parent
     manifest — the merge-aware local semantics. An all-zeros base (new-branch /
-    tag push) degrades the same way (never a skip), while manifest exactness
-    stays enforced by ``test_size_ratchet_manifest_matches_live_tree``.
+    tag push) degrades the same way (never a skip), while the manifest matching
+    the tree stays enforced by ``test_size_ratchet_manifest_matches_live_tree``.
     """
     from ouroboros.review import validate_size_ratchet_transition_against_base
 

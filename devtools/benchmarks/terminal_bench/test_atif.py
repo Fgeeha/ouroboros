@@ -145,6 +145,31 @@ def test_rotated_events_and_tools_stay_in_the_trajectory(tmp_path: Path) -> None
     assert trajectory["agent"]["version"] == "6.56.0"  # startup row lives in the archive
 
 
+def test_each_logical_call_is_one_step_with_what_the_model_saw(tmp_path: Path) -> None:
+    """#1316: a call writes start / settlement / wait-end rows sharing one invocation_id.
+    A start-only call stays as an unknown outcome; a call whose wait ended shows the
+    timeout text at the timeout's position even when the worker settled later."""
+    agent = _make_agent_dir(tmp_path)
+    ts = "2026-07-04T18:02:{:02d}+00:00".format
+    base = {"tool": "run_command", "args": {"cmd": ["make"]}}
+    _write_jsonl(agent / "ouroboros-data" / "logs" / "tools.jsonl", [
+        {**base, "ts": ts(1), "type": "tool_call_started", "invocation_id": "done"},
+        {**base, "ts": ts(2), "type": "tool_call", "invocation_id": "done", "result_preview": "ok", "status": "ok"},
+        {**base, "ts": ts(3), "type": "tool_call_started", "invocation_id": "slow"},
+        {**base, "ts": ts(4), "type": "tool_call_timeout", "invocation_id": "slow",
+         "result_preview": "⚠️ TOOL_TIMEOUT (run_command): exceeded 60s limit."},
+        {**base, "ts": ts(5), "type": "tool_call_started", "invocation_id": "lost"},
+        {**base, "ts": ts(6), "type": "tool_call", "invocation_id": "slow", "result_preview": "late", "status": "ok"},
+    ])
+    steps = [s for s in build_trajectory(agent)["steps"] if s.get("tool_calls")]
+    assert [s["timestamp"] for s in steps] == [ts(2), ts(4), ts(5)]  # one step per call
+    seen = [s["observation"]["results"][0]["content"] for s in steps]
+    assert seen[0] == "ok"
+    assert seen[1].startswith("[status=timeout is_error=True]\n⚠️ TOOL_TIMEOUT") and "late" not in seen[1]
+    assert "the model saw only this timeout" in seen[1]
+    assert seen[2].startswith("[status=unknown is_error=False]") and "no outcome recorded" in seen[2]
+
+
 def test_build_trajectory_minimal_dir(tmp_path: Path) -> None:
     agent = tmp_path / "agent"
     agent.mkdir()

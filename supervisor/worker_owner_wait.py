@@ -82,8 +82,27 @@ def handle_owner_wait(event: dict, ctx: Any) -> None:
             return
         wait = {**wait, "started_at": meta["started_at"], "state": "waiting"}
         try:
+            # A warm wait may arrive before the cold consumption notification
+            # (or its repair tick). Fold that exact interval before installing
+            # the new one; a stale consumed event cannot own the warm interval.
+            resume = meta["task"].get("_budget_pause_resume") or {}
+            if resume.get("sleep_exclusion_since"):
+                from supervisor.events_budget import _handle_budget_pause
+
+                _handle_budget_pause({"phase": "consumed", "task_id": task_id,
+                    "task_attempt": attempt, "pause_id": resume.get("pause_id"),
+                    "grant_id": resume.get("grant_id")}, ctx)
+                if meta["task"].get("_budget_pause_resume"):
+                    raise RuntimeError("cold sleep consumption is not yet confirmed")
             wait = set_owner_wait(ctx.DRIVE_ROOT, task_id, wait)
             meta["owner_wait"] = wait
+            if isinstance(wait.get("sleep"), dict):
+                # A model sleep is not execution: excluded live until the task runs again.
+                meta.setdefault("sleep_parked_at", _pool().time.time())
+            # A spent exact-budget carrier still on this row is retired by the
+            # revocation seam's ``_owner_wait_resume`` branch when the restart
+            # reads the durable grant as consumed (#1196, F3); it decides nothing
+            # while the task stays RUNNING here.
             worker.active_capacity = False
             if not queue.persist_queue_snapshot(reason="owner_wait_parked"):
                 raise RuntimeError("owner wait queue snapshot was not persisted")
@@ -120,13 +139,6 @@ def _resume_allowed(task_id: str, meta: dict, worker: Any) -> bool:
         log.warning("Owner wait cannot read cancellation authority for %s", task_id, exc_info=True)
         return False
     return (not intent or intent.get("stop_policy") == "finalize_then_cancel") and _pool().repo_writer_task_allowed(meta["task"])
-
-
-def _announce_wait_ended(task_id: str, quiz_id: str, chat_id: int) -> None:
-    """The bound closed and the pooled task resumed: one seam with the direct lane."""
-    from ouroboros.owner_wait import announce_wait_ended
-
-    announce_wait_ended(_pool().DRIVE_ROOT, task_id, quiz_id, chat_id)
 
 
 def _grant_resume(
@@ -173,8 +185,17 @@ def _grant_resume(
                 log.warning("Owner-wait rollback remains unpersisted for %s", task_id, exc_info=True)
             raise
         meta.pop("owner_wait_resume_requested", None)
-        if str(resumed.get("resume_reason") or "") == "timeout" and str(resumed.get("quiz_id") or ""):
-            _announce_wait_ended(task_id, str(resumed["quiz_id"]), int((meta.get("task") or {}).get("chat_id") or 0))
+        parked_at = meta.pop("sleep_parked_at", None)
+        if isinstance(parked_at, (int, float)):  # the ONE paused carrier every lifetime reader subtracts
+            meta["budget_paused_sec"] = float(meta.get("budget_paused_sec") or 0.0) + max(
+                0.0, _pool().time.time() - float(parked_at))
+        if (str(resumed.get("quiz_id") or "")
+                and not str(resumed.get("resume_reason") or "").startswith("control:")):
+            # The bound closed and the pooled task resumed: one seam with the direct lane.
+            from ouroboros.owner_wait import announce_wait_ended
+
+            announce_wait_ended(_pool().DRIVE_ROOT, task_id, str(resumed["quiz_id"]),
+                                int((meta.get("task") or {}).get("chat_id") or 0))
         # A mailbox wake is the start of useful model work, not a new attempt.
         meta["last_progress_at"] = _pool().time.time()
         return True

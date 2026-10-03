@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import contextlib
+import dataclasses
 import json
 import logging
 import os
 import pathlib
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from ouroboros.config import DATA_DIR
 from ouroboros.contracts.schema_versions import SCHEMA_VERSION_KEY
@@ -57,14 +59,41 @@ def atomic_write_text(path: pathlib.Path, content: str) -> None:
 
 
 def json_load_file(path: pathlib.Path) -> Optional[Dict[str, Any]]:
+    """Legacy best-effort read (None for every failure). Authority reads use ``read_state``."""
+    status, obj, _raw, _detail = _read_json_file(path)
+    return obj if status == "ok" else None
+
+
+def read_state_copy(path: pathlib.Path) -> Tuple[str, Optional[Dict[str, Any]], str]:
+    """``(status, object, detail)`` of one state-shaped file, never written (display readers)."""
+    status, obj, _raw, detail = _read_json_file(path)
+    return status, obj, detail
+
+
+def _read_json_file(path: pathlib.Path) -> Tuple[str, Optional[Dict[str, Any]], bytes, str]:
+    """``(status, object, raw bytes, detail)`` for one state copy, classified by the
+    operation itself (#1307): ``missing`` only for a not-found below a real directory
+    (``confirm_absent``), ``unreadable`` for any other OSError (EACCES, ENFILE, EIO, and
+    ENOTDIR — a file where ``state/`` belongs is not absence, on Windows too),
+    ``invalid`` for bytes that are not a non-empty JSON object. No ``exists()``
+    pre-check: it can fail the same way."""
+    from supervisor.state_initialization import confirm_absent
+
     try:
-        if not path.exists():
-            return None
-        obj = json.loads(path.read_text(encoding="utf-8"))
-        return obj if isinstance(obj, dict) else None
-    except Exception:
-        log.debug(f"Failed to load JSON from {path}", exc_info=True)
-        return None
+        try:
+            raw = pathlib.Path(path).read_bytes()
+        except FileNotFoundError:
+            confirm_absent(path)
+            return "missing", None, b"", ""
+    except OSError as exc:
+        return "unreadable", None, b"", f"{type(exc).__name__} errno={exc.errno}"
+    try:
+        obj = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        return "invalid", None, raw, type(exc).__name__
+    if not isinstance(obj, dict) or not obj:
+        return "invalid", None, raw, "not a non-empty JSON object"
+    return "ok", obj, raw, ""
 
 
 def acquire_file_lock(lock_path: pathlib.Path, timeout_sec: float = 4.0,
@@ -131,123 +160,437 @@ def ensure_state_defaults(st: Dict[str, Any]) -> Dict[str, Any]:
     return st
 
 
+# --- #1307: typed read quality, writer-owned recovery, one explicit initializer ---
+#
+# ``state.json`` is a small service file (owner binding, evolution/consciousness
+# controls, session identity, legacy money projection). Absent, corrupt and
+# unreadable-right-now are different facts: only the explicit ``init_state`` may
+# create a first state, a readable backup restores DATA but never current control
+# authority (its controls stay ``unconfirmed`` in the writer-owned ``_recovery``
+# block until an actual decision confirms each one; only a set owner binding of the
+# same initialization identity is proven), and an unreadable primary is never
+# overwritten. Money never reads this file (ledger authority).
+
+RECOVERY_KEY = "_recovery"
+STATE_READ_KEY = "_state_read"  # projection-only read quality; never persisted
+CONTROL_KEYS = (
+    "evolution_mode_enabled", "evolution_owner_stopped", "evolution_stop_source",
+    "post_task_autostop", "bg_consciousness_enabled",
+    "owner_id", "owner_chat_id", "owner_external_id", "owner_external_chat_id",
+)
+OPTIONAL_CONTROL_KEYS = frozenset({"evolution_stop_source", "post_task_autostop"})
+CURRENT_QUALITIES = frozenset({"current", "recovered"})
+
+
+class StateUnavailable(RuntimeError):
+    """State authority or persistence is unavailable; partial writes are explicit."""
+
+    def __init__(self, reason: str, detail: str = "", *, primary_written: bool = False) -> None:
+        super().__init__(f"state unavailable: {reason}" + (f" ({detail})" if detail else ""))
+        self.reason = reason
+        self.primary_written = primary_written
+
+
+@dataclasses.dataclass(frozen=True)
+class StateRead:
+    """One state observation: its values WITH their source and quality.
+
+    ``current``: the primary copy, no pending recovery. ``recovered``: the primary
+    after a backup recovery; ``unconfirmed`` controls are unknown. ``recovered_transient``:
+    the primary cannot be read right now; backup values are display-only and every
+    control but a proven owner binding is unknown. ``uninitialized``/``unavailable``: no values."""
+
+    quality: str
+    source: str
+    values: Dict[str, Any]
+    unconfirmed: Tuple[str, ...] = ()
+    reason: str = ""
+
+    def projection(self) -> Dict[str, Any]:
+        """The legacy dict view for DISPLAY readers; authority uses ``control_value``."""
+        out = dict(self.values)
+        if self.quality != "current":
+            out[STATE_READ_KEY] = {"quality": self.quality, "source": self.source,
+                                   "unconfirmed": list(self.unconfirmed), "reason": self.reason}
+        return out
+
+
+def control_value(st: Dict[str, Any], key: str) -> Tuple[bool, Any]:
+    """``(known, value)`` of one control in a state dict (a projection or a live
+    mutator dict). Unknown when the read was not current or the key awaits
+    confirmation after a recovery: a missing fact is never a default."""
+    meta = st.get(STATE_READ_KEY) if isinstance(st, dict) else None
+    if isinstance(meta, dict) and (meta.get("quality") not in CURRENT_QUALITIES | {"recovered_transient"}
+                                   or key in (meta.get("unconfirmed") or ())):
+        return False, None
+    recovery = st.get(RECOVERY_KEY) if isinstance(st, dict) else None
+    if isinstance(recovery, dict) and key in (recovery.get("unconfirmed") or ()):
+        return False, None
+    return (True, st.get(key)) if isinstance(st, dict) and (key in st or key in OPTIONAL_CONTROL_KEYS) else (False, None)
+
+
+def control_in_copy(path: pathlib.Path, key: str) -> Tuple[bool, Any]:
+    """``control_value`` of one control in the primary copy at ``path`` (a lock-free read
+    for a caller that addresses a drive by path): unknown unless that copy is readable."""
+    status, obj, _raw, _detail = _read_json_file(path)
+    from supervisor.state_initialization import authority_reason
+
+    if status != "ok" or authority_reason(pathlib.Path(path).parent.parent, str(obj.get("initialization_id") or "")):
+        return False, None
+    return control_value(obj, key)
+
+
+def mark_unconfirmed(live: Dict[str, Any], key: str) -> None:
+    """Inside an ``update_state`` mutator: restore a control to unknown (a failed
+    decision puts back what it could not prove)."""
+    recovery = live.setdefault(RECOVERY_KEY, {"source": "restored_unknown"})
+    if key not in (recovery.setdefault("unconfirmed", [])):
+        recovery["unconfirmed"].append(key)
+
+
+def control_is(st: Dict[str, Any], key: str, expected: Any) -> bool:
+    """True only when the control is KNOWN to equal ``expected``."""
+    known, value = control_value(st, key)
+    return known and value == expected
+
+
+def _backup_unconfirmed(backup: Dict[str, Any], drive_root=None) -> Tuple[str, ...]:
+    """The controls a backup copy cannot prove. A SET owner binding is proven when the
+    backup carries the completed initialization identity: its only writers fill a
+    known-empty slot and only an owner Reset (a new identity, both copies deleted)
+    clears one, so within an identity a set binding never changes. Switches and an
+    empty binding slot may have changed after the backup was written: unknown."""
+    from supervisor import state_initialization as witness
+
+    identity = str(backup.get("initialization_id") or "")
+    status, record = witness.read_witness(drive_root or DRIVE_ROOT) if identity else ("missing", {})
+    same = status == "ok" and record.get("phase") == "complete" and record.get("initialization_id") == identity
+    return tuple(key for key in CONTROL_KEYS
+                 if not (same and key.startswith("owner_") and backup.get(key) is not None
+                         and key not in _recovery_unconfirmed(backup)))
+
+
+def _recovery_unconfirmed(st: Dict[str, Any]) -> Tuple[str, ...]:
+    recovery = st.get(RECOVERY_KEY)
+    return tuple(recovery.get("unconfirmed") or ()) if isinstance(recovery, dict) else ()
+
+
+def read_state(drive_root=None) -> StateRead:
+    """Classify both copies WITHOUT writing (a GET, a display, a boot probe)."""
+    from supervisor.state_initialization import authority_reason, read_witness
+    root = pathlib.Path(drive_root) if drive_root is not None else DRIVE_ROOT
+    p_status, primary, _raw, p_detail = _read_json_file(root / "state" / "state.json")
+    if p_status == "ok":
+        reason = authority_reason(root, str(primary.get("initialization_id") or ""))
+        if reason:
+            return StateRead("unavailable", "primary", dict(primary), CONTROL_KEYS, reason)
+        unconfirmed = tuple(set(_recovery_unconfirmed(primary)) | (set(CONTROL_KEYS) - primary.keys() - OPTIONAL_CONTROL_KEYS))
+        return StateRead("recovered" if unconfirmed else "current", "primary",
+                         ensure_state_defaults(dict(primary)), unconfirmed)
+    b_status, backup, _braw, b_detail = _read_json_file(root / "state" / "state.last_good.json")
+    reason = f"primary {p_status}{f' ({p_detail})' if p_detail else ''}; backup {b_status}"
+    if b_status == "ok":
+        return StateRead("recovered_transient", "backup", ensure_state_defaults(dict(backup)),
+                         _backup_unconfirmed(backup, root), reason)
+    w_status, _witness = read_witness(root)
+    quality = "uninitialized" if p_status == b_status == w_status == "missing" else "unavailable"
+    return StateRead(quality, "none", {}, CONTROL_KEYS, reason + (f" ({b_detail})" if b_detail else ""))
+
+
+def _preserve_corrupt_primary(raw: bytes) -> str:
+    """Keep the damaged primary's bytes under an exclusive new name before any
+    recovery write replaces them; refusal is typed, never a silent overwrite."""
+    stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
+    for suffix in range(100):
+        target = STATE_PATH.with_name(f"state.corrupt-{stamp}{f'-{suffix}' if suffix else ''}.json")
+        try:
+            fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise StateUnavailable("corrupt_primary_unpreserved", f"{type(exc).__name__}") from exc
+        try:
+            offset = 0
+            while offset < len(raw):
+                written = os.write(fd, raw[offset:])
+                if written <= 0:
+                    raise OSError("corrupt copy made no progress")
+                offset += written
+            os.fsync(fd)
+            if os.fstat(fd).st_size != len(raw):
+                raise OSError("corrupt copy length mismatch")
+        except OSError as exc:
+            raise StateUnavailable("corrupt_primary_unpreserved", type(exc).__name__) from exc
+        finally:
+            os.close(fd)
+        return target.name
+    raise StateUnavailable("corrupt_primary_unpreserved", "no free name")
+
+
+def _state_for_write(*, initializing: bool = False) -> Dict[str, Any]:
+    """The CURRENT dict a locked writer may mutate (caller holds STATE_LOCK).
+
+    A readable primary is returned as is. A missing/invalid primary with a readable
+    backup is durably RECOVERED first: the invalid bytes are preserved, the backup's
+    values become the primary with its unprovable controls ``unconfirmed`` (#1144: the ledger
+    freshness marker is dropped so money re-derives). Anything else raises."""
+    p_status, primary, raw, p_detail = _read_json_file(STATE_PATH)
+    if p_status == "ok":
+        from supervisor.state_initialization import authority_reason
+
+        reason = authority_reason(DRIVE_ROOT, str(primary.get("initialization_id") or ""))
+        if reason and not initializing:
+            # Ordinary bookkeeping may retain legacy data; it cannot adopt or grant.
+            if reason == "initialization_witness_missing" and not primary.get("initialization_id"):
+                for key in CONTROL_KEYS:
+                    mark_unconfirmed(primary, key)
+            else:
+                raise StateUnavailable(reason)
+        for key in set(CONTROL_KEYS) - primary.keys() - OPTIONAL_CONTROL_KEYS:
+            mark_unconfirmed(primary, key)
+        return primary
+    if p_status == "unreadable":
+        raise StateUnavailable("primary_unreadable", p_detail)
+    b_status, backup, _braw, b_detail = _read_json_file(STATE_LAST_GOOD_PATH)
+    if b_status != "ok":
+        raise StateUnavailable("uninitialized" if p_status == b_status == "missing" else "no_readable_copy",
+                               f"primary {p_status}; backup {b_status} {b_detail}".strip())
+    unconfirmed = list(_backup_unconfirmed(backup))
+    recovery: Dict[str, Any] = {"source": "backup", "primary": p_status, "recovered_at": utc_now_iso(),
+                                "unconfirmed": unconfirmed}
+    if p_status == "invalid":
+        recovery["corrupt_copy"] = _preserve_corrupt_primary(raw)
+    recovered = {key: value for key, value in backup.items() if key != "usage_ledger_high_water_seq"}
+    recovered[RECOVERY_KEY] = recovery
+    log.error("state.json %s; recovered values from state.last_good.json with %s unconfirmed",
+              p_status, ", ".join(unconfirmed))
+    _save_state_unlocked(recovered)
+    append_jsonl(DRIVE_ROOT / "logs" / "events.jsonl", {
+        "ts": utc_now_iso(), "type": "state_recovered_from_backup", "primary": p_status,
+        "unconfirmed": unconfirmed, **({"corrupt_copy": recovery["corrupt_copy"]}
+                                              if "corrupt_copy" in recovery else {})})
+    return recovered
+
+
 def _load_state_unlocked() -> Dict[str, Any]:
-    """Load state; caller must hold STATE_LOCK."""
-    recovered = False
-    st_obj = json_load_file(STATE_PATH)
-    if st_obj is None:
-        st_obj = json_load_file(STATE_LAST_GOOD_PATH)
-        recovered = st_obj is not None
-
-    if st_obj is None:
-        st = ensure_state_defaults({})
-        _save_state_unlocked(st)
-        return st
-
-    st = ensure_state_defaults(st_obj)
-    if recovered:
-        _save_state_unlocked(st)
-    return st
+    """Locked CURRENT dict for the legacy in-module writers (raises when unavailable)."""
+    return ensure_state_defaults(_state_for_write())
 
 
 def _save_state_unlocked(st: Dict[str, Any]) -> None:
     """Save state; caller must hold STATE_LOCK."""
+    st.pop(STATE_READ_KEY, None)
     st = ensure_state_defaults(st)
     st[SCHEMA_VERSION_KEY] = STATE_SCHEMA_VERSION
     payload = json.dumps(st, ensure_ascii=False, indent=2)
-    atomic_write_text(STATE_PATH, payload)
-    atomic_write_text(STATE_LAST_GOOD_PATH, payload)
+    primary_written = False
+    try:
+        if atomic_write_text(STATE_PATH, payload) is False:
+            raise OSError("primary writer returned False")
+        primary_written = True
+        if atomic_write_text(STATE_LAST_GOOD_PATH, payload) is False:
+            raise OSError("backup writer returned False")
+    except OSError as exc:
+        raise StateUnavailable("backup_write_failed" if primary_written else "primary_write_failed",
+                               f"{type(exc).__name__} errno={exc.errno}",
+                               primary_written=primary_written) from exc
 
 
-def _warn_state_unlocked(op: str, lock_fd: Optional[int]) -> None:
-    """Loud trail when the state lock could not be acquired.
-
-    Proceeding unlocked is a deliberate availability tradeoff (a wedged lock
-    must not freeze the supervisor), but it must never be silent: an unlocked
-    write is exactly the lost-update class this lock exists to prevent.
-    """
+@contextlib.contextmanager
+def _state_lock(op: str, timeout_sec: float = 4.0):
+    """STATE_LOCK or a typed refusal: a writer never proceeds unlocked (#1307)."""
+    assert_test_data_path(STATE_PATH)
+    try:
+        lock_fd = acquire_file_lock(STATE_LOCK_PATH, timeout_sec=timeout_sec)
+    except OSError as exc:
+        raise StateUnavailable("lock_unavailable", f"{type(exc).__name__} errno={exc.errno}") from exc
     if lock_fd is None:
-        log.error("state.json %s proceeding WITHOUT lock (timeout on %s)", op, STATE_LOCK_PATH)
+        log.error("state.json %s refused: lock timeout on %s", op, STATE_LOCK_PATH)
+        raise StateUnavailable("lock_timeout", op)
+    try:
+        yield
+    finally:
+        release_file_lock(STATE_LOCK_PATH, lock_fd)
 
 
 def load_state() -> Dict[str, Any]:
+    """Display projection of ``read_state``: never writes, never mints defaults for a
+    missing/unreadable file; a non-current read carries ``_state_read``."""
     assert_test_data_path(STATE_PATH)
-    lock_fd = acquire_file_lock(STATE_LOCK_PATH)
-    _warn_state_unlocked("load", lock_fd)
-    try:
-        return _load_state_unlocked()
-    finally:
-        release_file_lock(STATE_LOCK_PATH, lock_fd)
+    return read_state().projection()
 
 
 def save_state(st: Dict[str, Any]) -> None:
-    assert_test_data_path(STATE_PATH)
-    lock_fd = acquire_file_lock(STATE_LOCK_PATH)
-    _warn_state_unlocked("save", lock_fd)
-    try:
+    """Author one WHOLE state (fixtures and isolated tooling). Production changes
+    fields through ``update_state``. It never overwrites an unreadable primary,
+    preserves an invalid one's bytes, and keeps the writer-owned ``_recovery``."""
+    from supervisor import state_initialization as witness
+
+    with _state_lock("save"):
+        p_status, primary, raw, p_detail = _read_json_file(STATE_PATH)
+        if p_status == "unreadable":
+            raise StateUnavailable("primary_unreadable", p_detail)
+        st = {key: value for key, value in st.items() if key not in (RECOVERY_KEY, STATE_READ_KEY)}
+        created = ""
+        if p_status == "missing":
+            # A whole-state write mints identity ONLY where ``init_state`` would: never
+            # over a lost initialized state, a history, or a recoverable backup.
+            b_status, _backup, _braw, b_detail = _read_json_file(STATE_LAST_GOOD_PATH)
+            if b_status != "missing":
+                raise StateUnavailable("primary_missing", f"backup {b_status} {b_detail}".strip())
+            decision = witness.initialization_decision(DRIVE_ROOT)
+            if not decision.get("create"):
+                raise StateUnavailable(str(decision.get("reason") or "refused"), str(decision.get("detail") or ""))
+            created = st["initialization_id"] = str(decision["initialization_id"])
+        if p_status == "invalid":
+            primary = _state_for_write()
+            p_status = "ok"
+        if p_status == "ok":
+            for key in (set(CONTROL_KEYS) - primary.keys() - OPTIONAL_CONTROL_KEYS) | (set(CONTROL_KEYS) - st.keys() - OPTIONAL_CONTROL_KEYS):
+                mark_unconfirmed(primary, key)
+        if p_status == "ok" and isinstance(primary.get(RECOVERY_KEY), dict):
+            st[RECOVERY_KEY] = primary[RECOVERY_KEY]
+        if p_status == "ok":
+            try:
+                st["initialization_id"] = witness.prepare_adoption(DRIVE_ROOT, primary)
+            except ValueError as exc:
+                raise StateUnavailable(str(exc)) from exc
         _save_state_unlocked(st)
-    finally:
-        release_file_lock(STATE_LOCK_PATH, lock_fd)
+        if not witness.complete(DRIVE_ROOT, st["initialization_id"], adopted=not created):
+            raise StateUnavailable("initialization_incomplete", "the witness could not be completed")
 
 
-def update_state(mutator) -> Dict[str, Any]:
+def update_state(mutator, *, confirm: Tuple[str, ...] = (), lock_timeout_sec: float = 4.0) -> Dict[str, Any]:
     """Atomically read-modify-write state under a single held lock.
 
-    Loads the current state, applies ``mutator(st)`` in place, and persists the
-    result while holding STATE_LOCK for the WHOLE operation, so concurrent
-    updates cannot lose each other (load and save are one critical section — the
-    racy ``st = load_state(); st[...] = ...; save_state(st)`` pattern drops the
-    other writer's change). Returns the saved state.
+    Rereads CURRENT under STATE_LOCK, applies ``mutator(st)`` in place, and persists
+    the result while holding the lock for the WHOLE operation, so concurrent updates
+    cannot lose each other. Returns the saved state.
 
-    This is also the canonical home of ``update_state`` that
-    ``supervisor.events`` imports — it previously lived only in
-    ``ouroboros.review_state``, so ``from supervisor.state import update_state``
-    raised ImportError (e.g. toggling background consciousness via tool).
+    The ``_recovery`` block is writer-owned: a mutator cannot clear it, and only the
+    control keys a real decision names in ``confirm`` leave its ``unconfirmed`` list
+    (bookkeeping never launders a backup into authority). Lock timeout, an
+    unreadable primary or a missing state raise ``StateUnavailable`` with nothing
+    written — bounded, typed, never an unlocked write.
 
     ``mutator`` must NOT call ``load_state``/``save_state``/``update_state`` itself:
     STATE_LOCK is not re-entrant within a process, so re-entering would block.
     """
-    assert_test_data_path(STATE_PATH)
-    lock_fd = acquire_file_lock(STATE_LOCK_PATH)
-    _warn_state_unlocked("update", lock_fd)
-    try:
-        st = _load_state_unlocked()
+    with _state_lock("update", lock_timeout_sec):
+        st = ensure_state_defaults(_state_for_write())
+        before = _recovery_unconfirmed(st)
+        recovery = st.get(RECOVERY_KEY)
         mutator(st)
-        _save_state_unlocked(st)
-        return st
-    finally:
-        release_file_lock(STATE_LOCK_PATH, lock_fd)
-
-
-def init_state() -> Dict[str, Any]:
-    """Initialize session snapshots for budget drift detection."""
-    assert_test_data_path(STATE_PATH)
-    lock_fd = acquire_file_lock(STATE_LOCK_PATH)
-    try:
-        st = _load_state_unlocked()
-
-        st["session_spent_snapshot"] = float(st.get("spent_usd") or 0.0)
-        or_settled = _openrouter_ledger_settled()
-        st["session_openrouter_settled_snapshot"] = or_settled
-        st["openrouter_ledger_settled_usd"] = or_settled
-        st["session_openrouter_key_fp"] = _openrouter_key_fingerprint()
-
-        ground_truth = check_openrouter_ground_truth()
-        if ground_truth is not None:
-            st["session_total_snapshot"] = ground_truth["total_usd"]
-            st["openrouter_total_usd"] = ground_truth["total_usd"]
-            st["openrouter_daily_usd"] = ground_truth["daily_usd"]
-            st["openrouter_last_check_at"] = utc_now_iso()
+        # A mutator may ADD an unknown (``mark_unconfirmed``), never remove one.
+        unconfirmed = [key for key in before if key not in set(confirm)] + [
+            key for key in _recovery_unconfirmed(st) if key not in before]
+        if unconfirmed:
+            st[RECOVERY_KEY] = {**(recovery if isinstance(recovery, dict) else {}), "unconfirmed": unconfirmed}
         else:
-            st["session_total_snapshot"] = 0.0
-
-        st["budget_drift_pct"] = None
-        st["budget_drift_alert"] = False
-
+            st.pop(RECOVERY_KEY, None)
         _save_state_unlocked(st)
         return st
-    finally:
-        release_file_lock(STATE_LOCK_PATH, lock_fd)
+
+
+def _set_aside_copies_older_than_a_reset(witness: Any) -> None:
+    """An owner Reset's ``pending`` witness is the owner's explicit fresh start: a state
+    copy of another identity (a writer that raced the Reset's delete) is moved aside
+    under a new name — never adopted as current, never deleted. Caller holds STATE_LOCK."""
+    w_status, record = witness.read_witness(DRIVE_ROOT)
+    if not (w_status == "ok" and record.get("phase") == "pending" and record.get("origin") == "owner_reset"):
+        return
+    identity, stamp = str(record.get("initialization_id") or ""), time.strftime("%Y%m%dT%H%M%S", time.gmtime())
+    for path in (STATE_PATH, STATE_LAST_GOOD_PATH):
+        status, obj, _raw, detail = _read_json_file(path)
+        if status == "missing" or (status == "ok" and obj.get("initialization_id") == identity):
+            continue
+        if status == "unreadable":
+            raise StateUnavailable("primary_unreadable", detail)
+        target = path.with_name(f"{path.stem}.pre-reset-{stamp}-{uuid.uuid4().hex[:6]}.json")
+        os.replace(path, target)
+        log.warning("owner reset pending: %s of another identity set aside as %s", path.name, target.name)
+
+
+def _recover_stopped_controls(st: Dict[str, Any]) -> None:
+    """An existing owner Stop intent proves disabled controls, never an enable grant."""
+    status, campaign, _raw, _detail = _read_json_file(DRIVE_ROOT / "state" / "evolution_campaign.json")
+    intent = campaign.get("stop_intent") if status == "ok" else None
+    if not isinstance(intent, dict) or intent.get("source") not in {"owner", "owner_chat", "panic"}:
+        return
+    facts = {"evolution_mode_enabled": False, "evolution_owner_stopped": True,
+             "evolution_stop_source": None, "post_task_autostop": False}
+    st.update(facts)
+    recovery = st.get(RECOVERY_KEY)
+    if isinstance(recovery, dict):
+        recovery["unconfirmed"] = [key for key in recovery.get("unconfirmed", []) if key not in facts]
+
+
+def init_state(*, origin: str = "first_boot") -> StateRead:
+    """The ONE explicit state initializer, run by supervisor boot before any
+    owner registration, autonomy admission or chat ingress.
+
+    A readable (or backup-recoverable) state is adopted and its initialization
+    witness completed. Both copies absent create a first state ONLY on positive
+    evidence (``state_initialization``); otherwise the answer is ``unavailable``
+    and nothing is minted — the supervisor keeps serving independent work.
+    Money/network facts for drift detection are read before taking the lock."""
+    from supervisor import state_initialization as witness
+
+    or_settled = _openrouter_ledger_settled()
+    key_fp = _openrouter_key_fingerprint()
+    ground_truth = check_openrouter_ground_truth()
+    try:
+        with _state_lock("init"):
+            created = ""
+            _set_aside_copies_older_than_a_reset(witness)
+            try:
+                st = _state_for_write(initializing=True)
+            except StateUnavailable as exc:
+                if exc.reason != "uninitialized":
+                    raise
+                decision = witness.initialization_decision(DRIVE_ROOT, origin=origin)
+                if not decision.get("create"):
+                    raise StateUnavailable(str(decision.get("reason") or "refused"),
+                                           str(decision.get("detail") or ""))
+                created = str(decision["initialization_id"])
+                st = ensure_state_defaults({"initialization_id": created})
+            if not created:
+                try:
+                    st["initialization_id"] = witness.prepare_adoption(DRIVE_ROOT, st)
+                except ValueError as exc:
+                    raise StateUnavailable(str(exc)) from exc
+                for key in set(CONTROL_KEYS) - st.keys() - OPTIONAL_CONTROL_KEYS:
+                    mark_unconfirmed(st, key)
+            st = ensure_state_defaults(st)
+            _recover_stopped_controls(st)
+            st["session_spent_snapshot"] = float(st.get("spent_usd") or 0.0)
+            st["session_openrouter_settled_snapshot"] = or_settled
+            st["openrouter_ledger_settled_usd"] = or_settled
+            st["session_openrouter_key_fp"] = key_fp
+            if ground_truth is not None:
+                st["session_total_snapshot"] = ground_truth["total_usd"]
+                st["openrouter_total_usd"] = ground_truth["total_usd"]
+                st["openrouter_daily_usd"] = ground_truth["daily_usd"]
+                st["openrouter_last_check_at"] = utc_now_iso()
+            else:
+                st["session_total_snapshot"] = 0.0
+            st["budget_drift_pct"] = None
+            st["budget_drift_alert"] = False
+            _save_state_unlocked(st)
+            if not witness.complete(DRIVE_ROOT, st["initialization_id"], adopted=not created):
+                raise StateUnavailable("initialization_incomplete", "the exact witness did not complete")
+    except (StateUnavailable, OSError) as exc:  # a failed witness/set-aside write is typed too, never fatal
+        log.error("State initialization refused: %s", exc)
+        try:
+            append_jsonl(DRIVE_ROOT / "logs" / "events.jsonl", {
+                "ts": utc_now_iso(), "type": "state_unavailable_at_boot",
+                "reason": getattr(exc, "reason", type(exc).__name__), "detail": str(exc)})
+        except Exception:
+            log.warning("state_unavailable_at_boot could not be recorded", exc_info=True)
+        read = read_state()
+        return StateRead("unavailable" if read.quality in CURRENT_QUALITIES else read.quality,
+                         read.source, read.values, CONTROL_KEYS, str(exc))
+    return read_state()
 
 
 TOTAL_BUDGET_LIMIT: float = 0.0
@@ -275,6 +618,8 @@ def budget_remaining(
     *,
     strict: bool = False,
     projection: Optional[Dict[str, Any]] = None,
+    allow_stale: bool = False,
+    refuse_below: float = 0.0,
 ) -> float:
     """Return ledger-derived remaining budget in USD.
 
@@ -282,16 +627,15 @@ def budget_remaining(
     unavailable monetary ledger fails closed while a configured limit is in
     force, so the supervisor cannot dispatch against stale counters.
 
-    ``projection`` is an optional pre-computed global usage projection (same
-    ``global_limit_usd`` and drive root as this function would use itself) so a
-    caller that already replayed the ledger — e.g. ``/api/state`` — does not
-    trigger a second replay. It is accepted only when its ``limit_usd`` equals
-    the limit this function reads itself (``round(max(0.0, total), 6)``, the
-    exact value ``usage_projection`` stamps); a mismatch — e.g. a settings
-    hot-reload between the caller's computation and this call, or a caller
-    passing a projection built for a different limit — falls through to
-    self-computation. Default ``None`` preserves the exact prior behavior,
-    including the strict fail-closed path.
+    ``projection`` is an optional pre-computed global usage projection (same limit and drive
+    root) so a caller that already replayed the ledger — e.g. ``/api/state`` — does not replay
+    it again. It is accepted only when its ``limit_usd`` equals the limit this function reads
+    itself (what ``usage_projection`` stamps); a mismatch falls through to the read below.
+
+    ``allow_stale`` is for a loop-thread pre-check that must not wait on money: it rides the
+    last validated snapshot against the LIVE limit. A snapshot may only ADMIT (every paid
+    attempt still passes ``reserve_attempt``): an answer at or below ``refuse_below`` and a cold
+    memo are decided on the exact locked read; a passed ``projection`` is display, never re-read.
     """
     total = float(TOTAL_BUDGET_LIMIT or 0.0)
     if total <= 0:
@@ -301,9 +645,14 @@ def budget_remaining(
     try:
         if projection is None:
             from ouroboros.usage_accounting import ensure_legacy_imported, usage_projection
+            from ouroboros.usage_ledger import UsageLockUnavailable
 
             ensure_legacy_imported(DRIVE_ROOT)
-            projection = usage_projection(DRIVE_ROOT, global_limit_usd=total)
+            with contextlib.suppress(*((UsageLockUnavailable,) if allow_stale else ())):
+                projection = usage_projection(DRIVE_ROOT, global_limit_usd=total, allow_stale=allow_stale)
+            if projection is None or (
+                    allow_stale and float(projection.get("remaining_known_usd") or 0.0) <= refuse_below):
+                projection = usage_projection(DRIVE_ROOT, global_limit_usd=total)
         return float(projection.get("remaining_known_usd") or 0.0)
     except Exception:
         log.exception("Budget ledger unavailable; refusing new model dispatch")
@@ -435,11 +784,14 @@ def check_openrouter_ground_truth() -> Optional[Dict[str, float]]:
         api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
         if not api_key:
             return None
+        from ouroboros.net_transport import trust_ssl_context
+
         req = urllib.request.Request(
             "https://openrouter.ai/api/v1/auth/key",
             headers={"Authorization": f"Bearer {api_key}"},
         )
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        # A provider call: it verifies against the owner's trust bundle like every other one.
+        with urllib.request.urlopen(req, timeout=10, context=trust_ssl_context()) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         # OpenRouter usage is dollars, not cents.
         usage_total = data.get("data", {}).get("usage", 0)
@@ -476,6 +828,9 @@ def update_budget_from_usage(usage: Dict[str, Any]) -> bool:
     monetary total: every core-mediated provider attempt has already been
     persisted by the transport wrapper.  This prevents logical usage events,
     retries, and review aggregation from charging the same attempt twice.
+    The persisted projection carries totals only; the per-root map is never written.
+    The ledger read is the writer's slim snapshot (``usage_writer_snapshot``): only what this
+    function persists is rendered; the loop's llm_usage path writes once per turn, direct callers on call.
     """
     def _to_float(v: Any, default: float = 0.0) -> float:
         try:
@@ -511,27 +866,28 @@ def update_budget_from_usage(usage: Dict[str, Any]) -> bool:
     from ouroboros.usage_accounting import (
         UsageLedgerCorrupt,
         ensure_legacy_imported,
-        usage_breakdown,
         usage_projection,
+        usage_writer_snapshot,
     )
 
     # Ledger I/O is deliberately OUTSIDE STATE_LOCK: the lock stays
     # short-lived, and the validated-snapshot marker below preserves the old
     # serialization invariant without holding STATE_LOCK across a long read.
+    # A DISPLAY read (``allow_stale``: this runs on the supervisor loop once per turn with
+    # ``llm_usage`` events): a lagging snapshot carries its own lower marker, so it never regresses money.
     try:
         ensure_legacy_imported(DRIVE_ROOT)
-        breakdown = usage_breakdown(DRIVE_ROOT)
+        breakdown = usage_writer_snapshot(DRIVE_ROOT, allow_stale=True)
         total_limit = float(TOTAL_BUDGET_LIMIT or 0.0)
         projection_snapshot = breakdown.pop("_usage_projection", None)
         if total_limit > 0 and isinstance(projection_snapshot, dict):
             from ouroboros._usage_rows import _with_limit
-            roots = projection_snapshot.pop("by_root", None)
+            # Totals only (issue #1002): per-root money is a ledger render nothing reads back from here.
+            projection_snapshot.pop("by_root", None)
             projection = _with_limit(projection_snapshot, total_limit)
-            if roots is not None:
-                projection["by_root"] = roots
         else:
             projection = (
-                usage_projection(DRIVE_ROOT, global_limit_usd=total_limit)
+                usage_projection(DRIVE_ROOT, global_limit_usd=total_limit, include_roots=False, allow_stale=True)
                 if total_limit > 0
                 else {key: breakdown.get(key) for key in (
                 "settled_usd", "confirmed_usd", "estimated_usd", "reserved_usd",
@@ -552,13 +908,16 @@ def update_budget_from_usage(usage: Dict[str, Any]) -> bool:
 
     should_check_ground_truth = False
     lock_fd = acquire_file_lock(STATE_LOCK_PATH)
-    _warn_state_unlocked("budget-update", lock_fd)
+    if lock_fd is None:  # the ledger stays the money authority; this projection waits for the next event
+        log.warning("legacy budget projection skipped: state lock timeout")
+        return False
     try:
-        st = _load_state_unlocked()
+        try:
+            st = _load_state_unlocked()
+        except StateUnavailable as exc:
+            log.warning("legacy budget projection skipped: %s", exc)
+            return False
         previous_marker = st.get("usage_ledger_high_water_seq")
-        marker_known = (
-            ledger_high_water_marker is not None
-        )
         previous_known = (
             isinstance(previous_marker, (list, tuple))
             and len(previous_marker) == 2
@@ -566,8 +925,7 @@ def update_budget_from_usage(usage: Dict[str, Any]) -> bool:
                     for value in previous_marker)
         )
         previous_marker_present = "usage_ledger_high_water_seq" in st
-        marker_to_write: Optional[tuple[int, int]] = None
-        if not marker_known or (previous_marker_present and not previous_known):
+        if ledger_high_water_marker is None or (previous_marker_present and not previous_known):
             # An unreadable/missing marker is unknown, never zero. Keep the
             # existing projection untouched: writing money without ordering
             # evidence could reintroduce the stale-snapshot regression.
@@ -575,44 +933,36 @@ def update_budget_from_usage(usage: Dict[str, Any]) -> bool:
                 "legacy budget projection FRESHNESS MARKER UNKNOWN: preserving prior projection"
             )
             return False
-        elif previous_known:
-            current_marker = ledger_high_water_marker
+        if previous_known:
             saved_marker = (int(previous_marker[0]), int(previous_marker[1]))
-            if current_marker < saved_marker:
+            if ledger_high_water_marker < saved_marker:
                 # ANY lower marker is refused, epoch or seq: a delayed writer
                 # holding a pre-compaction snapshot must never overwrite money
                 # a newer snapshot already saved. Equal/higher markers keep the
                 # normal positive update path below.
                 log.warning(
                     "legacy budget projection STALE SNAPSHOT REJECTED: ledger marker %s < saved %s",
-                    current_marker,
+                    ledger_high_water_marker,
                     saved_marker,
                 )
                 return False
-            marker_to_write = current_marker
-        else:
-            marker_to_write = ledger_high_water_marker
 
-        if marker_to_write is not None:
-            st["spent_usd"] = _to_float(breakdown.get("accounted_usd"))
-            st["spent_calls"] = _to_int(breakdown.get("physical_calls"))
-            st["spent_tokens_prompt"] = _to_int(breakdown.get("prompt_tokens"))
-            st["spent_tokens_completion"] = _to_int(breakdown.get("completion_tokens"))
-            st["spent_tokens_cached"] = _to_int(breakdown.get("cached_tokens"))
-            st["usage_accounting"] = projection
-            st["openrouter_ledger_settled_usd"] = openrouter_ledger_settled
-            # Historical key retained for state.json compatibility; its value
-            # is now the ordered ``[compaction_epoch, seq]`` pair.
-            st["usage_ledger_high_water_seq"] = list(marker_to_write)
-            previous_check_call = _to_int(st.get("openrouter_last_check_call"), -1)
-            should_check_ground_truth = bool(
-                st["spent_calls"] > 0
-                and st["spent_calls"] % 50 == 0
-                and st["spent_calls"] != previous_check_call
-            )
-            if should_check_ground_truth:
-                st["openrouter_last_check_call"] = st["spent_calls"]
-            _save_state_unlocked(st)
+        st["spent_usd"] = _to_float(breakdown.get("accounted_usd"))
+        st["spent_calls"] = _to_int(breakdown.get("physical_calls"))
+        st["spent_tokens_prompt"] = _to_int(breakdown.get("prompt_tokens"))
+        st["spent_tokens_completion"] = _to_int(breakdown.get("completion_tokens"))
+        st["spent_tokens_cached"] = _to_int(breakdown.get("cached_tokens"))
+        st["usage_accounting"] = projection
+        st["openrouter_ledger_settled_usd"] = openrouter_ledger_settled
+        # Historical key retained for state.json compatibility; its value
+        # is now the ordered ``[compaction_epoch, seq]`` pair.
+        st["usage_ledger_high_water_seq"] = list(ledger_high_water_marker)
+        previous_check_call = _to_int(st.get("openrouter_last_check_call"), -1)
+        # Every 50th call by CROSSING (a coalesced write may jump 49 -> 51), deduped by the last check.
+        should_check_ground_truth = st["spent_calls"] > 0 and st["spent_calls"] // 50 > max(previous_check_call, 0) // 50
+        if should_check_ground_truth:
+            st["openrouter_last_check_call"] = st["spent_calls"]
+        _save_state_unlocked(st)
     finally:
         release_file_lock(STATE_LOCK_PATH, lock_fd)
 
@@ -620,8 +970,13 @@ def update_budget_from_usage(usage: Dict[str, Any]) -> bool:
         ground_truth = check_openrouter_ground_truth()
         if ground_truth is not None:
             lock_fd = acquire_file_lock(STATE_LOCK_PATH)
+            if lock_fd is None:
+                return True
             try:
-                st = _load_state_unlocked()
+                try:
+                    st = _load_state_unlocked()
+                except StateUnavailable:
+                    return True
                 st["openrouter_total_usd"] = ground_truth["total_usd"]
                 st["openrouter_daily_usd"] = ground_truth["daily_usd"]
                 st["openrouter_last_check_at"] = utc_now_iso()
@@ -711,7 +1066,7 @@ def budget_breakdown(st: Dict[str, Any]) -> Dict[str, float]:
         from ouroboros.usage_accounting import ensure_legacy_imported, usage_breakdown
 
         ensure_legacy_imported(DRIVE_ROOT)
-        ledger = usage_breakdown(DRIVE_ROOT)
+        ledger = usage_breakdown(DRIVE_ROOT, allow_stale=True)
         for category, bucket in dict(ledger.get("by_category") or {}).items():
             breakdown[str(category)] = float(bucket.get("accounted_usd") or 0.0)
         unattributed = dict(ledger.get("unattributed") or {}).get("category") or {}
@@ -730,7 +1085,7 @@ def model_breakdown(st: Dict[str, Any]) -> Dict[str, Dict[str, float]]:
         from ouroboros.usage_accounting import ensure_legacy_imported, usage_breakdown
 
         ensure_legacy_imported(DRIVE_ROOT)
-        ledger = usage_breakdown(DRIVE_ROOT)
+        ledger = usage_breakdown(DRIVE_ROOT, allow_stale=True)
         buckets = dict(ledger.get("by_model") or {})
         unattributed = dict(ledger.get("unattributed") or {}).get("model") or {}
         if int(unattributed.get("physical_calls") or 0) or float(unattributed.get("accounted_usd") or 0.0):
@@ -786,10 +1141,15 @@ def reconstruct_task_cost(
             "cost_final": True, "reserved_usd": 0.0,
             "unresolved_upper_bound_usd": 0.0, "unknown_unmetered": 0,
             "non_final_rows": 0,
+            # No task was named, so no ledger bucket was summed: there is nothing
+            # for a carrier to explain (#498), and None says exactly that.
+            "cost_presentation": None,
         }
     else:
         try:
-            from ouroboros.cost_projection import honest_accounted_amount
+            from ouroboros.cost_projection import (
+                COST_SCOPE_OWN, build_cost_presentation, honest_accounted_amount,
+            )
             from ouroboros.usage_accounting import ensure_legacy_imported, usage_breakdown
 
             authority_root = pathlib.Path(drive_root) if drive_root is not None else DRIVE_ROOT
@@ -821,12 +1181,15 @@ def reconstruct_task_cost(
                 # The disclosed CAUSE of cost_final=false, carried with the flag.
                 "non_final_rows": int(bucket.get("non_final_rows") or 0),
                 "ledger_integrity_degraded": bool(bucket.get("integrity_degraded")),
+                # #498: the same bucket's own explanation of its own amount.
+                "cost_presentation": build_cost_presentation(bucket, scope=COST_SCOPE_OWN),
             }
         except Exception:
             log.error("Failed to reconstruct ledger task cost for %s", task_id, exc_info=True)
             projection = {
                 "cost_accounting_status": "unavailable", "cost_final": False,
                 "cost_accounting_error": "ledger_unavailable",
+                "cost_presentation": None,
                 "accounted_upper_bound_usd": None, "total_rounds": None,
                 "prompt_tokens": None, "completion_tokens": None,
                 "reserved_usd": None, "unresolved_upper_bound_usd": None,
@@ -897,9 +1260,9 @@ def status_text(workers_dict: Dict[int, Any], pending_list: list,
         from ouroboros.usage_accounting import ensure_legacy_imported, usage_breakdown, usage_projection
 
         ensure_legacy_imported(DRIVE_ROOT)
-        ledger_breakdown = usage_breakdown(DRIVE_ROOT)
+        ledger_breakdown = usage_breakdown(DRIVE_ROOT, allow_stale=True)  # /status renders on the loop
         ledger_projection = (
-            usage_projection(DRIVE_ROOT, global_limit_usd=TOTAL_BUDGET_LIMIT)
+            usage_projection(DRIVE_ROOT, global_limit_usd=TOTAL_BUDGET_LIMIT, allow_stale=True)
             if TOTAL_BUDGET_LIMIT > 0
             else ledger_breakdown
         )

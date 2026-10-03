@@ -5,6 +5,7 @@ import base64
 from copy import deepcopy
 from dataclasses import asdict
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -36,31 +37,44 @@ def call(client, asynchronous, **kwargs):
     return asyncio.run(value) if asynchronous else value
 
 
+def capture_catalog(failure, effort):
+    return [{**CAPTURE_OPERATION, "parameters": [
+        {"name": name, "location": "query", "enum": ["true", "false"]}
+        for name, enabled in (("captureFailureEvidence", failure), ("captureEffortEvidence", effort))
+        if enabled]}]
+
+
 @pytest.mark.parametrize("asynchronous", [False, True])
-@pytest.mark.parametrize("supported", [False, True])
-def test_capture_is_negotiated_once_without_changing_provider_payload(setup, asynchronous, supported):
+@pytest.mark.parametrize("failure,effort", [(False, False), (True, False), (False, True), (True, True)])
+def test_capture_is_negotiated_once_without_changing_provider_payload(setup, asynchronous, failure, effort):
     root, gateway, client = setup
-    gateway.operation_catalog = [deepcopy(CAPTURE_OPERATION)] if supported else []
-    call(client, asynchronous, model_role="main")
+    gateway.operation_catalog = capture_catalog(failure, effort)
+    _, usage = call(client, asynchronous, model_role="main")
     assert gateway.catalog_reads == 1
-    assert gateway.capture_requests == ([{"capture_failure_evidence": True}] if supported else [{}])
+    expected = {key: True for key, enabled in (
+        ("capture_failure_evidence", failure), ("capture_effort_evidence", effort)) if enabled}
+    assert gateway.capture_requests == [expected]
     payload = gateway.uploads[0][0]
-    assert "captureFailureEvidence" not in json.dumps(payload)
-    assert "capture_failure_evidence" not in json.dumps(payload)
+    for key in ("captureFailureEvidence", "capture_failure_evidence", "captureEffortEvidence", "capture_effort_evidence"):
+        assert key not in json.dumps(payload)
+    assert usage.get("effort_resolution") is None  # Capability alone supplies no evidence.
     assert retained(root, "request") == payload
     manifests = list((root / "observability/calls/task-one").glob("*_model_request.json"))
     assert len(manifests) == 1
     manifest = json.loads(manifests[0].read_text())
-    assert manifest["capture_failure_evidence"] is supported
+    assert manifest["capture_failure_evidence"] is failure
+    assert manifest["capture_effort_evidence"] is effort
     assert manifest["operation_id"] == "op-0"
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
-def test_lost_create_and_gateway_replacement_reuse_frozen_capture(setup, monkeypatch, asynchronous):
+@pytest.mark.parametrize("failure,effort", [(False, False), (True, False), (False, True), (True, True)])
+def test_lost_create_and_gateway_replacement_reuse_frozen_capture(setup, monkeypatch, asynchronous, failure, effort):
     root, gateway, client = setup
-    gateway.operation_catalog = [deepcopy(CAPTURE_OPERATION)]
+    gateway.operation_catalog = capture_catalog(failure, effort)
     gateway.lose_create = True
     replacement = Gateway()
+    replacement.operation_catalog = capture_catalog(not failure, not effort)
     for name in ("accepted_operations", "creates", "capture_requests"):
         setattr(replacement, name, getattr(gateway, name))
     monkeypatch.setattr(transport, "read_owned_gateway", lambda: replacement)
@@ -68,10 +82,22 @@ def test_lost_create_and_gateway_replacement_reuse_frozen_capture(setup, monkeyp
         tool_context=SimpleNamespace(task_id="task-one", is_direct_chat=False), control_reason=lambda: None))
     monkeypatch.setattr(transport.config, "NETWORK_WAIT_BACKOFF_START_SEC", 0.001)
     monkeypatch.setattr(transport.config, "NETWORK_WAIT_BACKOFF_MAX_SEC", 0.001)
-    answer, usage = call(client, asynchronous)
+    manifests = []
+
+    def observe(receipt):
+        manifests.append(json.loads(Path(receipt["request_manifest_ref"]["path"]).read_text()))
+
+    answer, usage = call(client, asynchronous, model_operation_observer=observe)
     assert answer == result()["message"]
     assert gateway.catalog_reads == 1 and replacement.catalog_reads == 0
-    assert gateway.capture_requests == [{"capture_failure_evidence": True}] * 2
+    expected = {key: True for key, enabled in (
+        ("capture_failure_evidence", failure), ("capture_effort_evidence", effort)) if enabled}
+    assert gateway.capture_requests == [expected] * 2
+    assert len(manifests) == 3  # Before lost create, before rejoin, then accepted custody.
+    assert all(item["capture_failure_evidence"] is failure and
+               item["capture_effort_evidence"] is effort for item in manifests)
+    assert len(gateway.uploads) == 1 and not replacement.uploads
+    assert retained(root, "request") == gateway.uploads[0][0]
     assert len(gateway.creates) == 2 and len(set(gateway.creates)) == 1
     assert len(gateway.accepted_operations) == len(usage["ledger_attempt_ids"]) == 1
     assert gateway.closed == replacement.closed == 1
@@ -141,8 +167,13 @@ def test_known_terminal_null_message_settles_then_rejects_without_private_projec
     assert retained(root)["failureEvidence"] == evidence
 
 
-def test_response_rejection_survives_existing_vision_ipc_reconstruction():
-    capture = ua.PhysicalAttemptCapture("attempt-one", MODEL, "claudexor", "settled", "opaque")
+@pytest.mark.parametrize("effort", [None, {
+    "requested": "ultra", "sent": {"options.reasoningEffort": "ultra"},
+    "sent_state": "explicit", "sent_source": "host_candidate",
+    "reported": None, "report_source": None,
+}])
+def test_response_rejection_survives_existing_vision_ipc_reconstruction(effort):
+    capture = ua.PhysicalAttemptCapture("attempt-one", MODEL, "claudexor", "settled", "opaque", effort=effort)
     receipt = {"receipt_id": "receipt-one", "custody": None, "capture": asdict(capture),
                "kind": "model", "text": "", "usage": {"prompt_tokens": 20}, "ledger_attempt_ids": ["attempt-one"],
                "error": "", "problem": deepcopy(REJECTION), "operation_id": "operation-one", "model_role": "vision",
@@ -153,6 +184,7 @@ def test_response_rejection_survives_existing_vision_ipc_reconstruction():
     assert error.code == "response_rejected" and error.stream_rejected and error.stream_incomplete
     assert error.problem == REJECTION and error.operation_id == "operation-one" and error.route == ROUTE
     assert error.physical_attempt_capture.state == "settled" and error.usage == receipt["usage"]
+    assert error.physical_attempt_capture.effort == effort
     assert classify_llm_exception(error).kind == "provider_error"
     assert not isinstance(error, ProviderNotDispatched)
 

@@ -32,6 +32,7 @@ from ouroboros.runtime_mode_policy import (
     protected_paths_in,
     protected_write_block_message,
 )
+from ouroboros.tool_policy import name_miss_guidance, tool_namespace
 from ouroboros.tool_capabilities import (
     ACTING_SUBAGENT_MODE,
     acting_tool_names_for_context,
@@ -151,6 +152,9 @@ def _presence_tool_allowed(ctx: Any, name: str) -> bool:
     )
 
     ceiling = presence_ceiling_from_context(ctx)
+    if name == "finish_task":
+        from ouroboros.dialogue_provenance import is_presence_task
+        return ceiling is None or not is_presence_task({"metadata": getattr(ctx, "task_metadata", {})})
     if name in {"presence_finish", "presence_cancel_work"}:
         return ceiling is not None
     return ceiling is None or presence_ceiling_allows_tool(ceiling, name)
@@ -190,6 +194,13 @@ def _presence_bound_args(ctx: Any, name: str, args: Any) -> tuple[dict[str, Any]
                 "⚠️ PRESENCE_CAPABILITY_BLOCKED: "
                 f"{name!r} is outside this presence task's positive capability ceiling."
             )
+        if ceiling is not None and name == "forward_to_worker":
+            # A selected forward keeps its own tree and reaches only this binding's work.
+            from ouroboros.presence_authority import presence_work_refusal
+
+            refusal = presence_work_refusal(ctx, str(bound.get("task_id") or ""), same_tree=True)
+            if refusal:
+                return {}, refusal
         return bound, ""
     except Exception as exc:
         return {}, f"⚠️ PRESENCE_ARGUMENT_BINDING_BLOCKED: {exc}"
@@ -238,22 +249,12 @@ _LIGHT_START_SERVICE_RESULT = ToolResult(
 
 
 
-def _unknown_tool_result(entries: Dict[str, Any], name: str, extension_unavailable: bool) -> str | ToolResult:
-    """The unknown-name answer, typed EXTENSION_UNAVAILABLE for a dead extension.
-
-    A registered extension name whose payload is NOT live is a distinct fact
-    from an unknown name (the D02 liveness bit), so it carries a typed code
-    instead of a nameless text; a truly unknown name keeps the legacy text.
-    """
-    text = f"⚠️ Unknown tool: {name}. Available: {', '.join(sorted(n for n, e in entries.items() if not e.alias_for))}"
-    if extension_unavailable:
-        return ToolResult(
-            status="unavailable",
-            code="EXTENSION_UNAVAILABLE",
-            text=text,
-            meta={"dynamic_provider": True},
-        )
-    return text
+def _dynamic_tool_schema(tool: Dict[str, Any]) -> Dict[str, Any]:
+    """The provider tool schema of one extension/MCP descriptor."""
+    return {"type": "function", "function": {
+        "name": tool["name"], "description": tool.get("description", ""),
+        "parameters": tool.get("schema", {"type": "object", "properties": {}}),
+    }}
 
 
 def _protected_write_block_result(*, path: str, runtime_mode: str, action: str) -> ToolResult:
@@ -309,7 +310,7 @@ class ToolRegistry:
         self._handler_overrides: Dict[str, Callable] = {}
 
     _FROZEN_TOOL_MODULES = [
-        "browser", "ci", "claude_advisory_review", "compact_context", "control",
+        "browser", "claude_advisory_review", "compact_context", "control",
         "core", "delegate", "edit_ops", "evolution_stats", "followup", "git", "git_pr", "git_rollback", "github",
         "health", "join_ledger", "knowledge", "media", "memory_tools", "plan_review", "project_journal", "presence",
         "recent_tasks",
@@ -479,6 +480,9 @@ class ToolRegistry:
 
     def _schema_for_entry(self, entry: ToolEntry) -> Dict[str, Any]:
         schema = entry.schema
+        if entry.name == "finish_task" and (self._is_local_readonly_subagent() or self._is_acting_subagent()):
+            schema = copy.deepcopy(schema)
+            schema["parameters"]["properties"].pop("pending_review", None)
         if self._is_local_readonly_subagent():
             if entry.name == "verify_and_record" and self._readonly_tool_allowed(entry.name):
                 # The read-only actor is allowed to mint exactly one kind of
@@ -501,22 +505,15 @@ class ToolRegistry:
                     parameters["properties"]["contract_kind"]["enum"] = ["delegation_zero_run"]
                 parameters["required"] = ["contract_kind", "zero_run_decision", "zero_run_basis"]
             elif entry.name in {"read_file", "list_files", "search_code", "query_code"}:
-                schema = copy.deepcopy(schema)
-                root_schema = schema.get("parameters", {}).get("properties", {}).get("root", {})
-                if entry.name == "search_code":
-                    allowed = {"active_workspace", "system_repo", "skill_payload"}
-                elif entry.name == "query_code":
-                    # query_code itself rejects non-repo roots — do not advertise more.
-                    allowed = {"active_workspace", "system_repo"}
-                else:
-                    allowed = {"active_workspace", "system_repo", "runtime_data", "task_drive", "skill_payload", "artifact_store"}
-                if isinstance(root_schema.get("enum"), list): root_schema["enum"] = [root for root in root_schema["enum"] if root in allowed]
+                # The advertised roots are the matrix's answer for this profile and
+                # operation (the same SSOT the dispatcher enforces), never a second list.
+                schema = self._schema_with_matrix_roots(entry)
             elif entry.name in {"browse_page", "browser_action"}:
                 schema = copy.deepcopy(entry.schema)
                 if entry.name == "browse_page":
-                    schema["description"] = "Open an HTTP(S) URL (external, or localhost on non-Ouroboros ports) or a file:// path under your workspace in a headless browser. Returns page content as text, html, markdown, or screenshot (base64 PNG) — use it with analyze_screenshot to visually verify your own built apps. The Ouroboros API ports, private/link-local IPs, and other URL schemes are blocked for subagents. Use viewport to test mobile layouts (e.g. '375x812')."
+                    schema["description"] = "Open an HTTP(S) URL (external, or localhost on non-Ouroboros ports) or a parent-readable file:// path in a headless browser. Returns page content as text, html, markdown, or screenshot (base64 PNG) — use it with analyze_screenshot to visually verify your own built apps. The Ouroboros API ports, private/link-local IPs, and other URL schemes are blocked for subagents. Use viewport to test mobile layouts (e.g. '375x812')."
                 if entry.name == "browser_action":
-                    schema["description"] = "Perform action on the current browser page (external HTTP(S), localhost on non-Ouroboros ports, or a file:// page under your workspace). Actions: click (selector), fill (selector + value), select (selector + value), screenshot (base64 PNG), scroll (value: up/down/top/bottom). JavaScript evaluate is unavailable to local-readonly subagents."
+                    schema["description"] = "Perform action on the current browser page (external HTTP(S), localhost on non-Ouroboros ports, or a parent-readable file:// page). Actions: click (selector), fill (selector + value), select (selector + value), screenshot (base64 PNG), scroll (value: up/down/top/bottom). JavaScript evaluate is unavailable to local-readonly subagents."
                     props = schema.get("parameters", {}).get("properties", {})
                     action_schema = props.get("action", {})
                     if isinstance((action_enum := action_schema.get("enum")), list):
@@ -557,15 +554,20 @@ class ToolRegistry:
             elif (entry.name in tool_resolution._ROOT_ARG_REPO_WRITE_TOOLS
                   or entry.name in _GENERIC_VCS_TARGET_TOOLS
                   or entry.name in {"read_file", "list_files", "search_code", "query_code"}):
-                schema = copy.deepcopy(schema)
-                root_schema = schema.get("parameters", {}).get("properties", {}).get("root", {})
-                operation = _target_binding_operation(entry.name, {})
-                if isinstance(root_schema.get("enum"), list) and operation:
-                    root_schema["enum"] = [root for root in root_schema["enum"]
-                        if decide_tool_access(profile=active_tool_profile(self._ctx), root=root,
-                                              operation=operation).allow
-                        and (entry.name != "query_code" or root in {"active_workspace", "system_repo"})]
+                schema = self._schema_with_matrix_roots(entry)
         return {"type": "function", "function": schema}
+
+    def _schema_with_matrix_roots(self, entry: ToolEntry) -> Dict[str, Any]:
+        """A copy of the schema whose ``root`` enum is what the matrix grants this
+        profile for the tool's operation; tool-specific root enums remain intact."""
+        schema = copy.deepcopy(entry.schema)
+        root_schema = schema.get("parameters", {}).get("properties", {}).get("root", {})
+        operation = _target_binding_operation(entry.name, {})
+        if isinstance(root_schema.get("enum"), list) and operation:
+            root_schema["enum"] = [root for root in root_schema["enum"]
+                if decide_tool_access(profile=active_tool_profile(self._ctx), root=root,
+                                      operation=operation).allow]
+        return schema
 
     def _schemas_for_entry(self, entry: ToolEntry) -> List[Dict[str, Any]]:
         return [self._schema_for_entry(entry)]
@@ -623,9 +625,63 @@ class ToolRegistry:
             "collisions": rows,
         })
 
+    def _extension_rows(self, *, record: bool) -> List[Dict[str, Any]]:
+        """Live, presence-allowed, granted, unshadowed extension descriptors.
+
+        ``record`` (``schemas()`` only) writes shadow collisions to the omission
+        ledger; a name-miss read leaves it untouched. A loader failure raises.
+        """
+        from ouroboros.extension_loader import _lock as _ext_lock, _tools as _ext_tools, is_extension_live as _ext_is_live
+
+        grants = self._acting_tool_grants() if self._is_acting_subagent() else None
+        meta = getattr(self._ctx, "task_metadata", {})
+        capability_root = pathlib.Path((meta.get("budget_drive_root") if isinstance(meta, dict) else "") or getattr(self._ctx, "budget_drive_root", "") or getattr(self._ctx, "drive_root", "") or ".").resolve(strict=False)
+        with _ext_lock:
+            rows = [
+                dict(tool)
+                for tool in _ext_tools.values()
+                if _ext_is_live(str(tool.get("skill") or ""), capability_root, repo_path=str(tool.get("skills_repo_path") or "") or None)
+                and _presence_tool_allowed(self._ctx, tool["name"])
+                and (grants is None or tool["name"] in grants)
+            ]
+        return self._visible_dynamic_tools("extensions", rows) if record else _partition_shadowed_tools(rows, self._entries)[0]
+
+    def _mcp_rows(self, *, refresh: bool, record: bool) -> List[Dict[str, Any]]:
+        """Configured MCP descriptors (with ``raw_name``) under the same filters.
+
+        ``schemas()`` passes both flags: a changed MCP setting may re-list servers
+        and collisions/empty servers enter the omission ledger. A name-miss read
+        passes neither, so it causes no transport, refresh or ledger write.
+        """
+        from ouroboros.mcp_client import ensure_configured_from_settings as _mcp_ensure_configured, get_manager as _mcp_get_manager
+
+        if refresh:
+            _mcp_ensure_configured(refresh=True, authority=self._ctx)
+        manager = _mcp_get_manager()
+        grants = self._acting_tool_grants() if self._is_acting_subagent() else None
+        rows = [tool for tool in manager.list_tools_for_registry()
+                if _presence_tool_allowed(self._ctx, tool["name"])
+                if grants is None or tool["name"] in grants]
+        if not record:
+            return _partition_shadowed_tools(rows, self._entries)[0]
+        rows = self._visible_dynamic_tools("mcp", rows)
+        self._record_mcp_slug_collisions([
+            item for item in getattr(manager, "tool_name_collisions", lambda: [])()
+            if grants is None or str(item.get("prefixed_name") or "") in grants
+        ])
+        # D1: an enabled+configured server returning zero tools WITHOUT
+        # raising (unreachable/slow/auth-failed) is otherwise silent. Make
+        # the reason visible so the model/owner learns WHY an expected MCP
+        # server produced no tools, instead of "the agent can't see MCP".
+        # Checked unconditionally so a broken server is surfaced even when a
+        # co-located healthy server contributed tools (does not mask it).
+        empty = manager.enabled_servers_without_tools()
+        if empty:
+            self._capability_omissions.append({"surface": "mcp", "reason": "server_no_tools", "servers": empty})
+        return rows
+
     def schemas(self, core_only: bool = False) -> List[Dict[str, Any]]:
         acting_subagent = self._is_acting_subagent()
-        acting_grants = self._acting_tool_grants() if acting_subagent else set()
         local_readonly_subagent = self._is_local_readonly_subagent()
         # Dispatch-only policy (В31=B): a consciousness-origin task is filtered by nothing here and
         # records no disabled_by_contract omission, so its prefix matches an owner turn's exactly.
@@ -667,33 +723,7 @@ class ToolRegistry:
             self._capability_omissions.append({"surface": "extensions", "reason": "resource_blocked", "resource": "network=false"})
         else:
             try:
-                from ouroboros.extension_loader import (
-                    _tools as _ext_tools,
-                    _lock as _ext_lock,
-                    is_extension_live as _ext_is_live,
-                )
-                meta = getattr(self._ctx, "task_metadata", {})
-                capability_root = pathlib.Path((meta.get("budget_drive_root") if isinstance(meta, dict) else "") or getattr(self._ctx, "budget_drive_root", "") or getattr(self._ctx, "drive_root", "") or ".").resolve(strict=False)
-                with _ext_lock:
-                    extension_tools = [
-                        dict(tool)
-                        for tool in _ext_tools.values()
-                        if _ext_is_live(str(tool.get("skill") or ""), capability_root, repo_path=str(tool.get("skills_repo_path") or "") or None)
-                        and _presence_tool_allowed(self._ctx, tool["name"])
-                        and (not acting_subagent or acting_grants is None or tool["name"] in acting_grants)
-                    ]
-                extension_tools = self._visible_dynamic_tools("extensions", extension_tools)
-                extension_schemas = [
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": tool["name"],
-                            "description": tool.get("description", ""),
-                            "parameters": tool.get("schema", {"type": "object", "properties": {}}),
-                        },
-                    }
-                    for tool in extension_tools
-                ]
+                extension_schemas = [_dynamic_tool_schema(tool) for tool in self._extension_rows(record=True)]
             except Exception as exc:
                 self._capability_omissions.append({"surface": "extensions", "reason": "discovery_error", "error": f"{type(exc).__name__}: {exc}"})
 
@@ -704,44 +734,7 @@ class ToolRegistry:
                 self._capability_omissions.append({"surface": "mcp", "reason": "resource_blocked", "resource": "network=false"})
             else:
                 try:
-                    from ouroboros.mcp_client import ensure_configured_from_settings as _mcp_ensure_configured, get_manager as _mcp_get_manager
-                    _mcp_ensure_configured(refresh=True)
-                    _mgr = _mcp_get_manager()
-                    mcp_tools = [
-                        tool
-                        for tool in _mgr.list_tools_for_registry()
-                        if _presence_tool_allowed(self._ctx, tool["name"])
-                        if not acting_subagent or acting_grants is None or tool["name"] in acting_grants
-                    ]
-                    mcp_tools = self._visible_dynamic_tools("mcp", mcp_tools)
-                    mcp_schemas = [
-                        {
-                            "type": "function",
-                            "function": {"name": tool["name"], "description": tool.get("description", ""), "parameters": tool.get("schema", {"type": "object", "properties": {}})},
-                        }
-                        for tool in mcp_tools
-                    ]
-                    slug_collisions = getattr(
-                        _mgr, "tool_name_collisions", lambda: []
-                    )()
-                    if acting_subagent and acting_grants is not None:
-                        slug_collisions = [
-                            item
-                            for item in slug_collisions
-                            if str(item.get("prefixed_name") or "") in acting_grants
-                        ]
-                    self._record_mcp_slug_collisions(
-                        slug_collisions
-                    )
-                    # D1: an enabled+configured server returning zero tools WITHOUT
-                    # raising (unreachable/slow/auth-failed) is otherwise silent. Make
-                    # the reason visible so the model/owner learns WHY an expected MCP
-                    # server produced no tools, instead of "the agent can't see MCP".
-                    # Checked unconditionally so a broken server is surfaced even when a
-                    # co-located healthy server contributed tools (does not mask it).
-                    _empty = _mgr.enabled_servers_without_tools()
-                    if _empty:
-                        self._capability_omissions.append({"surface": "mcp", "reason": "server_no_tools", "servers": _empty})
+                    mcp_schemas = [_dynamic_tool_schema(tool) for tool in self._mcp_rows(refresh=True, record=True)]
                 except Exception as exc:
                     self._capability_omissions.append({"surface": "mcp", "reason": "discovery_error", "error": f"{type(exc).__name__}: {exc}"})
             combined = built_in + extension_schemas + mcp_schemas
@@ -875,14 +868,7 @@ class ToolRegistry:
                 ext_tool
                 and _ext_is_live(str(ext_tool.get("skill") or ""), capability_root, repo_path=str(ext_tool.get("skills_repo_path") or "") or None)
             ):
-                return {
-                    "type": "function",
-                    "function": {
-                        "name": ext_tool["name"],
-                        "description": ext_tool.get("description", ""),
-                        "parameters": ext_tool.get("schema", {"type": "object", "properties": {}}),
-                    },
-                }
+                return _dynamic_tool_schema(ext_tool)
         try:
             from ouroboros.mcp_client import (
                 ensure_configured_from_settings as _mcp_ensure_configured,
@@ -901,15 +887,91 @@ class ToolRegistry:
                 return None
             mcp_tool = _mcp_get_manager().get_tool(requested)
             if mcp_tool:
-                return {
-                    "type": "function",
-                    "function": {
-                        "name": mcp_tool["name"],
-                        "description": mcp_tool.get("description", ""),
-                        "parameters": mcp_tool.get("schema", {"type": "object", "properties": {}}),
-                    },
-                }
+                return _dynamic_tool_schema(mcp_tool)
         return None
+
+    def callable_rows(self, namespace: str = "") -> Optional[List[Dict[str, Any]]]:
+        """Tools this task can dispatch now, as ``name`` rows (MCP rows add ``raw_name``).
+
+        The ``schemas()`` filters without its MCP settings reload, refresh or omission rebuild, and
+        without names dispatch refuses (``task_contract.disabled_tools`` even where a
+        schema stays visible): no transport, refresh or safety call. ``namespace``
+        (``tool_policy.tool_namespace``) selects one; ``None`` means that selected
+        extension/MCP catalog could not be read (an unselected failing surface is
+        left out, its failure being ``schemas()``'s recorded omission).
+        """
+        disabled = _disabled_tools(self._ctx)
+        rows: List[Dict[str, Any]] = [
+            {"name": name} for name in self.available_tools()
+            if name not in registry_guards._WEB_TOOLS or _resource_allowed(self._ctx, "web")
+            if name != "vcs_pull_ff" or _resource_allowed(self._ctx, "network")
+        ]
+        for surface in ("ext_", "mcp_"):
+            if namespace and not namespace.startswith(surface) or not _resource_allowed(self._ctx, "network"):
+                continue
+            try:
+                rows += ([{"name": tool["name"]} for tool in self._extension_rows(record=False)] if surface == "ext_"
+                         else [{"name": tool["name"], "raw_name": str(tool.get("raw_name") or ""),
+                                "raw_description": str(tool.get("raw_description") or "")}
+                               for tool in self._mcp_rows(refresh=False, record=False)])
+            except Exception:
+                if namespace:
+                    return None
+        return [row for row in rows if row["name"] not in disabled
+                and (not namespace or tool_namespace(row["name"]) == namespace)]
+
+    def _name_miss_result(
+        self, name: str, reason: Optional[ToolResult] = None, *, extension_unavailable: bool = False,
+    ) -> ToolResult:
+        """ONE answer for every name dispatch cannot run: builtin, extension or MCP.
+
+        ``reason`` is the source's own typed fact (an MCP catalog lookup); a
+        registered-but-dead extension is ``EXTENSION_UNAVAILABLE``; otherwise the
+        name is outside this task's callable catalog (``UNKNOWN_TOOL``). Beside the
+        reason stands the current callable view of the ONE namespace the name
+        addresses — never another namespace, never a policy-hidden name — plus, for
+        a genuine MCP miss, an exact naming-rule identity. Nothing is called.
+        """
+        if extension_unavailable:
+            text = f"⚠️ Unknown tool: {name!r}: its extension is not live for this task right now. Nothing was executed."
+            reason = ToolResult(status="unavailable", code="EXTENSION_UNAVAILABLE", text=text, meta={"dynamic_provider": True})
+        elif reason is None:
+            text = f"⚠️ Unknown tool: {name!r} is not in this task's current callable catalog. Nothing was executed."
+            reason = ToolResult(status="error", code="UNKNOWN_TOOL", text=text)
+        namespace, requested = tool_namespace(name), name.partition("__")[2]
+        rows = self.callable_rows(namespace)
+        identity = []
+        if rows and reason.code == "UNKNOWN_TOOL" and namespace.startswith("mcp_"):
+            from ouroboros.mcp_client import naming_rule_matches
+
+            identity = naming_rule_matches(requested, rows)
+        guidance = name_miss_guidance(requested or name, namespace, rows, identity=identity,
+                                      discovery="list_available_tools" in self.available_tools())
+        return _replace_tool_result(reason, text="\n".join([reason.text, *guidance]))
+
+    @staticmethod
+    def _mcp_dispatch_resolution(name: str):
+        """Pure on misses; a hit rechecks Settings before timeout/Safety/call."""
+        from ouroboros.mcp_client import (
+            ensure_configured_from_settings as ensure,
+            get_manager,
+        )
+
+        manager = get_manager()
+        resolution = manager.resolve_tool_name(name)
+        if resolution.status == "callable":
+            ensure(refresh=False)
+            resolution = manager.resolve_tool_name(name)
+        return resolution
+
+    def _mcp_name_miss(self, name: str) -> Optional[ToolResult]:
+        """Resolve before Safety; a miss runs no safety, transport or refresh."""
+        try:
+            resolution = self._mcp_dispatch_resolution(name)
+        except Exception as exc:
+            text = f"⚠️ TOOL_ERROR ({name}): MCP catalog lookup failed: {type(exc).__name__}: {exc}"
+            return ToolResult(status="error", code="TOOL_ERROR", text=text)
+        return None if resolution.status == "callable" else self._name_miss_result(name, resolution.refusal(name))
 
     def get_timeout(self, name: str) -> int:
         """Return timeout_sec for the named tool (default 360)."""
@@ -932,16 +994,18 @@ class ToolRegistry:
                 return int(ext_tool.get("timeout_sec") or 60) + 3
         try:
             from ouroboros.mcp_client import (
-                ensure_configured_from_settings as _mcp_ensure_configured,
                 get_manager as _mcp_get_manager,
                 is_mcp_tool_name as _mcp_is_name,
             )
-            _mcp_ensure_configured(refresh=False)
         except Exception:
             _mcp_get_manager = None
             _mcp_is_name = None
         if _mcp_get_manager and _mcp_is_name and _mcp_is_name(name):
             try:
+                # The loop obtains the OUTER timeout before registry execution.
+                # Use the same hit-only Settings recheck as dispatch, or a
+                # changed valid timeout would be strangled by the old outer one.
+                self._mcp_dispatch_resolution(name)
                 return int(_mcp_get_manager().tool_timeout_sec()) + 3
             except Exception:
                 return 63
@@ -955,9 +1019,11 @@ class ToolRegistry:
         resolved_binding: Any,
         interpreter_resolution: Any,
         worktree_before: Any,
+        handoff: Optional[Dict[str, Any]] = None,
     ) -> tuple[str | None, Any]:
         """Run one builtin handler under the scoped attestation."""
         from ouroboros.process_interpreters import interpreter_attestation
+        from ouroboros.owner_pause import OwnerPauseRefused, run_tool_handler
 
         observed_skill = None
         missing = object()
@@ -996,7 +1062,7 @@ class ToolRegistry:
                         if refusal:
                             return refusal, None
                         observed_skill = (state_root, constraint)
-                    result = entry.handler(self._ctx, **handler_args)
+                    result = run_tool_handler(self._ctx, entry.handler, self._ctx, **handler_args)
                     published = _published_tool_result(
                         self._ctx,
                         tool_result_sentinel,
@@ -1008,6 +1074,8 @@ class ToolRegistry:
                     ):
                         return None, published
                     return None, result
+                except OwnerPauseRefused:
+                    raise
                 except TypeError as e:
                     return f"⚠️ TOOL_ERROR ({name}): {e}", None
                 except Exception as e:
@@ -1036,6 +1104,27 @@ class ToolRegistry:
                 self._invalidate_advisory_if_worktree_changed(name, worktree_before)
 
     def _execute_legacy_text(self, name: str, args: Dict[str, Any]) -> str | ToolResult:
+        from ouroboros.owner_pause import OwnerPauseRefused, tool_handoff
+
+        try:
+            with tool_handoff(self._ctx, str(name or "")) as handoff:
+                result = self._execute_admitted_text(name, args, handoff)
+                typed = result if isinstance(result, ToolResult) else LegacyTextResultAdapter.from_text(name, result)
+                # Host unwind/transport owners settle local execution. Business
+                # status and tool-authored metadata cannot create or negate a join.
+                handoff["settled"] = (handoff.get("settled") is True
+                    or handoff.get("local_extension_returned") is True
+                    or handoff.get("mcp_call_returned") is True)
+                return typed
+        except OwnerPauseRefused as exc:
+            from ouroboros.tools.tool_result import launch_refusal_result
+
+            return launch_refusal_result(str(exc))
+
+    def _execute_admitted_text(self, name: str, args: Dict[str, Any],
+                               handoff: Optional[Dict[str, Any]] = None) -> str | ToolResult:
+        if handoff is not None:
+            handoff["not_started"] = True
         name = str(name or "").strip()
         args, presence_arg_error = _presence_bound_args(self._ctx, name, args)
         if presence_arg_error:
@@ -1045,21 +1134,19 @@ class ToolRegistry:
         local_readonly_subagent = self._is_local_readonly_subagent()
         acting_subagent = self._is_acting_subagent()
         acting_self_worktree = acting_subagent and str(getattr(task_constraint, "surface", "") or "") == "self_worktree"
+        from ouroboros.workspace_copies import is_system_copy
+
+        acting_system_worktree = acting_self_worktree and is_system_copy(self._ctx)
         acting_protected_grant = acting_subagent and bool(getattr(task_constraint, "protected_paths_grant", False))
         acting_tool_grants = self._acting_tool_grants() if acting_subagent else set()
         entry = self._entries.get(name)
         ext_tool, extension_unavailable = extension_dispatch._extension_dispatch_candidate(self._ctx, name) if entry is None else (None, False)
-        _mcp_is_name = None
         if entry is None and ext_tool is None:
-            try:
-                from ouroboros.mcp_client import (
-                    ensure_configured_from_settings as _mcp_ensure_configured,
-                    is_mcp_tool_name as _mcp_is_name,
-                )
-                _mcp_ensure_configured(refresh=False)
-            except Exception:
-                _mcp_is_name = None
-        is_mcp = bool(_mcp_is_name and _mcp_is_name(name))
+            from ouroboros.mcp_client import is_mcp_tool_name
+
+            is_mcp = is_mcp_tool_name(name)
+        else:
+            is_mcp = False
         _resource_gate = registry_guards._capability_resource_guard_result(
             self._ctx, name, args, ext_tool, is_mcp)
         if _resource_gate is not None:
@@ -1115,6 +1202,8 @@ class ToolRegistry:
                 redirect = tool_resolution._light_binding_failure_result(name, args)
                 if redirect is not None:
                     return redirect
+                if name == "delegate_start":
+                    return tool_resolution.delegate_payload_binding_refusal(self._ctx, exc)
                 operation = tool_resolution._target_binding_operation(name, args)
                 if operation in {"shell", "service"}:
                     return shell_cwd_block_message(
@@ -1123,9 +1212,9 @@ class ToolRegistry:
                     name, str(args.get("root") or "active_workspace"), exc)
         # Asked three times below (light start_service, protected writes, the
         # light repo tripwire snapshot) and always with the same answer: an
-        # acting child's own worktree counts as the system repo.
+        # isolated child counts as the body only when its admitted source does.
         targets_system_repo = (
-            _binding_set_targets_system_repo(self._ctx, resolved_binding) or acting_self_worktree
+            _binding_set_targets_system_repo(self._ctx, resolved_binding) or acting_system_worktree
         )
         if not _presence_binding_allowed(self._ctx, resolved_binding):
             return (
@@ -1154,12 +1243,15 @@ class ToolRegistry:
         # the stricter of the two through this one local; get_runtime_mode() is unchanged.
         from ouroboros.consciousness_authority import effective_runtime_mode as _effective_runtime_mode
         _runtime_mode = _effective_runtime_mode(_runtime_mode, getattr(self._ctx, "task_metadata", None))
-        if is_mcp:
+        if is_mcp:  # the exact catalog lookup precedes the paid safety check
+            miss = self._mcp_name_miss(name)
+            if miss is not None:
+                return miss
             return extension_dispatch._dispatch_mcp_tool_result(self._ctx, name, args)
         if entry is None:
             if ext_tool and callable(ext_tool.get("handler")):
-                return extension_dispatch._dispatch_extension_tool_result(self._ctx, name, ext_tool, args)
-            return _unknown_tool_result(self._entries, name, extension_unavailable)
+                return extension_dispatch._dispatch_extension_tool_result(self._ctx, name, ext_tool, args, handoff=handoff)
+            return self._name_miss_result(name, extension_unavailable=extension_unavailable)
         args, interpreter_resolution, interpreter_block = tool_resolution._resolve_python_predispatch(
             self, name, args, _runtime_mode, effective_constraint, resolved_binding,
         )
@@ -1183,11 +1275,11 @@ class ToolRegistry:
             # resolves user_files to the whole host, so a repository path
             # reached under THAT root is still Ouroboros self-modification.
             light_targets_system = (
-                _binding_set_is_light_restricted(self._ctx, resolved_binding) or acting_self_worktree
+                _binding_set_is_light_restricted(self._ctx, resolved_binding) or acting_system_worktree
                 or _user_files_binding_reaches_repo(self._ctx, resolved_binding)
             )
         else:
-            light_targets_system = not workspace_mode or acting_self_worktree
+            light_targets_system = not workspace_mode or acting_system_worktree
         if (
             _runtime_mode == "light"
             and name in _REPO_MUTATION_TOOLS
@@ -1222,7 +1314,7 @@ class ToolRegistry:
             if resolved_binding is not None:
                 protected_target = targets_system_repo
             else:
-                protected_target = (not workspace_mode or acting_self_worktree) and (
+                protected_target = (not workspace_mode or acting_system_worktree) and (
                     root_name in {"active_workspace", "system_repo"}
                 )
             protected_matches = (
@@ -1290,7 +1382,7 @@ class ToolRegistry:
                     effective_constraint=effective_constraint, resolved_binding=resolved_binding,
                 )
             early_error, result = self._invoke_builtin_handler(
-                name, entry, args, resolved_binding, interpreter_resolution, worktree_before,
+                name, entry, args, resolved_binding, interpreter_resolution, worktree_before, handoff,
             )
         if name in _PROCESS_COMMAND_TOOLS:
             # Tripwires run on the TOOL_ERROR path too: two early_error returns
@@ -1351,6 +1443,7 @@ class ToolRegistry:
                 pathlib.Path(self._ctx.drive_root),
                 mutation_root=pathlib.Path(self._ctx.repo_dir),
                 source_tool=tool_name,
+                mutating_task_id=str(getattr(self._ctx, "task_id", "") or ""),
             )
         except Exception:
             logging.getLogger(__name__).debug(

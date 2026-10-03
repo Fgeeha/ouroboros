@@ -460,8 +460,12 @@ def _child_process(
         "stderr": subprocess.PIPE,
     }
     kwargs.update(subprocess_new_group_kwargs())
+    kwargs = merge_hidden_kwargs(kwargs)
     try:
-        proc = subprocess.Popen(cmd, **merge_hidden_kwargs(kwargs))  # noqa: S603 - argv is host-constructed
+        from ouroboros.owner_pause import operation_start
+
+        with operation_start():
+            proc = subprocess.Popen(cmd, **kwargs)  # noqa: S603 - argv is host-constructed
     except BaseException:
         try:
             input_path.unlink(missing_ok=True)
@@ -559,6 +563,10 @@ def _run_child(
         out_thread.join(timeout=EXTENSION_CHILD_CLEANUP_GRACE_SEC)
         err_thread.join(timeout=EXTENSION_CHILD_CLEANUP_GRACE_SEC)
         _publish_child_facts(proc, child_started_ts)
+        if out_thread.is_alive() or err_thread.is_alive():
+            raise ExtensionProcessError("extension child output drain did not finish")
+        if overflow["stdout"] or overflow["stderr"]:
+            raise ExtensionProcessError("extension child output exceeded safety cap")
         if proc.returncode != 0:
             stderr_text = stderr.decode("utf-8", errors="replace").strip()
             safe_stderr = sanitize_tool_result_for_log(stderr_text)[-2000:] if stderr_text else ""
@@ -573,9 +581,11 @@ def _run_child(
             result = json.loads(result_path.read_text(encoding="utf-8") or "{}")
         except json.JSONDecodeError as exc:
             raise ExtensionProcessError(f"extension child returned invalid JSON: {exc}") from exc
+        if not isinstance(result, dict):
+            raise ExtensionProcessError("extension child returned invalid protocol shape")
         _publish_child_facts(proc, child_started_ts, ws_relay_failures=result.get("ws_relay_failures"),
                              skill_name=str(payload.get("skill_name") or ""))
-        if not result.get("ok", False):
+        if result.get("ok") is not True:
             raise ExtensionProcessError(str(result.get("error") or "extension child failed"))
         return dict(result)
 
@@ -777,7 +787,9 @@ def dispatch_extension_tool_subprocess(ext_tool: Dict[str, Any], ctx: ToolContex
             )
         ) if model_capable else None),
     )
-    return str(result.get("result") or "")
+    if "result" not in result:
+        raise _mark_child_spawned(ExtensionProcessError("extension child omitted tool result"))
+    return str(result["result"] or "")
 
 
 def dispatch_extension_route_subprocess(spec: Dict[str, Any], request_payload: Dict[str, Any], *, drive_root: pathlib.Path, repo_dir: pathlib.Path) -> Response:
@@ -865,7 +877,7 @@ def _load_child_extension(skill_name: str, drive_root: pathlib.Path, repo_dir: p
     from ouroboros.config import load_settings
     from ouroboros.extension_loader import load_extension
     from ouroboros.settings_integrity import _next_task_setting
-    from ouroboros.skill_loader import discover_skills
+    from ouroboros.skill_loader import discover_skill_identity
 
     def settings_reader():
         live = load_settings()
@@ -876,7 +888,7 @@ def _load_child_extension(skill_name: str, drive_root: pathlib.Path, repo_dir: p
         return {**{key: value for key, value in live.items() if not _next_task_setting(key)},
                 **task_settings}
 
-    skills = discover_skills(drive_root, repo_path=str(skills_repo_path))
+    skills = discover_skill_identity(drive_root, skill_name, repo_path=str(skills_repo_path))
     skill = next((item for item in skills if item.name == skill_name), None)
     if skill is None:
         raise ExtensionProcessError(f"extension skill {skill_name!r} is missing")
@@ -884,7 +896,6 @@ def _load_child_extension(skill_name: str, drive_root: pathlib.Path, repo_dir: p
         skill,
         settings_reader,
         drive_root=drive_root,
-        skills=skills,
         repo_path=str(skills_repo_path),
         _force_in_process=True,
     )

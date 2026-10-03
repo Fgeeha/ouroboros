@@ -65,20 +65,31 @@ def _seed_history(root):
         start_time=0.0, drive_logs=logs)
     final = next(row for row in pending if row["type"] == "send_message")
     log_chat("out", 1, 1, final["text"], task_id=direct["id"], message_meta=final.get("progress_meta", {}), drive_root=root)
-    # Ordinary native history receives counts from its normal authored summary,
-    # not from the removed ephemeral final-frame metadata producer. Only the
-    # summary model answer is a fixture; all summary/history writers are real.
-    from ouroboros.post_task_synthesis import _run_task_summary
+    # Even a stopped native turn receives the free facts row from the real
+    # emission path; replay consumes it without a second fixture write.
     from ouroboros.gateway.history import _assemble_history_response
-    with pytest.MonkeyPatch.context() as summary_model:
-        summary_model.setattr("ouroboros.llm_observability.chat_observed", lambda *_a, **_k: (
-            {"content": "Read the evidence and routed the follow-up into its Project."}, {},
-        ))
-        _run_task_summary(env, None, direct, {"rounds": 2}, direct_trace, logs)
     summaries = [row for row in json.loads(_assemble_history_response(root, 1, 50, 200))["messages"]
                  if row.get("task_id") == direct["id"] and row.get("system_type") == "task_summary"]
-    assert len(summaries) == 1 and summaries[0]["tool_calls"] == 2
+    assert len(summaries) == 1 and summaries[0]["tool_calls"] == 2 and summaries[0]["text"] == ""
     return {"preserved_path": str(preserved), "preserved_bytes": preserved.read_bytes()}
+
+
+def _seed_early_failure(root):
+    from ouroboros.task_results import write_task_result
+    from ouroboros.utils import append_jsonl
+    from supervisor.message_bus import log_chat
+    logs = root / "logs"
+    from ouroboros.task_finalization import stamp_root_final_phase
+
+    early = {"type": "send_message", "progress_meta": {"outcome_axes": {"execution": {"status": "infra_failed"}}}}
+    stamp_root_final_phase(early, {}, post_task_open=True, terminal_status="failed")
+    write_task_result(root, "known-failure", "failed", title="Known failed work",
+                      root_phase_checkpoint={"post_task_synthesis": "running"},
+                      outcome_axes={"execution": {"status": "infra_failed"}})
+    append_jsonl(logs / "progress.jsonl", {"task_id": "known-failure", "chat_id": 1,
+        "content": "Checking the requested result", "ts": "2026-09-08T10:00:00Z"})
+    log_chat("out", 1, 1, "The provider failed; retained work remains available.",
+             task_id="known-failure", message_meta=early["progress_meta"], drive_root=root)
 
 
 def test_ui_results_and_required_question_journey(wait_clone, tmp_path, monkeypatch):
@@ -111,11 +122,18 @@ def test_ui_results_and_required_question_journey(wait_clone, tmp_path, monkeypa
         oracle = ArtifactOracle(root)
         try:
             project = _api(server.base_url, "POST", "/api/projects", {"name": "Evidence review"})["project"]
+            _seed_early_failure(root)
             with sync_playwright() as pw:
                 browser = pw.chromium.launch()
                 page = browser.new_page(viewport={"width": 1440, "height": 1000}, reduced_motion="reduce")
                 try:
                     page.goto(server.base_url, wait_until="domcontentloaded")
+                    early_card = page.locator('.chat-live-card[data-task-id="known-failure"]')
+                    early_card.locator('[data-live-phase]').filter(has_text="Failed").wait_for(timeout=30000)
+                    early_card.get_by_text("Finalizing…", exact=True).wait_for()
+                    # This seeded row has no live actor. The real census can
+                    # correctly retire it; it is a replay metadata assertion,
+                    # not a screenshot claim of a live finalizing process.
                     cancelled = page.locator('.chat-live-card[data-task-id="old-cancelled"]')
                     cancelled.locator('[data-live-phase]').filter(has_text="Cancelled").wait_for(timeout=30000)
                     assert page.get_by_text("Retained ordinary answer before cancellation", exact=True).count() == 1

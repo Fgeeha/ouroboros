@@ -1535,14 +1535,14 @@ wheels = [
 
 [[package]]
 name = "ouroboros"
-version = "7.4.0"
+version = "7.5.1"
 source = { editable = "." }
 dependencies = [
     { name = "croniter" },
     { name = "ddgs" },
     { name = "dulwich" },
     { name = "gigachat" },
-    { name = "httpx" },
+    { name = "httpx", extra = ["socks"] },
     { name = "huggingface-hub" },
     { name = "jsonschema" },
     { name = "mcp" },
@@ -1606,7 +1606,7 @@ requires-dist = [
     { name = "ddgs" },
     { name = "dulwich" },
     { name = "gigachat", specifier = ">=0.2.1,<0.3" },
-    { name = "httpx" },
+    { name = "httpx", extras = ["socks"], specifier = ">=0.28" },
     { name = "huggingface-hub" },
     { name = "huggingface-hub", marker = "extra == 'all'" },
     { name = "jsonschema", specifier = ">=4.0" },

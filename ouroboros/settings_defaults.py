@@ -71,10 +71,15 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     "GIGACHAT_BASE_URL": "https://api.giga.chat/v1",
     "GIGACHAT_VERIFY_SSL_CERTS": "true",
     "GIGACHAT_PROFANITY_CHECK": "",
+    # PEM file with CA certificates ADDED to the default trust bundle for every
+    # first-party provider call (net_transport.extra_ca_bundle); "" = defaults only.
+    "OUROBOROS_EXTRA_CA_BUNDLE": "",
     "ANTHROPIC_API_KEY": "",
     "MINIMAX_API_KEY": "",
     "MINIMAX_REGION": "",
     "DEEPSEEK_API_KEY": "",
+    "ZAI_API_KEY": "",
+    "ZAI_PLAN": "",
     "OUROBOROS_NETWORK_PASSWORD": "",
     "OUROBOROS_SERVER_HOST": "127.0.0.1",
     "OUROBOROS_HOST_SERVICE_PORT": 8767,
@@ -97,7 +102,9 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     # unlike the worker lanes. (Renamed from the singular MODEL_FALLBACK.)
     "OUROBOROS_MODEL_FALLBACKS": OPENROUTER_DEFAULTS["fallback"],
     "OUROBOROS_SERVED_MODEL_REDOS": 2,  # redos of a round another model answered (`llm_substitution.py`)
-    "OUROBOROS_MODEL_DEEP_SELF_REVIEW": OPENROUTER_DEFAULTS["deep_self_review"],
+    # Empty preserves an unauthored default through settings merges/projection.
+    # The getter chooses the reachable default; existing nonempty choices stay pinned.
+    "OUROBOROS_MODEL_DEEP_SELF_REVIEW": "",
     "OUROBOROS_MAX_WORKERS": 10, "OUROBOROS_PRESENCE_MAX_ACTIVE": 2,
     "OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT": 6,
     "OUROBOROS_MAX_SUBAGENT_DEPTH": 3,
@@ -122,8 +129,8 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     "OUROBOROS_RUB_USD_RATE": "",
     # Live-pricing (OpenRouter + cloud.ru catalog) refetch interval; prices/FX drift.
     "OUROBOROS_PRICING_TTL_SEC": 21600,
-    # Main-loop round ceiling (was an inline literal in loop.py — hot-reloadable now).
-    "OUROBOROS_MAX_ROUNDS": 200,
+    # Optional main-loop round limit: a positive int or "unlimited" (legacy: settings_scales).
+    "OUROBOROS_MAX_ROUNDS": "unlimited",
     # Same-model attempt budget for TRANSIENT provider failure classes
     # (finish_reason=null, 429/5xx/overloaded); floored at the caller's base
     # retry budget. Permanent classes fail fast regardless.
@@ -156,10 +163,10 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     # same custody pass runs on the supervisor sweep, so this stays short.
     "OUROBOROS_DIRECT_TURN_STOP_WAIT_SEC": 2,
     # Activity-based liveness (the flat wall-clock pair it replaced is RETIRED below):
-    # idle window = no real progress AND no progressing subtree; abs ceiling = the
-    # unconditional per-task backstop (budget/cost stays a separate hard axis).
+    # idle window = no real progress AND no progressing subtree; abs ceiling = the optional
+    # per-task lifetime, "unlimited" or seconds (budget/cost stays a separate hard axis).
     "OUROBOROS_TASK_IDLE_TIMEOUT_SEC": 900,
-    "OUROBOROS_TASK_ABS_CEILING_SEC": 21600,
+    "OUROBOROS_TASK_ABS_CEILING_SEC": "unlimited",
     "OUROBOROS_PER_CALL_TIMEOUT_CEILING_SEC": 1800,
     "OUROBOROS_FINALIZATION_GRACE_SEC": FINALIZATION_GRACE_DEFAULT_SEC,
     "OUROBOROS_SUPERVISOR_LIVENESS_DEADLINE_SEC": SUPERVISOR_LIVENESS_DEADLINE_DEFAULT_SEC,
@@ -378,7 +385,7 @@ RETIRED_SETTING_KEYS: tuple[str, ...] = (
     "OUROBOROS_SOFT_TIMEOUT_SEC",
     "OUROBOROS_HARD_TIMEOUT_SEC",
     "OUROBOROS_REVIEW_NATIVE_MAX_ROUNDS",  # a ceiling on rounds; bounds are transcript/deadline/ledger
-    "OUROBOROS_BG_MAX_ROUNDS",  # a wake is an ordinary Main turn: OUROBOROS_MAX_ROUNDS + the per-task cost cap bound it
+    "OUROBOROS_BG_MAX_ROUNDS",  # a wake is an ordinary Main turn: the per-task cost cap (+ any OUROBOROS_MAX_ROUNDS) bounds it
 )
 
 

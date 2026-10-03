@@ -290,6 +290,10 @@ def test_strict_child_schema_rejects_false_capture_and_wrong_receipt():
     vision_process._read_receipt(receipt, "ours")
     with pytest.raises(ValueError, match="another invocation"):
         vision_process._read_receipt(receipt, "theirs")
+    capture["effort"] = ["not", "an", "evidence", "object"]
+    with pytest.raises(Exception):
+        vision_process._read_receipt(receipt, "ours")
+    capture["effort"] = None
     capture["state"] = "free"
     with pytest.raises(Exception):
         vision_process._read_receipt(receipt, "ours")
@@ -331,8 +335,10 @@ def test_subscription_tool_envelope_uses_existing_task_ceiling(monkeypatch):
 
 def test_real_parent_quota_controller_polls_metadata_then_rejoins_image_call(child_fixture, monkeypatch):
     from ouroboros.model_wait import task_model_wait_scope
+    from ouroboros.task_results import write_task_result
 
     state, events, root = child_fixture
+    write_task_result(root, "image-task", "running", root_task_id="image-task")
     state["mode"] = "quota"
     catalog_calls = []
 

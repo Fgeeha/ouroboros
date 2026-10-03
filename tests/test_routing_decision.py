@@ -11,7 +11,11 @@ from ouroboros.gateway.routing_decision import (
     handle_routing_decision,
     parse_routing_decision_id,
 )
-from ouroboros.project_dialogue import append_chat_annotation, chat_annotation_receipt
+from ouroboros.project_dialogue import (
+    append_chat_annotation,
+    build_owner_message_ref,
+    chat_annotation_receipt,
+)
 
 OPTIONS = [
     {"action": "steer_task", "task_id": "t-live", "label": "Fix CI"},
@@ -265,8 +269,10 @@ def test_route_to_project_candidates_reorder_is_host_validated(tmp_path, monkeyp
         {"action": "new_task_in_project", "project_id": "p1", "label": "New in P1"},
     ]
     ctx = types.SimpleNamespace(
-        current_chat_id=1, drive_root=tmp_path,
+        current_chat_id=1, drive_root=tmp_path, is_direct_chat=True,
         task_metadata={"client_message_id": "cm-1",
+                       "origin_message_ref": build_owner_message_ref(
+                           chat_id=1, client_message_id="cm-1", ts="2026-09-24T00:00:00+00:00", text="route me"),
                        "routing_contract": {"manual_options": manual}},
     )
     text = control._route_to_project(
@@ -554,3 +560,76 @@ def test_unreadable_annotations_do_not_break_the_decision_turn(tmp_path):
 
     assert "message_routing_receipt" not in metadata["routing_contract"]
     assert metadata["routing_contract"]["llm_first"] is True
+
+
+def test_decision_turn_reads_every_recorded_act_on_the_same_message_as_facts(tmp_path):
+    """The latest receipt alone hid an earlier act on the same owner message (a promote,
+    then a steer relaying it): each act keeps its own receipt, listed oldest first, and
+    the contract says these are facts, not a ban."""
+    from ouroboros.server_routing_context import _decision_turn_metadata
+
+    append_chat_annotation(tmp_path, "cm-fan", action="promote_chat_to_task", target="root-a",
+                           target_label="Deck", status="dispatched", routing_token="tok-1")
+    append_chat_annotation(tmp_path, "cm-fan", action="steer_task", target="root-b",
+                           target_label="Build", status="delivered", routing_token="tok-2")
+    append_chat_annotation(tmp_path, "cm-other", action="steer_task", target="root-c",
+                           target_label="Else", status="delivered", routing_token="tok-3")
+
+    contract = _decision_turn_metadata(_decision_ctx(tmp_path), 1, "cm-fan", {})["routing_contract"]
+
+    assert contract["message_routing_receipt"]["target"] == "root-b"  # the latest act, as before
+    assert [(act["action"], act["target"], act["status"]) for act in contract["message_routing_acts"]] == [
+        ("promote_chat_to_task", "root-a", "dispatched"), ("steer_task", "root-b", "delivered")]
+    assert "not a ban" in contract["message_routing_acts_note"]
+    assert set(contract["valid_actions"]) >= {"promote_chat_to_task", "steer_task"}
+    single = _decision_turn_metadata(_decision_ctx(tmp_path), 1, "cm-other", {})["routing_contract"]
+    assert "message_routing_acts" not in single and single["message_routing_receipt"]["target"] == "root-c"
+
+
+def _boundary(tmp_path, metadata, messages, *, delivery=None):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(tools=SimpleNamespace(_ctx=SimpleNamespace(
+        task_metadata=metadata, last_owner_delivery=delivery)), messages=messages, drive_root=tmp_path)
+
+
+def test_routing_acts_taken_during_the_turn_reach_its_next_model_boundary_as_append_only_facts(tmp_path):
+    """The decision metadata is captured once, at start; an act recorded since — the turn's own
+    steer, a status the rail later wrote — is read from the same receipts at the next boundary
+    and appended once, never rewritten, never phrased as a ban. Acts with no link to the
+    message are named as not listed, not inferred."""
+    from ouroboros.loop_model_call import ROUTING_RECEIPTS_HEADER, _append_routing_receipts
+    from ouroboros.server_routing_context import _decision_turn_metadata
+
+    append_chat_annotation(tmp_path, "cm-1", action="promote_chat_to_task", target="root-a",
+                           target_label="Deck", status="dispatched", routing_token="tok-1")
+    metadata = _decision_turn_metadata(_decision_ctx(tmp_path), 1, "cm-1", {})
+    messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "owner text"}]
+    ctx = _boundary(tmp_path, metadata, messages)
+    assert _append_routing_receipts(ctx) is False  # the startup receipt already said exactly this
+    append_chat_annotation(tmp_path, "cm-1", action="steer_task", target="root-b", target_label="Build",
+                           status="delivered", routing_token="tok-2")
+    append_chat_annotation(tmp_path, "agent-steer:tok-9", action="steer_task", target="root-c",
+                           status="delivered", routing_token="tok-9")
+    before = [dict(message) for message in messages]
+    assert _append_routing_receipts(ctx) is True
+    assert messages[:2] == before and len(messages) == 3
+    note = messages[-1]["content"]
+    assert note.startswith(ROUTING_RECEIPTS_HEADER) and "facts, not a ban" in note
+    acts = [line for line in note.splitlines() if line.startswith("- ")]
+    assert [line.split(":", 1)[0] for line in acts] == [
+        "- promote_chat_to_task → Deck (root-a)", "- steer_task → Build (root-b)"]
+    assert "root-c" not in note and "Not listed: an act recorded under its own agent-steer id" in note
+    assert _append_routing_receipts(ctx) is False  # unchanged receipts: no second row
+    # The rail later records the promote's outcome: a new row; the sent one stays as it was.
+    append_chat_annotation(tmp_path, "cm-1", action="promote_chat_to_task", target="root-a",
+                           target_label="Deck", status="scheduled", routing_token="tok-1")
+    assert _append_routing_receipts(ctx) is True and messages[2]["content"] == note
+    assert "scheduled" in messages[3]["content"] and "dispatched" not in messages[3]["content"]
+    # An owner message relayed into the turn mid-run brings its own receipts.
+    append_chat_annotation(tmp_path, "cm-2", action="steer_task", target="root-d", status="delivered",
+                           routing_token="tok-4")
+    relayed = _boundary(tmp_path, metadata, messages, delivery={"client_message_id": "cm-2"})
+    assert _append_routing_receipts(relayed) is True and "root-d" in messages[-1]["content"]
+    child = _boundary(tmp_path, {**metadata, "delegation_role": "subagent"}, [])
+    assert _append_routing_receipts(child) is False

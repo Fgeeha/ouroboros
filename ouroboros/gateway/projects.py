@@ -284,7 +284,7 @@ def _emit_naming_reason(drive_root: object, task_id: str, name: str, reason: str
         log.debug("_emit_naming_reason failed", exc_info=True)
 
 
-def _mark_task_lane(task_id: str, pid: str) -> str:
+def _mark_task_lane(task_id: str, pid: str, *, project: dict = None, restore: dict = None) -> dict:
     """Point the live queue/lease copy of ``task_id`` at ``pid`` under the queue lock
     and persist the snapshot; returns the value the lane held BEFORE the call, so a
     refused durable bind can put it back. SSOT for every post-hoc convert path here
@@ -307,13 +307,14 @@ def _mark_task_lane(task_id: str, pid: str) -> str:
     refusal "restored" an empty lane it never set, clearing a project the task really
     had. The main loop persists every tick anyway. No-op when the task is neither
     running nor pending — the durable bind alone is then correct."""
-    from ouroboros.project_lease import mark_task_project, task_lane_project_id
+    from ouroboros.project_lease import mark_task_project, task_lane_project_state
     from supervisor.queue import _queue_lock, persist_queue_snapshot
     from supervisor.workers import PENDING, RUNNING
 
     with _queue_lock:
-        previous = task_lane_project_id(RUNNING, PENDING, task_id)
-        marked = mark_task_project(RUNNING, PENDING, task_id, pid, authority="binding")
+        previous = task_lane_project_state(RUNNING, PENDING, task_id)
+        marked = mark_task_project(RUNNING, PENDING, task_id, pid, authority="binding",
+                                   project=project, restore=restore)
     if marked:
         try:
             persist_queue_snapshot(reason="project_from_task")
@@ -362,9 +363,9 @@ def _claim_origin_siblings(
             outcome["skipped"].append({"task_id": tid, "reason": f"already_bound:{existing}"})
             continue
         try:
-            previous = _mark_task_lane(tid, pid)
+            previous = _mark_task_lane(tid, pid, project=project)
         except Exception:
-            previous = ""
+            previous = None
             log.debug("_claim_origin_siblings: lane mark failed for %s", tid, exc_info=True)
         try:
             bind_task_to_project(
@@ -374,7 +375,8 @@ def _claim_origin_siblings(
             outcome["bound"].append(tid)
         except Exception as exc:
             try:
-                _mark_task_lane(tid, previous)
+                if previous is not None:
+                    _mark_task_lane(tid, previous.get("project_id", ""), restore=previous)
             except Exception:
                 log.debug("_claim_origin_siblings: lane restore failed for %s", tid, exc_info=True)
             outcome["skipped"].append({"task_id": tid, "reason": f"{type(exc).__name__}: {exc}"})
@@ -493,7 +495,7 @@ async def api_projects_create(request: Request) -> JSONResponse:
         # and the fresh clone dangling. Source-less create stays idempotent.
         from ouroboros.projects_registry import get_project
 
-        _existing = get_project(drive_root, sanitize_project_id(raw_id))
+        _existing = get_project(drive_root, sanitize_project_id(raw_id), strict=True)
         if _existing and (attach_path or git_url or with_workspace):
             return JSONResponse(
                 {
@@ -603,7 +605,7 @@ async def api_project_update(request: Request) -> JSONResponse:
         if not isinstance(body, dict):
             return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
         drive_root = request_drive_root(request)
-        if get_project(drive_root, project_id) is None:
+        if get_project(drive_root, project_id, strict=True) is None:
             return JSONResponse({"error": f"unknown project: {project_id}"}, status_code=404)
         name = str(body.get("name") or "").strip()
         if not name:
@@ -637,7 +639,7 @@ async def api_project_delete(request: Request) -> JSONResponse:
 
         project_id = str(request.path_params.get("project_id") or "").strip()
         drive_root = request_drive_root(request)
-        entry = get_reserved_project(drive_root, project_id)
+        entry = get_reserved_project(drive_root, project_id, strict=True)
         if entry is None:
             return JSONResponse({"error": f"unknown project: {project_id}"}, status_code=404)
         # All queue/binding comparisons use the canonical registry id.  The
@@ -796,9 +798,9 @@ async def api_project_from_task(request: Request) -> JSONResponse:
             lock held, after ``_claim`` has refreshed the origin."""
             pid = str(project["id"])
             try:
-                previous_lane = _mark_task_lane(task_id, pid)
+                previous_lane = _mark_task_lane(task_id, pid, project=project)
             except Exception:
-                previous_lane = ""
+                previous_lane = None
                 log.debug("api_project_from_task: in-memory project_id update failed for %s",
                           task_id, exc_info=True)
             try:
@@ -811,7 +813,8 @@ async def api_project_from_task(request: Request) -> JSONResponse:
                 # none) before answering, so the durable binding stays the one truth
                 # and no lane points at a project that binds nothing.
                 try:
-                    _mark_task_lane(task_id, previous_lane)
+                    if previous_lane is not None:
+                        _mark_task_lane(task_id, previous_lane.get("project_id", ""), restore=previous_lane)
                 except Exception:
                     log.debug("api_project_from_task: lane restore failed for %s", task_id, exc_info=True)
                 refusal = _conflicting_binding(disclose=False)
@@ -819,6 +822,11 @@ async def api_project_from_task(request: Request) -> JSONResponse:
                     raise
                 return refusal
             touch_project(drive_root, pid)
+            from ouroboros.project_handoff import enqueue_project_handoff, handoff_identity
+
+            # One typed word for the Main history receipt; the binding above is
+            # committed whatever it says (ouroboros/project_handoff.py).
+            handoff_receipt = enqueue_project_handoff(drive_root, task_id, source_ref=origin_ref)
             if not adopted:
                 # This conversion minted the project for THIS owner message, so the
                 # message's other live task ids join it now instead of each keeping a
@@ -834,7 +842,9 @@ async def api_project_from_task(request: Request) -> JSONResponse:
             # that from a key's absence, which is also how a transport that drops
             # unknown fields looks.
             return JSONResponse(
-                {"project": project, "binding": binding, "adopted": bool(adopted)},
+                {"project": project, "binding": binding, "adopted": bool(adopted),
+                 "handoff_receipt": handoff_receipt,
+                 "handoff_id": handoff_identity(pid, task_id, origin_ref)},
             )
 
         def _claim(project_name: str = "", naming_reason: str = "") -> Any:
@@ -876,7 +886,7 @@ async def api_project_from_task(request: Request) -> JSONResponse:
                             task_id, exc_info=True,
                         )
                 target = (bound or adopted) if implicit else ""
-                project = get_project(drive_root, target) if target else None
+                project = get_project(drive_root, target, strict=True) if target else None
                 if project is not None:
                     return _bind_and_answer(project, adopted=True)
                 if not project_name:

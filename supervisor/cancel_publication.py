@@ -36,6 +36,91 @@ CANCEL_FAILED = "failed"
 _CANCEL_TERMINALIZED = frozenset({CANCEL_CANCELLED, CANCEL_ALREADY_SETTLED, CANCEL_NOT_FOUND})
 
 
+# Transport is recorded fact, never proof that an HTTP caller was the owner.
+# The browser twin is ``web/modules/cancel_presentation.js``; both
+# tables must name the same sources, because one stored ``cancel_origin`` is
+# rendered by the task card AND by this host's durable terminal rows.
+CANCEL_SOURCE_PHRASES = {
+    "server_shutdown": "Server shutdown",
+    "http_single": "Stopped from the app (Stop now)",
+    "http_cascade": "Stopped from the app (Stop now)",
+    "http_graceful": "Stopped from the app (Wrap up)",
+    # ``_cancel_subtree_sweep`` mints this for every captured descendant.
+    "cascade_descendant": "Stopped with the task tree it belongs to",
+    # ``server_restart._stop_owned_work``: the /restart command (chat or app button).
+    "owner_restart": "Stopped by the Restart command",
+    # ``queue_snapshot._fence_snapshot_running_rows``: a row still RUNNING when the
+    # previous server stopped (``shutdown_cancel_text`` states it on the result).
+    "snapshot_restore": "The server stopped while this task was still running",
+    # ``join_ledger`` cancel_task, Ouroboros's own tool; the asking run is below.
+    "agent_tool": "Stopped by Ouroboros",
+}
+# The fixed label a producer writes as ``reason`` restates its phrase, so that
+# exact label is not repeated beside it; any other reason text still shows.
+CANCEL_SOURCE_LABELS = {
+    "http_graceful": "owner requested finalize-then-stop",
+    "owner_restart": "Owner restart",
+    "snapshot_restore": "server_shutdown",
+}
+# A recorded cause is producer free text; bound it before it joins an owner line.
+# The bound is a PREVIEW of a reason the record keeps whole, and says so.
+CANCEL_REASON_MAX_CHARS = 160
+CANCEL_REASON_PREVIEW_NOTE = " (preview; the full reason is kept with the task)"
+
+
+def cancel_cause_clauses(
+    origin: Dict[str, Any], result: Dict[str, Any], event: Dict[str, Any],
+) -> List[str]:
+    """The clauses a recorded ``cancel_origin`` PROVES, for one owner line.
+
+    Written here, beside ``_intent_outcome_fields`` which records the origin, so
+    the producer and the sentence share a home. The caller joins them with its
+    own separator; the browser twin is the cancelled branch of
+    ``log_events.js::taskReasonDetail`` and must stay word for word identical.
+
+    ``requested_by`` says which run ASKED — a cascade stamps the SWEPT ROOT
+    there — so reading it as the initiator named a task that somebody else had
+    stopped (#1061). When this record's OWN lineage proves that asker is its
+    parent or ancestor, the line states that relation. Only a typed
+    ``request_origin`` proves an actor; ``requested_by`` alone never does.
+    Ouroboros's own cancel_task stamps the run that asked, not a swept root,
+    so there the relation is the asker's, and it names that same actor.
+    """
+    from ouroboros.utils import strip_markdown
+
+    request_origin = origin.get("request_origin")
+    actor = (
+        str(request_origin.get("task_id") or "")
+        if isinstance(request_origin, dict) and request_origin.get("kind") == "agent_task"
+        else ""
+    )
+    source = str(origin.get("source") or "")
+    asker = source == "agent_tool"
+    asked = str(origin.get("requested_by") or "")
+    record = {**event, **result}
+    self_id = str(record.get("task_id") or record.get("id") or record.get("subagent_task_id") or "")
+    parent = str(record.get("parent_task_id") or "")
+    root = str(record.get("root_task_id") or "")
+    relation = ""
+    if asked and asked != self_id:
+        if asked == parent:
+            relation = "Requested by its parent task" if asker else "Stopped with its parent task"
+        elif parent and asked == root:
+            relation = "Requested by an ancestor task" if asker else "Stopped with an ancestor task"
+    stated = str(origin.get("reason") or "")
+    reason = ("" if " ".join(stated.split()) == CANCEL_SOURCE_LABELS.get(source)
+              else " ".join(strip_markdown(stated).split()))
+    if len(reason) > CANCEL_REASON_MAX_CHARS:
+        reason = reason[:CANCEL_REASON_MAX_CHARS - 1].rstrip() + "\u2026" + CANCEL_REASON_PREVIEW_NOTE
+    return [
+        CANCEL_SOURCE_PHRASES.get(source, source),
+        reason,
+        "this task and its sub-tasks" if origin.get("scope") == "cascade" else "",
+        relation,
+        "Requested by a task" if actor and not (asker and relation and actor == asked) else "",
+    ]
+
+
 def _load_result_row(q: Any, task_id: str) -> Dict[str, Any]:
     """The durable result row, or ``{}`` — fail-soft."""
     try:
@@ -384,12 +469,9 @@ def _publish_cancelled_task(
     # the lock so the crash detector can recover the slot on a later tick.
     from supervisor.task_reaper import _respawn_after_reap
     _respawn_after_reap(q, workers, worker.wid, expected_worker=worker)
-    if str(task.get("delegation_role") or "") == "subagent":
-        try:
-            from ouroboros.headless import remove_subagent_task_drive
-            remove_subagent_task_drive(q.DRIVE_ROOT, str(task_id))
-        except Exception:
-            log.debug("Failed to remove cancelled subagent drive for %s", task_id, exc_info=True)
+    # A cancelled subagent's drive is NOT settled here: settlement copies and hashes the
+    # child store, which the cancel path must not carry. The off-loop reconcile pass
+    # settles it without waiting out retention (``headless.prune_headless_task_drives``).
     try:
         q.persist_queue_snapshot(reason="cancel_running")
     except Exception:
@@ -626,6 +708,33 @@ def _finish_captured_chat_turn(
     _settle_intent(q, task_id, outcome=SETTLED_ALREADY,
                    detail=str(stored.get("status") or ""), intent=intent)
     return CANCEL_ALREADY_SETTLED if outcome == DIRECT_TURN_STOP_GONE else CANCEL_CANCELLED
+
+
+def stop_paused_late_phase_custody(q: Any, task_id: str, *, intent: Optional[Dict[str, Any]] = None) -> bool:
+    """The owner's Stop of an answered root's paused late phase (D10).
+
+    Saved post-task work degrades with ``owner_stopped`` and its skipped stages;
+    an unsent review records ``preparation_refused/owner_stopped``. The delivered
+    answer/status stay, and unused grants revoke. Live work keeps its own owner.
+    """
+    from ouroboros.post_task_synthesis import stop_paused_late_phase
+    from ouroboros.review_operation import stop_paused_acceptance_preparations
+    from supervisor.owner_pause_control import late_phase_settled
+    from supervisor.task_lifecycle import _settle_intent
+
+    try:
+        stopped_post = stop_paused_late_phase(q.DRIVE_ROOT, task_id)
+        stopped_review = stop_paused_acceptance_preparations(q.DRIVE_ROOT, task_id)
+        if not stopped_post and not stopped_review:
+            return False
+    except Exception:
+        log.warning("Stop of the saved late phase of %s was not recorded", task_id, exc_info=True)
+        return False
+    _settle_intent(q, task_id, outcome="cancelled", detail="late_phase_owner_stopped", intent=intent)
+    late_phase_settled(q.DRIVE_ROOT, task_id)
+    q.append_jsonl(q.DRIVE_ROOT / "logs" / "events.jsonl",
+                   {"ts": utc_now_iso(), "type": "late_phase_stopped", "task_id": task_id, "owner_visible": True})
+    return True
 
 
 def _finalize_cancel_intent_on_miss(

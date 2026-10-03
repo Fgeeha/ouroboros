@@ -57,8 +57,8 @@ BUDGET_ROOT_FENCES: Dict[str, Dict[str, Any]] = {}
 # FENCED under the queue lock, because a schedule event already draining would be
 # admitted after any number of cascade sweeps. Bounded in memory (newest kept) —
 # a cancelled tree is terminal, so an evicted entry names a tree that settled long
-# ago; the registry is per-process by design (a restart has no live descendants to
-# admit, and terminal task results are the durable truth).
+# ago; the registry is per-process because a restart re-derives it: restore cancels
+# the PENDING children of every interrupted root, and terminal results do the rest.
 CANCELLED_ROOT_FENCES: Dict[str, str] = {}
 _CANCELLED_ROOT_FENCE_CAP = 4096
 _CANCELLED_ROOT_FENCE_GRACE_SEC = 300.0
@@ -172,7 +172,9 @@ def apply_budget_root_admission_fence(task: Dict[str, Any], root_task_id: str) -
         "active", "paused",
     }:
         return False
-    task["_admission_blocked"] = "root_budget_fence"
+    # One latch, typed by its cause: an owner Pause is not a monetary stop.
+    task["_admission_blocked"] = ("root_owner_paused" if fence.get("cause") == "owner_pause"
+                                  else "root_budget_fence")
     task["_budget_root_task_id"] = root_task_id
     task["_budget_fence_id"] = str(fence.get("fence_id") or "")
     return True
@@ -195,7 +197,10 @@ def restore_queue_fences(
                 if not root_id:
                     malformed_acceptance = True
                     break
-                fenced_roots.add(root_id)
+                # A saved author stop closes its own admission, not its children.
+                # Pre-terminal shutdown and cancel custody are restored separately.
+                if status != "sealed" or fence.get("outcome") != "author_stop":
+                    fenced_roots.add(root_id)
     malformed_budget = not isinstance(raw_budget, list)
     restored: Dict[str, Dict[str, Any]] = {}
     if not malformed_budget:
@@ -220,6 +225,9 @@ def restore_queue_fences(
                     "fence_id": fence_id,
                     "auto_resume": False,
                     "paused_at": str(fence.get("paused_at") or utc_now_iso()),
+                    # The owner's Pause survives the restart as itself, never
+                    # as a monetary latch (owner_pause.py).
+                    **({"cause": "owner_pause"} if fence.get("cause") == "owner_pause" else {}),
                 }
     if not malformed_budget:
         BUDGET_ROOT_FENCES.clear()
@@ -601,6 +609,7 @@ def cancel_task_custody(task_id: str, *, deliver: bool = True) -> str:
     captured_pending = None
     captured_worker = None
     captured_meta = None
+    captured_running = None
     with q._queue_lock:
         settled = _settled_status(q.DRIVE_ROOT, task_id)
         if settled:
@@ -658,11 +667,19 @@ def cancel_task_custody(task_id: str, *, deliver: bool = True) -> str:
                     # Popping the row here would blind task_subtree_is_live for
                     # the whole off-lock kill window, letting a concurrent
                     # cascade report a settled tree over a still-live process.
-                    captured_meta = dict(q.RUNNING.get(task_id) or {})
+                    captured_running = q.RUNNING.get(task_id)
+                    captured_meta = dict(captured_running or {})
                     captured_worker.reaping = True
                     break
 
     if captured_pending is None and captured_worker is None:
+        from ouroboros.review_operation import task_has_live_review_operation
+
+        if task_has_live_review_operation(q.DRIVE_ROOT, task_id):
+            # The operation reads this durable Stop. Keep it open until paid
+            # workers release custody; a terminal author is not proof of that.
+            _release_intent_claim(q, task_id, error="review operation still owns paid work", intent=intent)
+            return CANCEL_FAILED
         # A settled row does not prove the direct turn is done: the pipeline
         # persists the terminal BEFORE post-task cognition, whose in-process
         # synthesis thread outlives the turn's own liveness (the pooled twin:
@@ -674,6 +691,10 @@ def cancel_task_custody(task_id: str, *, deliver: bool = True) -> str:
             from supervisor.cancel_publication import _finish_captured_chat_turn
 
             return _finish_captured_chat_turn(q, task_id, turn, intent=intent, deliver=deliver)
+        from supervisor.cancel_publication import stop_paused_late_phase_custody
+
+        if stop_paused_late_phase_custody(q, task_id, intent=intent):
+            return CANCEL_CANCELLED  # the answered root's saved remainder (D10), its answer kept
     if settled and captured_worker is None and not captured_was_reaping:
         # A slot stranded at ``reaping`` by a custody attempt that crashed is
         # recovered HERE too: the task settled on its own afterwards, so nothing
@@ -732,6 +753,7 @@ def cancel_task_custody(task_id: str, *, deliver: bool = True) -> str:
             return _finish_captured_running(
                 task_id, captured_worker, captured_meta or {},
                 intent=intent, deliver=deliver, settled_status=settled,
+                captured_running=captured_running,
             )
         return _finalize_cancel_intent_on_miss(task_id, intent=intent)
     except Exception:
@@ -1092,7 +1114,7 @@ def _finish_captured_pending(
 def _finish_captured_running(
     task_id: str, worker: Any, meta: Dict[str, Any], *,
     intent: Optional[Dict[str, Any]] = None, deliver: bool = True,
-    settled_status: str = "",
+    settled_status: str = "", captured_running: Optional[Dict[str, Any]] = None,
 ) -> str:
     """A running task: CONFIRM the process is dead, persist, then publish.
 
@@ -1140,6 +1162,10 @@ def _finish_captured_running(
         return CANCEL_FAILED
 
     _reconcile_dead_review_owner(q.DRIVE_ROOT, int(getattr(worker.proc, "pid", 0) or 0))
+    with q._queue_lock:
+        from supervisor.worker_health import retire_confirmed_worker_consumers
+        retire_confirmed_worker_consumers(worker, captured_running)
+
 
     # A terminal checkpoint can precede split-drive adoption and artifact capture.
     # Keep fully published CURRENT byte-identical; complete only work still owed.
@@ -1545,7 +1571,3 @@ from supervisor.queue_transitions import (  # noqa: E402, F401 -- intentional pu
     task_subtree_is_live,
     transition_acceptance_fence,
 )
-
-# Scheduled-admission projection moved to its owner module, but callers may
-# still import the established lifecycle surface.
-from supervisor.task_admission import record_scheduled_admission  # noqa: E402, F401

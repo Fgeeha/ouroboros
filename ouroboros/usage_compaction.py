@@ -8,8 +8,10 @@ the raw pre-compaction bytes move verbatim into an append-only
 Nothing is deleted, in-flight rows never fold, idempotency-bearing kinds
 (subscription/external/legacy) never fold, and the pass commits ONLY after
 proving, on the candidate bytes, that the production aggregation renders an
-identical NON-MONEY view and that the money itself is decimal-identical —
-otherwise it aborts and the ledger stays byte-identical.
+identical NON-MONEY view, that the money itself is decimal-identical and that
+every earliest root/group cap binding survives verbatim (group rows carry the
+source's; an aggregate never binds) — otherwise it aborts and the ledger stays
+byte-identical.
 
 Monetary exactness rule (fixed by the design note): group sums are computed as
 exact ``Decimal``s of the literals stored in the file and carried on group
@@ -26,7 +28,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
-import decimal
+import copy
 import hashlib
 import json
 import logging
@@ -36,10 +38,12 @@ import stat
 import threading
 import time
 import uuid
-from decimal import Decimal, DecimalException, InvalidOperation
-from typing import Any, Callable, Dict, Iterator, Optional, Tuple
+from decimal import Decimal, DecimalException
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from ouroboros._usage_rows import _breakdown_bucket, _summary, _processing_summary, _merge_processing_summary, row_ts_epoch
+from ouroboros._usage_rows import (BINDING_AUTHORITY_FIELD, BINDING_CARRIED, CARRIED_GROUP_BINDING,
+                                   CARRIED_ROOT_BINDING, NO_ORIGINAL_BINDING, BindingIndex)
 from ouroboros.runtime_limits import USAGE_LEDGER_FOLD_MIN_AGE_SEC
 from ouroboros.usage_ledger import (
     ARCHIVE_SEGMENT_DIR_REL,
@@ -83,7 +87,7 @@ _COMPACT_ATTEMPTS_LOCK = threading.Lock()
 
 # Immutable-segment cache for the history readers: abs path -> (expected
 # sha256, frozen attempt-id set, embedded prior header, file fingerprint, the
-# moment it was verified). The fingerprint is part of the hit condition, so a
+# verification time, original binding index). The fingerprint binds a hit, so a
 # segment deleted or rewritten after a warm read re-verifies (and fails)
 # instead of answering from memory — but a fingerprint is not proof of
 # identity: an in-place rewrite of the same size, inside the filesystem's
@@ -94,7 +98,7 @@ _COMPACT_ATTEMPTS_LOCK = threading.Lock()
 _SEGMENT_MTIME_SETTLE_SEC = 2.0
 _SEGMENT_CACHE_TTL_SEC = 60.0
 _SEGMENT_CACHE: Dict[
-    str, Tuple[str, frozenset, Optional[Dict[str, Any]], Tuple[int, int, int, int], float]
+    str, Tuple[str, frozenset, Optional[Dict[str, Any]], Tuple[int, int, int, int], float, BindingIndex]
 ] = {}
 
 # The union over one WHOLE chain, keyed by the chain's identity ((archive_rel,
@@ -104,37 +108,11 @@ _SEGMENT_CACHE: Dict[
 # compaction and only the newest chain can ever be asked again, so a
 # long-lived process must not keep one archived-id set per epoch it ever saw.
 _CHAIN_UNION_CACHE_MAX = 4
-_CHAIN_UNION_CACHE: Dict[Tuple[Tuple[str, str], ...], frozenset] = {}
+_CHAIN_UNION_CACHE: Dict[Tuple[Tuple[str, str], ...], tuple] = {}
 
 
-# Money is summed in an EXPLICIT context, never the ambient one. The default
-# 28-digit precision silently rounds a large-magnitude sum, and both the group
-# row and the self-check that approves it are computed the same way — so a
-# rounded total verifies against itself and the lost cent commits. Sixty
-# digits is far past any real ledger; ``Inexact`` is trapped so that even past
-# it the pass ABORTS instead of writing an approximation.
-MONEY_PRECISION = 60
-
-
-@contextlib.contextmanager
-def _exact_money() -> Iterator[None]:
-    """Decimal arithmetic that cannot silently lose a digit of money."""
-    with decimal.localcontext() as context:
-        context.prec = MONEY_PRECISION
-        context.traps[decimal.Inexact] = True
-        yield
-
-
-def _decimal_of(value: Any) -> Decimal:
-    """Exact decimal of a ledger monetary value (Decimal, int, or string).
-
-    Construction is context-free by language rule, so the literal is captured
-    exactly; only the arithmetic over these values needs ``_exact_money``."""
-    if isinstance(value, bool):
-        raise InvalidOperation
-    if isinstance(value, Decimal):
-        return value
-    return Decimal(str(value))
+# Shared exact arithmetic; the literal-exact compaction self-check stays independent.
+from ouroboros._usage_money import exact_money as _exact_money, decimal_of as _decimal_of
 
 
 class _Abort(Exception):
@@ -468,6 +446,9 @@ def _group_key(row: Dict[str, Any]) -> Tuple[Any, ...]:
         str(row.get("task_id") or ""),
         str(row.get("root_task_id") or ""),
         str(row.get("parent_task_id") or ""),
+        str(row.get("billing_group_id") or ""),
+        "billing_group_limit_usd" in row, row.get("billing_group_limit_usd"),
+        row.get("billing_group_limit_source"), row.get("billing_group_limit_revision"),
         str(row.get("prompt_cache_ttl") or ""),
         row.get("cost_usd") is not None,
         bool(row.get("cost_final")),
@@ -512,16 +493,9 @@ class _Group:
             )
 
 
-# The money keys every ``_summary`` carries — and therefore every
-# ``_breakdown_bucket``, which STARTS as one (``_usage_rows.py``). They are
-# projected out of the comparison below because ``_summary`` accumulates
-# dollars in BINARY floats and rounds at six places: the same history summed
-# as N per-row floats and as one exact per-group Decimal can round to either
-# side of the last digit. On the owner's live ledger that put 13 roots (51
-# buckets, 153 values) exactly 1e-6 apart and aborted a CORRECT fold every
-# time, holding the file at 77.8 MB against an 8 MB trigger. The answer is
-# not a tolerance: money is compared EXACTLY, one guard below, as decimals of
-# the literals actually stored.
+# Rendered cash intentionally rounds to six places. It is not a proof of
+# monetary equality, even with shared exact accumulation: the independent raw
+# Decimal self-check below remains mandatory alongside NON-MONEY equality.
 _FINGERPRINT_MONEY_KEYS = frozenset({
     "settled_usd", "confirmed_usd", "estimated_usd", "reserved_usd",
     "unresolved_upper_bound_usd", "accounted_usd",
@@ -581,7 +555,16 @@ def _render_fingerprint(finals: list) -> Dict[str, Any]:
             _without_money(_breakdown_bucket(unattributed)),
         )
 
+    from ouroboros._usage_money import billing_group_key
+    from ouroboros._usage_rows import _projection_from_final
+
+    group_rows = {}
+    for row in finals:
+        if group := billing_group_key(row):
+            group_rows.setdefault(group, []).append(row)
     return {
+        "by_group": {group: _without_money(_projection_from_final(
+            group_rows[group], False, billing_group_id=group)) for group in sorted(group_rows)},
         "summary": _without_money(_summary(finals)),
         "by_root": per_root,
         "breakdown": _without_money(_breakdown_bucket(finals)),
@@ -606,46 +589,34 @@ def _parse_ledger_lines(raw: bytes) -> Tuple[list, list]:
     return float_rows, decimal_rows
 
 
-def _attempt_is_recent(row: Dict[str, Any], now_ts: float) -> bool:
-    """Whether a final attempt row is younger than the fold horizon (an absent or
-    unparseable ``ts`` cannot prove recency and folds as before)."""
+def fold_eligible_at(row: Dict[str, Any]) -> Optional[float]:
+    """Earliest fold time for a plain closed attempt, or None if retained.
+
+    Shared with the generation-bound writer index: eligibility is maintenance
+    policy only, never an accounting or late-receipt authority.
+    """
+    if (str(row.get("kind") or "attempt") != "attempt"
+            or row.get("state") not in _FOLDABLE_FINAL_STATES
+            or is_abandoned_settlement(row)
+            or any(str(row.get(key) or "") for key in _REVIEW_KEYS)
+            or isinstance(row.get("cost_usd"), bool)
+            or isinstance(row.get("reservation_upper_bound_usd"), bool)):
+        return None
     ts = row_ts_epoch(row)
-    return ts is not None and now_ts - ts < USAGE_LEDGER_FOLD_MIN_AGE_SEC
+    return float("-inf") if ts is None else ts + USAGE_LEDGER_FOLD_MIN_AGE_SEC
 
 
 def _foldable_attempt_ids(records: list, *, now_ts: Optional[float] = None) -> set:
-    """Attempt ids whose whole chain folds: terminal, plain ``attempt`` kind,
-    no pending late receipt or review attribution, older than the fold horizon
-    (``now_ts`` defaults to ``_fold_clock()``) — plus prior baseline rows. Old
-    unresolved groups remain aggregates; they cannot recreate individual ids."""
-    finals = _final_rows(records)
+    """Closed non-review attempts past the horizon, plus prior baseline rows."""
     clock = _fold_clock() if now_ts is None else float(now_ts)
-    foldable: set = set()
-    for attempt_id, row in finals.items():
-        kind = str(row.get("kind") or "attempt")
-        if kind in _BASELINE_KINDS:
-            foldable.add(attempt_id)
-            continue
-        if kind != "attempt":
-            continue
-        if str(row.get("state") or "") not in _FOLDABLE_FINAL_STATES:
-            continue
-        if is_abandoned_settlement(row):
-            continue
-        if _attempt_is_recent(row, clock):
-            continue  # the allowance window still needs this row's own ts
-        if any(str(row.get(key) or "") for key in _REVIEW_KEYS):
-            continue
-        if isinstance(row.get("cost_usd"), bool) or isinstance(
-            row.get("reservation_upper_bound_usd"), bool
-        ):
-            continue  # fail-safe: malformed monetary value never folds
-        foldable.add(attempt_id)
-    return foldable
+    return {identity for identity, row in _final_rows(records).items()
+            if str(row.get("kind") or "attempt") in _BASELINE_KINDS
+            or ((eligible := fold_eligible_at(row)) is not None and eligible <= clock)}
 
 
 def _build_candidate(
     records: list, decimal_records: list, raw: bytes, beat: Callable[[], None],
+    *, bindings: Optional[BindingIndex] = None,
 ) -> Tuple[bytes, Dict[str, Any]]:
     """Fold ``records`` into the candidate bytes + commit receipt.
 
@@ -676,6 +647,15 @@ def _build_candidate(
             folded_row_count += 1
     if folded_row_count == 0 or not groups:
         raise _Abort("nothing foldable")
+    # An aggregate's cap is a minimum and its position a sort order, so the
+    # block carries every source binding verbatim (usage_admission readers).
+    if bindings is None:
+        bindings = BindingIndex()
+        for index, row in enumerate(records):
+            if index % 4096 == 0:
+                beat()
+            bindings.fold(row)
+    carried_keys: tuple = (set(), set())
 
     baseline_id = f"baseline-{uuid.uuid4().hex[:12]}"
     epoch = 1
@@ -692,7 +672,8 @@ def _build_candidate(
     for index, key in enumerate(sorted(groups, key=repr), start=1):
         group = groups[key]
         (state, model, provider, category, source, task_id, root_task_id,
-         parent_task_id, ttl, cost_known, cost_final, pricing_known,
+         parent_task_id, billing_group_id, has_group_limit, group_limit, group_source, group_revision,
+         ttl, cost_known, cost_final, pricing_known,
          bound_known) = key
         row: Dict[str, Any] = {
             "kind": "usage_baseline_group",
@@ -715,6 +696,11 @@ def _build_candidate(
         }
         if ttl:
             row["prompt_cache_ttl"] = ttl
+        if billing_group_id:  # whole-work attribution survives compaction (usage_admission)
+            row["billing_group_id"] = billing_group_id
+        if has_group_limit:
+            row.update(billing_group_limit_usd=None if group_limit is None else float(group_limit),
+                       billing_group_limit_source=group_source, billing_group_limit_revision=group_revision)
         if pricing_known is not None:
             row["pricing_known"] = pricing_known
         if cost_known:
@@ -731,6 +717,12 @@ def _build_candidate(
                 name: format(value, "f") if isinstance(value, Decimal) else value
                 for name, value in group.processing_summary.items()
             }
+        for bound, carry, carrier_field, keys in (
+                (bindings.roots, root_task_id, CARRIED_ROOT_BINDING, carried_keys[0]),
+                (bindings.groups, billing_group_id or root_task_id, CARRIED_GROUP_BINDING, carried_keys[1])):
+            if carry and carry not in keys:  # the first block row of each root/group carries it
+                keys.add(carry)
+                row[carrier_field] = bound.get(carry, NO_ORIGINAL_BINDING)
         group_rows.append(row)
 
     retained_lines: list = []
@@ -776,6 +768,7 @@ def _build_candidate(
         "folded_attempt_count": folded_attempt_count,
         "group_count": len(group_rows),
         "retained_row_count": retained_count,
+        BINDING_AUTHORITY_FIELD: BINDING_CARRIED,
     }
     for offset, row in enumerate(group_rows, start=2):
         row["seq"] = offset
@@ -853,12 +846,37 @@ def compact_usage_ledger_locked(
             float_rows, decimal_rows = _parse_ledger_lines(raw)
             if len(float_rows) != len(records):
                 raise _Abort("post-read line drift")
-            candidate, receipt = _build_candidate(float_rows, decimal_rows, raw, beat)
+            from ouroboros._usage_rows_memo import prepared_original_bindings
+            prepared = prepared_original_bindings(root)
+            bindings = BindingIndex()
+            for index, row in enumerate(float_rows):
+                if index % 4096 == 0:
+                    beat()
+                bindings.fold(row)
+            if prepared is not None:
+                bindings.recover_from(prepared)
+            candidate, receipt = _build_candidate(float_rows, decimal_rows, raw, beat, bindings=bindings)
             if len(candidate) >= len(raw):
                 raise _Abort("no byte gain")
             beat()
             candidate_records, candidate_decimals = _parse_ledger_lines(candidate)
             _validate_records(candidate_records)
+            beat()
+            # Exact decimals: an original cap is carried, never approximated.
+            source_bindings, candidate_bindings = BindingIndex(), BindingIndex()
+            for row in decimal_rows:
+                source_bindings.fold(row)
+            if prepared is not None:
+                # Match the literal comparison's Decimal representation without
+                # rewriting original source/revision attribution.
+                exact = BindingIndex(recovered=set(prepared.recovered))
+                exact.roots, exact.groups = [json.loads(json.dumps(index), parse_float=Decimal)
+                                            for index in (prepared.roots, prepared.groups)]
+                source_bindings.recover_from(exact)
+            for row in candidate_decimals:
+                candidate_bindings.fold(row)
+            if source_bindings != candidate_bindings:
+                raise _Abort("original binding authority mismatch")
             beat()
             finals_before = list(_final_rows(float_rows).values())
             finals_after = list(_final_rows(candidate_records).values())
@@ -866,19 +884,25 @@ def compact_usage_ledger_locked(
                 raise _Abort("aggregation fingerprint mismatch")
             beat()
 
-            def decimal_totals(rows: list) -> Tuple[Decimal, Decimal]:
+            def decimal_totals(rows: list) -> tuple:
+                from ouroboros._usage_money import billing_group_key, monetary_scope_key
+
                 cost = Decimal(0)
                 bound = Decimal(0)
+                scopes = {}
                 for row in _final_rows(rows).values():
                     if str(row.get("kind") or "") == "usage_baseline":
                         continue
                     value = row.get("cost_usd")
-                    if value is not None and str(row.get("state") or "") == "settled":
-                        cost += _decimal_of(value)
+                    paid = _decimal_of(value) if value is not None and row.get("state") == "settled" else Decimal(0)
                     upper = row.get("reservation_upper_bound_usd")
-                    if upper is not None:
-                        bound += _decimal_of(upper)
-                return cost, bound
+                    held = _decimal_of(upper) if upper is not None else Decimal(0)
+                    cost += paid
+                    bound += held
+                    for axis, identity in (("root", monetary_scope_key(row)), ("group", billing_group_key(row))):
+                        previous = scopes.get((axis, identity), (Decimal(0), Decimal(0)))
+                        scopes[axis, identity] = (previous[0] + paid, previous[1] + held)
+                return cost, bound, scopes
 
             if decimal_totals(decimal_rows) != decimal_totals(candidate_decimals):
                 raise _Abort("decimal money totals mismatch")
@@ -939,6 +963,39 @@ def compact_usage_ledger_locked(
     return receipt
 
 
+def _durable_growth_floor(root: pathlib.Path) -> Optional[int]:
+    """The size the last committed pass READ, taken from the ledger itself.
+
+    A pass swaps the file, so the moment one process folds, every other
+    process's inode-keyed memo stops matching and re-enters a full pass on its
+    next reservation — and a process that has just started has no memo at all
+    while the residue keeps the file above the trigger for good. The guard
+    therefore cannot live in process memory: it is a property of the ledger,
+    and the pass already stamps it into line 1 as ``source_size_bytes``, so
+    every process reads the same number. Lock-free, one ``readline``: appends
+    never touch line 1 and the swap is atomic, so the row is complete
+    whichever generation answers.
+
+    ``None`` means this ledger states no floor — no stamp, a leading row that
+    cannot be read (the caller's own read reports that, and masking it here
+    would hide it), or a recorded size that is not a positive count. The
+    per-process memo then stays the only guard, exactly as before.
+
+    Disclosed cost: the stamp names the PRE-pass size, so after a high-gain
+    fold the next pass waits until the file outgrows what the last one read.
+    """
+    try:
+        header = _live_baseline_header(root)
+    except (UsageLedgerCorrupt, OSError):
+        return None
+    if not header:
+        return None
+    size = header.get("source_size_bytes")
+    if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+        return None
+    return size
+
+
 def maybe_compact_usage_ledger_locked(
     root: pathlib.Path | str,
     *,
@@ -947,18 +1004,21 @@ def maybe_compact_usage_ledger_locked(
     """Opportunistic trigger on the monetary write path (under the held lock).
 
     ``os.stat`` fast-path below ``config.USAGE_LEDGER_COMPACT_BYTES``; above
-    it, a per-process growth guard throttles re-attempts after ANY pass, not
-    only an unprofitable one. A success used to clear the memo, which left the
-    threshold as the only brake: the unfoldable residue (group rows, retained
-    idempotent and review-attributed rows) never shrinks, so once it reaches
-    the trigger every reservation ran a full rewrite of the authority under
-    the held lock and copied the whole live file into a new archive segment
-    for a gain of a few kilobytes. Remembering the COMPACTED size instead
-    makes the memo mean "the ledger size when this process last ran a pass",
-    so the next one waits for ``USAGE_LEDGER_COMPACT_RETRY_GROWTH_BYTES`` of
-    real growth whatever the last outcome was. Every failure is contained:
-    this never raises into the caller's reservation (a corrupt ledger still
-    fails in the normal read)."""
+    it, TWO growth guards, and a pass runs only past both. The unfoldable
+    residue (group rows, retained idempotent and review-attributed rows, and
+    terminal rows younger than the fold horizon) never shrinks below the
+    trigger, so without a brake every reservation would rewrite the whole
+    authority under the held lock and copy the live file into a new archive
+    segment for a gain of a few kilobytes.
+
+    The durable one is the floor this ledger carries (``_durable_growth_floor``):
+    it is what makes the brake hold ACROSS processes, which a memo cannot.
+    The per-process memo records the size this process's last pass left behind,
+    whatever its outcome, and throttles a pass that aborted — an abort changes
+    no bytes, so the stamp still names the window that let it in.
+
+    Every failure is contained: this never raises into the caller's
+    reservation (a corrupt ledger still fails in the normal read)."""
     try:
         root = pathlib.Path(_drive_root(root))
     except Exception:
@@ -972,13 +1032,17 @@ def maybe_compact_usage_ledger_locked(
 
     if stat.st_size < int(config.USAGE_LEDGER_COMPACT_BYTES):
         return False
+    retry_growth = int(config.USAGE_LEDGER_COMPACT_RETRY_GROWTH_BYTES)
     key = str(root.resolve(strict=False))
     with _COMPACT_ATTEMPTS_LOCK:
         prior = _COMPACT_ATTEMPTS.get(key)
     if prior is not None and prior[:2] == (stat.st_ino, stat.st_dev) and (
-        stat.st_size < prior[2] + int(config.USAGE_LEDGER_COMPACT_RETRY_GROWTH_BYTES)
+        stat.st_size < prior[2] + retry_growth
     ):
-        return False
+        return False  # this process already ran a pass on these bytes
+    floor = _durable_growth_floor(root)
+    if floor is not None and stat.st_size < floor + retry_growth:
+        return False  # somebody's pass read this ledger; it has not regrown since
     receipt: Optional[Dict[str, Any]] = None
     try:
         receipt = compact_usage_ledger_locked(root, heartbeat=heartbeat)
@@ -1102,7 +1166,7 @@ def _open_archive_entry(path: pathlib.Path, dir_fd: Optional[int]) -> int:
 
 def _load_segment(
     root: pathlib.Path, header: Dict[str, Any], dir_fd: Optional[int]
-) -> Tuple[frozenset, Optional[Dict[str, Any]]]:
+) -> tuple:
     """Read one archived segment named (and fully described) by ``header``.
 
     Segments are immutable, so a verified read is cached — but the cache is
@@ -1132,7 +1196,7 @@ def _load_segment(
             and (now - info.st_mtime) > _SEGMENT_MTIME_SETTLE_SEC
             and (now - cached[4]) <= _SEGMENT_CACHE_TTL_SEC
         ):
-            return cached[1], cached[2]
+            return cached[1], cached[2], cached[5]
         chunks: list = []
         while True:
             chunk = os.read(fd, 1 << 20)
@@ -1162,8 +1226,11 @@ def _load_segment(
     ids.discard("")
     prior_header = rows[0] if rows and str(rows[0].get("kind") or "") == "usage_baseline" else None
     frozen = frozenset(ids)
-    _SEGMENT_CACHE[key] = (expected_sha256, frozen, prior_header, fingerprint, now)
-    return frozen, prior_header
+    bindings = BindingIndex()
+    for row in rows:
+        bindings.fold(row)
+    _SEGMENT_CACHE[key] = (expected_sha256, frozen, prior_header, fingerprint, now, bindings)
+    return frozen, prior_header, bindings
 
 
 def _no_newer_archived_epoch(
@@ -1251,8 +1318,8 @@ def _union_segment_ids(segment_ids: list) -> frozenset:
     return frozenset(ids)
 
 
-def archived_attempt_ids(root: pathlib.Path | str | None = None) -> frozenset:
-    """Every ``attempt_id`` recorded in the archived ledger segments.
+def _archive_chain(root: pathlib.Path, live_header: Optional[dict]) -> tuple:
+    """Attempt identities and original bindings from one verified archive chain.
 
     Walks the tamper-evident chain: the live header names (and hash-pins) the
     newest segment; each segment's own leading header names the one before it.
@@ -1272,8 +1339,6 @@ def archived_attempt_ids(root: pathlib.Path | str | None = None) -> frozenset:
     mis-stepped, cyclic or out-anchored chain raises ``UsageLedgerCorrupt`` —
     the model-send reverse sweep must treat that as its existing UNKNOWN /
     skip-pass state, never as evidence of an orphan."""
-    root = pathlib.Path(_drive_root(root))
-    live_header = _live_baseline_header(root)
     if live_header is None:  # no stamp: only the kernel's exact "no archive directory" ends
         for level in ((root / ARCHIVE_SEGMENT_DIR_REL).parent, root / ARCHIVE_SEGMENT_DIR_REL):
             try:  # a link at either level — dangling included — is the stamped reader's refusal, not ENOENT
@@ -1286,7 +1351,7 @@ def archived_attempt_ids(root: pathlib.Path | str | None = None) -> frozenset:
         try:  # the question early; anything else is UNKNOWN (typed), never a silent empty answer
             mode = os.stat(root / ARCHIVE_SEGMENT_DIR_REL).st_mode
         except FileNotFoundError:
-            return frozenset()  # never compacted and no archive: nothing to anchor against
+            return frozenset(), BindingIndex(), ()  # never compacted: no archive authority
         except OSError as exc:
             raise UsageLedgerCorrupt(
                 f"usage archive directory cannot be inspected: {root / ARCHIVE_SEGMENT_DIR_REL}"
@@ -1303,6 +1368,7 @@ def archived_attempt_ids(root: pathlib.Path | str | None = None) -> frozenset:
     header = live_header
     chain: list = []
     segments: list = []
+    binding_segments: list = []
     seen: set = set()
     expected_epoch: Optional[int] = None
     try:
@@ -1321,9 +1387,10 @@ def archived_attempt_ids(root: pathlib.Path | str | None = None) -> frozenset:
             if archive_rel in seen:
                 raise UsageLedgerCorrupt(f"usage archive segment cycle at {archive_rel}")
             seen.add(archive_rel)
-            segment_ids, header = _load_segment(root, header, dir_fd)
+            segment_ids, header, bindings = _load_segment(root, header, dir_fd)
             chain.append((archive_rel, expected))
             segments.append(segment_ids)
+            binding_segments.append(bindings)
             expected_epoch = epoch - 1
             if header is None and expected_epoch != 0:
                 raise UsageLedgerCorrupt(
@@ -1337,12 +1404,64 @@ def archived_attempt_ids(root: pathlib.Path | str | None = None) -> frozenset:
     key = tuple(chain)
     cached = _CHAIN_UNION_CACHE.get(key)
     if cached is not None:
-        return cached
+        return *cached, key
     union = _union_segment_ids(segments)
+    bindings = BindingIndex()
+    for segment in reversed(binding_segments):
+        current = copy.deepcopy(segment)
+        current.recover_from(bindings)
+        bindings = current
     if len(_CHAIN_UNION_CACHE) >= _CHAIN_UNION_CACHE_MAX:
         _CHAIN_UNION_CACHE.clear()
-    _CHAIN_UNION_CACHE[key] = union
-    return union
+    _CHAIN_UNION_CACHE[key] = (union, bindings)
+    return union, bindings, key
+
+
+def archived_attempt_ids(root: pathlib.Path | str | None = None) -> frozenset:
+    """Validated live-header archive chain's attempt identities (never replay)."""
+    root = pathlib.Path(_drive_root(root))
+    return _archive_chain(root, _live_baseline_header(root))[0]
+
+
+def prepare_original_bindings(root: pathlib.Path, header: dict) -> tuple:
+    """Off-lock recovery from the same verified chain as history membership.
+
+    The writer later proves its captured live generation. The certificate uses
+    the existing segment-cache lifetime and file identities; warm reservations
+    only stat these sources, never parse the archive again. An unavailable
+    source leaves UNKNOWN, with the same bounded cache lifetime for retry.
+    """
+    paths = []
+    verified_at = time.time()
+    bindings = BindingIndex()
+    try:
+        _ids, bindings, chain = _archive_chain(root, header)
+        paths = [(str(root / rel), _SEGMENT_CACHE[str(root / rel)][3]) for rel, _sha in chain]
+        verified_at = min([verified_at, *(_SEGMENT_CACHE[path][4] for path, _ in paths)])
+        directory = root / ARCHIVE_SEGMENT_DIR_REL
+        info = directory.stat()
+        paths.append((str(directory), (info.st_ino, info.st_dev, info.st_size, info.st_mtime_ns)))
+    except (UsageLedgerCorrupt, OSError, ValueError):
+        bindings, paths = BindingIndex(), []
+        log.warning("Original usage binding archive unavailable for %s", root, exc_info=True)
+    return bindings, (verified_at, tuple(paths))
+
+
+def original_bindings_current(certificate: Optional[tuple]) -> bool:
+    """Cheap freshness of off-lock recovery; no ledger/archive replay or mutation."""
+    if certificate is None:
+        return True
+    verified_at, paths = certificate
+    if time.time() - verified_at > _SEGMENT_CACHE_TTL_SEC:
+        return False
+    try:
+        for path, expected in paths:
+            info = pathlib.Path(path).lstat()
+            if (info.st_ino, info.st_dev, info.st_size, info.st_mtime_ns) != expected:
+                return False
+        return True
+    except OSError:
+        return False
 
 
 def usage_attempt_recorded(

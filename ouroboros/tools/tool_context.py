@@ -74,7 +74,9 @@ class ToolContext:
     pending_restart_reason: Optional[str] = None
     last_push_succeeded: bool = False
     last_reviewed_commit_sha: str = ""
-    emit_progress_fn: Callable[[str], None] = field(default=lambda _: None)
+    # The real binder accepts keyword facts (``narration=True`` for a tool that relays
+    # the model's own words); an unbound context must swallow them the same way.
+    emit_progress_fn: Callable[[str], None] = field(default=lambda _text, **_kw: None)
 
     # LLM-driven model/effort switch.
     active_model_override: Optional[str] = None
@@ -99,6 +101,9 @@ class ToolContext:
     # Budget tracking for usage events.
     event_queue: Optional[Any] = None
     task_id: Optional[str] = None
+    # The agent binds lifecycle authority; standalone tool invocations only
+    # carry attribution. Missing managed authority must never become standalone.
+    task_lifecycle_bound: bool = False
 
     # Conversation messages for safety checks.
     messages: Optional[List[Dict[str, Any]]] = None
@@ -128,7 +133,9 @@ class ToolContext:
         room = project_room_lens_dir(self)
         if room is not None:
             return room
-        return pathlib.Path(self.repo_dir)
+        from ouroboros.tool_access import folderless_scratch_dir
+
+        return folderless_scratch_dir(self) or pathlib.Path(self.repo_dir)
 
     def is_workspace_mode(self) -> bool:
         return (

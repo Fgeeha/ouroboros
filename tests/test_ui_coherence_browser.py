@@ -55,13 +55,16 @@ def test_chat_header_decoration_does_not_clip_menu_and_system_actions_keep_gap(s
     actions = page.locator("#chat-messages .system-message-actions")
     assert actions.count() == 2
     for action in actions.all():
+        # A completion row's terminal-time note sits between its prose and the actions.
         metrics = action.evaluate("""el => {
-            const prose = el.previousElementSibling;
-            return {previous:prose.classList.contains('message') ? 'message' : prose.className, nested:!!el.closest('.message'),
-                gap:el.querySelector('button').getBoundingClientRect().top - prose.getBoundingClientRect().bottom,
+            const note = el.previousElementSibling, prose = note.previousElementSibling;
+            return {previous:note.className, prose:prose.classList.contains('message'), nested:!!el.closest('.message'),
+                note:note.getBoundingClientRect().top - prose.getBoundingClientRect().bottom,
+                gap:el.querySelector('button').getBoundingClientRect().top - note.getBoundingClientRect().bottom,
                 below:el.getBoundingClientRect().bottom - el.querySelector('button').getBoundingClientRect().bottom};
         }""")
-        assert metrics["previous"] == "message" and not metrics["nested"]
+        assert metrics["previous"] == "msg-provenance" and metrics["prose"] and not metrics["nested"], metrics
+        assert metrics["note"] == pytest.approx(8, abs=0.5), metrics
         assert metrics["gap"] == pytest.approx(12, abs=0.5), metrics
         assert metrics["below"] == pytest.approx(12, abs=0.5), metrics
     header = page.locator(".chat-page-header")
@@ -612,7 +615,7 @@ def test_question_mirrors_full_form_settle_and_reload(subscription_ui, width, he
 
     # A keyboard answer: focus stays in the settled copy, then moves on to the next question.
     card('finished').locator('.chat-quiz-question').focus()
-    page.keyboard.press('Alt+Tab')
+    page.keyboard.press('Tab')
     assert page.evaluate("document.activeElement.classList.contains('chat-quiz-option')"), \
         page.evaluate('document.activeElement.outerHTML')
     page.keyboard.press('Enter')
@@ -657,13 +660,28 @@ def test_question_mirrors_full_form_settle_and_reload(subscription_ui, width, he
 
     # Stale snapshots — the census and a reconnect's history re-read taken before the answers —
     # never bring a removed copy back, also after Main's bounded question memory (2000) let the
-    # answers go: every quiz_state frame is one more remembered question.
-    for index in range(2001):
-        sockets[-1].send(json.dumps({'type': 'quiz_state', 'task_id': 'noise-task', 'quiz_id': f'noise-{index}',
-                                     'state': 'open'}))
-    page.wait_for_timeout(500)
+    # answers go: every quiz_state frame is one more remembered question.  The browser-side
+    # acknowledgement is the barrier here: a fixed delay only made this assertion race the
+    # client's event queue and the periodic state census on slower runners.
     detail_count = len(detail_reads)
+    assert 'late-task' not in detail_reads[:detail_count]
     mode['stale'] = True
+    page.evaluate("""() => {
+        window.__questionMirrorNoiseBarrier = false;
+        window.__questionMirrorNoiseDispose = window.__ouroWs.on('quiz_state', frame => {
+            if (frame?.task_id === 'noise-task' && frame?.quiz_id === 'noise-final')
+                window.__questionMirrorNoiseBarrier = true;
+        });
+    }""")
+    for index in range(2001):
+        page_quiz_id = 'noise-final' if index == 2000 else f'noise-{index}'
+        sockets[-1].send(json.dumps({'type': 'quiz_state', 'task_id': 'noise-task', 'quiz_id': page_quiz_id,
+                                     'state': 'open'}))
+    page.wait_for_function("() => window.__questionMirrorNoiseBarrier === true", timeout=15000)
+    page.evaluate("""() => {
+        window.__questionMirrorNoiseDispose?.();
+        delete window.__questionMirrorNoiseDispose;
+    }""")
     activities[0]['required_question'] = pointer('waiting', asked['waiting'])
     read_count = len(history_reads)
     page.evaluate('window.sameDocument = true')
@@ -694,7 +712,7 @@ def test_question_mirrors_full_form_settle_and_reload(subscription_ui, width, he
     assert len(decisions) == 2, 'a reload and a navigation never answer anything'
 
 
-@pytest.mark.parametrize('width', [1100, 320])
+@pytest.mark.parametrize('width', [1100, 375])
 def test_short_question_and_routing_cards_keep_their_width_floor(subscription_ui, width):
     """The shared card floor survives shrink-to-fit but yields to a narrow column."""
     page = subscription_ui['page']
@@ -711,6 +729,8 @@ def test_short_question_and_routing_cards_keep_their_width_floor(subscription_ui
         const column = document.querySelector('#chat-messages');
         column.append(decision.buildQuizCard({ type: 'quiz', task_id: 'width-proof', quiz_id: 'short',
             state: 'answered', answered_index: 0, question: 'Ок?', options: ['Да', 'Нет'] }));
+        column.append(decision.buildQuizCard({ type: 'quiz', task_id: 'width-proof', quiz_id: 'open',
+            state: 'open', question: 'What matters most here?', options: [], wait_for_answer: true }));
         const owner = media.bubbleFrameNode({ role: 'user' }, document.createElement('span'));
         owner.dataset.clientMessageId = 'width-route';
         decision.renderRoutingDecision(owner, { status: 'needs_manual_target', routing_token: 'width-token',
@@ -730,7 +750,9 @@ def test_short_question_and_routing_cards_keep_their_width_floor(subscription_ui
                 inside: box.right <= rect.right - parseFloat(cs.paddingRight) + 1};
         })};
     }""")
-    assert len(metrics['cards']) == 2, metrics
+    assert len(metrics['cards']) == 3, metrics
+    assert page.locator('.chat-quiz-card[data-quiz-id="open"] .chat-quiz-option').count() == 0
+    assert page.locator('.chat-quiz-card[data-quiz-id="open"] .chat-quiz-comment').count() == 1
     assert metrics['overflow'] <= 1, metrics
     assert all(card['width'] >= card['minimum'] - 1 and card['inside'] for card in metrics['cards']), metrics
     setup_browser.capture(page, f'question-routing-width-{width}')

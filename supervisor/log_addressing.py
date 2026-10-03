@@ -45,7 +45,8 @@ def bound_project_chat_id(ctx: Any, task_id: Any, parent_task_id: Any = "", root
     )
 
 
-def ingress_chat_id(raw_chat_id: Any, drive_root: Any, project_id: Any = "", *, source: Any = "") -> int:
+def ingress_chat_id(raw_chat_id: Any, drive_root: Any, project_id: Any = "", *,
+                    source: Any = "", project_basis: Optional[dict] = None) -> int:
     """The address a headless/API task is admitted with (ingress capture rule).
 
     A run scoped to a REGISTERED project is admitted into that project's thread,
@@ -64,9 +65,11 @@ def ingress_chat_id(raw_chat_id: Any, drive_root: Any, project_id: Any = "", *, 
     a real session, never "missing", as ``address_task_event`` also enforces.
     A value that is not a whole number (a JSON boolean or fraction
     included) raises, so the caller keeps its typed 400. Lifecycle is NOT
-    consulted here: ``queue.enqueue_task`` fences a non-active project before an
+    consulted for refusal here: ``queue.enqueue_task`` fences a non-active project before an
     address can matter, and a project deleted mid-run keeps its reserved chat.
     """
+    # API preparation already captured this authority; do not re-read a different
+    # snapshot just to address it. Other ingress callers retain their lookup.
     project_chat = None
     reserved_chat = None
     pid = str(project_id or "").strip()
@@ -76,7 +79,8 @@ def ingress_chat_id(raw_chat_id: Any, drive_root: Any, project_id: Any = "", *, 
 
             from ouroboros.projects_registry import PROJECT_ACTIVE
 
-            row = get_reserved_project(drive_root, pid) or {}
+            row = (project_basis.get("project") if project_basis is not None
+                   else get_reserved_project(drive_root, pid)) or {}
             if row.get("chat_id") is not None:
                 reserved_chat = int(row["chat_id"])
                 # Only an ACTIVE project supplies an address. An inactive one
@@ -144,6 +148,11 @@ def address_task_event(running: Any, drive_root: Any, payload: Dict[str, Any]) -
     for key in ("parent_task_id", "root_task_id"):
         if not payload.get(key) and task_row.get(key):
             payload[key] = str(task_row[key])
+    if task_row.get("_is_direct_chat"):
+        # A direct turn resumed from its exact budget pause runs on a pooled
+        # worker (#1196): its frames keep the lane fact the direct lane would
+        # have stamped, so the chat chrome reads the same host truth.
+        payload.setdefault("_is_direct_chat", True)
     bound_chat = resolve_project_chat(
         drive_root, task_id, payload.get("parent_task_id"), payload.get("root_task_id")
     )

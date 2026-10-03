@@ -167,11 +167,22 @@ def test_benchmark_evidence_keeps_exact_scores_and_hugging_face_revisions():
     }
     assert rows["terminal-bench-2.1-gpt-5.5"]["reporting"] == {
         "self_reported": True,
-        "submission_status": "open",
+        "submission_status": "closed",
+        "submission_merged": False,
+        "submission_closed_at": "2026-09-19T20:49:39Z",
         "submission_validation": "failed_source_filter",
         "evidence_status": "public_run",
     }
     assert rows["cl-bench-claude-sonnet-4.6"]["result"]["rank"] == 1
+    for row_id, closed_at in {
+        "terminal-bench-2.1-claude-opus-5-high": "2026-09-19T20:48:57Z",
+        "terminal-bench-2.1-grok-4.5": "2026-09-19T20:49:21Z",
+    }.items():
+        reporting = rows[row_id]["reporting"]
+        assert reporting["submission_status"] == "closed"
+        assert reporting["submission_merged"] is False
+        assert reporting["submission_closed_at"] == closed_at
+    assert rows["cl-bench-claude-sonnet-4.6"]["reporting"]["submission_status"] == "open"
     assert rows["swe-bench-pro-gpt-5.6-luna"]["analysis"] == {
         "test": "McNemar",
         "p_value": 0.4,

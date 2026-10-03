@@ -116,12 +116,11 @@ def test_missing_engine_run_directory_never_reads_the_working_directory(detail, 
     assert final_attempt_facts(detail, "run-fixture") == {}
 
 
-@pytest.mark.parametrize("applied,expected", [
-    ({"reasoningEffort": "xhigh"}, "confirmed"),
-    ({"reasoningEffort": "medium"}, "mismatch"),
-    (None, "unknown"),
+@pytest.mark.parametrize("applied", [
+    {"reasoningEffort": "xhigh"}, {"reasoningEffort": "medium"}, None, {},
+    {"cacheKey": "unrelated"}, {"reasoningEffort": None},
 ])
-def test_model_invocation_records_requested_and_applied_options(applied, expected):
+def test_model_invocation_records_requested_and_applied_options(applied):
     requested = {"reasoningEffort": "xhigh"}
     invocation = _ModelInvocation(
         {"usage_model": "claudexor::codex=model"}, {"options": requested}, {}
@@ -137,7 +136,8 @@ def test_model_invocation_records_requested_and_applied_options(applied, expecte
     observed = usage["claudexor"]
     assert observed["requested_options"] == requested
     assert observed["applied_options"] == applied
-    assert observed["options_honored"] == expected
+    assert usage["effort"]["reported"] == (applied or {}).get("reasoningEffort")
+    assert usage["effort"]["report_source"] == ("provider_applied_options" if isinstance(applied, dict) and applied.get("reasoningEffort") is not None else None)
 
 
 def test_a_differently_echoed_cache_key_is_a_durable_mismatch_of_its_own():
@@ -152,7 +152,8 @@ def test_a_differently_echoed_cache_key_is_a_durable_mismatch_of_its_own():
         "appliedOptions": {"reasoningEffort": "xhigh", "cacheKey": "engine-b"},
     })
 
-    assert usage["claudexor"]["options_honored"] == "mismatch"
+    assert usage["claudexor"]["requested_options"] == requested
+    assert usage["claudexor"]["applied_options"] == {"reasoningEffort": "xhigh", "cacheKey": "engine-b"}
 
 
 def _continuation(profile="profile-a", source="codex", model="gpt-6"):

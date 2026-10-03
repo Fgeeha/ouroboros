@@ -2,18 +2,14 @@
  * Project lifecycle rows in Main (docs/DESIGN.md "Project completion mirror").
  *
  * A Project root that ended with Ouroboros's own final answer reaches Main as an
- * ordinary Ouroboros message: folded when it is long, with the Project chip under
- * it — the chip names the Project and opens it. Every other lifecycle row (a
+ * ordinary Ouroboros message, folded when it is long. Every other lifecycle row (a
  * start, an ending with no answer, a row written before the answer rode the row)
- * keeps its System text and the shared `Open Project` action.
+ * keeps its System text. Either way the row ends with the same Project reference:
+ * the voice of a row never chooses how the UI points at its Project.
  */
-import { createSystemMessageAction, createSystemMessageActions, renderProjectChip } from './ui_helpers.js';
-
-function openProject(projectId, projectName) {
-    window.dispatchEvent(new CustomEvent('ouro:open-project', {
-        detail: { project: { id: projectId, name: projectName || 'Project' } },
-    }));
-}
+import { createSystemMessageActions } from './ui_helpers.js';
+import { projectReference } from './project_reference.js';
+import { terminalTimeNote } from './utils.js';
 
 // The fade says "there is more": it appears only when the fold really hides text. The clamp
 // itself is unconditional CSS, so toggling the class never moves layout. A row mounted while
@@ -47,22 +43,39 @@ function watchFolds() {
     window.addEventListener('resize', refreshFoldsSoon);
 }
 
-export function decorateProjectRow(bubble, { role = 'system', projectId = '', projectName = '' } = {}) {
+export function decorateProjectRow(bubble, { role = 'system', projectId = '', projectName = '', terminalTime, addedAt, completion = false } = {}) {
     if (!bubble || !projectId) return null;
-    const open = () => openProject(projectId, projectName);
-    let control;
     if (role === 'assistant') {
-        const name = projectName || 'Project';
-        control = renderProjectChip({ name, status: '↗', className: 'chat-quiz-project', onClick: open });
-        control.title = `Open ${name}`;
-        control.querySelector('.chat-live-project-status')?.setAttribute('aria-hidden', 'true');
         bubble.classList.add('project-answer');
         watchFolds();
         afterLayout(() => markFold(bubble));
-    } else {
-        control = createSystemMessageAction({ label: 'Open Project ↗', onClick: open });
     }
-    const actions = createSystemMessageActions(control);
+    const actions = createSystemMessageActions(projectReference({ id: projectId, name: projectName }));
     bubble.querySelector('.message')?.after(actions);
+    if (completion) {
+        const note = bubble.ownerDocument.createElement('div');
+        note.className = 'msg-provenance';
+        note.textContent = terminalTimeNote(terminalTime, addedAt);
+        bubble.insertBefore(note, actions);
+    }
     return actions;
+}
+
+/** Kept beside the authored body; adoption never replaces the selected text. */
+export function syncSavedProjectContext(bubble, projected, originId = '') {
+    if (bubble && originId) bubble.dataset.originId = originId;
+    if (!bubble || (projected && bubble.dataset.historyId)) return false;
+    const prior = bubble.querySelector('.saved-project-context');
+    if (!projected) {
+        if (!prior) return false;
+        prior.remove(); delete bubble.dataset.originProjected;
+        return true;
+    }
+    if (prior) return false;
+    const note = bubble.ownerDocument.createElement('div');
+    note.className = 'msg-provenance saved-project-context';
+    note.textContent = 'Saved project context — original request retained here; surrounding history may still need loading.';
+    bubble.insertBefore(note, bubble.querySelector('.message')?.nextSibling || null);
+    bubble.dataset.originProjected = '1';
+    return true;
 }

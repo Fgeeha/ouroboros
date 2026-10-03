@@ -23,25 +23,40 @@ export function mergeHistoricalTimelineItem(record, summary, row, ts) {
     const identity = String(row?.history_id || '');
     if (!identity) return false;
     // A child's lifecycle is one evolving status, just as it is live. Its
-    // authored progress keeps every source record, even when text and time match.
-    const evolving = summary.terminal || String(summary.dedupeKey || '').startsWith('subagent-lifecycle:');
+    // authored progress keeps every source record, even when text and time match;
+    // so does each delegated observation (`activity`), projected per seq at render.
+    const evolving = summary.terminal || String(summary.dedupeKey || '').startsWith('subagent-lifecycle:')
+        || String(summary.dedupeKey || '').startsWith('cardrow|');
+    const activity = summary.activity ? { activity: summary.activity } : {};
     const key = evolving ? summary.dedupeKey : `history:${identity}`;
+    const source = { sourceHistoryId: identity, sourceHistoryRevision: summary.cardRowRevision,
+        historyPosition: row.history_position };
     let item = record.items.find((entry) => entry.dedupeKey === key);
     if (!item && !evolving) {
         item = record.items.find((entry) => !entry.historyId
             && entry.dedupeKey === summary.dedupeKey && entry.sourceTs === row.ts);
     }
     if (item && evolving) {
+        // Source revision advances independently of live content: an older
+        // fallback can yield to its canonical current row without rolling back
+        // content, while stale sources cannot redirect an already newer locator.
+        const existingPosition = item.historyPosition;
+        const adoptedSource = !item.sourceHistoryId || Number.isSafeInteger(summary.cardRowRevision)
+            && (!Number.isSafeInteger(item.sourceHistoryRevision) || summary.cardRowRevision > item.sourceHistoryRevision);
+        if (adoptedSource) Object.assign(item, source);
         const incomingTime = Date.parse(row.ts), existingTime = Date.parse(item.sourceTs || '');
-        if (incomingTime < existingTime || incomingTime === existingTime
-                && compareHistoryPosition(row.history_position, item.historyPosition) < 0) return false;
+        if (Number.isSafeInteger(item.cardRowRevision)) {
+            if (!Number.isSafeInteger(summary.cardRowRevision) || summary.cardRowRevision <= item.cardRowRevision) return adoptedSource;
+        } else if (!Number.isSafeInteger(summary.cardRowRevision) && (incomingTime < existingTime || incomingTime === existingTime
+                && compareHistoryPosition(row.history_position, existingPosition) < 0)) return adoptedSource;
         const update = { headline: summary.headline || item.headline,
+            cardRowRevision: summary.cardRowRevision,
             fullHeadline: summary.fullHeadline || summary.headline || item.fullHeadline,
             body: summary.body || '', fullBody: summary.fullBody || summary.body || '',
             phase: summary.phase || item.phase, sourceTs: row.ts || item.sourceTs,
-            ts, sourceHistoryId: identity, historyPosition: row.history_position };
+            ts, ...source };
         if (Object.entries(update).every(([key, value]) => key === 'historyPosition'
-            ? JSON.stringify(item[key]) === JSON.stringify(value) : item[key] === value)) return false;
+            ? JSON.stringify(item[key]) === JSON.stringify(value) : item[key] === value)) return adoptedSource;
         Object.assign(item, update);
         return true;
     }
@@ -51,16 +66,18 @@ export function mergeHistoricalTimelineItem(record, summary, row, ts) {
         item.historyPosition = row.history_position;
         item.dedupeKey = key;
         item.count = 1;
+        if (summary.evidenceRef && !item.evidenceRef) item.evidenceRef = summary.evidenceRef;
     } else {
         record.items.push({
+            cardRowRevision: summary.cardRowRevision,
             phase: summary.phase || 'working', headline: summary.headline || 'Update',
             fullHeadline: summary.fullHeadline || summary.headline || 'Update',
             body: summary.body || '', fullBody: summary.fullBody || summary.body || '',
             fullRef: summary.fullRef || '', truncated: summary.truncated || false,
-            ts: ts || '', sourceTs: row.ts || '', count: 1, dedupeKey: key,
-            ...(evolving ? { sourceHistoryId: identity } : { historyId: identity }),
-            historyPosition: row.history_position,
-            lineKey: evolving ? `terminal-${String(key).replace(/[^A-Za-z0-9_-]/g, '-')}`
+            evidenceRef: summary.evidenceRef || null,
+            ts: ts || '', sourceTs: row.ts || '', count: 1, dedupeKey: key, ...activity,
+            ...(evolving ? source : { historyId: identity, historyPosition: row.history_position }),
+            lineKey: evolving && !String(key).startsWith('cardrow|') ? `terminal-${String(key).replace(/[^A-Za-z0-9_-]/g, '-')}`
                 : `history-${identity.replace(/[^A-Za-z0-9_-]/g, '-')}`,
         });
     }
@@ -72,6 +89,11 @@ export function mergeHistoricalTimelineItem(record, summary, row, ts) {
     return true;
 }
 
+/** Each mounted node a released id removes, as [id, node]: the rows it renders
+ * and the evolving lines that only locate their page by it (never a row stamp). */
+export const historyStamps = root => [['[data-history-id]', 'historyId'], ['[data-source-history-id]', 'sourceHistoryId']]
+    .flatMap(([selector, key]) => Array.from(root.querySelectorAll(selector), node => [node.dataset[key], node]));
+
 /** A page can leave the rendered window only outside reading, focus and selection. */
 export function historyNodeIsProtected(node, viewport, selection = globalThis.getSelection?.()) {
     if (!node?.isConnected) return false;
@@ -82,6 +104,12 @@ export function historyNodeIsProtected(node, viewport, selection = globalThis.ge
             try { if (selection.getRangeAt(index).intersectsNode(node)) return true; } catch {}
         }
     }
-    const bounds = viewport.getBoundingClientRect(), rect = node.getBoundingClientRect();
+    return historyNodeOnScreen(node, viewport);
+}
+
+/** A rendered node intersecting the feed's viewport (or a band of it); a collapsed one has no boxes. */
+export function historyNodeOnScreen(node, viewport, bounds = viewport.getBoundingClientRect()) {
+    if (!node?.isConnected) return false;
+    const rect = node.getBoundingClientRect();
     return Boolean(node.getClientRects().length && rect.bottom > bounds.top && rect.top < bounds.bottom);
 }

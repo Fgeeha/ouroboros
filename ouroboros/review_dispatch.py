@@ -33,6 +33,7 @@ log = logging.getLogger(__name__)
 _BOUND_API_PAID_STAMP: contextvars.ContextVar[Any] = contextvars.ContextVar(
     "ouroboros_review_api_paid_stamp", default=None,
 )
+_ACCEPTANCE_COLLECTION_LOCK = threading.Lock()
 
 # Identity prefixes for the configured reviewer surfaces. A surface that fans
 # rows out registers its prefix here rather than spelling one inline, so
@@ -42,13 +43,29 @@ SCOPE_SLOT_ID_PREFIX = "scope_slot"
 PLAN_SLOT_ID_PREFIX = "plan_slot"
 
 
-def task_acceptance_zero_physical_refusal(evidence: Any, *, retrieving: bool = False) -> dict[str, str]:
+def task_acceptance_zero_physical_refusal(
+    evidence: Any, *, retrieving: bool = False, delivery: Any = None,
+) -> dict[str, str]:
     """Describe an acceptance refusal that needs no reviewer transport.
 
     A retrieving row (native episode, agent session) reads the exact source
-    itself, so a partial tool-result PROJECTION does not refuse it; the
-    immutable-core overflow refuses every delivery — no owner requirement is
-    truncated for any reviewer."""
+    itself, so a partial tool-result PROJECTION does not refuse it. The
+    immutable-core overflow refuses every PACKET row — no owner requirement is
+    truncated for any reviewer — but a retrieving row only when its work order
+    found no exact packet source it can open (``delivery``, one row of
+    ``ReviewRequest.slot_source_delivery``): the packet ceiling sizes a
+    delivery, it never grants or removes a reader's right to review (#1329)."""
+    delivery = delivery if isinstance(delivery, dict) else {}
+    if retrieving and delivery.get("status") == "unavailable":
+        preparation = delivery.get("preparation_error")
+        if isinstance(preparation, dict):
+            return {"status": str(preparation.get("code") or "review_source_preparation_failed"),
+                    "summary": "Retrieving reviewer preparation failed; nothing was sent. " + str(delivery.get("reason") or "")}
+        return {
+            "status": "degraded_source_unreachable",
+            "summary": ("This retrieving reviewer has no exact source of the complete acceptance "
+                        "packet it can open; nothing was sent. " + str(delivery.get("reason") or "")).strip(),
+        }
     packet = evidence if isinstance(evidence, dict) else {}
     # Only a genuinely UNAVAILABLE source withholds the panel. A row the budget
     # ladder shed still has a durable, actor-resolvable source ref, so it is a
@@ -69,7 +86,7 @@ def task_acceptance_zero_physical_refusal(evidence: Any, *, retrieving: bool = F
             ),
         }
     overflow = packet.get("__immutable_core_overflow__")
-    if overflow:
+    if overflow and not (retrieving and delivery.get("status") == "paged"):
         reason = str((overflow if isinstance(overflow, dict) else {}).get("reason") or "").strip()
         return {
             "status": "degraded_core_overflow",
@@ -80,6 +97,13 @@ def task_acceptance_zero_physical_refusal(evidence: Any, *, retrieving: bool = F
             ),
         }
     return {}
+
+
+def task_acceptance_row_refusal(request: Any, slot: Any) -> dict[str, str]:
+    """The zero-physical refusal of ONE panel row, with its own source delivery."""
+    return task_acceptance_zero_physical_refusal(
+        request.evidence, retrieving=bool(getattr(slot, "retrieves", False)),
+        delivery=(getattr(request, "slot_source_delivery", None) or {}).get(str(getattr(slot, "slot_id", ""))))
 
 
 def acceptance_slot_fit(
@@ -116,11 +140,7 @@ def run_zero_physical_task_acceptance(
     """Return the substrate's synthetic refusal when EVERY row would be refused
     free, or ``None`` for physical work — a mixed panel refuses its packet rows
     inside `_run_slot` ($0) and runs its retrieving rows."""
-    if not all(
-        task_acceptance_zero_physical_refusal(
-            request.evidence, retrieving=bool(getattr(slot, "retrieves", False)))
-        for slot in slots
-    ):
+    if not all(task_acceptance_row_refusal(request, slot) for slot in slots):
         return None
     from ouroboros.review_substrate import run_review_request
 
@@ -143,41 +163,23 @@ def claim_task_acceptance_dispatch(
     )
 
 
-def collect_task_acceptance_run(run: dict, *, drive_root: Any, usage_ctx: Any) -> Any:
+def collect_task_acceptance_run(run: dict, *, drive_root: Any, usage_ctx: Any, controller: Any = None) -> Any:
     """Collect the recorded operation at zero new dispatch, using its exact inputs.
 
     The existing host review record owns the request and roster; custody owns live
-    workers and complete producer artifacts. No new configuration or evidence is
-    sampled here, and missing custody cannot turn collection into a new send.
+    workers and complete producer artifacts. Collection branches BEFORE the
+    ordinary runner (``review_operation.collect_recorded_acceptance_run``): exact
+    producer CAS, a live local worker, or an attach-only read of a proven
+    delegated run, parsed locally. Missing custody cannot turn it into a send.
     """
-    import copy
-    import time
-    from ouroboros.review_custody import _freeze_roster_rows
-    from ouroboros.review_execution import ReviewRouteKind
-    from ouroboros.review_substrate import ReviewRequest, ReviewSlot, run_review_request
+    from ouroboros.review_operation import collect_recorded_acceptance_run
 
-    request = ReviewRequest(**copy.deepcopy(run["request"]))
-    if request.surface != "task_acceptance" or not request.retry_key:
-        raise ValueError("recorded acceptance operation identity is missing")
-    slots = [ReviewSlot(**{**row, "route": ReviewRouteKind(row["route"])})
-             for row in copy.deepcopy(run.get("slot_roster") or [])]
-    if not slots:
-        raise ValueError("recorded acceptance roster is unavailable")
-    request.reconcile_only, request.drain_deadline = True, time.monotonic()
-    previous = getattr(usage_ctx, "_review_frozen_rows", None)
-    usage_ctx._review_frozen_rows = {
-        **(previous or {}),
-        "task_acceptance": _freeze_roster_rows(usage_ctx, "task_acceptance", run.get("actors")),
-    }
-    try:
-        return run_review_request(request, slots=slots, drive_root=pathlib.Path(drive_root),
-                                  usage_ctx=usage_ctx)
-    finally:
-        usage_ctx._review_frozen_rows = previous
+    return collect_recorded_acceptance_run(run, drive_root=pathlib.Path(drive_root), usage_ctx=usage_ctx,
+                                           controller=controller)
 
 
 def reconcile_pending_acceptance_runs(
-    llm_trace: dict, *, drive_root: Any, usage_ctx: Any,
+    llm_trace: dict, *, drive_root: Any, usage_ctx: Any, controller: Any = None,
 ) -> int:
     """Collect every already-paid acceptance panel still recorded as running, $0.
 
@@ -200,19 +202,37 @@ def reconcile_pending_acceptance_runs(
             continue
         if not isinstance(run.get("request"), dict) or not run.get("slot_roster"):
             continue
-        if not acceptance_run_pending(run):
-            continue
-        try:
-            result = collect_task_acceptance_run(
-                run, drive_root=drive_root, usage_ctx=usage_ctx,
-            )
-        except (OSError, TimeoutError, ValueError, KeyError) as exc:
-            log.warning("acceptance run %s could not be reconciled: %s",
-                        str(run.get("panel_id") or "")[:16], exc)
-            continue
-        # Keep the host panel identity and paid request; only producer facts advance.
-        run.update({key: value for key, value in vars(result).items() if key not in {"request", "panel_id"}})
-        advanced += not acceptance_run_pending(run)
+        while True:
+            with _ACCEPTANCE_COLLECTION_LOCK:
+                if not acceptance_run_pending(run):
+                    break
+                actors = run.get("actors")
+                snapshot = dict(run)
+            try:
+                # Collection may read a delegated run; never hold the lock over I/O.
+                result = collect_task_acceptance_run(
+                    snapshot, drive_root=drive_root, usage_ctx=usage_ctx,
+                    **({"controller": controller} if controller is not None else {}),
+                )
+            except (OSError, TimeoutError, ValueError, KeyError) as exc:
+                log.warning("acceptance run %s could not be reconciled: %s",
+                            str(run.get("panel_id") or "")[:16], exc)
+                break
+            with _ACCEPTANCE_COLLECTION_LOCK:
+                if not acceptance_run_pending(run):
+                    # This caller observed pending too and may own publication
+                    # of the transition, even when another collector applied it.
+                    advanced += 1
+                    break
+                # Collectors replace this list, never mutate its rows. A concurrent
+                # collection won: recollect its facts instead of erasing progress.
+                if run.get("actors") is not actors:
+                    continue
+                # Keep the host panel identity and paid request.
+                run.update({key: value for key, value in vars(result).items()
+                            if key not in {"request", "panel_id"}})
+                advanced += not acceptance_run_pending(run)
+                break
     return advanced
 
 
@@ -221,6 +241,14 @@ def task_acceptance_preclaim_refusal(ctx: Any) -> Any:
     from ouroboros.review_substrate import ReviewRunResult
     from ouroboros.task_results import project_task_acceptance_review_capacity
 
+    if getattr(ctx, "historical_purpose", None):
+        from ouroboros.acceptance_late import historical_preclaim_refusal
+
+        reason = historical_preclaim_refusal(ctx)
+        if reason:
+            return ReviewRunResult(request={"surface": "task_acceptance", "task_id": str(ctx.task_id)},
+                actors=[], parsed_findings=[], aggregate_signal="DEGRADED", degraded=True,
+                degraded_reasons=[f"{reason} (no reviewer was called)"])
     projection = project_task_acceptance_review_capacity(
         ctx.tools._ctx,
         binding_hash=str((ctx.review_binding or {}).get("binding_hash") or ""),
@@ -228,6 +256,7 @@ def task_acceptance_preclaim_refusal(ctx: Any) -> Any:
         # A-material: refuse a PAID dispatch whose material the tree already
         # bought, even when the binding hash moved (a cosmetic tool call moves it).
         paid_identity=str((ctx.review_binding or {}).get("paid_identity") or ""),
+        purpose=str(getattr(ctx, "purpose", "") or ""),
     )
     if projection.get("state") == "available" and not projection.get("binding_seen"):
         return None
@@ -352,15 +381,24 @@ def bind_task_acceptance_paid_dispatch(ctx: Any) -> Iterator[Any]:
         or getattr(tools_ctx, "drive_root", ".")
     ))
     prior = getattr(tools_ctx, "_review_paid_stamp", None)
+    prior_authority = getattr(tools_ctx, "_review_paid_authority", None)
     if prior is not None:
         raise TaskAcceptanceDispatchUnavailable("review_dispatch_stamp_already_bound")
     tools_ctx._review_paid_stamp = task_acceptance_paid_dispatch_stamp(
         ctx, accounting_root, root_task_id, ctx.task_id, ctx.review_binding,
     )
+    # The immutable operation checkpoint retains the wallet binding before the
+    # physical seam claims it. A missing claim still never authorizes recovery.
+    tools_ctx._review_paid_authority = ({
+        "schema_version": 1, "authority": "host_root", "lineage": dict(lineage),
+        "binding": {key: ctx.review_binding.get(key) for key in (
+            "binding_hash", "candidate_hash", "evidence_revision", "fence_hash", "paid_identity")},
+    } if lineage.get("is_root_task") else None)
     try:
         yield tools_ctx
     finally:
         tools_ctx._review_paid_stamp = prior
+        tools_ctx._review_paid_authority = prior_authority
 
 
 def invoke_review_paid_stamp(stamp: Any) -> None:

@@ -200,55 +200,25 @@ def test_root_guard_publishes_its_two_refusals(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("label", "tool", "code", "text"),
+    ("tool", "args", "content"),
     [
-        (
-            "repo_read",
-            "read_file",
-            "LEGACY_BLOCKED",
-            "⚠️ REPO_READ_BLOCKED: this subagent cannot read repo secret or control files.",
-        ),
-        (
-            "repo_list",
-            "list_files",
-            "LEGACY_BLOCKED",
-            "⚠️ REPO_LIST_BLOCKED: this subagent cannot list repo secret or control paths.",
-        ),
-        (
-            "data_read",
-            "read_file",
-            "DATA_BLOCKED",
-            "⚠️ DATA_READ_BLOCKED: this subagent cannot read secret or owner-control data files.",
-        ),
-        (
-            "data_list",
-            "list_files",
-            "DATA_BLOCKED",
-            "⚠️ DATA_LIST_BLOCKED: this subagent cannot list secret or owner-control data paths.",
-        ),
-        (
-            "resource_block",
-            "read_file",
-            "LEGACY_BLOCKED",
-            "⚠️ READ_FILE_BLOCKED: this subagent cannot access secret or owner-control data files.",
-        ),
+        ("read_file", {"path": ".env"}, "SECRET=1"),
+        ("list_files", {"path": ".git"}, "HEAD"),
+        ("read_file", {"root": "runtime_data", "path": "settings.json"}, "{}"),
+        ("list_files", {"root": "runtime_data", "path": "secrets"}, "sample.txt"),
+        ("read_file", {"root": "system_repo", "path": ".env"}, "SECRET=1"),
     ],
 )
-def test_restricted_subagent_refusals_publish_their_adapter_code(tmp_path, label, tool, code, text):
+def test_helper_file_content_has_successful_native_results(tmp_path, tool, args, content):
     repo, drive = _tree(tmp_path)
-    ctx = _readonly_ctx(repo, drive)
-    calls = {
-        "repo_read": lambda: core_file_tools._repo_read(ctx, ".env"),
-        "repo_list": lambda: core_file_tools._repo_list(ctx, ".git"),
-        "data_read": lambda: core_file_tools._data_read(ctx, "settings.json"),
-        "data_list": lambda: core_file_tools._data_list(ctx, "secrets"),
-        "resource_block": lambda: core_file_tools._read_file(ctx, ".env", root="system_repo"),
-    }
-
-    published = _published(ctx, tool, calls[label])
-
-    assert published.code == code
-    assert published.text == text
+    (repo / ".git").mkdir()
+    (repo / ".git" / "HEAD").write_text("ref: refs/heads/fixture\n", encoding="utf-8")
+    (drive / "secrets").mkdir()
+    (drive / "secrets" / "sample.txt").write_text("synthetic input", encoding="utf-8")
+    registry = ToolRegistry(repo_dir=repo, drive_root=drive)
+    registry.set_context(_readonly_ctx(repo, drive))
+    result = registry.execute_result(tool, args)
+    assert result.status == "ok" and content in result.text
 
 
 def test_user_files_path_refusal_stays_a_policy_denial(tmp_path, monkeypatch):
@@ -372,7 +342,13 @@ def test_owner_chat_delivery_terminals_are_native(tmp_path, label, tool, code, t
             {"path": "notes.txt", "root": "runtime_data", "old_str": "zeta", "new_str": "q"},
             "EDIT_TEXT_BLOCKED",
             "⚠️ EDIT_TEXT_ERROR: old_str not found in runtime_data:notes.txt.\n"
-            "File preview (first 2000 chars):\nalpha\nbeta\n",
+            "Nearest region: line 2 (0 of 1 old_str line(s) match ignoring whitespace):\n"
+            " 2| beta\n"
+            "first difference at line 2:\n"
+            "  file   : 'beta'\n"
+            "  old_str: 'zeta'\n"
+            "Re-read that region (read_file start_line=2 max_lines=1) and copy the exact bytes into old_str.\n"
+            "File preview (whole file, 11 chars):\nalpha\nbeta\n",
         ),
         (
             "edit_text",

@@ -60,6 +60,10 @@ from ouroboros.provider_models import (  # noqa: E402
     LEGACY_MODEL_SETTING_KEYS,
 )
 from ouroboros.tools.scope_review_contract import SCOPE_REQUIRED_ITEMS  # noqa: E402
+from tests.candidate_checkout import (  # noqa: E402
+    CandidateCheckout, CandidateError, assert_served_candidate,
+    require_candidate_interpreter, verify_checkout,
+)
 
 LANE_MOCK = "mock"
 
@@ -115,9 +119,34 @@ SCENARIOS = {
     # on an event-gated model hold (ModelGate), never a timed race.
     "S26": ("direct-chat owner stop: an in-flight direct turn is addressable (running list + activity snapshot), stop-now mid-round answers the typed 'still live' with the cooperative control armed ONCE (a repeat is idempotent), the turn ends at its next step with ZERO further model rounds under the owner-stop reason, the chat concludes, custody settles already_settled against the turn's own terminal, and a later stop is the typed 404", LANE_MOCK),
     "S27": ("ordinary Main/Project capability: real stdio MCP reads and writes, correct built-in room target, and a second native turn completes while the first model call is held", LANE_MOCK),
+    # Serial addressed turns (owner 2026-09-23 21:12: the GENERAL capability of
+    # continuable addressed participant turns, native children and session agents,
+    # with an explicit end of participation; planning the first consumer). Stub
+    # models prove the HOST wiring only — never a live model's or vendor's quality.
+    "S28": ("serial addressed turns, NATIVE: A->B->A peer contributions through forward_to_worker + await_messages (a contribution does not end participation; FINAL only after the awaited reply), selected originals addressed to the planning parent and present in its plan evidence, sibling-only originals absent", LANE_MOCK),
+    "S29": ("serial addressed turns, SESSION: one fake-engine run pauses twice; a native child's original is relayed byte-exact through delegate_answer free_text, the run resumes in the SAME session (continuation=same_session on every waiting payload, the re-wait included) and echoes the exact bytes; the codex-shaped input_required terminal names continuation=new_physical_run and is continued by a NEW start", LANE_MOCK),
+    # Wave 8: the exact mid-run budget pause / owner Resume lifecycle (#1196) as a
+    # real consumer: priced stub, tiny wallet, the ledger fence pauses the task
+    # nonterminally under its own id; an increase wakes nothing; Resume grants once.
+    "S30": ("exact budget pause -> owner Resume, MANAGED root: priced rounds hit the global ledger fence, the task parks nonterminal under its SAME id (durable paused row + PENDING _budget_pause carrier, no task_done, no paid wrap-up, /api/state budget_paused); Resume while exhausted is the typed 409; raising TOTAL_BUDGET alone wakes nothing (bounded watch); Resume after the increase mints ONE single-use grant, the loop consumes it, the task completes with cumulative rounds/spend and task_done exactly once; a repeated Resume is the typed 404", LANE_MOCK),
+    "S31": ("exact budget pause -> owner Resume, DIRECT owner-chat turn: a WS chat turn hits its graceful in-task ceiling mid-turn, the live actor ends and its own record parks inline as the PENDING _budget_pause carrier with _is_direct_chat under the SAME id (no second actor, no task_done, no paid wrap-up; census direct_chat/budget_paused); a budget increase wakes nothing; Resume mints one grant, a pooled worker continues the checkpoint with the Q10 threshold refresh, and the turn concludes in the chat (durable chat row + keyed final frame over the same /ws); a repeated Resume is the typed 404", LANE_MOCK),
+    "S32": ("exact budget pause survives the physical epoch: a paused MANAGED root rides a GRACEFUL server SIGTERM (the lifespan teardown's kill_workers ran: server_shutdown row) untouched — no task_done, no cancel, the same paused row and PENDING _budget_pause carrier in the final snapshot; the next boot parks the SAME id again unheld and un-dispatched (census budget_paused, public detail scheduled/budget_paused, Resume still the typed 409 while exhausted); after the increase one Resume grant completes the same id with cumulative rounds/spend", LANE_MOCK),
+    # Presence resilience: Host responsiveness and turn custody under real waits.
+    # FOUR tests: executor starvation alone, a held Host authentication alone,
+    # both together, and the owner's Panic under the combined load.
+    "S33": ("Presence waits keep owner controls answering: 12 events (2 held at the model, slot and same-conversation waits) on a 12-thread default executor and/or one held Host authentication; while held, /api/state, a v1 receipt and the owner's Stop (durable cancel intent, cancelled terminal) answer inside 10s/15s windows (health alone never passes); a disconnected turn and its retry are ONE model call and a later replay answers the same projection; Panic under the combined load ends the whole tree", LANE_MOCK),
+    # Plan review's ANSWER CHANNEL under blocking enforcement at the shipped cycle cap,
+    # over the asynchronous barrier route with three DISTINCT keyless reviewer models
+    # (the stub answers per seat by the wire model id).
+    "S34": ("plan review addressed answer, BLOCKING at the shipped cap: t1 objects below quorum -> $0 reject -> the identical envelope with the answer re-asks t1 ALONE (t2/t3 kept at $0 as replayed rows) over the barrier route -> t1 retires -> GREEN closed, two paid cycles, the task completes under blocking", LANE_MOCK),
+    "S35": ("plan review no-need path, BLOCKING: t1 asks the author (need_evidence), t2 leaves a note; a $0 accept closes the wave GREEN with no second panel (three reviewer calls, one paid cycle) and the task completes under blocking", LANE_MOCK),
 }
 
 MOCK_SLUG = "openai-compatible::mock-model"
+# The three DISTINCT reviewer slugs of the per-seat scenarios: seat t<i> rides
+# ``<MOCK_SLUG>-t<i>``, so ``default_slot_binder`` (the wire ``model`` field) names
+# the seat that made the call and a ReviewScript step can answer per seat.
+DISTINCT_MOCK_MODEL_IDS = tuple(f"mock-model-t{i}" for i in (1, 2, 3))
 
 # ---------------------------------------------------------------------------
 # Prompt markers the stub classifies review-organ calls by (roast F22).
@@ -521,9 +550,17 @@ class LoopbackModelServer:
                     outer.gate(body)
                 if outer.latency_sec:
                     time.sleep(outer.latency_sec)
-                return self._send(outer._completion(body), stream=bool(body.get("stream")))
+                try:
+                    completion = outer._completion(body)
+                except Exception as exc:  # a scenario-script bug must fail LOUDLY, never hang the client
+                    import traceback
 
-            def _send(self, payload, *, stream=False):
+                    sys.stderr.write("LoopbackModelServer: scenario step raised\n" + traceback.format_exc())
+                    return self._send({"error": {"message": f"scenario step raised {type(exc).__name__}: {exc}",
+                                                 "type": "e2e_script_error"}}, status=500)
+                return self._send(completion, stream=bool(body.get("stream")))
+
+            def _send(self, payload, *, stream=False, status=200):
                 content_type = "application/json"
                 if stream:
                     content_type = "text/event-stream"
@@ -543,7 +580,7 @@ class LoopbackModelServer:
                             + "data: [DONE]\n\n").encode("utf-8")
                 else:
                     data = json.dumps(payload).encode("utf-8")
-                self.send_response(200)
+                self.send_response(status)
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
@@ -610,12 +647,20 @@ class ScriptedStubModel(LoopbackModelServer):
 
     def __init__(self, script=None, *, final_answer: str = "Final answer: scripted scenario complete.",
                  latency_sec: float = 0.0, review_script: "ReviewScript | None" = None,
-                 gate: "ModelGate | None" = None) -> None:
+                 gate: "ModelGate | None" = None, model_ids=None) -> None:
         super().__init__(latency_sec=latency_sec, gate=gate)
         self.script = list(script or [])
         self.final_answer = final_answer
         self.review_script = review_script
+        # As on ReplayModel: extra wire ids to advertise on /models, so the
+        # capability-evidence window probe confirms a window for each distinct slot route.
+        self._explicit_model_ids = [str(m) for m in model_ids] if model_ids else None
         self._script_index = 0
+
+    def _model_ids(self) -> list[str]:
+        if self._explicit_model_ids is not None:
+            return sorted(set(self._explicit_model_ids) | {"mock-model"})
+        return super()._model_ids()
 
     def _next_step(self, _body) -> dict | None:
         if self._script_index >= len(self.script):
@@ -654,6 +699,23 @@ def default_slot_binder(body: dict) -> str:
     slugs per model slot in settings, so the wire's ``model`` field names the slot
     that made the call (no guessing from prompt shape)."""
     return str(body.get("model") or "")
+
+
+class HeldStep:
+    """Marker a CALLABLE ReplayModel step returns to serve ``step`` now and be
+    consulted AGAIN on the next call of the same (lineage, slot).
+
+    The attempt ordinal does not advance, so a wait that must repeat a
+    timing-dependent number of times (until a mailbox delivery is visible in the
+    transcript) keeps ONE fixture row instead of guessing the count — the
+    ReplayModel twin of the wave-3a ``_Again`` hold for the scripted stub.
+    ``assert_consumed()`` still requires the held row to have been served.
+    """
+
+    __slots__ = ("step",)
+
+    def __init__(self, step: dict) -> None:
+        self.step = step
 
 
 class ReplayModel(LoopbackModelServer):
@@ -729,6 +791,9 @@ class ReplayModel(LoopbackModelServer):
         self.consumed.append(key)
         if callable(step):
             step = step(body)
+            if isinstance(step, HeldStep):
+                self._attempts[(lineage, slot)] = attempt - 1  # consult this row again
+                step = step.step
         if "message" in step:
             return "replay", dict(step["message"])
         if "final" in step:
@@ -956,7 +1021,17 @@ class KeylessIsolatedServer(IsolatedServer):
     servers authenticate from them). This lane's contract is the opposite: the ONLY
     provider config a scenario server may see is what the scenario's settings.json
     says, and that file only ever names the loopback stub.
+
+    Browser callers pass a CandidateCheckout to retain the dirty snapshot until
+    its contained process tree is proven gone. Plain Path callers keep the
+    mutable HEAD-clone contract used by self-modification E2E scenarios.
     """
+
+    def __init__(self, clone, *args, **kwargs):
+        self.candidate = clone if isinstance(clone, CandidateCheckout) else None
+        self._candidate_container = None
+        self._candidate_cleanup_error = ""
+        super().__init__(self.candidate.path if self.candidate else clone, *args, **kwargs)
 
     def _env(self) -> dict:
         env = super()._env()
@@ -965,8 +1040,71 @@ class KeylessIsolatedServer(IsolatedServer):
                 env.pop(key, None)
         return env
 
+    def start(self, ready_timeout: float = 180):
+        if self.candidate is None:
+            return super().start(ready_timeout)
+        from ouroboros.process_containment import ProcessContainer
 
-def keyless_reviewer_slots(*, advisory: bool = False) -> str:
+        if self._candidate_container is not None or self._candidate_cleanup_error:
+            raise CandidateError("CANDIDATE_CUSTODY: previous server tree was not released")
+        verify_checkout(self.clone, self.candidate)
+        self._patch_settings_ports()
+        env = self._env()
+        python = sys.executable
+        if os.name == "nt":
+            # As in the shared UI fixture, the base interpreter owns the serving
+            # PID; the venv launcher would return a different parent PID.
+            python = str(getattr(sys, "_base_executable", sys.executable))
+            site = pathlib.Path(sys.executable).resolve().parent.parent / "Lib" / "site-packages"
+            if site.is_dir():
+                env["PYTHONPATH"] = os.pathsep.join([str(site), env.get("PYTHONPATH", "")])
+        require_candidate_interpreter(python, env, self.clone)
+        self._candidate_container = ProcessContainer()
+        self.candidate.hold()
+        self.proc = None
+        try:
+            self.proc = self._candidate_container.spawn(
+                [python, "server.py"], cwd=self.clone, env=env,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            self._wait_ready(ready_timeout)
+            assert_served_candidate(self.base_url, self.clone, self.data_root,
+                                    self.proc.pid, self.candidate)
+        except BaseException:
+            self.stop()
+            raise
+        return self
+
+    def stop(self) -> None:
+        if self.candidate is None:
+            return super().stop()
+        if self._candidate_cleanup_error:
+            raise CandidateError(self._candidate_cleanup_error)
+        container, self._candidate_container = self._candidate_container, None
+        if container is None:
+            return
+        try:
+            try:
+                super().stop()
+            finally:
+                try:
+                    error = container.reap()
+                finally:
+                    container.close()
+                if error:
+                    raise CandidateError(f"CANDIDATE_RETAINED: process cleanup failed: {error}")
+                if self.proc is not None:
+                    self.proc.wait(timeout=5)
+        except BaseException as exc:
+            from ouroboros.test_environment import retain_tree
+
+            self._candidate_cleanup_error = f"CANDIDATE_RETAINED: {exc}"
+            retain_tree(self.data_root, self._candidate_cleanup_error)
+            raise
+        self.candidate.release()
+
+
+def keyless_reviewer_slots(*, advisory: bool = False, distinct_models: bool = False) -> str:
     """The structured ``OUROBOROS_REVIEWER_SLOTS`` value pinning every reviewer row
     to the loopback stub.
 
@@ -981,10 +1119,15 @@ def keyless_reviewer_slots(*, advisory: bool = False) -> str:
     the stub (wave 3a): the advisory pre-review then runs the bounded NATIVE
     inspection episode against the loopback model instead of being unavailable
     keyless (which the commit gate compensates with an audited bypass).
+
+    ``distinct_models=True`` pins seat ``t<i>`` to its own slug
+    (``DISTINCT_MOCK_MODEL_IDS``) so a per-seat ReviewScript can tell the seats
+    apart on the wire; the stub must advertise those ids (``model_ids``).
     """
     row = {"kind": "api_chat", "target_id": MOCK_SLUG}
     payload = {
-        "triad": [{"slot_id": f"t{i}", "route": dict(row)} for i in (1, 2, 3)],
+        "triad": [{"slot_id": f"t{i}", "route": {**row, **({"target_id": f"{MOCK_SLUG}-t{i}"} if distinct_models else {})}}
+                  for i in (1, 2, 3)],
         "scope": [{"slot_id": "s1", "route": dict(row)}],
     }
     if advisory:

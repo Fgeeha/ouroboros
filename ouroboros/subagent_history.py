@@ -5,12 +5,26 @@ from __future__ import annotations
 import json
 import logging
 import pathlib
+from datetime import datetime, timezone
 from typing import Any, Mapping
 
 from ouroboros.utils import utc_now_iso, write_text_atomic
 
 log = logging.getLogger(__name__)
 LAST_DELEGATION_FILENAME = "subagent_last_delegation.json"
+
+
+def _timestamp_key(value: Any) -> tuple[int, datetime]:
+    """Order recorded instants, not their differing ISO spellings (Z/offset/fraction)."""
+    text = str(value or "")
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return (1, parsed.astimezone(timezone.utc))
+    except (ValueError, OverflowError):
+        # Unknown/legacy malformed dates cannot outrank a known instant.
+        return (0, datetime.min.replace(tzinfo=timezone.utc))
 
 
 def _last_delegation_path(drive_root=None):
@@ -40,6 +54,29 @@ def execution_identity(snapshot: Mapping[str, Any]) -> dict[str, str]:
                if route.get("kind") == "agent_session" else {})}
 
 
+def snapshot_handle(snapshot: Mapping[str, Any]) -> str:
+    """The handle of the engine a frozen snapshot names, from its own facts."""
+    from ouroboros.configured_subagents import engine_handle
+
+    return engine_handle(execution_identity(snapshot))
+
+
+def recorded_handle(row: Mapping[str, Any]) -> str:
+    """Name the engine a history row ran, from the row's OWN recorded facts.
+
+    A typed ``identity`` yields its handle; an older row without one yields its
+    recorded route target. Never mapped through the live roster: the row an id
+    points at today may be a different engine, and that would relabel the past.
+    """
+    from ouroboros.configured_subagents import engine_handle
+
+    identity = row.get("identity")
+    if isinstance(identity, Mapping) and identity.get("target_id"):
+        return engine_handle(identity)
+    route, model = str(row.get("route") or ""), str(row.get("requested_model") or "")
+    return model if route == "api_model" else route + ("=" + model if route and model else "")
+
+
 def record_last_delegation(*, route: str, requested_model: str, applied_model: str,
                            run_id: str, selected_subagent_id: str = "",
                            requested_profile: str = "", applied_profile: str = "",
@@ -67,6 +104,10 @@ def record_last_delegation(*, route: str, requested_model: str, applied_model: s
         try:
             old = subagent_last_delegation(drive_root)
             rows = dict(old.get("latest_by_subagent") or {})
+            legacy_actor = str(old.get("selected_subagent_id") or "")
+            if legacy_actor and legacy_actor not in rows:
+                rows[legacy_actor] = {key: value for key, value in old.items()
+                                      if key != "latest_by_subagent"}
             old_actor = rows.get(selected_subagent_id) or {}
             previous = old_actor if old_actor.get("run_id") == run_id else old if old.get("run_id") == run_id else {}
             if run_id and previous and (not occurred_at or (
@@ -90,11 +131,12 @@ def record_last_delegation(*, route: str, requested_model: str, applied_model: s
                                ("task_id", task_id), ("invocation_id", invocation_id), ("attempt_id", attempt_id)):
                 if value:
                     row[key] = str(value)
-            if selected_subagent_id and (not old_actor or (occurred_at and row["ts"] >= str(old_actor.get("ts") or ""))):
+            if selected_subagent_id and (not old_actor or (occurred_at and
+                    _timestamp_key(row["ts"]) >= _timestamp_key(old_actor.get("ts")))):
                 rows[selected_subagent_id] = row
-            rows = dict(sorted(rows.items(), key=lambda item: str(item[1].get("ts") or ""),
+            rows = dict(sorted(rows.items(), key=lambda item: _timestamp_key(item[1].get("ts")),
                                reverse=True)[:MAX_CONFIGURED_SUBAGENTS])
-            latest = row if not old or (occurred_at and row["ts"] >= str(old.get("ts") or "")) else old
+            latest = row if not old or (occurred_at and _timestamp_key(row["ts"]) >= _timestamp_key(old.get("ts"))) else old
             write_text_atomic(path, json.dumps({**latest, "latest_by_subagent": rows}, ensure_ascii=False, indent=1))
         finally:
             release_exclusive_file_lock(lock_path, lock)

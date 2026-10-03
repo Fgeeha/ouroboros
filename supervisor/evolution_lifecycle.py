@@ -48,14 +48,67 @@ def _read_evolution_campaign() -> Dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+# #1307: a received Stop outlives a failed state write. The live latch keeps it in this
+# process; the campaign's ``stop_intent`` keeps it durably, beside (never instead of) the
+# state flag and whether or not cancellation finished. Only an owner-sourced successful
+# ``start_evolution_campaign`` clears them.
+_STOP_LATCH = {"stopped": False}
+_OWNER_START_SOURCES = frozenset({"owner", "owner_chat"})
+
+
+def record_evolution_stop_intent(source: str, reason: str = "") -> bool:
+    """Latch the Stop, then record it in the EXISTING campaign record (no invented
+    terminal status). False: the durable intent could not be written (the caller
+    discloses it). An absent campaign gets only the intent, never a fake status."""
+    from supervisor import state
+
+    _STOP_LATCH["stopped"] = True
+    lock_fd = state.acquire_file_lock(state.STATE_LOCK_PATH, timeout_sec=1.0)
+    if lock_fd is None:
+        return False
+    try:
+        campaign = _read_evolution_campaign()
+        campaign["stop_intent"] = {"at": utc_now_iso(), "source": str(source or "owner"), "reason": str(reason or "")}
+        return _write_evolution_campaign(campaign, _state_lock_held=True)
+    except OSError:
+        return False
+    finally:
+        state.release_file_lock(state.STATE_LOCK_PATH, lock_fd)
+
+
+def evolution_stop_reason(campaign: Optional[Dict[str, Any]] = None) -> str:
+    """Why no new evolution may be admitted regardless of state.json: a received
+    Stop (latch or durable intent) or an unconsumed Panic flag. "" when none."""
+    from supervisor import queue
+    from supervisor.state_initialization import confirm_absent
+
+    if _STOP_LATCH["stopped"]:
+        return "stop_latched"
+    if isinstance((campaign if campaign is not None else _read_evolution_campaign()).get("stop_intent"), dict):
+        return "stop_intent"
+    path = pathlib.Path(queue.DRIVE_ROOT) / "state" / "panic_stop.flag"
+    try:
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            confirm_absent(path)
+            return ""
+        return "panic_flag"
+    except OSError:
+        return "panic_flag_unknown"
+
+
 def disable_evolution_projection() -> None:
     """Clear the scheduler projection without changing campaign history."""
     from supervisor import state
 
-    state.update_state(lambda live: live.update({
-        "evolution_mode_enabled": False,
-        "post_task_autostop": False,
-    }))
+    try:
+        state.update_state(lambda live: live.update({
+            "evolution_mode_enabled": False,
+            "post_task_autostop": False,
+        }), confirm=("evolution_mode_enabled", "post_task_autostop"))
+    except state.StateUnavailable:
+        log.warning("evolution projection disable not persisted: state unavailable", exc_info=True)
 
 
 def disable_evolution_authority(
@@ -103,14 +156,19 @@ def enqueue_evolution_task_if_needed() -> None:
     q._deliver_pending_owner_report()
     if q.PENDING or q.RUNNING:
         return
+    from supervisor.state import StateUnavailable, control_is, update_state
+
     st = q.load_state()
-    if not bool(st.get("evolution_mode_enabled")):
+    # Autonomy needs KNOWN current controls (#1307): an unknown flag is not "enabled".
+    # The owner chat is only the notice address, so its display value serves.
+    if not (control_is(st, "evolution_mode_enabled", True) and control_is(st, "evolution_owner_stopped", False)):
         return
     owner_chat_id = st.get("owner_chat_id")
     if not owner_chat_id:
         return
     campaign = q._read_evolution_campaign()
-    from supervisor.state import update_state
+    if evolution_stop_reason(campaign):
+        return
     has_authority = all(str(campaign.get(key) or "").strip() for key in ("id", "source"))
     if campaign.get("status") != "active" or not has_authority:
         q.disable_evolution_authority("bare_flag_disabled", campaign_id=str(campaign.get("id") or ""))
@@ -147,14 +205,9 @@ def enqueue_evolution_task_if_needed() -> None:
             role="system", system_type="evolution_notice")
         return
 
-    # BUG3: pause if the SAME objective has been re-proposed and no-op'd
-    # OBJECTIVE_REPEAT_CAP times without ever absorbing. This is a SEPARATE
-    # breaker from consecutive_failures above: that counter is reset to 0 by
-    # ANY non-failing cycle (events.py), so it cannot catch a self-maintenance
-    # loop where a blocked objective is re-proposed NON-consecutively
-    # (interleaved with other no_op work). The per-objective count is keyed on
-    # the same canonical fingerprint the transaction stamps, accumulates across
-    # non-consecutive recurrence, and is cleared only on a genuine absorb.
+    # Objective repeats count non-consecutive no-ops by the transaction's canonical
+    # fingerprint, clearing only on absorption. The failure streak cannot catch
+    # these loops because every non-failing cycle resets it (events.py).
     objective_repeat_counts = campaign.get("objective_repeat_counts") or {}
     active_objective_fp = canonical_objective_fingerprint(
         str(campaign.get("objective") or ""),
@@ -177,8 +230,8 @@ def enqueue_evolution_task_if_needed() -> None:
             role="system", system_type="evolution_notice")
         return
 
-    try:
-        remaining = q.budget_remaining(st, strict=True)
+    try:  # on the supervisor loop: ride the snapshot, decide the reserve refusal on the exact read
+        remaining = q.budget_remaining(st, strict=True, allow_stale=True, refuse_below=q.EVOLUTION_BUDGET_RESERVE)
     except Exception:
         log.error("Evolution scheduling deferred: cost accounting unavailable", exc_info=True)
         q.append_jsonl(q.DRIVE_ROOT / "logs" / "events.jsonl", {
@@ -205,6 +258,7 @@ def enqueue_evolution_task_if_needed() -> None:
             "🧬 Evolution stayed off: the campaign changed before its next task could be attached. Start it again when ready.",
             role="system", system_type="evolution_notice")
         return
+    tid = transaction["task_id"]  # only a positively refused attempt retains its identity
     task = {
         "id": tid, "type": "evolution",
         "chat_id": int(owner_chat_id),
@@ -212,20 +266,23 @@ def enqueue_evolution_task_if_needed() -> None:
         "metadata": {"evolution_transaction": transaction, **consciousness_origin_metadata(campaign)},
     }
     q.attach_task_contract(task)
-    admitted = q.enqueue_task(task)
+    def prepare_admission(row: Dict[str, Any]) -> bool:
+        refreshed = q.begin_evolution_transaction(tid, cycle=cycle, campaign=campaign, transaction=transaction)
+        if refreshed:
+            row["metadata"]["evolution_transaction"] = refreshed
+        return bool(refreshed)
+
+    admitted = q.enqueue_with_admission_receipt(task, prepare_admission=prepare_admission)
     if isinstance(admitted, dict) and admitted.get("_admission_blocked"):
-        # The ONE admission door refused the cycle (a consciousness campaign out of its
-        # allowance or concurrency, a closed pool): pause the campaign like the other
-        # breakers — once, with an owner line — instead of minting a transaction and
-        # bumping the cycle on every supervisor pass. /evolve start (or the agent at
-        # Full, once its allowance is back) resumes the SAME campaign; the minted
-        # transaction is archived as dispatch_not_persisted by the next one.
+        # Preserve positive no-handoff evidence, never infer it from an idle queue.
+        if admitted.get("_admission_never_admitted") is True:
+            refusal = {"reason": admitted["_admission_blocked"], "source": campaign["source"]}
+            update_evolution_transaction(tid, admission_refused=refusal)
         reason = str(admitted.get("_admission_blocked") or "admission_fence")
         detail = str(admitted.get("_admission_detail") or admitted.get("_worker_pool_disabled_reason") or "")
         if not reason.startswith("consciousness_"):
-            # Any other refusal clears itself (a pool, a reservation): no cycle is recorded
-            # and the next pass tries again, as before — never a pause of the owner's campaign.
-            log.warning("evolution cycle %s was not admitted (%s); retrying on the next pass", tid, reason)
+            if transaction.get("admission_refused", {}).get("reason") != reason:
+                log.warning("evolution cycle %s was not admitted (%s); retrying on the next pass", tid, reason)
             return
         q.pause_evolution_campaign(f"admission_refused:{reason}")
         q.disable_evolution_projection()
@@ -240,7 +297,10 @@ def enqueue_evolution_task_if_needed() -> None:
         live["evolution_cycle"] = cycle
         live["last_evolution_task_at"] = utc_now_iso()
 
-    update_state(_record_cycle)
+    try:
+        update_state(_record_cycle)
+    except StateUnavailable:
+        log.warning("evolution cycle %s admitted; its state counter was not persisted", tid, exc_info=True)
 
 
 def _write_evolution_campaign(
@@ -324,6 +384,9 @@ def start_evolution_campaign(objective: str = "", *, source: str = "owner", orig
         return {}
     try:
         campaign = _read_evolution_campaign()
+        owner_start = str(source or "") in _OWNER_START_SOURCES
+        if not owner_start and evolution_stop_reason(campaign):
+            return {}  # a received Stop yields only to the owner's own start (#1307)
         prior_campaign_id = str(campaign.get("id") or "")
         now = utc_now_iso()
         objective = str(objective or "").strip()
@@ -365,11 +428,15 @@ def start_evolution_campaign(objective: str = "", *, source: str = "owner", orig
         generation = current_evolution_boot_generation()
         if generation:
             campaign["last_boot_reconcile_gen"] = generation
-        return campaign if _write_evolution_campaign(
+        campaign.pop("stop_intent", None)  # cleared ONLY by this successful authorized start
+        written = _write_evolution_campaign(
             campaign,
             expected_campaign_id=prior_campaign_id,
             _state_lock_held=True,
-        ) else {}
+        )
+        if written and owner_start:
+            _STOP_LATCH["stopped"] = False
+        return campaign if written else {}
     finally:
         state.release_file_lock(state.STATE_LOCK_PATH, lock_fd)
 
@@ -405,19 +472,13 @@ def pause_evolution_campaign(reason: str = "") -> Dict[str, Any]:
 def complete_evolution_campaign(
     reason: str = "", *, status: str = "stopped", cleanup_worktree: bool = True
 ) -> Dict[str, Any]:
-    """Terminally CLOSE the active campaign — the OWNER-stop counterpart of the
-    resumable pause. ``status`` is non-{active,paused}, so a later ``/evolve start``
-    mints a FRESH campaign instead of resurrecting this one. Archives + pops any
-    in-flight ``active_transaction`` (and ``post_task_backlog_id``) so a terminally
-    stopped campaign carries no dangling commit for a boot reconcile to absorb. The
-    durable gate against autonomous re-arm is the ``evolution_owner_stopped`` state
-    flag set at the owner-stop sites (read by ``apply_pending_request``); this terminal
-    status is the observability/audit marker plus a clean campaign. Never raises.
+    """Close rather than pause: a later owner start creates a fresh campaign.
 
-    ``cleanup_worktree`` (default True) runs the deterministic per-cycle worktree reset
-    for an in-flight transaction. PANIC passes ``False``: the Emergency Stop Invariant
-    (BIBLE) forbids delaying panic, so panic must NOT run git stash/reset work before its
-    hard exit — the panic flag + boot reconcile own that recovery instead."""
+    Archive/remove the active transaction and backlog claim so boot cannot absorb
+    a stopped cycle. The owner's sticky evolution_owner_stopped flag independently
+    prevents autonomous re-arm. Never raises. Panic passes cleanup_worktree=False:
+    no git work may delay its hard exit; boot custody owns later recovery.
+    """
     try:
         from supervisor import state
 
@@ -472,8 +533,20 @@ def complete_evolution_campaign(
         return {}
 
 
-def begin_evolution_transaction(task_id: str, *, cycle: int, campaign: Dict[str, Any]) -> Dict[str, Any]:
-    """Attach a compact self-modification transaction to the active campaign."""
+def begin_evolution_transaction(task_id: str, *, cycle: int, campaign: Dict[str, Any],
+                                transaction: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Attach a cycle, or refresh its base under Q immediately before its receipt.
+
+    Clear positive-refusal proof BEFORE admission; interruptions keep orphan custody.
+    """
+    previous = campaign.get("active_transaction")
+    previous = previous if isinstance(previous, dict) else {}
+    refusal = previous.get("admission_refused")
+    objective_fp = canonical_objective_fingerprint(str(campaign.get("objective") or ""))
+    if (transaction is None and isinstance(refusal, dict) and refusal.get("source") == campaign.get("source")
+            and previous.get("objective_fp") == objective_fp and not previous.get("commit_sha")):
+        return dict(previous)
+    expected_transaction = transaction
     try:
         from supervisor import git_ops
 
@@ -490,27 +563,18 @@ def begin_evolution_transaction(task_id: str, *, cycle: int, campaign: Dict[str,
         "campaign_id": str((campaign or {}).get("id") or ""),
         "task_id": str(task_id or ""),
         "cycle": int(cycle or 0),
-        # BUG3: capture the objective this cycle will run, at cycle START, as the SSOT
-        # per-cycle fingerprint. Read here (not at outcome time) because campaign["objective"]
-        # can be overwritten by a later promotion before the outcome is recorded.
-        "objective_fp": canonical_objective_fingerprint(str((campaign or {}).get("objective") or "")),
-        "created_at": utc_now_iso(),
-        "updated_at": utc_now_iso(),
-        "base_head": base_head,
-        "base_branch": base_branch,
-        "preflight_status": "pending",
-        "advisory_status": "pending",
-        "triad_scope_status": "pending",
-        "commit_sha": "",
-        "push_status": "pending",
-        "restart_decision": "",
-        "restart_required": False,
-        "restart_verified": False,
-        "restart_verified_at": "",
-        "rescue_ref": "",
-        "rescue_path": "",
-        "recovery_hint": "",
+        "objective_fp": objective_fp,  # cycle-start truth, not a later campaign objective
+        "created_at": utc_now_iso(), "updated_at": utc_now_iso(),
+        "base_head": base_head, "base_branch": base_branch,
+        "preflight_status": "pending", "advisory_status": "pending", "triad_scope_status": "pending",
+        "commit_sha": "", "push_status": "pending",
+        "restart_decision": "", "restart_required": False, "restart_verified": False, "restart_verified_at": "",
+        "rescue_ref": "", "rescue_path": "", "recovery_hint": "",
     }
+    if expected_transaction is not None:
+        transaction = {**expected_transaction, **{key: transaction[key] for key in
+                       ("base_head", "base_branch", "objective_fp", "cycle")}}
+        transaction.pop("admission_refused", None)
     from supervisor import state
 
     state.assert_test_data_path(state.STATE_PATH)
@@ -519,18 +583,22 @@ def begin_evolution_transaction(task_id: str, *, cycle: int, campaign: Dict[str,
         return {}
     try:
         current = _read_evolution_campaign()
-        live_state = state.json_load_file(state.STATE_PATH) or {}
+        live_state = state.read_state().projection()
         existing_tx = current.get("active_transaction")
         existing_tx = existing_tx if isinstance(existing_tx, dict) else {}
         if (
-            bool(live_state.get("evolution_owner_stopped"))
-            or not bool(live_state.get("evolution_mode_enabled"))
+            not state.control_is(live_state, "evolution_owner_stopped", False)
+            or not state.control_is(live_state, "evolution_mode_enabled", True)
+            or evolution_stop_reason(current)
             or current.get("status") != "active"
-            or str(current.get("id") or "") != str(campaign.get("id") or "")
+            or any(current.get(key) != campaign.get(key) for key in ("id", "source", "objective"))
+            or (expected_transaction is not None and existing_tx != expected_transaction)
             or bool(str(existing_tx.get("commit_sha") or "").strip())
         ):
             return {}
-        if existing_tx:
+        if expected_transaction is not None and existing_tx == transaction:
+            return transaction
+        if existing_tx and expected_transaction is None:
             existing_tx.update({
                 "cycle_outcome": "abandoned",
                 "abandoned_reason": "dispatch_not_persisted",
@@ -543,10 +611,7 @@ def begin_evolution_transaction(task_id: str, *, cycle: int, campaign: Dict[str,
             return {}
         stored = _read_evolution_campaign()
         stored_tx = stored.get("active_transaction")
-        if not isinstance(stored_tx, dict) or any(
-            str(stored_tx.get(key) or "") != str(transaction.get(key) or "")
-            for key in ("campaign_id", "transaction_id", "task_id")
-        ):
+        if stored_tx != transaction:
             return {}
         return transaction
     finally:
@@ -578,11 +643,17 @@ def _evolution_claim_error(
     campaign_id: str, transaction_id: str, task_id: str, commit_sha: str = "",
     require_uncommitted: bool = False,
 ) -> str:
+    from supervisor.state import control_value
+
     if not campaign_id or not transaction_id or not task_id:
         return "claim_identity_missing"
-    if bool(live_state.get("evolution_owner_stopped")):
+    stopped_known, stopped = control_value(live_state, "evolution_owner_stopped")
+    if (stopped_known and stopped) or evolution_stop_reason(campaign):
         return "owner_stopped"
-    if not bool(live_state.get("evolution_mode_enabled")) and not commit_sha:
+    enabled_known, enabled = control_value(live_state, "evolution_mode_enabled")
+    if not stopped_known or (not enabled_known and not commit_sha):
+        return "state_controls_unknown"  # an unknown control never reads as permission (#1307)
+    if not enabled and not commit_sha:
         return "evolution_disabled"
     if campaign.get("status") != "active":
         return "campaign_not_active"
@@ -621,7 +692,7 @@ def check_evolution_authority(
         return {"ok": False, "reason": "state_lock_unavailable"}
     try:
         campaign = _read_evolution_campaign()
-        live_state = state.json_load_file(state.STATE_PATH) or {}
+        live_state = state.read_state().projection()
         reason = _evolution_claim_error(
             campaign, live_state,
             campaign_id=str(campaign_id or ""),
@@ -731,7 +802,7 @@ def record_evolution_commit(
     if lock_fd is None:
         return {"ok": False, "reason": "state_lock_unavailable", "commit_sha": commit_sha}
     try:
-        live_state = state.json_load_file(state.STATE_PATH) or {}
+        live_state = state.read_state().projection()
         from ouroboros.utils import update_json_locked
 
         receipt: Dict[str, Any] = {}
@@ -887,9 +958,10 @@ def update_evolution_transaction(task_id: str, **updates: Any) -> bool:
         tx = campaign.get("active_transaction")
         if not isinstance(tx, dict) or str(tx.get("task_id") or "") != str(task_id or ""):
             return False
-        for key, value in updates.items():
-            if value is not None:
-                tx[key] = value
+        updates = {key: value for key, value in updates.items() if value is not None}
+        if all(tx.get(key) == value for key, value in updates.items()):
+            return True
+        tx.update(updates)
         tx["updated_at"] = utc_now_iso()
         campaign["active_transaction"] = tx
         campaign["updated_at"] = utc_now_iso()
@@ -899,19 +971,16 @@ def update_evolution_transaction(task_id: str, **updates: Any) -> bool:
 
 
 def _cleanup_worktree_after_cycle(tx: Dict[str, Any], task_id: str) -> None:
-    """Deterministic worktree cleanup when a cycle closes WITHOUT absorption.
-
-    A no_op/abandoned evolution cycle must leave the repo at its recorded
-    ``base_head``: abandoned edits or unreviewed local commits otherwise leak
-    into the next cycle (and into unrelated tasks) as mystery state. Recovery
-    is never silent — dirty files go into a git stash and an ahead HEAD is
-    preserved as a local branch before the hard reset; both refs are recorded
-    on the transaction. Skipped (with a recorded reason) when other tasks are
-    running in the shared worktree or the base is unknown. Never raises.
-    Kill-switch: OUROBOROS_EVOLUTION_CYCLE_CLEANUP=false.
+    """Restore a no-op/abandoned admitted cycle's base, preserving dirty/ahead work
+    in recorded stash/local refs. Never reset a positively unadmitted cycle or
+    another live writer; unknown base, live tests and the cleanup kill-switch skip
+    cleanup with a reason. Never raises (OUROBOROS_EVOLUTION_CYCLE_CLEANUP=false).
     """
     if str(os.environ.get("OUROBOROS_EVOLUTION_CYCLE_CLEANUP", "true") or "true").lower() in {"0", "false", "no", "off"}:
         tx["cleanup_status"] = "disabled"
+        return
+    if tx.get("admission_refused") and not tx.get("commit_sha"):
+        tx["cleanup_status"] = "skipped_never_admitted"
         return
     base_head = str(tx.get("base_head") or "").strip()
     if not base_head:

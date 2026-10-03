@@ -145,7 +145,15 @@
             "provider": "gigachat",
             "resolved_model": "gigachat/GigaChat-3-Pro",
             "cost": null,
-            "cost_final": false
+            "cost_final": false,
+            "effort": {
+              "requested": "medium",
+              "sent": {},
+              "sent_state": "omitted",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            }
           },
           "ledger_attempt_count": 1
         },
@@ -157,7 +165,8 @@
               "verify_ssl_certs": true,
               "credentials": "gigachat-fixture-key",
               "base_url": "https://api.giga.chat/v1",
-              "timeout": 30.0
+              "timeout": 30.0,
+              "max_retries": 0
             },
             "payload": {
               "model": "GigaChat-3-Pro",
@@ -293,7 +302,15 @@
             "provider": "gigachat",
             "resolved_model": "gigachat/GigaChat-3-Pro",
             "cost": null,
-            "cost_final": false
+            "cost_final": false,
+            "effort": {
+              "requested": "medium",
+              "sent": {},
+              "sent_state": "omitted",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            }
           },
           "ledger_attempt_count": 1
         },
@@ -305,7 +322,8 @@
               "verify_ssl_certs": true,
               "user": "fixture-user",
               "password": "fixture-password",
-              "base_url": "https://api.giga.chat/v1"
+              "base_url": "https://api.giga.chat/v1",
+              "max_retries": 0
             },
             "payload": {
               "model": "GigaChat-3-Pro",
@@ -397,7 +415,15 @@
             "provider": "gigachat",
             "resolved_model": "gigachat/GigaChat-3-Pro",
             "cost": null,
-            "cost_final": false
+            "cost_final": false,
+            "effort": {
+              "requested": "medium",
+              "sent": {},
+              "sent_state": "omitted",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            }
           },
           "ledger_attempt_count": 1
         },
@@ -408,7 +434,8 @@
               "scope": "GIGACHAT_API_PERS",
               "verify_ssl_certs": true,
               "credentials": "gigachat-fixture-key",
-              "base_url": "https://api.giga.chat/v1"
+              "base_url": "https://api.giga.chat/v1",
+              "max_retries": 0
             },
             "payload": {
               "model": "GigaChat-3-Pro",

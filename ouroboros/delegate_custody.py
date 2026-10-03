@@ -18,6 +18,7 @@ owner indistinguishable from an intruder.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import logging
@@ -151,6 +152,8 @@ class RunCustody:
     ledger_recorded: bool = False
     settled: bool = False
     terminal_state: str = ""  # SETTLED row's state, replayed (empty pre-existing/CLOSED_ABSENT)
+    terminal_reason: str = ""  # #1196: engine ``outcomeFacts.reason`` replayed from SETTLED ("" = none)
+    continuation_of: str = ""  # #1196: the settled run this one explicitly continued (``continue_from``)
     containment_disclosed: bool = False  # written once; a re-poll must not re-find
     unread_disclosed: bool = False  # settled-never-read omission named durably
     # Staged-output half of the terminal story (D7). ``output_artifact``:
@@ -164,6 +167,9 @@ class RunCustody:
     output_complete: bool = False
     output_sha: str = ""
     output_consumed: bool = False
+    # Immutable pairs keep custody memo copies independent. Aggregate consumption
+    # settles work debt; each reader still owes its own receipt for the current hash.
+    output_reader_receipts: Tuple[Tuple[str, str], ...] = ()
     # C1 isolation binding for a MUTATING run: private execution root, diff
     # baseline commit, AUTHORITY target tree. ``snapshot_id`` keys the
     # worktree-service registry entry (= the provisioning invocation id). All
@@ -260,6 +266,18 @@ def daemon_says_absent(exc: Any) -> bool:
     nothing about whether the resource is there.
     """
     return int(getattr(exc, "status_code", 0) or 0) == 404
+
+PROJECT_HAS_THREADS = "project_has_threads"  # the engine's typed refusal of a project DELETE
+
+def daemon_keeps_project(exc: Any) -> bool:
+    """True when the daemon ANSWERED that it keeps the project: it still holds threads
+    on it. The twin of ``daemon_says_absent`` — a definite fact from a reachable daemon,
+    and a PERMANENT one for the host (Ouroboros creates sticky review threads scoped to
+    the project root and the gateway has no thread delete), so retrying it on a timer
+    costs a daemon round trip per sweep forever. The CODE decides, never the message —
+    a transient, a 5xx or an unreadable body is a failure to find out, still retryable.
+    """
+    return str(getattr(exc, "code", "") or "") == PROJECT_HAS_THREADS
 
 def custody_log_unreadable(drive_root: Any) -> bool:
     """Whether the custody event log EXISTS but cannot be opened (GR6-4).
@@ -400,6 +418,7 @@ def _merge_started_into(entry: RunCustody, previous: RunCustody) -> None:
     """
     for attr in _STARTED_PROGRESS_FLAGS:
         setattr(entry, attr, getattr(previous, attr))
+    entry.output_reader_receipts = previous.output_reader_receipts
     entry.patch_apply_key = previous.patch_apply_key
     entry.project_owned = previous.project_owned and entry.project_owned
     entry.project_persistent = previous.project_persistent or entry.project_persistent
@@ -486,6 +505,10 @@ def _apply(state: Dict[str, RunCustody], row: Dict[str, Any]) -> None:
         # A stale ack row (older than the current staging) must not bless new bytes.
         if not ack_sha or not custody.output_sha or ack_sha == custody.output_sha:
             custody.output_consumed = True
+            reader = str(row.get("reader_task_id") or custody.task_id)
+            custody.output_reader_receipts = tuple(
+                pair for pair in custody.output_reader_receipts if pair[0] != reader
+            ) + ((reader, ack_sha),)
     elif kind == PATCH_CAPTURED:
         custody.patch_captured = True
     elif kind == PATCH_APPLY_STARTED:
@@ -517,6 +540,7 @@ def _apply(state: Dict[str, RunCustody], row: Dict[str, Any]) -> None:
         # emitted it before SETTLED, so replay is unaffected).
         custody.ledger_recorded = custody.settled = True
         custody.terminal_state = str(row.get("state") or "") or custody.terminal_state
+        custody.terminal_reason = str(row.get("outcome_reason") or "") or custody.terminal_reason
     elif kind == CLOSED_ABSENT:
         # Closed, not settled: custody is over, the run leaves ``open_runs``.
         # The registration survives independently (wholesale clearing here was
@@ -524,16 +548,40 @@ def _apply(state: Dict[str, RunCustody], row: Dict[str, Any]) -> None:
         custody.settled = True
 
 
+def _fold_rows(rows: Any) -> Dict[str, RunCustody]:
+    state: Dict[str, RunCustody] = {}
+    for row in rows:
+        _apply(state, row)
+    return state
+
+
+
+
+def custody_rows(drive_root: Any) -> Tuple[Dict[str, Any], ...]:
+    """Every custody row of the chain, served from the process-local memo.
+
+    The same rows ``_iter_rows`` yields (inline request bodies replaced by a
+    locator), advanced by the bytes appended since the last read and refolded
+    on any fingerprint doubt (``delegate_custody_memo``). Read-only.
+    """
+    from ouroboros.delegate_custody_memo import custody_rows as _memo_rows
+
+    return _memo_rows(drive_root)
+
+
 def replay(drive_root: Any,
            rows: Optional[List[Dict[str, Any]]] = None) -> Dict[str, RunCustody]:
     """Rebuild every known run's custody from the durable rows (one pass).
 
     ``rows`` replays a pre-read snapshot so several projections can share ONE
-    consistent traversal (the atomic payload busy claim, gate fix 5a)."""
-    state: Dict[str, RunCustody] = {}
-    for row in rows if rows is not None else _iter_rows(event_log_path(drive_root)):
-        _apply(state, row)
-    return state
+    consistent traversal (the atomic payload busy claim, gate fix 5a). Without
+    ``rows`` the fold runs over the memo's rows and is cached per memo
+    generation; the returned objects are always this caller's own copies."""
+    if rows is not None:
+        return _fold_rows(rows)
+    from ouroboros.delegate_custody_memo import clone_custody_state, folded_state
+
+    return folded_state(drive_root, _fold_rows, clone_custody_state)
 
 def lookup(drive_root: Any, task_id: str, run_id: str) -> Tuple[str, Optional[RunCustody]]:
     """Answer OWNED / FOREIGN / UNKNOWN for ``run_id`` as seen by ``task_id``."""
@@ -664,7 +712,7 @@ def run_timing(drive_root: Any, run_id: str) -> Tuple[str, int]:
     started_ts, max_seconds = "", 0
     if not rid:
         return started_ts, max_seconds
-    for row in _iter_rows(event_log_path(drive_root)):
+    for row in custody_rows(drive_root):
         if str(row.get("run_id") or "") != rid or str(row.get("type") or "") != STARTED:
             continue
         started_ts = started_ts or str(row.get("ts") or "")
@@ -733,7 +781,7 @@ def invocation_record(drive_root: Any, invocation_id: str, *,
         return None
     found: Optional[Dict[str, Any]] = None
     state, run_id = "pending", ""
-    for row in rows if rows is not None else _iter_rows(event_log_path(drive_root)):
+    for row in rows if rows is not None else custody_rows(drive_root):
         if str(row.get("invocation_id") or "") != target:
             continue
         kind = str(row.get("type") or "")
@@ -765,15 +813,20 @@ def invocation_record(drive_root: Any, invocation_id: str, *,
                 "baseline_sha": str(row.get("baseline_sha") or ""),
                 "target_root": str(row.get("target_root") or ""),
                 "authority_source": str(row.get("authority_source") or ""),
-                "resource_ref": row.get("resource_ref") if isinstance(row.get("resource_ref"), dict) else {},
+                # A copy: the source rows may be the shared, read-only custody memo.
+                "resource_ref": copy.deepcopy(row.get("resource_ref")) if isinstance(row.get("resource_ref"), dict) else {},
                 "selected_subagent_id": str(row.get("selected_subagent_id") or ""),
                 "config_fingerprint": str(row.get("config_fingerprint") or ""),
                 "work_order_fingerprint": str(row.get("work_order_fingerprint") or ""),
                 "work_order_coverage": str(row.get("work_order_coverage") or ""),
                 "authority_fingerprint": str(row.get("authority_fingerprint") or ""),
-                "processing": row.get("processing") if isinstance(row.get("processing"), dict) else {},
+                "processing": copy.deepcopy(row.get("processing")) if isinstance(row.get("processing"), dict) else {},
+                # #1196: the cap and HOW it was decided replay with the body a
+                # retry re-POSTs, so the replayed STARTED row keeps the same basis.
+                "max_seconds": int(row.get("max_seconds") or 0) if str(row.get("max_seconds") or "").lstrip("-").isdigit() else 0,
+                "max_seconds_basis": str(row.get("max_seconds_basis") or ""),
                 "work_order_source_request": (
-                    row.get("work_order_source_request")
+                    copy.deepcopy(row.get("work_order_source_request"))
                     if isinstance(row.get("work_order_source_request"), dict) else {}
                 ),
             }
@@ -789,9 +842,8 @@ def invocation_record(drive_root: Any, invocation_id: str, *,
 def record_start_requested(drive_root: Any, **payload: Any) -> bool:
     """Durably name the resources a start is about to bind, BEFORE the POST.
 
-    Returns whether the row LANDED; the caller must not POST when it did not —
-    a run whose request row never reached disk is live, mutating and unfindable
-    if the worker dies before ``record_started``.
+    Returns whether the row LANDED; without it the caller must not POST:
+    a worker crash before ``record_started`` would leave the run unfindable.
 
     The full replay envelope goes to raw CAS before its event reference. Use
     ``write_blob``, never a redacted ``persist_call`` projection: request values
@@ -808,7 +860,9 @@ def record_start_requested(drive_root: Any, **payload: Any) -> bool:
             return False
         payload = {key: value for key, value in payload.items() if key != "request"}
         payload.update(request_ref=ref, prompt_chars=len(str(body.get("prompt") or "")))
-    return emit(drive_root, START_REQUESTED, payload)
+    from ouroboros.owner_pause import admit_delegated_start
+
+    return admit_delegated_start(drive_root, payload)
 
 
 def record_started(drive_root: Any, custody: RunCustody,
@@ -851,12 +905,12 @@ def record_started(drive_root: Any, custody: RunCustody,
 
 def record_output_consumed(drive_root: Any, custody: RunCustody, *,
                            artifact: str, byte_length: int, sha256: str,
-                           chars: int, lines: int) -> bool:
+                           chars: int, lines: int, reader_task_id: str = "") -> bool:
     from ouroboros.delegate_output import record_output_consumed as _record
 
     return _record(
         drive_root, custody, artifact=artifact, byte_length=byte_length,
-        sha256=sha256, chars=chars, lines=lines,
+        sha256=sha256, chars=chars, lines=lines, reader_task_id=reader_task_id,
     )
 
 
@@ -878,6 +932,33 @@ def retire_project(drive_root: Any, gateway: Any, custody: RunCustody) -> None:
         _retire_project_locked(drive_root, gateway, custody)
 
 
+def _project_runs(drive_root: Any, custody: RunCustody) -> Optional[List[RunCustody]]:
+    """This project's runs from a COMPLETE custody view; ``None`` when no such view exists."""
+    from ouroboros.delegate_custody_usage import complete_custody_rows
+
+    rows_raw = complete_custody_rows(
+        event_log_path(drive_root), _ROW_MARKER, started_type=STARTED)
+    if rows_raw is None:
+        log.warning("Retirement deferred: custody log view incomplete")
+        return None
+    state = replay(drive_root, rows=rows_raw)
+    if custody.run_id and custody.run_id not in state:
+        log.warning("Retirement deferred: run %s not in replay", custody.run_id)
+        return None
+    return [run for run in state.values() if run.project_id == custody.project_id and run.run_id]
+
+
+def _release_registration(drive_root: Any, custody: RunCustody, **facts: Any) -> None:
+    """Our custody over the registration ends: the memo (every sibling, exactly as
+    the replay clears them) and the durable row, ``facts`` naming why it was kept."""
+    custody.project_owned = False
+    for sibling in _CUSTODY.values():
+        if sibling.project_id == custody.project_id:
+            sibling.project_owned = False
+    emit(drive_root, PROJECT_RETIRED, {"run_id": custody.run_id, "task_id": custody.task_id,
+                                       "project_id": custody.project_id, **facts})
+
+
 def _retire_project_locked(drive_root: Any, gateway: Any, custody: RunCustody) -> None:
     if custody.project_persistent:
         custody.project_owned = False
@@ -887,20 +968,8 @@ def _retire_project_locked(drive_root: Any, gateway: Any, custody: RunCustody) -
     if not custody.project_id:
         return
     try:
-        from ouroboros.delegate_custody_usage import complete_custody_rows
-
-        rows_raw = complete_custody_rows(
-            event_log_path(drive_root), _ROW_MARKER, started_type=STARTED)
-        if rows_raw is None:
-            log.warning("Retirement deferred: custody log view incomplete")
-            return
-        state = replay(drive_root, rows=rows_raw)
-        if custody.run_id and custody.run_id not in state:
-            log.warning("Retirement deferred: run %s not in replay", custody.run_id)
-            return
-        rows = [run for run in state.values()
-                if run.project_id == custody.project_id and run.run_id]
-        if not any(run.project_owned for run in rows):
+        rows = _project_runs(drive_root, custody)
+        if rows is None or not any(run.project_owned for run in rows):
             return
         if any(run.project_persistent for run in rows):
             # #362: ANY persistent sharer makes the project a durable user
@@ -920,18 +989,33 @@ def _retire_project_locked(drive_root: Any, gateway: Any, custody: RunCustody) -
     except Exception as exc:
         if not daemon_says_absent(exc):
             log.warning("Failed to retire delegated project %s", custody.project_id, exc_info=True)
-            # The daemon's own refusal text rides the row: "failed" without the
-            # WHY made every retire loop a forensic dig.
+            # The daemon's typed refusal rides the row beside its text: "failed"
+            # without the WHY made every retire loop a forensic dig, and the CODE
+            # is what tells a permanent refusal from one worth retrying.
+            refusal = {"code": str(getattr(exc, "code", "") or ""),
+                       "status": int(getattr(exc, "status_code", 0) or 0)}
+            if daemon_keeps_project(exc):
+                # Discharge only when EVERY run of the project is settled per a
+                # complete view read NOW, under the retirement lock and right
+                # before the discharge row is appended: STARTED appends take no
+                # lock, so a PROJECT_RETIRED replayed after a sibling's STARTED
+                # would strip that sibling's ownership. Nothing proven means no.
+                try:
+                    settled_rows = _project_runs(drive_root, custody)
+                except Exception:
+                    log.warning("Discharge deferred: replay failed for %s", custody.run_id, exc_info=True)
+                    settled_rows = None
+                if settled_rows and all(run.settled for run in settled_rows):
+                    # The #362 vocabulary — our custody ends, the engine keeps the
+                    # project — under the engine's own code; never a deletion claim.
+                    _release_registration(drive_root, custody, project_kept=True,
+                                          reason=PROJECT_HAS_THREADS, **refusal)
+                    return
             emit(drive_root, PROJECT_RETIRE_FAILED, {"run_id": custody.run_id, "task_id": custody.task_id,
                                                      "project_id": custody.project_id,
-                                                     "reason": str(exc)[:500]})
+                                                     "reason": str(exc)[:500], **refusal})
             return
-    custody.project_owned = False
-    for sibling in _CUSTODY.values():
-        if sibling.project_id == custody.project_id:
-            sibling.project_owned = False
-    emit(drive_root, PROJECT_RETIRED, {"run_id": custody.run_id, "task_id": custody.task_id,
-                                       "project_id": custody.project_id})
+    _release_registration(drive_root, custody)
 
 
 def close_absent_run(drive_root: Any, gateway: Any, custody: RunCustody, reason: str) -> None:
@@ -968,10 +1052,20 @@ def settle_run(drive_root: Any, gateway: Any, custody: RunCustody, detail: Dict[
         return {"settled": True, "ledger_recorded": True,
                 "project_retired": not custody.project_owned and not custody.project_persistent,
                 "project_persistent": custody.project_persistent, "retried": False}
-    from ouroboros.gateways.claudexor import final_attempt_facts
+    from ouroboros.gateways.claudexor import final_attempt_facts, run_failure_cause
 
     summary = summary_of(detail)
     observed = final_attempt_facts(detail, custody.run_id)
+    # A run that did not succeed says WHY on its settlement row: the model asked for, the
+    # ENGINE's own code ("" = it gave none) and the words it reported (opaque, never
+    # branched on). A succeeded row is byte-identical to before.
+    failure = summary.get("failure") if isinstance(summary.get("failure"), dict) else {}
+    outcome_facts = summary.get("outcomeFacts") if isinstance(summary.get("outcomeFacts"), dict) else {}
+    failure_facts = {} if str(summary.get("state") or "") in SUCCEEDED_STATES else {
+        "requested_model": custody.model, "failure_code": str(failure.get("code") or ""),
+        "reported_cause": run_failure_cause(failure),
+        # Engine TYPED reason (``wall_clock_exceeded`` = maxSeconds expiry): the continuation gate's one fact.
+        "outcome_reason": str(outcome_facts.get("reason") or "")}
     # Claudexor reports CASH in `spendUsd`, EXACTNESS in `spendEstimated`. A run
     # is only free when the amount is really zero AND really settled: expired
     # sessions, bill-by-construction routes and auth fallbacks all charge, and
@@ -1006,6 +1100,7 @@ def settle_run(drive_root: Any, gateway: Any, custody: RunCustody, detail: Dict[
                 # and the ledger writer decides what is usable.
                 input_token_usage=summary.get("inputTokenUsage"),
                 attempt_execution=detail.get("attemptExecution"),
+                effort_resolution=observed.get("effort_resolution"),
                 spend_usd=spend,
                 spend_estimated=estimated,
                 credential_profile_id=applied_profile,
@@ -1039,6 +1134,7 @@ def settle_run(drive_root: Any, gateway: Any, custody: RunCustody, detail: Dict[
                 "model": observed.get("model", ""),
                 "observed_attempt": observed,
                 "state": str(summary.get("state") or ""),
+                **failure_facts,
                 # The SAME facts the ledger row just recorded. An undisclosed spend was emitted
                 # here as `0.0` beside a flag — the render-unknown-as-zero shape the ledger row
                 # itself stopped doing — and finality ignored the estimated half exactly as the

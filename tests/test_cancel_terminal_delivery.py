@@ -596,3 +596,104 @@ def test_unsent_receipts_and_new_stop_episodes_do_not_inherit_delivery(tmp_path,
     delivery._handle_send_message(new_event, ctx)
     assert stored()["cancel_receipt"]["delivered_chat_id"] == 1
     assert _completion_excerpt(stored(), chat_id=1) == f"{SALVAGE_EXCERPT_LABEL}."
+
+def test_receipt_names_the_stop_cause_before_and_after_the_settle(tmp_path):
+    """The technical stop facts in the DETAILS panel name the cause the owner
+    actually made. While the intent is live the receipt reads it there; once
+    custody has settled, the intent row is gone and the same scalars live on the
+    stored ``cancel_origin``, so a receipt built then is not suddenly causeless."""
+    from supervisor import terminal_delivery as td
+
+    write_task_result(tmp_path, "task-live-cause", STATUS_RUNNING, chat_id=1)
+    intent = ci.request_cancel(tmp_path, "task-live-cause", reason="server_shutdown",
+                               source="snapshot_restore")
+    td._persist_cancel_receipt(
+        tmp_path, "task-live-cause",
+        settled_status="cancelled", outcome="cancelled",
+        delivery_id="d-live", preserved_path="", preview_omitted=0,
+    )
+    live = load_task_result(tmp_path, "task-live-cause")["cancel_receipt"]
+    assert live["stop_reason"] == "server_shutdown"
+    assert live["stop_requested_at"] == intent["requested_at"]
+
+    # A task whose custody already settled: no intent row is left to read.
+    origin = {"reason": "server_shutdown", "source": "snapshot_restore",
+              "requested_at": "2026-09-19T23:41:07+00:00"}
+    write_task_result(tmp_path, "task-settled-cause", "cancelled", chat_id=1,
+                      result="stopped", cancel_origin=origin)
+    assert ci.active_intent(tmp_path, "task-settled-cause") is None
+
+    td._persist_cancel_receipt(
+        tmp_path, "task-settled-cause",
+        settled_status="cancelled", outcome="cancelled",
+        delivery_id="d-settled", preserved_path="", preview_omitted=0,
+    )
+    settled = load_task_result(tmp_path, "task-settled-cause")["cancel_receipt"]
+    assert settled["stop_reason"] == "server_shutdown"
+    assert settled["stop_requested_at"] == origin["requested_at"]
+
+    # Quiet direction: a task that was never cancelled gets no stop cause at all.
+    write_task_result(tmp_path, "task-no-cause", STATUS_COMPLETED, chat_id=1, result="done")
+    td._persist_cancel_receipt(
+        tmp_path, "task-no-cause",
+        settled_status="completed", outcome="completed",
+        delivery_id="d-none", preserved_path="", preview_omitted=0,
+    )
+    plain = load_task_result(tmp_path, "task-no-cause")["cancel_receipt"]
+    assert "stop_reason" not in plain and "stop_requested_at" not in plain
+
+
+def test_salvage_receipt_states_files_rescued_even_without_salvageable_text(tmp_path):
+    """TZ-2 C2: "(no salvageable agent output ...)" must not read as "no files". The
+    receipt states the artifact-store count from the shared unmeasured listing — positive,
+    zero or unknown — and that no hashes were computed; the typed fact rides
+    ``cancel_receipt``. The count is a mutable disclosure, never part of the
+    content-derived delivery identity, and staged inputs or receipts never raise it."""
+    from ouroboros.headless import task_artifacts_dir
+    from ouroboros.outcome_receipt_store import verification_receipts_path
+    from supervisor import terminal_delivery as td
+
+    def build(tid, task=None):
+        return td.build_unreviewed_salvage_event(
+            tmp_path, task or {"chat_id": 4}, tid, outcome="cancelled", settled_status="cancelled")
+
+    write_task_result(tmp_path, "files-1", STATUS_RUNNING, result="working")
+    store = task_artifacts_dir(tmp_path, "files-1")
+    (store / "draft.docx").write_bytes(b"x")
+    event = build("files-1")
+    assert "(no salvageable agent output was found for this task)" in event["text"]
+    assert "Files rescued: 1 " in event["text"] and "hashes not computed" in event["text"], event["text"]
+    receipt = load_task_result(tmp_path, "files-1")["cancel_receipt"]
+    assert receipt["files_rescued"] == {"count": 1, "state": "positive", "hash_computed": False,
+                                        "stores": [{"store": str(store), "count": 1, "readable": True}]}
+    (store / "more.txt").write_bytes(b"y")
+    rebuilt = build("files-1")
+    assert rebuilt["delivery_id"] == event["delivery_id"] and "Files rescued: 2 " in rebuilt["text"]
+    assert load_task_result(tmp_path, "files-1")["cancel_receipt"]["files_rescued"]["count"] == 2
+    (store / "attachments").mkdir()
+    (store / "attachments" / "brief.pdf").write_bytes(b"input")
+    verification_receipts_path(tmp_path, "files-1").write_text('{"check": "x"}\n', encoding="utf-8")
+    inputs_only = build("files-1")
+    assert inputs_only["delivery_id"] == event["delivery_id"] and "Files rescued: 2 " in inputs_only["text"]
+
+    write_task_result(tmp_path, "files-0", STATUS_RUNNING, result="working")
+    task_artifacts_dir(tmp_path, "files-0")
+    zero = build("files-0")
+    assert "Files rescued: none" in zero["text"] and "hashes not computed" in zero["text"], zero["text"]
+    assert load_task_result(tmp_path, "files-0")["cancel_receipt"]["files_rescued"]["state"] == "zero"
+
+    write_task_result(tmp_path, "files-x", STATUS_RUNNING, result="working")
+    task_artifacts_dir(tmp_path, "files-x", create=False).write_text("not a directory", encoding="utf-8")
+    unknown = build("files-x")
+    assert "Files rescued: unknown" in unknown["text"], unknown["text"]
+    assert load_task_result(tmp_path, "files-x")["cancel_receipt"]["files_rescued"]["state"] == "unknown"
+
+    # A split root: the child drive named on the task row is walked beside the canonical store.
+    child = tmp_path / "child-drive"
+    write_task_result(tmp_path, "files-s", STATUS_RUNNING, result="working")
+    (task_artifacts_dir(child, "files-s") / "out.txt").write_bytes(b"o")
+    split = build("files-s", {"chat_id": 4, "child_drive_root": str(child)})
+    assert "Files rescued: 1 " in split["text"], split["text"]
+    stores = load_task_result(tmp_path, "files-s")["cancel_receipt"]["files_rescued"]["stores"]
+    assert [row["store"] for row in stores] == [str(task_artifacts_dir(tmp_path, "files-s", create=False)),
+                                                str(task_artifacts_dir(child, "files-s", create=False))]

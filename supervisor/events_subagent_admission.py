@@ -339,9 +339,10 @@ def _validate_external_workspace(ctx, path: str) -> str:
 
 def _external_workspace_head(path: str) -> tuple[str, str]:
     """Return a Git base or an empty base for an admitted ordinary directory."""
+    from ouroboros.workspace_admission import has_git_metadata
+
     p = pathlib.Path(path).expanduser().resolve(strict=False)
-    if p.is_dir() and not any((root / ".git").exists() or (root / ".git").is_symlink()
-                              for root in (p, *p.parents)):
+    if p.is_dir() and not has_git_metadata(p):
         return "", ""
     try:
         result = subprocess.run(
@@ -413,17 +414,23 @@ def _resolve_subagent_constraint(
         return readonly, workspace_root, workspace_mode, f"Subagent rejected: invalid acting write_surface {surface!r}."
     # SURFACE-AWARE master gate (Q4 sandbox unwind): the surface is validated
     # first so the unset-toggle default can key on it — light allows the
-    # external build surfaces (external_workspace/genesis), never self_worktree.
+    # external build sources, including isolated copies, but never the own body.
+    from ouroboros.workspace_copies import source_is_system_repo
+
+    from ouroboros.tools.tool_resolution import system_repo_dir_for
+    system_repo = getattr(ctx, "REPO_DIR", None) or system_repo_dir_for(ctx)
+    copy_source = str(workspace_root or system_repo)
+    system_copy = surface == "self_worktree" and source_is_system_repo(copy_source, system_repo)
     try:
         from ouroboros.config import get_allow_mutative_subagents
-        allowed = bool(get_allow_mutative_subagents(surface))
+        allowed = bool(get_allow_mutative_subagents(surface, source_is_system_repo=system_copy))
     except Exception:
         allowed = False
     if not allowed:
         return readonly, workspace_root, workspace_mode, (
             f"Subagent rejected: acting subagents with write_surface={surface!r} are disabled "
             "here (OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS; unset in light allows only "
-            "external_workspace/genesis). Reschedule read-only, use an external surface, or "
+            "external_workspace/genesis and isolated foreign-project copies). Use a permitted surface or "
             "enable the toggle."
         )
     grants = [str(g).strip() for g in (req.get("external_tool_grants") or []) if str(g).strip()]
@@ -443,10 +450,15 @@ def _resolve_subagent_constraint(
         try:
             from ouroboros import subagent_worktrees
 
+            if not system_copy:
+                detail = _validate_external_workspace(ctx, copy_source)
+                if detail:
+                    raise ValueError(detail)
             handle = subagent_worktrees.provision_worktree(
-                repo_dir=ctx.REPO_DIR,
+                repo_dir=copy_source,
                 task_id=tid,
                 base_sha=constraint["base_sha"],
+                source_is_system_repo=system_copy,
                 parent_task_id=parent_task_id,
             )
             constraint["write_root"] = handle.path

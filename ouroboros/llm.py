@@ -232,6 +232,8 @@ class LLMClient(
             if use_local:
                 turn_state_for_route(model_turn_state, "local")
                 local_kwargs = {"timeout": timeout}
+                if reasoning_effort is not None:
+                    local_kwargs["reasoning_effort"] = reasoning_effort
                 if processing_preference:
                     local_kwargs["processing_preference"] = processing_preference
                 if context_mode:
@@ -311,6 +313,8 @@ class LLMClient(
             def local_call():
                 adopt_physical_attempt_capture(None)
                 local_kwargs = {"timeout": timeout}
+                if reasoning_effort is not None:
+                    local_kwargs["reasoning_effort"] = reasoning_effort
                 if processing_preference:
                     local_kwargs["processing_preference"] = processing_preference
                 if context_mode:

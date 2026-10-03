@@ -24,6 +24,22 @@ def _context(tmp_path, kind):
     return ctx, project if kind != "system" else system
 
 
+SHA, MOVED = "a" * 40, "b" * 40
+BASE = "https://github.example/owner/selected"
+
+
+def _run(run_id, name="CI", status="completed", conclusion="success", **extra):
+    return {"databaseId": run_id, "workflowName": name, "event": "pull_request", "status": status,
+            "conclusion": conclusion, "attempt": 1, "url": f"{BASE}/actions/runs/{run_id}", "headSha": SHA, **extra}
+
+
+def _job(job_id, name, status="completed", conclusion="success", steps=(), run_id=11):
+    return {"databaseId": job_id, "name": name, "status": status, "conclusion": conclusion,
+            "url": f"{BASE}/actions/runs/{run_id}/job/{job_id}",
+            "steps": [{"number": number, "name": step, "status": step_status, "conclusion": step_conclusion}
+                      for number, step, step_status, step_conclusion in steps]}
+
+
 @pytest.fixture
 def gh_calls(monkeypatch):
     calls = []
@@ -35,7 +51,14 @@ def gh_calls(monkeypatch):
         if argv[1:3] in (["issue", "list"], ["pr", "list"]):
             output = "[]"
         elif argv[1:3] in (["issue", "view"], ["pr", "view"]):
-            output = json.dumps({"number": 7, "title": "Fixture", "state": "OPEN", "author": {"login": "fixture"}})
+            output = json.dumps({"number": 7, "title": "Fixture", "state": "OPEN", "author": {"login": "fixture"},
+                                 "headRefOid": SHA, "url": f"{BASE}/pull/7"})
+        elif argv[1:3] == ["run", "list"]:
+            output = json.dumps([_run(11, conclusion="failure")])
+        elif argv[1:3] == ["run", "view"]:
+            output = json.dumps({"jobs": [_job(55, "test", conclusion="failure")]})
+        elif argv[1] == "api":
+            output = "[]"
         elif argv[1:3] == ["issue", "create"]:
             output = "https://github.com/owner/selected/issues/7"
         return SimpleNamespace(returncode=0, stdout=output, stderr="")
@@ -51,6 +74,7 @@ _CALLS = [
     ("create_github_issue", {"title": "Title", "body": "Body", "labels": "bug"}, 2),
     ("list_github_prs", {}, 1), ("get_github_pr", {"number": 7}, 3),
     ("comment_on_pr", {"number": 7, "body": "text"}, 1),
+    ("get_github_checks", {"number": 7}, 4),
 ]
 
 
@@ -68,7 +92,12 @@ def test_every_repository_tool_keeps_target_in_all_subcalls(tmp_path, gh_calls, 
     assert not result.startswith("⚠️"), result
     assert len(gh_calls) == count
     assert "repo" in entry.schema["parameters"]["properties"]
+    assert sum(argv[1] == "api" for argv, _ in gh_calls) == (name == "get_github_checks")
     for argv, kwargs in gh_calls:
+        if argv[1] == "api":  # The checks reader's one literal path: its target is the URL GitHub returned.
+            assert argv == ["gh", "api", "repos/owner/selected/check-runs/55/annotations?per_page=100",
+                            "--hostname", "github.example"]
+            continue
         assert kwargs["cwd"] == str(expected_cwd)
         if repo:
             assert argv[-2:] == ["--repo", repo]
@@ -168,10 +197,10 @@ def test_room_registry_failure_is_visible(tmp_path, monkeypatch):
     from ouroboros import projects_registry
     from ouroboros.workspace_admission import room_chat_lens_dir
 
-    def fail(*args):
+    def fail(*args, **kwargs):
         raise OSError("fixture registry failure")
 
-    monkeypatch.setattr(projects_registry, "get_project", fail)
+    monkeypatch.setattr(projects_registry, "get_reserved_project", fail)
     directory, note = room_chat_lens_dir(tmp_path, "project-fixture")
     assert directory == ""
     assert "registry entry is unreadable" in note
@@ -208,7 +237,7 @@ def test_cli_store_metadata_enables_only_cli_tools_without_probing(tmp_path, mon
     ctx, _ = _context(tmp_path, "queued")
     for name, _, _ in _CALLS:
         assert _builtin_tool_availability(name, ctx)[0] is True
-    for name in ("run_ci_tests", "submit_skill_to_hub", "generate_evolution_stats"):
+    for name in ("submit_skill_to_hub", "generate_evolution_stats"):
         assert _builtin_tool_availability(name, ctx) == (False, "missing_credential", "GITHUB_TOKEN")
 
 

@@ -90,7 +90,7 @@ def test_deferred_question_flush_and_resume_requires_pool_grant(tmp_path):
         write_owner_message(tmp_path, "Change the requested destination", task_id="root-1")
         resume = events.get(timeout=3)
         # An owner answer is never labelled a bound expiry.
-        assert resume["phase"] == "resume" and "resume_reason" not in resume
+        assert resume["phase"] == "resume" and resume["resume_reason"] == "owner_text"
         assert not ended.is_set()
         commands.put({**identity, "phase": "resume_granted"})
         thread.join(timeout=2)
@@ -143,7 +143,7 @@ def test_the_granted_resume_row_records_the_bound_expiry(tmp_path, monkeypatch):
     through the ordinary grant, so the projection can say a bound ended it."""
     from types import SimpleNamespace
 
-    from ouroboros.task_results import load_task_result
+    from ouroboros.task_results import load_task_result, write_task_result
     from supervisor import worker_owner_wait as supervisor_wait
 
     import supervisor.message_bus as mb
@@ -155,6 +155,7 @@ def test_the_granted_resume_row_records_the_bound_expiry(tmp_path, monkeypatch):
     bridge = mb.LocalChatBridge()
     bridge._broadcast_fn = frames.append
     monkeypatch.setattr(mb, "get_bridge", lambda: bridge)
+    write_task_result(tmp_path, "root-1", "running")
     wait = {"wait_id": "w1", "task_attempt": 1, "quiz_id": "q1", "source_ref": "ref"}
     set_owner_wait(tmp_path, "root-1", {**wait, "state": "waiting"})
     worker = SimpleNamespace(in_q=queue.Queue(), busy_task_id="root-1",
@@ -199,3 +200,16 @@ def test_cold_wait_requires_observed_restart_and_current_wait(tmp_path):
     assert restore_owner_wait_allowed(tmp_path, task)
     (tmp_path / "state/panic_stop.flag").write_text("panic")
     assert not restore_owner_wait_allowed(tmp_path, task)
+
+
+def test_a_new_owner_wait_is_dated_by_itself_and_a_review_park_is_not_stamped_here(tmp_path):
+    from datetime import datetime
+
+    ctx = context(tmp_path)
+    block = checkpoint_owner_wait(ctx, [], {}, {}, 1, [], set())
+    assert block["started_at"] == ctx.task_started_at  # the lifetime clock is untouched
+    parked = datetime.fromisoformat(block["parked_at"])
+    assert parked.tzinfo is not None and parked.timestamp() >= ctx.task_started_at
+    review = checkpoint_owner_wait(ctx, [], {}, {}, 1, [], set(), review_binding="acceptance-1")
+    assert "parked_at" not in review and review["review_binding"] == "acceptance-1"
+    assert review["started_at"] == ctx.task_started_at

@@ -20,6 +20,8 @@ import time
 import uuid
 from typing import Dict, List  # noqa: F401
 
+from ouroboros.owner_pause import OwnerPauseRefused
+from ouroboros.tools.tool_result import launch_refusal_result, _publish_tool_result
 from ouroboros.artifacts import copy_directory_to_task_artifacts, copy_file_to_task_artifacts, record_task_scratch  # noqa: F401
 from ouroboros.platform_layer import bootstrap_process_path, kill_process_tree, scrub_repo_from_pythonpath, subprocess_new_group_kwargs  # noqa: F401
 from ouroboros.process_interpreters import (
@@ -268,6 +270,15 @@ def _literal_argv_notes(cmd: List[str]) -> str:
     return "".join(notes)
 
 
+def _pre_spawn_refusal(ctx: ToolContext, text: str, *, tool: str = "run_command") -> str:
+    """This producer refused before submission; arbitrary errors carry no such fact."""
+    from ouroboros.tools.tool_result import LegacyTextResultAdapter, _replace_tool_result
+
+    result = LegacyTextResultAdapter.from_text(tool, text)
+    return _publish_tool_result(ctx, _replace_tool_result(
+        result, meta_updates={"operation_outcome": "completed_no_effect"}))
+
+
 @process_environment_tool
 def _run_shell(
     ctx: ToolContext,
@@ -294,14 +305,11 @@ def _run_shell(
             # A `{ ...; }` brace group is valid shell, not malformed JSON.
             is_brace_group = stripped.startswith("{ ") and stripped.rstrip().endswith("}")
             if is_brace_group:
-                return (
-                    '⚠️ SHELL_CMD_ERROR: `{ ...; }` is a shell brace group, which run_command '
+                return _pre_spawn_refusal(ctx, '⚠️ SHELL_CMD_ERROR: `{ ...; }` is a shell brace group, which run_command '
                     'cannot execute directly (it runs argv without a shell). Wrap it in a shell:\n'
-                    '  run_command(cmd=["sh", "-c", "{ cmd1; cmd2; }"])'
-                )
+                    '  run_command(cmd=["sh", "-c", "{ cmd1; cmd2; }"])')
             if stripped[:1] in ("[", "{") and not is_posix_test_cmd:
-                return (
-                    '⚠️ SHELL_ARG_ERROR: `cmd` looks like a JSON/Python list literal '
+                return _pre_spawn_refusal(ctx, '⚠️ SHELL_ARG_ERROR: `cmd` looks like a JSON/Python list literal '
                     'but failed to parse cleanly (likely an escape or quote-mismatch '
                     'issue). Pass cmd as an actual array, not a stringified array.\n\n'
                     'Correct usage:\n'
@@ -309,8 +317,7 @@ def _run_shell(
                     'Wrong usage (the failure that brought you here):\n'
                     '  run_command(cmd=\'["git", "log", "--oneline", "-10"]\')\n\n'
                     'For reading files, prefer `read_file`.\n'
-                    'For searching code, prefer `search_code`.'
-                )
+                    'For searching code, prefer `search_code`.')
             try:
                 parts = shlex.split(cmd)
                 if parts:
@@ -320,33 +327,29 @@ def _run_shell(
         if recovered is not None:
             cmd = recovered
         else:
-            return (
-                '⚠️ SHELL_ARG_ERROR: `cmd` must be a JSON array of strings, not a plain string.\n\n'
+            return _pre_spawn_refusal(ctx, '⚠️ SHELL_ARG_ERROR: `cmd` must be a JSON array of strings, not a plain string.\n\n'
                 'Correct usage:\n'
                 '  run_command(cmd=["grep", "-r", "pattern", "path/"])\n'
                 '  run_command(cmd=["python", "-c", "print(1+1)"])\n\n'
                 'Wrong usage:\n'
                 '  run_command(cmd="grep -r pattern path/")\n\n'
                 'For reading files, prefer `read_file`.\n'
-                'For searching code, prefer `search_code`.'
-            )
+                'For searching code, prefer `search_code`.')
 
     if not isinstance(cmd, list):
-        return "⚠️ SHELL_ARG_ERROR: cmd must be a list of strings."
+        return _pre_spawn_refusal(ctx, "⚠️ SHELL_ARG_ERROR: cmd must be a list of strings.")
     cmd = [str(x) for x in cmd]
+    if not cmd:
+        return _pre_spawn_refusal(ctx, "⚠️ SHELL_ARG_ERROR: cmd must not be empty.")
 
     if cmd and cmd[0] in _SHELL_BUILTINS:
         if cmd[0] == "cd":
-            return (
-                '⚠️ SHELL_CMD_ERROR: "cd" is a shell builtin, not an executable. '
+            return _pre_spawn_refusal(ctx, '⚠️ SHELL_CMD_ERROR: "cd" is a shell builtin, not an executable. '
                 'Use the "cwd" parameter instead: '
-                'run_command(cmd=["git", "log"], cwd="/target/dir")'
-            )
-        return (
-            f'⚠️ SHELL_CMD_ERROR: "{cmd[0]}" is a shell builtin and cannot '
+                'run_command(cmd=["git", "log"], cwd="/target/dir")')
+        return _pre_spawn_refusal(ctx, f'⚠️ SHELL_CMD_ERROR: "{cmd[0]}" is a shell builtin and cannot '
             'be executed directly via subprocess. '
-            'Use ["sh", "-c", "your command"] if you need shell builtins.'
-        )
+            'Use ["sh", "-c", "your command"] if you need shell builtins.')
 
     cmd, autocorrect_note = _maybe_autocorrect_grep_backslash_pipe(cmd)
     regex_autocorrected = bool(autocorrect_note)
@@ -359,12 +362,10 @@ def _run_shell(
         work_dir = pathlib.Path(binding.target_path)
         cwd_root = binding.root
     except (OSError, ValueError) as exc:
-        return shell_cwd_block_message(ctx, cwd, operation="shell", error=exc)
+        return _pre_spawn_refusal(ctx, shell_cwd_block_message(ctx, cwd, operation="shell", error=exc))
     if not work_dir.exists() or not work_dir.is_dir():
-        return (
-            f"⚠️ SHELL_CWD_BLOCKED: cwd is not a directory: {work_dir}. "
-            f"root={binding.root}, source={binding.source}."
-        )
+        return _pre_spawn_refusal(ctx, f"⚠️ SHELL_CWD_BLOCKED: cwd is not a directory: {work_dir}. "
+            f"root={binding.root}, source={binding.source}.")
     # Disclose the room-lens default once; explicit cwd is already caller-visible.
     if not str(cwd or "").strip() and not getattr(ctx, "_room_cwd_noted", False):
         try:
@@ -401,7 +402,7 @@ def _run_shell(
     if scratch_abs:
         _scratch_reason = _scratch_safety_reason(ctx, scratch_abs, pathlib.Path(work_dir), repo_root)
         if _scratch_reason:
-            return f"⚠️ SCRATCH_BLOCKED: {_scratch_reason}."
+            return _pre_spawn_refusal(ctx, f"⚠️ SCRATCH_BLOCKED: {_scratch_reason}.")
     timeout_sec = _resolve_effective_timeout(_RUN_SHELL_DEFAULT_TIMEOUT_SEC, ctx, override_sec=_timeout_override)
     bootstrap_process_path()
     # Emergency bundled-node PATH prepend; None on every healthy path (env stays byte-identical).
@@ -419,6 +420,7 @@ def _run_shell(
             res = executor_execute(ctx, cmd, pathlib.Path(work_dir), timeout_sec,
                                    env_overlay=interpreter_path_overlay(node_resolution),
                                    **({"target_env": selected_env} if selected_env else {}))
+            process_meta = {"operation_outcome": getattr(res, "operation_outcome", "unknown")}
         else:
             res = _tracked_subprocess_run(
                 cmd, cwd=str(work_dir),
@@ -426,6 +428,7 @@ def _run_shell(
                 text=True, timeout=timeout_sec,
                 **({"env": run_env} if run_env is not None else {}),
             )
+            process_meta = {"operation_outcome": "completed"}
         _lived_ms = _publish_finished_process_facts(ctx, res, _command_start_ts)
         # Post-run hashes exclude scratch only while its exact bytes still match.
         _record_scratch_fingerprints(ctx, scratch_abs)
@@ -439,9 +442,9 @@ def _run_shell(
                     f"{_format_process_output(res.stdout or '', '')}"
                     f"{executor_note}"
                 )
-                return _publish_process_result(ctx, "SHELL_NO_MATCH", text, exit_code=res.returncode, shell_regex_auto_corrected=regex_autocorrected)
+                return _publish_process_result(ctx, "SHELL_NO_MATCH", text, exit_code=res.returncode, shell_regex_auto_corrected=regex_autocorrected, meta=process_meta)
             text = autocorrect_note + f"⚠️ SHELL_EXIT_ERROR: command exited with {_describe_returncode(res.returncode, cwd=work_dir, binding=binding, lived_ms=_lived_ms, resolved_runtime=_active_resolved_runtime(ctx))}.\n\n{_format_process_output(res.stdout or '', res.stderr or '')}{executor_note}"
-            return _publish_process_result(ctx, "SHELL_EXIT_ERROR", text, exit_code=res.returncode, shell_regex_auto_corrected=regex_autocorrected)
+            return _publish_process_result(ctx, "SHELL_EXIT_ERROR", text, exit_code=res.returncode, shell_regex_auto_corrected=regex_autocorrected, meta=process_meta)
         after_changed = _status_snapshot(repo_root)
         if after_changed != before_changed:
             # This resolved cwd may be outside the live-repo dispatcher snapshot.
@@ -472,7 +475,7 @@ def _run_shell(
                 + f"{_describe_returncode(0, cwd=work_dir, binding=binding)}\n"
                 + _format_process_output(res.stdout or "", res.stderr or "")
             )
-            return _masked_green_disclosure(ctx, _publish_process_result(ctx, "ARTIFACT_OUTPUT_UNDECLARED", text, exit_code=0, shell_regex_auto_corrected=regex_autocorrected), cmd)
+            return _masked_green_disclosure(ctx, _publish_process_result(ctx, "ARTIFACT_OUTPUT_UNDECLARED", text, exit_code=0, shell_regex_auto_corrected=regex_autocorrected, meta=process_meta), cmd)
         artifact_note, artifact_failed, artifact_registered = _register_process_outputs(
             ctx,
             outputs,
@@ -518,21 +521,23 @@ def _run_shell(
                 + f"{_format_process_output(res.stdout or '', res.stderr or '')}"
                 + artifact_note
             )
-            result = _masked_green_disclosure(ctx, _publish_process_result(ctx, "ARTIFACT_OUTPUT_ERROR", text, exit_code=0, shell_regex_auto_corrected=regex_autocorrected), cmd)
+            result = _masked_green_disclosure(ctx, _publish_process_result(ctx, "ARTIFACT_OUTPUT_ERROR", text, exit_code=0, shell_regex_auto_corrected=regex_autocorrected, meta=process_meta), cmd)
             return _disclose_output_audit_failure(ctx, result, audit_error)
         executor_note = ""
         if getattr(res, "backend_trace", None):
             executor_note = "\n\nEXECUTOR_TRACE:\n" + json.dumps(res.backend_trace, ensure_ascii=False, indent=2)
         text = autocorrect_note + f"{_describe_returncode(0, cwd=work_dir, binding=binding)}\n{_format_process_output(res.stdout or '', res.stderr or '')}{artifact_note}{audit_note}{scratch_note}{executor_note}"
-        result = _masked_green_disclosure(ctx, _publish_process_result(ctx, "SHELL_REGEX_AUTO_CORRECTED" if regex_autocorrected else "OK", text, exit_code=0, artifact_registered=bool(artifact_registered and not artifact_failed), shell_regex_auto_corrected=regex_autocorrected), cmd)
+        result = _masked_green_disclosure(ctx, _publish_process_result(ctx, "SHELL_REGEX_AUTO_CORRECTED" if regex_autocorrected else "OK", text, exit_code=0, artifact_registered=bool(artifact_registered and not artifact_failed), shell_regex_auto_corrected=regex_autocorrected, meta=process_meta), cmd)
         return _disclose_output_audit_failure(ctx, result, audit_error)
+    except OwnerPauseRefused as exc:
+        return _publish_tool_result(ctx, launch_refusal_result(str(exc), completed_no_effect=True))
     except subprocess.TimeoutExpired:
         _publish_unfinished_process_facts(ctx, _command_start_ts, timed_out=True)
         # Timeout-created scratch still needs its exclusion fingerprint.
         _record_scratch_fingerprints(ctx, scratch_abs)
         return (
             f"⚠️ TOOL_TIMEOUT (run_command): command exceeded the per-command timeout of {timeout_sec}s "
-            f"and its subprocess tree was terminated (root={binding.root}, cwd={work_dir}). NOTE: this is the per-command "
+            f"and the host killed what it could still reach of its process tree; a background child may survive untracked (root={binding.root}, cwd={work_dir}). NOTE: this is the per-command "
             f"FOREGROUND timeout, NOT the task deadline. For genuinely long-running compute (training, "
             f"sampling, large builds/downloads), start it with start_service and poll "
             f"service_status/service_logs while you do other work, or pass an explicit timeout_sec=<seconds> "
@@ -542,15 +547,17 @@ def _run_shell(
         if res is None:
             _publish_unfinished_process_facts(ctx, _command_start_ts, spawn_error=e)
         _record_scratch_fingerprints(ctx, scratch_abs)
-        if res is None and isinstance(e, FileNotFoundError) and len(cmd) == 1:
-            return (
+        if res is None and getattr(e, "process_not_started", False) is True and isinstance(e, FileNotFoundError) and len(cmd) == 1:
+            return _pre_spawn_refusal(ctx,
                 "⚠️ SHELL_ARG_ERROR: the sole cmd element was treated as ONE executable name, "
                 "and that executable was not found. Pass the program and each argument as "
                 'separate array elements, e.g. ["git", "status", "--porcelain"]. For pipes, '
                 'redirects or chaining, explicitly use ["sh", "-c", "..."] or run_script. '
                 f"No command was started. root={binding.root}, cwd={work_dir}"
             )
-        return f"⚠️ SHELL_ERROR: {e}. root={binding.root}, cwd={work_dir}"
+        text = f"⚠️ SHELL_ERROR: {e}. root={binding.root}, cwd={work_dir}"
+        return (_pre_spawn_refusal(ctx, text) if res is None and getattr(e, "process_not_started", False) is True
+                else text)
 
 
 @process_environment_tool
@@ -577,19 +584,22 @@ def _run_script(
     interp = str(interpreter or "python3").strip()
     body = str(script or "")
     if not body.strip():
-        return "⚠️ TOOL_ARG_ERROR (run_script): script is required."
+        return _pre_spawn_refusal(ctx, "⚠️ TOOL_ARG_ERROR (run_script): script is required.", tool="run_script")
     try:
         binding = _resolved_binding or build_resolved_resource_binding(
             ctx, operation="shell", process_cwd=cwd, bucket=bucket, skill_name=skill_name,
         )
     except (OSError, ValueError) as exc:
-        return shell_cwd_block_message(ctx, cwd, operation="shell", error=exc)
+        return _pre_spawn_refusal(ctx, shell_cwd_block_message(ctx, cwd, operation="shell", error=exc), tool="run_script")
     # The undeclared-output audit of the script BODY (argv only carries the temp script path, so
     # _run_shell cannot see the body) is POST-exec (v6.56.0): the stat filter needs the files to
     # exist, and a pre-exec scan on not-yet-written paths would either be a no-op or false-flag
     # import strings. We resolve the body-audit scratch against the SAME effective cwd the script
     # executes in so a relatively-declared scratch path matches a user_files write in the body.
     resolved_workdir = pathlib.Path(binding.target_path)
+    if not resolved_workdir.is_dir():
+        return _pre_spawn_refusal(ctx, f"⚠️ SHELL_CWD_BLOCKED: cwd is not a directory: {resolved_workdir}.",
+                                  tool="run_script")
     _scratch_abs_body = _resolve_scratch_abs(scratch, resolved_workdir)
     _body_start_epoch = time.time()  # st_mtime audit; monotonic below is for durations
     _body_start_ts = time.monotonic()
@@ -602,11 +612,12 @@ def _run_script(
             root = pathlib.Path(ctx.task_drive_root()) / "tmp_scripts"
         except Exception:
             root = pathlib.Path(ctx.drive_root) / "tmp_scripts"
-    root.mkdir(parents=True, exist_ok=True)
     suffix = ".py" if "python" in pathlib.PurePath(interp).name else ".sh"
     run_dir = None
     script_path = root / f"script_{uuid.uuid4().hex}{suffix}"
+    shell_entered = False
     try:
+        root.mkdir(parents=True, exist_ok=True)
         if active_workspace_script:
             run_dir = pathlib.Path(tempfile.mkdtemp(prefix="script_", dir=root))
             # Ignore only this invocation's files, not neighbouring user work.
@@ -624,13 +635,18 @@ def _run_script(
                 try:
                     script_arg = executor_map_host_path(executor, script_path)
                 except Exception as exc:
-                    return f"⚠️ RUN_SCRIPT_BLOCKED: executor-backed run_script could not map temp script path: {type(exc).__name__}: {exc}"
+                    return _pre_spawn_refusal(ctx, f"⚠️ RUN_SCRIPT_BLOCKED: executor-backed run_script could not map temp script path: {type(exc).__name__}: {exc}", tool="run_script")
         argv = [interp, script_arg, *[str(item) for item in (args or [])]]
+        shell_entered = True
         result = _run_shell(
             ctx, argv, cwd=cwd, outputs=outputs, scratch=scratch,
             _resolved_binding=binding, timeout_sec=timeout_sec, timeout=timeout,
             env_from_settings=kwargs.get("env_from_settings"),
         )
+    except (OSError, ValueError) as exc:
+        if shell_entered:
+            raise
+        return _pre_spawn_refusal(ctx, f"⚠️ RUN_SCRIPT_BLOCKED: script preparation failed: {exc}", tool="run_script")
     finally:
         try:
             if run_dir is not None:
@@ -677,13 +693,12 @@ def get_tools() -> List[ToolEntry]:
         ToolEntry("run_command", {
             "name": "run_command",
             "description": (
-                "Run a foreground bounded command in an allowed resource-root cwd. Returns stdout+stderr. "
-                "Every result header echoes the resolved cwd. "
-                "cmd MUST be an array of strings, never a single shell-style "
-                "string. Use cwd= for working directory; cd is rejected. "
-                "For pipes/chaining use [\"sh\", \"-c\", \"cmd1 && cmd2\"]. "
-                "Prefer the dedicated tools where one fits: read_file (not cat/head/sed-as-reader), "
-                "search_code/query_code (not grep/find-as-search), write_file/edit_text (not sed/echo-redirect)."
+                "Run a bounded foreground command in an allowed cwd; returns stdout+stderr and the resolved cwd. "
+                "cmd MUST be an array of strings, never one shell string. A builtin as cmd[0] (cd, export, ...) "
+                "is refused: use cwd= or [\"sh\", \"-c\", \"cd x && a | b\"] (also for pipes/chaining). "
+                "A background child (&, nohup) is no service: holding stdout/stderr it stalls the call until "
+                "timeout_sec, and once the call returns nothing tracks it (use start_service). "
+                "Prefer read_file, search_code/query_code, write_file/edit_text to cat/head/sed, grep/find, redirects."
             ),
             "parameters": {"type": "object", "properties": {
                 "cmd": {
@@ -696,7 +711,7 @@ def get_tools() -> List[ToolEntry]:
                         "stringified array like '[\"git\", \"log\"]'."
                     ),
                 },
-	                "cwd": {"type": "string", "default": "", "description": "Omit for active_workspace; use system_repo[/subdir] for Ouroboros or skill_payload[/subdir] with bucket+skill_name for a skill. Existing task_drive, artifact_store, user_files and authorized absolute cwd forms remain available; use cwd instead of the rejected cd builtin."},
+	                "cwd": {"type": "string", "default": "", "description": "Omit for active_workspace; use system_repo[/subdir] for Ouroboros or skill_payload[/subdir] with bucket+skill_name for a skill. task_drive, artifact_store, user_files and authorized absolute cwd forms are also accepted."},
 	                "env_from_settings": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Explicit environment variable → saved setting key mapping. Uses existing Settings-selection authority; secret values are masked in diagnostics."},
 	                "bucket": {"type": "string", "enum": ["external", "clawhub", "ouroboroshub", "user_repo"], "description": "Physical skill location for cwd=skill_payload[/subdir]."},
 	                "skill_name": {"type": "string", "description": "Exact skill identity for cwd=skill_payload[/subdir]."},

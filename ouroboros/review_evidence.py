@@ -126,6 +126,45 @@ def annotate_criteria_evidence_resolution(actors: Any, evidence: Any) -> None:
 
 
 
+def _accept_repo_diff(ctx: Any, *, include_recent_commit: bool, drive_root: Any, task_id: str) -> tuple:
+    """The packet's repository text and the disclosure of the source it came from.
+
+    ONE repository capture per acceptance packet: the bounded preview and the
+    exact source both project the SAME bytes, so the two views can never
+    describe two different trees (and the exact path never re-reads git).
+    """
+    capture_state: Dict[str, Any] = {}
+    repo_diff = collect_turn_diff(
+        ctx, include_recent_commit=include_recent_commit, capture_meta=capture_state,
+    )
+    diff_meta: Dict[str, Any] = {
+        key: capture_state[key] for key in ("issue", "capture_disclosure") if key in capture_state
+    }
+    try:
+        if capture_state.get("exact_required") or "OMISSION NOTE: truncated at " in str(repo_diff or "") \
+                or "... (truncated from " in str(repo_diff or ""):
+            if capture_state.get("capture") is None:
+                # A later read cannot certify the bytes behind a legacy partial preview.
+                return repo_diff, {**diff_meta, "issue": {
+                    "tool": "repo_diff", "status": "source_unavailable",
+                    "reason": "repo_diff_capture_missing", "source_ref": {},
+                }}
+            from ouroboros.artifacts import materialize_repo_diff_evidence
+            repo_getter = getattr(ctx, "active_repo_dir", None)
+            repo_dir = repo_getter() if callable(repo_getter) else repo_getter or getattr(ctx, "repo_dir", None)
+            exact, diff_meta = materialize_repo_diff_evidence(
+                repo_dir, drive_root, task_id, include_recent_commit=include_recent_commit,
+                capture=capture_state.get("capture"),
+            )
+            if diff_meta.get("complete"):
+                repo_diff = exact
+    finally:
+        # The private spool never outlives the packet build, retained or not.
+        if capture_state.get("capture") is not None:
+            capture_state["capture"].release()
+    return repo_diff, diff_meta
+
+
 def build_task_acceptance_evidence(
     ctx: Any,
     *,
@@ -171,14 +210,11 @@ def build_task_acceptance_evidence(
     }
     prov["canonical_payload"] = "host_attested"
     prov["aliases"] = "host_attested"
-    if isinstance(agent_evidence, dict) and agent_evidence:
-        a = dict(agent_evidence)
-        if "repo_diff" in a:
-            # Never let an agent-supplied value masquerade as the host diff.
-            a["agent_supplied_repo_diff"] = a.pop("repo_diff")
-        # Redact agent-supplied evidence too (structural key-aware) — it is serialized into an
-        # external reviewer prompt, so a token/password in it is an exfil surface (review round-4).
-        ev["agent_supplied"] = redact_projection(a).value
+    supplied_section = accept_agent_supplied_section(agent_evidence)
+    if supplied_section:
+        # Demoted repo_diff + structural redaction, through the ONE helper the
+        # root nomination also uses (review round-4 exfil surface).
+        ev["agent_supplied"] = supplied_section
         prov["agent_supplied"] = "agent_supplied"
     contract = _accept_task_contract(ctx)
     # W2: resolve the claims that bind this task through the ONE seam — ingress
@@ -190,6 +226,10 @@ def build_task_acceptance_evidence(
     if claims_source in {"plan_review", "author_plan"}:
         contract = {**contract, "acceptance_claims": claims}
     receipts = read_context_verification_receipts(ctx, task_id, fallback_root=drive_root) if task_id else []
+    # The same host-recorded provenance the post-task synthesis reads: the reviewer
+    # learns whether the owner door stamped this run before it weighs the corpus.
+    ev["run_origin"] = _accept_run_origin(ctx, drive_root, task_id)
+    prov["run_origin"] = "host_attested"
     owner_directives = _accept_owner_directives(ctx, drive_root, task_id)
     if owner_directives:
         # This is an immutable verbatim corpus, not a parsed decision ledger:
@@ -265,19 +305,15 @@ def build_task_acceptance_evidence(
             ev["skill_lifecycle_history_coverage"] = skill_history_coverage
             prov["skill_lifecycle_history_coverage"] = "host_attested"
             ev["skill_lifecycle_complete"] = bool(skill_history_coverage.get("complete"))
-    repo_diff = collect_turn_diff(ctx, include_recent_commit=include_recent_commit)
-    diff_meta: Dict[str, Any] = {}
-    if "OMISSION NOTE: truncated at " in str(repo_diff or "") or "... (truncated from " in str(repo_diff or ""):
-        from ouroboros.artifacts import materialize_repo_diff_evidence
-        repo_getter = getattr(ctx, "active_repo_dir", None)
-        repo_dir = repo_getter() if callable(repo_getter) else repo_getter or getattr(ctx, "repo_dir", None)
-        exact, diff_meta = materialize_repo_diff_evidence(
-            repo_dir, drive_root, task_id, include_recent_commit=include_recent_commit,
-        )
-        if diff_meta.get("complete"):
-            repo_diff = exact
+    repo_diff, diff_meta = _accept_repo_diff(
+        ctx, include_recent_commit=include_recent_commit, drive_root=drive_root, task_id=task_id)
     ev["repo_diff"] = repo_diff
     prov["repo_diff"] = "host_attested"
+    # Identity/size/gaps of the private source this text was projected from.
+    # The raw bytes and their host-private ref deliberately stay out of the packet.
+    if diff_meta.get("capture_disclosure"):
+        ev["repo_diff_capture"] = redact_projection(diff_meta["capture_disclosure"]).value
+        prov["repo_diff_capture"] = "host_attested"
     if diff_meta.get("source_ref"):
         ev["repo_diff_source_ref"] = redact_projection(diff_meta["source_ref"]).value
         prov["repo_diff_source_ref"] = "host_attested"
@@ -381,8 +417,12 @@ def build_task_acceptance_evidence(
         if arts:
             ev["artifacts"] = arts
             prov["artifacts"] = "artifact"
-            if any(isinstance(row, dict) and row.get("name") == "…" for row in arts):
-                partial_sources.append({"tool": "artifact_manifest", "status": "source_unavailable", "reason": "artifact_manifest_truncated_without_exact_range", "source_ref": {}})
+            for row in arts:
+                if row.get("name") == "…":
+                    ref = row.get("source_ref") or {}
+                    partial_sources.append({"tool": "artifact_manifest", "source_ref": ref,
+                        "status": "not_materialized_for_reviewer" if ref else "source_unavailable",
+                        "reason": "artifact_manifest_preview" if ref else "artifact_inventory_unavailable"})
     if ev.get("skill_lifecycle_complete") is False:
         coverage = ev.get("skill_lifecycle_history_coverage") or {}
         partial_sources.append({"tool": "skill_lifecycle", "status": "not_materialized_for_reviewer",
@@ -701,7 +741,9 @@ def collect_review_evidence(
     holds only rows this task owns (plus legacy rows with no recorded owner),
     while another task's rows on the same checkout are carried separately under
     ``foreign_advisory_runs`` so a reader cannot mistake them for this task's
-    own work.
+    own work. The repository stale marker is attributed the same way: shown to
+    every task on the checkout, with ``stale_task_id``/``stale_attribution``
+    naming whose mutation or review wrote it.
     """
     from ouroboros.review_state import (
         _LEGACY_CURRENT_REPO_KEY,
@@ -767,6 +809,8 @@ def collect_review_evidence(
             "bypass_reason": str(getattr(current_run, "bypass_reason", "") or ""),
             "stale_reason": str(getattr(state, "last_stale_reason", "") or "") if stale_matches_repo else "",
             "stale_ts": str(getattr(state, "last_stale_from_edit_ts", "") or "") if stale_matches_repo else "",
+            # Whose mutation or review wrote the marker; it never hides the marker.
+            **{key: value if stale_matches_repo else "" for key, value in state.stale_marker_provenance(task_id).items()},
         },
         "recent_attempts": [_attempt_to_dict(item) for item in (scoped_attempts[-max_attempts:] if max_attempts > 0 else [])],
         "omitted_attempts": max(0, len(scoped_attempts) - max_attempts) if max_attempts > 0 else len(scoped_attempts),
@@ -1101,12 +1145,14 @@ from ouroboros.review_evidence_sections import (  # noqa: E402, F401 -- intentio
     _accept_obligation_row,
     _accept_owner_directives,
     _accept_protected_set,
+    _accept_run_origin,
     _accept_receipt_exhibits,
     _accept_redact_cap,
     _accept_task_contract,
     _accept_trajectory,
     _accept_verification_summary,
     _owner_content_projection,
+    accept_agent_supplied_section,
     collect_turn_diff,
     obligation_is_pending,
     task_acceptance_evidence_revision,

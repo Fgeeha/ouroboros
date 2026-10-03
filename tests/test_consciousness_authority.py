@@ -57,8 +57,11 @@ def test_levels_and_their_two_consequences():
     assert ca.disabled_tools_for("act") == list(ca.ACT_DISABLED)
     observe = ca.disabled_tools_for("observe")
     assert set(ca.ACT_DISABLED) <= set(observe)
-    assert {"promote_chat_to_task", "schedule_subagent", "write_file", "run_command",
+    assert {"promote_chat_to_task", "run_command",
             "browser_action", "initiate_presence", "submit_skill_to_hub"} <= set(observe)
+    # The names with a real read-only path are kept and narrowed on ARGUMENTS.
+    assert ca.OBSERVE_ARGUMENT_NARROWED.isdisjoint(observe)
+    assert {"schedule_subagent", "delegate_start", "cancel_task"} <= ca.OBSERVE_ARGUMENT_NARROWED
     # The nanny of a running campaign is never withheld, at any level.
     assert "steer_task" not in observe and "steer_task" not in ca.disabled_tools_for("act")
     # Observe is an EXCEPTION list: reading and talking stay available by default.
@@ -81,7 +84,9 @@ def test_observe_table_covers_every_registry_entry_marked_mutates_worktree(tmp_p
     reg = _registry(tmp_path)
     marked = {e.name for e in reg._entries.values() if e.mutates_worktree and not e.alias_for}
     assert marked, "the catalog carries mutates_worktree entries"
-    missing = marked - set(ca.OBSERVE_DISABLED)
+    # The argument-narrowed names have a read-only Observe path; what they may be
+    # ASKED to do is checked at dispatch instead of hiding the whole tool.
+    missing = marked - set(ca.OBSERVE_DISABLED) - ca.OBSERVE_ARGUMENT_NARROWED
     assert not missing, f"mutates_worktree entries missing from OBSERVE_WORLD_MUTATION_TOOLS: {sorted(missing)}"
     unknown = set(ca.OBSERVE_DISABLED) - {e.name for e in reg._entries.values()}
     # Skill/project tools are registered lazily (skills, journal); the built-in names must exist.
@@ -305,17 +310,22 @@ def test_routing_issuer_keeps_wake_relays_task_authored_and_explicit_owner_ingre
     wake = types.SimpleNamespace(task_id="wake-1", is_direct_chat=True, last_owner_delivery=None,
                                  task_metadata=dict(_wake_task("act")["metadata"]))
     assert _routing_issuer(wake) == {"kind": ISSUER_TASK, "task_id": "wake-1", "root_task_id": "wake-1"}
+    # An owner turn is the direct turn the owner door stamped; a bare direct context is not one.
     owner = types.SimpleNamespace(task_id="turn-1", is_direct_chat=True, last_owner_delivery=None,
-                                  task_metadata={})
+                                  task_metadata={"origin_message_ref": {"chat_id": 1, "client_message_id": "cm-1"}})
     assert _routing_issuer(owner) == {"kind": ISSUER_OWNER_TURN}
+    bare = types.SimpleNamespace(task_id="turn-2", is_direct_chat=True, last_owner_delivery=None, task_metadata={})
+    assert _routing_issuer(bare) == {"kind": ISSUER_TASK, "task_id": "turn-2", "root_task_id": "turn-2"}
     # Draining real owner dialogue provides receipt identity, never authorship.
     relaying = types.SimpleNamespace(task_id="c-root", is_direct_chat=False,
                                      last_owner_delivery={"client_message_id": "cm-9", "text": "go"},
                                      task_metadata={"initiator": "consciousness"})
     assert _routing_issuer(relaying) == {"kind": ISSUER_TASK, "task_id": "c-root", "root_task_id": "c-root"}
-    stamped = types.SimpleNamespace(task_id="c-root", is_direct_chat=True, last_owner_delivery=None,
-                                    task_metadata={"initiator": "consciousness", "client_message_id": "cm-2"})
-    assert _routing_issuer(stamped) == {"kind": ISSUER_OWNER_TURN}
+    # A client id is not the door's stamp: a wake (or a Presence event, whose client id is the
+    # provider's event id) keeps speaking as a task.
+    client_id_only = types.SimpleNamespace(task_id="c-root", is_direct_chat=True, last_owner_delivery=None,
+                                           task_metadata={"initiator": "consciousness", "client_message_id": "cm-2"})
+    assert _routing_issuer(client_id_only) == {"kind": ISSUER_TASK, "task_id": "c-root", "root_task_id": "c-root"}
 
 
 def test_steer_from_a_wake_is_written_as_an_independent_task_message(tmp_path, monkeypatch):
@@ -571,10 +581,13 @@ def test_request_file_and_pending_apply_carry_the_origin(tmp_path, monkeypatch):
     monkeypatch.setattr("supervisor.evolution_lifecycle.evolution_block_reason", lambda: "")
     monkeypatch.setattr("supervisor.evolution_lifecycle.start_evolution_campaign",
                         lambda objective, source="", **kw: calls.append((objective, source, kw)) or {"id": "c1"})
-    monkeypatch.setattr("supervisor.state.load_state", lambda: {"owner_chat_id": 7})
+    monkeypatch.setattr("supervisor.state.load_state", lambda: {
+        "owner_chat_id": 7, "evolution_owner_stopped": False,
+        "evolution_mode_enabled": False,
+    })
 
     def _update_state(mutator):
-        live: dict = {}
+        live = {"evolution_owner_stopped": False, "evolution_mode_enabled": False}
         mutator(live)
         return live
 
@@ -597,6 +610,7 @@ def test_agent_tool_enable_is_refused_while_the_owner_stop_stands(tmp_path, monk
     from supervisor import evolution_lifecycle as el
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     state.update_state(lambda live: live.update(owner_chat_id=7, evolution_owner_stopped=True))
     started: list = []
     monkeypatch.setattr(el, "evolution_block_reason", lambda: "")
@@ -616,6 +630,7 @@ def test_agent_tool_enable_without_an_owner_stop_starts_a_campaign_with_the_orig
     from supervisor import evolution_lifecycle as el
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     state.update_state(lambda live: live.update(owner_chat_id=7, evolution_owner_stopped=False))
     started: list = []
     monkeypatch.setattr(el, "evolution_block_reason", lambda: "")
@@ -639,6 +654,7 @@ def test_a_stop_the_agent_placed_itself_stays_undoable_by_the_agent(tmp_path, mo
     from supervisor import evolution_lifecycle as el
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     # What the agent's own toggle_evolution(False) leaves behind (the disable path itself needs
     # the live supervisor; its state write is pinned in test_evolution_stop_and_cost).
     state.update_state(lambda live: live.update(owner_chat_id=7, evolution_owner_stopped=True,
@@ -667,11 +683,10 @@ def test_observe_does_without_the_work_starting_review_verb():
     # The GitHub write verbs change the world beyond the repository (PLAN §5.4: Observe keeps the reads only).
     for verb in ("create_github_issue", "comment_on_issue", "comment_on_pr", "close_github_issue"):
         assert verb in ca.OBSERVE_DISABLED and verb not in ca.ACT_DISABLED, verb
-    for verb in ("list_github_prs", "get_github_pr", "list_github_issues", "get_github_issue"):
+    for verb in ("list_github_prs", "get_github_pr", "get_github_checks", "list_github_issues", "get_github_issue"):
         assert verb not in ca.OBSERVE_DISABLED, verb
-    # The two built-in execution verbs (astra scope round 5): a skill's script, a push + CI run.
-    for verb in ("skill_exec", "run_ci_tests"):
-        assert verb in ca.OBSERVE_DISABLED and verb not in ca.ACT_DISABLED, verb
+    # The built-in execution verb (astra scope round 5): a skill's script.
+    assert "skill_exec" in ca.OBSERVE_DISABLED and "skill_exec" not in ca.ACT_DISABLED
 
 
 def test_deep_review_request_carries_the_origin_to_the_one_door(tmp_path, monkeypatch):
@@ -691,6 +706,7 @@ def test_deep_review_request_carries_the_origin_to_the_one_door(tmp_path, monkey
     assert "initiator" not in owner.pending_events[0]
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     queue.init(tmp_path)
     pending: list = []
     queue.init_queue_refs(pending, {}, {"value": 0})
@@ -722,6 +738,7 @@ def test_the_allowance_is_read_before_the_queue_lock(tmp_path, monkeypatch):
     from supervisor import queue, state
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     queue.init(tmp_path)
     pending: list = []
     queue.init_queue_refs(pending, {}, {"value": 0})
@@ -758,6 +775,7 @@ def test_campaign_keeps_the_origin_and_its_cycle_tasks_inherit_it(tmp_path, monk
     from supervisor import evolution_lifecycle, queue, state
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     queue.init(tmp_path)
     pending: list = []
     queue.init_queue_refs(pending, {}, {"value": 0})
@@ -809,6 +827,7 @@ def test_a_transient_refusal_never_pauses_the_campaign(tmp_path, monkeypatch):
     from supervisor import evolution_lifecycle, queue, state
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     queue.init(tmp_path)
     pending: list = []
     queue.init_queue_refs(pending, {}, {"value": 0})
@@ -834,6 +853,7 @@ def test_the_owners_start_adopts_a_paused_consciousness_campaign(tmp_path):
     from supervisor import evolution_lifecycle, queue, state
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     queue.init(tmp_path)
     origin = {"initiator": "consciousness", "usage_category": "consciousness_task", "consciousness_autonomy": "full"}
     campaign = evolution_lifecycle.start_evolution_campaign("Improve", source="agent_tool", origin=origin)
@@ -854,6 +874,7 @@ def test_owner_campaign_carries_no_origin(tmp_path):
     from supervisor import evolution_lifecycle, queue, state
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     queue.init(tmp_path)
     campaign = evolution_lifecycle.start_evolution_campaign("Improve", source="owner_chat")
     assert "initiator" not in campaign
@@ -930,22 +951,33 @@ def test_a_wake_starts_fresh_work_with_no_predecessor_and_needs_no_manifest(tmp_
     assert "predecessor_task_id" not in promoted.pending_events[0]
 
 
-def test_a_wake_without_the_manifest_still_refuses_an_unaddressable_predecessor(tmp_path):
-    """The typed refusal is unchanged; only the facts the wake is given are new."""
+def test_a_wake_without_the_manifest_continues_a_settled_root_and_still_refuses_a_live_one(tmp_path):
+    """The door judges the root, not the facts a wake was handed: with no manifest at all
+    a wake continues a settled root on both verbs (the pointer is rebuilt from the durable
+    result and equals the one the manifest would have shown), while a live root keeps its
+    typed refusal toward steer_task and emits nothing."""
     from ouroboros.projects_registry import create_project
     from ouroboros.tools.control_routing import _promote_chat_to_task, _route_to_project
 
     create_project(tmp_path, "racer", name="Racer")
-    _addressable_result(tmp_path)
+    preview = _addressable_result(tmp_path)
 
     routed = _wake_routing_ctx(tmp_path)
     out = _route_to_project(routed, "racer", "Continue the racer", predecessor_task_id="racer-old")
-    assert out.startswith("⚠️ AUTHORITY_SOURCE_UNAVAILABLE (route_to_project)")
-    assert "not an addressable result in the host routing manifest" in out
-    assert routed.pending_events == []
+    assert out.startswith("⚠️ ROUTE_UNCONFIRMED"), out
+    [route_evt] = routed.pending_events
+    assert route_evt["predecessor_authority_source"] == preview["authority_source"]
 
     promoted = _wake_routing_ctx(tmp_path)
-    refused = _promote_chat_to_task(promoted, "Finish the racer", workspace="none",
-                                    predecessor_task_id="racer-old")
-    assert refused.startswith("⚠️ AUTHORITY_SOURCE_UNAVAILABLE (promote_chat_to_task)")
-    assert promoted.pending_events == []
+    _promote_chat_to_task(promoted, "Finish the racer", workspace="none", predecessor_task_id="racer-old")
+    [promote_evt] = promoted.pending_events
+    assert promote_evt["predecessor_task_id"] == "racer-old"
+    assert promote_evt["initiator"] == "consciousness"
+
+    (tmp_path / "task_results" / "racer-live.json").write_text(json.dumps({
+        "_schema_version": 1, "task_id": "racer-live", "status": "running", "project_id": "racer",
+    }), encoding="utf-8")
+    refused = _wake_routing_ctx(tmp_path)
+    out = _route_to_project(refused, "racer", "Continue the racer", predecessor_task_id="racer-live")
+    assert out.startswith("⚠️ AUTHORITY_SOURCE_UNAVAILABLE (route_to_project)") and "steer_task" in out
+    assert refused.pending_events == []
