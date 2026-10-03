@@ -1265,9 +1265,12 @@ def _forward_to_worker(
                 "started, so nothing has read it: it reads it when it starts, and if it ends unstarted its result keeps "
                 f"it as unread mail.{observed} Files cannot be attached to messages between tasks.")
     if provenance == PROVENANCE_PEER_TASK:
+        # A Presence turn may already be over: persistence is proven, a read is not.
+        read_note = ("This proves persistence, not that its model read it; if the turn continues, "
+                     "its checkpoint can read it." if observed else "it reads it at its next checkpoint.")
         return (f"Message forwarded to task {tid}: written to its mailbox as a message from a peer task "
-                f"({as_peer}; never owner text or an ancestor's steering); it reads it at its next "
-                f"checkpoint.{observed} Files cannot be attached to messages between tasks.")
+                f"({as_peer}; never owner text or an ancestor's steering){'.' if observed else ';'} "
+                f"{read_note}{observed} Files cannot be attached to messages between tasks.")
     if listed_root is not None:
         return (f"Message forwarded to task {tid}: written to its mailbox as a message from this task "
                 "(never owner text); it reads it at its next checkpoint. Files cannot be attached to messages between tasks.")
@@ -1440,11 +1443,12 @@ def get_tools() -> List[ToolEntry]:
             "name": "forward_to_worker",
             "description": (
                 "Write an addressed task-tree message into a running or queued task's mailbox: a child "
-                "or descendant of yours (delivered as the ancestor's message), your own parent "
-                "or a sibling (delivered as a message from a peer task naming the relation — "
-                "a contribution it weighs, never steering; relay is refused there), or any active "
-                "independent root the host lists or a source-bound inline Presence turn (a message "
-                "from an independent task). Presence observation gaps are disclosed; a write never "
+                "or descendant of yours (delivered as the ancestor's message), any other task in your "
+                "tree — your parent, a sibling, or any task sharing your root (delivered as a message "
+                "from a peer task naming the relation — a contribution it weighs, never steering; relay "
+                "is refused there), or any active independent root the host lists or a source-bound "
+                "inline Presence turn (a message from an independent task). Presence observation gaps "
+                "are disclosed, also when the Presence root is in your own tree; a write never "
                 "proves a read. It is never labelled owner dialogue, files cannot be attached, the body "
                 "is limited to 8000 chars (longer is refused, never truncated), and the "
                 "result says written, not read: a running task drains it at its next checkpoint, a queued "

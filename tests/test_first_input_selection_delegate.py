@@ -1,6 +1,8 @@
 """Declared inputs reach a configured session through the same start path as shared
-ones: the nanny's delegate_start and its retry replay compose the selected contract
-(receipt included) and send it to the daemon; no route is refused for its kind."""
+ones: a model-authored delegate_start and its retry replay send the complete normalized
+contract (selection, declared context, inherited intent note) as authority; the nanny's
+compiled work order (test_first_input_selection_context) carries the receipt. No route
+is refused for its kind."""
 from __future__ import annotations
 
 import json
@@ -15,7 +17,7 @@ from tests._delegated_transport_shared import (  # noqa: F401 - installs the off
 
 
 @pytest.mark.parametrize("carrier", ["contract", "metadata_contract", "metadata"])
-def test_declared_direct_start_sends_the_selected_contract_and_its_receipt(tmp_path, monkeypatch, carrier):
+def test_declared_direct_start_sends_the_normalized_contract_authority(tmp_path, monkeypatch, carrier):
     from ouroboros.gateways import claudexor as gateway
     from ouroboros.tools import delegate
 

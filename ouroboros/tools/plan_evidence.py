@@ -422,9 +422,10 @@ def task_evidence_reader(root: pathlib.Path) -> Callable[[str], Optional[str]]:
             "status": record.get("status"),
             "reason_code": record.get("reason_code"),
             "ts": record.get("ts"),
-            "result": str(record.get("result") or ""),
         }
         if "terminal_host_notice" in record:
+            # Before the result: a bounded head keeps the host's own disclosure.
             projection["terminal_host_notice"] = str(record["terminal_host_notice"] or "")
+        projection["result"] = str(record.get("result") or "")
         return json.dumps(projection, ensure_ascii=False, indent=2, default=str)
     return _read

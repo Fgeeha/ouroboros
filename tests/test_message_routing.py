@@ -538,7 +538,11 @@ class TestForwardToWorkerTool(unittest.TestCase):
             self.assertIn("a task in your tree", observed)
             self.assertIn("execution_observation=", observed)
             self.assertIn('"kind": "presence"', observed)
+            # The roster path's conditional wording survives: a Presence turn may be over.
+            self.assertIn("if the turn continues, its checkpoint can read it", observed)
+            self.assertNotIn("reads it at its next checkpoint", observed)
             self.assertNotIn("execution_observation", plain)
+            self.assertIn("reads it at its next checkpoint", plain)
 
     def test_relay_on_the_peer_branch_is_forbidden(self):
         from ouroboros.owner_mailbox import drain_owner_entries

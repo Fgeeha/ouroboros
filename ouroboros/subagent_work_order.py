@@ -26,7 +26,7 @@ def input_source_selection_receipt(task: Mapping[str, Any]) -> dict[str, Any]:
             "SYSTEM.md and BIBLE.md; existing reference-book projections",
             "explicit assignment, question, evidence and normalized task authority",
             "runtime access, tools, workspace, clock, resource and budget facts",
-            "the inherited delegation_budget.intent_note: parent-authored advice that survives selection as task authority",
+            "the inherited delegation_budget.intent_note: parent-authored advice carried in the task contract, never authority",
             "this child's own retained progress, tool and event history",
         ],
         "omitted_automatic": [
@@ -36,7 +36,7 @@ def input_source_selection_receipt(task: Mapping[str, Any]) -> dict[str, Any]:
             "parent context, notes, review_notes, predecessor narrative and inherited attachments",
             "task-tree blackboard, routing manifests and other-task summaries",
         ],
-        "lifetime": "Entire task, including tools, retries, fallback, compaction and selected API descendants.",
+        "lifetime": "Entire task, including tools, retries, fallback, compaction and selected descendants.",
         "collaboration": (
             "Ordinary task messages remain available; input selection imposes no collaboration order. "
             "The host does not gate mailbox delivery or detect the first position."

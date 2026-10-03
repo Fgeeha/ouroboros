@@ -59,3 +59,13 @@ def test_the_head_cut_never_splits_a_multibyte_character(tmp_path):
 
     assert len(row["text"].encode("utf-8")) <= EVIDENCE_PER_ITEM_BYTES
     assert row["text"].endswith("я")
+
+
+def test_a_host_notice_rides_in_the_bounded_head_of_a_long_result(tmp_path):
+    write_task_result(tmp_path, "task-f", STATUS_COMPLETED, result="x" * 50_000,
+                      terminal_host_notice="First source limitation.")
+
+    [row] = _resolve(tmp_path, "task:task-f")["attached"]
+
+    assert '"terminal_host_notice": "First source limitation."' in row["text"]
+    assert row["attached_bytes"] <= EVIDENCE_PER_ITEM_BYTES < row["bytes"]
