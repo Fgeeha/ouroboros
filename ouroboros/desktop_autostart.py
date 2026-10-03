@@ -4,6 +4,9 @@ Only packaged launchers with automatic-intent support may register. Adapters
 change the NEXT sign-in, never start/stop the current runtime or release a saved
 pause. launchd has no KeepAlive; systemd uses the shipped, non-restarting unit.
 Linux selects one registration: native packages use systemd, portable builds XDG.
+The native unit is the one the deb/rpm installed, which a managed update never
+replaces: an older package's unit starts the launcher with owner intent, which
+lifts a Panic stop, so it is never enabled (an existing registration still turns off).
 """
 from __future__ import annotations
 
@@ -13,6 +16,7 @@ import os
 from pathlib import Path
 import plistlib
 import re
+import shlex
 import subprocess
 import sys
 from xml.parsers.expat import ExpatError
@@ -26,6 +30,7 @@ UNIT = "ouroboros.service"
 NATIVE_LAUNCHER = Path("/opt/ouroboros/Ouroboros")
 NATIVE_UNIT = Path("/usr/lib/systemd/user/ouroboros.service")
 AUTOMATIC_ARGS = ["--launch-intent", "automatic"]
+UPDATE_PACKAGE = "Update the Ouroboros deb/rpm package to use sign-in startup."
 
 
 def launcher_target() -> tuple[Path | None, str]:
@@ -139,10 +144,27 @@ def _systemd_state() -> str:
     return states[value]
 
 
+def _unit_starts_automatic() -> bool:
+    """Whether the installed unit's ExecStart passes automatic intent to the launcher."""
+    try:
+        text = NATIVE_UNIT.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return False
+    commands = [value.strip() for key, sep, value in (line.partition("=") for line in text.splitlines())
+                if sep and key.strip() == "ExecStart"]
+    try:
+        argv = shlex.split(commands[-1]) if commands else []
+    except ValueError:
+        return False
+    return any(argv[i:i + 2] == AUTOMATIC_ARGS for i in range(1, len(argv) - 1))
+
+
 def _linux(exe: Path, enabled: bool | None) -> str:
     path = _desktop_path()
     native = exe == NATIVE_LAUNCHER
     unit_state = _systemd_state() if native or NATIVE_UNIT.is_file() else "off"
+    if native and (enabled or (enabled is None and unit_state != "on")) and not _unit_starts_automatic():
+        return "unavailable"
     if enabled is not None:
         if native:
             path.unlink(missing_ok=True)
@@ -172,7 +194,10 @@ def autostart_status(enabled: bool | None = None) -> dict[str, str]:
     if exe is None:
         return {"state": "unavailable", "reason": reason}
     state = ADAPTERS[sys.platform](exe, enabled)
-    return {"state": state, **({"reason": "The packaged sign-in service is unavailable."} if state == "unavailable" else {})}
+    if state != "unavailable":
+        return {"state": state}
+    # Natively the deb/rpm owns the sign-in unit: a missing or older one is fixed by updating it.
+    return {"state": state, "reason": UPDATE_PACKAGE if exe == NATIVE_LAUNCHER else "The packaged sign-in service is unavailable."}
 
 
 def runtime_facts() -> dict:

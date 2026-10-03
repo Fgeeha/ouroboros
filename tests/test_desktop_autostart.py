@@ -15,6 +15,32 @@ import pytest
 from ouroboros import desktop_autostart as startup
 from ouroboros.launcher_bootstrap import automatic_launch_allowed, parse_launch_options
 
+SHIPPED_UNIT = (Path(__file__).resolve().parents[1] / "packaging/systemd/ouroboros.service").read_text(encoding="utf-8")
+# The unit exactly as the 7.2.0 through 7.5.1 deb/rpm packages installed it; a managed update never replaces it.
+HISTORICAL_UNIT = """[Unit]
+Description=Ouroboros agent runtime
+Documentation=https://github.com/razzant/ouroboros
+
+[Service]
+Type=simple
+# Native packages install the release-reviewed launcher at this fixed path.
+# The launcher remains the sole owner of bootstrap, restart, panic, and cleanup.
+ExecStart=/opt/ouroboros/Ouroboros
+
+# Stop the complete launcher/server/worker tree started by this unit.
+KillMode=control-group
+KillSignal=SIGTERM
+# SIGTERM is sent immediately. This is only the upper bound systemd waits for
+# remaining cgroup processes before escalating to SIGKILL.
+TimeoutStopSec=120
+
+# Deliberately no systemd restart policy: the launcher owns its crash fuse and
+# treats a panic exit as a complete stop until the owner starts Ouroboros again.
+
+[Install]
+WantedBy=default.target
+"""
+
 
 @pytest.fixture
 def host(tmp_path, monkeypatch):
@@ -61,7 +87,7 @@ def host(tmp_path, monkeypatch):
         monkeypatch.setenv("OUROBOROS_BUNDLE_DIR", str(bundle))
         if native:
             monkeypatch.setattr(startup, "NATIVE_LAUNCHER", exe)
-            startup.NATIVE_UNIT.touch()
+            startup.NATIVE_UNIT.write_text(SHIPPED_UNIT, encoding="utf-8")
         if appimage:
             exe = tmp_path / "My Ouroboros.AppImage"
             exe.touch()
@@ -158,6 +184,22 @@ def test_linux_native_unit_is_not_masked_by_a_hidden_leftover_entry(host, tmp_pa
     assert startup.autostart_status()["state"] == "on"
     path.write_text(leftover, encoding="utf-8")  # a live leftover still starts the other copy
     assert startup.autostart_status()["state"] == "other_copy"
+
+
+def test_an_older_installed_unit_is_never_enabled_but_still_turns_off(host):
+    package, os_state = host
+    package("linux", native=True)
+    startup.NATIVE_UNIT.write_text(HISTORICAL_UNIT, encoding="utf-8")  # old deb/rpm, current managed code
+    command = next(line.partition("=")[2] for line in HISTORICAL_UNIT.splitlines() if line.startswith("ExecStart="))
+    assert parse_launch_options(shlex.split(command)[1:]).launch_intent == "owner"  # Panic would not hold it
+    for enable in (None, True):
+        status = startup.autostart_status(enable)
+        assert status["state"] == "unavailable" and status["reason"] == startup.UPDATE_PACKAGE
+    assert [call[2] for call in os_state.calls] == ["is-enabled", "is-enabled"]  # read, never enabled
+    os_state.unit = "enabled"  # registered earlier by hand: shown as it is, so the owner can turn it off
+    assert startup.autostart_status() == {"state": "on"}
+    assert startup.autostart_status(False) == {"state": "off"}
+    assert ["systemctl", "--user", "disable", "ouroboros.service"] in os_state.calls
 
 
 def test_linux_portable_disables_existing_native_registration_before_writing(host, tmp_path):
@@ -269,6 +311,5 @@ def test_a_sign_in_start_keeps_a_saved_pause(tmp_path, monkeypatch):
 
 
 def test_native_unit_uses_automatic_intent():
-    """Stage-0 dependency: its executor owns the shipped unit, not this change."""
-    unit = Path(__file__).resolve().parents[1] / "packaging/systemd/ouroboros.service"
-    assert "ExecStart=/opt/ouroboros/Ouroboros --launch-intent automatic" in unit.read_text(encoding="utf-8")
+    """The unit new deb/rpm packages ship; the adapter enables it only once installed."""
+    assert "ExecStart=/opt/ouroboros/Ouroboros --launch-intent automatic" in SHIPPED_UNIT
