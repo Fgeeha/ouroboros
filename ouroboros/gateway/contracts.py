@@ -10,6 +10,10 @@ from ouroboros.cost_projection import CostPresentation
 from ouroboros.gateway.history_contracts import ChatHistoryResponse  # noqa: F401 -- public re-export
 from ouroboros.gateway.widgets import ExtensionLiveSnapshot, WidgetTab, WidgetsResponse
 from ouroboros.gateway.decision_contracts import DecisionRequest, DecisionResponse  # noqa: F401 -- public re-exports
+from ouroboros.gateway.ui_i18n_contracts import (  # noqa: F401 -- public re-exports
+    UiI18nEntry, UiI18nLanguageRequest, UiI18nLanguageSummary, UiI18nMissingRequest,
+    UiI18nMissingResponse, UiI18nProfile, UiI18nResponse, UiI18nStats,
+)
 from ouroboros.gateway.schedule_contracts import (  # noqa: F401 -- public re-exports
     ScheduleActionResponse,
     ScheduledTasksResponse,
@@ -909,90 +913,6 @@ class UiPreferencesResponse(TypedDict):
     welcome: dict[str, str]  # install-wide empty-Main UI copy: mode default|hidden|custom and plain text
 
 
-class UiI18nProfile(TypedDict):
-    """A language's profile inside its translation memory (ouroboros/i18n_memory.py)."""
-
-    label: str  # display name the owner typed or the generator chose
-    instruction: str  # free-text description for the generator (an invented language's brief)
-    direction: Literal["ltr", "rtl"]
-    lexicon: str  # generator-written vocabulary/rules for rare or invented languages
-
-
-class UiI18nEntry(TypedDict):
-    """One translation: `text`, or plural `forms` keyed by CLDR category."""
-
-    text: NotRequired[str]
-    forms: NotRequired[dict[str, str]]
-    provenance: Literal["generated", "owner", "imported"]
-    source_hash: NotRequired[str]
-    model: NotRequired[str]
-    at: NotRequired[str]
-    attempt_id: NotRequired[str]
-    pack: NotRequired[str]
-    pack_version: NotRequired[str]
-    context: NotRequired[str]
-
-
-class UiI18nStats(TypedDict):
-    entries: int
-    generated: int
-    owner: int
-    imported: int
-    stale: int | None  # None = the current English of code keys was not available
-    pending: int  # queued misses awaiting the generator
-
-
-class UiI18nLanguageSummary(TypedDict):
-    """One language present on disk, for the Settings select."""
-
-    language: str
-    label: str
-    entries: int
-    pending: int
-    malformed: bool
-
-
-class UiI18nResponse(TypedDict):
-    """GET /api/ui/i18n and the body of a successful language POST."""
-
-    ok: NotRequired[bool]
-    language: str  # BCP-47 tag; "" = not chosen (English source renders)
-    chosen: bool
-    english: bool  # not chosen or chosen English: entries are empty by construction
-    revision: int
-    profile: UiI18nProfile | None
-    plural_select: dict[str, Any] | None  # {"map": {"0": "other", ...}, "period": int|None}, written by the browser
-    plural_categories: list[str] | None
-    entries: dict[str, UiI18nEntry]
-    stats: UiI18nStats
-    updated_at: str
-    memory_error: str  # nonempty when the stored file is malformed (English fallback in effect)
-    languages: list[UiI18nLanguageSummary]
-
-
-class UiI18nLanguageRequest(TypedDict):
-    """POST /api/ui/i18n/language."""
-
-    language: str  # BCP-47 tag ("" = not chosen, "en" = chosen English)
-    label: NotRequired[str]
-    profile: NotRequired[dict[str, Any]]
-    plural_select: NotRequired[dict[str, Any]]  # Intl.PluralRules select(n) for 0..100 (+ period)
-    plural_categories: NotRequired[list[str]]
-
-
-class UiI18nMissingRequest(TypedDict):
-    """POST /api/ui/i18n/missing: strings the renderer could not translate."""
-
-    language: str  # must equal the install's current language (409 otherwise)
-    items: list[dict[str, Any]]  # {key, context?}; shape-filtered, at most 200 per call
-
-
-class UiI18nMissingResponse(TypedDict):
-    accepted: int
-    dropped: int
-    pending: int
-
-
 class GitLogResponse(TypedDict):
     commits: list[Dict[str, Any]]
     # Tag rows: {tag, date, sha (peeled commit), message} — the mirror said ``list[str]`` while ``list_versions``
@@ -1624,6 +1544,8 @@ __all__ = [
     "SkillGrantResponse",
     "SkillDeleteResponse",
     "UiPreferencesResponse",
+    "UiI18nProfile", "UiI18nEntry", "UiI18nStats", "UiI18nLanguageSummary",
+    "UiI18nResponse", "UiI18nLanguageRequest", "UiI18nMissingRequest", "UiI18nMissingResponse",
     "GitLogResponse",
     "EvolutionDataResponse",
     "ScheduledTasksResponse",

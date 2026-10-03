@@ -4,6 +4,7 @@ import { taskCheckpointLabel, checkpointHasProgressRow } from './task_checkpoint
 export { taskCheckpointLabel } from './task_checkpoints.js';
 import { harnessPresentation } from './harness_presentation.js';
 import { acceptanceIncidentClauses } from './acceptance_incident_presentation.js';
+import { fmt, tr } from './i18n.js';
 import { historyRetentionView } from './history_retention.js';
 import { effortEvidenceText } from './effort_evidence.js';
 import { delegatedActivityView } from './delegated_activity.js';
@@ -485,8 +486,12 @@ const TASK_CAUSE_PHRASES = {
 
 export function taskReasonPhrase(code) {
     const raw = String(code || '');
-    return TASK_CAUSE_PHRASES[raw] || raw;
+    // English is the source; an install language reads the sentence by its stable code (i18n.js).
+    return TASK_CAUSE_PHRASES[raw] ? tr(`task.cause.${raw}`, TASK_CAUSE_PHRASES[raw]) : raw;
 }
+
+// The cause lookup the shared acceptance presenter receives: no second path reads the table.
+const causePhraseLookup = (key) => (TASK_CAUSE_PHRASES[String(key || '')] ? taskReasonPhrase(key) : '');
 
 // The custody overlay stamps this code as the row's reason_code while a
 // delegated run is still unreconciled, and the debt then heals from the WRITE
@@ -600,7 +605,7 @@ export function taskReasonDetail(evt) {
             : taskReasonPhrase(reason === 'plan_review_advisory' ? planReviewKey(record, reason) : reason);
     }
     const rationale = completion?.action === 'stop' ? plainCauseText(completion.rationale, 0) : authorStopRationale(decision);
-    const line = joinCauseClauses([clause, rationale, ...acceptanceIncidentClauses(decision, reason, TASK_CAUSE_PHRASES),
+    const line = joinCauseClauses([clause, rationale, ...acceptanceIncidentClauses(decision, reason, causePhraseLookup),
         ...terminalLimitations(record, reason, held), custody ? taskReasonPhrase(custody) : '']);
     // Cancellation's host/browser sentence has identical punctuation. Other
     // cause policy stays with the runtime owner of this shared seam.
@@ -719,12 +724,14 @@ export function taskDoneIsTerminal(evt) {
 // reducers; this translator never inspects event payloads or infers completion.
 export function taskPresentation(phase = 'working') {
     const normalizedPhase = typeof phase === 'string' && phase.trim() ? phase.trim() : 'working';
-    const headline = normalizedPhase === 'done' ? 'Done'
-        : normalizedPhase === 'warn' ? 'Done with warnings'
-            : normalizedPhase === 'cancelled' ? 'Cancelled'
-                : ['error', 'timeout', 'lifecycle_error'].includes(normalizedPhase) ? 'Failed'
-                    : 'Working';
-    return { phase: normalizedPhase, headline };
+    const word = normalizedPhase === 'done' ? 'done'
+        : normalizedPhase === 'warn' ? 'warn'
+            : normalizedPhase === 'cancelled' ? 'cancelled'
+                : ['error', 'timeout', 'lifecycle_error'].includes(normalizedPhase) ? 'error'
+                    : 'working';
+    const english = { done: 'Done', warn: 'Done with warnings', cancelled: 'Cancelled', error: 'Failed', working: 'Working' }[word];
+    // The English twin of project_dialogue.OUTCOME_PHASE_HEADLINE; an install language reads it by code.
+    return { phase: normalizedPhase, headline: tr(`task.headline.${word}`, english) };
 }
 
 function taskOutcomeMeta(evt) {
@@ -1369,33 +1376,33 @@ function summarizeChatLiveEventView(evt) {
     }
 
     if (t === 'task_started' || t === 'task_received') {
-        return chatView({ headline: 'Working on it', promote: true, dedupeKey: key() });
+        return chatView({ headline: tr('task.progress.working_on_it', 'Working on it'), promote: true, dedupeKey: key() });
     }
 
     if (t === 'context_building_started') {
-        return chatView({ headline: 'Getting ready', promote: true, dedupeKey: key() });
+        return chatView({ headline: tr('task.progress.getting_ready', 'Getting ready'), promote: true, dedupeKey: key() });
     }
 
     if (t === 'context_building_finished') {
-        return chatView({ headline: 'Looking through the context', dedupeKey: key() });
+        return chatView({ headline: tr('task.progress.looking_through_context', 'Looking through the context'), dedupeKey: key() });
     }
 
     if (t === 'task_heartbeat') {
-        return chatView({ headline: 'Still working', dedupeKey: key(evt.phase || '') });
+        return chatView({ headline: tr('task.progress.still_working', 'Still working'), dedupeKey: key(evt.phase || '') });
     }
 
     if (t === 'llm_round_started') {
-        return chatView({ phase: 'thinking', headline: 'Thinking', dedupeKey: key(evt.round || '', evt.attempt || '') });
+        return chatView({ phase: 'thinking', headline: tr('task.progress.thinking', 'Thinking'), dedupeKey: key(evt.round || '', evt.attempt || '') });
     }
 
     if (t === 'task_message_injected') {
         // A message from another task landed in this task's transcript: a
         // visible row in the receiver's block (owner 5=A), named by value.
-        const source = evt.source_task_id ? String(evt.source_task_id) : 'another task';
+        const source = evt.source_task_id ? String(evt.source_task_id) : tr('task.progress.another_task', 'another task');
         const preview = String(evt.text_preview || '');
         return chatView({
             phase: 'info',
-            headline: `Message from task ${source}`,
+            headline: fmt('Message from task {source}', { source }),
             body: shortText(preview, 200),
             fullBody: preview,
             visible: true,
@@ -1435,7 +1442,7 @@ function summarizeChatLiveEventView(evt) {
         const errorText = describeText(evt.error, 220);
         return chatView({
             phase: 'error',
-            headline: 'Thinking step failed',
+            headline: tr('task.fault.thinking_step_failed', 'Thinking step failed'),
             body: errorText.preview,
             fullBody: errorText.full,
             visible: true,
@@ -1450,8 +1457,8 @@ function summarizeChatLiveEventView(evt) {
         const errorText = describeText(evt.error, 220);
         return chatView({
             phase: 'warn',
-            headline: 'Settings reload failed at task start',
-            body: 'This task runs on the previously applied configuration.'
+            headline: tr('task.fault.settings_reload_failed', 'Settings reload failed at task start'),
+            body: tr('task.fault.settings_reload_failed_body', 'This task runs on the previously applied configuration.')
                 + (errorText.preview ? ` (${errorText.preview})` : ''),
             fullBody: errorText.full,
             visible: true,

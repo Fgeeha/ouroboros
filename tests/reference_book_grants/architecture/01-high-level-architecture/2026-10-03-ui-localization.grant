@@ -1,0 +1,6 @@
+1919
+The component map names the interface-language owners added with the
+translation memory: ui_language.py + i18n_memory.py (core), gateway/ui_i18n.py
+and its typed envelopes ui_i18n_contracts.py, and the browser overlay row now
+describes the gateway-served memory, the tr/fmt seams, settings_language.js and
+ui_i18n_types.js in place of the removed hand dictionary.

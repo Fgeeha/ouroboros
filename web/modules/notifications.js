@@ -32,6 +32,7 @@
 import { TERMINAL_TASK_STATUSES } from './chat_activity.js';
 import { getLogTaskGroupId } from './log_events.js';
 import { shellBridgeApi } from './ui_helpers.js';
+import { tr } from './i18n.js';
 
 export const NOTIFY_PREFS_KEY = 'ouroboros.notifications';
 
@@ -58,6 +59,10 @@ export const NOTIFY_TITLES = Object.freeze({
     important: 'Message from Ouroboros',
     main_reply: 'Ouroboros replied',
 });
+
+// Titles are a four-word catalog outside the DOM: the install language reads them by code
+// (web/modules/i18n.js); the body is the authored frame text and stays as written.
+const notifyTitle = (category) => tr(`notify.title.${category}`, NOTIFY_TITLES[category]);
 
 const BODY_CHARS = 140;
 /* Bounded only for hygiene in a page that may live for days. A key evicted
@@ -165,7 +170,7 @@ export function classifyLiveFrame(frame, { kind = 'chat', isMain = false, isRoot
         return {
             category: waiting ? 'needs_answer' : 'important',
             key: `quiz:${taskId}:${quizId}`,
-            title: waiting ? NOTIFY_TITLES.needs_answer : 'Ouroboros asks a question',
+            title: waiting ? notifyTitle('needs_answer') : tr('notify.title.asks_question', 'Ouroboros asks a question'),
             body: trimBody(source.question || frame.question || frame.content),
             target: { chatId: frame.chat_id, taskId, quizId },
         };
@@ -190,7 +195,7 @@ export function classifyLiveFrame(frame, { kind = 'chat', isMain = false, isRoot
         return {
             category: 'task_done',
             key: `conclusion:${taskId}`,
-            title: NOTIFY_TITLES.task_done,
+            title: notifyTitle('task_done'),
             body: '',
             target: { chatId: frame.chat_id, taskId },
         };
@@ -213,7 +218,7 @@ export function classifyLiveFrame(frame, { kind = 'chat', isMain = false, isRoot
         return {
             category: 'important',
             key: `important:${rowKey}`,
-            title: NOTIFY_TITLES.important,
+            title: notifyTitle('important'),
             body: trimBody(frame.content),
             target: { chatId: frame.chat_id, taskId },
         };
@@ -231,7 +236,7 @@ export function classifyLiveFrame(frame, { kind = 'chat', isMain = false, isRoot
         return {
             category: 'task_done',
             key: `conclusion:${taskId}`,
-            title: NOTIFY_TITLES.task_done,
+            title: notifyTitle('task_done'),
             body: trimBody(frame.content),
             target: { chatId: frame.chat_id, taskId },
         };
@@ -246,7 +251,7 @@ export function classifyLiveFrame(frame, { kind = 'chat', isMain = false, isRoot
             // of the same task share this key, so the owner is pulled back once
             // rather than twice for the same conclusion.
             key: taskId ? `conclusion:${taskId}` : `main_reply:${rowKey}`,
-            title: NOTIFY_TITLES.main_reply,
+            title: notifyTitle('main_reply'),
             body: trimBody(frame.content),
             target: { chatId: frame.chat_id, taskId },
         };

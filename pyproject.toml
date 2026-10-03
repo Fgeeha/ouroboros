@@ -137,7 +137,6 @@ web = [
     "*.png",
     "*.jpg",
     "modules/*.js",
-    "i18n/*.js",
     "providers/*.svg",
     "providers/*.png",
     "providers/*.ico",

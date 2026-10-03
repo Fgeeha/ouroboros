@@ -12,6 +12,7 @@
  *   footer  the strip that closes a task card bound to a Project
  */
 import { PAGE_ICONS } from './page_icons.js';
+import { tr } from './i18n.js';
 
 const LAYOUT_CLASS = { inline: 'chat-quiz-project', bar: '', footer: 'chat-live-bound-pointer' };
 // The arrow alone says "opens"; words appear only when the surface is itself the news.
@@ -25,7 +26,7 @@ const targets = new WeakMap();
 const MINTED_ID = /^proj_[0-9a-f]+$/;
 function displayName(project) {
     const name = String(project?.name || '').trim();
-    return name && !(name === String(project?.id || '') && MINTED_ID.test(name)) ? name : 'Project';
+    return name && !(name === String(project?.id || '') && MINTED_ID.test(name)) ? name : tr('project.reference.generic', 'Project');
 }
 
 /** One name for the visible text, the tooltip and the accessible name, so they cannot disagree. */

@@ -29,7 +29,7 @@ import { createModelRolesEditor, modelRoleMap } from './model_roles.js';
 import { PROCESSING_PREFERENCE_KEY, MODEL_PROCESSING_PREFERENCES_KEY } from './route_editor_primitives.js';
 import { collectSafeFieldValues, normalizeTone, renderSafeField, setInlineStatus, revealNewRow } from './ui_helpers.js';
 import { extensionActionStatus } from './extension_status_text.js';
-import { bindLanguageSegments } from './i18n.js';
+import { bindLanguageSettings } from './settings_language.js';
 
 let markSettingsDirty = () => {};
 const BASE_SECRET_KEYS = new Set(SECRET_KEYS.map(([key]) => key));
@@ -466,9 +466,9 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     // Notification preferences are client-local for the same reason; the module
     // owns delegated handlers, so mounting only paints current state.
     getNotifier().mountSettings(page);
-    // Language applies on click and persists on its own; it never marks the page dirty.
-    bindLanguageSegments(page, (language) => apiClient.saveUiLanguage(language)
-        .catch(() => showToast('Language choice could not be saved.', 'error')));
+    // The interface language is an install-wide setting with its own endpoint; the block
+    // saves on change and never marks the Settings draft dirty.
+    const disposeLanguage = bindLanguageSettings(page);
     const disposeLocalModel = bindLocalModelControls({ state,
         onApplication: (local) => syncRestartState({ ...restartState, local_model: local }) });
     // Best-effort About version from /api/health.
@@ -1130,7 +1130,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     // make the server draft dirty — otherwise toggling one would ask the owner
     // to discard "unsaved settings" that do not exist.
     const onServerSettingEdited = (event) => {
-        if (event?.target?.closest?.('[data-notify-settings]')) return;
+        if (event?.target?.closest?.('[data-notify-settings], [data-i18n-settings]')) return;
         onSettingsEdited();
     };
     page.addEventListener('input', onServerSettingEdited);
@@ -1195,6 +1195,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         disposeSettingsTabs();
         window.removeEventListener('beforeunload', beforeUnload);
         disposeLocalModel();
+        disposeLanguage();
         disposeRestartReconnect?.();
         accountModelCatalog.dispose();
         restartReadSequence += 1;

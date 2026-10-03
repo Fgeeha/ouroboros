@@ -1,0 +1,3 @@
+930
+Six endpoint rows for the interface language and its translation memory:
+GET /api/ui/i18n, POST /language, /missing, /import, GET /export, POST /regenerate.

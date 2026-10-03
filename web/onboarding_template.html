@@ -23,9 +23,11 @@
   </script>
   <script type="module" src="/static/modules/onboarding_wizard.js"></script>
   <script type="module">
-    // Onboarding predates /api/ui/preferences: the browser's last language choice is the only source.
-    import { setLanguage, storedLanguage } from '/static/modules/i18n.js';
-    if (storedLanguage() !== 'en') setLanguage('ru');
+    // The wizard paints from the same translation memory as the SPA: an install with an
+    // imported pack or an existing dictionary is translated from the first screen; with
+    // nothing on disk the English source renders.
+    import { bootLanguage } from '/static/modules/i18n.js';
+    bootLanguage();
   </script>
 </body>
 </html>

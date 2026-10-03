@@ -1,3 +1,5 @@
+import { tr } from './i18n.js';
+
 // Read-only presentation of one owner question: the quiz card header, in the Project and in its
 // Main mirror alike. Task liveness and answerability are separate facts: a status
 // leads with one word that answers "is there an unanswered question for me?" and
@@ -33,5 +35,7 @@ export function questionPresentation(row = {}) {
     const { waiting, resumed } = waitFacts(row);
     const key = !QUIZ_LIFECYCLE.includes(state) ? 'unknown' : state !== 'open' ? state
         : waiting ? 'waiting' : resumed ? 'resumed' : 'open';
-    return { status: STATUS[key] };
+    // The English words stay the source (and the Python twin's); the install language reads
+    // them by the lifecycle code (web/modules/i18n.js).
+    return { status: tr(`question.status.${key}`, STATUS[key]) };
 }

@@ -29,7 +29,7 @@ import { initUpdateStatus } from './modules/update_status.js';
 import { initDashboard } from './modules/dashboard.js';
 import { hydrateNavIcons } from './modules/page_icons.js';
 
-import { setLanguage, storedLanguage } from './modules/i18n.js';
+import { refreshDictionary, setLanguage, storedLanguage } from './modules/i18n.js';
 import { initOnboardingOverlay } from './modules/onboarding_overlay.js';
 import { installAltMenuSuppression, installDesktopShellLinkInterceptor } from './modules/ui_helpers.js';
 import { nameProjectReference, projectReference } from './modules/project_reference.js';
@@ -897,10 +897,14 @@ apiFetch('/api/ui/preferences', { cache: 'no-store' })
     .catch(() => setupResizablePanels({}));
 
 // The interface language is an install-wide setting, not a UI preference: the gateway
-// answers the chosen tag (and the memory the overlay paints from) at /api/ui/i18n.
+// answers the chosen tag and the memory the overlay paints from at /api/ui/i18n. Other
+// clients learn about a change from the frames below; the settings save path broadcasts
+// nothing, so these are the only cross-client signals.
 apiClient.uiI18n()
-    .then((i18n) => setLanguage(i18n && !i18n.english ? i18n.language : 'en'))
+    .then((i18n) => setLanguage(i18n.language, i18n))
     .catch(() => setLanguage(storedLanguage()));
+ws.on('ui_language_changed', () => { refreshDictionary(); });
+ws.on('ui_i18n_updated', () => { refreshDictionary(); });
 
 ws.on('open', () => {
     activitySocketDisconnected = false;

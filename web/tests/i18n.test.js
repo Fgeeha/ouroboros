@@ -1,52 +1,140 @@
-// The translation overlay: string lookup, the DOM walker, and the language
-// switch. `createTranslator` and `setLanguage` touch only the handful of DOM
-// methods stubbed below (closest/querySelectorAll/createTreeWalker/dataset), so
-// the house node-stub idiom covers them without a browser.
+// The interface language in the browser: string lookup with plural forms, the catalog seam
+// (`tr`/`fmt`), the miss reporter, the DOM overlay (text, attributes, inline composites,
+// scoped words, restore) and the serialized language switch. The overlay touches only the
+// handful of DOM methods stubbed below, so the house node-stub idiom covers it without a
+// browser. The memory arrives as a gateway payload here: no dictionary lives in the repo.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-    createTranslator, setLanguage, translateString,
-    EXCLUDE_SELECTOR, SKIP_ROOTS, USER_CONTENT,
+    applyPayload, createTranslator, englishTag, entryText, flushMisses, fmt, fmtInto,
+    pendingMisses, pluralSelectMap, setLanguage, setMissTransport, tr, translateString,
+    CODE_PREFIX, EXCLUDE_SELECTOR, SCOPE_SEPARATOR, SKIP_ROOTS, USER_CONTENT,
 } from '../modules/i18n.js';
-import { ru, ruPatterns, ruScoped, plural } from '../i18n/ru.js';
 
-test('an exact dictionary key is replaced', () => {
-    assert.equal(translateString('Settings', ru, ruPatterns), 'Настройки');
-    assert.equal(translateString('Main Chat', ru, ruPatterns), 'Основной чат');
+// A Russian memory the way GET /api/ui/i18n answers it: exact chrome strings, a DOM-scoped
+// word, number templates with plural forms, and catalog sentences by code.
+const RU_ENTRIES = {
+    'Settings': { text: 'Настройки' },
+    'Main Chat': { text: 'Основной чат' },
+    'Search': { text: 'Поиск' },
+    'System': { text: 'Системная' },
+    'Light': { text: 'Лёгкий' },
+    ['Light' + SCOPE_SEPARATOR + '[data-theme-control]']: { text: 'Светлая' },
+    '{n} errors': { forms: { one: '{n} ошибка', few: '{n} ошибки', many: '{n} ошибок', other: '{n} ошибки' } },
+    '{n} B': { text: '{n} Б' },
+    '{n} notes': { forms: { one: '{n} заметка', few: '{n} заметки', many: '{n} заметок', other: '{n} заметки' } },
+    'Type a code such as <1>pt-BR</1> or a name.': { text: 'Введите код, например <1>pt-BR</1>, или название.' },
+    'New task in {name}': { text: 'Новая задача в {name}' },
+    [CODE_PREFIX + 'task.headline.done']: { text: 'Готово' },
+};
+const RU = { language: 'ru', english: false, revision: 7, entries: RU_ENTRIES };
+const EN = { language: '', english: true, revision: 0, entries: {} };
+
+const sent = [];
+setMissTransport((payload) => { sent.push(payload); return Promise.resolve({ ok: true }); });
+
+test('a tag is English when empty or an en-* tag, nothing else', () => {
+    assert.equal(englishTag(''), true);
+    assert.equal(englishTag('en'), true);
+    assert.equal(englishTag('en-GB'), true);
+    assert.equal(englishTag('ru'), false);
+    assert.equal(englishTag('eng'), false);
 });
 
-test('surrounding whitespace survives the replacement', () => {
-    assert.equal(translateString('\n  Settings  ', ru, ruPatterns), '\n  Настройки  ');
-    assert.equal(translateString('   ', ru, ruPatterns), '   ');
+test('an exact memory key is replaced and surrounding whitespace survives', () => {
+    applyPayload(RU);
+    assert.equal(translateString('Settings'), 'Настройки');
+    assert.equal(translateString('Main Chat'), 'Основной чат');
+    assert.equal(translateString('\n  Settings  '), '\n  Настройки  ');
+    assert.equal(translateString('   '), '   ');
 });
 
-test('interpolated strings fall through to the pattern list, with Russian plurals', () => {
-    assert.equal(translateString('1 errors', ru, ruPatterns), '1 ошибка');
-    assert.equal(translateString('3 errors', ru, ruPatterns), '3 ошибки');
-    assert.equal(translateString('11 errors', ru, ruPatterns), '11 ошибок');
-    assert.equal(translateString('25 errors', ru, ruPatterns), '25 ошибок');
-    assert.equal(plural(2, 'запуск', 'запуска', 'запусков'), 'запуска');
+test('a string with one number uses its {n} template and the plural form Intl selects', () => {
+    applyPayload(RU);
+    assert.equal(translateString('1 errors'), '1 ошибка');
+    assert.equal(translateString('3 errors'), '3 ошибки');
+    assert.equal(translateString('11 errors'), '11 ошибок');
+    assert.equal(translateString('25 errors'), '25 ошибок');
+    assert.equal(translateString('2.5 errors'), '2.5 ошибки');
+    assert.equal(translateString('12 B'), '12 Б');
+    // Two numbers are not a template; the string stays.
+    assert.equal(translateString('3 of 12 errors'), '3 of 12 errors');
 });
 
-test('an unknown string is returned unchanged, and non-strings pass through', () => {
-    assert.equal(translateString('Ouroboros ate the tail', ru, ruPatterns), 'Ouroboros ate the tail');
-    assert.equal(translateString('', ru, ruPatterns), '');
-    assert.equal(translateString(undefined, ru, ruPatterns), undefined);
-    // No dictionary at all is the boot state before ru.js resolves.
-    assert.equal(translateString('Settings', null, null), 'Settings');
+test('an unknown string is returned unchanged, non-strings pass through, inherited keys never match', () => {
+    applyPayload(RU);
+    assert.equal(translateString('Ouroboros ate the tail'), 'Ouroboros ate the tail');
+    assert.equal(translateString(''), '');
+    assert.equal(translateString(undefined), undefined);
+    assert.equal(translateString('constructor'), 'constructor');
+    assert.equal(translateString('toString'), 'toString');
+    applyPayload(EN);
+    assert.equal(translateString('Settings'), 'Settings');
 });
 
-test('inherited Object keys are not mistaken for translations', () => {
-    assert.equal(translateString('constructor', ru, ruPatterns), 'constructor');
-    assert.equal(translateString('toString', ru, ruPatterns), 'toString');
+test('entryText picks the plural form, then other, then many, then the first form', () => {
+    applyPayload(RU);
+    assert.equal(entryText({ text: 'x' }, 5), 'x');
+    assert.equal(entryText({ forms: { one: 'один', many: 'много' } }, 2.5), 'много');
+    assert.equal(entryText({ forms: { few: 'несколько' } }, 1), 'несколько');
+    assert.equal(entryText({ forms: {} }, 1), null);
+    assert.equal(entryText(null, 1), null);
 });
 
-test('the hot-loop roots are a subset of nothing else: every selector parses as a CSS list', () => {
+test('the plural map the browser hands the memory covers 0..100 with a period of 100', () => {
+    const ru = pluralSelectMap('ru');
+    assert.equal(ru.map['1'], 'one');
+    assert.equal(ru.map['3'], 'few');
+    assert.equal(ru.map['5'], 'many');
+    assert.equal(ru.map['21'], 'one');
+    assert.equal(ru.period, 100);
+    assert.ok(ru.categories.includes('few'));
+    assert.equal(Object.keys(ru.map).length, 101);
+    const en = pluralSelectMap('en');
+    assert.equal(en.map['1'], 'one');
+    assert.equal(en.map['0'], 'other');
+});
+
+test('tr answers the English source in English and the memory sentence otherwise; a miss is reported once', async () => {
+    applyPayload(EN);
+    assert.equal(tr('task.headline.done', 'Done'), 'Done');
+    assert.deepEqual(pendingMisses(), []);
+    applyPayload(RU);
+    assert.equal(tr('task.headline.done', 'Done'), 'Готово');
+    assert.equal(tr('task.headline.warn', 'Done with warnings'), 'Done with warnings');
+    assert.equal(tr('task.headline.warn', 'Done with warnings'), 'Done with warnings');
+    assert.deepEqual(pendingMisses(), [CODE_PREFIX + 'task.headline.warn']);
+    sent.length = 0;
+    await flushMisses();
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].language, 'ru');
+    assert.deepEqual(sent[0].items.map((item) => item.key), [CODE_PREFIX + 'task.headline.warn']);
+    assert.equal(sent[0].items[0].context.source, 'Done with warnings');
+    assert.deepEqual(pendingMisses(), []);
+});
+
+test('fmt fills placeholders into the translated template and selects the plural form by n', () => {
+    applyPayload(RU);
+    assert.equal(fmt('New task in {name}', { name: 'Docs' }), 'Новая задача в Docs');
+    assert.equal(fmt('{n} notes', { n: 1 }), '1 заметка');
+    assert.equal(fmt('{n} notes', { n: 3 }), '3 заметки');
+    assert.equal(fmt('{n} notes', { n: 11 }), '11 заметок');
+    // A template the memory lacks renders the English source, placeholders filled.
+    assert.equal(fmt('Message from task {source}', { source: 'abc' }), 'Message from task abc');
+    assert.ok(pendingMisses().includes('Message from task {source}'));
+    applyPayload(EN);
+    assert.equal(fmt('New task in {name}', { name: 'Docs' }), 'New task in Docs');
+    assert.equal(fmt('{n} notes', { n: 3 }), '3 notes');
+});
+
+test('the selector lists parse as CSS lists and keep the content the overlay must never touch', () => {
     for (const selector of [EXCLUDE_SELECTOR, SKIP_ROOTS, USER_CONTENT]) {
         assert.ok(selector.length > 0);
         for (const part of selector.split(',')) assert.ok(part.trim().length > 0, selector);
     }
     assert.ok(EXCLUDE_SELECTOR.includes('input'), 'user input is never translated as content');
+    assert.ok(SKIP_ROOTS.includes('#chat-messages'), 'the Main transcript stays out of the overlay');
+    assert.ok(SKIP_ROOTS.includes('.chat-messages'), 'every Project transcript stays out of the overlay');
     assert.ok(SKIP_ROOTS.includes('#log-entries'), 'the log stream stays out of the observer');
     assert.ok(USER_CONTENT.includes('.nav-project-row'), 'a project name is never translated');
 });
@@ -54,7 +142,8 @@ test('the hot-loop roots are a subset of nothing else: every selector parses as 
 // ---------------------------------------------------------------------------
 // Minimal DOM. Only what the overlay calls: element/text nodes, `closest` and
 // `querySelectorAll` over compound selectors with a descendant combinator, a
-// text-node TreeWalker, and a `dataset` that `[data-*]` queries can see.
+// text-node TreeWalker, `replaceChildren`/`createTextNode` for inline composites,
+// and a `dataset` that `[data-*]` queries can see.
 // ---------------------------------------------------------------------------
 
 const TOKEN = /[.#][\w-]+|\[[^\]]*\]|[a-zA-Z][\w-]*/g;
@@ -101,6 +190,7 @@ const doc = {
         let i = 0;
         return { nextNode: () => (i < texts.length ? texts[i++] : null) };
     },
+    createTextNode(value) { return new Txt(value); },
 };
 
 class Txt {
@@ -129,6 +219,10 @@ class El {
         return new Set(String(this.attrs.get('class') || '').split(/\s+/).filter(Boolean));
     }
 
+    set textContent(value) { this.replaceChildren(new Txt(value)); }
+
+    get textContent() { return this.childNodes.map((n) => (n.nodeType === 3 ? n.nodeValue : n.textContent)).join(''); }
+
     getAttribute(name) {
         if (name.startsWith('data-')) {
             const key = name.slice(5).replace(/-([a-z])/g, (m, c) => c.toUpperCase());
@@ -138,6 +232,12 @@ class El {
     }
 
     setAttribute(name, value) { this.attrs.set(name, String(value)); }
+
+    replaceChildren(...nodes) {
+        for (const node of this.childNodes) if (!nodes.includes(node)) node.parentElement = null;
+        this.childNodes = nodes;
+        for (const node of nodes) node.parentElement = this;
+    }
 
     closest(selector) {
         for (let node = this; node; node = node.parentElement) {
@@ -190,67 +290,6 @@ function sampleTree() {
 
 const text = (node) => node.childNodes[0].nodeValue;
 
-test('owner-supplied names are left alone while the chrome around them is translated', () => {
-    const root = sampleTree();
-    const [projectItem, filesEntry, panelTitle, plainRow, input] = root.childNodes;
-    createTranslator({ dict: ru, patterns: ruPatterns }).applyTo(root);
-
-    // A project named "Delete old logs" must not become "Удалить old logs".
-    assert.equal(text(projectItem.childNodes[0].childNodes[0]), 'Delete old logs');
-    assert.equal(projectItem.childNodes[0].getAttribute('title'), 'Delete old logs');
-    assert.equal(panelTitle.childNodes[0].nodeValue, 'Delete old logs');
-    // A file named "Settings" stays a file name, not the Settings page.
-    assert.equal(text(filesEntry.childNodes[0]), 'Settings');
-    // A composed label merely embedding the name is safe: every pattern is anchored.
-    assert.equal(projectItem.childNodes[1].getAttribute('aria-label'), 'Actions for Delete old logs');
-
-    // The gate is not a blanket off-switch: siblings and metadata still translate.
-    assert.equal(text(filesEntry.childNodes[1]), '12 Б');
-    assert.equal(text(plainRow.childNodes[0]), 'Настройки');
-    assert.equal(plainRow.getAttribute('title'), 'Настройки');
-    // Inputs are excluded as content but their chrome attributes are translated.
-    assert.equal(input.getAttribute('placeholder'), 'Поиск');
-});
-
-test('a scoped word wins only inside its scope and restores like any other', () => {
-    const themes = el('div', {}, el('button', {}, 'Light'), el('button', {}, 'System'));
-    themes.dataset.themeControl = '';
-    const root = el('div', {}, themes, el('button', {}, 'Light'));
-    const translator = createTranslator({ dict: ru, patterns: ruPatterns, scoped: ruScoped });
-    translator.applyTo(root);
-    assert.equal(text(themes.childNodes[0]), 'Светлая');
-    assert.equal(text(themes.childNodes[1]), 'Системная');
-    assert.equal(text(root.childNodes[1]), 'Лёгкий');
-    translator.restore(root);
-    assert.equal(text(themes.childNodes[0]), 'Light');
-    assert.equal(text(root.childNodes[1]), 'Light');
-});
-
-test('restore returns every rewritten node and attribute to its exact English source', () => {
-    const root = sampleTree();
-    const before = JSON.stringify(snapshot(root));
-    const translator = createTranslator({ dict: ru, patterns: ruPatterns });
-    translator.applyTo(root);
-    assert.notEqual(JSON.stringify(snapshot(root)), before);
-    translator.restore(root);
-    assert.equal(JSON.stringify(snapshot(root)), before);
-    root.querySelectorAll('button,span,input,h2,div').forEach((node) => {
-        assert.deepEqual(node.dataset, {}, 'no bookkeeping is left behind');
-    });
-});
-
-test('restore never clobbers text or attributes the app rewrote while Russian was on', () => {
-    const root = sampleTree();
-    const translator = createTranslator({ dict: ru, patterns: ruPatterns });
-    translator.applyTo(root);
-    const row = root.childNodes[3];
-    row.childNodes[0].childNodes[0].nodeValue = 'Live value';
-    row.setAttribute('title', 'Live title');
-    translator.restore(root);
-    assert.equal(text(row.childNodes[0]), 'Live value');
-    assert.equal(row.getAttribute('title'), 'Live title');
-});
-
 function snapshot(root) {
     const out = [];
     (function collect(node) {
@@ -266,6 +305,116 @@ function snapshot(root) {
     return out;
 }
 
+test('owner-supplied names are left alone while the chrome around them is translated', () => {
+    applyPayload(RU);
+    const root = sampleTree();
+    const [projectItem, filesEntry, panelTitle, plainRow, input] = root.childNodes;
+    createTranslator().applyTo(root);
+
+    // A project named "Delete old logs" must not become "Удалить old logs".
+    assert.equal(text(projectItem.childNodes[0].childNodes[0]), 'Delete old logs');
+    assert.equal(projectItem.childNodes[0].getAttribute('title'), 'Delete old logs');
+    assert.equal(panelTitle.childNodes[0].nodeValue, 'Delete old logs');
+    // A file named "Settings" stays a file name, not the Settings page.
+    assert.equal(text(filesEntry.childNodes[0]), 'Settings');
+    // A composed label merely embedding the name has no exact key and stays.
+    assert.equal(projectItem.childNodes[1].getAttribute('aria-label'), 'Actions for Delete old logs');
+
+    // The gate is not a blanket off-switch: siblings and metadata still translate.
+    assert.equal(text(filesEntry.childNodes[1]), '12 Б');
+    assert.equal(text(plainRow.childNodes[0]), 'Настройки');
+    assert.equal(plainRow.getAttribute('title'), 'Настройки');
+    // Inputs are excluded as content but their chrome attributes are translated.
+    assert.equal(input.getAttribute('placeholder'), 'Поиск');
+});
+
+test('untranslated chrome is reported as a miss; volatile strings and user content are not', async () => {
+    applyPayload(RU);
+    const root = el('div', {},
+        el('span', { class: 'nav-row-label' }, 'Files'),
+        el('span', { class: 'files-entry-meta' }, '12 B'),
+        el('span', {}, '⋯'),
+        el('span', { class: 'files-entry-name' }, 'README'),
+        el('span', { class: 'files-entry-meta' }, '2026-10-03T10:00:00Z'));
+    createTranslator().applyTo(root);
+    assert.deepEqual(pendingMisses(), ['Files']);
+    sent.length = 0;
+    await flushMisses();
+    assert.equal(sent[0].items[0].context.role, 'span');
+});
+
+test('a scoped word wins only inside its scope and restores like any other', () => {
+    applyPayload(RU);
+    const themes = el('div', {}, el('button', {}, 'Light'), el('button', {}, 'System'));
+    themes.dataset.themeControl = '';
+    const root = el('div', {}, themes, el('button', {}, 'Light'));
+    const translator = createTranslator();
+    translator.applyTo(root);
+    assert.equal(text(themes.childNodes[0]), 'Светлая');
+    assert.equal(text(themes.childNodes[1]), 'Системная');
+    assert.equal(text(root.childNodes[1]), 'Лёгкий');
+    translator.restore(root);
+    assert.equal(text(themes.childNodes[0]), 'Light');
+    assert.equal(text(root.childNodes[1]), 'Light');
+});
+
+test('an inline composite translates as one sentence, keeps <code> verbatim, and restores its nodes', () => {
+    applyPayload(RU);
+    const code = el('code', {}, 'pt-BR');
+    const help = el('div', { class: 'settings-inline-note' }, 'Type a code such as ', code, ' or a name.');
+    const root = el('div', {}, help);
+    const translator = createTranslator();
+    translator.applyTo(root);
+    assert.equal(help.textContent, 'Введите код, например pt-BR, или название.');
+    assert.ok(help.childNodes.includes(code), 'the original <code> element is reused, not cloned');
+    assert.equal(code.textContent, 'pt-BR');
+    // Idempotent: a second pass starts from the stashed English, not from the translation.
+    translator.applyTo(root);
+    assert.equal(help.textContent, 'Введите код, например pt-BR, или название.');
+    translator.restore(root);
+    assert.equal(help.textContent, 'Type a code such as pt-BR or a name.');
+    assert.equal(help.childNodes.length, 3);
+});
+
+test('a producer-written fmt result is left alone by the overlay', () => {
+    applyPayload(RU);
+    const target = el('span', {});
+    const root = el('div', {}, target);
+    assert.equal(fmtInto(target, 'New task in {name}', { name: 'Settings' }), 'Новая задача в Settings');
+    assert.equal(target.dataset.i18nFmt, 'New task in {name}');
+    createTranslator().applyTo(root);
+    // Without the mark the overlay would see "Settings" inside and must not re-touch it.
+    assert.equal(target.textContent, 'Новая задача в Settings');
+});
+
+test('restore returns every rewritten node and attribute to its exact English source', () => {
+    applyPayload(RU);
+    const root = sampleTree();
+    const before = JSON.stringify(snapshot(root));
+    const translator = createTranslator();
+    translator.applyTo(root);
+    assert.notEqual(JSON.stringify(snapshot(root)), before);
+    translator.restore(root);
+    assert.equal(JSON.stringify(snapshot(root)), before);
+    root.querySelectorAll('button,span,input,h2,div').forEach((node) => {
+        assert.deepEqual(node.dataset, {}, 'no bookkeeping is left behind');
+        assert.equal(node.__ouroAttrs, undefined);
+    });
+});
+
+test('restore never clobbers text or attributes the app rewrote while the language was on', () => {
+    applyPayload(RU);
+    const root = sampleTree();
+    const translator = createTranslator();
+    translator.applyTo(root);
+    const row = root.childNodes[3];
+    row.childNodes[0].childNodes[0].nodeValue = 'Live value';
+    row.setAttribute('title', 'Live title');
+    translator.restore(root);
+    assert.equal(text(row.childNodes[0]), 'Live value');
+    assert.equal(row.getAttribute('title'), 'Live title');
+});
+
 // ---------------------------------------------------------------------------
 // Observer and language switch. The stubs record every MutationObserver ever
 // constructed, so an orphaned one cannot hide behind the survivor.
@@ -276,9 +425,11 @@ function withBrowser(body, fn) {
     const frames = [];
     const keys = ['document', 'window', 'localStorage', 'requestAnimationFrame', 'MutationObserver'];
     const saved = keys.map((key) => [key, key in globalThis, globalThis[key]]);
-    globalThis.document = { body, documentElement: {} };
+    const documentElement = { lang: '', dir: '', removeAttribute(name) { this[name] = ''; } };
+    const stored = new Map();
+    globalThis.document = { body, documentElement };
     globalThis.window = { dispatchEvent() {} };
-    globalThis.localStorage = { getItem: () => null, setItem() {} };
+    globalThis.localStorage = { getItem: (k) => (stored.has(k) ? stored.get(k) : null), setItem(k, v) { stored.set(k, String(v)); } };
     globalThis.requestAnimationFrame = (cb) => frames.push(cb);
     globalThis.MutationObserver = class {
         constructor(cb) { this.cb = cb; this.live = false; observers.push(this); }
@@ -295,13 +446,14 @@ function withBrowser(body, fn) {
             else delete globalThis[key];
         }
     };
-    return Promise.resolve(fn({ deliver, observers })).finally(restore);
+    return Promise.resolve(fn({ deliver, observers, documentElement, stored })).finally(restore);
 }
 
 test('the observer translates nodes added later and stops dead on disconnect', () => {
+    applyPayload(RU);
     const root = sampleTree();
     return withBrowser(root, ({ deliver }) => {
-        const translator = createTranslator({ dict: ru, patterns: ruPatterns });
+        const translator = createTranslator();
         translator.observe(root);
         const added = el('span', { class: 'nav-row-label' }, 'Settings');
         added.parentElement = root;
@@ -318,17 +470,32 @@ test('the observer translates nodes added later and stops dead on disconnect', (
     });
 });
 
-test('concurrent switches to Russian leave one translator, so English comes back whole', () => {
+test('a payload switch paints the document, sets <html lang>/dir, and remembers the tag', () => {
     const root = sampleTree();
-    return withBrowser(root, async ({ deliver }) => {
-        const english = JSON.stringify(snapshot(root));
-        // Both calls race the dynamic import of the dictionary; without the switch
-        // queue each would build a translator and strand the loser's observer.
-        await Promise.all([setLanguage('ru'), setLanguage('ru')]);
+    return withBrowser(root, async ({ documentElement, stored }) => {
+        await setLanguage('ru', { ...RU, profile: { direction: 'rtl' } });
         assert.equal(text(root.childNodes[3].childNodes[0]), 'Настройки');
+        assert.equal(documentElement.lang, 'ru');
+        assert.equal(documentElement.dir, 'rtl');
+        assert.equal(stored.get('ouro.language'), 'ru');
+        await setLanguage('en', EN);
+        assert.equal(documentElement.lang, 'en');
+        assert.equal(documentElement.dir, '');
+        assert.equal(stored.get('ouro.language'), '');
+    });
+});
 
-        await setLanguage('en');
+test('concurrent switches leave one translator, so English comes back whole', () => {
+    const root = sampleTree();
+    return withBrowser(root, async ({ deliver, observers }) => {
+        const english = JSON.stringify(snapshot(root));
+        await Promise.all([setLanguage('ru', RU), setLanguage('ru', RU)]);
+        assert.equal(text(root.childNodes[3].childNodes[0]), 'Настройки');
+        assert.equal(observers.filter((o) => o.live).length, 1);
+
+        await setLanguage('en', EN);
         assert.equal(JSON.stringify(snapshot(root)), english);
+        assert.equal(observers.filter((o) => o.live).length, 0);
         // A stranded observer would retranslate on the next frame; none may.
         deliver([{ type: 'childList', addedNodes: [root] }]);
         assert.equal(JSON.stringify(snapshot(root)), english);

@@ -88,8 +88,11 @@ export function acceptanceIncidentAttempt(incident) {
 export function acceptanceIncidentClauses(decision, reason, phrases) {
     const incident = decision?.acceptance_incident;
     if (!incident || typeof incident !== 'object' || String(incident.status || '') === 'resolved') return [];
-    const rail = reason && reason !== 'final_message' ? (phrases[reason] || '') : '';
-    return [phrases.acceptance_preparation_failed, rail];
+    // `phrases` is the caller's cause lookup: a function (the install-language seam) or the
+    // raw English table, so no presenter reads the table past the translation seam.
+    const phrase = typeof phrases === 'function' ? phrases : (key) => (phrases || {})[key];
+    const rail = reason && reason !== 'final_message' ? (phrase(reason) || '') : '';
+    return [phrase('acceptance_preparation_failed'), rail];
 }
 
 // The Reviews group of ONE task's acceptance: the panel rows the task really

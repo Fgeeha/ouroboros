@@ -11,6 +11,7 @@ import { delegatedActivityBodyHtml, delegatedHeadline, delegatedLineView } from 
 import { joinMarkdownHeadings, MARKDOWN_FENCED_CODE } from './utils.js';
 import { REUSABLE_TASK_IDS } from './task_control_menu.js';
 import { apiFetch } from './api_client.js';
+import { currentLanguage, fmt, isEnglish, tr } from './i18n.js';
 import {
     accountedUpperBound,
     accountedUpperBoundWithChildren,
@@ -1220,14 +1221,22 @@ export function formatMsgTime(isoStr) {
         const pad = n => String(n).padStart(2, '0');
         const hhmm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
         const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+        // English keeps this hand format byte for byte; an install language takes its month
+        // names from Intl and its two words from the catalog (web/modules/i18n.js).
+        const monthName = (date) => {
+            if (!isEnglish()) {
+                try { return new Intl.DateTimeFormat(currentLanguage(), { month: 'short' }).format(date); } catch { /* hand list below */ }
+            }
+            return months[date.getMonth()];
+        };
         const todayStr = now.toDateString();
         const yesterday = new Date(now);
         yesterday.setDate(now.getDate() - 1);
         let short;
         if (d.toDateString() === todayStr) short = hhmm;
-        else if (d.toDateString() === yesterday.toDateString()) short = `Yesterday, ${hhmm}`;
-        else short = `${months[d.getMonth()]} ${d.getDate()}, ${hhmm}`;
-        const full = `${months[d.getMonth()]} ${d.getDate()}, ${d.getFullYear()} at ${hhmm}`;
+        else if (d.toDateString() === yesterday.toDateString()) short = `${tr('time.yesterday', 'Yesterday')}, ${hhmm}`;
+        else short = `${monthName(d)} ${d.getDate()}, ${hhmm}`;
+        const full = `${monthName(d)} ${d.getDate()}, ${d.getFullYear()} ${tr('time.at', 'at')} ${hhmm}`;
         return { short, full };
     } catch {
         return null;
@@ -1239,12 +1248,12 @@ export function routingOptionLabel(option) {
     if (!option || typeof option !== 'object') return '';
     if (option.label) return String(option.label);
     if (option.action === 'new_task_in_project') {
-        return `New task in ${String(option.project_name || 'Project')}`;
+        return fmt('New task in {name}', { name: String(option.project_name || tr('routing.generic_project', 'Project')) });
     }
     if (option.title || option.project_name) {
         return String(option.title || option.project_name);
     }
-    return option.project_id && !option.task_id ? 'Project' : 'Task';
+    return option.project_id && !option.task_id ? tr('routing.generic_project', 'Project') : tr('routing.generic_task', 'Task');
 }
 
 /** Human text for a typed routing annotation ('' hides the line). */
@@ -1259,20 +1268,21 @@ export function routingAnnotationText(annotation) {
     const status = String(annotation.status || '');
     const target = String(annotation.target || '');
     const targetLabel = String(annotation.target_label || '')
-        || (target ? (action === 'project_route' ? 'Project' : 'Task') : '');
-    if (status === 'pending') return 'Choosing the right destination…';
+        || (target ? (action === 'project_route' ? tr('routing.generic_project', 'Project') : tr('routing.generic_task', 'Task')) : '');
+    if (status === 'pending') return tr('routing.pending', 'Choosing the right destination…');
     if (status === 'needs_manual_target') {
         const optionLabels = (Array.isArray(annotation.options) ? annotation.options : [])
             .map(routingOptionLabel)
             .filter(Boolean);
-        if (optionLabels.length) return `Choose a target · ${optionLabels.join(' / ')}`;
+        if (optionLabels.length) return `${tr('routing.choose_target', 'Choose a target')} · ${optionLabels.join(' / ')}`;
         // No options and (by the guard above) no cause: a receipt written
         // before the host sentence existed, or by a producer that bypasses
         // `_emit_routing_receipt`. Nothing can be chosen on such a row, so it
         // must not invite a choice.
-        return targetLabel ? `Not routed · ${targetLabel}` : 'Not routed';
+        const notRouted = tr('routing.not_routed', 'Not routed');
+        return targetLabel ? `${notRouted} · ${targetLabel}` : notRouted;
     }
-    if (status === 'project_unavailable') return 'Project is unavailable';
+    if (status === 'project_unavailable') return tr('routing.project_unavailable', 'Project is unavailable');
     const labels = {
         mailbox_delivery: 'Delivered to task',
         steer_task: 'Steered task',
@@ -1280,7 +1290,8 @@ export function routingAnnotationText(annotation) {
         route_to_project: 'Routed to project',
         project_route: 'Project routing',
     };
-    const label = labels[action] || status.replaceAll('_', ' ') || action.replaceAll('_', ' ');
+    const label = labels[action] ? tr(`routing.action.${action}`, labels[action])
+        : (status.replaceAll('_', ' ') || action.replaceAll('_', ' '));
     return targetLabel && label ? `${label} · ${targetLabel}` : label;
 }
 
