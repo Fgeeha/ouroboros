@@ -489,7 +489,8 @@ def _tree_ledger_snapshot_rows(
 
 def _format_tree_ledger_row(row: Dict[str, Any]) -> str:
     flag = " ⚠needs_parent_attention" if row.get("needs_parent_attention") else ""
-    who = str(row.get("role") or "") or str(row.get("task_id") or "")[:8]
+    # Role AND the full task id: a row is addressable with forward_to_worker/peek_task.
+    who = " ".join(part for part in (str(row.get("role") or ""), str(row.get("task_id") or "")) if part)
     payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
     payload_note = ""
     if str(row.get("kind") or "") == DELEGATION_CONSTRAINT_KIND and payload:
