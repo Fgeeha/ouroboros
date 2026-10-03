@@ -968,7 +968,7 @@ def build_recent_sections(
         sections.append(f"## Supervisor ({coverage_line(supervisor_coverage)})\n\n" + supervisor_summary)
 
     reflections_entries = memory.read_task_recent("task_reflections.jsonl", "", 20)[0]
-    reflections_text = _format_recent_reflections(reflections_entries, limit=10)
+    reflections_text = _format_recent_reflections(reflections_entries, limit=20)
     if reflections_text:
         sections.append("## Execution reflections\n\n" + reflections_text)
 
@@ -984,7 +984,7 @@ def build_recent_sections(
             project_rows = list(iter_jsonl_objects(
                 project_reflections_path(_pid), max_entries=20,
             ))
-            project_text = _format_recent_reflections(project_rows, limit=10)
+            project_text = _format_recent_reflections(project_rows, limit=20)
             if project_text:
                 sections.append(
                     f"## Project execution reflections (this project's own: {_pid})\n\n"

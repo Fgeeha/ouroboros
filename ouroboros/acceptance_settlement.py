@@ -42,6 +42,7 @@ import threading
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
+from ouroboros.plan_review_facts import learn_from_late_settlement
 from ouroboros.utils import utc_now_iso
 # Late settlement reads the canonical result, including a forked task's budget root.
 from ouroboros.tool_access_paths import canonical_data_root as _result_root
@@ -807,12 +808,14 @@ def attach_late_acceptance_settlement(usage_ctx: Any, request: Any, wave: Dict[s
     outbox (durably owed, keyed by ``delivery_id``; a second settlement of the
     same wave, concurrent or later, finds that notice already owed or delivered
     and queues no second live copy). The owner
-    sees it; the next turn reads it in chat history. The acceptance twin of plan
-    review's historical supplement (docs/architecture/06-agent-core.md).
+    sees it; the next turn reads it in chat history, and one bounded reflection
+    row carries the settled verdict to the learning log (plan_review_facts).
     """
-    return settle_acceptance_operation(
-        usage_ctx, retry_key=str(getattr(request, "retry_key", "") or ""),
-        task_id=str(getattr(request, "task_id", "") or ""), result=result, wave=wave) == "announced"
+    retry_key = str(getattr(request, "retry_key", "") or "")
+    outcome = settle_acceptance_operation(usage_ctx, retry_key=retry_key, task_id=str(getattr(request, "task_id", "") or ""), result=result, wave=wave)
+    if outcome == "announced":  # one row per announced settlement; a replay announces nothing new
+        learn_from_late_settlement(_result_root(usage_ctx), result, retry_key)
+    return outcome == "announced"
 
 
 def settle_acceptance_operation(usage_ctx: Any, *, retry_key: str, task_id: str, result: Dict[str, Any],
