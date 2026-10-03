@@ -1547,6 +1547,7 @@ __all__ = [
     "SkillGrantResponse",
     "SkillDeleteResponse",
     "UiPreferencesResponse",
+    "DesktopAutostartResponse",
     "GitLogResponse",
     "EvolutionDataResponse",
     "ScheduledTasksResponse",

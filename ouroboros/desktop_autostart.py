@@ -188,6 +188,8 @@ def _linux(exe: Path, enabled: bool | None) -> str:
             path.unlink(missing_ok=True)
         unit_state = "off"
     if native:  # an entry that starts nothing (absent or turned off) leaves the unit's state standing
+        if unit_state == "on" and not _unit_starts_automatic():
+            return "on"  # an older unit enabled by hand is shown as it is, so the owner can still turn it off
         return unit_state if _desktop_state(path, exe) in ("off", "disabled_by_os") else "other_copy"
     return "other_copy" if unit_state == "on" else _desktop_state(path, exe)
 

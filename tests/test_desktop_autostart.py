@@ -217,7 +217,7 @@ def test_linux_native_unit_is_not_masked_by_a_turned_off_leftover_entry(host, tm
     assert startup.autostart_status()["state"] == "other_copy"
 
 
-def test_an_older_installed_unit_is_never_enabled_but_still_turns_off(host):
+def test_an_older_installed_unit_is_never_enabled_but_still_turns_off(host, tmp_path):
     package, os_state = host
     package("linux", native=True)
     startup.NATIVE_UNIT.write_text(HISTORICAL_UNIT, encoding="utf-8")  # old deb/rpm, current managed code
@@ -229,7 +229,12 @@ def test_an_older_installed_unit_is_never_enabled_but_still_turns_off(host):
     assert [call[2] for call in os_state.calls] == ["is-enabled", "is-enabled"]  # read, never enabled
     os_state.unit = "enabled"  # registered earlier by hand: shown as it is, so the owner can turn it off
     assert startup.autostart_status() == {"state": "on"}
+    path = tmp_path / ".config/autostart/ouroboros.desktop"  # a live entry of another copy beside it
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('[Desktop Entry]\nType=Application\nExec="/home/me/Ouroboros.AppImage" --launch-intent automatic\n', encoding="utf-8")
+    assert startup.autostart_status() == {"state": "on"}  # not masked as other_copy: enabling is refused, so off must stay reachable
     assert startup.autostart_status(False) == {"state": "off"}
+    assert not path.exists()
     assert ["systemctl", "--user", "disable", "ouroboros.service"] in os_state.calls
 
 
